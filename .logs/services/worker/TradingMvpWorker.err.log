@@ -1,0 +1,225 @@
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 4, in <module>
+    from rq import Connection, Queue, Worker
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\__init__.py", line 6, in <module>
+    from .worker import SimpleWorker, SpawnWorker, Worker
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\__init__.py", line 2, in <module>
+    from .base import (
+    ...<6 lines>...
+    )
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\base.py", line 48, in <module>
+    from ..scheduler import RQScheduler
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\scheduler.py", line 23, in <module>
+    ForkProcess = get_context('fork').Process
+                  ~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 243, in get_context
+    return super().get_context(method)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 193, in get_context
+    raise ValueError('cannot find context for %r' % method) from None
+ValueError: cannot find context for 'fork'
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 13, in main
+    from rq import Connection, Queue, Worker  # type: ignore[import-not-found]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\__init__.py", line 6, in <module>
+    from .worker import SimpleWorker, SpawnWorker, Worker
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\__init__.py", line 2, in <module>
+    from .base import (
+    ...<6 lines>...
+    )
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\base.py", line 48, in <module>
+    from ..scheduler import RQScheduler
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\scheduler.py", line 23, in <module>
+    ForkProcess = get_context('fork').Process
+                  ~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 243, in get_context
+    return super().get_context(method)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 193, in get_context
+    raise ValueError('cannot find context for %r' % method) from None
+ValueError: cannot find context for 'fork'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 27, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 16, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 13, in main
+    from rq import Connection, Queue, Worker  # type: ignore[import-not-found]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\__init__.py", line 6, in <module>
+    from .worker import SimpleWorker, SpawnWorker, Worker
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\__init__.py", line 2, in <module>
+    from .base import (
+    ...<6 lines>...
+    )
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\base.py", line 48, in <module>
+    from ..scheduler import RQScheduler
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\scheduler.py", line 23, in <module>
+    ForkProcess = get_context('fork').Process
+                  ~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 243, in get_context
+    return super().get_context(method)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 193, in get_context
+    raise ValueError('cannot find context for %r' % method) from None
+ValueError: cannot find context for 'fork'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 27, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 16, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 13, in main
+    from rq import Connection, Queue, Worker  # type: ignore[import-not-found]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\__init__.py", line 6, in <module>
+    from .worker import SimpleWorker, SpawnWorker, Worker
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\__init__.py", line 2, in <module>
+    from .base import (
+    ...<6 lines>...
+    )
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\base.py", line 48, in <module>
+    from ..scheduler import RQScheduler
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\scheduler.py", line 23, in <module>
+    ForkProcess = get_context('fork').Process
+                  ~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 243, in get_context
+    return super().get_context(method)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 193, in get_context
+    raise ValueError('cannot find context for %r' % method) from None
+ValueError: cannot find context for 'fork'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 27, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 16, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 13, in main
+    while True:
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\__init__.py", line 6, in <module>
+    from .worker import SimpleWorker, SpawnWorker, Worker
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\__init__.py", line 2, in <module>
+    from .base import (
+    ...<6 lines>...
+    )
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\worker\base.py", line 48, in <module>
+    from ..scheduler import RQScheduler
+  File "C:\my-trading-bot\.venv\Lib\site-packages\rq\scheduler.py", line 23, in <module>
+    ForkProcess = get_context('fork').Process
+                  ~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 243, in get_context
+    return super().get_context(method)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\DRAC\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 193, in get_context
+    raise ValueError('cannot find context for %r' % method) from None
+ValueError: cannot find context for 'fork'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 27, in <module>
+  File "C:\my-trading-bot\workers\worker.py", line 16, in main
+    from rq import Connection, Queue, Worker  # type: ignore[import-not-found]
+        ^^^^^^^^^^^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 30, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 14, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 30, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 14, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 30, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 14, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 30, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 14, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 30, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 14, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+Traceback (most recent call last):
+  File "C:\my-trading-bot\workers\worker.py", line 30, in <module>
+    main()
+    ~~~~^^
+  File "C:\my-trading-bot\workers\worker.py", line 14, in main
+    time.sleep(60)
+    ~~~~~~~~~~^^^^
+KeyboardInterrupt
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.

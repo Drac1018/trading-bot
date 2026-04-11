@@ -1,0 +1,40 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "page": {
+      "title": "Page",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "suggestion": {
+      "title": "Suggestion",
+      "type": "string"
+    },
+    "severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "improved_copy": {
+      "title": "Improved Copy",
+      "type": "string"
+    }
+  },
+  "required": [
+    "page",
+    "title",
+    "suggestion",
+    "severity",
+    "improved_copy"
+  ],
+  "title": "UXSuggestion",
+  "type": "object"
+}

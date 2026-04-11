@@ -1,0 +1,329 @@
+{
+  "$defs": {
+    "BinanceAccountAsset": {
+      "additionalProperties": false,
+      "properties": {
+        "asset": {
+          "title": "Asset",
+          "type": "string"
+        },
+        "wallet_balance": {
+          "default": 0.0,
+          "title": "Wallet Balance",
+          "type": "number"
+        },
+        "available_balance": {
+          "default": 0.0,
+          "title": "Available Balance",
+          "type": "number"
+        },
+        "margin_balance": {
+          "default": 0.0,
+          "title": "Margin Balance",
+          "type": "number"
+        },
+        "unrealized_profit": {
+          "default": 0.0,
+          "title": "Unrealized Profit",
+          "type": "number"
+        },
+        "max_withdraw_amount": {
+          "default": 0.0,
+          "title": "Max Withdraw Amount",
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset"
+      ],
+      "title": "BinanceAccountAsset",
+      "type": "object"
+    },
+    "BinanceAccountPosition": {
+      "additionalProperties": false,
+      "properties": {
+        "symbol": {
+          "title": "Symbol",
+          "type": "string"
+        },
+        "position_side": {
+          "enum": [
+            "long",
+            "short"
+          ],
+          "title": "Position Side",
+          "type": "string"
+        },
+        "position_amt": {
+          "title": "Position Amt",
+          "type": "number"
+        },
+        "entry_price": {
+          "default": 0.0,
+          "title": "Entry Price",
+          "type": "number"
+        },
+        "mark_price": {
+          "default": 0.0,
+          "title": "Mark Price",
+          "type": "number"
+        },
+        "liquidation_price": {
+          "default": 0.0,
+          "title": "Liquidation Price",
+          "type": "number"
+        },
+        "leverage": {
+          "default": 0.0,
+          "title": "Leverage",
+          "type": "number"
+        },
+        "unrealized_profit": {
+          "default": 0.0,
+          "title": "Unrealized Profit",
+          "type": "number"
+        },
+        "isolated_margin": {
+          "default": 0.0,
+          "title": "Isolated Margin",
+          "type": "number"
+        },
+        "notional": {
+          "default": 0.0,
+          "title": "Notional",
+          "type": "number"
+        },
+        "margin_type": {
+          "default": "",
+          "title": "Margin Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "position_side",
+        "position_amt"
+      ],
+      "title": "BinanceAccountPosition",
+      "type": "object"
+    },
+    "BinanceAccountSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "connected": {
+          "title": "Connected",
+          "type": "boolean"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "testnet_enabled": {
+          "title": "Testnet Enabled",
+          "type": "boolean"
+        },
+        "futures_enabled": {
+          "title": "Futures Enabled",
+          "type": "boolean"
+        },
+        "tracked_symbols": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tracked Symbols",
+          "type": "array"
+        },
+        "can_trade": {
+          "default": false,
+          "title": "Can Trade",
+          "type": "boolean"
+        },
+        "fee_tier": {
+          "default": 0,
+          "title": "Fee Tier",
+          "type": "integer"
+        },
+        "total_wallet_balance": {
+          "default": 0.0,
+          "title": "Total Wallet Balance",
+          "type": "number"
+        },
+        "available_balance": {
+          "default": 0.0,
+          "title": "Available Balance",
+          "type": "number"
+        },
+        "total_unrealized_profit": {
+          "default": 0.0,
+          "title": "Total Unrealized Profit",
+          "type": "number"
+        },
+        "total_margin_balance": {
+          "default": 0.0,
+          "title": "Total Margin Balance",
+          "type": "number"
+        },
+        "total_position_initial_margin": {
+          "default": 0.0,
+          "title": "Total Position Initial Margin",
+          "type": "number"
+        },
+        "total_open_order_initial_margin": {
+          "default": 0.0,
+          "title": "Total Open Order Initial Margin",
+          "type": "number"
+        },
+        "total_maint_margin": {
+          "default": 0.0,
+          "title": "Total Maint Margin",
+          "type": "number"
+        },
+        "asset_count": {
+          "default": 0,
+          "title": "Asset Count",
+          "type": "integer"
+        },
+        "open_positions": {
+          "default": 0,
+          "title": "Open Positions",
+          "type": "integer"
+        },
+        "open_orders": {
+          "default": 0,
+          "title": "Open Orders",
+          "type": "integer"
+        },
+        "exchange_update_time": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exchange Update Time"
+        }
+      },
+      "required": [
+        "connected",
+        "message",
+        "testnet_enabled",
+        "futures_enabled"
+      ],
+      "title": "BinanceAccountSummary",
+      "type": "object"
+    },
+    "BinanceOpenOrderSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "symbol": {
+          "title": "Symbol",
+          "type": "string"
+        },
+        "side": {
+          "title": "Side",
+          "type": "string"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "price": {
+          "default": 0.0,
+          "title": "Price",
+          "type": "number"
+        },
+        "stop_price": {
+          "default": 0.0,
+          "title": "Stop Price",
+          "type": "number"
+        },
+        "orig_qty": {
+          "default": 0.0,
+          "title": "Orig Qty",
+          "type": "number"
+        },
+        "executed_qty": {
+          "default": 0.0,
+          "title": "Executed Qty",
+          "type": "number"
+        },
+        "reduce_only": {
+          "default": false,
+          "title": "Reduce Only",
+          "type": "boolean"
+        },
+        "close_position": {
+          "default": false,
+          "title": "Close Position",
+          "type": "boolean"
+        },
+        "time_in_force": {
+          "default": "",
+          "title": "Time In Force",
+          "type": "string"
+        },
+        "update_time": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Update Time"
+        }
+      },
+      "required": [
+        "symbol",
+        "side",
+        "type",
+        "status"
+      ],
+      "title": "BinanceOpenOrderSummary",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "$ref": "#/$defs/BinanceAccountSummary"
+    },
+    "assets": {
+      "items": {
+        "$ref": "#/$defs/BinanceAccountAsset"
+      },
+      "title": "Assets",
+      "type": "array"
+    },
+    "positions": {
+      "items": {
+        "$ref": "#/$defs/BinanceAccountPosition"
+      },
+      "title": "Positions",
+      "type": "array"
+    },
+    "open_orders": {
+      "items": {
+        "$ref": "#/$defs/BinanceOpenOrderSummary"
+      },
+      "title": "Open Orders",
+      "type": "array"
+    }
+  },
+  "required": [
+    "summary"
+  ],
+  "title": "BinanceAccountResponse",
+  "type": "object"
+}

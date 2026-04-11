@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "integration_point": {
+      "title": "Integration Point",
+      "type": "string"
+    },
+    "description": {
+      "title": "Description",
+      "type": "string"
+    },
+    "automation_opportunity": {
+      "title": "Automation Opportunity",
+      "type": "string"
+    },
+    "tech_debt_item": {
+      "title": "Tech Debt Item",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Priority",
+      "type": "string"
+    }
+  },
+  "required": [
+    "title",
+    "integration_point",
+    "description",
+    "automation_opportunity",
+    "tech_debt_item",
+    "priority"
+  ],
+  "title": "IntegrationSuggestion",
+  "type": "object"
+}

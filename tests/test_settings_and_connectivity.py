@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+from datetime import timedelta
+
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from trading_mvp.database import Base, get_db
+from trading_mvp.main import app
+from trading_mvp.models import AgentRun
+from trading_mvp.schemas import (
+    AppSettingsUpdateRequest,
+    BinanceConnectionTestRequest,
+    OpenAIConnectionTestRequest,
+)
+from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
+from trading_mvp.services.settings import (
+    get_or_create_settings,
+    serialize_settings,
+    should_call_openai,
+    update_settings,
+)
+from trading_mvp.time_utils import utcnow_naive
+
+
+def build_settings_payload() -> AppSettingsUpdateRequest:
+    return AppSettingsUpdateRequest(
+        live_trading_enabled=True,
+        manual_live_approval=True,
+        live_approval_window_minutes=15,
+        default_symbol="BTCUSDT",
+        tracked_symbols=["BTCUSDT", "ETHUSDT"],
+        default_timeframe="15m",
+        schedule_windows=["1h", "4h", "12h", "24h"],
+        max_leverage=3.0,
+        max_risk_per_trade=0.01,
+        max_daily_loss=0.02,
+        max_consecutive_losses=3,
+        stale_market_seconds=1800,
+        slippage_threshold_pct=0.003,
+        starting_equity=100000.0,
+        ai_enabled=True,
+        ai_provider="openai",
+        ai_model="gpt-4.1-mini",
+        ai_call_interval_minutes=30,
+        decision_cycle_interval_minutes=15,
+        ai_max_input_candles=32,
+        ai_temperature=0.1,
+        binance_market_data_enabled=True,
+        binance_testnet_enabled=True,
+        binance_futures_enabled=True,
+        openai_api_key="sk-test-openai",
+        binance_api_key="binance-key",
+        binance_api_secret="binance-secret",
+        clear_openai_api_key=False,
+        clear_binance_api_key=False,
+        clear_binance_api_secret=False,
+    )
+
+
+def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    serialized = serialize_settings(row)
+
+    assert row.openai_api_key_encrypted
+    assert row.openai_api_key_encrypted != "sk-test-openai"
+    assert serialized["openai_api_key_configured"] is True
+    assert serialized["binance_api_key_configured"] is True
+    assert serialized["binance_api_secret_configured"] is True
+    assert serialized["tracked_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 2880
+
+
+def test_should_call_openai_respects_manual_and_replay(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    assert should_call_openai(db_session, row, "trading_decision", "manual") is True
+    assert should_call_openai(db_session, row, "trading_decision", "historical_replay") is False
+
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="latest decision",
+            input_payload={},
+            output_payload={},
+            metadata_json={"source": "llm"},
+            schema_valid=True,
+        )
+    )
+    db_session.flush()
+
+    assert should_call_openai(db_session, row, "trading_decision", "realtime_cycle") is False
+
+
+def test_should_call_openai_applies_failure_backoff(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="fallback",
+            provider_name="deterministic-mock",
+            summary="fallback decision",
+            input_payload={},
+            output_payload={},
+            metadata_json={
+                "source": "llm_fallback",
+                "error": "Client error 400 Bad Request",
+            },
+            schema_valid=True,
+            created_at=utcnow_naive(),
+        )
+    )
+    db_session.flush()
+
+    assert should_call_openai(db_session, row, "trading_decision", "realtime_cycle") is False
+    assert should_call_openai(db_session, row, "trading_decision", "manual") is False
+
+
+def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    now = utcnow_naive()
+    db_session.add_all(
+        [
+            AgentRun(
+                role="trading_decision",
+                trigger_event="realtime_cycle",
+                schema_name="TradeDecision",
+                status="completed",
+                provider_name="openai",
+                summary="openai success",
+                input_payload={},
+                output_payload={},
+                metadata_json={
+                    "source": "llm",
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+                },
+                schema_valid=True,
+                created_at=now - timedelta(hours=2),
+            ),
+            AgentRun(
+                role="trading_decision",
+                trigger_event="realtime_cycle",
+                schema_name="TradeDecision",
+                status="fallback",
+                provider_name="deterministic-mock",
+                summary="openai fallback",
+                input_payload={},
+                output_payload={},
+                metadata_json={
+                    "source": "llm_fallback",
+                    "error": "Client error 400 Bad Request",
+                },
+                schema_valid=True,
+                created_at=now - timedelta(hours=1),
+            ),
+            AgentRun(
+                role="integration_planner",
+                trigger_event="scheduled_review",
+                schema_name="IntegrationSuggestionBatch",
+                status="completed",
+                provider_name="openai",
+                summary="planner success",
+                input_payload={},
+                output_payload={},
+                metadata_json={
+                    "source": "llm",
+                    "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+                },
+                schema_valid=True,
+                created_at=now - timedelta(days=2),
+            ),
+        ]
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["recent_ai_calls_24h"] == 2
+    assert serialized["recent_ai_successes_24h"] == 1
+    assert serialized["recent_ai_failures_24h"] == 1
+    assert serialized["recent_ai_tokens_24h"]["total_tokens"] == 120
+    assert serialized["recent_ai_role_calls_7d"]["integration_planner"] == 1
+    assert "BAD_REQUEST x1" in serialized["recent_ai_failure_reasons"]
+    assert serialized["observed_monthly_ai_calls_projection"] == 60
+
+
+def test_connection_services_return_success_with_patched_clients(db_session, monkeypatch) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    monkeypatch.setattr(
+        "trading_mvp.providers.OpenAIProvider.test_connection",
+        lambda self: {"ok": True, "model": self.model},
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.binance.BinanceClient.test_connection",
+        lambda self, symbol, timeframe: {"market_data_ok": True, "symbol": symbol, "timeframe": timeframe},
+    )
+
+    openai_result = check_openai_connection(
+        row,
+        OpenAIConnectionTestRequest(api_key=None, model="gpt-4.1-mini"),
+    )
+    binance_result = check_binance_connection(
+        row,
+        BinanceConnectionTestRequest(
+            api_key=None,
+            api_secret=None,
+            testnet_enabled=True,
+            symbol="BTCUSDT",
+            timeframe="15m",
+        ),
+    )
+
+    assert openai_result.ok is True
+    assert binance_result.ok is True
+    assert binance_result.details["symbol"] == "BTCUSDT"
+
+
+def test_get_or_create_settings_provides_new_defaults(db_session) -> None:
+    row = get_or_create_settings(db_session)
+    serialized = serialize_settings(row)
+
+    assert serialized["ai_call_interval_minutes"] >= 5
+    assert serialized["decision_cycle_interval_minutes"] >= 1
+    assert serialized["tracked_symbols"]
+
+
+def test_update_settings_does_not_change_trading_pause_state(db_session) -> None:
+    row = get_or_create_settings(db_session)
+    row.trading_paused = True
+    db_session.flush()
+
+    updated = update_settings(db_session, build_settings_payload())
+
+    assert updated.trading_paused is True
+
+
+def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'settings_api.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as client:
+            pause_response = client.post("/api/settings/pause")
+            assert pause_response.status_code == 200
+            assert pause_response.json()["trading_paused"] is True
+
+            resume_response = client.post("/api/settings/resume")
+            assert resume_response.status_code == 200
+            assert resume_response.json()["trading_paused"] is False
+
+        with TestingSessionLocal() as session:
+            events = session.execute(
+                text(
+                    """
+                select event_type, message
+                from audit_events
+                order by id asc
+                """
+                )
+            ).all()
+            assert ("trading_paused", "Global trading pause enabled.") in events
+            assert ("trading_resumed", "Global trading pause cleared.") in events
+    finally:
+        app.dependency_overrides.clear()

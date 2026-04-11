@@ -1,0 +1,51 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    },
+    "recommended_mode": {
+      "enum": [
+        "hold",
+        "monitor",
+        "act"
+      ],
+      "title": "Recommended Mode",
+      "type": "string"
+    },
+    "must_do_actions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Must Do Actions",
+      "type": "array"
+    },
+    "blockers": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Blockers",
+      "type": "array"
+    },
+    "priority": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Priority",
+      "type": "string"
+    }
+  },
+  "required": [
+    "summary",
+    "recommended_mode",
+    "must_do_actions",
+    "blockers",
+    "priority"
+  ],
+  "title": "ChiefReviewSummary",
+  "type": "object"
+}

@@ -1,0 +1,71 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "problem": {
+      "title": "Problem",
+      "type": "string"
+    },
+    "proposal": {
+      "title": "Proposal",
+      "type": "string"
+    },
+    "severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "effort": {
+      "enum": [
+        "small",
+        "medium",
+        "large"
+      ],
+      "title": "Effort",
+      "type": "string"
+    },
+    "impact": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Impact",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "rationale": {
+      "title": "Rationale",
+      "type": "string"
+    }
+  },
+  "required": [
+    "title",
+    "problem",
+    "proposal",
+    "severity",
+    "effort",
+    "impact",
+    "priority",
+    "rationale"
+  ],
+  "title": "ProductBacklogItem",
+  "type": "object"
+}

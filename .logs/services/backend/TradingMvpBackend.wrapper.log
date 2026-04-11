@@ -1,0 +1,354 @@
+2026-04-08 19:12:24,422 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:27,613 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:27,655 INFO  - Installing service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:12:27,768 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was installed successfully.
+2026-04-08 19:12:28,842 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:31,585 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:31,632 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:12:32,365 DEBUG - Starting WinSW in service mode
+2026-04-08 19:12:32,403 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-08 19:12:32,563 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-08 19:12:32,621 INFO  - Started process 20924
+2026-04-08 19:12:32,639 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:15:35,039 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:37,669 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:37,713 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:15:37,754 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' stopped successfully.
+2026-04-08 19:15:37,756 INFO  - Stopping TradingMvpBackend
+2026-04-08 19:15:37,756 DEBUG - ProcessKill 20924
+2026-04-08 19:15:37,773 DEBUG - Stopping process 20924...
+2026-04-08 19:15:38,089 DEBUG - Process 20924 canceled with code 0.
+2026-04-08 19:15:38,093 INFO  - Finished TradingMvpBackend
+2026-04-08 19:15:40,496 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:43,562 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:43,643 INFO  - Uninstalling service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:15:43,726 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was uninstalled successfully.
+2026-04-08 19:15:45,404 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:52,136 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:52,179 INFO  - Installing service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:15:52,250 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was installed successfully.
+2026-04-08 19:15:52,949 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:55,265 DEBUG - Starting WinSW in console mode
+2026-04-08 19:15:55,312 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:15:55,953 DEBUG - Starting WinSW in service mode
+2026-04-08 19:15:55,986 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-08 19:15:56,254 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-08 19:15:56,319 INFO  - Started process 18536
+2026-04-08 19:15:56,340 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:16:28,264 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:30,834 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:30,887 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:16:30,923 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' stopped successfully.
+2026-04-08 19:16:30,924 INFO  - Stopping TradingMvpBackend
+2026-04-08 19:16:30,925 DEBUG - ProcessKill 18536
+2026-04-08 19:16:30,940 DEBUG - Stopping process 18536...
+2026-04-08 19:16:31,212 DEBUG - Process 18536 canceled with code 0.
+2026-04-08 19:16:31,215 INFO  - Finished TradingMvpBackend
+2026-04-08 19:16:33,649 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:35,894 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:35,933 INFO  - Uninstalling service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:16:35,975 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was uninstalled successfully.
+2026-04-08 19:16:36,647 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:38,955 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:38,997 INFO  - Installing service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:16:39,071 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was installed successfully.
+2026-04-08 19:16:39,784 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:41,903 DEBUG - Starting WinSW in console mode
+2026-04-08 19:16:41,948 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:16:42,579 DEBUG - Starting WinSW in service mode
+2026-04-08 19:16:42,612 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-08 19:16:42,740 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-08 19:16:42,780 INFO  - Started process 4160
+2026-04-08 19:16:42,795 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:35:42,349 DEBUG - Starting WinSW in console mode
+2026-04-08 19:35:50,611 DEBUG - Starting WinSW in console mode
+2026-04-08 19:35:50,664 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:35:50,713 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' stopped successfully.
+2026-04-08 19:35:50,715 INFO  - Stopping TradingMvpBackend
+2026-04-08 19:35:50,715 DEBUG - ProcessKill 4160
+2026-04-08 19:35:50,734 DEBUG - Stopping process 4160...
+2026-04-08 19:35:51,105 DEBUG - Process 4160 canceled with code 0.
+2026-04-08 19:35:51,108 INFO  - Finished TradingMvpBackend
+2026-04-08 19:35:53,578 DEBUG - Starting WinSW in console mode
+2026-04-08 19:35:56,766 DEBUG - Starting WinSW in console mode
+2026-04-08 19:35:56,815 INFO  - Uninstalling service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:35:56,863 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was uninstalled successfully.
+2026-04-08 19:35:57,608 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:00,915 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:00,957 INFO  - Installing service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:36:01,039 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was installed successfully.
+2026-04-08 19:36:01,788 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:04,031 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:04,077 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:36:04,744 DEBUG - Starting WinSW in service mode
+2026-04-08 19:36:04,779 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-08 19:36:04,921 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-08 19:36:04,967 INFO  - Started process 22092
+2026-04-08 19:36:04,983 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:39:59,582 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:06,840 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:06,888 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:40:06,939 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' stopped successfully.
+2026-04-08 19:40:06,941 INFO  - Stopping TradingMvpBackend
+2026-04-08 19:40:06,942 DEBUG - ProcessKill 22092
+2026-04-08 19:40:06,960 DEBUG - Stopping process 22092...
+2026-04-08 19:40:07,286 DEBUG - Process 22092 canceled with code 0.
+2026-04-08 19:40:07,294 INFO  - Finished TradingMvpBackend
+2026-04-08 19:40:09,784 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:13,442 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:13,485 INFO  - Uninstalling service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:40:13,536 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was uninstalled successfully.
+2026-04-08 19:40:14,293 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:19,933 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:19,976 INFO  - Installing service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:40:20,060 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was installed successfully.
+2026-04-08 19:40:20,999 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:24,179 DEBUG - Starting WinSW in console mode
+2026-04-08 19:40:24,233 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-08 19:40:24,970 DEBUG - Starting WinSW in service mode
+2026-04-08 19:40:25,012 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-08 19:40:25,232 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-08 19:40:25,310 INFO  - Started process 10984
+2026-04-08 19:40:25,331 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 23:55:09,210 DEBUG - Starting WinSW in console mode
+2026-04-08 23:55:11,802 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpBackend.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-08 23:58:10,379 DEBUG - Starting WinSW in console mode
+2026-04-08 23:58:12,886 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpBackend.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 00:06:59,628 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:02,039 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:02,090 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:07:02,137 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' stopped successfully.
+2026-04-09 00:07:02,159 INFO  - Stopping TradingMvpBackend
+2026-04-09 00:07:02,163 DEBUG - ProcessKill 10984
+2026-04-09 00:07:02,197 DEBUG - Stopping process 10984...
+2026-04-09 00:07:02,673 DEBUG - Process 10984 canceled with code 0.
+2026-04-09 00:07:02,680 INFO  - Finished TradingMvpBackend
+2026-04-09 00:07:04,923 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:07,483 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:07,524 INFO  - Uninstalling service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:07:07,568 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was uninstalled successfully.
+2026-04-09 00:07:08,284 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:11,002 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:11,040 INFO  - Installing service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:07:11,093 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' was installed successfully.
+2026-04-09 00:07:11,822 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:14,597 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:14,638 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:07:15,302 DEBUG - Starting WinSW in service mode
+2026-04-09 00:07:15,338 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-09 00:07:15,496 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 00:07:15,552 INFO  - Started process 23980
+2026-04-09 00:07:15,568 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:36:18,770 DEBUG - Starting WinSW in console mode
+2026-04-09 00:36:50,483 DEBUG - Starting WinSW in console mode
+2026-04-09 00:36:53,630 DEBUG - Starting WinSW in console mode
+2026-04-09 00:36:53,676 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:36:53,684 INFO  - Stopping TradingMvpBackend
+2026-04-09 00:36:53,685 DEBUG - ProcessKill 23980
+2026-04-09 00:36:53,703 DEBUG - Stopping process 23980...
+2026-04-09 00:36:54,089 DEBUG - Process 23980 canceled with code 0.
+2026-04-09 00:36:54,094 INFO  - Finished TradingMvpBackend
+2026-04-09 00:36:54,212 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:36:54,850 DEBUG - Starting WinSW in service mode
+2026-04-09 00:36:55,012 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 00:36:55,053 INFO  - Started process 17144
+2026-04-09 00:36:55,069 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:36:55,142 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 00:41:21,319 DEBUG - Starting WinSW in console mode
+2026-04-09 00:41:25,338 DEBUG - Starting WinSW in console mode
+2026-04-09 00:41:25,428 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:41:25,502 INFO  - Stopping TradingMvpBackend
+2026-04-09 00:41:25,502 DEBUG - ProcessKill 17144
+2026-04-09 00:41:25,527 DEBUG - Stopping process 17144...
+2026-04-09 00:41:25,982 DEBUG - Process 17144 canceled with code 0.
+2026-04-09 00:41:25,987 INFO  - Finished TradingMvpBackend
+2026-04-09 00:41:26,021 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:41:26,847 DEBUG - Starting WinSW in service mode
+2026-04-09 00:41:27,067 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 00:41:27,122 INFO  - Started process 17140
+2026-04-09 00:41:27,140 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:41:27,404 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 00:45:12,566 DEBUG - Starting WinSW in console mode
+2026-04-09 00:45:16,326 DEBUG - Starting WinSW in console mode
+2026-04-09 00:45:16,413 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:45:16,507 INFO  - Stopping TradingMvpBackend
+2026-04-09 00:45:16,507 DEBUG - ProcessKill 17140
+2026-04-09 00:45:16,537 DEBUG - Stopping process 17140...
+2026-04-09 00:45:16,964 DEBUG - Process 17140 canceled with code 0.
+2026-04-09 00:45:16,969 INFO  - Finished TradingMvpBackend
+2026-04-09 00:45:17,043 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 00:45:18,061 DEBUG - Starting WinSW in service mode
+2026-04-09 00:45:18,289 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 00:45:18,345 INFO  - Started process 24904
+2026-04-09 00:45:18,364 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:45:18,629 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 01:02:20,213 DEBUG - Starting WinSW in console mode
+2026-04-09 01:02:26,894 DEBUG - Starting WinSW in console mode
+2026-04-09 01:02:27,088 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 01:02:27,302 INFO  - Stopping TradingMvpBackend
+2026-04-09 01:02:27,303 DEBUG - ProcessKill 24904
+2026-04-09 01:02:27,331 DEBUG - Stopping process 24904...
+2026-04-09 01:02:28,071 DEBUG - Process 24904 canceled with code 0.
+2026-04-09 01:02:28,079 INFO  - Finished TradingMvpBackend
+2026-04-09 01:02:28,107 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 01:02:29,239 DEBUG - Starting WinSW in service mode
+2026-04-09 01:02:29,630 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 01:02:29,698 INFO  - Started process 27596
+2026-04-09 01:02:29,722 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 01:02:29,820 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 01:18:44,077 DEBUG - Starting WinSW in console mode
+2026-04-09 01:19:47,262 DEBUG - Starting WinSW in console mode
+2026-04-09 01:20:40,496 DEBUG - Starting WinSW in console mode
+2026-04-09 01:23:10,830 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpBackend.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 01:23:10,836 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpBackend.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 22:45:06,697 DEBUG - Starting WinSW in console mode
+2026-04-09 22:45:09,342 DEBUG - Starting WinSW in console mode
+2026-04-09 22:45:09,396 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 22:45:09,413 INFO  - Stopping TradingMvpBackend
+2026-04-09 22:45:09,414 DEBUG - ProcessKill 27596
+2026-04-09 22:45:09,441 DEBUG - Stopping process 27596...
+2026-04-09 22:45:09,923 DEBUG - Process 27596 canceled with code 0.
+2026-04-09 22:45:09,928 INFO  - Finished TradingMvpBackend
+2026-04-09 22:45:09,932 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 22:45:10,671 DEBUG - Starting WinSW in service mode
+2026-04-09 22:45:10,886 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 22:45:10,941 INFO  - Started process 14392
+2026-04-09 22:45:10,963 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 22:45:11,227 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 22:54:36,977 DEBUG - Starting WinSW in console mode
+2026-04-09 22:54:41,582 DEBUG - Starting WinSW in console mode
+2026-04-09 22:54:41,631 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 22:54:41,641 INFO  - Stopping TradingMvpBackend
+2026-04-09 22:54:41,642 DEBUG - ProcessKill 14392
+2026-04-09 22:54:41,666 DEBUG - Stopping process 14392...
+2026-04-09 22:54:42,078 DEBUG - Process 14392 canceled with code 0.
+2026-04-09 22:54:42,083 INFO  - Finished TradingMvpBackend
+2026-04-09 22:54:42,170 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 22:54:42,925 DEBUG - Starting WinSW in service mode
+2026-04-09 22:54:43,131 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 22:54:43,179 INFO  - Started process 19004
+2026-04-09 22:54:43,198 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 22:54:43,220 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 23:30:48,203 DEBUG - Starting WinSW in console mode
+2026-04-09 23:30:52,643 DEBUG - Starting WinSW in console mode
+2026-04-09 23:30:52,717 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 23:30:52,773 INFO  - Stopping TradingMvpBackend
+2026-04-09 23:30:52,775 DEBUG - ProcessKill 19004
+2026-04-09 23:30:52,797 DEBUG - Stopping process 19004...
+2026-04-09 23:30:53,314 DEBUG - Process 19004 canceled with code 0.
+2026-04-09 23:30:53,321 INFO  - Finished TradingMvpBackend
+2026-04-09 23:30:53,552 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 23:30:54,601 DEBUG - Starting WinSW in service mode
+2026-04-09 23:30:54,815 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 23:30:54,875 INFO  - Started process 19848
+2026-04-09 23:30:54,902 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 23:30:55,156 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-09 23:55:01,418 DEBUG - Starting WinSW in console mode
+2026-04-09 23:55:05,747 DEBUG - Starting WinSW in console mode
+2026-04-09 23:55:05,809 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 23:55:05,853 INFO  - Stopping TradingMvpBackend
+2026-04-09 23:55:05,854 DEBUG - ProcessKill 19848
+2026-04-09 23:55:05,876 DEBUG - Stopping process 19848...
+2026-04-09 23:55:06,318 DEBUG - Process 19848 canceled with code 0.
+2026-04-09 23:55:06,323 INFO  - Finished TradingMvpBackend
+2026-04-09 23:55:06,375 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-09 23:55:07,250 DEBUG - Starting WinSW in service mode
+2026-04-09 23:55:07,478 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-09 23:55:07,529 INFO  - Started process 4476
+2026-04-09 23:55:07,548 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 23:55:07,569 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-10 00:20:26,329 DEBUG - Starting WinSW in console mode
+2026-04-10 00:20:30,571 DEBUG - Starting WinSW in console mode
+2026-04-10 00:20:30,654 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:20:30,709 INFO  - Stopping TradingMvpBackend
+2026-04-10 00:20:30,711 DEBUG - ProcessKill 4476
+2026-04-10 00:20:30,737 DEBUG - Stopping process 4476...
+2026-04-10 00:20:31,291 DEBUG - Process 4476 canceled with code 0.
+2026-04-10 00:20:31,297 INFO  - Finished TradingMvpBackend
+2026-04-10 00:20:31,494 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:20:32,317 DEBUG - Starting WinSW in service mode
+2026-04-10 00:20:32,518 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-10 00:20:32,568 INFO  - Started process 20768
+2026-04-10 00:20:32,587 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-10 00:20:32,619 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-10 00:20:47,067 DEBUG - Starting WinSW in console mode
+2026-04-10 00:23:47,117 DEBUG - Starting WinSW in console mode
+2026-04-10 00:23:50,051 DEBUG - Starting WinSW in console mode
+2026-04-10 00:23:50,095 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:23:50,103 INFO  - Stopping TradingMvpBackend
+2026-04-10 00:23:50,104 DEBUG - ProcessKill 20768
+2026-04-10 00:23:50,119 DEBUG - Stopping process 20768...
+2026-04-10 00:23:50,490 DEBUG - Process 20768 canceled with code 0.
+2026-04-10 00:23:50,494 INFO  - Finished TradingMvpBackend
+2026-04-10 00:23:50,630 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:23:51,235 DEBUG - Starting WinSW in service mode
+2026-04-10 00:23:51,400 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-10 00:23:51,440 INFO  - Started process 19996
+2026-04-10 00:23:51,454 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-10 00:23:51,529 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-10 00:35:11,496 DEBUG - Starting WinSW in console mode
+2026-04-10 00:35:15,095 DEBUG - Starting WinSW in console mode
+2026-04-10 00:35:15,156 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:35:15,202 INFO  - Stopping TradingMvpBackend
+2026-04-10 00:35:15,203 DEBUG - ProcessKill 19996
+2026-04-10 00:35:15,221 DEBUG - Stopping process 19996...
+2026-04-10 00:35:15,728 DEBUG - Process 19996 canceled with code 0.
+2026-04-10 00:35:15,735 INFO  - Finished TradingMvpBackend
+2026-04-10 00:35:15,973 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:35:16,650 DEBUG - Starting WinSW in service mode
+2026-04-10 00:35:16,824 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-10 00:35:16,868 INFO  - Started process 23656
+2026-04-10 00:35:16,884 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-10 00:35:16,948 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-10 00:37:41,947 DEBUG - Starting WinSW in console mode
+2026-04-10 00:37:46,330 DEBUG - Starting WinSW in console mode
+2026-04-10 00:37:46,405 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:37:46,453 INFO  - Stopping TradingMvpBackend
+2026-04-10 00:37:46,454 DEBUG - ProcessKill 23656
+2026-04-10 00:37:46,477 DEBUG - Stopping process 23656...
+2026-04-10 00:37:46,914 DEBUG - Process 23656 canceled with code 0.
+2026-04-10 00:37:46,920 INFO  - Finished TradingMvpBackend
+2026-04-10 00:37:46,970 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 00:37:47,923 DEBUG - Starting WinSW in service mode
+2026-04-10 00:37:48,190 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-10 00:37:48,245 INFO  - Started process 15700
+2026-04-10 00:37:48,264 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-10 00:37:48,489 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-10 01:15:49,301 DEBUG - Starting WinSW in console mode
+2026-04-10 01:15:52,634 DEBUG - Starting WinSW in console mode
+2026-04-10 01:15:52,691 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 01:15:52,732 INFO  - Stopping TradingMvpBackend
+2026-04-10 01:15:52,733 DEBUG - ProcessKill 15700
+2026-04-10 01:15:52,749 DEBUG - Stopping process 15700...
+2026-04-10 01:15:53,148 DEBUG - Process 15700 canceled with code 0.
+2026-04-10 01:15:53,153 INFO  - Finished TradingMvpBackend
+2026-04-10 01:15:53,249 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-10 01:15:54,029 DEBUG - Starting WinSW in service mode
+2026-04-10 01:15:54,199 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-10 01:15:54,242 INFO  - Started process 20712
+2026-04-10 01:15:54,257 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-10 01:15:54,330 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' restarted successfully.
+2026-04-10 01:54:52,053 DEBUG - Starting WinSW in console mode
+2026-04-10 01:56:54,619 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpBackend.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-11 22:53:18,640 DEBUG - Starting WinSW in service mode
+2026-04-11 22:53:19,150 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-11 22:53:19,211 INFO  - Started process 8520
+2026-04-11 22:53:19,259 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-11 23:55:53,998 DEBUG - Starting WinSW in console mode
+2026-04-11 23:56:01,711 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpBackend.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-11 23:56:57,006 DEBUG - Starting WinSW in console mode
+2026-04-11 23:57:11,860 DEBUG - Starting WinSW in console mode
+2026-04-11 23:57:11,972 INFO  - Stopping service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-11 23:57:12,033 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' stopped successfully.
+2026-04-11 23:57:12,044 INFO  - Stopping TradingMvpBackend
+2026-04-11 23:57:12,087 DEBUG - Stopping process 8520...
+2026-04-11 23:57:12,873 DEBUG - Process 8520 canceled with code 0.
+2026-04-11 23:57:12,883 INFO  - Finished TradingMvpBackend
+2026-04-11 23:57:33,262 DEBUG - Starting WinSW in console mode
+2026-04-11 23:57:42,263 DEBUG - Starting WinSW in console mode
+2026-04-11 23:57:42,356 INFO  - Starting service 'Trading MVP Backend (TradingMvpBackend)'...
+2026-04-11 23:57:44,508 DEBUG - Starting WinSW in service mode
+2026-04-11 23:57:44,620 INFO  - Service 'Trading MVP Backend (TradingMvpBackend)' started successfully.
+2026-04-11 23:57:45,039 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_backend.ps1"
+2026-04-11 23:57:45,198 INFO  - Started process 24768
+2026-04-11 23:57:45,221 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender

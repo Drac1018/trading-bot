@@ -1,0 +1,74 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "role": {
+      "title": "Role",
+      "type": "string"
+    },
+    "trigger_event": {
+      "title": "Trigger Event",
+      "type": "string"
+    },
+    "schema_name": {
+      "title": "Schema Name",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "provider_name": {
+      "title": "Provider Name",
+      "type": "string"
+    },
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    },
+    "input_payload": {
+      "additionalProperties": true,
+      "title": "Input Payload",
+      "type": "object"
+    },
+    "output_payload": {
+      "additionalProperties": true,
+      "title": "Output Payload",
+      "type": "object"
+    },
+    "metadata_json": {
+      "additionalProperties": true,
+      "title": "Metadata Json",
+      "type": "object"
+    },
+    "schema_valid": {
+      "title": "Schema Valid",
+      "type": "boolean"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    },
+    "completed_at": {
+      "format": "date-time",
+      "title": "Completed At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "role",
+    "trigger_event",
+    "schema_name",
+    "status",
+    "provider_name",
+    "summary",
+    "input_payload",
+    "output_payload",
+    "metadata_json",
+    "schema_valid",
+    "started_at",
+    "completed_at"
+  ],
+  "title": "AgentRunRecord",
+  "type": "object"
+}

@@ -1,0 +1,296 @@
+{
+  "$defs": {
+    "AppliedChangeRecordResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        },
+        "related_backlog_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Related Backlog Id"
+        },
+        "related_backlog_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Related Backlog Title"
+        },
+        "source_type": {
+          "enum": [
+            "ai",
+            "user",
+            "manual"
+          ],
+          "title": "Source Type",
+          "type": "string"
+        },
+        "files_changed": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files Changed",
+          "type": "array"
+        },
+        "verification_summary": {
+          "title": "Verification Summary",
+          "type": "string"
+        },
+        "applied_at": {
+          "format": "date-time",
+          "title": "Applied At",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "summary",
+        "detail",
+        "source_type",
+        "files_changed",
+        "verification_summary",
+        "applied_at",
+        "created_at",
+        "updated_at"
+      ],
+      "title": "AppliedChangeRecordResponse",
+      "type": "object"
+    },
+    "UserChangeRequestResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "requested",
+            "accepted",
+            "applied",
+            "verified"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "linked_backlog_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Linked Backlog Id"
+        },
+        "linked_backlog_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Linked Backlog Title"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "detail",
+        "status",
+        "created_at",
+        "updated_at"
+      ],
+      "title": "UserChangeRequestResponse",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "integer"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "problem": {
+      "title": "Problem",
+      "type": "string"
+    },
+    "proposal": {
+      "title": "Proposal",
+      "type": "string"
+    },
+    "severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "effort": {
+      "enum": [
+        "small",
+        "medium",
+        "large"
+      ],
+      "title": "Effort",
+      "type": "string"
+    },
+    "impact": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Impact",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "rationale": {
+      "title": "Rationale",
+      "type": "string"
+    },
+    "source": {
+      "title": "Source",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "auto_apply_supported": {
+      "default": false,
+      "title": "Auto Apply Supported",
+      "type": "boolean"
+    },
+    "auto_apply_label": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Auto Apply Label"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "user_requests": {
+      "items": {
+        "$ref": "#/$defs/UserChangeRequestResponse"
+      },
+      "title": "User Requests",
+      "type": "array"
+    },
+    "applied_records": {
+      "items": {
+        "$ref": "#/$defs/AppliedChangeRecordResponse"
+      },
+      "title": "Applied Records",
+      "type": "array"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "problem",
+    "proposal",
+    "severity",
+    "effort",
+    "impact",
+    "priority",
+    "rationale",
+    "source",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "ProductBacklogDetailResponse",
+  "type": "object"
+}

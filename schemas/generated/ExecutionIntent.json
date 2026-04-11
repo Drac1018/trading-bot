@@ -1,0 +1,84 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "symbol": {
+      "title": "Symbol",
+      "type": "string"
+    },
+    "action": {
+      "enum": [
+        "long",
+        "short",
+        "reduce",
+        "exit"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "quantity": {
+      "exclusiveMinimum": 0.0,
+      "title": "Quantity",
+      "type": "number"
+    },
+    "requested_price": {
+      "exclusiveMinimum": 0.0,
+      "title": "Requested Price",
+      "type": "number"
+    },
+    "stop_loss": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stop Loss"
+    },
+    "take_profit": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Take Profit"
+    },
+    "leverage": {
+      "exclusiveMinimum": 0.0,
+      "maximum": 10.0,
+      "title": "Leverage",
+      "type": "number"
+    },
+    "mode": {
+      "const": "live",
+      "title": "Mode",
+      "type": "string"
+    },
+    "reduce_only": {
+      "default": false,
+      "title": "Reduce Only",
+      "type": "boolean"
+    },
+    "close_only": {
+      "default": false,
+      "title": "Close Only",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "symbol",
+    "action",
+    "quantity",
+    "requested_price",
+    "leverage",
+    "mode"
+  ],
+  "title": "ExecutionIntent",
+  "type": "object"
+}

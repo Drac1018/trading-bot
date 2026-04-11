@@ -1,0 +1,17 @@
+﻿<service>
+  <id>TradingMvpWorker</id>
+  <name>Trading MVP Worker</name>
+  <description>RQ worker for trading jobs</description>
+  <executable>powershell.exe</executable>
+  <arguments>-NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_worker.ps1"</arguments>
+  <workingdirectory>C:\my-trading-bot</workingdirectory>
+  <stoptimeout>15 sec</stoptimeout>
+  <resetfailure>1 hour</resetfailure>
+  <onfailure action="restart" delay="10 sec" />
+  <logpath>C:\my-trading-bot\.logs\\services\\worker</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10240</sizeThreshold>
+    <pattern>yyyyMMdd</pattern>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>

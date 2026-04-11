@@ -1,0 +1,133 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "decision": {
+      "enum": [
+        "hold",
+        "long",
+        "short",
+        "reduce",
+        "exit"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "confidence": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "symbol": {
+      "maxLength": 30,
+      "minLength": 1,
+      "title": "Symbol",
+      "type": "string"
+    },
+    "timeframe": {
+      "maxLength": 20,
+      "minLength": 1,
+      "title": "Timeframe",
+      "type": "string"
+    },
+    "entry_zone_min": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Entry Zone Min"
+    },
+    "entry_zone_max": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Entry Zone Max"
+    },
+    "stop_loss": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stop Loss"
+    },
+    "take_profit": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Take Profit"
+    },
+    "max_holding_minutes": {
+      "maximum": 10080,
+      "minimum": 1,
+      "title": "Max Holding Minutes",
+      "type": "integer"
+    },
+    "risk_pct": {
+      "exclusiveMinimum": 0.0,
+      "maximum": 1.0,
+      "title": "Risk Pct",
+      "type": "number"
+    },
+    "leverage": {
+      "exclusiveMinimum": 0.0,
+      "maximum": 10.0,
+      "title": "Leverage",
+      "type": "number"
+    },
+    "rationale_codes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Rationale Codes",
+      "type": "array"
+    },
+    "explanation_short": {
+      "maxLength": 240,
+      "minLength": 3,
+      "title": "Explanation Short",
+      "type": "string"
+    },
+    "explanation_detailed": {
+      "maxLength": 600,
+      "minLength": 10,
+      "title": "Explanation Detailed",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision",
+    "confidence",
+    "symbol",
+    "timeframe",
+    "max_holding_minutes",
+    "risk_pct",
+    "leverage",
+    "rationale_codes",
+    "explanation_short",
+    "explanation_detailed"
+  ],
+  "title": "TradeDecision",
+  "type": "object"
+}

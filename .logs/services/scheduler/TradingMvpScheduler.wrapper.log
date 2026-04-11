@@ -1,0 +1,231 @@
+2026-04-08 19:12:49,913 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:52,899 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:52,940 INFO  - Installing service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:12:53,031 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was installed successfully.
+2026-04-08 19:12:53,807 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:56,138 DEBUG - Starting WinSW in console mode
+2026-04-08 19:12:56,183 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:12:56,815 DEBUG - Starting WinSW in service mode
+2026-04-08 19:12:56,848 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-08 19:12:56,986 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-08 19:12:57,035 INFO  - Started process 20112
+2026-04-08 19:12:57,053 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:17:34,995 DEBUG - Starting WinSW in console mode
+2026-04-08 19:17:41,307 DEBUG - Starting WinSW in console mode
+2026-04-08 19:17:41,434 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:17:41,592 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' has already stopped.
+2026-04-08 19:17:45,035 DEBUG - Starting WinSW in console mode
+2026-04-08 19:17:48,750 DEBUG - Starting WinSW in console mode
+2026-04-08 19:17:48,823 INFO  - Uninstalling service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:17:48,909 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was uninstalled successfully.
+2026-04-08 19:17:50,211 DEBUG - Starting WinSW in console mode
+2026-04-08 19:17:54,205 DEBUG - Starting WinSW in console mode
+2026-04-08 19:17:54,269 INFO  - Installing service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:17:54,401 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was installed successfully.
+2026-04-08 19:17:55,986 DEBUG - Starting WinSW in console mode
+2026-04-08 19:18:00,754 DEBUG - Starting WinSW in console mode
+2026-04-08 19:18:00,875 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:18:02,557 DEBUG - Starting WinSW in service mode
+2026-04-08 19:18:02,635 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-08 19:18:02,967 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-08 19:18:03,047 INFO  - Started process 19856
+2026-04-08 19:18:03,068 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:36:41,308 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:44,030 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:44,082 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:36:44,130 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' stopped successfully.
+2026-04-08 19:36:44,131 INFO  - Stopping TradingMvpScheduler
+2026-04-08 19:36:44,132 DEBUG - ProcessKill 19856
+2026-04-08 19:36:44,152 DEBUG - Stopping process 19856...
+2026-04-08 19:36:44,339 DEBUG - Process 19856 canceled with code 0.
+2026-04-08 19:36:44,342 INFO  - Finished TradingMvpScheduler
+2026-04-08 19:36:46,882 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:49,560 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:49,606 INFO  - Uninstalling service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:36:49,660 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was uninstalled successfully.
+2026-04-08 19:36:50,415 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:53,383 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:53,430 INFO  - Installing service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:36:53,512 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was installed successfully.
+2026-04-08 19:36:54,351 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:57,301 DEBUG - Starting WinSW in console mode
+2026-04-08 19:36:57,351 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:36:58,063 DEBUG - Starting WinSW in service mode
+2026-04-08 19:36:58,099 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-08 19:36:58,258 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-08 19:36:58,314 INFO  - Started process 18856
+2026-04-08 19:36:58,334 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 19:40:58,581 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:00,565 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:00,624 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:41:00,670 INFO  - Stopping TradingMvpScheduler
+2026-04-08 19:41:00,668 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' stopped successfully.
+2026-04-08 19:41:00,671 DEBUG - ProcessKill 18856
+2026-04-08 19:41:00,689 DEBUG - Stopping process 18856...
+2026-04-08 19:41:00,871 DEBUG - Process 18856 canceled with code 0.
+2026-04-08 19:41:00,876 INFO  - Finished TradingMvpScheduler
+2026-04-08 19:41:03,378 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:05,533 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:05,585 INFO  - Uninstalling service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:41:05,633 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was uninstalled successfully.
+2026-04-08 19:41:06,390 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:08,341 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:08,396 INFO  - Installing service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:41:08,496 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was installed successfully.
+2026-04-08 19:41:09,501 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:11,535 DEBUG - Starting WinSW in console mode
+2026-04-08 19:41:11,588 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 19:41:12,410 DEBUG - Starting WinSW in service mode
+2026-04-08 19:41:12,449 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-08 19:41:12,648 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-08 19:41:12,743 INFO  - Started process 23388
+2026-04-08 19:41:12,763 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-08 23:55:09,188 DEBUG - Starting WinSW in console mode
+2026-04-08 23:55:11,801 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-08 23:58:10,373 DEBUG - Starting WinSW in console mode
+2026-04-08 23:58:12,838 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-08 23:58:31,941 DEBUG - Starting WinSW in console mode
+2026-04-08 23:58:36,719 DEBUG - Starting WinSW in console mode
+2026-04-08 23:58:36,832 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-08 23:58:37,984 DEBUG - Starting WinSW in service mode
+2026-04-08 23:58:38,027 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-08 23:58:38,291 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-08 23:58:38,367 INFO  - Started process 16020
+2026-04-08 23:58:38,388 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:07:50,193 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:52,756 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:52,823 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:07:52,884 INFO  - Stopping TradingMvpScheduler
+2026-04-09 00:07:52,882 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' stopped successfully.
+2026-04-09 00:07:52,885 DEBUG - ProcessKill 16020
+2026-04-09 00:07:52,906 DEBUG - Stopping process 16020...
+2026-04-09 00:07:53,118 DEBUG - Process 16020 canceled with code 0.
+2026-04-09 00:07:53,122 INFO  - Finished TradingMvpScheduler
+2026-04-09 00:07:55,620 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:58,326 DEBUG - Starting WinSW in console mode
+2026-04-09 00:07:58,375 INFO  - Uninstalling service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:07:58,425 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was uninstalled successfully.
+2026-04-09 00:07:59,123 DEBUG - Starting WinSW in console mode
+2026-04-09 00:08:01,478 DEBUG - Starting WinSW in console mode
+2026-04-09 00:08:01,523 INFO  - Installing service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:08:01,563 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' was installed successfully.
+2026-04-09 00:08:02,283 DEBUG - Starting WinSW in console mode
+2026-04-09 00:08:04,652 DEBUG - Starting WinSW in console mode
+2026-04-09 00:08:04,695 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:08:05,317 DEBUG - Starting WinSW in service mode
+2026-04-09 00:08:05,350 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-09 00:08:05,490 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-09 00:08:05,531 INFO  - Started process 14536
+2026-04-09 00:08:05,544 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:37:06,222 DEBUG - Starting WinSW in console mode
+2026-04-09 00:37:09,427 DEBUG - Starting WinSW in console mode
+2026-04-09 00:37:09,479 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:37:09,489 INFO  - Stopping TradingMvpScheduler
+2026-04-09 00:37:09,490 DEBUG - ProcessKill 14536
+2026-04-09 00:37:09,510 DEBUG - Stopping process 14536...
+2026-04-09 00:37:09,895 DEBUG - Process 14536 canceled with code 0.
+2026-04-09 00:37:09,928 INFO  - Finished TradingMvpScheduler
+2026-04-09 00:37:10,019 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:37:10,955 DEBUG - Starting WinSW in service mode
+2026-04-09 00:37:11,147 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-09 00:37:11,197 INFO  - Started process 24696
+2026-04-09 00:37:11,214 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 00:37:11,256 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' restarted successfully.
+2026-04-09 00:52:10,670 DEBUG - Starting WinSW in console mode
+2026-04-09 00:52:15,395 DEBUG - Starting WinSW in console mode
+2026-04-09 00:52:15,444 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:52:15,501 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' stopped successfully.
+2026-04-09 00:52:15,502 INFO  - Stopping TradingMvpScheduler
+2026-04-09 00:52:15,503 DEBUG - ProcessKill 24696
+2026-04-09 00:52:15,531 DEBUG - Stopping process 24696...
+2026-04-09 00:52:16,055 DEBUG - Process 24696 canceled with code 0.
+2026-04-09 00:52:16,118 INFO  - Finished TradingMvpScheduler
+2026-04-09 00:52:46,079 DEBUG - Starting WinSW in console mode
+2026-04-09 00:55:40,654 DEBUG - Starting WinSW in console mode
+2026-04-09 00:55:44,569 DEBUG - Starting WinSW in console mode
+2026-04-09 00:55:44,634 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 00:55:45,564 DEBUG - Starting WinSW in service mode
+2026-04-09 00:55:45,616 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' started successfully.
+2026-04-09 00:55:45,924 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-09 00:55:46,044 INFO  - Started process 2512
+2026-04-09 00:55:46,075 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 01:02:19,972 DEBUG - Starting WinSW in console mode
+2026-04-09 01:02:20,427 DEBUG - Starting WinSW in console mode
+2026-04-09 01:02:23,750 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 01:02:23,746 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 01:02:43,428 DEBUG - Starting WinSW in console mode
+2026-04-09 01:03:08,745 DEBUG - Starting WinSW in console mode
+2026-04-09 01:03:13,397 DEBUG - Starting WinSW in console mode
+2026-04-09 01:03:13,479 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 01:03:13,548 INFO  - Stopping TradingMvpScheduler
+2026-04-09 01:03:13,550 DEBUG - ProcessKill 2512
+2026-04-09 01:03:13,579 DEBUG - Stopping process 2512...
+2026-04-09 01:03:13,963 DEBUG - Process 2512 canceled with code 0.
+2026-04-09 01:03:13,970 INFO  - Finished TradingMvpScheduler
+2026-04-09 01:03:14,092 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 01:03:15,048 DEBUG - Starting WinSW in service mode
+2026-04-09 01:03:15,462 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-09 01:03:15,552 INFO  - Started process 29208
+2026-04-09 01:03:15,573 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 01:03:15,644 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' restarted successfully.
+2026-04-09 01:18:45,741 DEBUG - Starting WinSW in console mode
+2026-04-09 01:19:03,916 DEBUG - Starting WinSW in console mode
+2026-04-09 01:19:36,744 DEBUG - Starting WinSW in console mode
+2026-04-09 01:19:47,426 DEBUG - Starting WinSW in console mode
+2026-04-09 01:20:40,572 DEBUG - Starting WinSW in console mode
+2026-04-09 01:21:06,702 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 01:23:10,816 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 01:23:10,821 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-09 22:45:17,738 DEBUG - Starting WinSW in console mode
+2026-04-09 22:45:20,548 DEBUG - Starting WinSW in console mode
+2026-04-09 22:45:20,609 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 22:45:20,640 INFO  - Stopping TradingMvpScheduler
+2026-04-09 22:45:20,645 DEBUG - ProcessKill 29208
+2026-04-09 22:45:20,674 DEBUG - Stopping process 29208...
+2026-04-09 22:45:21,480 DEBUG - Process 29208 canceled with code 0.
+2026-04-09 22:45:21,487 INFO  - Finished TradingMvpScheduler
+2026-04-09 22:45:21,682 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 22:45:22,452 DEBUG - Starting WinSW in service mode
+2026-04-09 22:45:22,666 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-09 22:45:22,726 INFO  - Started process 30104
+2026-04-09 22:45:22,745 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 22:45:22,771 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' restarted successfully.
+2026-04-09 22:54:37,019 DEBUG - Starting WinSW in console mode
+2026-04-09 22:54:41,905 DEBUG - Starting WinSW in console mode
+2026-04-09 22:54:41,955 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 22:54:41,964 INFO  - Stopping TradingMvpScheduler
+2026-04-09 22:54:41,965 DEBUG - ProcessKill 30104
+2026-04-09 22:54:41,982 DEBUG - Stopping process 30104...
+2026-04-09 22:54:42,207 DEBUG - Process 30104 canceled with code 0.
+2026-04-09 22:54:42,212 INFO  - Finished TradingMvpScheduler
+2026-04-09 22:54:42,230 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-09 22:54:42,987 DEBUG - Starting WinSW in service mode
+2026-04-09 22:54:43,211 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-09 22:54:43,273 INFO  - Started process 3816
+2026-04-09 22:54:43,294 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-09 22:54:43,541 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' restarted successfully.
+2026-04-10 00:20:26,533 DEBUG - Starting WinSW in console mode
+2026-04-10 00:20:28,872 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-10 00:20:47,538 DEBUG - Starting WinSW in console mode
+2026-04-10 00:24:02,459 DEBUG - Starting WinSW in console mode
+2026-04-10 00:24:05,422 DEBUG - Starting WinSW in console mode
+2026-04-10 00:24:05,474 INFO  - Stopping service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-10 00:24:05,496 INFO  - Stopping TradingMvpScheduler
+2026-04-10 00:24:05,497 DEBUG - ProcessKill 3816
+2026-04-10 00:24:05,518 DEBUG - Stopping process 3816...
+2026-04-10 00:24:05,847 DEBUG - Process 3816 canceled with code 0.
+2026-04-10 00:24:05,852 INFO  - Finished TradingMvpScheduler
+2026-04-10 00:24:06,017 INFO  - Starting service 'Trading MVP Scheduler (TradingMvpScheduler)'...
+2026-04-10 00:24:07,095 DEBUG - Starting WinSW in service mode
+2026-04-10 00:24:07,303 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-10 00:24:07,347 INFO  - Started process 24632
+2026-04-10 00:24:07,361 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender
+2026-04-10 00:24:07,395 INFO  - Service 'Trading MVP Scheduler (TradingMvpScheduler)' restarted successfully.
+2026-04-10 01:57:22,090 DEBUG - Starting WinSW in console mode
+2026-04-10 01:59:24,641 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-10 02:02:45,367 DEBUG - Starting WinSW in console mode
+2026-04-10 02:04:47,937 FATAL - An error occurred trying to start process 'C:\my-trading-bot\.services\TradingMvpScheduler.exe' with working directory 'C:\my-trading-bot'. 사용자가 작업을 취소했습니다.
+2026-04-11 22:53:18,433 DEBUG - Starting WinSW in service mode
+2026-04-11 22:53:18,903 INFO  - Starting powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_scheduler.ps1"
+2026-04-11 22:53:18,959 INFO  - Started process 8244
+2026-04-11 22:53:18,981 DEBUG - Forwarding logs of the process System.Diagnostics.Process (powershell) to WinSW.RollingSizeTimeLogAppender

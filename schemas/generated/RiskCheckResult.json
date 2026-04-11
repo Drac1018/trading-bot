@@ -1,0 +1,58 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "allowed": {
+      "title": "Allowed",
+      "type": "boolean"
+    },
+    "decision": {
+      "enum": [
+        "hold",
+        "long",
+        "short",
+        "reduce",
+        "exit"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "reason_codes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Reason Codes",
+      "type": "array"
+    },
+    "approved_risk_pct": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Approved Risk Pct",
+      "type": "number"
+    },
+    "approved_leverage": {
+      "maximum": 10.0,
+      "minimum": 0.0,
+      "title": "Approved Leverage",
+      "type": "number"
+    },
+    "operating_mode": {
+      "enum": [
+        "live",
+        "paused",
+        "hold"
+      ],
+      "title": "Operating Mode",
+      "type": "string"
+    }
+  },
+  "required": [
+    "allowed",
+    "decision",
+    "reason_codes",
+    "approved_risk_pct",
+    "approved_leverage",
+    "operating_mode"
+  ],
+  "title": "RiskCheckResult",
+  "type": "object"
+}

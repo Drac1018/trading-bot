@@ -1,0 +1,17 @@
+﻿<service>
+  <id>TradingMvpFrontend</id>
+  <name>Trading MVP Frontend</name>
+  <description>Next.js frontend for the trading MVP</description>
+  <executable>powershell.exe</executable>
+  <arguments>-NoProfile -ExecutionPolicy Bypass -File "C:\my-trading-bot\scripts\\run_frontend_service.ps1"</arguments>
+  <workingdirectory>C:\my-trading-bot</workingdirectory>
+  <stoptimeout>15 sec</stoptimeout>
+  <resetfailure>1 hour</resetfailure>
+  <onfailure action="restart" delay="10 sec" />
+  <logpath>C:\my-trading-bot\.logs\\services\\frontend</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10240</sizeThreshold>
+    <pattern>yyyyMMdd</pattern>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>

@@ -1,0 +1,103 @@
+Lockfile is up to date, resolution step is skipped
+Already up to date
+
+╭ Warning ─────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│   Ignored build scripts: sharp@0.34.5.                                       │
+│   Run "pnpm approve-builds" to pick which dependencies should be allowed     │
+│   to run scripts.                                                            │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Done in 757ms using pnpm v10.33.0
+▲ Next.js 16.2.2 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://0.0.0.0:3000
+✓ Ready in 723ms
+
+ GET / 500 in 650ms (next.js: 290ms, application-code: 360ms)
+ GET / 500 in 103ms (next.js: 5ms, application-code: 98ms)
+ GET / 500 in 80ms (next.js: 5ms, application-code: 75ms)
+ GET / 500 in 86ms (next.js: 3ms, application-code: 82ms)
+ GET / 500 in 89ms (next.js: 4ms, application-code: 85ms)
+ GET / 500 in 105ms (next.js: 7ms, application-code: 98ms)
+ GET / 500 in 83ms (next.js: 3ms, application-code: 79ms)
+ GET / 500 in 76ms (next.js: 4ms, application-code: 72ms)
+ GET / 500 in 211ms (next.js: 9ms, application-code: 202ms)
+ GET / 500 in 138ms (next.js: 9ms, application-code: 130ms)
+ GET / 500 in 99ms (next.js: 6ms, application-code: 93ms)
+ GET / 500 in 75ms (next.js: 6ms, application-code: 69ms)
+ GET / 500 in 107ms (next.js: 7ms, application-code: 100ms)
+ GET / 500 in 72ms (next.js: 5ms, application-code: 67ms)
+ GET / 500 in 87ms (next.js: 5ms, application-code: 81ms)
+ GET /? 500 in 77ms (next.js: 7ms, application-code: 70ms)
+ GET / 500 in 91ms (next.js: 3ms, application-code: 88ms)
+ GET / 500 in 75ms (next.js: 4ms, application-code: 71ms)
+ GET / 500 in 73ms (next.js: 3ms, application-code: 70ms)
+ GET / 500 in 83ms (next.js: 4ms, application-code: 80ms)
+ GET / 500 in 110ms (next.js: 6ms, application-code: 104ms)
+ GET / 500 in 81ms (next.js: 8ms, application-code: 73ms)
+ GET / 500 in 144ms (next.js: 7ms, application-code: 137ms)
+ GET / 500 in 95ms (next.js: 4ms, application-code: 92ms)
+ GET / 500 in 110ms (next.js: 4ms, application-code: 107ms)
+ GET / 500 in 83ms (next.js: 3ms, application-code: 80ms)
+ GET / 500 in 142ms (next.js: 8ms, application-code: 135ms)
+ GET / 500 in 80ms (next.js: 4ms, application-code: 76ms)
+ GET / 500 in 104ms (next.js: 5ms, application-code: 99ms)
+ GET / 500 in 81ms (next.js: 5ms, application-code: 77ms)
+ GET / 500 in 90ms (next.js: 4ms, application-code: 86ms)
+ GET / 500 in 94ms (next.js: 4ms, application-code: 91ms)
+ GET / 500 in 141ms (next.js: 10ms, application-code: 131ms)
+ GET / 500 in 73ms (next.js: 3ms, application-code: 70ms)
+ GET / 500 in 77ms (next.js: 3ms, application-code: 74ms)
+ GET / 500 in 79ms (next.js: 4ms, application-code: 75ms)
+ GET / 500 in 153ms (next.js: 12ms, application-code: 141ms)
+ GET / 500 in 77ms (next.js: 4ms, application-code: 74ms)
+ GET / 500 in 72ms (next.js: 3ms, application-code: 69ms)
+ GET / 500 in 68ms (next.js: 3ms, application-code: 64ms)
+ GET / 500 in 89ms (next.js: 5ms, application-code: 84ms)
+ GET / 500 in 68ms (next.js: 3ms, application-code: 65ms)
+ GET / 500 in 67ms (next.js: 3ms, application-code: 64ms)
+ GET / 500 in 68ms (next.js: 4ms, application-code: 64ms)
+ GET / 500 in 110ms (next.js: 8ms, application-code: 102ms)
+ GET / 500 in 90ms (next.js: 5ms, application-code: 85ms)
+ GET / 500 in 85ms (next.js: 3ms, application-code: 82ms)
+ GET / 500 in 73ms (next.js: 4ms, application-code: 70ms)
+ GET / 500 in 75ms (next.js: 3ms, application-code: 71ms)
+ GET / 500 in 82ms (next.js: 6ms, application-code: 76ms)
+ GET / 500 in 70ms (next.js: 4ms, application-code: 66ms)
+ GET / 500 in 70ms (next.js: 4ms, application-code: 66ms)
+ GET / 500 in 76ms (next.js: 5ms, application-code: 71ms)
+ GET / 500 in 74ms (next.js: 5ms, application-code: 69ms)
+ GET / 500 in 76ms (next.js: 3ms, application-code: 73ms)
+ GET / 500 in 81ms (next.js: 3ms, application-code: 77ms)
+ GET / 500 in 120ms (next.js: 5ms, application-code: 115ms)
+ GET / 500 in 333ms (next.js: 19ms, application-code: 314ms)
+ GET / 500 in 88ms (next.js: 4ms, application-code: 85ms)
+ GET / 500 in 96ms (next.js: 4ms, application-code: 92ms)
+ GET / 200 in 1256ms (next.js: 12ms, application-code: 1243ms)
+ GET /? 200 in 706ms (next.js: 4ms, application-code: 701ms)
+ GET /dashboard/market 200 in 1982ms (next.js: 761ms, application-code: 1221ms)
+ GET /dashboard/decisions 200 in 1110ms (next.js: 20ms, application-code: 1089ms)
+ GET /dashboard/positions 200 in 101ms (next.js: 25ms, application-code: 76ms)
+ GET /dashboard/orders 200 in 433ms (next.js: 15ms, application-code: 417ms)
+ GET / 200 in 447ms (next.js: 4ms, application-code: 443ms)
+ GET /dashboard/settings 200 in 102ms (next.js: 18ms, application-code: 85ms)
+ GET /dashboard/backlog 200 in 103ms (next.js: 16ms, application-code: 87ms)
+ GET /dashboard/settings 200 in 75ms (next.js: 15ms, application-code: 60ms)
+ GET /dashboard/audit 200 in 786ms (next.js: 16ms, application-code: 769ms)
+ GET /dashboard/scheduler 200 in 105ms (next.js: 21ms, application-code: 84ms)
+ GET /dashboard/agents 200 in 1262ms (next.js: 16ms, application-code: 1246ms)
+ GET /dashboard/risk 200 in 407ms (next.js: 17ms, application-code: 390ms)
+ GET /dashboard/orders 200 in 424ms (next.js: 17ms, application-code: 407ms)
+ GET /dashboard/positions 200 in 63ms (next.js: 15ms, application-code: 47ms)
+ GET /dashboard/positions 200 in 25ms (next.js: 16ms, application-code: 10ms)
+ GET /dashboard/positions 200 in 51ms (next.js: 3ms, application-code: 48ms)
+ GET /dashboard/decisions 200 in 828ms (next.js: 4ms, application-code: 823ms)
+ GET /dashboard/decisions 200 in 26ms (next.js: 17ms, application-code: 9ms)
+ GET /dashboard/decisions 200 in 1007ms (next.js: 4ms, application-code: 1003ms)
+ GET /dashboard/risk 200 in 418ms (next.js: 22ms, application-code: 396ms)
+✓ Compiled in 140ms
+✓ Compiled in 53ms
+✓ Compiled in 50ms
+✓ Compiled in 100ms
+✓ Compiled in 47ms

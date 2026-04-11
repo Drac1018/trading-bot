@@ -1,0 +1,48 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "schedule_window": {
+      "title": "Schedule Window",
+      "type": "string"
+    },
+    "workflow": {
+      "title": "Workflow",
+      "type": "string"
+    },
+    "status": {
+      "title": "Status",
+      "type": "string"
+    },
+    "triggered_by": {
+      "title": "Triggered By",
+      "type": "string"
+    },
+    "next_run_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Next Run At"
+    },
+    "outcome": {
+      "additionalProperties": true,
+      "title": "Outcome",
+      "type": "object"
+    }
+  },
+  "required": [
+    "schedule_window",
+    "workflow",
+    "status",
+    "triggered_by",
+    "outcome"
+  ],
+  "title": "SchedulerRunRecord",
+  "type": "object"
+}
