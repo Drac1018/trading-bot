@@ -7,7 +7,17 @@ from sqlalchemy.orm import Session
 from trading_mvp.config import get_settings
 from trading_mvp.models import RiskCheck, Setting
 from trading_mvp.schemas import MarketSnapshotPayload, RiskCheckResult, TradeDecision
-from trading_mvp.services.account import get_latest_pnl_snapshot, get_open_positions
+from trading_mvp.services.account import (
+    get_latest_pnl_snapshot,
+    get_open_position,
+    get_open_positions,
+)
+from trading_mvp.services.runtime_state import (
+    DEGRADED_MANAGE_ONLY_STATE,
+    EMERGENCY_EXIT_STATE,
+    PROTECTION_REQUIRED_STATE,
+    get_operating_state,
+)
 from trading_mvp.services.settings import get_runtime_credentials, is_live_execution_armed
 
 HARD_MAX_GLOBAL_LEVERAGE = 5.0
@@ -51,6 +61,10 @@ def _effective_leverage_cap(settings_row: Setting, symbol: str) -> float:
 
 def _position_notional(quantity: float, price: float) -> float:
     return abs(quantity) * max(price, 0.0)
+
+
+def _decision_matches_position_side(position_side: str, decision: str) -> bool:
+    return (position_side == "long" and decision == "long") or (position_side == "short" and decision == "short")
 
 
 def _build_exposure_metrics(session: Session, decision_symbol: str, equity: float) -> dict[str, float]:
@@ -110,7 +124,17 @@ def evaluate_risk(
     defaults = get_settings()
     live_requested = settings_row.live_trading_enabled
     operating_mode: Literal["live", "paused", "hold"] = "live"
-    is_entry_decision = decision.decision in {"long", "short"}
+    operating_state = get_operating_state(settings_row)
+    existing_position = get_open_position(session, decision.symbol)
+    is_protection_recovery = bool(
+        existing_position is not None
+        and operating_state in {PROTECTION_REQUIRED_STATE, DEGRADED_MANAGE_ONLY_STATE}
+        and decision.decision in {"long", "short"}
+        and _decision_matches_position_side(existing_position.side, decision.decision)
+        and decision.stop_loss is not None
+        and decision.take_profit is not None
+    )
+    is_entry_decision = decision.decision in {"long", "short"} and not is_protection_recovery
     latest_pnl = get_latest_pnl_snapshot(session, settings_row)
     credentials = get_runtime_credentials(settings_row)
     symbol_risk_tier = get_symbol_risk_tier(decision.symbol)
@@ -122,6 +146,12 @@ def evaluate_risk(
     if settings_row.trading_paused and is_entry_decision:
         reason_codes.append("TRADING_PAUSED")
         operating_mode = "paused"
+    if operating_state == PROTECTION_REQUIRED_STATE and is_entry_decision:
+        reason_codes.append(PROTECTION_REQUIRED_STATE)
+    if operating_state == DEGRADED_MANAGE_ONLY_STATE and is_entry_decision:
+        reason_codes.append(DEGRADED_MANAGE_ONLY_STATE)
+    if operating_state == EMERGENCY_EXIT_STATE and is_entry_decision:
+        reason_codes.append(EMERGENCY_EXIT_STATE)
     if market_snapshot.is_stale and is_entry_decision:
         reason_codes.append("STALE_MARKET_DATA")
     if not market_snapshot.is_complete and is_entry_decision:
@@ -137,13 +167,16 @@ def evaluate_risk(
     if is_entry_decision and (decision.stop_loss is None or decision.take_profit is None):
         reason_codes.append("MISSING_STOP_OR_TARGET")
 
-    entry = _entry_price(decision, market_snapshot)
+    if is_protection_recovery and existing_position is not None:
+        entry = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price
+    else:
+        entry = _entry_price(decision, market_snapshot)
     if decision.decision == "long" and decision.stop_loss is not None and decision.take_profit is not None:
         if decision.stop_loss >= entry or decision.take_profit <= entry:
-            reason_codes.append("INVALID_LONG_BRACKETS")
+            reason_codes.append("INVALID_PROTECTION_BRACKETS" if is_protection_recovery else "INVALID_LONG_BRACKETS")
     if decision.decision == "short" and decision.stop_loss is not None and decision.take_profit is not None:
         if decision.stop_loss <= entry or decision.take_profit >= entry:
-            reason_codes.append("INVALID_SHORT_BRACKETS")
+            reason_codes.append("INVALID_PROTECTION_BRACKETS" if is_protection_recovery else "INVALID_SHORT_BRACKETS")
 
     slippage = abs(entry - market_snapshot.latest_price) / max(market_snapshot.latest_price, 1.0)
     if slippage > settings_row.slippage_threshold_pct and is_entry_decision:
@@ -172,6 +205,7 @@ def evaluate_risk(
         approved_risk_pct=decision.risk_pct if allowed else 0.0,
         approved_leverage=min(decision.leverage, effective_leverage_cap) if allowed else 0.0,
         operating_mode=operating_mode if not allowed else "live",
+        operating_state=operating_state,
         effective_leverage_cap=effective_leverage_cap,
         symbol_risk_tier=symbol_risk_tier,
         exposure_metrics=exposure_metrics,

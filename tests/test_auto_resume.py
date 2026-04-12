@@ -461,7 +461,29 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(tmp_path, monkeypatch) 
 
     def fake_sync(db, settings_row, symbol=None):
         call_order.append("sync")
-        return {"symbols": ["BTCUSDT"], "synced_orders": 0, "synced_positions": 0, "equity": 100.0}
+        return {
+            "symbols": ["BTCUSDT"],
+            "synced_orders": 0,
+            "synced_positions": 0,
+            "equity": 100.0,
+            "operating_state": "PROTECTION_REQUIRED",
+            "protection_recovery_status": "recreating",
+            "protection_recovery_active": True,
+            "missing_protection_symbols": ["BTCUSDT"],
+            "missing_protection_items": {"BTCUSDT": ["stop_loss"]},
+            "symbol_protection_state": {
+                "BTCUSDT": {
+                    "status": "missing",
+                    "protected": False,
+                    "protective_order_count": 0,
+                    "has_stop_loss": False,
+                    "has_take_profit": True,
+                    "missing_components": ["stop_loss"],
+                }
+            },
+            "unprotected_positions": ["BTCUSDT"],
+            "emergency_actions_taken": [],
+        }
 
     monkeypatch.setattr("trading_mvp.main.attempt_auto_resume", fake_attempt)
     monkeypatch.setattr("trading_mvp.main.sync_live_state", fake_sync)
@@ -487,6 +509,9 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(tmp_path, monkeypatch) 
             payload = response.json()
             assert payload["auto_resume_precheck"]["trigger_source"] == "api_live_sync_precheck"
             assert payload["auto_resume_postcheck"]["trigger_source"] == "api_live_sync_postcheck"
+            assert payload["operating_state"] == "PROTECTION_REQUIRED"
+            assert payload["protection_recovery_status"] == "recreating"
+            assert payload["missing_protection_items"] == {"BTCUSDT": ["stop_loss"]}
             assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
     finally:
         app.dependency_overrides.clear()

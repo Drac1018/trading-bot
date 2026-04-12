@@ -14,6 +14,7 @@ import httpx
 from trading_mvp.schemas import MarketCandle
 
 JsonDict = dict[str, Any]
+ALGO_ORDER_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "TRAILING_STOP_MARKET"}
 
 
 class BinanceAPIError(RuntimeError):
@@ -137,6 +138,27 @@ class BinanceClient:
         if not isinstance(payload, Mapping):
             raise RuntimeError(message)
         return dict(payload)
+
+    @staticmethod
+    def _is_algo_order_type(order_type: str) -> bool:
+        return order_type.upper() in ALGO_ORDER_TYPES
+
+    @staticmethod
+    def _normalize_algo_order_payload(payload: Mapping[str, object]) -> JsonDict:
+        result = dict(payload)
+        if "algoId" in result and "orderId" not in result:
+            result["orderId"] = result["algoId"]
+        if "clientAlgoId" in result and "clientOrderId" not in result:
+            result["clientOrderId"] = result["clientAlgoId"]
+        if "algoStatus" in result and "status" not in result:
+            result["status"] = result["algoStatus"]
+        if "orderType" in result and "type" not in result:
+            result["type"] = result["orderType"]
+        if "triggerPrice" in result and "stopPrice" not in result:
+            result["stopPrice"] = result["triggerPrice"]
+        if "quantity" in result and "origQty" not in result:
+            result["origQty"] = result["quantity"]
+        return result
 
     def ping(self) -> dict[str, object]:
         payload = self._request("GET", "/fapi/v1/ping")
@@ -298,6 +320,32 @@ class BinanceClient:
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
     ) -> dict[str, object]:
+        if self.futures_enabled and self._is_algo_order_type(order_type):
+            algo_params: dict[str, str | int | float | bool] = {
+                "algoType": "CONDITIONAL",
+                "symbol": symbol.upper(),
+                "side": side,
+                "type": order_type,
+                "newOrderRespType": response_type,
+                "workingType": working_type,
+            }
+            if quantity is not None and not close_position:
+                algo_params["quantity"] = quantity
+            if price is not None:
+                algo_params["price"] = price
+            if stop_price is not None:
+                algo_params["triggerPrice"] = stop_price
+            if reduce_only and not close_position:
+                algo_params["reduceOnly"] = "true"
+            if close_position:
+                algo_params["closePosition"] = "true"
+            if client_order_id:
+                algo_params["clientAlgoId"] = client_order_id
+            payload = self._request("POST", "/fapi/v1/algoOrder", params=algo_params, signed=True, retryable=False)
+            return self._normalize_algo_order_payload(
+                self._as_dict(payload, "Unexpected Binance new algo order response.")
+            )
+
         params: dict[str, str | int | float | bool] = {
             "symbol": symbol.upper(),
             "side": side,
@@ -319,6 +367,36 @@ class BinanceClient:
             params["newClientOrderId"] = client_order_id
         payload = self._request("POST", "/fapi/v1/order", params=params, signed=True, retryable=False)
         return self._as_dict(payload, "Unexpected Binance new order response.")
+
+    def get_algo_order(
+        self,
+        *,
+        algo_id: str | None = None,
+        client_algo_id: str | None = None,
+    ) -> dict[str, object]:
+        params: dict[str, str] = {}
+        if algo_id:
+            params["algoId"] = algo_id
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        payload = self._request("GET", "/fapi/v1/algoOrder", params=params, signed=True)
+        return self._normalize_algo_order_payload(
+            self._as_dict(payload, "Unexpected Binance algo order response.")
+        )
+
+    def get_open_algo_orders(
+        self,
+        symbol: str | None = None,
+    ) -> list[dict[str, object]]:
+        params = {"symbol": symbol.upper()} if symbol else None
+        payload = self._request("GET", "/fapi/v1/openAlgoOrders", params=params, signed=True)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected Binance open algo orders response.")
+        return [
+            self._normalize_algo_order_payload(cast(Mapping[str, object], item))
+            for item in payload
+            if isinstance(item, Mapping)
+        ]
 
     def test_new_order(
         self,
@@ -351,6 +429,22 @@ class BinanceClient:
         payload = self._request("DELETE", "/fapi/v1/order", params=params, signed=True, retryable=False)
         return self._as_dict(payload, "Unexpected Binance cancel order response.")
 
+    def cancel_algo_order(
+        self,
+        *,
+        algo_id: str | None = None,
+        client_algo_id: str | None = None,
+    ) -> dict[str, object]:
+        params: dict[str, str] = {}
+        if algo_id:
+            params["algoId"] = algo_id
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        payload = self._request("DELETE", "/fapi/v1/algoOrder", params=params, signed=True, retryable=False)
+        return self._normalize_algo_order_payload(
+            self._as_dict(payload, "Unexpected Binance cancel algo order response.")
+        )
+
     def cancel_all_open_orders(self, symbol: str) -> dict[str, object]:
         payload = self._request(
             "DELETE",
@@ -381,7 +475,10 @@ class BinanceClient:
         payload = self._request("GET", "/fapi/v1/openOrders", params=params, signed=True)
         if not isinstance(payload, list):
             raise RuntimeError("Unexpected Binance open orders response.")
-        return [dict(cast(Mapping[str, object], item)) for item in payload if isinstance(item, Mapping)]
+        orders = [dict(cast(Mapping[str, object], item)) for item in payload if isinstance(item, Mapping)]
+        if self.futures_enabled:
+            orders.extend(self.get_open_algo_orders(symbol))
+        return orders
 
     def get_account_trades(
         self,

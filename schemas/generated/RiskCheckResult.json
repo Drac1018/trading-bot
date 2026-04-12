@@ -44,6 +44,11 @@
       "title": "Operating Mode",
       "type": "string"
     },
+    "operating_state": {
+      "default": "TRADABLE",
+      "title": "Operating State",
+      "type": "string"
+    },
     "effective_leverage_cap": {
       "exclusiveMinimum": 0.0,
       "maximum": 10.0,

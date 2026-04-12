@@ -219,3 +219,123 @@ def test_timestamp_error_resyncs_for_signed_post(monkeypatch) -> None:
 
     assert payload["orderId"] == 0
     assert len(captured_order_timestamps) == 2
+
+
+def test_new_order_routes_protective_types_to_algo_endpoint(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "algoId": "algo-1",
+                "clientAlgoId": "algo-client-1",
+                "algoStatus": "NEW",
+                "orderType": "STOP_MARKET",
+                "triggerPrice": "69000",
+                "quantity": "0.01",
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def request(self, method, path, params=None, headers=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["params"] = dict(params or {})
+            captured["headers"] = dict(headers or {})
+            return FakeResponse()
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    payload = BinanceClient(api_key="key", api_secret="secret").new_order(
+        symbol="BTCUSDT",
+        side="SELL",
+        order_type="STOP_MARKET",
+        stop_price=69000.0,
+        close_position=True,
+        client_order_id="algo-client-1",
+        response_type="ACK",
+    )
+
+    assert captured["path"] == "/fapi/v1/algoOrder"
+    assert captured["params"]["algoType"] == "CONDITIONAL"
+    assert captured["params"]["triggerPrice"] == 69000.0
+    assert captured["params"]["closePosition"] == "true"
+    assert "stopPrice" not in captured["params"]
+    assert captured["params"]["clientAlgoId"] == "algo-client-1"
+    assert payload["orderId"] == "algo-1"
+    assert payload["clientOrderId"] == "algo-client-1"
+    assert payload["status"] == "NEW"
+    assert payload["type"] == "STOP_MARKET"
+    assert payload["stopPrice"] == "69000"
+
+
+def test_get_open_orders_includes_open_algo_orders(monkeypatch) -> None:
+    requested_paths: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            if self.path == "/fapi/v1/openOrders":
+                return [
+                    {
+                        "orderId": "spot-1",
+                        "clientOrderId": "spot-client-1",
+                        "status": "NEW",
+                        "type": "LIMIT",
+                    }
+                ]
+            if self.path == "/fapi/v1/openAlgoOrders":
+                return [
+                    {
+                        "algoId": "algo-2",
+                        "clientAlgoId": "algo-client-2",
+                        "algoStatus": "NEW",
+                        "orderType": "TAKE_PROFIT_MARKET",
+                        "triggerPrice": "72000",
+                        "quantity": "0.01",
+                    }
+                ]
+            return {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def request(self, method, path, params=None, headers=None):
+            requested_paths.append(path)
+            return FakeResponse(path)
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    payload = BinanceClient(api_key="key", api_secret="secret").get_open_orders("BTCUSDT")
+
+    assert requested_paths == ["/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders"]
+    assert len(payload) == 2
+    assert payload[0]["orderId"] == "spot-1"
+    assert payload[1]["orderId"] == "algo-2"
+    assert payload[1]["clientOrderId"] == "algo-client-2"
+    assert payload[1]["type"] == "TAKE_PROFIT_MARKET"
+    assert payload[1]["status"] == "NEW"
+    assert payload[1]["stopPrice"] == "72000"

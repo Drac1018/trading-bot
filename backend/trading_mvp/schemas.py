@@ -216,6 +216,7 @@ class RiskCheckResult(StrictBaseModel):
     approved_risk_pct: float = Field(ge=0.0, le=1.0)
     approved_leverage: float = Field(ge=0.0, le=10.0)
     operating_mode: Literal["live", "paused", "hold"]
+    operating_state: str = "TRADABLE"
     effective_leverage_cap: float = Field(gt=0.0, le=10.0)
     symbol_risk_tier: Literal["btc", "major_alt", "alt"]
     exposure_metrics: dict[str, float] = Field(default_factory=dict)
@@ -313,6 +314,12 @@ class OverviewResponse(StrictBaseModel):
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
     pause_severity: str | None = None
     pause_recovery_class: str | None = None
+    operating_state: str = "TRADABLE"
+    protection_recovery_status: str = "idle"
+    protection_recovery_active: bool = False
+    protection_recovery_failure_count: int = 0
+    missing_protection_symbols: list[str] = Field(default_factory=list)
+    missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
     daily_pnl: float
     cumulative_pnl: float
     blocked_reasons: list[str]
@@ -352,6 +359,12 @@ class AppSettingsResponse(StrictBaseModel):
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
     pause_severity: str | None = None
     pause_recovery_class: str | None = None
+    operating_state: str = "TRADABLE"
+    protection_recovery_status: str = "idle"
+    protection_recovery_active: bool = False
+    protection_recovery_failure_count: int = 0
+    missing_protection_symbols: list[str] = Field(default_factory=list)
+    missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str

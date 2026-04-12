@@ -20,6 +20,7 @@ from trading_mvp.models import (
     SchedulerRun,
 )
 from trading_mvp.schemas import OverviewResponse
+from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
 from trading_mvp.services.settings import (
     get_effective_symbols,
     get_or_create_settings,
@@ -78,9 +79,41 @@ def _build_position_protection_state(session: Session, position: Position) -> di
     }
 
 
+def _as_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in {None, ""}]
+
+
+def _as_missing_items(value: object) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): _as_string_list(item)
+        for key, item in value.items()
+        if isinstance(item, list)
+    }
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
 def get_overview(session: Session) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
     settings_payload = serialize_settings(settings_row)
+    runtime_state = summarize_runtime_state(settings_row)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
     latest_decision = session.scalar(select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1))
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
@@ -89,10 +122,19 @@ def get_overview(session: Session) -> OverviewResponse:
     protection_summary = [_build_position_protection_state(session, position) for position in open_positions]
     protected_positions = sum(1 for item in protection_summary if bool(item["protected"]))
     unprotected_positions = len(protection_summary) - protected_positions
+    missing_protection_items: dict[str, list[str]] = {
+        str(item["symbol"]): _as_string_list(item["missing_components"])
+        for item in protection_summary
+        if _as_string_list(item["missing_components"])
+    }
+    missing_protection_symbols = list(missing_protection_items)
+    operating_state = str(settings_payload.get("operating_state") or runtime_state["operating_state"])
+    if not settings_row.trading_paused and unprotected_positions > 0:
+        operating_state = PROTECTION_REQUIRED_STATE
     blocked_reasons = latest_risk.reason_codes if latest_risk is not None and not latest_risk.allowed else []
-    auto_resume_last_blockers = settings_payload.get("auto_resume_last_blockers", [])
-    if not isinstance(auto_resume_last_blockers, list):
-        auto_resume_last_blockers = []
+    auto_resume_last_blockers = _as_string_list(settings_payload.get("auto_resume_last_blockers", []))
+    serialized_missing_symbols = _as_string_list(settings_payload.get("missing_protection_symbols", []))
+    runtime_missing_items = _as_missing_items(runtime_state["missing_protection_items"])
     return OverviewResponse(
         mode=str(settings_payload["mode"]),
         symbol=settings_row.default_symbol,
@@ -111,9 +153,23 @@ def get_overview(session: Session) -> OverviewResponse:
         auto_resume_after=settings_row.auto_resume_after,
         auto_resume_status=str(settings_payload.get("auto_resume_status") or "not_paused"),
         auto_resume_eligible=bool(settings_payload.get("auto_resume_eligible", False)),
-        auto_resume_last_blockers=[str(item) for item in auto_resume_last_blockers],
+        auto_resume_last_blockers=auto_resume_last_blockers,
         pause_severity=str(settings_payload.get("pause_severity") or "") or None,
         pause_recovery_class=str(settings_payload.get("pause_recovery_class") or "") or None,
+        operating_state=operating_state,
+        protection_recovery_status=str(settings_payload.get("protection_recovery_status") or runtime_state["protection_recovery_status"]),
+        protection_recovery_active=bool(settings_payload.get("protection_recovery_active", runtime_state["protection_recovery_active"])),
+        protection_recovery_failure_count=_as_int(
+            settings_payload.get(
+                "protection_recovery_failure_count",
+                runtime_state["protection_recovery_failure_count"],
+            ),
+            default=0,
+        ),
+        missing_protection_symbols=missing_protection_symbols
+        or serialized_missing_symbols,
+        missing_protection_items=missing_protection_items
+        or runtime_missing_items,
         daily_pnl=latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
         cumulative_pnl=latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
         blocked_reasons=blocked_reasons,

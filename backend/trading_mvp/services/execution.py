@@ -23,6 +23,20 @@ from trading_mvp.services.account import (
 )
 from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
+from trading_mvp.services.pause_control import (
+    clear_symbol_protection_state,
+    mark_manage_only_state,
+    set_symbol_protection_state,
+)
+from trading_mvp.services.runtime_state import (
+    DEGRADED_MANAGE_ONLY_STATE,
+    EMERGENCY_EXIT_STATE,
+    PROTECTION_RECOVERY_THRESHOLD,
+    PROTECTION_REQUIRED_STATE,
+    TRADABLE_STATE,
+    get_operating_state,
+    get_protection_recovery_detail,
+)
 from trading_mvp.services.settings import (
     get_effective_symbols,
     get_runtime_credentials,
@@ -162,12 +176,25 @@ def _calculate_quantity(entry_price: float, stop_loss: float | None, equity: flo
     return round(min(risk_budget / per_unit_risk, max_notional_quantity), 6)
 
 
-def _classify_execution_intent(decision: TradeDecision, existing_position: Position | None) -> str:
+def _decision_matches_position_side(decision: TradeDecision, existing_position: Position | None) -> bool:
+    if existing_position is None:
+        return False
+    target_side = "long" if decision.decision == "long" else "short"
+    return existing_position.side == target_side
+
+
+def _classify_execution_intent(
+    decision: TradeDecision,
+    existing_position: Position | None,
+    *,
+    operating_state: str,
+) -> str:
     if decision.decision in {"reduce", "exit"}:
         return "reduce_only"
-    if existing_position is not None:
-        target_side = "long" if decision.decision == "long" else "short"
-        if existing_position.side == target_side:
+    if existing_position is not None and _decision_matches_position_side(decision, existing_position):
+        if operating_state in {PROTECTION_REQUIRED_STATE, DEGRADED_MANAGE_ONLY_STATE}:
+            return "protection"
+        if existing_position.side in {"long", "short"}:
             return "scale_in"
     return "entry"
 
@@ -207,6 +234,130 @@ def _build_protection_state(position: Position | None, open_orders: list[dict[st
     }
 
 
+def _get_string_list(payload: dict[str, object], key: str) -> list[str]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in {None, ""}]
+
+
+def _protective_bucket(order_payload: dict[str, object]) -> str | None:
+    order_type = str(order_payload.get("type", "")).upper()
+    if order_type.startswith("STOP"):
+        return "stop_loss"
+    if order_type.startswith("TAKE_PROFIT"):
+        return "take_profit"
+    return None
+
+
+def _is_protective_order_type_name(order_type: str | None) -> bool:
+    if not order_type:
+        return False
+    normalized = order_type.upper()
+    return normalized.startswith("STOP") or normalized.startswith("TAKE_PROFIT")
+
+
+def _is_algo_order_payload(order_payload: dict[str, object]) -> bool:
+    if _is_protective_order(order_payload):
+        return True
+    return any(key in order_payload for key in ("algoId", "clientAlgoId"))
+
+
+def _fetch_exchange_order(
+    client: BinanceClient,
+    *,
+    symbol: str,
+    order_type: str | None,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+) -> dict[str, object]:
+    if _is_protective_order_type_name(order_type) and hasattr(client, "get_algo_order"):
+        try:
+            return client.get_algo_order(algo_id=order_id, client_algo_id=client_order_id)  # type: ignore[attr-defined]
+        except Exception:
+            if not hasattr(client, "get_order"):
+                raise
+    return client.get_order(symbol=symbol, order_id=order_id, client_order_id=client_order_id)
+
+
+def _cancel_exchange_order(
+    client: BinanceClient,
+    *,
+    symbol: str,
+    order_payload: dict[str, object] | None = None,
+    order_type: str | None = None,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+) -> dict[str, object]:
+    payload = order_payload or {}
+    remote_order_id = order_id or str(payload.get("orderId", "")) or None
+    remote_client_order_id = client_order_id or str(payload.get("clientOrderId", "")) or None
+    effective_order_type = order_type or str(payload.get("type", "") or "")
+    if (_is_algo_order_payload(payload) or _is_protective_order_type_name(effective_order_type)) and hasattr(
+        client,
+        "cancel_algo_order",
+    ):
+        try:
+            return client.cancel_algo_order(  # type: ignore[attr-defined]
+                algo_id=remote_order_id,
+                client_algo_id=remote_client_order_id,
+            )
+        except Exception:
+            if not hasattr(client, "cancel_order"):
+                raise
+    return client.cancel_order(
+        symbol=symbol,
+        order_id=remote_order_id,
+        client_order_id=remote_client_order_id,
+    )
+
+
+def _cancel_duplicate_protective_orders(
+    session: Session,
+    client: BinanceClient,
+    *,
+    symbol: str,
+    open_orders: list[dict[str, object]],
+    preferred_order_ids: list[int] | None = None,
+) -> None:
+    preferred = {str(item) for item in (preferred_order_ids or [])}
+    orders_by_bucket: dict[str, list[dict[str, object]]] = {"stop_loss": [], "take_profit": []}
+    for item in open_orders:
+        bucket = _protective_bucket(item)
+        if bucket is None:
+            continue
+        orders_by_bucket[bucket].append(item)
+
+    for _bucket, items in orders_by_bucket.items():
+        if len(items) <= 1:
+            continue
+        keep_item = next((item for item in items if str(item.get("orderId", "")) in preferred), items[0])
+        keep_order_id = str(keep_item.get("orderId", ""))
+        for item in items:
+            order_id = str(item.get("orderId", ""))
+            if order_id == keep_order_id:
+                continue
+            client_order_id = str(item.get("clientOrderId", ""))
+            _cancel_exchange_order(
+                client,
+                symbol=symbol,
+                order_payload=item,
+                order_id=order_id or None,
+                client_order_id=client_order_id or None,
+            )
+            local = None
+            if order_id:
+                local = session.scalar(select(Order).where(Order.external_order_id == order_id).limit(1))
+            if local is None and client_order_id:
+                local = session.scalar(select(Order).where(Order.client_order_id == client_order_id).limit(1))
+            if local is not None:
+                local.status = "canceled"
+                local.exchange_status = "CANCELED"
+                local.last_exchange_update_at = utcnow_naive()
+                session.add(local)
+    session.flush()
+
+
 def _has_valid_protection_template(position: Position | None, stop_loss: float | None, take_profit: float | None) -> bool:
     if position is None or stop_loss is None or take_profit is None:
         return False
@@ -225,16 +376,23 @@ def build_execution_intent(
     settings_row: Setting,
     equity: float,
     existing_position: Position | None = None,
+    operating_state: str = TRADABLE_STATE,
 ) -> ExecutionIntent:
     entry_price = _entry_price(decision, market_snapshot)
-    intent_type = _classify_execution_intent(decision, existing_position)
-    quantity = _calculate_quantity(
-        entry_price=entry_price,
-        stop_loss=decision.stop_loss,
-        equity=equity,
-        risk_pct=risk_result.approved_risk_pct,
-        leverage=risk_result.approved_leverage,
-    )
+    intent_type = _classify_execution_intent(decision, existing_position, operating_state=operating_state)
+    if intent_type == "protection" and existing_position is not None:
+        quantity = max(existing_position.quantity, 0.0001)
+        entry_price = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price
+        leverage = existing_position.leverage if existing_position.leverage > 0 else min(risk_result.approved_leverage, settings_row.max_leverage)
+    else:
+        quantity = _calculate_quantity(
+            entry_price=entry_price,
+            stop_loss=decision.stop_loss,
+            equity=equity,
+            risk_pct=risk_result.approved_risk_pct,
+            leverage=risk_result.approved_leverage,
+        )
+        leverage = min(risk_result.approved_leverage, settings_row.max_leverage)
     return ExecutionIntent(
         symbol=decision.symbol,
         action=decision.decision,  # type: ignore[arg-type]
@@ -243,7 +401,7 @@ def build_execution_intent(
         requested_price=entry_price,
         stop_loss=decision.stop_loss,
         take_profit=decision.take_profit,
-        leverage=min(risk_result.approved_leverage, settings_row.max_leverage),
+        leverage=leverage,
         mode="live",
         reduce_only=decision.decision in {"reduce", "exit"},
         close_only=decision.decision == "exit",
@@ -437,7 +595,12 @@ def _safe_submit_order(
             response_type=response_type,
         )
     except (httpx.TimeoutException, httpx.TransportError):
-        response = client.get_order(symbol=symbol, client_order_id=client_order_id)
+        response = _fetch_exchange_order(
+            client,
+            symbol=symbol,
+            order_type=order_type,
+            client_order_id=client_order_id,
+        )
     return client_order_id, response
 
 
@@ -529,10 +692,18 @@ def _cancel_exit_orders(session: Session, client: BinanceClient, symbol: str) ->
             continue
         external_order_id = str(item.get("orderId", ""))
         client_order_id = str(item.get("clientOrderId", ""))
-        client.cancel_order(symbol=symbol, order_id=external_order_id or None, client_order_id=client_order_id or None)
+        _cancel_exchange_order(
+            client,
+            symbol=symbol,
+            order_payload=item,
+            order_id=external_order_id or None,
+            client_order_id=client_order_id or None,
+        )
         local = None
         if external_order_id:
             local = session.scalar(select(Order).where(Order.external_order_id == external_order_id).limit(1))
+        if local is None and client_order_id:
+            local = session.scalar(select(Order).where(Order.client_order_id == client_order_id).limit(1))
         if local is not None:
             local.status = "canceled"
             local.exchange_status = "CANCELED"
@@ -552,15 +723,20 @@ def _create_protective_orders(
     take_profit: float | None,
     parent_order: Order | None,
     position: Position | None,
+    existing_open_orders: list[dict[str, object]] | None = None,
 ) -> list[int]:
     if position is None or stop_loss is None or take_profit is None:
         return []
     exit_side = "SELL" if position.side == "long" else "BUY"
     created_ids: list[int] = []
-    for order_type, stop_price in (
-        ("STOP_MARKET", client.normalize_price(symbol, stop_loss)),
-        ("TAKE_PROFIT_MARKET", client.normalize_price(symbol, take_profit)),
-    ):
+    current_state = _build_protection_state(position, existing_open_orders or [])
+    missing_components = _get_string_list(current_state, "missing_components")
+    requested_orders: list[tuple[str, float]] = []
+    if "stop_loss" in missing_components:
+        requested_orders.append(("STOP_MARKET", client.normalize_price(symbol, stop_loss)))
+    if "take_profit" in missing_components:
+        requested_orders.append(("TAKE_PROFIT_MARKET", client.normalize_price(symbol, take_profit)))
+    for order_type, stop_price in requested_orders:
         client_order_id, exchange_order = _safe_submit_order(
             client,
             symbol=symbol,
@@ -602,22 +778,31 @@ def _pause_for_protection_failure(
     detail: str,
     emergency_result: dict[str, object] | None = None,
 ) -> None:
-    set_trading_pause(
-        session,
-        True,
-        reason_code=reason_code,
-        reason_detail={
-            "symbol": symbol,
-            "detail": detail,
-            "position_size": position.quantity if position is not None else 0.0,
-            "protective_state": protective_state,
-            "emergency_result": emergency_result or {},
-        },
-        pause_origin="system",
+    emergency_completed = bool(
+        emergency_result is not None
+        and emergency_result.get("status") == "completed"
+        and _to_float(emergency_result.get("remaining_position"), 0.0) <= 0.0
     )
+    if emergency_completed:
+        clear_symbol_protection_state(
+            session,
+            settings_row,
+            symbol=symbol,
+            trigger_source=f"protection_failure:{reason_code}:recovered_flat",
+        )
+    else:
+        mark_manage_only_state(
+            session,
+            settings_row,
+            symbol=symbol,
+            trigger_source=f"protection_failure:{reason_code}",
+            missing_components=_get_string_list(protective_state, "missing_components"),
+            last_error=detail,
+            emergency_action=emergency_result or None,
+        )
     payload = {
         "reason_code": reason_code,
-        "pause_origin": "system",
+        "operating_state": TRADABLE_STATE if emergency_completed else DEGRADED_MANAGE_ONLY_STATE,
         "symbol": symbol,
         "position_size": position.quantity if position is not None else 0.0,
         "protective_state": protective_state,
@@ -626,11 +811,11 @@ def _pause_for_protection_failure(
     }
     record_audit_event(
         session,
-        event_type="trading_paused",
+        event_type="protection_manage_only_enabled",
         entity_type="settings",
         entity_id=str(settings_row.id),
         severity="critical",
-        message="Trading paused because an unprotected live position was detected.",
+        message="Trading entry was blocked and management-only mode was enabled after a protection failure.",
         payload=payload,
     )
     create_alert(
@@ -664,6 +849,17 @@ def _emergency_close_position(
     if position is None or position.status != "open" or position.quantity <= 0:
         return {"status": "skipped", "reason": "NO_OPEN_POSITION"}
 
+    set_symbol_protection_state(
+        session,
+        settings_row,
+        symbol=symbol,
+        state=EMERGENCY_EXIT_STATE,
+        trigger_source=reason,
+        missing_components=_get_string_list(protection_state, "missing_components"),
+        auto_recovery_active=False,
+        recovery_status="emergency_exit",
+        last_error=None,
+    )
     side = "SELL" if position.side == "long" else "BUY"
     reference_price = position.mark_price if position.mark_price > 0 else position.entry_price
     quantity = client.normalize_order_quantity(
@@ -722,6 +918,12 @@ def _emergency_close_position(
         remaining_position = get_open_position(session, symbol)
         if remaining_position is None:
             _cancel_exit_orders(session, client, symbol)
+            clear_symbol_protection_state(
+                session,
+                settings_row,
+                symbol=symbol,
+                trigger_source=f"{reason}:flat_after_emergency_exit",
+            )
         payload = {
             **trigger_payload,
             "order_id": order.id,
@@ -796,6 +998,21 @@ def _ensure_protected_position(
     open_orders = client.get_open_orders(symbol)
     protection_state = _build_protection_state(position, open_orders)
     if protection_state["status"] == "protected":
+        clear_symbol_protection_state(
+            session,
+            settings_row,
+            symbol=symbol,
+            trigger_source=f"{trigger_source}:already_protected",
+        )
+        record_audit_event(
+            session,
+            event_type="protection_recovery_succeeded",
+            entity_type="position",
+            entity_id=str(position.id if position is not None else symbol),
+            severity="info",
+            message="Protective order verification confirmed exchange-resident protection.",
+            payload={"symbol": symbol, "trigger_source": trigger_source, "protective_state": protection_state},
+        )
         return {
             "status": "protected",
             "protection_state": protection_state,
@@ -803,6 +1020,21 @@ def _ensure_protected_position(
             "emergency_action": None,
         }
 
+    failure_detail = get_protection_recovery_detail(settings_row)
+    failure_count = int(
+        dict(failure_detail.get("symbol_states", {})).get(symbol, {}).get("failure_count", 0) or 0
+    )
+    set_symbol_protection_state(
+        session,
+        settings_row,
+        symbol=symbol,
+        state=PROTECTION_REQUIRED_STATE,
+        trigger_source=trigger_source,
+        missing_components=_get_string_list(protection_state, "missing_components"),
+        auto_recovery_active=True,
+        recovery_status="recreating",
+        last_error=None,
+    )
     record_audit_event(
         session,
         event_type="unprotected_position_detected",
@@ -863,11 +1095,40 @@ def _ensure_protected_position(
                         take_profit=take_profit,
                         parent_order=parent_order,
                         position=position,
+                        existing_open_orders=open_orders,
                     )
+                )
+                open_orders = client.get_open_orders(symbol)
+                _cancel_duplicate_protective_orders(
+                    session,
+                    client,
+                    symbol=symbol,
+                    open_orders=open_orders,
+                    preferred_order_ids=created_order_ids,
                 )
                 open_orders = client.get_open_orders(symbol)
                 protection_state = _build_protection_state(position, open_orders)
                 if protection_state["status"] == "protected":
+                    clear_symbol_protection_state(
+                        session,
+                        settings_row,
+                        symbol=symbol,
+                        trigger_source=f"{trigger_source}:protected_recreated",
+                    )
+                    record_audit_event(
+                        session,
+                        event_type="protection_recovery_succeeded",
+                        entity_type="position",
+                        entity_id=position_entity_id,
+                        severity="info",
+                        message="Protective orders were recreated and verified on the exchange.",
+                        payload={
+                            "symbol": symbol,
+                            "trigger_source": trigger_source,
+                            "created_order_ids": created_order_ids,
+                            "protective_state": protection_state,
+                        },
+                    )
                     return {
                         "status": "protected_recreated",
                         "protection_state": protection_state,
@@ -893,6 +1154,17 @@ def _ensure_protected_position(
     else:
         recreate_error = "Local stop loss / take profit template was unavailable."
 
+    next_failure_count = failure_count + 1
+    if next_failure_count >= PROTECTION_RECOVERY_THRESHOLD:
+        mark_manage_only_state(
+            session,
+            settings_row,
+            symbol=symbol,
+            trigger_source=f"{trigger_source}:recovery_failed",
+            missing_components=_get_string_list(protection_state, "missing_components"),
+            last_error=recreate_error or "Protective order recovery failed.",
+        )
+
     emergency_result = _emergency_close_position(
         session,
         settings_row,
@@ -912,6 +1184,16 @@ def _ensure_protected_position(
         detail=recreate_error or "Protective orders were missing and emergency exit was triggered.",
         emergency_result=emergency_result,
     )
+    if emergency_result.get("status") != "completed":
+        mark_manage_only_state(
+            session,
+            settings_row,
+            symbol=symbol,
+            trigger_source=f"{trigger_source}:emergency_failed",
+            missing_components=_get_string_list(protection_state, "missing_components"),
+            last_error=recreate_error or "Emergency exit failed after protective recovery failure.",
+            emergency_action=emergency_result,
+        )
     return {
         "status": "emergency_exit",
         "protection_state": protection_state,
@@ -940,8 +1222,10 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
             if not order.external_order_id and not order.client_order_id:
                 continue
             try:
-                exchange_order = client.get_order(
+                exchange_order = _fetch_exchange_order(
                     symbol=order.symbol,
+                    client=client,
+                    order_type=order.order_type,
                     order_id=order.external_order_id,
                     client_order_id=order.client_order_id,
                 )
@@ -967,6 +1251,9 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
             if avg_price > 0:
                 order.average_fill_price = avg_price
             session.add(order)
+            if _is_protective_order_type_name(order.order_type):
+                synced_orders += 1
+                continue
             try:
                 trades = client.get_account_trades(symbol=order.symbol, order_id=order.external_order_id)
             except Exception as exc:
@@ -1045,6 +1332,13 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                         "result": protection_result["emergency_action"],
                     }
                 )
+        else:
+            clear_symbol_protection_state(
+                session,
+                settings_row,
+                symbol=item_symbol,
+                trigger_source="sync_live_state:protected_or_flat",
+            )
         synced_positions += 1
     latest_prices = {
         item_symbol: position.mark_price
@@ -1070,6 +1364,7 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         )
         raise RuntimeError(f"{reason_code}: {exc}") from exc
     pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, account_info)
+    runtime_state = get_protection_recovery_detail(settings_row)
     return {
         "symbols": symbols,
         "synced_orders": synced_orders,
@@ -1078,6 +1373,15 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         "symbol_protection_state": symbol_protection_state,
         "unprotected_positions": unprotected_positions,
         "emergency_actions_taken": emergency_actions_taken,
+        "operating_state": get_operating_state(settings_row),
+        "protection_recovery_status": str(runtime_state.get("status", "idle")),
+        "protection_recovery_active": bool(runtime_state.get("auto_recovery_active", False)),
+        "missing_protection_symbols": [str(item) for item in runtime_state.get("missing_symbols", []) if item],
+        "missing_protection_items": {
+            str(key): [str(item) for item in value]
+            for key, value in runtime_state.get("missing_items", {}).items()
+            if isinstance(value, list)
+        },
     }
 
 
@@ -1199,6 +1503,7 @@ def execute_live_trade(
         return {"status": "error", "reason_codes": [reason_code], "error": str(exc)}
 
     existing_position = get_open_position(session, decision.symbol)
+    operating_state = get_operating_state(settings_row)
     intent = build_execution_intent(
         decision,
         market_snapshot,
@@ -1206,6 +1511,7 @@ def execute_live_trade(
         settings_row,
         live_balances["sizing_equity"] if live_balances["sizing_equity"] > 0 else latest_pnl.equity,
         existing_position=existing_position,
+        operating_state=operating_state,
     )
     intent_type = intent.intent_type
     pre_trade_protection = _build_protection_state(existing_position, open_orders)
@@ -1222,6 +1528,45 @@ def execute_live_trade(
                 payload={"symbol": decision.symbol, "existing_side": existing_position.side, "target_side": target_side},
             )
             return {"status": "rejected", "reason_codes": ["OPPOSITE_LIVE_POSITION_OPEN"], "intent_type": intent_type}
+
+    if intent_type == "protection":
+        if existing_position is None:
+            return {"status": "rejected", "reason_codes": ["NO_OPEN_POSITION"], "intent_type": intent_type}
+        protection_recovery_result = _ensure_protected_position(
+            session,
+            settings_row,
+            client,
+            symbol=decision.symbol,
+            position=existing_position,
+            stop_loss=intent.stop_loss or existing_position.stop_loss,
+            take_profit=intent.take_profit or existing_position.take_profit,
+            decision_run_id=decision_run_id,
+            risk_row=risk_row,
+            parent_order=None,
+            trigger_source="execute_live_trade:protection",
+            pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+        )
+        record_audit_event(
+            session,
+            event_type="protection_recovery_processed",
+            entity_type="position",
+            entity_id=str(existing_position.id),
+            severity="info" if protection_recovery_result["status"] != "emergency_exit" else "critical",
+            message="Protection recovery intent processed.",
+            payload={
+                "symbol": decision.symbol,
+                "intent_type": intent_type,
+                "decision": decision.model_dump(mode="json"),
+                "protection_result": protection_recovery_result,
+            },
+        )
+        return {
+            "status": protection_recovery_result["status"],
+            "intent_type": intent_type,
+            "protective_state": protection_recovery_result["protection_state"],
+            "protective_order_ids": protection_recovery_result.get("created_order_ids", []),
+            "emergency_action": protection_recovery_result.get("emergency_action"),
+        }
 
     if intent_type == "entry" and existing_position is None:
         _cancel_exit_orders(session, client, decision.symbol)

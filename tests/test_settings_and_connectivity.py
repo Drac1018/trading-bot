@@ -280,6 +280,10 @@ def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> 
     assert serialized["auto_resume_last_blockers"] == ["MISSING_PROTECTIVE_ORDERS"]
     assert serialized["pause_severity"] == "warning"
     assert serialized["pause_recovery_class"] == "recoverable_system"
+    assert serialized["operating_state"] == "PAUSED"
+    assert serialized["protection_recovery_status"] == "idle"
+    assert serialized["missing_protection_symbols"] == []
+    assert serialized["missing_protection_items"] == {}
 
 
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:
@@ -316,5 +320,27 @@ def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> No
             ).all()
             assert ("trading_paused", "Global trading pause enabled.") in events
             assert ("trading_resumed", "Global trading pause cleared.") in events
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_health_endpoint_uses_lifespan_startup(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'lifespan_health.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["status"] == "ok"
+            assert payload["database"] == "ready"
     finally:
         app.dependency_overrides.clear()

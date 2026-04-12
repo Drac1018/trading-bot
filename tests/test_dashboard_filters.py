@@ -151,6 +151,7 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
 
     assert overview.open_positions == 1
     assert overview.unprotected_positions == 1
+    assert overview.operating_state == "PAUSED"
     assert overview.trading_paused is True
     assert overview.pause_reason_code == "PROTECTIVE_ORDER_FAILURE"
     assert overview.pause_origin == "system"
@@ -158,6 +159,10 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
     assert overview.auto_resume_last_blockers == ["MISSING_PROTECTIVE_ORDERS"]
     assert overview.pause_severity == "critical"
     assert overview.pause_recovery_class == "portfolio_unsafe"
+    assert overview.protection_recovery_status == "idle"
+    assert overview.protection_recovery_active is False
+    assert overview.missing_protection_symbols == ["BTCUSDT"]
+    assert overview.missing_protection_items == {"BTCUSDT": ["take_profit"]}
     assert overview.position_protection_summary[0]["symbol"] == "BTCUSDT"
     assert overview.position_protection_summary[0]["missing_components"] == ["take_profit"]
     assert positions[0]["protected"] is False

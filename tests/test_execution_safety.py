@@ -3,11 +3,15 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sqlalchemy import select
-from trading_mvp.models import AuditEvent, Position
+from trading_mvp.models import AuditEvent, Order, Position
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
-from trading_mvp.services.execution import execute_live_trade, sync_live_state
+from trading_mvp.services.execution import _cancel_exit_orders, execute_live_trade, sync_live_state
 from trading_mvp.services.secret_store import encrypt_secret
-from trading_mvp.services.settings import get_or_create_settings, set_trading_pause
+from trading_mvp.services.settings import (
+    get_or_create_settings,
+    serialize_settings,
+    set_trading_pause,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -294,6 +298,108 @@ class ScaleInClient(ExitWhilePausedClient):
         return [{"id": "trade-404", "price": "70080", "qty": "0.01", "commission": "0.05", "commissionAsset": "USDT", "realizedPnl": "0.0"}]
 
 
+class ProtectionFailureManageOnlyClient(ProtectionFailureClient):
+    def new_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        stop_price: float | None = None,
+        reduce_only: bool = False,
+        close_position: bool = False,
+        client_order_id: str | None = None,
+        response_type: str = "RESULT",
+        working_type: str = "MARK_PRICE",
+    ):
+        if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            raise RuntimeError("protective create failed")
+        if reduce_only:
+            raise RuntimeError("emergency close failed")
+        self.entry_submitted = True
+        return {"orderId": "101", "status": "FILLED", "executedQty": quantity or 0.01, "avgPrice": "70000"}
+
+
+class AlgoSyncLookupClient:
+    def __init__(self) -> None:
+        self.algo_order_calls = 0
+        self.standard_order_calls = 0
+        self.trade_lookup_calls = 0
+
+    def get_account_info(self):
+        return {
+            "availableBalance": "100.0",
+            "totalWalletBalance": "100.0",
+            "totalUnrealizedProfit": "0.0",
+            "totalMarginBalance": "100.0",
+        }
+
+    def get_algo_order(self, *, algo_id: str | None = None, client_algo_id: str | None = None):
+        self.algo_order_calls += 1
+        return {
+            "orderId": algo_id or "algo-lookup-1",
+            "clientOrderId": client_algo_id or "algo-client-lookup-1",
+            "status": "NEW",
+            "type": "STOP_MARKET",
+            "executedQty": "0.0",
+            "avgPrice": "0",
+            "stopPrice": "69000",
+        }
+
+    def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        self.standard_order_calls += 1
+        return {
+            "orderId": order_id or "std-lookup-1",
+            "clientOrderId": client_order_id or "std-client-lookup-1",
+            "status": "NEW",
+            "type": "LIMIT",
+            "executedQty": "0.0",
+            "avgPrice": "0",
+        }
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        self.trade_lookup_calls += 1
+        return []
+
+    def get_open_orders(self, symbol: str):
+        return []
+
+    def get_position_information(self, symbol: str):
+        return []
+
+
+class AlgoCancelClient:
+    def __init__(self) -> None:
+        self.algo_cancel_calls = 0
+        self.standard_cancel_calls = 0
+        self.orders = [
+            {
+                "orderId": "algo-stop-1",
+                "clientOrderId": "algo-stop-client-1",
+                "algoId": "algo-stop-1",
+                "clientAlgoId": "algo-stop-client-1",
+                "type": "STOP_MARKET",
+                "closePosition": "true",
+                "reduceOnly": "true",
+                "status": "NEW",
+            }
+        ]
+
+    def get_open_orders(self, symbol: str):
+        return list(self.orders)
+
+    def cancel_algo_order(self, *, algo_id: str | None = None, client_algo_id: str | None = None):
+        self.algo_cancel_calls += 1
+        self.orders = []
+        return {"orderId": algo_id or "algo-stop-1", "status": "CANCELED"}
+
+    def cancel_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        self.standard_cancel_calls += 1
+        return {"orderId": order_id or "std-order-1", "status": "CANCELED"}
+
+
 def test_entry_protection_failure_triggers_emergency_close(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: ProtectionFailureClient())
@@ -310,10 +416,11 @@ def test_entry_protection_failure_triggers_emergency_close(monkeypatch, db_sessi
 
     settings_row = get_or_create_settings(db_session)
     events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    serialized = serialize_settings(settings_row)
 
     assert result["status"] == "emergency_exit"
-    assert settings_row.trading_paused is True
-    assert settings_row.pause_reason_code == "PROTECTIVE_ORDER_FAILURE"
+    assert settings_row.trading_paused is False
+    assert serialized["operating_state"] == "TRADABLE"
     assert any(event.event_type == "emergency_exit_triggered" for event in events)
     assert any(event.event_type == "emergency_exit_completed" for event in events)
 
@@ -343,9 +450,11 @@ def test_sync_live_state_recreates_missing_protection_and_logs(monkeypatch, db_s
     result = sync_live_state(db_session, get_or_create_settings(db_session), symbol="BTCUSDT")
     db_session.flush()
     events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    serialized = serialize_settings(get_or_create_settings(db_session))
 
     assert "BTCUSDT" in result["unprotected_positions"]
     assert result["symbol_protection_state"]["BTCUSDT"]["status"] == "protected"
+    assert serialized["operating_state"] == "TRADABLE"
     assert any(event.event_type == "unprotected_position_detected" for event in events)
     assert any(event.event_type == "protection_recreate_attempted" for event in events)
 
@@ -427,3 +536,96 @@ def test_scale_in_does_not_cancel_existing_protection_before_fill(monkeypatch, d
     assert result["status"] == "filled"
     assert result["intent_type"] == "scale_in"
     assert cancel_calls == []
+
+
+def test_protection_failure_falls_back_to_manage_only_when_emergency_close_fails(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: ProtectionFailureManageOnlyClient())
+
+    result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=4,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    serialized = serialize_settings(get_or_create_settings(db_session))
+
+    assert result["status"] == "emergency_exit"
+    assert serialized["operating_state"] == "DEGRADED_MANAGE_ONLY"
+    assert serialized["protection_recovery_failure_count"] >= 1
+    assert any(event.event_type == "protection_manage_only_enabled" for event in events)
+
+
+def test_sync_live_state_uses_algo_lookup_for_protective_orders(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = AlgoSyncLookupClient()
+    db_session.add(
+        Order(
+            symbol="BTCUSDT",
+            decision_run_id=None,
+            risk_check_id=None,
+            position_id=None,
+            side="sell",
+            order_type="stop_market",
+            mode="live",
+            status="pending",
+            external_order_id="algo-lookup-1",
+            client_order_id="algo-client-lookup-1",
+            reduce_only=True,
+            close_only=True,
+            parent_order_id=None,
+            exchange_status="NEW",
+            requested_quantity=0.01,
+            requested_price=69000.0,
+            filled_quantity=0.0,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    sync_live_state(db_session, get_or_create_settings(db_session), symbol="BTCUSDT")
+
+    assert client.algo_order_calls == 1
+    assert client.standard_order_calls == 0
+    assert client.trade_lookup_calls == 0
+
+
+def test_cancel_exit_orders_uses_algo_cancel_for_protective_orders(db_session) -> None:
+    client = AlgoCancelClient()
+    db_session.add(
+        Order(
+            symbol="BTCUSDT",
+            decision_run_id=None,
+            risk_check_id=None,
+            position_id=None,
+            side="sell",
+            order_type="stop_market",
+            mode="live",
+            status="pending",
+            external_order_id="algo-stop-1",
+            client_order_id="algo-stop-client-1",
+            reduce_only=True,
+            close_only=True,
+            parent_order_id=None,
+            exchange_status="NEW",
+            requested_quantity=0.01,
+            requested_price=69000.0,
+            filled_quantity=0.0,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    _cancel_exit_orders(db_session, client, "BTCUSDT")
+
+    assert client.algo_cancel_calls == 1
+    assert client.standard_cancel_calls == 0

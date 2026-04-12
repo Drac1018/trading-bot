@@ -23,6 +23,7 @@ from trading_mvp.services.pause_policy import (
     pause_reason_recovery_class,
     pause_reason_severity,
 )
+from trading_mvp.services.runtime_state import summarize_runtime_state
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
 from trading_mvp.time_utils import utcnow_naive
 
@@ -39,6 +40,7 @@ DISPLAY_MAX_LEVERAGE = 5.0
 DISPLAY_MAX_RISK_PER_TRADE = 0.02
 DISPLAY_MAX_DAILY_LOSS = 0.05
 AUTO_RESUME_GRACE_MAX_MINUTES = 15
+RUNTIME_STATE_DETAIL_KEYS = {"operating_state", "protection_recovery"}
 
 
 def _default_windows(defaults: AppConfig) -> list[str]:
@@ -214,6 +216,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     effective_max_daily_loss = min(settings_row.max_daily_loss, DISPLAY_MAX_DAILY_LOSS)
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
     auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
+    runtime_state = summarize_runtime_state(settings_row)
 
     payload = AppSettingsResponse(
         id=settings_row.id,
@@ -236,6 +239,15 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         auto_resume_last_blockers=[str(item) for item in auto_resume_state.get("blockers", [])],
         pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
+        operating_state=str(runtime_state["operating_state"]),
+        protection_recovery_status=str(runtime_state["protection_recovery_status"]),
+        protection_recovery_active=bool(runtime_state["protection_recovery_active"]),
+        protection_recovery_failure_count=int(runtime_state["protection_recovery_failure_count"]),
+        missing_protection_symbols=[str(item) for item in runtime_state["missing_protection_symbols"]],
+        missing_protection_items={
+            str(key): [str(item) for item in value]
+            for key, value in runtime_state["missing_protection_items"].items()
+        },
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
@@ -363,10 +375,16 @@ def set_trading_pause(
 ) -> Setting:
     row = get_or_create_settings(session)
     row.trading_paused = paused
+    existing_detail = dict(row.pause_reason_detail or {})
+    preserved_runtime_detail = {
+        key: existing_detail[key]
+        for key in RUNTIME_STATE_DETAIL_KEYS
+        if key in existing_detail
+    }
     if paused:
         now = utcnow_naive()
         policy = get_pause_reason_policy(reason_code)
-        current_detail = dict(reason_detail or {})
+        current_detail = {**preserved_runtime_detail, **dict(reason_detail or {})}
         live_armed_before_pause = is_live_execution_armed(row)
         live_ready_before_pause = is_live_execution_ready(row)
         live_armed_until_before_pause = row.live_execution_armed_until
@@ -412,7 +430,7 @@ def set_trading_pause(
     else:
         row.pause_reason_code = None
         row.pause_origin = None
-        row.pause_reason_detail = {}
+        row.pause_reason_detail = preserved_runtime_detail
         row.pause_triggered_at = None
         row.auto_resume_after = None
     session.add(row)

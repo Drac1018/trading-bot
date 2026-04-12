@@ -49,6 +49,12 @@ type ProtectionSyncState = {
 export type SettingsPayload = {
   id: number;
   mode: string;
+  operating_state: string;
+  protection_recovery_status: string;
+  protection_recovery_active: boolean;
+  protection_recovery_failure_count: number;
+  missing_protection_symbols: string[];
+  missing_protection_items: Record<string, string[]>;
   live_trading_enabled: boolean;
   live_trading_env_enabled: boolean;
   manual_live_approval: boolean;
@@ -121,6 +127,11 @@ type LiveSyncResult = {
   synced_orders?: number;
   synced_positions?: number;
   equity?: number;
+  operating_state?: string;
+  protection_recovery_status?: string;
+  protection_recovery_active?: boolean;
+  missing_protection_symbols?: string[];
+  missing_protection_items?: Record<string, string[]>;
   symbol_protection_state?: Record<string, ProtectionSyncState>;
   unprotected_positions?: string[];
   emergency_actions_taken?: Array<Record<string, unknown>>;
@@ -131,7 +142,9 @@ type LiveSyncResult = {
 
 type FormState = Omit<
   SettingsPayload,
-  | "id" | "mode" | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
+  | "id" | "mode" | "operating_state" | "protection_recovery_status" | "protection_recovery_active"
+  | "protection_recovery_failure_count" | "missing_protection_symbols" | "missing_protection_items"
+  | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "pause_severity"
   | "pause_recovery_class" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
@@ -238,6 +251,22 @@ function stringifyPauseDetail(detail: Record<string, unknown>) {
   return JSON.stringify(detail, null, 2);
 }
 
+function formatCodeList(values: string[] | null | undefined, empty = "-") {
+  if (!values || values.length === 0) return empty;
+  return values.map((item) => formatDisplayValue(item)).join(", ");
+}
+
+function renderMissingProtectionItems(
+  missingItems: Record<string, string[]> | null | undefined,
+  empty = "누락된 보호 항목 없음",
+) {
+  const entries = Object.entries(missingItems ?? {}).filter(([, values]) => values.length > 0);
+  if (entries.length === 0) return empty;
+  return entries
+    .map(([symbol, values]) => `${symbol}: ${values.map((item) => formatDisplayValue(item)).join(", ")}`)
+    .join(" / ");
+}
+
 function AutoResumeStatusCard({ result, title }: { result: AutoResumeResult | null | undefined; title: string }) {
   if (!result) return null;
   const blockers = result.blockers ?? [];
@@ -270,6 +299,7 @@ function AutoResumeStatusCard({ result, title }: { result: AutoResumeResult | nu
 function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
   if (!result) return null;
   const protectionEntries = Object.entries(result.symbol_protection_state ?? {});
+  const missingProtectionText = renderMissingProtectionItems(result.missing_protection_items);
   return (
     <div className="mt-3 space-y-3 rounded-2xl border border-amber-200 bg-white p-4">
       <div className="flex flex-wrap gap-2">
@@ -277,6 +307,28 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
         <StatusPill>주문 {result.synced_orders ?? 0}건</StatusPill>
         <StatusPill>포지션 {result.synced_positions ?? 0}건</StatusPill>
         {typeof result.equity === "number" ? <StatusPill>Equity {formatDisplayValue(result.equity, "equity")}</StatusPill> : null}
+      </div>
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-2xl bg-canvas px-4 py-3">
+          <p className="text-xs text-slate-500">운영 상태</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.operating_state, "operating_state")}</p>
+        </div>
+        <div className="rounded-2xl bg-canvas px-4 py-3">
+          <p className="text-xs text-slate-500">보호 복구 상태</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.protection_recovery_status, "protection_recovery_status")}</p>
+        </div>
+        <div className="rounded-2xl bg-canvas px-4 py-3">
+          <p className="text-xs text-slate-500">보호 복구 진행 여부</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.protection_recovery_active, "protection_recovery_active")}</p>
+        </div>
+        <div className="rounded-2xl bg-canvas px-4 py-3">
+          <p className="text-xs text-slate-500">누락 보호 심볼</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">{formatCodeList(result.missing_protection_symbols, "-")}</p>
+        </div>
+      </div>
+      <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
+        <p className="text-xs text-slate-500">누락 보호 항목</p>
+        <p className="mt-2 text-sm font-semibold text-slate-900">{missingProtectionText}</p>
       </div>
       {protectionEntries.length > 0 ? <div className="grid gap-3 md:grid-cols-2">
         {protectionEntries.map(([symbol, state]) => <div key={symbol} className="rounded-2xl bg-canvas px-4 py-3">
@@ -300,25 +352,35 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
 
 function OperationalStatusPanel({ state }: { state: SettingsPayload }) {
   const blockerText = state.auto_resume_last_blockers.length > 0 ? state.auto_resume_last_blockers.map((item) => formatDisplayValue(item)).join(" / ") : "차단 사유 없음";
+  const missingProtectionText = renderMissingProtectionItems(state.missing_protection_items);
   return (
     <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-lg font-semibold text-slate-900">운영 상태</h3>
         <StatusPill tone={state.trading_paused ? "danger" : state.live_execution_ready ? "good" : "warn"}>{state.trading_paused ? "거래 중지" : state.live_execution_ready ? "실행 가능" : "가드 유지"}</StatusPill>
+        <StatusPill tone={state.operating_state === "TRADABLE" ? "good" : state.operating_state === "PAUSED" ? "danger" : "warn"}>
+          운영 상태 {formatDisplayValue(state.operating_state, "operating_state")}
+        </StatusPill>
         {state.auto_resume_status !== "not_paused" ? <StatusPill tone={state.auto_resume_status === "resumed" ? "good" : state.auto_resume_status === "blocked" ? "danger" : "warn"}>자동 복구 {formatDisplayValue(state.auto_resume_status, "auto_resume_status")}</StatusPill> : null}
       </div>
       <p className="mt-3 text-sm leading-7 text-slate-600">현재 중지는 신규 진입을 막는 운영 pause입니다. 다만 기존 포지션의 보호 주문 유지, 축소, 비상 청산 같은 생존 경로는 계속 허용될 수 있습니다.</p>
       <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">운영 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.operating_state, "operating_state")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">보호 복구 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.protection_recovery_status, "protection_recovery_status")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">보호 복구 진행 여부</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.protection_recovery_active, "protection_recovery_active")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">거래 중지 여부</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.trading_paused, "trading_paused")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">중지 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_reason_code, "pause_reason_code")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">중지 발생 주체</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_origin, "pause_origin")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">심각도</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_severity, "pause_severity")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">복구 분류</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_recovery_class, "pause_recovery_class")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">중지 발생 시각</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_triggered_at, "pause_triggered_at")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">보호 복구 실패 누적</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.protection_recovery_failure_count, "protection_recovery_failure_count")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">누락 보호 심볼</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatCodeList(state.missing_protection_symbols, "없음")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 정책 대상</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_whitelisted, "auto_resume_whitelisted")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 가능</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_eligible, "auto_resume_eligible")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_status, "auto_resume_status")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">자동 복구 차단 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{blockerText}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">누락 보호 항목</p><p className="mt-2 text-sm font-semibold text-slate-900">{missingProtectionText}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">중지 상세</p><p className="mt-2 text-sm leading-6 text-slate-900">{stringifyPauseDetail(state.pause_reason_detail)}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">다음 자동 복구 재시도 시각</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_after, "auto_resume_after")}</p></div>
       </div>

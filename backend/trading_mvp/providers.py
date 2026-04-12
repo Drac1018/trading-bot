@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import httpx
 from pydantic import BaseModel
@@ -68,6 +69,42 @@ class OpenAIProvider:
             "Content-Type": "application/json",
         }
 
+    @staticmethod
+    def _build_strict_json_schema(response_model: type[BaseModel]) -> dict[str, Any]:
+        schema = deepcopy(response_model.model_json_schema())
+
+        def normalize(node: Any) -> Any:
+            if isinstance(node, dict):
+                node.pop("default", None)
+                node.pop("examples", None)
+
+                for key in ("properties", "$defs"):
+                    child = node.get(key)
+                    if isinstance(child, dict):
+                        for nested_key, nested_value in list(child.items()):
+                            child[nested_key] = normalize(nested_value)
+
+                for key in ("items", "additionalProperties", "contains", "if", "then", "else", "not"):
+                    if key in node:
+                        node[key] = normalize(node[key])
+
+                for key in ("anyOf", "allOf", "oneOf", "prefixItems"):
+                    child = node.get(key)
+                    if isinstance(child, list):
+                        node[key] = [normalize(item) for item in child]
+
+                properties = node.get("properties")
+                if isinstance(properties, dict):
+                    node["required"] = list(properties.keys())
+                    node["additionalProperties"] = False
+                elif node.get("type") == "object" and "additionalProperties" not in node:
+                    node["additionalProperties"] = False
+            elif isinstance(node, list):
+                return [normalize(item) for item in node]
+            return node
+
+        return cast(dict[str, Any], normalize(schema))
+
     def generate(
         self,
         role: str,
@@ -76,7 +113,7 @@ class OpenAIProvider:
         response_model: type[BaseModel],
         instructions: str,
     ) -> ProviderResult:
-        schema = response_model.model_json_schema()
+        schema = self._build_strict_json_schema(response_model)
         request_body = {
             "model": self.model,
             "temperature": self.temperature,

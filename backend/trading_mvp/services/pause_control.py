@@ -17,6 +17,14 @@ from trading_mvp.services.pause_policy import (
     pause_reason_severity,
 )
 from trading_mvp.services.risk import HARD_MAX_DAILY_LOSS
+from trading_mvp.services.runtime_state import (
+    DEGRADED_MANAGE_ONLY_STATE,
+    EMERGENCY_EXIT_STATE,
+    PROTECTION_REQUIRED_STATE,
+    TRADABLE_STATE,
+    get_protection_recovery_detail,
+    summarize_runtime_state,
+)
 from trading_mvp.services.settings import (
     get_effective_symbols,
     get_runtime_credentials,
@@ -24,6 +32,181 @@ from trading_mvp.services.settings import (
     set_trading_pause,
 )
 from trading_mvp.time_utils import utcnow_naive
+
+
+def _recompute_operating_state(symbol_states: dict[str, dict[str, Any]]) -> str:
+    states = {
+        str(item.get("state", TRADABLE_STATE))
+        for item in symbol_states.values()
+        if item.get("state")
+    }
+    if EMERGENCY_EXIT_STATE in states:
+        return EMERGENCY_EXIT_STATE
+    if DEGRADED_MANAGE_ONLY_STATE in states:
+        return DEGRADED_MANAGE_ONLY_STATE
+    if PROTECTION_REQUIRED_STATE in states:
+        return PROTECTION_REQUIRED_STATE
+    return TRADABLE_STATE
+
+
+def _write_runtime_state(
+    session: Session,
+    settings_row: Setting,
+    *,
+    operating_state: str,
+    recovery_status: str,
+    auto_recovery_active: bool,
+    symbol_states: dict[str, dict[str, Any]],
+    last_error: str | None = None,
+) -> None:
+    detail = dict(settings_row.pause_reason_detail or {})
+    detail["operating_state"] = operating_state
+    detail["protection_recovery"] = {
+        "status": recovery_status,
+        "auto_recovery_active": auto_recovery_active,
+        "last_transition_at": utcnow_naive().isoformat(),
+        "last_error": last_error,
+        "symbol_states": symbol_states,
+        "missing_symbols": [
+            symbol
+            for symbol, value in symbol_states.items()
+            if bool(value.get("missing_components"))
+        ],
+        "missing_items": {
+            symbol: [str(item) for item in value.get("missing_components", [])]
+            for symbol, value in symbol_states.items()
+            if bool(value.get("missing_components"))
+        },
+    }
+    settings_row.pause_reason_detail = detail
+    session.add(settings_row)
+    session.flush()
+
+
+def set_symbol_protection_state(
+    session: Session,
+    settings_row: Setting,
+    *,
+    symbol: str,
+    state: str,
+    trigger_source: str,
+    missing_components: list[str] | None = None,
+    auto_recovery_active: bool = False,
+    recovery_status: str | None = None,
+    last_error: str | None = None,
+    emergency_action: dict[str, object] | None = None,
+    reset_failures: bool = False,
+) -> dict[str, Any]:
+    current_summary = summarize_runtime_state(settings_row)
+    recovery = get_protection_recovery_detail(settings_row)
+    symbol_states = dict(recovery.get("symbol_states", {}))
+    current_symbol_state = dict(symbol_states.get(symbol, {}))
+    failure_count = 0 if reset_failures else int(current_symbol_state.get("failure_count", 0) or 0)
+    if state != TRADABLE_STATE and last_error:
+        failure_count += 1
+    updated_symbol_state = {
+        **current_symbol_state,
+        "state": state,
+        "missing_components": [str(item) for item in (missing_components or [])],
+        "failure_count": failure_count,
+        "auto_recovery_active": auto_recovery_active,
+        "recovery_status": recovery_status or state.lower(),
+        "last_error": last_error,
+        "last_transition_at": utcnow_naive().isoformat(),
+        "trigger_source": trigger_source,
+    }
+    if emergency_action is not None:
+        updated_symbol_state["emergency_action"] = emergency_action
+    if state == TRADABLE_STATE:
+        symbol_states.pop(symbol, None)
+    else:
+        symbol_states[symbol] = updated_symbol_state
+
+    operating_state = _recompute_operating_state(symbol_states)
+    resolved_status = recovery_status or (
+        "restored"
+        if operating_state == TRADABLE_STATE
+        else "emergency_exit"
+        if operating_state == EMERGENCY_EXIT_STATE
+        else "manage_only"
+        if operating_state == DEGRADED_MANAGE_ONLY_STATE
+        else "protection_required"
+    )
+    _write_runtime_state(
+        session,
+        settings_row,
+        operating_state=operating_state,
+        recovery_status=resolved_status,
+        auto_recovery_active=auto_recovery_active if operating_state != TRADABLE_STATE else False,
+        symbol_states=symbol_states,
+        last_error=last_error,
+    )
+
+    next_summary = summarize_runtime_state(settings_row)
+    if current_summary["operating_state"] != next_summary["operating_state"]:
+        record_audit_event(
+            session,
+            event_type="operating_state_changed",
+            entity_type="settings",
+            entity_id=str(settings_row.id),
+            severity="warning" if next_summary["operating_state"] != TRADABLE_STATE else "info",
+            message="Runtime trading operating state updated.",
+            payload={
+                "previous_state": current_summary["operating_state"],
+                "operating_state": next_summary["operating_state"],
+                "symbol": symbol,
+                "trigger_source": trigger_source,
+                "missing_components": missing_components or [],
+                "failure_count": failure_count,
+                "last_error": last_error,
+            },
+        )
+    return next_summary
+
+
+def clear_symbol_protection_state(
+    session: Session,
+    settings_row: Setting,
+    *,
+    symbol: str,
+    trigger_source: str,
+) -> dict[str, Any]:
+    return set_symbol_protection_state(
+        session,
+        settings_row,
+        symbol=symbol,
+        state=TRADABLE_STATE,
+        trigger_source=trigger_source,
+        missing_components=[],
+        auto_recovery_active=False,
+        recovery_status="restored",
+        last_error=None,
+        reset_failures=True,
+    )
+
+
+def mark_manage_only_state(
+    session: Session,
+    settings_row: Setting,
+    *,
+    symbol: str,
+    trigger_source: str,
+    missing_components: list[str],
+    last_error: str,
+    emergency_action: dict[str, object] | None = None,
+) -> dict[str, Any]:
+    return set_symbol_protection_state(
+        session,
+        settings_row,
+        symbol=symbol,
+        state=DEGRADED_MANAGE_ONLY_STATE,
+        trigger_source=trigger_source,
+        missing_components=missing_components,
+        auto_recovery_active=False,
+        recovery_status="manage_only",
+        last_error=last_error,
+        emergency_action=emergency_action,
+    )
 
 
 def _to_float(value: object) -> float:

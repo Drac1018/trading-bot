@@ -48,6 +48,7 @@ from trading_mvp.services.risk import (
     get_symbol_leverage_cap,
     get_symbol_risk_tier,
 )
+from trading_mvp.services.runtime_state import summarize_runtime_state
 from trading_mvp.services.settings import (
     get_effective_symbols,
     get_or_create_settings,
@@ -239,6 +240,7 @@ class TradingOrchestrator:
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
         open_positions = get_open_positions(self.session, symbol)
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
+        runtime_state = summarize_runtime_state(self.settings_row)
         effective_leverage_cap = min(
             self.settings_row.max_leverage,
             HARD_MAX_GLOBAL_LEVERAGE,
@@ -250,6 +252,10 @@ class TradingOrchestrator:
             "symbol_risk_tier": get_symbol_risk_tier(symbol),
             "daily_pnl": latest_pnl.daily_pnl,
             "consecutive_losses": latest_pnl.consecutive_losses,
+            "operating_state": runtime_state["operating_state"],
+            "protection_recovery_status": runtime_state["protection_recovery_status"],
+            "missing_protection_symbols": runtime_state["missing_protection_symbols"],
+            "missing_protection_items": runtime_state["missing_protection_items"],
         }
         openai_gate = get_openai_call_gate(
             self.session,

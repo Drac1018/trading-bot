@@ -157,23 +157,41 @@ class TradingDecisionAgent:
             and features.volume_ratio >= 0.85
         )
         weakening_signal = abs(features.trend_score) < 0.2 or features.volume_ratio < 0.8
+        operating_state = str(risk_context.get("operating_state", "TRADABLE"))
 
-        if open_position is not None and open_position.side == "long" and (short_signal or features.rsi > 73):
+        if open_position is not None and operating_state == "PROTECTION_REQUIRED":
+            decision = "long" if open_position.side == "long" else "short"
+            rationale = ["PROTECTION_REQUIRED", "RESTORE_PROTECTION"]
+            short_explanation = "누락된 보호 주문을 복구할 수 있도록 손절가와 익절가를 다시 제안합니다."
+            detailed_explanation = (
+                "현재는 신규 진입보다 기존 포지션 보호 복구가 우선입니다. "
+                "기존 포지션 방향을 유지한 채 손절가와 익절가를 다시 설정하도록 보수적으로 판단합니다."
+            )
+        elif open_position is not None and operating_state == "DEGRADED_MANAGE_ONLY":
+            decision = "reduce"
+            rationale = ["MANAGE_ONLY_MODE", "REDUCE_EXPOSURE"]
+            short_explanation = "관리 전용 상태이므로 기존 포지션을 일부 축소하는 판단을 우선합니다."
+            detailed_explanation = (
+                "보호 복구가 반복 실패해 신규 진입은 막힌 상태입니다. "
+                "현재는 노출을 줄이고 남은 포지션만 보수적으로 관리하는 것이 우선입니다."
+            )
+
+        if decision == "hold" and open_position is not None and open_position.side == "long" and (short_signal or features.rsi > 73):
             decision = "exit"
             rationale = ["LONG_EXHAUSTION", "POSITION_RISK_RESET"]
             short_explanation = "기존 롱 포지션의 우위가 약해져 청산이 우선입니다."
             detailed_explanation = "과열 또는 반전 신호가 확인돼 기존 롱 포지션을 정리하는 편이 보수적입니다."
-        elif open_position is not None and open_position.side == "short" and (long_signal or features.rsi < 28):
+        elif decision == "hold" and open_position is not None and open_position.side == "short" and (long_signal or features.rsi < 28):
             decision = "exit"
             rationale = ["SHORT_EXHAUSTION", "POSITION_RISK_RESET"]
             short_explanation = "기존 숏 포지션의 우위가 약해져 청산이 우선입니다."
             detailed_explanation = "반등 또는 추세 전환 가능성이 커져 기존 숏 포지션을 정리하는 편이 보수적입니다."
-        elif open_position is not None and weakening_signal:
+        elif decision == "hold" and open_position is not None and weakening_signal:
             decision = "reduce"
             rationale = ["WEAKENING_SIGNAL", "PROTECT_OPEN_PNL"]
             short_explanation = "기존 포지션을 일부 축소해 리스크를 낮춥니다."
             detailed_explanation = "추세 강도와 거래량 우위가 약화돼 포지션 규모를 줄이는 편이 안전합니다."
-        elif long_signal:
+        elif decision == "hold" and long_signal:
             decision = "long"
             rationale = ["TREND_UP", "VOLUME_SUPPORT", "RSI_HEALTHY"]
             short_explanation = "상승 추세와 거래량 지지가 확인돼 롱 진입을 제안합니다."
@@ -181,7 +199,7 @@ class TradingDecisionAgent:
                 "단기 추세 점수와 RSI, 거래량 지지가 함께 개선돼 리스크 대비 기대수익이 "
                 "상대적으로 양호한 구간으로 판단합니다."
             )
-        elif short_signal:
+        elif decision == "hold" and short_signal:
             decision = "short"
             rationale = ["TREND_DOWN", "VOLUME_SUPPORT", "RSI_WEAK"]
             short_explanation = "하락 추세가 우세해 숏 진입을 제안합니다."

@@ -22,6 +22,12 @@ type Overview = {
   auto_resume_last_blockers: string[];
   pause_severity: string | null;
   pause_recovery_class: string | null;
+  operating_state: string;
+  protection_recovery_status: string;
+  protection_recovery_active: boolean;
+  protection_recovery_failure_count: number;
+  missing_protection_symbols: string[];
+  missing_protection_items: Record<string, string[]>;
   daily_pnl: number;
   cumulative_pnl: number;
   blocked_reasons: string[];

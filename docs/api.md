@@ -4,7 +4,43 @@
 
 - `GET /health`
 
-## Dashboard / Data
+서버와 DB 초기화 상태를 확인합니다. FastAPI `lifespan`에서 테이블 초기화가 끝난 뒤 응답합니다.
+
+## Settings
+
+- `GET /api/settings`
+- `PUT /api/settings`
+- `POST /api/settings/pause`
+- `POST /api/settings/resume`
+- `POST /api/settings/live/arm`
+- `POST /api/settings/live/disarm`
+
+### `GET /api/settings`
+
+운영자가 설정 화면에서 바로 봐야 하는 상태 필드:
+
+- `mode`
+- `live_execution_ready`
+- `trading_paused`
+- `pause_reason_code`
+- `pause_origin`
+- `pause_reason_detail`
+- `pause_triggered_at`
+- `pause_severity`
+- `pause_recovery_class`
+- `auto_resume_after`
+- `auto_resume_whitelisted`
+- `auto_resume_eligible`
+- `auto_resume_status`
+- `auto_resume_last_blockers`
+- `operating_state`
+- `protection_recovery_status`
+- `protection_recovery_active`
+- `protection_recovery_failure_count`
+- `missing_protection_symbols`
+- `missing_protection_items`
+
+## Dashboard
 
 - `GET /api/dashboard/overview`
 - `GET /api/market/snapshots`
@@ -18,18 +54,11 @@
 - `GET /api/scheduler`
 - `GET /api/audit`
 - `GET /api/alerts`
-- `GET /api/settings`
-- `GET /api/backlog`
-- `GET /api/backlog/{backlog_id}`
-- `GET /api/backlog/{backlog_id}/codex-draft`
-- `POST /api/backlog/{backlog_id}/auto-apply`
-- `POST /api/backlog/auto-apply-supported`
 
 ### `GET /api/dashboard/overview`
 
-운영 개요 응답에는 최신 시장/의사결정/리스크 요약뿐 아니라, 현재 운영 상태를 바로 보여주기 위한 필드가 포함됩니다.
+개요 화면에서 쓰는 주요 운영 상태 필드:
 
-주요 운영 상태 필드:
 - `trading_paused`
 - `pause_reason_code`
 - `pause_origin`
@@ -40,27 +69,24 @@
 - `auto_resume_last_blockers`
 - `pause_severity`
 - `pause_recovery_class`
+- `operating_state`
+- `protection_recovery_status`
+- `protection_recovery_active`
+- `protection_recovery_failure_count`
+- `missing_protection_symbols`
+- `missing_protection_items`
 - `protected_positions`
 - `unprotected_positions`
 - `position_protection_summary`
 
-## Control
+## Live Sync
 
-- `POST /api/system/seed`
-- `POST /api/settings/pause`
-- `POST /api/settings/resume`
-- `POST /api/backlog/requests`
-- `POST /api/backlog/applied`
-- `POST /api/cycles/run`
-- `POST /api/replay/run`
-- `POST /api/reviews/{window}`
 - `POST /api/live/sync`
 
-### `POST /api/live/sync`
-
-라이브 동기화는 거래소 주문/포지션 상태를 갱신하면서 보호 주문 상태와 자동 복구 상태도 함께 반환합니다.
+거래소 주문/포지션/계좌 상태를 동기화하고, 보호 주문 상태와 자동 복구 상태를 함께 반환합니다.
 
 기본 응답 필드:
+
 - `symbols`
 - `synced_orders`
 - `synced_positions`
@@ -68,13 +94,20 @@
 - `symbol_protection_state`
 - `unprotected_positions`
 - `emergency_actions_taken`
+- `operating_state`
+- `protection_recovery_status`
+- `protection_recovery_active`
+- `missing_protection_symbols`
+- `missing_protection_items`
 
-auto-resume 관련 필드:
+자동 복구 관련 필드:
+
 - `auto_resume_precheck`
 - `auto_resume_postcheck`
 - `auto_resume`
 
-auto-resume payload 공통 필드:
+auto-resume 공통 필드:
+
 - `attempted`
 - `resumed`
 - `allowed`
@@ -93,6 +126,22 @@ auto-resume payload 공통 필드:
 - `sync_status`
 - `approval_state`
 - `approval_detail`
+
+## Reviews / Cycles
+
+- `POST /api/cycles/run`
+- `POST /api/reviews/{window}`
+- `POST /api/replay/run`
+
+## Backlog
+
+- `GET /api/backlog`
+- `GET /api/backlog/{backlog_id}`
+- `GET /api/backlog/{backlog_id}/codex-draft`
+- `POST /api/backlog/requests`
+- `POST /api/backlog/applied`
+- `POST /api/backlog/{backlog_id}/auto-apply`
+- `POST /api/backlog/auto-apply-supported`
 
 ## CLI
 
