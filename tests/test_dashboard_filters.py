@@ -8,6 +8,7 @@ from trading_mvp.services.dashboard import (
     get_overview,
     get_positions,
 )
+from trading_mvp.services.settings import get_or_create_settings
 
 
 def test_order_and_execution_filters(db_session) -> None:
@@ -97,6 +98,16 @@ def test_audit_filters(db_session) -> None:
 
 
 def test_overview_and_positions_include_protection_status(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    settings.trading_paused = True
+    settings.pause_reason_code = "PROTECTIVE_ORDER_FAILURE"
+    settings.pause_origin = "system"
+    settings.pause_reason_detail = {
+        "detail": "protective verification failed",
+        "auto_resume": {"status": "not_eligible", "blockers": ["MISSING_PROTECTIVE_ORDERS"]},
+    }
+    db_session.flush()
+
     position = Position(
         symbol="BTCUSDT",
         mode="live",
@@ -140,6 +151,13 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
 
     assert overview.open_positions == 1
     assert overview.unprotected_positions == 1
+    assert overview.trading_paused is True
+    assert overview.pause_reason_code == "PROTECTIVE_ORDER_FAILURE"
+    assert overview.pause_origin == "system"
+    assert overview.auto_resume_status == "not_eligible"
+    assert overview.auto_resume_last_blockers == ["MISSING_PROTECTIVE_ORDERS"]
+    assert overview.pause_severity == "critical"
+    assert overview.pause_recovery_class == "portfolio_unsafe"
     assert overview.position_protection_summary[0]["symbol"] == "BTCUSDT"
     assert overview.position_protection_summary[0]["missing_components"] == ["take_profit"]
     assert positions[0]["protected"] is False

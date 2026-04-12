@@ -304,6 +304,15 @@ class OverviewResponse(StrictBaseModel):
     live_trading_enabled: bool
     live_execution_ready: bool
     trading_paused: bool
+    pause_reason_code: str | None = None
+    pause_origin: str | None = None
+    pause_triggered_at: datetime | None = None
+    auto_resume_after: datetime | None = None
+    auto_resume_status: str = "not_paused"
+    auto_resume_eligible: bool = False
+    auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    pause_severity: str | None = None
+    pause_recovery_class: str | None = None
     daily_pnl: float
     cumulative_pnl: float
     blocked_reasons: list[str]

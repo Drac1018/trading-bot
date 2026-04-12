@@ -13,6 +13,15 @@ type Overview = {
   live_trading_enabled: boolean;
   live_execution_ready: boolean;
   trading_paused: boolean;
+  pause_reason_code: string | null;
+  pause_origin: string | null;
+  pause_triggered_at: string | null;
+  auto_resume_after: string | null;
+  auto_resume_status: string;
+  auto_resume_eligible: boolean;
+  auto_resume_last_blockers: string[];
+  pause_severity: string | null;
+  pause_recovery_class: string | null;
   daily_pnl: number;
   cumulative_pnl: number;
   blocked_reasons: string[];
@@ -50,6 +59,7 @@ export default async function HomePage() {
         decisions,
         orders,
         positions,
+        warnings: [],
       }}
     />
   );

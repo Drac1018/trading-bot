@@ -256,6 +256,32 @@ def test_update_settings_does_not_change_trading_pause_state(db_session) -> None
     assert updated.trading_paused is True
 
 
+def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> None:
+    row = get_or_create_settings(db_session)
+    row.trading_paused = True
+    row.pause_reason_code = "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE"
+    row.pause_origin = "system"
+    row.pause_triggered_at = utcnow_naive()
+    row.pause_reason_detail = {
+        "detail": "account snapshot unavailable",
+        "auto_resume": {
+            "status": "blocked",
+            "blockers": ["MISSING_PROTECTIVE_ORDERS"],
+        },
+    }
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["trading_paused"] is True
+    assert serialized["pause_reason_code"] == "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE"
+    assert serialized["pause_origin"] == "system"
+    assert serialized["auto_resume_status"] == "blocked"
+    assert serialized["auto_resume_last_blockers"] == ["MISSING_PROTECTIVE_ORDERS"]
+    assert serialized["pause_severity"] == "warning"
+    assert serialized["pause_recovery_class"] == "recoverable_system"
+
+
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'settings_api.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)

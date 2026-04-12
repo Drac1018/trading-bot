@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useMemo, useState, useTransition, type ReactNode } from "react";
 
 import { AIUsagePanel } from "./ai-usage-panel";
 import { formatDisplayValue } from "../lib/ui-copy";
@@ -12,7 +12,38 @@ const monthlyLabels: Record<string, string> = {
   trading_decision: "거래 의사결정 AI",
   integration_planner: "통합 기획 AI",
   ui_ux: "UI/UX AI",
-  product_improvement: "제품 개선 AI"
+  product_improvement: "제품 개선 AI",
+};
+
+type AutoResumeResult = {
+  attempted?: boolean;
+  resumed?: boolean;
+  allowed?: boolean;
+  status?: string;
+  reason_code?: string | null;
+  pause_origin?: string | null;
+  pause_severity?: string | null;
+  pause_recovery_class?: string | null;
+  trigger_source?: string;
+  blockers?: string[];
+  symbol_blockers?: Record<string, string[]>;
+  blocker_details?: Array<Record<string, unknown>>;
+  evaluated_symbols?: string[];
+  protective_orders?: Record<string, string>;
+  market_data_status?: Record<string, string>;
+  sync_status?: Record<string, string>;
+  approval_state?: string;
+  approval_detail?: Record<string, unknown>;
+  auto_resume_after?: string | null;
+};
+
+type ProtectionSyncState = {
+  status?: string;
+  protected?: boolean;
+  protective_order_count?: number;
+  has_stop_loss?: boolean;
+  has_take_profit?: boolean;
+  missing_components?: string[];
 };
 
 export type SettingsPayload = {
@@ -26,6 +57,17 @@ export type SettingsPayload = {
   live_approval_window_minutes: number;
   live_execution_ready: boolean;
   trading_paused: boolean;
+  pause_reason_code: string | null;
+  pause_origin: string | null;
+  pause_reason_detail: Record<string, unknown>;
+  pause_triggered_at: string | null;
+  auto_resume_after: string | null;
+  auto_resume_whitelisted: boolean;
+  auto_resume_eligible: boolean;
+  auto_resume_status: string;
+  auto_resume_last_blockers: string[];
+  pause_severity: string | null;
+  pause_recovery_class: string | null;
   default_symbol: string;
   tracked_symbols: string[];
   default_timeframe: string;
@@ -72,65 +114,33 @@ export type SettingsPayload = {
   manual_ai_guard_minutes: number;
 };
 
-type ConnectionTestResult = {
-  ok: boolean;
-  provider: string;
-  message: string;
-  details: Record<string, unknown>;
-};
+type ConnectionTestResult = { ok: boolean; provider: string; message: string; details: Record<string, unknown> };
 
 type LiveSyncResult = {
   symbols?: string[];
   synced_orders?: number;
   synced_positions?: number;
   equity?: number;
-  symbol_protection_state?: Record<
-    string,
-    {
-      status?: string;
-      protected?: boolean;
-      protective_order_count?: number;
-      has_stop_loss?: boolean;
-      has_take_profit?: boolean;
-      missing_components?: string[];
-    }
-  >;
+  symbol_protection_state?: Record<string, ProtectionSyncState>;
   unprotected_positions?: string[];
   emergency_actions_taken?: Array<Record<string, unknown>>;
+  auto_resume_precheck?: AutoResumeResult | null;
+  auto_resume_postcheck?: AutoResumeResult | null;
+  auto_resume?: AutoResumeResult | null;
 };
 
 type FormState = Omit<
   SettingsPayload,
-  | "id"
-  | "mode"
-  | "live_trading_env_enabled"
-  | "live_execution_armed"
-  | "live_execution_armed_until"
-  | "live_execution_ready"
-  | "trading_paused"
-  | "openai_api_key_configured"
-  | "binance_api_key_configured"
-  | "binance_api_secret_configured"
-  | "estimated_monthly_ai_calls"
-  | "estimated_monthly_ai_calls_breakdown"
-  | "projected_monthly_ai_calls_if_enabled"
-  | "projected_monthly_ai_calls_breakdown_if_enabled"
-  | "recent_ai_calls_24h"
-  | "recent_ai_calls_7d"
-  | "recent_ai_successes_24h"
-  | "recent_ai_successes_7d"
-  | "recent_ai_failures_24h"
-  | "recent_ai_failures_7d"
-  | "recent_ai_tokens_24h"
-  | "recent_ai_tokens_7d"
-  | "recent_ai_role_calls_24h"
-  | "recent_ai_role_calls_7d"
-  | "recent_ai_role_failures_24h"
-  | "recent_ai_role_failures_7d"
-  | "recent_ai_failure_reasons"
-  | "observed_monthly_ai_calls_projection"
-  | "observed_monthly_ai_calls_projection_breakdown"
-  | "manual_ai_guard_minutes"
+  | "id" | "mode" | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
+  | "trading_paused" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
+  | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "pause_severity"
+  | "pause_recovery_class" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
+  | "estimated_monthly_ai_calls" | "estimated_monthly_ai_calls_breakdown" | "projected_monthly_ai_calls_if_enabled"
+  | "projected_monthly_ai_calls_breakdown_if_enabled" | "recent_ai_calls_24h" | "recent_ai_calls_7d" | "recent_ai_successes_24h"
+  | "recent_ai_successes_7d" | "recent_ai_failures_24h" | "recent_ai_failures_7d" | "recent_ai_tokens_24h"
+  | "recent_ai_tokens_7d" | "recent_ai_role_calls_24h" | "recent_ai_role_calls_7d" | "recent_ai_role_failures_24h"
+  | "recent_ai_role_failures_7d" | "recent_ai_failure_reasons" | "observed_monthly_ai_calls_projection"
+  | "observed_monthly_ai_calls_projection_breakdown" | "manual_ai_guard_minutes"
 > & {
   openai_api_key: string;
   binance_api_key: string;
@@ -141,12 +151,19 @@ type FormState = Omit<
   clear_binance_api_secret: boolean;
 };
 
-const inputClass =
-  "w-full rounded-2xl border border-amber-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-amber-400";
+const inputClass = "w-full rounded-2xl border border-amber-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-amber-400";
 
-function uniqueSymbols(values: string[]) {
-  return Array.from(new Set(values.map((item) => item.trim().toUpperCase()).filter(Boolean)));
+class ApiRequestError extends Error {
+  payload?: unknown;
+
+  constructor(message: string, payload?: unknown) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.payload = payload;
+  }
 }
+
+function uniqueSymbols(values: string[]) { return Array.from(new Set(values.map((item) => item.trim().toUpperCase()).filter(Boolean))); }
 
 function toFormState(initial: SettingsPayload): FormState {
   return {
@@ -180,107 +197,132 @@ function toFormState(initial: SettingsPayload): FormState {
     custom_symbols: initial.tracked_symbols.filter((symbol) => !symbolOptions.includes(symbol)).join(", "),
     clear_openai_api_key: false,
     clear_binance_api_key: false,
-    clear_binance_api_secret: false
+    clear_binance_api_secret: false,
   };
 }
 
-function Field(props: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-2">
-      <span className="text-sm font-semibold text-slate-900">{props.label}</span>
-      {props.children}
-      {props.hint ? <span className="text-xs text-slate-500">{props.hint}</span> : null}
-    </label>
-  );
+function StatusPill({ tone = "neutral", children }: { tone?: "neutral" | "good" | "warn" | "danger"; children: ReactNode }) {
+  const className = {
+    neutral: "border border-slate-200 bg-slate-50 text-slate-700",
+    good: "border border-emerald-200 bg-emerald-50 text-emerald-700",
+    warn: "border border-amber-200 bg-amber-50 text-amber-800",
+    danger: "border border-rose-200 bg-rose-50 text-rose-800",
+  }[tone];
+  return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${className}`}>{children}</span>;
+}
+
+function Field(props: { label: string; hint?: string; children: ReactNode }) {
+  return <label className="flex flex-col gap-2"><span className="text-sm font-semibold text-slate-900">{props.label}</span>{props.children}{props.hint ? <span className="text-xs text-slate-500">{props.hint}</span> : null}</label>;
 }
 
 function Toggle(props: { checked: boolean; label: string; onChange: (value: boolean) => void }) {
-  return (
-    <label className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-white px-4 py-3">
-      <input checked={props.checked} onChange={(event) => props.onChange(event.target.checked)} type="checkbox" />
-      <span className="text-sm font-medium text-slate-900">{props.label}</span>
-    </label>
-  );
+  return <label className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-white px-4 py-3"><input checked={props.checked} onChange={(event) => props.onChange(event.target.checked)} type="checkbox" /><span className="text-sm font-medium text-slate-900">{props.label}</span></label>;
+}
+
+function MetricCard({ label, value, tone = "default" }: { label: string; value: string; tone?: "default" | "dark" | "warm" }) {
+  if (tone === "dark") return <div className="rounded-[1.5rem] bg-slate-950 px-4 py-4 text-white"><p className="text-xs uppercase tracking-[0.24em] text-white/60">{label}</p><p className="mt-2 text-xl font-semibold">{value}</p></div>;
+  if (tone === "warm") return <div className="rounded-[1.5rem] border border-amber-200 bg-amber-50 px-4 py-4"><p className="text-xs uppercase tracking-[0.24em] text-amber-900">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
+  return <div className="rounded-[1.5rem] border border-slate-200 bg-white px-4 py-4"><p className="text-xs uppercase tracking-[0.24em] text-slate-500">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
 }
 
 function ResultCard({ title, result }: { title: string; result: ConnectionTestResult | null }) {
-  if (!result) {
-    return null;
-  }
+  if (!result) return null;
+  return <div className={`rounded-2xl px-4 py-3 text-sm ${result.ok ? "bg-emerald-50 text-emerald-900" : "bg-rose-50 text-rose-900"}`}><p className="font-semibold">{title}</p><p className="mt-1">{result.message}</p><pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{JSON.stringify(result.details, null, 2)}</pre></div>;
+}
+
+function stringifyPauseDetail(detail: Record<string, unknown>) {
+  if (!detail || Object.keys(detail).length === 0) return "-";
+  if (typeof detail.detail === "string" && detail.detail.trim()) return detail.detail;
+  if (typeof detail.error === "string" && detail.error.trim()) return detail.error;
+  if (typeof detail.symbol === "string" && detail.symbol.trim()) return `${detail.symbol} 관련 상태 점검 필요`;
+  return JSON.stringify(detail, null, 2);
+}
+
+function AutoResumeStatusCard({ result, title }: { result: AutoResumeResult | null | undefined; title: string }) {
+  if (!result) return null;
+  const blockers = result.blockers ?? [];
+  const symbolBlockers = Object.entries(result.symbol_blockers ?? {});
+  const protectiveOrders = Object.entries(result.protective_orders ?? {});
+  const marketStatus = Object.entries(result.market_data_status ?? {});
+  const syncStatus = Object.entries(result.sync_status ?? {});
   return (
-    <div className={`rounded-2xl px-4 py-3 text-sm ${result.ok ? "bg-emerald-50 text-emerald-900" : "bg-rose-50 text-rose-900"}`}>
-      <p className="font-semibold">{title}</p>
-      <p className="mt-1">{result.message}</p>
-      <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{JSON.stringify(result.details, null, 2)}</pre>
+    <div className="rounded-2xl border border-amber-200 bg-white p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-sm font-semibold text-slate-900">{title}</p>
+        <StatusPill tone={result.resumed ? "good" : result.allowed ? "good" : result.status === "blocked" ? "danger" : "warn"}>{formatDisplayValue(result.status, "auto_resume_status")}</StatusPill>
+        {result.trigger_source ? <StatusPill>{result.trigger_source}</StatusPill> : null}
+      </div>
+      <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">중지 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.reason_code, "pause_reason_code")}</p></div>
+        <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">승인 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.approval_state, "approval_state")}</p></div>
+      </div>
+      {blockers.length > 0 ? <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800"><p className="font-semibold">자동 복구 차단 사유</p><p className="mt-2">{blockers.map((item) => formatDisplayValue(item)).join(" / ")}</p></div> : null}
+      {symbolBlockers.length > 0 ? <div className="mt-3 grid gap-3 md:grid-cols-2">{symbolBlockers.map(([symbol, values]) => <div key={`blocker-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">{symbol} 차단 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{values.length > 0 ? values.map((item) => formatDisplayValue(item)).join(" / ") : "차단 없음"}</p></div>)}</div> : null}
+      {(protectiveOrders.length > 0 || marketStatus.length > 0 || syncStatus.length > 0) ? <div className="mt-3 grid gap-3 md:grid-cols-3">
+        {protectiveOrders.map(([symbol, status]) => <div key={`protect-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">{symbol} 보호 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(status, "status")}</p></div>)}
+        {marketStatus.map(([symbol, status]) => <div key={`market-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">{symbol} 시장 데이터</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(status, "status")}</p></div>)}
+        {syncStatus.map(([symbol, status]) => <div key={`sync-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">{symbol} 동기화 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(status, "status")}</p></div>)}
+      </div> : null}
     </div>
   );
 }
 
 function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
-  if (!result) {
-    return null;
-  }
-
+  if (!result) return null;
   const protectionEntries = Object.entries(result.symbol_protection_state ?? {});
-
   return (
     <div className="mt-3 space-y-3 rounded-2xl border border-amber-200 bg-white p-4">
       <div className="flex flex-wrap gap-2">
-        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
-          동기화 심볼 {result.symbols?.join(", ") ?? "-"}
-        </span>
-        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
-          주문 {result.synced_orders ?? 0}건
-        </span>
-        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
-          포지션 {result.synced_positions ?? 0}건
-        </span>
-        {typeof result.equity === "number" ? (
-          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
-            Equity {formatDisplayValue(result.equity, "equity")}
-          </span>
-        ) : null}
+        <StatusPill>동기화 심볼 {result.symbols?.join(", ") ?? "-"}</StatusPill>
+        <StatusPill>주문 {result.synced_orders ?? 0}건</StatusPill>
+        <StatusPill>포지션 {result.synced_positions ?? 0}건</StatusPill>
+        {typeof result.equity === "number" ? <StatusPill>Equity {formatDisplayValue(result.equity, "equity")}</StatusPill> : null}
       </div>
-
-      {protectionEntries.length > 0 ? (
-        <div className="grid gap-3 md:grid-cols-2">
-          {protectionEntries.map(([symbol, state]) => (
-            <div key={symbol} className="rounded-2xl bg-canvas px-4 py-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="rounded-full border border-amber-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
-                  {symbol}
-                </span>
-                <span
-                  className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                    state.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
-                  }`}
-                >
-                  {state.protected ? "보호됨" : "보호 확인 필요"}
-                </span>
-              </div>
-              <p className="mt-3 text-sm text-slate-700">
-                상태: {formatDisplayValue(state.status, "status")} / 보호주문 {state.protective_order_count ?? 0}개
-              </p>
-              {!state.protected && (state.missing_components?.length ?? 0) > 0 ? (
-                <p className="mt-2 text-sm text-rose-700">누락: {state.missing_components?.join(", ")}</p>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      {(result.unprotected_positions?.length ?? 0) > 0 ? (
-        <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-          무보호 포지션 감지: {result.unprotected_positions?.join(", ")}
-        </div>
-      ) : null}
-
-      {(result.emergency_actions_taken?.length ?? 0) > 0 ? (
-        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-          비상 조치: {JSON.stringify(result.emergency_actions_taken, null, 2)}
-        </div>
-      ) : null}
+      {protectionEntries.length > 0 ? <div className="grid gap-3 md:grid-cols-2">
+        {protectionEntries.map(([symbol, state]) => <div key={symbol} className="rounded-2xl bg-canvas px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusPill>{symbol}</StatusPill>
+            <StatusPill tone={state.protected ? "good" : "danger"}>{state.protected ? "보호됨" : "보호 확인 필요"}</StatusPill>
+          </div>
+          <p className="mt-3 text-sm text-slate-700">상태: {formatDisplayValue(state.status, "status")} / 보호 주문 {state.protective_order_count ?? 0}개</p>
+          <p className="mt-2 text-sm text-slate-600">손절 {formatDisplayValue(state.has_stop_loss, "has_stop_loss")} / 익절 {formatDisplayValue(state.has_take_profit, "has_take_profit")}</p>
+          {!state.protected && (state.missing_components?.length ?? 0) > 0 ? <p className="mt-2 text-sm text-rose-700">누락: {state.missing_components?.join(", ")}</p> : null}
+        </div>)}
+      </div> : <div className="rounded-2xl border border-dashed border-amber-300 px-4 py-5 text-sm text-slate-500">이번 동기화 응답에는 심볼별 보호 상태가 포함되지 않았습니다.</div>}
+      {(result.unprotected_positions?.length ?? 0) > 0 ? <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">무보호 포지션 감지: {result.unprotected_positions?.join(", ")}</div> : null}
+      {(result.emergency_actions_taken?.length ?? 0) > 0 ? <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><p className="font-semibold">비상 조치 발생</p><pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{JSON.stringify(result.emergency_actions_taken, null, 2)}</pre></div> : null}
+      <AutoResumeStatusCard result={result.auto_resume_precheck} title="자동 복구 사전 점검" />
+      <AutoResumeStatusCard result={result.auto_resume_postcheck} title="자동 복구 사후 점검" />
+      {!result.auto_resume_precheck && !result.auto_resume_postcheck ? <AutoResumeStatusCard result={result.auto_resume} title="자동 복구 평가" /> : null}
     </div>
+  );
+}
+
+function OperationalStatusPanel({ state }: { state: SettingsPayload }) {
+  const blockerText = state.auto_resume_last_blockers.length > 0 ? state.auto_resume_last_blockers.map((item) => formatDisplayValue(item)).join(" / ") : "차단 사유 없음";
+  return (
+    <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-lg font-semibold text-slate-900">운영 상태</h3>
+        <StatusPill tone={state.trading_paused ? "danger" : state.live_execution_ready ? "good" : "warn"}>{state.trading_paused ? "거래 중지" : state.live_execution_ready ? "실행 가능" : "가드 유지"}</StatusPill>
+        {state.auto_resume_status !== "not_paused" ? <StatusPill tone={state.auto_resume_status === "resumed" ? "good" : state.auto_resume_status === "blocked" ? "danger" : "warn"}>자동 복구 {formatDisplayValue(state.auto_resume_status, "auto_resume_status")}</StatusPill> : null}
+      </div>
+      <p className="mt-3 text-sm leading-7 text-slate-600">현재 중지는 신규 진입을 막는 운영 pause입니다. 다만 기존 포지션의 보호 주문 유지, 축소, 비상 청산 같은 생존 경로는 계속 허용될 수 있습니다.</p>
+      <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">거래 중지 여부</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.trading_paused, "trading_paused")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">중지 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_reason_code, "pause_reason_code")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">중지 발생 주체</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_origin, "pause_origin")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">심각도</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_severity, "pause_severity")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">복구 분류</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_recovery_class, "pause_recovery_class")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">중지 발생 시각</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.pause_triggered_at, "pause_triggered_at")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 정책 대상</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_whitelisted, "auto_resume_whitelisted")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 가능</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_eligible, "auto_resume_eligible")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_status, "auto_resume_status")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">자동 복구 차단 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{blockerText}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">중지 상세</p><p className="mt-2 text-sm leading-6 text-slate-900">{stringifyPauseDetail(state.pause_reason_detail)}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">다음 자동 복구 재시도 시각</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_after, "auto_resume_after")}</p></div>
+      </div>
+    </section>
   );
 }
 
@@ -294,31 +336,22 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const [liveSyncResult, setLiveSyncResult] = useState<LiveSyncResult | null>(null);
   const [isPending, startTransition] = useTransition();
 
-  const projectedBreakdown = useMemo(
-    () => Object.entries(state.projected_monthly_ai_calls_breakdown_if_enabled),
-    [state.projected_monthly_ai_calls_breakdown_if_enabled]
-  );
-  const mergedSymbols = useMemo(
-    () => uniqueSymbols([...form.tracked_symbols, ...form.custom_symbols.split(",")]),
-    [form.custom_symbols, form.tracked_symbols]
-  );
+  const projectedBreakdown = useMemo(() => Object.entries(state.projected_monthly_ai_calls_breakdown_if_enabled), [state.projected_monthly_ai_calls_breakdown_if_enabled]);
+  const mergedSymbols = useMemo(() => uniqueSymbols([...form.tracked_symbols, ...form.custom_symbols.split(",")]), [form.custom_symbols, form.tracked_symbols]);
 
   const requestJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const response = await fetch(`${apiBaseUrl}${path}`, init);
+    const contentType = response.headers.get("content-type") ?? "";
+    const body = contentType.includes("application/json") ? await response.json() : await response.text();
     if (!response.ok) {
-      throw new Error((await response.text()) || "요청 처리에 실패했습니다.");
+      const message = typeof body === "string" ? body : JSON.stringify(body);
+      throw new ApiRequestError(message || "요청 처리에 실패했습니다.", body);
     }
-    return (await response.json()) as T;
+    return body as T;
   };
 
-  const syncSettings = (next: SettingsPayload) => {
-    setState(next);
-    setForm(toFormState(next));
-  };
-
-  const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => {
-    setForm((current) => ({ ...current, [key]: value }));
-  };
+  const syncSettings = (next: SettingsPayload) => { setState(next); setForm(toFormState(next)); };
+  const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((current) => ({ ...current, [key]: value }));
 
   const payload = {
     live_trading_enabled: form.live_trading_enabled,
@@ -350,36 +383,22 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     binance_api_secret: form.binance_api_secret || null,
     clear_openai_api_key: form.clear_openai_api_key,
     clear_binance_api_key: form.clear_binance_api_key,
-    clear_binance_api_secret: form.clear_binance_api_secret
+    clear_binance_api_secret: form.clear_binance_api_secret,
   };
 
   const save = () => {
     startTransition(() => {
-      void requestJson<SettingsPayload>("/api/settings", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      }).then((result) => {
-        syncSettings(result);
-        setMessage("설정을 저장했습니다.");
-      }).catch((error: unknown) => {
-        setMessage(error instanceof Error ? error.message : "설정 저장에 실패했습니다.");
-      });
+      void requestJson<SettingsPayload>("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+        .then((result) => { syncSettings(result); setMessage("설정을 저장했습니다."); })
+        .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "설정 저장에 실패했습니다."); });
     });
   };
 
   const runPost = (path: string, successMessage: string, onSuccess?: (data: any) => void, body?: object) => {
     startTransition(() => {
-      void requestJson(path, {
-        method: "POST",
-        headers: body ? { "Content-Type": "application/json" } : undefined,
-        body: body ? JSON.stringify(body) : undefined
-      }).then((result) => {
-        onSuccess?.(result);
-        setMessage(successMessage);
-      }).catch((error: unknown) => {
-        setMessage(error instanceof Error ? error.message : "요청 처리에 실패했습니다.");
-      });
+      void requestJson(path, { method: "POST", headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined })
+        .then((result) => { onSuccess?.(result); setMessage(successMessage); })
+        .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "요청 처리에 실패했습니다."); });
     });
   };
 
@@ -389,41 +408,24 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">실거래 설정</p>
           <h2 className="mt-2 text-2xl font-semibold text-slate-900 sm:text-3xl">심볼, AI, 거래소 운영 제어</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">
-            AI가 켜져 있을 때만 의사결정과 리뷰 파이프라인이 동작합니다. AI를 끄면 실제 시장 스냅샷만 수집합니다.
-          </p>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면에서는 실거래 사용 여부, 수동 승인 정책, AI 호출 주기, Binance 연결, 자동 복구 상태를 함께 확인합니다.</p>
         </div>
         <div className="grid gap-2 sm:grid-cols-2">
-          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">OpenAI: {state.openai_api_key_configured ? "설정됨" : "미설정"}</span>
-          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">Binance Key: {state.binance_api_key_configured ? "설정됨" : "미설정"}</span>
-          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700">Binance Secret: {state.binance_api_secret_configured ? "설정됨" : "미설정"}</span>
-          <span className={`rounded-full px-3 py-2 text-xs font-semibold ${state.live_execution_ready ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>
-            실거래 상태: {state.live_execution_ready ? "실행 가능" : "가드 유지"}
-          </span>
+          <StatusPill tone={state.openai_api_key_configured ? "good" : "warn"}>OpenAI: {state.openai_api_key_configured ? "설정됨" : "미설정"}</StatusPill>
+          <StatusPill tone={state.binance_api_key_configured ? "good" : "warn"}>Binance Key: {state.binance_api_key_configured ? "설정됨" : "미설정"}</StatusPill>
+          <StatusPill tone={state.binance_api_secret_configured ? "good" : "warn"}>Binance Secret: {state.binance_api_secret_configured ? "설정됨" : "미설정"}</StatusPill>
+          <StatusPill tone={state.live_execution_ready ? "good" : state.trading_paused ? "danger" : "warn"}>실거래 상태: {state.live_execution_ready ? "실행 가능" : state.trading_paused ? "중지" : "가드 유지"}</StatusPill>
         </div>
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-6">
-        <div className="rounded-[1.5rem] bg-slate-950 px-4 py-4 text-white">
-          <p className="text-xs uppercase tracking-[0.24em] text-white/60">현재 모드</p>
-          <p className="mt-2 text-xl font-semibold">{formatDisplayValue(state.mode, "mode")}</p>
-        </div>
-        <div className="rounded-[1.5rem] border border-amber-200 bg-amber-50 px-4 py-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-amber-900">현재 월간 AI 호출</p>
-          <p className="mt-2 text-xl font-semibold text-slate-900">{state.estimated_monthly_ai_calls.toLocaleString("ko-KR")}회</p>
-        </div>
-        <div className="rounded-[1.5rem] border border-slate-200 bg-white px-4 py-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">AI 활성화 시 예상</p>
-          <p className="mt-2 text-xl font-semibold text-slate-900">{state.projected_monthly_ai_calls_if_enabled.toLocaleString("ko-KR")}회</p>
-        </div>
-        {projectedBreakdown.map(([key, value]) => (
-          <div key={key} className="rounded-[1.5rem] border border-slate-200 bg-white px-4 py-4">
-            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">{monthlyLabels[key] ?? key}</p>
-            <p className="mt-2 text-xl font-semibold text-slate-900">{value.toLocaleString("ko-KR")}회</p>
-          </div>
-        ))}
+        <MetricCard label="현재 모드" value={formatDisplayValue(state.mode, "mode")} tone="dark" />
+        <MetricCard label="현재 월간 AI 호출" value={`${state.estimated_monthly_ai_calls.toLocaleString("ko-KR")}회`} tone="warm" />
+        <MetricCard label="AI 활성 시 예상" value={`${state.projected_monthly_ai_calls_if_enabled.toLocaleString("ko-KR")}회`} />
+        {projectedBreakdown.map(([key, value]) => <MetricCard key={key} label={monthlyLabels[key] ?? key} value={`${value.toLocaleString("ko-KR")}회`} />)}
       </div>
 
+      <OperationalStatusPanel state={state} />
       <AIUsagePanel settings={state} />
 
       <section className="grid gap-5 xl:grid-cols-2">
@@ -437,15 +439,35 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
           </div>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <Toggle checked={form.live_trading_enabled} label="실거래 경로 사용" onChange={(value) => updateField("live_trading_enabled", value)} />
-            <Toggle checked={form.manual_live_approval} label="수동 승인 게이트" onChange={(value) => updateField("manual_live_approval", value)} />
+            <Toggle checked={form.manual_live_approval} label="수동 승인 정책 사용" onChange={(value) => updateField("manual_live_approval", value)} />
           </div>
+          <p className="mt-4 text-sm leading-6 text-slate-600">즉시 중지는 신규 진입을 막는 운영 pause입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용될 수 있습니다.</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/pause", "거래를 일시중지했습니다.", syncSettings)} type="button">즉시 중지</button>
             <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/resume", "거래 일시중지를 해제했습니다.", syncSettings)} type="button">중지 해제</button>
             <button className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", syncSettings, { minutes: form.live_approval_window_minutes })} type="button">실거래 승인</button>
             <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/live/disarm", "실거래 승인 창을 닫았습니다.", syncSettings)} type="button">승인 해제</button>
-            <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost(`/api/live/sync?symbol=${encodeURIComponent(form.default_symbol)}`, "거래소 상태와 보호주문 상태를 동기화했습니다.", setLiveSyncResult)} type="button">거래소 동기화</button>
-            <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/test/binance/live-order", "실주문 사전 점검을 마쳤습니다.", (result) => setLiveOrderResult({ ok: true, provider: "binance-live-test", message: "실주문 사전 점검에 성공했습니다.", details: result }), { symbol: form.default_symbol, side: "BUY" })} type="button">실주문 사전 점검</button>
+            <button
+              className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700"
+              onClick={async () => {
+                try {
+                  setLiveSyncResult(await requestJson<LiveSyncResult>(`/api/live/sync?symbol=${encodeURIComponent(form.default_symbol)}`, { method: "POST" }));
+                  setMessage("거래소 상태와 보호 주문 상태를 동기화했습니다.");
+                } catch (error: unknown) {
+                  if (error instanceof ApiRequestError && error.payload && typeof error.payload === "object") {
+                    const detail = "detail" in error.payload ? (error.payload as { detail?: unknown }).detail : error.payload;
+                    if (detail && typeof detail === "object") {
+                      setLiveSyncResult(detail as LiveSyncResult);
+                    }
+                  }
+                  setMessage(error instanceof Error ? error.message : "거래소 동기화에 실패했습니다.");
+                }
+              }}
+              type="button"
+            >
+              거래소 동기화
+            </button>
+            <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/test/binance/live-order", "실주문 사전 점검을 마쳤습니다.", (result) => setLiveOrderResult({ ok: true, provider: "binance-live-test", message: "실주문 사전 점검이 성공했습니다.", details: result }), { symbol: form.default_symbol, side: "BUY" })} type="button">실주문 사전 점검</button>
           </div>
           <LiveSyncPanel result={liveSyncResult} />
           <ResultCard title="실주문 사전 점검" result={liveOrderResult} />
@@ -460,7 +482,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">현재 선택 심볼</p><p className="mt-2 text-sm font-semibold text-slate-900">{mergedSymbols.join(", ")}</p></div>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="타임프레임"><input className={inputClass} value={form.default_timeframe} onChange={(event) => updateField("default_timeframe", event.target.value)} /></Field>
-              <Field label="최대 레버리지" hint="입력 값은 전역 상한이며, BTC 5x / 메이저 알트 3x / 일반 알트 2x 하드 캡이 추가로 적용됩니다."><input className={inputClass} type="number" min={1} max={5} step="0.1" value={form.max_leverage} onChange={(event) => updateField("max_leverage", Number(event.target.value))} /></Field>
+              <Field label="최대 레버리지" hint="표시 상한은 5x, 런타임에서는 심볼군 하드 캡이 추가로 적용됩니다."><input className={inputClass} type="number" min={1} max={5} step="0.1" value={form.max_leverage} onChange={(event) => updateField("max_leverage", Number(event.target.value))} /></Field>
               <Field label="거래당 최대 리스크" hint="하드 상한은 2%입니다."><input className={inputClass} type="number" min={0.001} max={0.02} step="0.001" value={form.max_risk_per_trade} onChange={(event) => updateField("max_risk_per_trade", Number(event.target.value))} /></Field>
               <Field label="일일 손실 한도" hint="하드 상한은 5%입니다."><input className={inputClass} type="number" min={0.001} max={0.05} step="0.001" value={form.max_daily_loss} onChange={(event) => updateField("max_daily_loss", Number(event.target.value))} /></Field>
               <Field label="연속 손실 한도"><input className={inputClass} type="number" min={1} max={20} value={form.max_consecutive_losses} onChange={(event) => updateField("max_consecutive_losses", Number(event.target.value))} /></Field>
@@ -512,12 +534,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
       </section>
 
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <p className="text-sm text-slate-600">선택한 심볼 목록은 수동 실행, 스케줄러, 월간 AI 호출 계산에 모두 반영됩니다.</p>
-        <button className="rounded-full bg-amber-400 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60" disabled={isPending} onClick={save} type="button">
-          {isPending ? "저장 중..." : "설정 저장"}
-        </button>
+        <p className="text-sm text-slate-600">선택한 심볼 목록은 수동 실행, 스케줄러, 토큰 사용량 계산에 모두 반영됩니다.</p>
+        <button className="rounded-full bg-amber-400 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60" disabled={isPending} onClick={save} type="button">{isPending ? "저장 중..." : "설정 저장"}</button>
       </div>
-
       {message ? <p className="text-sm text-slate-600">{message}</p> : null}
     </div>
   );

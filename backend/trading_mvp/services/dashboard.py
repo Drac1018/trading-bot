@@ -80,6 +80,7 @@ def _build_position_protection_state(session: Session, position: Position) -> di
 
 def get_overview(session: Session) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
+    settings_payload = serialize_settings(settings_row)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
     latest_decision = session.scalar(select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1))
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
@@ -89,8 +90,11 @@ def get_overview(session: Session) -> OverviewResponse:
     protected_positions = sum(1 for item in protection_summary if bool(item["protected"]))
     unprotected_positions = len(protection_summary) - protected_positions
     blocked_reasons = latest_risk.reason_codes if latest_risk is not None and not latest_risk.allowed else []
+    auto_resume_last_blockers = settings_payload.get("auto_resume_last_blockers", [])
+    if not isinstance(auto_resume_last_blockers, list):
+        auto_resume_last_blockers = []
     return OverviewResponse(
-        mode=serialize_settings(settings_row)["mode"],  # type: ignore[arg-type]
+        mode=str(settings_payload["mode"]),
         symbol=settings_row.default_symbol,
         tracked_symbols=get_effective_symbols(settings_row),
         timeframe=settings_row.default_timeframe,
@@ -101,6 +105,15 @@ def get_overview(session: Session) -> OverviewResponse:
         live_trading_enabled=settings_row.live_trading_enabled,
         live_execution_ready=is_live_execution_ready(settings_row),
         trading_paused=settings_row.trading_paused,
+        pause_reason_code=str(settings_payload.get("pause_reason_code") or "") or None,
+        pause_origin=str(settings_payload.get("pause_origin") or "") or None,
+        pause_triggered_at=settings_row.pause_triggered_at,
+        auto_resume_after=settings_row.auto_resume_after,
+        auto_resume_status=str(settings_payload.get("auto_resume_status") or "not_paused"),
+        auto_resume_eligible=bool(settings_payload.get("auto_resume_eligible", False)),
+        auto_resume_last_blockers=[str(item) for item in auto_resume_last_blockers],
+        pause_severity=str(settings_payload.get("pause_severity") or "") or None,
+        pause_recovery_class=str(settings_payload.get("pause_recovery_class") or "") or None,
         daily_pnl=latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
         cumulative_pnl=latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
         blocked_reasons=blocked_reasons,
