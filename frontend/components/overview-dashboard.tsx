@@ -9,6 +9,18 @@ import { formatDisplayValue } from "../lib/ui-copy";
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshIntervalMs = 15000;
 
+type ProtectionSummary = {
+  symbol: string;
+  side: string;
+  status: string;
+  protected: boolean;
+  protective_order_count: number;
+  has_stop_loss: boolean;
+  has_take_profit: boolean;
+  missing_components: string[];
+  position_size: number;
+};
+
 type Overview = {
   mode: string;
   symbol: string;
@@ -24,6 +36,9 @@ type Overview = {
   daily_pnl: number;
   cumulative_pnl: number;
   blocked_reasons: string[];
+  protected_positions: number;
+  unprotected_positions: number;
+  position_protection_summary: ProtectionSummary[];
 };
 
 type Row = Record<string, unknown>;
@@ -108,7 +123,7 @@ function SmallList({
                     ? row.explanation_short
                     : typeof row.summary === "string"
                       ? row.summary
-                      : "세부 내용을 확인하세요."}
+                      : "세부 내용은 상세 화면에서 확인해 주세요."}
               </p>
             </article>
           ))}
@@ -168,7 +183,7 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
 
   const blockedSummary = useMemo(() => {
     if (payload.overview.blocked_reasons.length === 0) {
-      return "현재 차단 사유 없이 실거래 조건을 평가 중입니다.";
+      return "현재 차단 사유 없이 거래 조건을 평가 중입니다.";
     }
     return payload.overview.blocked_reasons.map((item) => formatDisplayValue(item)).join(" / ");
   }, [payload.overview.blocked_reasons]);
@@ -176,7 +191,14 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
   const latestDecisionText =
     typeof payload.overview.latest_decision?.explanation_short === "string"
       ? payload.overview.latest_decision.explanation_short
-      : "최근 의사결정이 아직 없습니다.";
+      : "최근 의사결정 데이터가 아직 없습니다.";
+
+  const protectionSummaryText =
+    payload.overview.unprotected_positions > 0
+      ? `${payload.overview.unprotected_positions}개 포지션이 보호 확인 필요 상태입니다.`
+      : payload.overview.open_positions > 0
+        ? "열린 포지션이 모두 보호주문 기준으로 확인되었습니다."
+        : "현재 열린 포지션이 없습니다.";
 
   return (
     <div className="space-y-6">
@@ -188,7 +210,7 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
               실시간 거래 상태 대시보드
             </h1>
             <p className="mt-4 max-w-3xl text-sm leading-7 text-slate-600 sm:text-base">
-              실거래 준비 상태, 최근 의사결정, 최신 알림, 주문 흐름을 자동 새로고침으로 확인합니다.
+              거래 준비 상태, 최근 의사결정, 보호 상태, 주문 흐름을 자동 새로고침으로 확인합니다.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -215,7 +237,7 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
         {refreshError ? <p className="mt-4 text-sm text-rose-700">{refreshError}</p> : null}
       </section>
 
-      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <SummaryCard
           label="추적 심볼"
           value={String(payload.overview.tracked_symbols.length)}
@@ -236,11 +258,16 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
           value={formatDisplayValue(payload.overview.cumulative_pnl, "cumulative_pnl")}
           hint="전체 운영 누적 손익"
         />
+        <SummaryCard
+          label="보호 상태"
+          value={`${payload.overview.protected_positions}/${payload.overview.open_positions}`}
+          hint={protectionSummaryText}
+        />
       </section>
 
       <section className="grid gap-4 lg:grid-cols-3">
         <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">핵심 상태</p>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">시장 상태</p>
           <div className="mt-4 space-y-3">
             <div className="rounded-2xl bg-canvas p-4">
               <p className="text-xs text-slate-500">기본 심볼</p>
@@ -278,12 +305,12 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
           <div className="mt-4 rounded-2xl bg-canvas p-4">
             <p className="text-xs text-slate-500">실거래 상태</p>
             <p className="mt-2 text-lg font-semibold text-ink">
-              {payload.overview.live_trading_enabled ? "실거래 경로 사용 중" : "실거래 경로 비활성"}
+              {payload.overview.live_trading_enabled ? "실거래 경로 사용 중" : "실거래 경로 비활성화"}
             </p>
             <p className="mt-2 text-sm leading-6 text-slate-600">
               {payload.overview.trading_paused
                 ? "현재 거래가 일시중지 상태입니다."
-                : "실거래 승인 창과 리스크 엔진 조건을 계속 점검합니다."}
+                : "실거래 승인 창과 리스크 엔진 조건을 계속 확인 중입니다."}
             </p>
           </div>
         </div>
@@ -305,6 +332,15 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
                     <span className="rounded-full border border-amber-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
                       {String(row.side ?? "-")}
                     </span>
+                    {typeof row.protected === "boolean" ? (
+                      <span
+                        className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                          row.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
+                        }`}
+                      >
+                        {row.protected ? "보호됨" : "보호 확인 필요"}
+                      </span>
+                    ) : null}
                   </div>
                   <p className="mt-2 text-sm leading-6 text-slate-600">
                     수량 {formatDisplayValue(row.quantity, "quantity")} / 진입가{" "}
@@ -315,6 +351,61 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
             </div>
           )}
         </div>
+      </section>
+
+      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Protection</p>
+        <h2 className="mt-2 text-xl font-semibold text-ink">포지션 보호 상태</h2>
+        {payload.overview.position_protection_summary.length === 0 ? (
+          <div className="mt-4 rounded-2xl border border-dashed border-amber-300 px-4 py-6 text-sm text-slate-500">
+            현재 열린 포지션이 없어 보호 상태를 표시할 항목이 없습니다.
+          </div>
+        ) : (
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            {payload.overview.position_protection_summary.map((item) => (
+              <article key={`${item.symbol}-${item.side}`} className="rounded-[1.5rem] border border-amber-100 bg-canvas/80 p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full border border-amber-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
+                    {item.symbol}
+                  </span>
+                  <span className="rounded-full border border-amber-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
+                    {formatDisplayValue(item.side, "side")}
+                  </span>
+                  <span
+                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                      item.protected ? "bg-emerald-100 text-emerald-800" : "bg-rose-100 text-rose-800"
+                    }`}
+                  >
+                    {item.protected ? "보호됨" : "보호 확인 필요"}
+                  </span>
+                </div>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl bg-white px-4 py-3">
+                    <p className="text-xs text-slate-500">포지션 수량</p>
+                    <p className="mt-2 text-sm font-semibold text-ink">{formatDisplayValue(item.position_size, "quantity")}</p>
+                  </div>
+                  <div className="rounded-2xl bg-white px-4 py-3">
+                    <p className="text-xs text-slate-500">보호주문 수</p>
+                    <p className="mt-2 text-sm font-semibold text-ink">{item.protective_order_count}개</p>
+                  </div>
+                  <div className="rounded-2xl bg-white px-4 py-3">
+                    <p className="text-xs text-slate-500">손절 주문</p>
+                    <p className="mt-2 text-sm font-semibold text-ink">{item.has_stop_loss ? "확인됨" : "없음"}</p>
+                  </div>
+                  <div className="rounded-2xl bg-white px-4 py-3">
+                    <p className="text-xs text-slate-500">익절 주문</p>
+                    <p className="mt-2 text-sm font-semibold text-ink">{item.has_take_profit ? "확인됨" : "없음"}</p>
+                  </div>
+                </div>
+                {!item.protected ? (
+                  <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+                    누락 항목: {item.missing_components.length > 0 ? item.missing_components.join(", ") : "보호주문 확인 필요"}
+                  </div>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <div className="grid gap-6 xl:grid-cols-3">

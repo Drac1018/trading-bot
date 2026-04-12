@@ -27,6 +27,9 @@ from trading_mvp.services.settings import (
     serialize_settings,
 )
 
+FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
+PROTECTIVE_ORDER_TYPES = {"stop_market", "take_profit_market"}
+
 
 def _serialize_model_list(rows: Sequence[object]) -> list[dict[str, object]]:
     payloads: list[dict[str, object]] = []
@@ -39,6 +42,42 @@ def _serialize_model_list(rows: Sequence[object]) -> list[dict[str, object]]:
     return payloads
 
 
+def _build_position_protection_state(session: Session, position: Position) -> dict[str, object]:
+    active_orders = list(
+        session.scalars(
+            select(Order).where(
+                Order.mode == "live",
+                Order.symbol == position.symbol,
+                Order.status.notin_(FINAL_ORDER_STATUSES),
+            )
+        )
+    )
+    protective_orders = [
+        order
+        for order in active_orders
+        if order.order_type.lower() in PROTECTIVE_ORDER_TYPES
+    ]
+    has_stop = any(order.order_type.lower().startswith("stop") for order in protective_orders)
+    has_take_profit = any(order.order_type.lower().startswith("take_profit") for order in protective_orders)
+    missing_components: list[str] = []
+    if not has_stop:
+        missing_components.append("stop_loss")
+    if not has_take_profit:
+        missing_components.append("take_profit")
+    return {
+        "symbol": position.symbol,
+        "side": position.side,
+        "status": "protected" if not missing_components else "missing",
+        "protected": not missing_components,
+        "protective_order_count": len(protective_orders),
+        "has_stop_loss": has_stop,
+        "has_take_profit": has_take_profit,
+        "missing_components": missing_components,
+        "order_ids": [order.id for order in protective_orders],
+        "position_size": position.quantity,
+    }
+
+
 def get_overview(session: Session) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
@@ -46,6 +85,9 @@ def get_overview(session: Session) -> OverviewResponse:
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
     latest_pnl = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
     open_positions = list(session.scalars(select(Position).where(Position.status == "open", Position.mode == "live")))
+    protection_summary = [_build_position_protection_state(session, position) for position in open_positions]
+    protected_positions = sum(1 for item in protection_summary if bool(item["protected"]))
+    unprotected_positions = len(protection_summary) - protected_positions
     blocked_reasons = latest_risk.reason_codes if latest_risk is not None and not latest_risk.allowed else []
     return OverviewResponse(
         mode=serialize_settings(settings_row)["mode"],  # type: ignore[arg-type]
@@ -62,6 +104,9 @@ def get_overview(session: Session) -> OverviewResponse:
         daily_pnl=latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
         cumulative_pnl=latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
         blocked_reasons=blocked_reasons,
+        protected_positions=protected_positions,
+        unprotected_positions=unprotected_positions,
+        position_protection_summary=protection_summary,
     )
 
 
@@ -78,7 +123,11 @@ def get_decisions(session: Session, limit: int = 50) -> list[dict[str, object]]:
 
 
 def get_positions(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(Position).where(Position.mode == "live").order_by(desc(Position.created_at)).limit(limit))))
+    rows = list(session.scalars(select(Position).where(Position.mode == "live").order_by(desc(Position.created_at)).limit(limit)))
+    payloads = _serialize_model_list(rows)
+    for payload, position in zip(payloads, rows, strict=False):
+        payload.update(_build_position_protection_state(session, position))
+    return payloads
 
 
 def get_orders(

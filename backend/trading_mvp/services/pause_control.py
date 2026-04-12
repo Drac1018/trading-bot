@@ -127,8 +127,12 @@ def _write_auto_resume_state(
     *,
     status: str,
     blockers: list[str],
+    symbol_blockers: dict[str, list[str]],
+    blocker_details: list[dict[str, object]],
     evaluated_symbols: list[str],
     protective_orders: dict[str, str],
+    market_data_status: dict[str, str],
+    sync_status: dict[str, str],
     approval_state: str,
     approval_detail: dict[str, object],
 ) -> None:
@@ -136,9 +140,13 @@ def _write_auto_resume_state(
     detail["auto_resume"] = {
         "status": status,
         "blockers": blockers,
+        "symbol_blockers": symbol_blockers,
+        "blocker_details": blocker_details,
         "last_checked_at": utcnow_naive().isoformat(),
         "evaluated_symbols": evaluated_symbols,
         "protective_orders": protective_orders,
+        "market_data_status": market_data_status,
+        "sync_status": sync_status,
         "approval_state": approval_state,
         "approval_detail": approval_detail,
     }
@@ -166,12 +174,20 @@ def evaluate_auto_resume_safety(
         "pause_origin": settings_row.pause_origin,
         "auto_resume_after": settings_row.auto_resume_after.isoformat() if settings_row.auto_resume_after else None,
         "blockers": [],
+        "symbol_blockers": {},
+        "blocker_details": [],
         "evaluated_symbols": evaluated_symbols,
         "protective_orders": {},
+        "market_data_status": {},
+        "sync_status": {},
         "approval_state": "not_checked",
+        "approval_detail": {},
         "pause_severity": pause_reason_severity(reason_code) if reason_code else None,
         "pause_recovery_class": pause_reason_recovery_class(reason_code) if reason_code else None,
         "trigger_source": trigger_source,
+        "health_error": None,
+        "market_errors": {},
+        "sync_errors": {},
     }
     if not settings_row.trading_paused:
         return result
@@ -188,23 +204,48 @@ def evaluate_auto_resume_safety(
 
     result["attempted"] = True
     blockers: list[str] = []
+    symbol_blockers: dict[str, list[str]] = {}
+    blocker_details: list[dict[str, object]] = []
+    market_data_status: dict[str, str] = {}
+    sync_status: dict[str, str] = {}
     defaults = get_settings()
     credentials = get_runtime_credentials(settings_row, defaults=defaults)
 
+    def add_blocker(
+        code: str,
+        *,
+        symbol: str | None = None,
+        detail: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        blockers.append(code)
+        if symbol is not None:
+            values = symbol_blockers.setdefault(symbol, [])
+            if code not in values:
+                values.append(code)
+        blocker_detail: dict[str, object] = {"code": code}
+        if symbol is not None:
+            blocker_detail["symbol"] = symbol
+        if detail is not None:
+            blocker_detail["detail"] = detail
+        if source is not None:
+            blocker_detail["source"] = source
+        blocker_details.append(blocker_detail)
+
     if not defaults.live_trading_env_enabled:
-        blockers.append("LIVE_ENV_DISABLED")
+        add_blocker("LIVE_ENV_DISABLED", source="settings")
     if not settings_row.live_trading_enabled:
-        blockers.append("LIVE_TRADING_DISABLED")
+        add_blocker("LIVE_TRADING_DISABLED", source="settings")
     if not settings_row.manual_live_approval:
-        blockers.append("LIVE_APPROVAL_POLICY_DISABLED")
+        add_blocker("LIVE_APPROVAL_POLICY_DISABLED", source="settings")
     if not credentials.binance_api_key or not credentials.binance_api_secret:
-        blockers.append("LIVE_CREDENTIALS_MISSING")
+        add_blocker("LIVE_CREDENTIALS_MISSING", source="credentials")
 
     approval_allowed, approval_state, approval_detail = _approval_state(settings_row)
     result["approval_state"] = approval_state
     result["approval_detail"] = approval_detail
     if not approval_allowed:
-        blockers.append("LIVE_APPROVAL_REQUIRED")
+        add_blocker("LIVE_APPROVAL_REQUIRED", source="approval")
 
     latest_pnl = get_latest_pnl_snapshot(session, settings_row)
     previous_daily_pnl = _to_float(resume_context.get("daily_pnl_before_pause"))
@@ -214,29 +255,37 @@ def evaluate_auto_resume_safety(
         settings_row.max_daily_loss,
         HARD_MAX_DAILY_LOSS,
     ):
-        blockers.append("DAILY_LOSS_LIMIT_REACHED")
+        add_blocker("DAILY_LOSS_LIMIT_REACHED", detail="Daily loss threshold exceeded.", source="pnl")
     if latest_pnl.consecutive_losses >= settings_row.max_consecutive_losses:
-        blockers.append("MAX_CONSECUTIVE_LOSSES_REACHED")
+        add_blocker("MAX_CONSECUTIVE_LOSSES_REACHED", detail="Consecutive loss threshold exceeded.", source="pnl")
     if latest_pnl.consecutive_losses > previous_consecutive_losses:
-        blockers.append("PORTFOLIO_RISK_UNCERTAIN")
+        add_blocker("PORTFOLIO_RISK_UNCERTAIN", detail="Consecutive losses increased while paused.", source="pnl")
     if previous_daily_pnl < 0 and latest_pnl.daily_pnl < previous_daily_pnl:
-        blockers.append("PORTFOLIO_RISK_UNCERTAIN")
+        add_blocker("PORTFOLIO_RISK_UNCERTAIN", detail="Daily PnL deteriorated while paused.", source="pnl")
     if previous_equity > 0 and latest_pnl.equity < previous_equity * 0.85:
-        blockers.append("PORTFOLIO_RISK_UNCERTAIN")
+        add_blocker("PORTFOLIO_RISK_UNCERTAIN", detail="Equity dropped materially while paused.", source="pnl")
 
     protective_summary: dict[str, str] = {}
     if not blockers:
         try:
             client = _build_client(settings_row)
         except Exception:
-            blockers.append("EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE")
+            add_blocker(
+                "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+                detail="Failed to initialize Binance client for auto-resume evaluation.",
+                source="client",
+            )
             client = None
 
         if client is not None:
             try:
                 client.get_account_info()
             except Exception as exc:
-                blockers.append("EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
+                add_blocker(
+                    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                    source="account",
+                )
                 result["health_error"] = str(exc)
 
             for symbol in evaluated_symbols:
@@ -245,49 +294,92 @@ def evaluate_auto_resume_safety(
                     latest_candle = candles[-1]
                     staleness = (utcnow_naive() - latest_candle.timestamp).total_seconds()
                     if staleness > settings_row.stale_market_seconds:
-                        blockers.append("TEMPORARY_MARKET_DATA_FAILURE")
+                        add_blocker(
+                            "TEMPORARY_MARKET_DATA_FAILURE",
+                            symbol=symbol,
+                            detail=f"Market data stale by {int(staleness)} seconds.",
+                            source="market_data",
+                        )
+                        market_data_status[symbol] = "stale"
                         protective_summary.setdefault(symbol, "market_data_stale")
                         continue
+                    market_data_status[symbol] = "ok"
                 except Exception as exc:
-                    blockers.append("TEMPORARY_MARKET_DATA_FAILURE")
+                    add_blocker(
+                        "TEMPORARY_MARKET_DATA_FAILURE",
+                        symbol=symbol,
+                        detail=str(exc),
+                        source="market_data",
+                    )
+                    market_data_status[symbol] = "unavailable"
                     protective_summary.setdefault(symbol, "market_data_unavailable")
-                    result.setdefault("market_errors", {})[symbol] = str(exc)
+                    result["market_errors"][symbol] = str(exc)
                     continue
 
                 try:
                     open_orders = client.get_open_orders(symbol)
                 except Exception as exc:
-                    blockers.append("EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
-                    result.setdefault("sync_errors", {})[f"{symbol}:open_orders"] = str(exc)
+                    add_blocker(
+                        "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+                        symbol=symbol,
+                        detail=str(exc),
+                        source="open_orders",
+                    )
+                    sync_status[symbol] = "open_orders_failed"
+                    result["sync_errors"][f"{symbol}:open_orders"] = str(exc)
                     protective_summary.setdefault(symbol, "open_orders_unavailable")
                     continue
 
                 try:
                     remote_positions = client.get_position_information(symbol)
                 except Exception as exc:
-                    blockers.append("EXCHANGE_POSITION_SYNC_FAILED")
-                    result.setdefault("sync_errors", {})[f"{symbol}:positions"] = str(exc)
+                    add_blocker(
+                        "EXCHANGE_POSITION_SYNC_FAILED",
+                        symbol=symbol,
+                        detail=str(exc),
+                        source="positions",
+                    )
+                    sync_status[symbol] = "positions_failed"
+                    result["sync_errors"][f"{symbol}:positions"] = str(exc)
                     protective_summary.setdefault(symbol, "positions_unavailable")
                     continue
 
                 consistency_blocker = _position_consistency_blocker(settings_row, symbol, remote_positions)
                 if consistency_blocker:
-                    blockers.append(consistency_blocker)
+                    add_blocker(
+                        consistency_blocker,
+                        symbol=symbol,
+                        detail="Local and exchange position state do not match.",
+                        source="reconciliation",
+                    )
+                    sync_status[symbol] = "state_inconsistent"
                     protective_summary.setdefault(symbol, "state_inconsistent")
                     continue
 
                 has_open_position = any(abs(_to_float(item.get("positionAmt"))) > 0 for item in remote_positions)
                 if has_open_position and not _has_protective_orders(open_orders):
-                    blockers.append("MISSING_PROTECTIVE_ORDERS")
+                    add_blocker(
+                        "MISSING_PROTECTIVE_ORDERS",
+                        symbol=symbol,
+                        detail="Open position exists without reduceOnly/closePosition protective orders.",
+                        source="protective_orders",
+                    )
+                    sync_status[symbol] = "protective_orders_missing"
                     protective_summary[symbol] = "missing"
                 elif has_open_position:
+                    sync_status[symbol] = "position_ready"
                     protective_summary[symbol] = "ready"
                 else:
+                    sync_status[symbol] = "flat"
                     protective_summary[symbol] = "flat"
 
     deduped_blockers = list(dict.fromkeys(blockers))
     result["blockers"] = deduped_blockers
+    result["symbol_blockers"] = symbol_blockers
+    result["blocker_details"] = blocker_details
     result["protective_orders"] = protective_summary
+    result["market_data_status"] = market_data_status
+    result["sync_status"] = sync_status
     result["allowed"] = not deduped_blockers
     result["status"] = "ready" if result["allowed"] else "blocked"
     return result
@@ -317,8 +409,18 @@ def attempt_auto_resume(
             settings_row,
             status=str(evaluation["status"]),
             blockers=[str(item) for item in evaluation.get("blockers", [])],
+            symbol_blockers={
+                str(key): [str(item) for item in value]
+                for key, value in evaluation.get("symbol_blockers", {}).items()
+            },
+            blocker_details=[
+                {str(key): value for key, value in item.items()}
+                for item in evaluation.get("blocker_details", [])
+            ],
             evaluated_symbols=[str(item) for item in evaluation.get("evaluated_symbols", [])],
             protective_orders={str(key): str(value) for key, value in evaluation.get("protective_orders", {}).items()},
+            market_data_status={str(key): str(value) for key, value in evaluation.get("market_data_status", {}).items()},
+            sync_status={str(key): str(value) for key, value in evaluation.get("sync_status", {}).items()},
             approval_state=str(evaluation.get("approval_state", "not_checked")),
             approval_detail=dict(evaluation.get("approval_detail", {})),
         )
@@ -363,8 +465,12 @@ def attempt_auto_resume(
             settings_row,
             status="blocked",
             blockers=[str(item) for item in evaluation["blockers"]],
+            symbol_blockers={str(key): [str(item) for item in value] for key, value in evaluation["symbol_blockers"].items()},
+            blocker_details=[{str(key): value for key, value in item.items()} for item in evaluation["blocker_details"]],
             evaluated_symbols=[str(item) for item in evaluation["evaluated_symbols"]],
             protective_orders={str(key): str(value) for key, value in evaluation["protective_orders"].items()},
+            market_data_status={str(key): str(value) for key, value in evaluation["market_data_status"].items()},
+            sync_status={str(key): str(value) for key, value in evaluation["sync_status"].items()},
             approval_state=str(evaluation.get("approval_state", "not_checked")),
             approval_detail=dict(evaluation.get("approval_detail", {})),
         )

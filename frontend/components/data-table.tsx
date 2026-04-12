@@ -10,6 +10,11 @@ type Row = Record<string, unknown>;
 
 const preferredColumnOrder = [
   "status",
+  "protected",
+  "protective_order_count",
+  "has_stop_loss",
+  "has_take_profit",
+  "missing_components",
   "decision",
   "symbol",
   "timeframe",
@@ -140,12 +145,21 @@ export function DataTable({
                       {formatDisplayValue(row.provider_name, "provider_name")}
                     </span>
                   ) : null}
-                  {typeof row.mode === "string" ? (
-                    <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
-                      {formatDisplayValue(row.mode, "mode")}
-                    </span>
-                  ) : null}
-                </div>
+                {typeof row.mode === "string" ? (
+                  <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                    {formatDisplayValue(row.mode, "mode")}
+                  </span>
+                ) : null}
+                {typeof row.protected === "boolean" ? (
+                  <span
+                    className={`rounded-full px-3 py-1 text-xs font-medium ${
+                      row.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
+                    }`}
+                  >
+                    {row.protected ? "보호됨" : "보호 확인 필요"}
+                  </span>
+                ) : null}
+              </div>
               </div>
 
               <dl className="mt-4 grid gap-3 md:grid-cols-2">

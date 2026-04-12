@@ -194,6 +194,40 @@ def test_live_risk_blocks_when_env_gate_is_disabled(db_session) -> None:
         risk_service.get_settings = original_get_settings  # type: ignore[assignment]
 
 
+def test_reduce_is_allowed_while_trading_is_paused(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.trading_paused = True
+    settings_row.live_trading_enabled = False
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    db_session.add(settings_row)
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="reduce",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=64000.0,
+        take_profit=66500.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="paused reduce",
+        explanation_detailed="paused mode should still allow reduce-only management for an existing position.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is True
+    assert "TRADING_PAUSED" not in result.reason_codes
+    assert "LIVE_TRADING_DISABLED" not in result.reason_codes
+
+
 def test_btc_uses_five_x_hard_cap(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.max_leverage = 5.0

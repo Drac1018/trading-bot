@@ -110,6 +110,7 @@ def evaluate_risk(
     defaults = get_settings()
     live_requested = settings_row.live_trading_enabled
     operating_mode: Literal["live", "paused", "hold"] = "live"
+    is_entry_decision = decision.decision in {"long", "short"}
     latest_pnl = get_latest_pnl_snapshot(session, settings_row)
     credentials = get_runtime_credentials(settings_row)
     symbol_risk_tier = get_symbol_risk_tier(decision.symbol)
@@ -118,22 +119,22 @@ def evaluate_risk(
     effective_daily_loss_cap = min(settings_row.max_daily_loss, HARD_MAX_DAILY_LOSS)
     exposure_metrics = _build_exposure_metrics(session, decision.symbol, latest_pnl.equity)
 
-    if settings_row.trading_paused:
+    if settings_row.trading_paused and is_entry_decision:
         reason_codes.append("TRADING_PAUSED")
         operating_mode = "paused"
-    if market_snapshot.is_stale:
+    if market_snapshot.is_stale and is_entry_decision:
         reason_codes.append("STALE_MARKET_DATA")
-    if not market_snapshot.is_complete:
+    if not market_snapshot.is_complete and is_entry_decision:
         reason_codes.append("INCOMPLETE_MARKET_DATA")
-    if latest_pnl.daily_pnl < 0 and abs(latest_pnl.daily_pnl) / max(latest_pnl.equity, 1.0) >= effective_daily_loss_cap:
+    if is_entry_decision and latest_pnl.daily_pnl < 0 and abs(latest_pnl.daily_pnl) / max(latest_pnl.equity, 1.0) >= effective_daily_loss_cap:
         reason_codes.append("DAILY_LOSS_LIMIT_REACHED")
-    if latest_pnl.consecutive_losses >= settings_row.max_consecutive_losses and decision.decision in {"long", "short"}:
+    if latest_pnl.consecutive_losses >= settings_row.max_consecutive_losses and is_entry_decision:
         reason_codes.append("MAX_CONSECUTIVE_LOSSES_REACHED")
-    if decision.leverage > effective_leverage_cap:
+    if is_entry_decision and decision.leverage > effective_leverage_cap:
         reason_codes.append("LEVERAGE_EXCEEDS_LIMIT")
-    if decision.risk_pct > effective_risk_cap:
+    if is_entry_decision and decision.risk_pct > effective_risk_cap:
         reason_codes.append("RISK_PCT_EXCEEDS_LIMIT")
-    if decision.decision in {"long", "short"} and (decision.stop_loss is None or decision.take_profit is None):
+    if is_entry_decision and (decision.stop_loss is None or decision.take_profit is None):
         reason_codes.append("MISSING_STOP_OR_TARGET")
 
     entry = _entry_price(decision, market_snapshot)
@@ -145,22 +146,23 @@ def evaluate_risk(
             reason_codes.append("INVALID_SHORT_BRACKETS")
 
     slippage = abs(entry - market_snapshot.latest_price) / max(market_snapshot.latest_price, 1.0)
-    if slippage > settings_row.slippage_threshold_pct and decision.decision in {"long", "short", "reduce", "exit"}:
+    if slippage > settings_row.slippage_threshold_pct and is_entry_decision:
         reason_codes.append("SLIPPAGE_THRESHOLD_EXCEEDED")
     if decision.decision == "hold":
         reason_codes.append("HOLD_DECISION")
         operating_mode = "hold" if operating_mode != "paused" else operating_mode
 
-    if live_requested:
+    if not credentials.binance_api_key or not credentials.binance_api_secret:
+        if decision.decision != "hold":
+            reason_codes.append("LIVE_CREDENTIALS_MISSING")
+    if is_entry_decision and live_requested:
         if not defaults.live_trading_env_enabled:
             reason_codes.append("LIVE_ENV_DISABLED")
         if not settings_row.manual_live_approval:
             reason_codes.append("LIVE_APPROVAL_POLICY_DISABLED")
         if not is_live_execution_armed(settings_row):
             reason_codes.append("LIVE_APPROVAL_REQUIRED")
-        if not credentials.binance_api_key or not credentials.binance_api_secret:
-            reason_codes.append("LIVE_CREDENTIALS_MISSING")
-    elif decision.decision != "hold":
+    elif is_entry_decision:
         reason_codes.append("LIVE_TRADING_DISABLED")
     allowed = len(reason_codes) == 0
     result = RiskCheckResult(

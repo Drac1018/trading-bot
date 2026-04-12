@@ -79,6 +79,26 @@ type ConnectionTestResult = {
   details: Record<string, unknown>;
 };
 
+type LiveSyncResult = {
+  symbols?: string[];
+  synced_orders?: number;
+  synced_positions?: number;
+  equity?: number;
+  symbol_protection_state?: Record<
+    string,
+    {
+      status?: string;
+      protected?: boolean;
+      protective_order_count?: number;
+      has_stop_loss?: boolean;
+      has_take_profit?: boolean;
+      missing_components?: string[];
+    }
+  >;
+  unprotected_positions?: string[];
+  emergency_actions_taken?: Array<Record<string, unknown>>;
+};
+
 type FormState = Omit<
   SettingsPayload,
   | "id"
@@ -196,6 +216,74 @@ function ResultCard({ title, result }: { title: string; result: ConnectionTestRe
   );
 }
 
+function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
+  if (!result) {
+    return null;
+  }
+
+  const protectionEntries = Object.entries(result.symbol_protection_state ?? {});
+
+  return (
+    <div className="mt-3 space-y-3 rounded-2xl border border-amber-200 bg-white p-4">
+      <div className="flex flex-wrap gap-2">
+        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+          동기화 심볼 {result.symbols?.join(", ") ?? "-"}
+        </span>
+        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+          주문 {result.synced_orders ?? 0}건
+        </span>
+        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+          포지션 {result.synced_positions ?? 0}건
+        </span>
+        {typeof result.equity === "number" ? (
+          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+            Equity {formatDisplayValue(result.equity, "equity")}
+          </span>
+        ) : null}
+      </div>
+
+      {protectionEntries.length > 0 ? (
+        <div className="grid gap-3 md:grid-cols-2">
+          {protectionEntries.map(([symbol, state]) => (
+            <div key={symbol} className="rounded-2xl bg-canvas px-4 py-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-full border border-amber-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
+                  {symbol}
+                </span>
+                <span
+                  className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                    state.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
+                  }`}
+                >
+                  {state.protected ? "보호됨" : "보호 확인 필요"}
+                </span>
+              </div>
+              <p className="mt-3 text-sm text-slate-700">
+                상태: {formatDisplayValue(state.status, "status")} / 보호주문 {state.protective_order_count ?? 0}개
+              </p>
+              {!state.protected && (state.missing_components?.length ?? 0) > 0 ? (
+                <p className="mt-2 text-sm text-rose-700">누락: {state.missing_components?.join(", ")}</p>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {(result.unprotected_positions?.length ?? 0) > 0 ? (
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+          무보호 포지션 감지: {result.unprotected_positions?.join(", ")}
+        </div>
+      ) : null}
+
+      {(result.emergency_actions_taken?.length ?? 0) > 0 ? (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          비상 조치: {JSON.stringify(result.emergency_actions_taken, null, 2)}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const [state, setState] = useState(initial);
   const [form, setForm] = useState<FormState>(() => toFormState(initial));
@@ -203,7 +291,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const [openAiResult, setOpenAiResult] = useState<ConnectionTestResult | null>(null);
   const [binanceResult, setBinanceResult] = useState<ConnectionTestResult | null>(null);
   const [liveOrderResult, setLiveOrderResult] = useState<ConnectionTestResult | null>(null);
-  const [liveSyncResult, setLiveSyncResult] = useState<Record<string, unknown> | null>(null);
+  const [liveSyncResult, setLiveSyncResult] = useState<LiveSyncResult | null>(null);
   const [isPending, startTransition] = useTransition();
 
   const projectedBreakdown = useMemo(
@@ -356,10 +444,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/resume", "거래 일시중지를 해제했습니다.", syncSettings)} type="button">중지 해제</button>
             <button className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", syncSettings, { minutes: form.live_approval_window_minutes })} type="button">실거래 승인</button>
             <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/live/disarm", "실거래 승인 창을 닫았습니다.", syncSettings)} type="button">승인 해제</button>
-            <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost(`/api/live/sync?symbol=${encodeURIComponent(form.default_symbol)}`, "거래소 상태를 동기화했습니다.", setLiveSyncResult)} type="button">거래소 동기화</button>
+            <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost(`/api/live/sync?symbol=${encodeURIComponent(form.default_symbol)}`, "거래소 상태와 보호주문 상태를 동기화했습니다.", setLiveSyncResult)} type="button">거래소 동기화</button>
             <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/test/binance/live-order", "실주문 사전 점검을 마쳤습니다.", (result) => setLiveOrderResult({ ok: true, provider: "binance-live-test", message: "실주문 사전 점검에 성공했습니다.", details: result }), { symbol: form.default_symbol, side: "BUY" })} type="button">실주문 사전 점검</button>
           </div>
-          {liveSyncResult ? <pre className="mt-3 overflow-x-auto rounded-2xl bg-slate-950 px-4 py-3 text-xs text-white">{JSON.stringify(liveSyncResult, null, 2)}</pre> : null}
+          <LiveSyncPanel result={liveSyncResult} />
           <ResultCard title="실주문 사전 점검" result={liveOrderResult} />
         </div>
 

@@ -224,6 +224,7 @@ class RiskCheckResult(StrictBaseModel):
 class ExecutionIntent(StrictBaseModel):
     symbol: str
     action: Literal["long", "short", "reduce", "exit"]
+    intent_type: Literal["entry", "scale_in", "protection", "reduce_only", "emergency_exit"]
     quantity: float = Field(gt=0.0)
     requested_price: float = Field(gt=0.0)
     stop_loss: float | None = None
@@ -306,6 +307,9 @@ class OverviewResponse(StrictBaseModel):
     daily_pnl: float
     cumulative_pnl: float
     blocked_reasons: list[str]
+    protected_positions: int = 0
+    unprotected_positions: int = 0
+    position_protection_summary: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AuditTimelineEntry(StrictBaseModel):

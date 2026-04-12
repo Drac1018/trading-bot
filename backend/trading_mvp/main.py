@@ -367,11 +367,62 @@ def run_replay(cycles: int = 5, start_index: int = 120, db: Session = Depends(ge
 @app.post("/api/live/sync")
 def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
     settings_row = get_or_create_settings(db)
+    auto_resume_precheck: dict[str, object] | None = None
+    auto_resume_postcheck: dict[str, object] | None = None
+
+    if settings_row.trading_paused:
+        auto_resume_precheck = attempt_auto_resume(
+            db,
+            settings_row,
+            trigger_source="api_live_sync_precheck",
+        )
+        db.flush()
+        settings_row = get_or_create_settings(db)
     try:
         result = sync_live_state(db, settings_row, symbol=symbol)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    auto_resume = attempt_auto_resume(db, settings_row, trigger_source="api_live_sync")
+        error_payload = {
+            "error": str(exc),
+            "auto_resume_precheck": auto_resume_precheck,
+            "auto_resume_postcheck": auto_resume_postcheck,
+            "auto_resume": auto_resume_precheck,
+        }
+        record_audit_event(
+            db,
+            event_type="live_sync_failed",
+            entity_type="binance",
+            entity_id=symbol or settings_row.default_symbol,
+            severity="warning",
+            message="Live exchange state sync failed.",
+            payload=error_payload,
+        )
+        record_health_event(
+            db,
+            component="live_sync",
+            status="error",
+            message="Live exchange state sync failed.",
+            payload=error_payload,
+        )
+        db.commit()
+        raise HTTPException(status_code=400, detail=error_payload) from exc
+
+    settings_row = get_or_create_settings(db)
+    if auto_resume_precheck is not None or settings_row.trading_paused:
+        auto_resume_postcheck = attempt_auto_resume(
+            db,
+            settings_row,
+            trigger_source="api_live_sync_postcheck",
+        )
+        db.flush()
+        settings_row = get_or_create_settings(db)
+
+    auto_resume = auto_resume_postcheck or auto_resume_precheck
+    payload = {
+        **result,
+        "auto_resume_precheck": auto_resume_precheck,
+        "auto_resume_postcheck": auto_resume_postcheck,
+        "auto_resume": auto_resume,
+    }
     record_audit_event(
         db,
         event_type="live_sync",
@@ -379,10 +430,10 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
         entity_id=symbol or settings_row.default_symbol,
         severity="info",
         message="Live exchange state synchronized.",
-        payload={**result, "auto_resume": auto_resume},
+        payload=payload,
     )
     db.commit()
-    return {**result, "auto_resume": auto_resume}
+    return payload
 
 
 @app.get("/api/backlog")

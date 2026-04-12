@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from trading_mvp.models import AuditEvent, Execution, Order
-from trading_mvp.services.dashboard import get_audit_timeline, get_executions, get_orders
+from trading_mvp.models import AuditEvent, Execution, Order, Position
+from trading_mvp.services.dashboard import (
+    get_audit_timeline,
+    get_executions,
+    get_orders,
+    get_overview,
+    get_positions,
+)
 
 
 def test_order_and_execution_filters(db_session) -> None:
@@ -88,3 +94,54 @@ def test_audit_filters(db_session) -> None:
 
     assert len(filtered) == 1
     assert filtered[0]["event_type"] == "backlog_auto_applied"
+
+
+def test_overview_and_positions_include_protection_status(db_session) -> None:
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=70100.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=1.0,
+        metadata_json={},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    db_session.add(
+        Order(
+            symbol="BTCUSDT",
+            position_id=position.id,
+            side="sell",
+            order_type="stop_market",
+            mode="live",
+            status="pending",
+            external_order_id="protect-stop-1",
+            reduce_only=True,
+            close_only=True,
+            requested_quantity=0.01,
+            requested_price=69000.0,
+            filled_quantity=0.0,
+            average_fill_price=0.0,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    overview = get_overview(db_session)
+    positions = get_positions(db_session)
+
+    assert overview.open_positions == 1
+    assert overview.unprotected_positions == 1
+    assert overview.position_protection_summary[0]["symbol"] == "BTCUSDT"
+    assert overview.position_protection_summary[0]["missing_components"] == ["take_profit"]
+    assert positions[0]["protected"] is False
+    assert positions[0]["protective_order_count"] == 1
+    assert positions[0]["missing_components"] == ["take_profit"]

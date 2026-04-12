@@ -35,6 +35,35 @@
 - `POST /api/cycles/run`
 - `POST /api/replay/run`
 - `POST /api/reviews/{window}`
+- `POST /api/live/sync`
+
+### `POST /api/live/sync`
+
+실거래 상태 동기화 전에 `auto_resume_precheck`, 동기화 후 `auto_resume_postcheck`를 평가할 수 있다.
+
+성공 응답에는 아래 필드가 함께 포함된다.
+- `auto_resume_precheck`
+- `auto_resume_postcheck`
+- `auto_resume`
+
+auto-resume payload는 운영 관측용으로 아래 공통 필드를 유지한다.
+- `attempted`
+- `resumed`
+- `allowed`
+- `status`
+- `reason_code`
+- `pause_origin`
+- `pause_severity`
+- `pause_recovery_class`
+- `trigger_source`
+- `blockers`
+- `symbol_blockers`
+- `blocker_details`
+- `evaluated_symbols`
+- `protective_orders`
+- `market_data_status`
+- `sync_status`
+- `approval_state`
 
 ## CLI
 

@@ -192,6 +192,12 @@ def test_auto_resume_blocks_when_open_position_has_no_protective_orders(db_sessi
 
     assert result["status"] == "blocked"
     assert "MISSING_PROTECTIVE_ORDERS" in result["blockers"]
+    assert result["symbol_blockers"]["BTCUSDT"] == ["MISSING_PROTECTIVE_ORDERS"]
+    assert result["protective_orders"]["BTCUSDT"] == "missing"
+    assert any(
+        item["code"] == "MISSING_PROTECTIVE_ORDERS" and item.get("symbol") == "BTCUSDT"
+        for item in result["blocker_details"]
+    )
     assert get_or_create_settings(db_session).trading_paused is True
 
 
@@ -387,3 +393,171 @@ def test_auto_resume_attempts_are_written_to_audit_log(db_session, monkeypatch) 
         "trading_auto_resume_attempted",
         "trading_auto_resumed",
     ]
+
+
+def test_auto_resume_reports_symbol_detail_for_market_data_failure(db_session, monkeypatch) -> None:
+    _prime_live_ready(db_session, monkeypatch)
+    paused = set_trading_pause(
+        db_session,
+        True,
+        reason_code="TEMPORARY_MARKET_DATA_FAILURE",
+        reason_detail={"source": "market"},
+        pause_origin="system",
+        auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+        preserve_live_arm=True,
+    )
+
+    class FailingMarketClient(_HealthyClient):
+        def fetch_klines(self, symbol: str, interval: str, limit: int = 2):
+            raise RuntimeError("market data unavailable")
+
+    monkeypatch.setattr("trading_mvp.services.pause_control._build_client", lambda settings: FailingMarketClient())
+
+    result = attempt_auto_resume(db_session, paused, trigger_source="test")
+
+    assert result["status"] == "blocked"
+    assert "TEMPORARY_MARKET_DATA_FAILURE" in result["blockers"]
+    assert result["symbol_blockers"]["BTCUSDT"] == ["TEMPORARY_MARKET_DATA_FAILURE"]
+    assert result["market_data_status"]["BTCUSDT"] == "unavailable"
+    assert any(
+        item["code"] == "TEMPORARY_MARKET_DATA_FAILURE" and item.get("symbol") == "BTCUSDT"
+        for item in result["blocker_details"]
+    )
+
+
+def test_live_sync_runs_auto_resume_precheck_before_sync(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'live_sync_precheck.db'}", future=True)
+    testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with testing_session() as session:
+            yield session
+
+    call_order: list[str] = []
+
+    def fake_attempt(db, settings_row, trigger_source="system"):
+        call_order.append(trigger_source)
+        return {
+            "attempted": True,
+            "resumed": False,
+            "allowed": False,
+            "status": "blocked",
+            "reason_code": settings_row.pause_reason_code,
+            "pause_origin": settings_row.pause_origin,
+            "pause_severity": "warning",
+            "pause_recovery_class": "recoverable_system",
+            "trigger_source": trigger_source,
+            "blockers": ["LIVE_APPROVAL_REQUIRED"],
+            "symbol_blockers": {},
+            "blocker_details": [],
+            "evaluated_symbols": ["BTCUSDT"],
+            "protective_orders": {},
+            "market_data_status": {},
+            "sync_status": {},
+            "approval_state": "required",
+        }
+
+    def fake_sync(db, settings_row, symbol=None):
+        call_order.append("sync")
+        return {"symbols": ["BTCUSDT"], "synced_orders": 0, "synced_positions": 0, "equity": 100.0}
+
+    monkeypatch.setattr("trading_mvp.main.attempt_auto_resume", fake_attempt)
+    monkeypatch.setattr("trading_mvp.main.sync_live_state", fake_sync)
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with testing_session() as session:
+            update_settings(session, _build_live_settings_payload())
+            set_trading_pause(
+                session,
+                True,
+                reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+                reason_detail={"source": "exchange"},
+                pause_origin="system",
+                auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+                preserve_live_arm=True,
+            )
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.post("/api/live/sync")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["auto_resume_precheck"]["trigger_source"] == "api_live_sync_precheck"
+            assert payload["auto_resume_postcheck"]["trigger_source"] == "api_live_sync_postcheck"
+            assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_live_sync_failure_still_returns_precheck_result(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'live_sync_failure.db'}", future=True)
+    testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with testing_session() as session:
+            yield session
+
+    def fake_attempt(db, settings_row, trigger_source="system"):
+        return {
+            "attempted": True,
+            "resumed": False,
+            "allowed": False,
+            "status": "blocked",
+            "reason_code": settings_row.pause_reason_code,
+            "pause_origin": settings_row.pause_origin,
+            "pause_severity": "warning",
+            "pause_recovery_class": "recoverable_system",
+            "trigger_source": trigger_source,
+            "blockers": ["MISSING_PROTECTIVE_ORDERS"],
+            "symbol_blockers": {"BTCUSDT": ["MISSING_PROTECTIVE_ORDERS"]},
+            "blocker_details": [{"code": "MISSING_PROTECTIVE_ORDERS", "symbol": "BTCUSDT"}],
+            "evaluated_symbols": ["BTCUSDT"],
+            "protective_orders": {"BTCUSDT": "missing"},
+            "market_data_status": {"BTCUSDT": "ok"},
+            "sync_status": {"BTCUSDT": "protective_orders_missing"},
+            "approval_state": "armed",
+        }
+
+    def fail_sync(db, settings_row, symbol=None):
+        raise RuntimeError("sync exploded")
+
+    monkeypatch.setattr("trading_mvp.main.attempt_auto_resume", fake_attempt)
+    monkeypatch.setattr("trading_mvp.main.sync_live_state", fail_sync)
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with testing_session() as session:
+            update_settings(session, _build_live_settings_payload())
+            set_trading_pause(
+                session,
+                True,
+                reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+                reason_detail={"source": "exchange"},
+                pause_origin="system",
+                auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+                preserve_live_arm=True,
+            )
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.post("/api/live/sync")
+            assert response.status_code == 400
+            detail = response.json()["detail"]
+            assert detail["auto_resume_precheck"]["symbol_blockers"]["BTCUSDT"] == ["MISSING_PROTECTIVE_ORDERS"]
+
+        with testing_session() as session:
+            event = session.scalar(
+                select(AuditEvent)
+                .where(AuditEvent.event_type == "live_sync_failed")
+                .order_by(AuditEvent.id.desc())
+                .limit(1)
+            )
+            assert event is not None
+            assert event.payload["auto_resume_precheck"]["blockers"] == ["MISSING_PROTECTIVE_ORDERS"]
+    finally:
+        app.dependency_overrides.clear()

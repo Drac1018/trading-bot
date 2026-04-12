@@ -16,6 +16,19 @@ type Overview = {
   daily_pnl: number;
   cumulative_pnl: number;
   blocked_reasons: string[];
+  protected_positions: number;
+  unprotected_positions: number;
+  position_protection_summary: Array<{
+    symbol: string;
+    side: string;
+    status: string;
+    protected: boolean;
+    protective_order_count: number;
+    has_stop_loss: boolean;
+    has_take_profit: boolean;
+    missing_components: string[];
+    position_size: number;
+  }>;
 };
 
 type Row = Record<string, unknown>;

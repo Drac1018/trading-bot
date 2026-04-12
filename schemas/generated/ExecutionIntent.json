@@ -15,6 +15,17 @@
       "title": "Action",
       "type": "string"
     },
+    "intent_type": {
+      "enum": [
+        "entry",
+        "scale_in",
+        "protection",
+        "reduce_only",
+        "emergency_exit"
+      ],
+      "title": "Intent Type",
+      "type": "string"
+    },
     "quantity": {
       "exclusiveMinimum": 0.0,
       "title": "Quantity",
@@ -74,6 +85,7 @@
   "required": [
     "symbol",
     "action",
+    "intent_type",
     "quantity",
     "requested_price",
     "leverage",
