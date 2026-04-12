@@ -369,6 +369,190 @@ def test_risk_result_includes_exposure_metrics(db_session) -> None:
     assert row.payload["exposure_metrics"]["same_tier_concentration_pct"] >= 0.0
 
 
+def test_risk_blocks_gross_exposure_limit_for_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_gross_exposure_pct = 0.5
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.8,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="ETHUSDT",
+        timeframe="15m",
+        entry_zone_min=3200.0,
+        entry_zone_max=3210.0,
+        stop_loss=3150.0,
+        take_profit=3330.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="gross exposure gate",
+        explanation_detailed="new entry should be blocked when projected gross exposure exceeds the deterministic cap.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert "GROSS_EXPOSURE_LIMIT_REACHED" in result.reason_codes
+
+
+def test_risk_blocks_directional_bias_limit_for_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_directional_bias_pct = 0.7
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=1.0,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="ETHUSDT",
+        timeframe="15m",
+        entry_zone_min=3200.0,
+        entry_zone_max=3210.0,
+        stop_loss=3150.0,
+        take_profit=3330.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="directional bias gate",
+        explanation_detailed="new entry should be blocked when one-sided directional exposure exceeds the configured cap.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert "DIRECTIONAL_BIAS_LIMIT_REACHED" in result.reason_codes
+
+
+def test_risk_blocks_same_tier_concentration_limit_for_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_same_tier_concentration_pct = 0.2
+    db_session.add(
+        Position(
+            symbol="ETHUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=4.0,
+            entry_price=3200.0,
+            mark_price=3200.0,
+            leverage=2.0,
+            stop_loss=3100.0,
+            take_profit=3400.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("SOLUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="SOLUSDT",
+        timeframe="15m",
+        entry_zone_min=150.0,
+        entry_zone_max=151.0,
+        stop_loss=145.0,
+        take_profit=160.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="tier concentration gate",
+        explanation_detailed="new entry should be blocked when exposure inside the same risk tier exceeds the configured cap.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert "SAME_TIER_CONCENTRATION_LIMIT_REACHED" in result.reason_codes
+
+
+def test_reduce_and_exit_remain_allowed_under_exposure_limits(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    settings_row.max_gross_exposure_pct = 0.2
+    settings_row.max_directional_bias_pct = 0.2
+    settings_row.max_same_tier_concentration_pct = 0.2
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=1.0,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reduce_decision = TradeDecision(
+        decision="reduce",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=63000.0,
+        take_profit=68000.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="reduce allowed",
+        explanation_detailed="reduce-only management should stay allowed even when entry exposure caps are already exceeded.",
+    )
+    exit_decision = reduce_decision.model_copy(update={"decision": "exit", "explanation_short": "exit allowed"})
+
+    reduce_result, _ = evaluate_risk(db_session, settings_row, reduce_decision, snapshot)
+    exit_result, _ = evaluate_risk(db_session, settings_row, exit_decision, snapshot)
+
+    assert reduce_result.allowed is True
+    assert exit_result.allowed is True
+    assert "GROSS_EXPOSURE_LIMIT_REACHED" not in reduce_result.reason_codes
+    assert "DIRECTIONAL_BIAS_LIMIT_REACHED" not in exit_result.reason_codes
+
+
 def test_unprotected_state_blocks_new_entry_but_allows_reduce(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.live_trading_enabled = True

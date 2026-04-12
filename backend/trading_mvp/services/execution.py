@@ -23,6 +23,7 @@ from trading_mvp.services.account import (
 )
 from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
+from trading_mvp.services.execution_policy import select_execution_plan
 from trading_mvp.services.pause_control import (
     clear_symbol_protection_state,
     mark_manage_only_state,
@@ -380,6 +381,8 @@ def build_execution_intent(
 ) -> ExecutionIntent:
     entry_price = _entry_price(decision, market_snapshot)
     intent_type = _classify_execution_intent(decision, existing_position, operating_state=operating_state)
+    if intent_type == "reduce_only" and existing_position is not None:
+        entry_price = existing_position.mark_price if existing_position.mark_price > 0 else market_snapshot.latest_price
     if intent_type == "protection" and existing_position is not None:
         quantity = max(existing_position.quantity, 0.0001)
         entry_price = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price
@@ -576,24 +579,54 @@ def _safe_submit_order(
     side: str,
     order_type: str,
     quantity: float | None = None,
+    price: float | None = None,
     stop_price: float | None = None,
     reduce_only: bool = False,
     close_position: bool = False,
     response_type: str = "RESULT",
+    time_in_force: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     client_order_id = f"mvp-{uuid4().hex[:24]}"
     try:
-        response = client.new_order(
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            quantity=quantity,
-            stop_price=stop_price,
-            reduce_only=reduce_only,
-            close_position=close_position,
-            client_order_id=client_order_id,
-            response_type=response_type,
-        )
+        if price is None and time_in_force is None:
+            response = client.new_order(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                stop_price=stop_price,
+                reduce_only=reduce_only,
+                close_position=close_position,
+                client_order_id=client_order_id,
+                response_type=response_type,
+            )
+        elif time_in_force is None:
+            response = client.new_order(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                price=price,
+                stop_price=stop_price,
+                reduce_only=reduce_only,
+                close_position=close_position,
+                client_order_id=client_order_id,
+                response_type=response_type,
+            )
+        else:
+            response = client.new_order(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                price=price,
+                stop_price=stop_price,
+                reduce_only=reduce_only,
+                close_position=close_position,
+                client_order_id=client_order_id,
+                response_type=response_type,
+                time_in_force=time_in_force,
+            )
     except (httpx.TimeoutException, httpx.TransportError):
         response = _fetch_exchange_order(
             client,
@@ -913,6 +946,7 @@ def _emergency_close_position(
         session.add(order)
         trades = client.get_account_trades(symbol=symbol, order_id=order.external_order_id)
         fee_paid, realized_pnl = _record_live_trades(session, order, trades)
+        create_exchange_pnl_snapshot(session, settings_row)
         remaining_orders = client.get_open_orders(symbol)
         sync_live_positions(session, settings_row, symbol=symbol, client=client, open_orders=remaining_orders)
         remaining_position = get_open_position(session, symbol)
@@ -1271,6 +1305,7 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                 )
                 raise RuntimeError(f"{reason_code}: {exc}") from exc
             _record_live_trades(session, order, trades)
+            create_exchange_pnl_snapshot(session, settings_row)
             synced_orders += 1
         try:
             open_orders = client.get_open_orders(item_symbol)
@@ -1589,16 +1624,30 @@ def execute_live_trade(
         reference_price=intent.requested_price,
         enforce_min_notional=intent_type in {"entry", "scale_in"},
     )
+    execution_plan = select_execution_plan(
+        intent,
+        market_snapshot,
+        settings_row,
+        pre_trade_protection=pre_trade_protection,
+    )
+    execution_price = intent.requested_price
+    if execution_plan.price is not None:
+        if hasattr(client, "normalize_price"):
+            execution_price = client.normalize_price(decision.symbol, execution_plan.price)
+        else:
+            execution_price = execution_plan.price
     try:
         client.change_initial_leverage(decision.symbol, max(1, int(round(intent.leverage))))
         client_order_id, exchange_order = _safe_submit_order(
             client,
             symbol=decision.symbol,
             side=side,
-            order_type="MARKET",
+            order_type=execution_plan.order_type,
             quantity=normalized_quantity,
+            price=execution_price if execution_plan.order_type == "LIMIT" else None,
             reduce_only=reduce_only,
             response_type="RESULT",
+            time_in_force=execution_plan.time_in_force,
         )
     except BinanceAPIError as exc:
         reason_codes = ["BINANCE_ORDER_REJECTED"]
@@ -1608,9 +1657,9 @@ def execute_live_trade(
             session,
             symbol=decision.symbol,
             side=decision.decision,
-            order_type="MARKET",
+            order_type=execution_plan.order_type,
             requested_quantity=normalized_quantity,
-            requested_price=intent.requested_price,
+            requested_price=execution_price,
             decision_run_id=decision_run_id,
             risk_row=risk_row,
             reduce_only=reduce_only,
@@ -1622,6 +1671,7 @@ def execute_live_trade(
                 "available_balance": live_balances["available_balance"],
                 "equity": live_balances["equity"],
                 "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
             },
         )
         create_alert(
@@ -1637,6 +1687,7 @@ def execute_live_trade(
                 "requested_quantity": normalized_quantity,
                 "available_balance": live_balances["available_balance"],
                 "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
             },
         )
         record_audit_event(
@@ -1654,6 +1705,7 @@ def execute_live_trade(
                 "available_balance": live_balances["available_balance"],
                 "equity": live_balances["equity"],
                 "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
             },
         )
         session.flush()
@@ -1664,21 +1716,26 @@ def execute_live_trade(
             "error": str(exc),
             "exchange_code": exc.code,
             "intent_type": intent_type,
+            "execution_policy": execution_plan.to_payload(),
         }
     except Exception as exc:
         order = _create_rejected_order_row(
             session,
             symbol=decision.symbol,
             side=decision.decision,
-            order_type="MARKET",
+            order_type=execution_plan.order_type,
             requested_quantity=normalized_quantity,
-            requested_price=intent.requested_price,
+            requested_price=execution_price,
             decision_run_id=decision_run_id,
             risk_row=risk_row,
             reduce_only=reduce_only,
             close_only=decision.decision == "exit",
             reason_codes=["LIVE_EXECUTION_ERROR"],
-            metadata_json={"error": str(exc), "intent_type": intent_type},
+            metadata_json={
+                "error": str(exc),
+                "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
+            },
         )
         create_alert(
             session,
@@ -1686,7 +1743,12 @@ def execute_live_trade(
             severity="error",
             title="Live execution failed",
             message="??? ?? ? ??? ??????.",
-            payload={"symbol": decision.symbol, "error": str(exc), "intent_type": intent_type},
+            payload={
+                "symbol": decision.symbol,
+                "error": str(exc),
+                "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
+            },
         )
         record_audit_event(
             session,
@@ -1695,24 +1757,41 @@ def execute_live_trade(
             entity_id=str(order.id),
             severity="error",
             message="Live execution failed before exchange acceptance.",
-            payload={"symbol": decision.symbol, "error": str(exc), "intent_type": intent_type},
+            payload={
+                "symbol": decision.symbol,
+                "error": str(exc),
+                "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
+            },
         )
         record_health_event(
             session,
             component="live_execution",
             status="error",
             message="Unexpected live execution error.",
-            payload={"symbol": decision.symbol, "error": str(exc), "intent_type": intent_type},
+            payload={
+                "symbol": decision.symbol,
+                "error": str(exc),
+                "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
+            },
         )
         session.flush()
-        return {"order_id": order.id, "status": "error", "reason_codes": ["LIVE_EXECUTION_ERROR"], "error": str(exc), "intent_type": intent_type}
+        return {
+            "order_id": order.id,
+            "status": "error",
+            "reason_codes": ["LIVE_EXECUTION_ERROR"],
+            "error": str(exc),
+            "intent_type": intent_type,
+            "execution_policy": execution_plan.to_payload(),
+        }
 
     order = _upsert_exchange_order_row(
         session,
         symbol=decision.symbol,
-        requested_price=intent.requested_price,
+        requested_price=execution_price,
         requested_quantity=normalized_quantity,
-        order_type="MARKET",
+        order_type=execution_plan.order_type,
         side=decision.decision,
         exchange_order={**exchange_order, "clientOrderId": client_order_id},
         decision_run_id=decision_run_id,
@@ -1720,6 +1799,12 @@ def execute_live_trade(
         reduce_only=reduce_only,
         close_only=decision.decision == "exit",
     )
+    order.metadata_json = {
+        **(order.metadata_json or {}),
+        "execution_policy": execution_plan.to_payload(),
+    }
+    session.add(order)
+    session.flush()
     try:
         trades = client.get_account_trades(symbol=decision.symbol, order_id=order.external_order_id)
     except Exception as exc:
@@ -1737,6 +1822,7 @@ def execute_live_trade(
         )
         return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
     fee_paid, realized_pnl = _record_live_trades(session, order, trades)
+    create_exchange_pnl_snapshot(session, settings_row)
 
     try:
         post_trade_open_orders = client.get_open_orders(decision.symbol)
@@ -1824,15 +1910,22 @@ def execute_live_trade(
     else:
         _cancel_exit_orders(session, client, decision.symbol)
 
-    slippage_pct = abs(order.average_fill_price - intent.requested_price) / max(intent.requested_price, 1.0)
-    if slippage_pct > settings_row.slippage_threshold_pct:
+    slippage_pct = 0.0
+    if order.filled_quantity > 0 and order.average_fill_price > 0:
+        slippage_pct = abs(order.average_fill_price - execution_price) / max(execution_price, 1.0)
+    if order.filled_quantity > 0 and slippage_pct > settings_row.slippage_threshold_pct:
         create_alert(
             session,
             category="execution",
             severity="warning",
             title="Slippage threshold exceeded",
             message="??? ????? ???? ??????.",
-            payload={"order_id": order.id, "slippage_pct": slippage_pct, "intent_type": intent_type},
+            payload={
+                "order_id": order.id,
+                "slippage_pct": slippage_pct,
+                "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
+            },
         )
 
     latest_price = position.mark_price if position is not None else market_snapshot.latest_price
@@ -1868,6 +1961,7 @@ def execute_live_trade(
             "pre_trade_protection": pre_trade_protection,
             "slippage_pct": slippage_pct,
             "intent_type": intent_type,
+            "execution_policy": execution_plan.to_payload(),
         },
     )
     return {
@@ -1883,4 +1977,5 @@ def execute_live_trade(
         "protective_order_ids": protective_order_ids,
         "protective_state": protection_result["protection_state"] if protection_result is not None else pre_trade_protection,
         "intent_type": intent_type,
+        "execution_policy": execution_plan.to_payload(),
     }

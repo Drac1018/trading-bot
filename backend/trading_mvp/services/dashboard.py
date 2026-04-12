@@ -44,6 +44,20 @@ def _serialize_model_list(rows: Sequence[object]) -> list[dict[str, object]]:
 
 
 def _build_position_protection_state(session: Session, position: Position) -> dict[str, object]:
+    if position.status != "open" or position.quantity <= 0:
+        return {
+            "symbol": position.symbol,
+            "side": position.side,
+            "status": "flat",
+            "protected": True,
+            "protective_order_count": 0,
+            "has_stop_loss": False,
+            "has_take_profit": False,
+            "missing_components": [],
+            "order_ids": [],
+            "position_size": position.quantity,
+        }
+
     active_orders = list(
         session.scalars(
             select(Order).where(
@@ -192,10 +206,29 @@ def get_decisions(session: Session, limit: int = 50) -> list[dict[str, object]]:
 
 
 def get_positions(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    rows = list(session.scalars(select(Position).where(Position.mode == "live").order_by(desc(Position.created_at)).limit(limit)))
+    rows = list(
+        session.scalars(
+            select(Position)
+            .where(
+                Position.mode == "live",
+                Position.status == "open",
+                Position.quantity > 0,
+            )
+            .order_by(desc(Position.created_at))
+            .limit(limit)
+        )
+    )
     payloads = _serialize_model_list(rows)
     for payload, position in zip(payloads, rows, strict=False):
-        payload.update(_build_position_protection_state(session, position))
+        protection_state = _build_position_protection_state(session, position)
+        payload["protection_status"] = protection_state["status"]
+        payload.update(
+            {
+                key: value
+                for key, value in protection_state.items()
+                if key != "status"
+            }
+        )
     return payloads
 
 

@@ -11,6 +11,8 @@ from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.time_utils import utcnow_naive
 
+DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
+
 
 def timeframe_to_minutes(timeframe: str) -> int:
     if timeframe.endswith("m"):
@@ -142,6 +144,34 @@ def build_market_snapshot(
         testnet_enabled=binance_testnet_enabled,
         stale_threshold_seconds=stale_threshold_seconds,
     )
+
+
+def build_market_context(
+    symbol: str,
+    base_timeframe: str,
+    *,
+    context_timeframes: tuple[str, ...] = DEFAULT_CONTEXT_TIMEFRAMES,
+    lookback: int = 60,
+    upto_index: int | None = None,
+    force_stale: bool = False,
+    use_binance: bool = False,
+    binance_testnet_enabled: bool = False,
+    stale_threshold_seconds: int = 1800,
+) -> dict[str, MarketSnapshotPayload]:
+    timeframes = [base_timeframe, *[item for item in context_timeframes if item != base_timeframe]]
+    snapshots: dict[str, MarketSnapshotPayload] = {}
+    for timeframe in timeframes:
+        snapshots[timeframe] = build_market_snapshot(
+            symbol=symbol,
+            timeframe=timeframe,
+            lookback=lookback,
+            upto_index=upto_index,
+            force_stale=force_stale,
+            use_binance=use_binance,
+            binance_testnet_enabled=binance_testnet_enabled,
+            stale_threshold_seconds=stale_threshold_seconds,
+        )
+    return snapshots
 
 
 def persist_market_snapshot(session: Session, snapshot: MarketSnapshotPayload) -> MarketSnapshot:

@@ -39,7 +39,11 @@ from trading_mvp.services.backlog_insights import (
 )
 from trading_mvp.services.execution import execute_live_trade
 from trading_mvp.services.features import compute_features, persist_feature_snapshot
-from trading_mvp.services.market_data import build_market_snapshot, persist_market_snapshot
+from trading_mvp.services.market_data import (
+    build_market_context,
+    build_market_snapshot,
+    persist_market_snapshot,
+)
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.risk import (
     HARD_MAX_GLOBAL_LEVERAGE,
@@ -220,6 +224,18 @@ class TradingOrchestrator:
             upto_index=upto_index,
             force_stale=force_stale,
         )
+        market_context = build_market_context(
+            symbol=symbol,
+            base_timeframe=timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+            use_binance=self.settings_row.binance_market_data_enabled,
+            binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+            stale_threshold_seconds=self.settings_row.stale_market_seconds,
+        )
+        higher_timeframe_context = {
+            tf: payload for tf, payload in market_context.items() if tf != timeframe
+        }
         if not self.settings_row.ai_enabled:
             return {
                 "symbol": symbol,
@@ -236,7 +252,7 @@ class TradingOrchestrator:
                 "settings": serialize_settings(self.settings_row),
                 "auto_resume": auto_resume_result,
             }
-        feature_payload = compute_features(market_snapshot)
+        feature_payload = compute_features(market_snapshot, higher_timeframe_context)
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
         open_positions = get_open_positions(self.session, symbol)
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
@@ -279,6 +295,10 @@ class TradingOrchestrator:
             trigger_event,
             {
                 "market_snapshot": market_snapshot.model_dump(mode="json"),
+                "market_context": {
+                    context_timeframe: snapshot.model_dump(mode="json")
+                    for context_timeframe, snapshot in higher_timeframe_context.items()
+                },
                 "features": feature_payload.model_dump(mode="json"),
                 "risk_context": risk_context,
             },

@@ -64,6 +64,10 @@ def test_ai_disabled_collects_market_data_only(monkeypatch, db_session) -> None:
     )
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_market_context",
+        lambda **kwargs: {"15m": snapshot, "1h": snapshot.model_copy(update={"timeframe": "1h"}), "4h": snapshot.model_copy(update={"timeframe": "4h"})},
+    )
 
     result = TradingOrchestrator(db_session).run_selected_symbols_cycle(trigger_event="realtime_cycle")
     db_session.commit()
@@ -107,6 +111,10 @@ def test_ai_disabled_hourly_window_creates_only_market_snapshots(monkeypatch, db
     )
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_market_context",
+        lambda **kwargs: {"15m": snapshot, "1h": snapshot.model_copy(update={"timeframe": "1h"}), "4h": snapshot.model_copy(update={"timeframe": "4h"})},
+    )
 
     result = run_window(db_session, "1h", triggered_by="scheduler")
     db_session.commit()
@@ -147,6 +155,10 @@ def test_ai_enabled_hourly_window_only_refreshes_market_data(monkeypatch, db_ses
     )
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_market_context",
+        lambda **kwargs: {"15m": snapshot, "1h": snapshot.model_copy(update={"timeframe": "1h"}), "4h": snapshot.model_copy(update={"timeframe": "4h"})},
+    )
 
     result = run_window(db_session, "1h", triggered_by="scheduler")
     db_session.commit()

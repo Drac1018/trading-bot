@@ -319,6 +319,7 @@ class BinanceClient:
         client_order_id: str | None = None,
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
     ) -> dict[str, object]:
         if self.futures_enabled and self._is_algo_order_type(order_type):
             algo_params: dict[str, str | int | float | bool] = {
@@ -357,6 +358,8 @@ class BinanceClient:
             params["quantity"] = quantity
         if price is not None:
             params["price"] = price
+        if time_in_force is not None:
+            params["timeInForce"] = time_in_force
         if stop_price is not None:
             params["stopPrice"] = stop_price
         if reduce_only:

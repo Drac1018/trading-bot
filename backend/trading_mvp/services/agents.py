@@ -120,6 +120,59 @@ class TradingDecisionAgent:
     def __init__(self, provider: StructuredModelProvider) -> None:
         self.provider = provider
 
+    @staticmethod
+    def _adaptive_brackets(
+        side: Literal["long", "short"],
+        *,
+        price: float,
+        atr: float,
+        features: FeaturePayload,
+    ) -> tuple[float, float]:
+        safe_price = max(price, 1.0)
+        safe_atr = max(atr, safe_price * 0.002)
+        stop_multiple = 1.1
+        take_multiple = 2.0
+
+        if features.regime.primary_regime == "range":
+            stop_multiple *= 0.85
+            take_multiple *= 0.75
+        elif features.regime.trend_alignment in {"bullish_aligned", "bearish_aligned"}:
+            take_multiple *= 1.25
+
+        if features.regime.volatility_regime == "expanded":
+            stop_multiple *= 1.15
+            take_multiple *= 1.2
+        elif features.regime.volatility_regime == "compressed":
+            stop_multiple *= 0.9
+
+        if features.regime.weak_volume:
+            take_multiple *= 0.85
+        if features.regime.momentum_state == "weakening":
+            take_multiple *= 0.9
+        if features.regime.momentum_state == "overextended":
+            stop_multiple *= 0.95
+            take_multiple *= 0.8
+
+        if side == "long":
+            return round(safe_price - safe_atr * stop_multiple, 2), round(safe_price + safe_atr * take_multiple, 2)
+        return round(safe_price + safe_atr * stop_multiple, 2), round(safe_price - safe_atr * take_multiple, 2)
+
+    @staticmethod
+    def _confidence(features: FeaturePayload) -> float:
+        confidence = 0.22 + min(abs(features.trend_score) / 2.5, 0.32)
+        confidence += min(abs(features.momentum_score) / 3.0, 0.18)
+        if features.regime.trend_alignment in {"bullish_aligned", "bearish_aligned"}:
+            confidence += 0.12
+        if features.regime.volume_regime == "strong":
+            confidence += 0.05
+        if features.regime.primary_regime == "range":
+            confidence -= 0.1
+        if features.regime.weak_volume:
+            confidence -= 0.08
+        if "STALE_MARKET_DATA" in features.data_quality_flags or "INCOMPLETE_MARKET_DATA" in features.data_quality_flags:
+            confidence -= 0.2
+        return round(min(0.96, max(0.18, confidence)), 4)
+
     def _deterministic_decision(
         self,
         market_snapshot: MarketSnapshotPayload,
@@ -129,13 +182,7 @@ class TradingDecisionAgent:
     ) -> TradeDecision:
         price = market_snapshot.latest_price
         atr = max(features.atr, price * 0.0025)
-        confidence = min(
-            0.96,
-            max(
-                0.18,
-                (abs(features.trend_score) / 2.0) + abs(features.volume_ratio - 1.0) * 0.18,
-            ),
-        )
+        confidence = self._confidence(features)
         open_position = open_positions[0] if open_positions else None
 
         decision: Literal["hold", "long", "short", "reduce", "exit"] = "hold"
@@ -146,17 +193,28 @@ class TradingDecisionAgent:
             "다음 평가 사이클까지 모니터링이 안전합니다."
         )
 
+        regime_name = features.regime.primary_regime
+        trend_alignment = features.regime.trend_alignment
+        weak_volume = features.regime.weak_volume
+        momentum_weakening = features.regime.momentum_weakening
+        range_like_signal = regime_name == "range"
         long_signal = (
-            features.trend_score >= 0.44
-            and 42.0 <= features.rsi <= 69.0
-            and features.volume_ratio >= 0.85
+            trend_alignment == "bullish_aligned"
+            and regime_name != "range"
+            and features.trend_score >= 0.22
+            and features.momentum_score >= 0.12
+            and 45.0 <= features.rsi <= 82.0
+            and not weak_volume
         )
         short_signal = (
-            features.trend_score <= -0.45
-            and 31.0 <= features.rsi <= 58.0
-            and features.volume_ratio >= 0.85
+            trend_alignment == "bearish_aligned"
+            and regime_name != "range"
+            and features.trend_score <= -0.22
+            and features.momentum_score <= -0.12
+            and 18.0 <= features.rsi <= 55.0
+            and not weak_volume
         )
-        weakening_signal = abs(features.trend_score) < 0.2 or features.volume_ratio < 0.8
+        weakening_signal = momentum_weakening or weak_volume or range_like_signal
         operating_state = str(risk_context.get("operating_state", "TRADABLE"))
 
         if open_position is not None and operating_state == "PROTECTION_REQUIRED":
@@ -208,18 +266,29 @@ class TradingDecisionAgent:
                 "상대적으로 우세한 구간으로 판단합니다."
             )
 
-        risk_pct = min(float(risk_context["max_risk_per_trade"]), max(0.003, round(confidence * 0.008, 4)))
-        leverage = min(float(risk_context["max_leverage"]), max(1.0, round(1.0 + (confidence * 1.8), 2)))
-        entry_min = round(price - atr * 0.15, 2)
-        entry_max = round(price + atr * 0.15, 2)
+        risk_pct = max(0.003, round(confidence * 0.008, 4))
+        if features.regime.volatility_regime == "expanded":
+            risk_pct *= 0.85
+        if weak_volume or range_like_signal:
+            risk_pct *= 0.85
+        risk_pct = min(float(risk_context["max_risk_per_trade"]), round(risk_pct, 4))
+
+        leverage = max(1.0, round(1.0 + (confidence * 1.6), 2))
+        if features.regime.volatility_regime == "expanded":
+            leverage *= 0.85
+        if weak_volume or range_like_signal:
+            leverage *= 0.9
+        leverage = min(float(risk_context["max_leverage"]), round(leverage, 2))
+
+        entry_band = atr * (0.08 if range_like_signal else 0.14)
+        entry_min = round(price - entry_band, 2)
+        entry_max = round(price + entry_band, 2)
         stop_loss: float | None = None
         take_profit: float | None = None
         if decision == "long":
-            stop_loss = round(price - atr * 1.2, 2)
-            take_profit = round(price + atr * 2.2, 2)
+            stop_loss, take_profit = self._adaptive_brackets("long", price=price, atr=atr, features=features)
         elif decision == "short":
-            stop_loss = round(price + atr * 1.2, 2)
-            take_profit = round(price - atr * 2.2, 2)
+            stop_loss, take_profit = self._adaptive_brackets("short", price=price, atr=atr, features=features)
         elif decision in {"reduce", "exit"} and open_position is not None:
             stop_loss = open_position.stop_loss
             take_profit = open_position.take_profit
@@ -289,6 +358,13 @@ class TradingDecisionAgent:
                     "drawdown_pct": features.drawdown_pct,
                     "rsi": features.rsi,
                     "atr": features.atr,
+                    "atr_pct": features.atr_pct,
+                    "momentum_score": features.momentum_score,
+                    "regime": features.regime.model_dump(mode="json"),
+                    "multi_timeframe": {
+                        timeframe: context.model_dump(mode="json")
+                        for timeframe, context in features.multi_timeframe.items()
+                    },
                     "data_quality_flags": features.data_quality_flags,
                 },
                 "open_positions": [

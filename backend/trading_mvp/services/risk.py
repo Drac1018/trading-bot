@@ -18,7 +18,11 @@ from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
     get_operating_state,
 )
-from trading_mvp.services.settings import get_runtime_credentials, is_live_execution_armed
+from trading_mvp.services.settings import (
+    get_exposure_limits,
+    get_runtime_credentials,
+    is_live_execution_armed,
+)
 
 HARD_MAX_GLOBAL_LEVERAGE = 5.0
 HARD_MAX_RISK_PER_TRADE = 0.02
@@ -67,7 +71,36 @@ def _decision_matches_position_side(position_side: str, decision: str) -> bool:
     return (position_side == "long" and decision == "long") or (position_side == "short" and decision == "short")
 
 
-def _build_exposure_metrics(session: Session, decision_symbol: str, equity: float) -> dict[str, float]:
+def _estimate_projected_notional(
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    *,
+    equity: float,
+    approved_risk_pct: float,
+    approved_leverage: float,
+) -> float:
+    entry_price = _entry_price(decision, market_snapshot)
+    safe_entry_price = max(entry_price, 1.0)
+    if decision.stop_loss is None:
+        quantity = max((equity * min(approved_leverage, 1.0)) / safe_entry_price, 0.0001)
+        return _position_notional(quantity, safe_entry_price)
+    per_unit_risk = abs(entry_price - decision.stop_loss)
+    if per_unit_risk == 0:
+        return 0.0
+    risk_budget = max(equity, 0.0) * approved_risk_pct
+    max_notional_quantity = (max(equity, 0.0) * approved_leverage) / safe_entry_price
+    quantity = min(risk_budget / per_unit_risk, max_notional_quantity)
+    return _position_notional(quantity, safe_entry_price)
+
+
+def _build_exposure_metrics(
+    session: Session,
+    decision_symbol: str,
+    equity: float,
+    *,
+    projected_side: str | None = None,
+    projected_notional: float = 0.0,
+) -> dict[str, float]:
     positions = get_open_positions(session)
     decision_tier = get_symbol_risk_tier(decision_symbol)
     total_notional = 0.0
@@ -75,39 +108,46 @@ def _build_exposure_metrics(session: Session, decision_symbol: str, equity: floa
     short_notional = 0.0
     decision_symbol_notional = 0.0
     same_tier_notional = 0.0
-    largest_symbol_notional = 0.0
+    symbol_notionals: dict[str, float] = {}
 
     for position in positions:
         mark_price = position.mark_price if position.mark_price > 0 else position.entry_price
         notional = _position_notional(position.quantity, mark_price)
         total_notional += notional
+        symbol_key = position.symbol.upper()
+        symbol_notionals[symbol_key] = symbol_notionals.get(symbol_key, 0.0) + notional
         if position.side == "long":
             long_notional += notional
         else:
             short_notional += notional
-        if position.symbol.upper() == decision_symbol.upper():
+        if symbol_key == decision_symbol.upper():
             decision_symbol_notional += notional
         if get_symbol_risk_tier(position.symbol) == decision_tier:
             same_tier_notional += notional
-        largest_symbol_notional = max(largest_symbol_notional, notional)
+
+    if projected_side in {"long", "short"} and projected_notional > 0:
+        symbol_key = decision_symbol.upper()
+        total_notional += projected_notional
+        symbol_notionals[symbol_key] = symbol_notionals.get(symbol_key, 0.0) + projected_notional
+        if projected_side == "long":
+            long_notional += projected_notional
+        else:
+            short_notional += projected_notional
+        decision_symbol_notional += projected_notional
+        same_tier_notional += projected_notional
 
     safe_equity = max(equity, 1.0)
-    safe_total = max(total_notional, 1.0)
-    directional_bias = max(long_notional, short_notional) / safe_total if total_notional > 0 else 0.0
+    dominant_side_notional = max(long_notional, short_notional)
+    largest_symbol_notional = max(symbol_notionals.values(), default=0.0)
     return {
         "gross_exposure_pct_equity": round(total_notional / safe_equity, 6),
         "long_exposure_pct_equity": round(long_notional / safe_equity, 6),
         "short_exposure_pct_equity": round(short_notional / safe_equity, 6),
-        "directional_bias_pct": round(directional_bias, 6),
-        "decision_symbol_concentration_pct": round(
-            decision_symbol_notional / safe_total if total_notional > 0 else 0.0,
-            6,
-        ),
-        "same_tier_concentration_pct": round(
-            same_tier_notional / safe_total if total_notional > 0 else 0.0,
-            6,
-        ),
+        "directional_bias_pct": round(dominant_side_notional / safe_equity, 6),
+        "decision_symbol_concentration_pct": round(decision_symbol_notional / safe_equity, 6),
+        "same_tier_concentration_pct": round(same_tier_notional / safe_equity, 6),
         "largest_position_pct_equity": round(largest_symbol_notional / safe_equity, 6),
+        "projected_trade_notional_pct_equity": round(projected_notional / safe_equity, 6),
         "open_position_count": float(len(positions)),
     }
 
@@ -141,7 +181,23 @@ def evaluate_risk(
     effective_leverage_cap = _effective_leverage_cap(settings_row, decision.symbol)
     effective_risk_cap = min(settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE)
     effective_daily_loss_cap = min(settings_row.max_daily_loss, HARD_MAX_DAILY_LOSS)
-    exposure_metrics = _build_exposure_metrics(session, decision.symbol, latest_pnl.equity)
+    exposure_limits = get_exposure_limits(settings_row)
+    projected_notional = 0.0
+    if is_entry_decision:
+        projected_notional = _estimate_projected_notional(
+            decision,
+            market_snapshot,
+            equity=latest_pnl.equity,
+            approved_risk_pct=min(decision.risk_pct, effective_risk_cap),
+            approved_leverage=min(decision.leverage, effective_leverage_cap),
+        )
+    exposure_metrics = _build_exposure_metrics(
+        session,
+        decision.symbol,
+        latest_pnl.equity,
+        projected_side=decision.decision if is_entry_decision else None,
+        projected_notional=projected_notional,
+    )
 
     if settings_row.trading_paused and is_entry_decision:
         reason_codes.append("TRADING_PAUSED")
@@ -166,6 +222,17 @@ def evaluate_risk(
         reason_codes.append("RISK_PCT_EXCEEDS_LIMIT")
     if is_entry_decision and (decision.stop_loss is None or decision.take_profit is None):
         reason_codes.append("MISSING_STOP_OR_TARGET")
+    if is_entry_decision and exposure_metrics["gross_exposure_pct_equity"] > exposure_limits["gross_exposure_pct"]:
+        reason_codes.append("GROSS_EXPOSURE_LIMIT_REACHED")
+    if is_entry_decision and exposure_metrics["largest_position_pct_equity"] > exposure_limits["largest_position_pct"]:
+        reason_codes.append("LARGEST_POSITION_LIMIT_REACHED")
+    if is_entry_decision and exposure_metrics["directional_bias_pct"] > exposure_limits["directional_bias_pct"]:
+        reason_codes.append("DIRECTIONAL_BIAS_LIMIT_REACHED")
+    if (
+        is_entry_decision
+        and exposure_metrics["same_tier_concentration_pct"] > exposure_limits["same_tier_concentration_pct"]
+    ):
+        reason_codes.append("SAME_TIER_CONCENTRATION_LIMIT_REACHED")
 
     if is_protection_recovery and existing_position is not None:
         entry = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price

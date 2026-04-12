@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from types import SimpleNamespace
+
+from trading_mvp.schemas import (
+    ExecutionIntent,
+    MarketCandle,
+    MarketSnapshotPayload,
+    RiskCheckResult,
+    TradeDecision,
+)
+from trading_mvp.services.execution import execute_live_trade
+from trading_mvp.services.execution_policy import select_execution_plan
+from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE
+from trading_mvp.services.secret_store import encrypt_secret
+from trading_mvp.services.settings import get_or_create_settings
+from trading_mvp.time_utils import utcnow_naive
+
+
+def _snapshot(*, latest_price: float = 70000.0, is_stale: bool = False) -> MarketSnapshotPayload:
+    now = utcnow_naive()
+    return MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=now,
+        latest_price=latest_price,
+        latest_volume=1200.0,
+        candle_count=3,
+        is_stale=is_stale,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=now, open=69950.0, high=70030.0, low=69960.0, close=70000.0, volume=900.0),
+            MarketCandle(timestamp=now, open=69980.0, high=70040.0, low=69970.0, close=70005.0, volume=950.0),
+            MarketCandle(timestamp=now, open=69990.0, high=70050.0, low=69980.0, close=latest_price, volume=1000.0),
+        ],
+    )
+
+
+def _intent(*, action: str, intent_type: str, requested_price: float = 70000.0) -> ExecutionIntent:
+    return ExecutionIntent(
+        symbol="BTCUSDT",
+        action=action,  # type: ignore[arg-type]
+        intent_type=intent_type,  # type: ignore[arg-type]
+        quantity=0.01,
+        requested_price=requested_price,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        leverage=2.0,
+        mode="live",
+        reduce_only=intent_type == "reduce_only",
+        close_only=action == "exit",
+    )
+
+
+def _risk_result(action: str) -> RiskCheckResult:
+    return RiskCheckResult(
+        allowed=True,
+        decision=action,  # type: ignore[arg-type]
+        reason_codes=[],
+        approved_risk_pct=0.01,
+        approved_leverage=2.0,
+        operating_mode="live",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
+    )
+
+
+def _decision(action: str) -> TradeDecision:
+    return TradeDecision(
+        decision=action,  # type: ignore[arg-type]
+        confidence=0.8,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=69990.0,
+        entry_zone_max=70010.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="execution policy test",
+        explanation_detailed="execution policy path should choose the expected order type.",
+    )
+
+
+def _prime_live_settings(db_session):
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    settings_row.slippage_threshold_pct = 0.002
+    db_session.add(settings_row)
+    db_session.flush()
+    return settings_row
+
+
+class PolicyCaptureClient:
+    def __init__(self, *, initial_position_qty: float = 0.0, orders: list[dict[str, object]] | None = None) -> None:
+        self.current_position_qty = initial_position_qty
+        self.orders = list(orders or [])
+        self.primary_order_calls: list[dict[str, object]] = []
+        self.protective_order_calls: list[dict[str, object]] = []
+        self.last_primary_order_id: str | None = None
+        self.side = "long"
+
+    def get_account_info(self):
+        return {
+            "availableBalance": "250.0",
+            "totalWalletBalance": "250.0",
+            "totalUnrealizedProfit": "0.0",
+            "totalMarginBalance": "250.0",
+        }
+
+    def get_open_orders(self, symbol: str):
+        return list(self.orders)
+
+    def get_position_information(self, symbol: str):
+        if self.current_position_qty <= 0:
+            return []
+        position_amt = self.current_position_qty if self.side == "long" else -self.current_position_qty
+        return [{"positionAmt": str(position_amt), "entryPrice": "70000", "markPrice": "70000", "leverage": "2"}]
+
+    def change_initial_leverage(self, symbol: str, leverage: int):
+        return {"leverage": leverage}
+
+    def normalize_order_quantity(self, symbol: str, quantity: float, *, reference_price: float | None = None, enforce_min_notional: bool = True):
+        return quantity
+
+    def normalize_price(self, symbol: str, price: float):
+        return price
+
+    def new_order(self, **kwargs):
+        order_type = str(kwargs["order_type"])
+        if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            self.protective_order_calls.append(kwargs)
+            order_id = f"{order_type.lower()}-{len(self.protective_order_calls)}"
+            self.orders.append(
+                {
+                    "orderId": order_id,
+                    "clientOrderId": kwargs.get("client_order_id", order_id),
+                    "type": order_type,
+                    "closePosition": "true",
+                    "reduceOnly": "true",
+                    "stopPrice": str(kwargs.get("stop_price") or 0),
+                    "status": "NEW",
+                }
+            )
+            return {"orderId": order_id, "status": "NEW"}
+
+        self.primary_order_calls.append(kwargs)
+        order_id = f"primary-{len(self.primary_order_calls)}"
+        self.last_primary_order_id = order_id
+        reduce_only = bool(kwargs.get("reduce_only"))
+        close_position = bool(kwargs.get("close_position"))
+        quantity = float(kwargs.get("quantity") or 0.0)
+        if close_position:
+            self.current_position_qty = 0.0
+        elif reduce_only:
+            self.current_position_qty = max(self.current_position_qty - quantity, 0.0)
+        elif self.current_position_qty > 0:
+            self.current_position_qty += quantity
+        else:
+            self.current_position_qty = quantity
+        return {
+            "orderId": order_id,
+            "clientOrderId": kwargs.get("client_order_id", order_id),
+            "status": "FILLED",
+            "executedQty": str(quantity),
+            "avgPrice": str(kwargs.get("price") or 70000.0),
+        }
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        if order_id and order_id == self.last_primary_order_id:
+            return [
+                {
+                    "id": f"trade-{order_id}",
+                    "price": "70000",
+                    "qty": "0.01",
+                    "commission": "0.1",
+                    "commissionAsset": "USDT",
+                    "realizedPnl": "0.0",
+                }
+            ]
+        return []
+
+    def cancel_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        self.orders = [item for item in self.orders if str(item.get("orderId", "")) != str(order_id or "")]
+        return {"status": "CANCELED"}
+
+    def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        return {"orderId": order_id or "lookup", "status": "NEW", "executedQty": "0.0", "avgPrice": "0"}
+
+
+def test_entry_policy_prefers_limit_under_passive_conditions() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(action="long", intent_type="entry"),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+
+    assert plan.order_type == "LIMIT"
+    assert plan.time_in_force == "GTC"
+    assert plan.policy_name == "entry_passive_limit"
+
+
+def test_scale_in_and_reduce_policy_split_from_exit() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    scale_in_plan = select_execution_plan(
+        _intent(action="long", intent_type="scale_in"),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={"protected": True},
+    )
+    reduce_plan = select_execution_plan(
+        _intent(action="reduce", intent_type="reduce_only"),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={"protected": True},
+    )
+    exit_plan = select_execution_plan(
+        _intent(action="exit", intent_type="reduce_only"),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={"protected": True},
+    )
+
+    assert scale_in_plan.order_type == "LIMIT"
+    assert reduce_plan.order_type == "LIMIT"
+    assert exit_plan.order_type == "MARKET"
+
+
+def test_entry_policy_uses_market_when_snapshot_is_stale() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(action="long", intent_type="entry"),
+        _snapshot(is_stale=True),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+
+    assert plan.order_type == "MARKET"
+    assert plan.reason == "market_data_not_reliable"
+
+
+def test_execute_live_trade_uses_policy_for_entry_and_scale_in(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    entry_client = PolicyCaptureClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: entry_client)
+
+    entry_result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=10,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert entry_result["status"] == "filled"
+    assert entry_result["execution_policy"]["order_type"] == "LIMIT"
+    assert entry_client.primary_order_calls[0]["order_type"] == "LIMIT"
+    assert entry_client.primary_order_calls[0]["time_in_force"] == "GTC"
+
+    scale_in_client = PolicyCaptureClient(
+        initial_position_qty=0.01,
+        orders=[
+            {"orderId": "stop-1", "clientOrderId": "stop-1", "type": "STOP_MARKET", "closePosition": "true", "reduceOnly": "true", "stopPrice": "69000", "status": "NEW"},
+            {"orderId": "tp-1", "clientOrderId": "tp-1", "type": "TAKE_PROFIT_MARKET", "closePosition": "true", "reduceOnly": "true", "stopPrice": "72000", "status": "NEW"},
+        ],
+    )
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: scale_in_client)
+
+    scale_in_result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=11,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert scale_in_result["intent_type"] == "scale_in"
+    assert scale_in_result["execution_policy"]["order_type"] == "LIMIT"
+    assert scale_in_client.primary_order_calls[0]["order_type"] == "LIMIT"
+
+
+def test_execute_live_trade_uses_reduce_and_exit_policy(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    reduce_client = PolicyCaptureClient(
+        initial_position_qty=0.02,
+        orders=[
+            {"orderId": "stop-1", "clientOrderId": "stop-1", "type": "STOP_MARKET", "closePosition": "true", "reduceOnly": "true", "stopPrice": "69000", "status": "NEW"},
+            {"orderId": "tp-1", "clientOrderId": "tp-1", "type": "TAKE_PROFIT_MARKET", "closePosition": "true", "reduceOnly": "true", "stopPrice": "72000", "status": "NEW"},
+        ],
+    )
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: reduce_client)
+
+    reduce_result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=12,
+        decision=_decision("reduce"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("reduce"),
+    )
+
+    assert reduce_result["intent_type"] == "reduce_only"
+    assert reduce_result["execution_policy"]["order_type"] == "LIMIT"
+    assert reduce_client.primary_order_calls[0]["order_type"] == "LIMIT"
+
+    exit_client = PolicyCaptureClient(
+        initial_position_qty=0.01,
+        orders=[
+            {"orderId": "stop-1", "clientOrderId": "stop-1", "type": "STOP_MARKET", "closePosition": "true", "reduceOnly": "true", "stopPrice": "69000", "status": "NEW"},
+            {"orderId": "tp-1", "clientOrderId": "tp-1", "type": "TAKE_PROFIT_MARKET", "closePosition": "true", "reduceOnly": "true", "stopPrice": "72000", "status": "NEW"},
+        ],
+    )
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: exit_client)
+
+    exit_result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=13,
+        decision=_decision("exit"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("exit"),
+    )
+
+    assert exit_result["intent_type"] == "reduce_only"
+    assert exit_result["execution_policy"]["order_type"] == "MARKET"
+    assert exit_client.primary_order_calls[0]["order_type"] == "MARKET"
+
+
+def test_protection_path_stays_separate_from_primary_execution(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    protection_client = PolicyCaptureClient(initial_position_qty=0.01)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: protection_client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.get_operating_state",
+        lambda settings_row: PROTECTION_REQUIRED_STATE,
+    )
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=14,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert result["status"] in {"protected", "protected_recreated"}
+    assert protection_client.primary_order_calls == []
+    assert {call["order_type"] for call in protection_client.protective_order_calls} == {
+        "STOP_MARKET",
+        "TAKE_PROFIT_MARKET",
+    }

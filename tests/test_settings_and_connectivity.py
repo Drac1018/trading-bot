@@ -36,6 +36,10 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         max_risk_per_trade=0.01,
         max_daily_loss=0.02,
         max_consecutive_losses=3,
+        max_gross_exposure_pct=3.0,
+        max_largest_position_pct=1.5,
+        max_directional_bias_pct=2.0,
+        max_same_tier_concentration_pct=2.5,
         stale_market_seconds=1800,
         slippage_threshold_pct=0.003,
         starting_equity=100000.0,
@@ -237,6 +241,10 @@ def test_serialize_settings_applies_hard_runtime_caps(db_session) -> None:
     row.max_leverage = 9.0
     row.max_risk_per_trade = 0.2
     row.max_daily_loss = 0.5
+    row.max_gross_exposure_pct = 9.0
+    row.max_largest_position_pct = 4.0
+    row.max_directional_bias_pct = 5.0
+    row.max_same_tier_concentration_pct = 6.0
     db_session.flush()
 
     serialized = serialize_settings(row)
@@ -244,6 +252,10 @@ def test_serialize_settings_applies_hard_runtime_caps(db_session) -> None:
     assert serialized["max_leverage"] == 5.0
     assert serialized["max_risk_per_trade"] == 0.02
     assert serialized["max_daily_loss"] == 0.05
+    assert serialized["max_gross_exposure_pct"] == 3.0
+    assert serialized["max_largest_position_pct"] == 1.5
+    assert serialized["max_directional_bias_pct"] == 2.0
+    assert serialized["max_same_tier_concentration_pct"] == 2.5
 
 
 def test_update_settings_does_not_change_trading_pause_state(db_session) -> None:

@@ -281,6 +281,28 @@ class MarketSnapshotPayload(StrictBaseModel):
     candles: list[MarketCandle]
 
 
+class TimeframeFeatureContext(StrictBaseModel):
+    timeframe: str
+    trend_score: float
+    volatility_pct: float = Field(ge=0.0)
+    volume_ratio: float = Field(ge=0.0)
+    drawdown_pct: float = Field(ge=0.0)
+    rsi: float = Field(ge=0.0, le=100.0)
+    atr: float = Field(ge=0.0)
+    atr_pct: float = Field(ge=0.0)
+    momentum_score: float
+
+
+class RegimeFeatureContext(StrictBaseModel):
+    primary_regime: Literal["bullish", "bearish", "range", "transition"]
+    trend_alignment: Literal["bullish_aligned", "bearish_aligned", "mixed", "range"]
+    volatility_regime: Literal["compressed", "normal", "expanded"]
+    volume_regime: Literal["weak", "normal", "strong"]
+    momentum_state: Literal["strengthening", "stable", "weakening", "overextended"]
+    weak_volume: bool = False
+    momentum_weakening: bool = False
+
+
 class FeaturePayload(StrictBaseModel):
     symbol: str
     timeframe: str
@@ -290,6 +312,10 @@ class FeaturePayload(StrictBaseModel):
     drawdown_pct: float = Field(ge=0.0)
     rsi: float = Field(ge=0.0, le=100.0)
     atr: float = Field(ge=0.0)
+    atr_pct: float = Field(ge=0.0)
+    momentum_score: float
+    multi_timeframe: dict[str, TimeframeFeatureContext] = Field(default_factory=dict)
+    regime: RegimeFeatureContext
     data_quality_flags: list[str]
 
 
@@ -373,6 +399,10 @@ class AppSettingsResponse(StrictBaseModel):
     max_risk_per_trade: float
     max_daily_loss: float
     max_consecutive_losses: int
+    max_gross_exposure_pct: float
+    max_largest_position_pct: float
+    max_directional_bias_pct: float
+    max_same_tier_concentration_pct: float
     stale_market_seconds: int
     slippage_threshold_pct: float
     starting_equity: float
@@ -424,6 +454,10 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     max_risk_per_trade: float = Field(gt=0.0, le=0.02)
     max_daily_loss: float = Field(gt=0.0, le=0.05)
     max_consecutive_losses: int = Field(ge=1, le=20)
+    max_gross_exposure_pct: float = Field(default=3.0, gt=0.0, le=3.0)
+    max_largest_position_pct: float = Field(default=1.5, gt=0.0, le=1.5)
+    max_directional_bias_pct: float = Field(default=2.0, gt=0.0, le=2.0)
+    max_same_tier_concentration_pct: float = Field(default=2.5, gt=0.0, le=2.5)
     stale_market_seconds: int = Field(ge=30, le=86400)
     slippage_threshold_pct: float = Field(gt=0.0, le=0.1)
     starting_equity: float = Field(gt=0.0)

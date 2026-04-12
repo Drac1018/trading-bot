@@ -39,6 +39,10 @@ MINUTES_PER_30_DAY_MONTH = 30 * 24 * 60
 DISPLAY_MAX_LEVERAGE = 5.0
 DISPLAY_MAX_RISK_PER_TRADE = 0.02
 DISPLAY_MAX_DAILY_LOSS = 0.05
+DISPLAY_MAX_GROSS_EXPOSURE_PCT = 3.0
+DISPLAY_MAX_LARGEST_POSITION_PCT = 1.5
+DISPLAY_MAX_DIRECTIONAL_BIAS_PCT = 2.0
+DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT = 2.5
 AUTO_RESUME_GRACE_MAX_MINUTES = 15
 RUNTIME_STATE_DETAIL_KEYS = {"operating_state", "protection_recovery"}
 
@@ -88,6 +92,10 @@ def get_or_create_settings(session: Session) -> Setting:
         max_risk_per_trade=defaults.max_risk_per_trade,
         max_daily_loss=defaults.max_daily_loss,
         max_consecutive_losses=defaults.max_consecutive_losses,
+        max_gross_exposure_pct=defaults.max_gross_exposure_pct,
+        max_largest_position_pct=defaults.max_largest_position_pct,
+        max_directional_bias_pct=defaults.max_directional_bias_pct,
+        max_same_tier_concentration_pct=defaults.max_same_tier_concentration_pct,
         stale_market_seconds=defaults.stale_market_seconds,
         slippage_threshold_pct=defaults.slippage_threshold_pct,
         starting_equity=defaults.starting_equity,
@@ -118,6 +126,18 @@ def get_runtime_credentials(settings_row: Setting, defaults: AppConfig | None = 
         binance_api_key=decrypt_secret(settings_row.binance_api_key_encrypted, app_defaults.app_secret_seed),
         binance_api_secret=decrypt_secret(settings_row.binance_api_secret_encrypted, app_defaults.app_secret_seed),
     )
+
+
+def get_exposure_limits(settings_row: Setting) -> dict[str, float]:
+    return {
+        "gross_exposure_pct": min(settings_row.max_gross_exposure_pct, DISPLAY_MAX_GROSS_EXPOSURE_PCT),
+        "largest_position_pct": min(settings_row.max_largest_position_pct, DISPLAY_MAX_LARGEST_POSITION_PCT),
+        "directional_bias_pct": min(settings_row.max_directional_bias_pct, DISPLAY_MAX_DIRECTIONAL_BIAS_PCT),
+        "same_tier_concentration_pct": min(
+            settings_row.max_same_tier_concentration_pct,
+            DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT,
+        ),
+    }
 
 
 def is_live_execution_armed(settings_row: Setting) -> bool:
@@ -214,6 +234,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     effective_max_leverage = min(settings_row.max_leverage, DISPLAY_MAX_LEVERAGE)
     effective_max_risk_per_trade = min(settings_row.max_risk_per_trade, DISPLAY_MAX_RISK_PER_TRADE)
     effective_max_daily_loss = min(settings_row.max_daily_loss, DISPLAY_MAX_DAILY_LOSS)
+    exposure_limits = get_exposure_limits(settings_row)
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
     auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
     runtime_state = summarize_runtime_state(settings_row)
@@ -256,6 +277,10 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         max_risk_per_trade=effective_max_risk_per_trade,
         max_daily_loss=effective_max_daily_loss,
         max_consecutive_losses=settings_row.max_consecutive_losses,
+        max_gross_exposure_pct=exposure_limits["gross_exposure_pct"],
+        max_largest_position_pct=exposure_limits["largest_position_pct"],
+        max_directional_bias_pct=exposure_limits["directional_bias_pct"],
+        max_same_tier_concentration_pct=exposure_limits["same_tier_concentration_pct"],
         stale_market_seconds=settings_row.stale_market_seconds,
         slippage_threshold_pct=settings_row.slippage_threshold_pct,
         starting_equity=settings_row.starting_equity,
@@ -325,6 +350,10 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.max_risk_per_trade = payload.max_risk_per_trade
     row.max_daily_loss = payload.max_daily_loss
     row.max_consecutive_losses = payload.max_consecutive_losses
+    row.max_gross_exposure_pct = payload.max_gross_exposure_pct
+    row.max_largest_position_pct = payload.max_largest_position_pct
+    row.max_directional_bias_pct = payload.max_directional_bias_pct
+    row.max_same_tier_concentration_pct = payload.max_same_tier_concentration_pct
     row.stale_market_seconds = payload.stale_market_seconds
     row.slippage_threshold_pct = payload.slippage_threshold_pct
     row.starting_equity = payload.starting_equity

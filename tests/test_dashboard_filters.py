@@ -165,6 +165,36 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
     assert overview.missing_protection_items == {"BTCUSDT": ["take_profit"]}
     assert overview.position_protection_summary[0]["symbol"] == "BTCUSDT"
     assert overview.position_protection_summary[0]["missing_components"] == ["take_profit"]
+    assert overview.position_protection_summary[0]["status"] == "missing"
+    assert positions[0]["status"] == "open"
+    assert positions[0]["protection_status"] == "missing"
     assert positions[0]["protected"] is False
     assert positions[0]["protective_order_count"] == 1
     assert positions[0]["missing_components"] == ["take_profit"]
+
+
+def test_positions_hide_closed_rows_and_do_not_mark_them_missing(db_session) -> None:
+    closed_position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="closed",
+        quantity=0.0,
+        entry_price=70000.0,
+        mark_price=70050.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=0.0,
+        metadata_json={},
+    )
+    db_session.add(closed_position)
+    db_session.flush()
+
+    positions = get_positions(db_session)
+    overview = get_overview(db_session)
+
+    assert positions == []
+    assert overview.open_positions == 0
+    assert overview.position_protection_summary == []

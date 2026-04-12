@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     max_risk_per_trade: float = 0.02
     max_daily_loss: float = 0.05
     max_consecutive_losses: int = 3
+    max_gross_exposure_pct: float = 3.0
+    max_largest_position_pct: float = 1.5
+    max_directional_bias_pct: float = 2.0
+    max_same_tier_concentration_pct: float = 2.5
     stale_market_seconds: int = 1800
     slippage_threshold_pct: float = 0.003
     schedule_windows: str = "1h,4h,12h,24h"

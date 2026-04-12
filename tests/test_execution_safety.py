@@ -131,6 +131,7 @@ class ProtectionFailureClient:
         client_order_id: str | None = None,
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
     ):
         if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
             raise RuntimeError("protective create failed")
@@ -191,6 +192,7 @@ class UnprotectedSyncClient:
         client_order_id: str | None = None,
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
     ):
         order_id = "stop-1" if order_type == "STOP_MARKET" else "tp-1"
         self.orders.append(
@@ -254,6 +256,7 @@ class ExitWhilePausedClient:
         client_order_id: str | None = None,
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
     ):
         self.exit_submitted = True
         return {"orderId": "303", "status": "FILLED", "executedQty": quantity or 0.01, "avgPrice": "69950"}
@@ -290,6 +293,7 @@ class ScaleInClient(ExitWhilePausedClient):
         client_order_id: str | None = None,
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
     ):
         self.scaled_in = True
         return {"orderId": "404", "status": "FILLED", "executedQty": quantity or 0.01, "avgPrice": "70080"}
@@ -313,6 +317,7 @@ class ProtectionFailureManageOnlyClient(ProtectionFailureClient):
         client_order_id: str | None = None,
         response_type: str = "RESULT",
         working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
     ):
         if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
             raise RuntimeError("protective create failed")
