@@ -22,10 +22,16 @@ def _next_run(window: str, from_time: datetime | None = None) -> datetime:
 
 def run_window(session: Session, window: str, triggered_by: str = "manual") -> dict[str, object]:
     orchestrator = TradingOrchestrator(session)
-    auto_resume_result = attempt_auto_resume(session, orchestrator.settings_row)
+    auto_resume_result = attempt_auto_resume(
+        session,
+        orchestrator.settings_row,
+        trigger_source=f"{triggered_by}:{window}",
+    )
     if window == "1h":
         outcome = orchestrator.run_market_refresh_cycle(
-            status="market_data_only" if not orchestrator.settings_row.ai_enabled else "market_refresh"
+            status="market_data_only" if not orchestrator.settings_row.ai_enabled else "market_refresh",
+            trigger_event=triggered_by,
+            auto_resume_checked=True,
         )
         if not orchestrator.settings_row.ai_enabled:
             return {
@@ -35,7 +41,12 @@ def run_window(session: Session, window: str, triggered_by: str = "manual") -> d
                 "auto_resume": auto_resume_result,
             }
     elif not orchestrator.settings_row.ai_enabled:
-        return {"window": window, "status": "skipped", "reason": "AI_DISABLED"}
+        return {
+            "window": window,
+            "status": "skipped",
+            "reason": "AI_DISABLED",
+            "auto_resume": auto_resume_result,
+        }
     scheduler_run = SchedulerRun(
         schedule_window=window,
         workflow="market_refresh" if window == "1h" else "scheduled_review",
@@ -107,12 +118,19 @@ def run_window(session: Session, window: str, triggered_by: str = "manual") -> d
 
 def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler") -> dict[str, object]:
     settings_row = get_or_create_settings(session)
-    auto_resume_result = attempt_auto_resume(session, settings_row)
+    auto_resume_result = attempt_auto_resume(
+        session,
+        settings_row,
+        trigger_source=f"{triggered_by}:interval",
+    )
     interval_minutes = settings_row.decision_cycle_interval_minutes
     orchestrator = TradingOrchestrator(session)
     if not settings_row.ai_enabled:
         return {
-            **orchestrator.run_selected_symbols_cycle(trigger_event="realtime_cycle"),
+            **orchestrator.run_selected_symbols_cycle(
+                trigger_event="realtime_cycle",
+                auto_resume_checked=True,
+            ),
             "auto_resume": auto_resume_result,
         }
     scheduler_run = SchedulerRun(
@@ -127,7 +145,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
     session.flush()
 
     try:
-        outcome = orchestrator.run_selected_symbols_cycle(trigger_event="realtime_cycle")
+        outcome = orchestrator.run_selected_symbols_cycle(
+            trigger_event="realtime_cycle",
+            auto_resume_checked=True,
+        )
     except Exception as exc:
         scheduler_run.status = "failed"
         scheduler_run.outcome = {"error": str(exc)}

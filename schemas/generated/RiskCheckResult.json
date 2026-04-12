@@ -43,6 +43,28 @@
       ],
       "title": "Operating Mode",
       "type": "string"
+    },
+    "effective_leverage_cap": {
+      "exclusiveMinimum": 0.0,
+      "maximum": 10.0,
+      "title": "Effective Leverage Cap",
+      "type": "number"
+    },
+    "symbol_risk_tier": {
+      "enum": [
+        "btc",
+        "major_alt",
+        "alt"
+      ],
+      "title": "Symbol Risk Tier",
+      "type": "string"
+    },
+    "exposure_metrics": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Exposure Metrics",
+      "type": "object"
     }
   },
   "required": [
@@ -51,7 +73,9 @@
     "reason_codes",
     "approved_risk_pct",
     "approved_leverage",
-    "operating_mode"
+    "operating_mode",
+    "effective_leverage_cap",
+    "symbol_risk_tier"
   ],
   "title": "RiskCheckResult",
   "type": "object"

@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "StructuredCompetitorNote": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "category": {
+          "title": "Category",
+          "type": "string"
+        },
+        "differentiation": {
+          "title": "Differentiation",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "category",
+        "differentiation",
+        "summary",
+        "created_at"
+      ],
+      "title": "StructuredCompetitorNote",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "category_breakdown": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Category Breakdown",
+      "type": "object"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/StructuredCompetitorNote"
+      },
+      "title": "Items",
+      "type": "array"
+    }
+  },
+  "required": [
+    "generated_at"
+  ],
+  "title": "StructuredCompetitorNotesResponse",
+  "type": "object"
+}

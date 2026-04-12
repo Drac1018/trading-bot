@@ -469,6 +469,9 @@ def test_execute_live_trade_uses_exchange_available_balance_for_sizing(monkeypat
         approved_risk_pct=0.01,
         approved_leverage=1.0,
         operating_mode="live",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
     )
 
     result = execute_live_trade(
@@ -557,6 +560,9 @@ def test_execute_live_trade_rejects_insufficient_margin_without_raising(monkeypa
         approved_risk_pct=0.01,
         approved_leverage=1.0,
         operating_mode="live",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
     )
 
     result = execute_live_trade(
@@ -605,7 +611,7 @@ def test_run_interval_decision_cycle_marks_failure_instead_of_raising(monkeypatc
     db_session.add(settings_row)
     db_session.flush()
 
-    def fail_cycle(self, trigger_event="realtime_cycle"):
+    def fail_cycle(self, trigger_event="realtime_cycle", **kwargs):
         raise RuntimeError("interval failure")
 
     monkeypatch.setattr(TradingOrchestrator, "run_selected_symbols_cycle", fail_cycle)

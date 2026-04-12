@@ -21,6 +21,7 @@
 - `GET /api/settings`
 - `GET /api/backlog`
 - `GET /api/backlog/{backlog_id}`
+- `GET /api/backlog/{backlog_id}/codex-draft`
 - `POST /api/backlog/{backlog_id}/auto-apply`
 - `POST /api/backlog/auto-apply-supported`
 

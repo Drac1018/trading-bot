@@ -10,11 +10,18 @@ from trading_mvp.config import Settings as AppConfig
 from trading_mvp.config import get_settings
 from trading_mvp.models import Setting
 from trading_mvp.schemas import AppSettingsResponse, AppSettingsUpdateRequest
+from trading_mvp.services.account import get_latest_pnl_snapshot
 from trading_mvp.services.ai_usage import (
     AIUsageMetrics,
     build_ai_usage_metrics,
     get_openai_call_gate,
     manual_ai_guard_minutes,
+)
+from trading_mvp.services.pause_policy import (
+    get_pause_reason_policy,
+    pause_reason_allows_auto_resume,
+    pause_reason_recovery_class,
+    pause_reason_severity,
 )
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
 from trading_mvp.time_utils import utcnow_naive
@@ -28,7 +35,10 @@ class RuntimeCredentials:
 
 
 MINUTES_PER_30_DAY_MONTH = 30 * 24 * 60
-AUTO_RESUME_REASON_CODES = {"EXCHANGE_ACCOUNT_STATE_UNAVAILABLE"}
+DISPLAY_MAX_LEVERAGE = 5.0
+DISPLAY_MAX_RISK_PER_TRADE = 0.02
+DISPLAY_MAX_DAILY_LOSS = 0.05
+AUTO_RESUME_GRACE_MAX_MINUTES = 15
 
 
 def _default_windows(defaults: AppConfig) -> list[str]:
@@ -129,10 +139,6 @@ def is_live_execution_ready(settings_row: Setting, defaults: AppConfig | None = 
     )
 
 
-def pause_reason_allows_auto_resume(reason_code: str | None) -> bool:
-    return bool(reason_code and reason_code in AUTO_RESUME_REASON_CODES)
-
-
 def arm_live_execution(session: Session, minutes: int | None = None) -> Setting:
     row = get_or_create_settings(session)
     row.live_execution_armed = True
@@ -203,6 +209,12 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     elif is_live_execution_ready(settings_row, defaults=defaults):
         mode = "live_ready"
 
+    effective_max_leverage = min(settings_row.max_leverage, DISPLAY_MAX_LEVERAGE)
+    effective_max_risk_per_trade = min(settings_row.max_risk_per_trade, DISPLAY_MAX_RISK_PER_TRADE)
+    effective_max_daily_loss = min(settings_row.max_daily_loss, DISPLAY_MAX_DAILY_LOSS)
+    pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
+    auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
+
     payload = AppSettingsResponse(
         id=settings_row.id,
         live_trading_enabled=settings_row.live_trading_enabled,
@@ -219,13 +231,18 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         pause_triggered_at=settings_row.pause_triggered_at,
         auto_resume_after=settings_row.auto_resume_after,
         auto_resume_whitelisted=pause_reason_allows_auto_resume(settings_row.pause_reason_code),
+        auto_resume_eligible=pause_policy.auto_resume_eligible if settings_row.trading_paused else False,
+        auto_resume_status=str(auto_resume_state.get("status", "not_paused" if not settings_row.trading_paused else "idle")),
+        auto_resume_last_blockers=[str(item) for item in auto_resume_state.get("blockers", [])],
+        pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
+        pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
         schedule_windows=settings_row.schedule_windows,
-        max_leverage=settings_row.max_leverage,
-        max_risk_per_trade=settings_row.max_risk_per_trade,
-        max_daily_loss=settings_row.max_daily_loss,
+        max_leverage=effective_max_leverage,
+        max_risk_per_trade=effective_max_risk_per_trade,
+        max_daily_loss=effective_max_daily_loss,
         max_consecutive_losses=settings_row.max_consecutive_losses,
         stale_market_seconds=settings_row.stale_market_seconds,
         slippage_threshold_pct=settings_row.slippage_threshold_pct,
@@ -347,10 +364,45 @@ def set_trading_pause(
     row = get_or_create_settings(session)
     row.trading_paused = paused
     if paused:
+        now = utcnow_naive()
+        policy = get_pause_reason_policy(reason_code)
+        current_detail = dict(reason_detail or {})
+        live_armed_before_pause = is_live_execution_armed(row)
+        live_ready_before_pause = is_live_execution_ready(row)
+        live_armed_until_before_pause = row.live_execution_armed_until
+        latest_pnl = get_latest_pnl_snapshot(session, row)
+        grace_until: datetime | None = None
+        if (
+            pause_origin == "system"
+            and policy.auto_resume_eligible
+            and live_ready_before_pause
+        ):
+            grace_minutes = max(5, min(row.live_approval_window_minutes, AUTO_RESUME_GRACE_MAX_MINUTES))
+            grace_until = now + timedelta(minutes=grace_minutes)
+            if live_armed_until_before_pause is not None and live_armed_until_before_pause > grace_until:
+                grace_until = live_armed_until_before_pause
+        current_detail["resume_context"] = {
+            "live_execution_armed_before_pause": live_armed_before_pause,
+            "live_execution_ready_before_pause": live_ready_before_pause,
+            "live_execution_armed_until_before_pause": (
+                live_armed_until_before_pause.isoformat() if live_armed_until_before_pause else None
+            ),
+            "approval_grace_until": grace_until.isoformat() if grace_until else None,
+            "pause_severity": policy.severity,
+            "pause_recovery_class": policy.recovery_class,
+            "equity_before_pause": latest_pnl.equity,
+            "daily_pnl_before_pause": latest_pnl.daily_pnl,
+            "consecutive_losses_before_pause": latest_pnl.consecutive_losses,
+        }
+        current_detail["auto_resume"] = {
+            "status": "idle" if policy.auto_resume_eligible else "not_eligible",
+            "blockers": [],
+            "last_checked_at": None,
+        }
         row.pause_reason_code = reason_code
         row.pause_origin = pause_origin
-        row.pause_reason_detail = reason_detail or {}
-        row.pause_triggered_at = utcnow_naive()
+        row.pause_reason_detail = current_detail
+        row.pause_triggered_at = now
         row.auto_resume_after = (
             auto_resume_after if pause_reason_allows_auto_resume(reason_code) else None
         )

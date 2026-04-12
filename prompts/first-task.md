@@ -1,346 +1,444 @@
 # First Task Prompt
 
-You are Codex working inside this repository. Your task is to IMPLEMENT, not just design, a production-credible MVP of a multi-agent automated trading product.
+You are Codex working inside this repository.
 
-Important execution behavior:
+Your task is to **IMPLEMENT**, not just design.
+
+This repository is intended to grow into a multi-agent automated trading platform, but the current implementation priority is more concrete:
+
+**Inspect, stabilize, and refactor the repository toward a live-trading-safe Binance Futures short-term trading system, while preserving a modular architecture that can later expand into a broader multi-agent platform.**
+
+---
+
+## Important execution behavior
+
 - Do not stop after giving a plan.
-- First inspect the repository, understand the current structure, and adapt to the existing stack and conventions if they exist.
-- If the repository is empty or incomplete, scaffold the project from scratch using sensible defaults.
-- Make decisions autonomously when details are missing.
-- Prefer the simplest architecture that is robust, testable, and extensible.
-- Run commands, linters, type checks, and tests as needed.
+- First inspect the repository and understand its current structure.
+- Adapt to the existing stack and conventions if they already exist.
+- Do not force a full rewrite just because a different ideal architecture is possible.
+- If parts are empty or missing, scaffold only what is necessary.
+- Make reasonable decisions autonomously when details are missing.
+- Prefer the simplest architecture that is robust, testable, extensible, observable, and safe by default.
+- Run commands, tests, lint, type checks, and verification steps when needed.
 - Fix issues until the project is runnable.
-- At the end, provide a concise implementation summary, exact run commands, what remains incomplete, and any risks.
+- At the end, provide:
+  1. what changed
+  2. exact run commands
+  3. what is fully working
+  4. what is mocked or stubbed
+  5. remaining risks / next steps
+  6. exact files created or modified
 
-Project goal:
-Build a multi-agent automated trading platform with 5 AI roles and deterministic safety controls. The system must be able to run in paper-trading mode end-to-end by default, and support optional future live trading through a guarded adapter.
+---
 
-High-level product concept:
-1) Chief Review / Aggregation AI
-   - Reviews outputs from other agents
-   - Aggregates findings
-   - Resolves conflicts
-   - Produces final operational summary and recommended mode (hold / monitor / act)
-   - Does NOT directly place orders
+## Current goal
 
-2) Integration Planner AI
-   - Identifies where AI should be attached in the product
-   - Reviews system workflows, logs, metrics, and bottlenecks
-   - Suggests integration points, automation opportunities, and technical improvements
-   - Works mostly in batch / review mode, not in the tight real-time execution path
+The immediate goal is **not** to build a generic demo platform first.
 
-3) Trading Decision AI
-   - Produces structured trade decisions: hold / long / short / reduce / exit
-   - Returns confidence, rationale codes, entry zone, stop loss, take profit, max hold duration, and position sizing suggestion
-   - Does NOT directly execute orders
-   - All output must be structured JSON and validated against schema
+The immediate goal is to make the repository safer and more operationally credible as a:
 
-4) UI/UX AI
-   - Improves dashboard clarity, alert copy, explanations, workflow usability, settings UX
-   - Generates suggestions, annotations, and improvement tickets
-   - Can propose UI copy and dashboard enhancements
-   - Must not auto-deploy changes without explicit human approval
+**Binance Futures live-trading-oriented short-term / scalping system**
 
-5) Product Improvement / Planning AI
-   - Reviews KPIs, experiment results, user behavior, historical performance, and competitor notes
-   - Generates backlog items, priorities, and improvement proposals
-   - Creates planning artifacts and product recommendations
-   - Must not change trading policy automatically
+while keeping modular boundaries that support a future multi-agent platform.
 
-Critical architecture principle:
-AI may analyze, recommend, summarize, and plan, but deterministic risk rules and execution controls must have final authority.
+---
+
+## Current implementation priority
+
+Prioritize the following work in order:
+
+1. inspect the full repository
+2. map the current trading loop and boundaries
+3. identify dangerous coupling and missing safety controls
+4. refactor toward a live-trading-safe structure
+5. separate:
+   - AI judgment
+   - deterministic risk validation
+   - order execution
+   - position / account management
+   - settings / control
+   - audit / observability
+6. preserve or explain legacy behavior where needed
+7. stabilize the real trading core before expanding non-core product surfaces
+
+Do not prioritize frontend expansion, broad multi-agent orchestration, or non-essential batch workflows over the trading core.
+
+---
+
+## Long-term product scope
+
+The long-term platform can still include these 5 AI roles:
+- Chief Review / Aggregation AI
+- Integration Planner AI
+- Trading Decision AI
+- UI/UX AI
+- Product Improvement / Planning AI
+
+But the current implementation focus must remain on:
+
+- market snapshot ingestion and normalization
+- feature calculation and persistence
+- Trading Decision AI cycle
+- strict schema validation
+- deterministic risk evaluation
+- safe execution pipeline
+- position tracking and management
+- audit logging
+- emergency control and manual intervention capability
+
+The other agent roles should remain modular and replaceable, but they must not compromise live trading core safety or clarity.
+
+---
+
+## Live trading operating profile
+
+Assume the current live trading core is designed for:
+
+- Exchange: Binance Futures
+- Runtime: 24/7 automated operation
+- Mode: live-trading-oriented
+- Primary decision timeframe: 15m
+- Multi-symbol trading: allowed
+- Multi-timeframe analysis: recommended when available
+- Multiple simultaneous positions: allowed
+- Add-on entries / scale-ins: allowed only if safely validated
+- Trading style: short-term / scalping oriented
+- Preference: 70 profit / 30 safety, while preserving hard safety controls
+- External risk mode: must support ON/OFF
+- Forced stop and manual liquidation: mandatory
+
+Paper trading, replay, and simulation are still useful for development and verification.
+However, this project must not be treated as a paper-only sandbox.
+
+Live trading must be an explicit, auditable, controlled capability.
+
+---
+
+## Critical architecture principle
+
+AI may analyze and decide trade intent, but deterministic risk rules and execution controls must have final authority.
+
 Real money movement must never be governed by free-form AI output alone.
 
-Default safety mode:
-- Paper trading ON by default
-- Live trading OFF by default
-- If live trading is ever enabled later, it must require:
-  - explicit environment flag
-  - explicit manual approval gate
-  - deterministic risk engine approval
-  - full audit logging
-- Build the software so it is safe even when exchange credentials are absent
+This project must enforce a strict separation between:
+- Trading Decision AI
+- `risk_guard`
+- `order_executor`
 
-Core risk constraints to implement:
-- Maximum leverage: 3x
-- Maximum risk per trade: 1.00% of account equity
-- Daily loss limit: 2.00% of account equity
-- If 3 consecutive losses occur, system should prefer HOLD mode
-- If stop loss or take profit is missing or invalid, new entry is blocked
-- If market data is stale or incomplete, block execution
-- If slippage exceeds configured threshold, block or cancel execution
-- If agent output fails schema validation, discard it
-- If deterministic policy conflicts with AI recommendation, policy wins
-- Must include emergency kill switch / trading pause
+AI determines intent.
+`risk_guard` determines whether execution is actually allowed.
+`order_executor` sends orders only after approval.
 
-Primary deliverable:
-A runnable full-stack MVP that demonstrates:
-- multi-agent orchestration
-- paper trading
-- deterministic risk validation
-- order simulation / execution pipeline
-- audit logs
-- dashboard UI
-- scheduled re-evaluation
-- product improvement workflow
+---
 
-If the repo has no clear stack already, use this preferred stack:
-- Backend API: Python 3.12 + FastAPI
-- Worker / background jobs: Python workers with Redis queue
-- Database: PostgreSQL
-- Cache / task queue: Redis
-- Frontend: Next.js + TypeScript + Tailwind
-- Infra: Docker Compose
-- Tests: pytest for backend, Playwright or equivalent minimal UI smoke test, unit tests for risk engine and agent schema validation
+## Safety principles
 
-Repository structure to create if needed:
-- backend/
-- frontend/
-- workers/
-- docs/
-- infra/
-- scripts/
-- tests/
-- prompts/
-- schemas/
+The system must remain safe even when:
+- exchange credentials are missing
+- market data is partial
+- exchange state is inconsistent
+- connectivity is degraded
+- one subsystem fails
 
-Required system components:
-1. Market Data Layer
-   - ingest market data from a mock / simulated source
-   - optionally add an exchange adapter interface for future real exchange integration
-   - support historical candle replay for testing
-   - normalize timestamps and symbols
-   - provide clean internal market snapshots
+Mandatory controls:
+- emergency kill switch
+- global trading pause
+- degraded mode support
+- manual liquidation path
+- auditable control changes
+- logged approval and rejection reasons
 
-2. Feature Layer
-   - calculate baseline indicators and features
-   - trend, volatility, volume, drawdown-related features
-   - data quality checks
-   - feature snapshot persisted for each decision cycle
+In failure scenarios, the system must restrict new entries while preserving at least minimal position-management functionality.
 
-3. Agent Layer
-   - implement all 5 agent roles
-   - all agent outputs must use strict schemas
-   - store every agent input/output with timestamps
-   - orchestrator decides which agents to call depending on the event:
-     - real-time decision cycle: primarily Trading Decision AI
-     - post-decision summary: Chief Review AI
-     - scheduled product review: Product Improvement AI
-     - system/integration review: Integration Planner AI
-     - UX review: UI/UX AI
-   - do NOT call all agents on every tick
+---
 
-4. Deterministic Policy / Risk Engine
-   - final authority before any execution
-   - validates leverage, size, stop loss, take profit, daily loss limit, consecutive loss state, stale data, slippage threshold
-   - produces allow / deny with reason codes
-   - must be unit tested
+## Mandatory risk rules
 
-5. Execution Layer
-   - paper execution engine required
-   - support pending/open/filled/cancelled/rejected states
-   - record simulated fills and realized/unrealized PnL
-   - use deterministic logic for paper fills
-   - add adapter interface so live trading can be added later
-   - live adapter can remain disabled or stubbed if credentials are unavailable
+### Leverage policy
 
-6. Scheduler
-   - configurable review cycles for 1h, 4h, 12h, 24h
-   - each cycle can trigger specific agent workflows
-   - store outcomes and next actions
+Leverage policy must be centrally managed through configuration/policy modules, not scattered hardcoded checks.
 
-7. Audit / Observability
-   - persistent audit log for:
-     - agent outputs
-     - risk checks
-     - execution attempts
-     - state transitions
-     - alerts
-   - structured logs
-   - health/status endpoint
-   - event timeline view in UI
+At minimum enforce:
 
-8. Frontend / Dashboard
-   Build a usable internal admin dashboard with at least these pages:
-   - Overview
-   - Market / signals snapshot
-   - Decisions
-   - Positions
-   - Orders / executions
-   - Risk status
-   - Agents
-   - Scheduler
-   - Audit log
-   - Settings
-   - Product improvement backlog
+- BTC: maximum `5x`
+- major alts: maximum `3x`
+- general alts: maximum `2x`
 
-UI expectations:
-- clean, modern, operator-friendly layout
-- clear visual distinction between recommendation vs approved execution
-- show why system is in HOLD if blocked
-- show per-agent outputs in human-readable form
-- allow pause / resume trading
-- show paper/live mode clearly
-- settings for schedule windows: 1h, 4h, 12h, 24h
-- human-facing copy should be concise and understandable
-- use sensible seed data so the dashboard is not empty
+Create a centralized symbol-group policy mechanism if it does not already exist.
 
-Minimum schemas to implement:
+### Account risk policy
+
+At minimum enforce:
+
+- max loss per trade: `2.00%` of account equity
+- daily loss limit: `5.00%` of account equity
+- after `3` consecutive losses, apply more conservative restrictions
+- block new entries if account state, market state, or position state cannot be computed reliably
+- block or cancel execution if slippage exceeds configured or context-aware tolerance
+- discard malformed or schema-invalid AI output
+- deterministic policy always wins on conflict
+
+### Exposure awareness
+
+Even if there is no hard total exposure cap yet, the system must still calculate and track:
+
+- total margin usage
+- inter-symbol correlation risk
+- directional concentration
+- portfolio / position aggregate risk
+
+No hard cap is acceptable for now.
+No missing calculation is acceptable.
+
+---
+
+## `risk_guard` responsibilities
+
+The `risk_guard` layer is the final execution gate.
+
+It must validate, at minimum:
+
+- leverage limits by symbol group
+- max loss per trade
+- daily loss limit
+- degraded mode restrictions
+- entry blocking during pause / emergency states
+- entry blocking when account or market data is missing or inconsistent
+- quantity sizing and exchange precision rules
+- exchange-rule compatibility
+- total exposure awareness
+- directional bias awareness
+- inter-symbol correlation awareness
+- aggregate portfolio / position risk
+- slippage thresholds
+- failure-mode minimum position-management behavior
+
+If AI output conflicts with hard risk rules, hard risk rules must win every time.
+
+---
+
+## Execution flow to build or refactor
+
+Required flow:
+
+1. collect market / account / position data
+2. build AI input
+3. request Trading Decision AI
+4. parse and schema-validate AI response
+5. run deterministic `risk_guard`
+6. execute only if approved
+7. persist approval or rejection results
+8. persist position / order / fill / PnL updates
+9. log the full decision and execution trail
+
+This must be the highest-priority end-to-end path.
+
+---
+
+## AI decision authority
+
+The Trading Decision AI / ChatGPT path may determine:
+
+- whether to enter
+- whether to exit
+- long / short direction
+- whether to hold
+- whether to reduce
+- whether to add to a position
+- whether to re-enter the same symbol
+- whether to use stop loss
+- whether to use take profit
+- max holding duration
+- order style preference
+- external risk mode handling
+
+However, AI must never bypass deterministic validation or execution controls.
+
+---
+
+## System components to inspect and refactor
+
+### 1. Market data layer
+- collect and normalize market snapshots
+- support Binance Futures market data if already present
+- support replay / verification mode where practical
+- normalize timestamps and symbols
+- provide clean internal market snapshots
+
+### 2. Feature layer
+- calculate baseline indicators and features
+- support short-term decision use cases
+- persist feature snapshots per decision cycle
+- include data-quality checks
+
+### 3. Agent layer
+- Trading Decision AI is the priority path
+- Chief Review / Integration Planner / UI/UX / Product Improvement remain modular
+- all agent outputs must use strict schemas
+- store every agent input/output with timestamps
+- do not call every agent on every tick
+
+### 4. Deterministic policy / `risk_guard`
+- final authority before execution
+- validates leverage, size, stop loss, take profit, daily loss, consecutive losses, stale data, exposure awareness, and slippage
+- must be unit tested
+- must clearly explain rejection reason codes
+
+### 5. Execution layer
+- protected Binance Futures execution path
+- support order states such as pending / filled / canceled / rejected / expired
+- record fills, fees, realized/unrealized PnL
+- support protective orders
+- support position synchronization
+- support manual liquidation capability
+- preserve auditable live control boundaries
+
+### 6. Control layer
+- global trading pause
+- emergency stop
+- manual live approval gating
+- degraded mode
+- external risk mode ON/OFF
+- manual liquidation
+- audit trail for all control actions
+
+### 7. Audit / observability
+- persistent audit log for:
+  - agent outputs
+  - risk checks
+  - execution attempts
+  - state transitions
+  - alerts
+  - control changes
+- structured logs
+- health/status endpoint
+- operational timeline visibility
+
+### 8. Frontend / dashboard
+Prioritize operational visibility over broad product polish.
+
+Important surfaces include:
+- overview
+- market / signal snapshot
+- decisions
+- positions
+- orders / executions
+- risk status
+- agents
+- scheduler
+- audit log
+- settings / controls
+
+The UI must clearly distinguish:
+- AI recommendation
+- risk approval / rejection
+- actual execution status
+- live / paused / degraded state
+
+---
+
+## Required schemas
+
+At minimum, the repository should have explicit strict schemas around:
+
 - TradeDecision
-- ChiefReviewSummary
-- IntegrationSuggestion
-- UXSuggestion
-- ProductBacklogItem
 - RiskCheckResult
 - ExecutionIntent
 - AgentRunRecord
 - SchedulerRunRecord
-Use strict validation and reject malformed payloads.
 
-Suggested TradeDecision schema fields:
-- decision: hold | long | short | reduce | exit
-- confidence: float 0..1
-- symbol
-- timeframe
-- entry_zone_min
-- entry_zone_max
-- stop_loss
-- take_profit
-- max_holding_minutes
-- risk_pct
-- leverage
-- rationale_codes: string[]
-- explanation_short
-- explanation_detailed
+Additional multi-agent schemas can remain in place, but the trading-core schemas must stay correct, strict, and auditable.
 
-Required database entities:
-- users (if needed for local admin)
-- settings
-- market_snapshots
-- feature_snapshots
-- agent_runs
-- risk_checks
-- positions
-- orders
-- executions
-- pnl_snapshots
-- alerts
-- scheduler_runs
-- product_backlog
-- competitor_notes
-- ui_feedback
-- system_health_events
+Malformed payloads must be rejected.
 
-Implementation rules:
-- Do not hardcode secrets
-- Provide .env.example
-- Provide clear config loading
-- Support local development with Docker Compose
-- Seed the DB with sample symbols and mock market data
-- Include mock competitor notes so Product Improvement AI has something to process
-- Include sample UI feedback data so UI/UX AI has something to review
-- Include sample audit history so timeline pages render meaningfully
-- Prefer typed interfaces and explicit DTOs
-- Use migrations if using an ORM
-- Keep functions cohesive and modular
-- Avoid fake implementations that only return success placeholders
-- If something cannot be fully integrated, implement a working mock or adapter boundary and document it clearly
+---
 
-Agent implementation expectations:
-Chief Review / Aggregation AI:
-- input: recent trade decisions, risk results, system health, alerts
-- output: summary, recommended operating mode, must-do actions, priority
-- never directly execute orders
+## Implementation rules
 
-Integration Planner AI:
-- input: logs, metrics summaries, error summaries, architecture state
-- output: suggested integration points, automation opportunities, tech debt items, priority
-- batch/scheduled use only
+- do not hardcode secrets
+- provide `.env.example`
+- provide clear config loading
+- prefer typed interfaces and explicit DTOs
+- do not replace working code with fake placeholders
+- if something cannot be fully integrated, create a working boundary or mock and document it clearly
+- preserve existing working live-trading safety controls where possible
+- improve traceability, not just surface features
 
-Trading Decision AI:
-- input: market snapshot, features, open positions, risk context
-- output: structured TradeDecision
-- must be deterministic enough to test around schema + pipeline behavior
-- if external model integration is not available locally, implement model client boundaries and a mock provider so the system still runs
+---
 
-UI/UX AI:
-- input: UI feedback, usage events, current dashboard structure
-- output: UXSuggestion items and improved copy blocks
-- do not auto-apply high-risk changes silently
+## Testing and verification expectations
 
-Product Improvement AI:
-- input: KPI summaries, performance metrics, competitor notes, prior backlog
-- output: backlog recommendations with severity, effort, impact, and rationale
+You must verify the live trading core, especially:
 
-Execution flow to build:
-- collect market snapshot
-- compute features
-- call Trading Decision AI
-- validate schema
-- run deterministic risk engine
-- if denied: log and surface HOLD / BLOCKED state
-- if approved in paper mode: send to paper execution engine
-- store position/order/execution updates
-- call Chief Review AI after decision cycle
-- update dashboard and audit logs
-- allow scheduled batch jobs for UI/UX AI and Product Improvement AI
+- risk engine logic
+- leverage policy by symbol group
+- order sizing and exchange validation
+- execution path safety
+- AI schema validation
+- pause / emergency behavior
+- degraded mode behavior
+- replay / historical non-live behavior
+- multi-symbol isolation behavior
 
-Backtesting / replay requirement:
-- implement a simple historical replay mode using CSV or seeded data
-- allow running a simulation cycle from CLI or API
-- persist resulting decisions and paper executions
-- enough to validate the end-to-end pipeline
+Paper/replay tests are good.
+But they must serve validation of the live-safe core, not replace it conceptually.
 
-Required commands / scripts:
-- local setup
-- database migrate
-- seed sample data
-- run backend
-- run frontend
-- run workers
-- run full stack
-- run tests
-- run replay simulation
-- lint / type check
+---
 
-Documentation to produce:
-- README.md with exact setup and run steps
-- docs/architecture.md
-- docs/agent-design.md
-- docs/risk-policy.md
-- docs/execution-flow.md
-- docs/api.md
-- AGENTS.md for future Codex runs explaining:
-  - how to navigate the repo
-  - which commands to run
-  - coding conventions
-  - test commands
-  - safety principles
-  - what “done” means in this project
+## Documentation to produce or update
 
-Acceptance criteria:
-- `docker compose up --build` or equivalent starts the MVP locally
-- seed data creates a usable dashboard
-- an end-to-end paper-trading cycle can run successfully
-- the risk engine blocks invalid decisions
-- all agent outputs are schema-validated and logged
-- scheduler supports 1h / 4h / 12h / 24h review cycles
-- dashboard clearly shows mode, positions, decisions, and audit trail
-- tests cover core risk rules and key pipeline paths
-- docs are sufficient for another engineer to continue development
+Prefer documenting the current real architecture instead of an idealized one.
 
-Strong preference on implementation style:
-- Build a real MVP, not a slideware prototype
-- Favor correctness, observability, and maintainability over unnecessary complexity
-- Keep the system modular so each AI role can later be replaced or improved independently
-- Use clean naming and readable code
-- Do not ask unnecessary questions if you can infer a reasonable path
-- When uncertain, choose a safe default and document it
+At minimum update or provide:
 
-Final output expected from you after implementation:
-1. What you changed
-2. How to run the project
-3. What is fully working now
-4. What is mocked or stubbed
-5. Remaining risks / next steps
-6. Exact files created or modified
+- `README.md`
+- `docs/architecture.md`
+- `docs/agent-design.md`
+- `docs/risk-policy.md`
+- `docs/execution-flow.md`
+- `docs/api.md`
+- `AGENTS.md`
+
+Documentation must explain:
+- how the current trading core works
+- where AI judgment ends
+- where deterministic control begins
+- how live execution is guarded
+- how pause / emergency / degraded behaviors work
+
+---
+
+## Acceptance criteria for the current phase
+
+The current phase should not be considered done unless the repository provides:
+
+- a runnable local environment
+- a live-trading-capable but safety-controlled structure
+- deterministic risk validation
+- schema-validated AI decision handling
+- auditable decision / execution / control trails
+- visibility into positions, orders, executions, risk, and settings
+- emergency pause / control flows
+- tests for the risk engine and key pipeline paths
+- documentation sufficient for another engineer to continue safely
+
+Large UI scope or broader multi-agent polish does not outrank correctness and safety of the trading core.
+
+---
+
+## Strong implementation preference
+
+Build a real, operationally credible MVP.
+
+Favor:
+- correctness
+- safety
+- observability
+- maintainability
+- explicit boundaries
+
+Avoid:
+- vague architectural fluff
+- fake success placeholders
+- uncontrolled AI execution authority
+- broad non-core expansion before the live trading path is safe and understandable

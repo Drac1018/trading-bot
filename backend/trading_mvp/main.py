@@ -8,10 +8,10 @@ from trading_mvp.database import Base, engine, get_db
 from trading_mvp.schemas import (
     AppliedChangeRecordCreate,
     AppSettingsUpdateRequest,
-    BacklogCodexDraftResponse,
     BacklogAutoApplyBatchResponse,
     BacklogAutoApplyResult,
     BacklogBoardResponse,
+    BacklogCodexDraftResponse,
     BinanceAccountResponse,
     BinanceConnectionTestRequest,
     BinanceLiveTestOrderRequest,
@@ -31,7 +31,6 @@ from trading_mvp.services.backlog_auto_apply import (
     auto_apply_backlog_item,
     auto_apply_supported_backlogs,
 )
-from trading_mvp.services.backlog_codex_drafts import build_codex_prompt_draft
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
 from trading_mvp.services.dashboard import (
@@ -50,6 +49,7 @@ from trading_mvp.services.dashboard import (
 )
 from trading_mvp.services.execution import run_live_test_order, sync_live_state
 from trading_mvp.services.orchestrator import TradingOrchestrator
+from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.scheduler import run_window
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import (
@@ -371,6 +371,7 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
         result = sync_live_state(db, settings_row, symbol=symbol)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    auto_resume = attempt_auto_resume(db, settings_row, trigger_source="api_live_sync")
     record_audit_event(
         db,
         event_type="live_sync",
@@ -378,10 +379,10 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
         entity_id=symbol or settings_row.default_symbol,
         severity="info",
         message="Live exchange state synchronized.",
-        payload=result,
+        payload={**result, "auto_resume": auto_resume},
     )
     db.commit()
-    return result
+    return {**result, "auto_resume": auto_resume}
 
 
 @app.get("/api/backlog")

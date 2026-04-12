@@ -216,6 +216,9 @@ class RiskCheckResult(StrictBaseModel):
     approved_risk_pct: float = Field(ge=0.0, le=1.0)
     approved_leverage: float = Field(ge=0.0, le=10.0)
     operating_mode: Literal["live", "paused", "hold"]
+    effective_leverage_cap: float = Field(gt=0.0, le=10.0)
+    symbol_risk_tier: Literal["btc", "major_alt", "alt"]
+    exposure_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class ExecutionIntent(StrictBaseModel):
@@ -331,6 +334,11 @@ class AppSettingsResponse(StrictBaseModel):
     pause_triggered_at: datetime | None = None
     auto_resume_after: datetime | None = None
     auto_resume_whitelisted: bool = False
+    auto_resume_eligible: bool = False
+    auto_resume_status: str = "not_paused"
+    auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    pause_severity: str | None = None
+    pause_recovery_class: str | None = None
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str
@@ -386,9 +394,9 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     tracked_symbols: list[str] = Field(min_length=1)
     default_timeframe: str = Field(min_length=1, max_length=20)
     schedule_windows: list[str]
-    max_leverage: float = Field(gt=0.0, le=10.0)
-    max_risk_per_trade: float = Field(gt=0.0, le=1.0)
-    max_daily_loss: float = Field(gt=0.0, le=1.0)
+    max_leverage: float = Field(gt=0.0, le=5.0)
+    max_risk_per_trade: float = Field(gt=0.0, le=0.02)
+    max_daily_loss: float = Field(gt=0.0, le=0.05)
     max_consecutive_losses: int = Field(ge=1, le=20)
     stale_market_seconds: int = Field(ge=30, le=86400)
     slippage_threshold_pct: float = Field(gt=0.0, le=0.1)

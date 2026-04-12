@@ -40,7 +40,14 @@ from trading_mvp.services.backlog_insights import (
 from trading_mvp.services.execution import execute_live_trade
 from trading_mvp.services.features import compute_features, persist_feature_snapshot
 from trading_mvp.services.market_data import build_market_snapshot, persist_market_snapshot
-from trading_mvp.services.risk import evaluate_risk
+from trading_mvp.services.pause_control import attempt_auto_resume
+from trading_mvp.services.risk import (
+    HARD_MAX_GLOBAL_LEVERAGE,
+    HARD_MAX_RISK_PER_TRADE,
+    evaluate_risk,
+    get_symbol_leverage_cap,
+    get_symbol_risk_tier,
+)
 from trading_mvp.services.settings import (
     get_effective_symbols,
     get_or_create_settings,
@@ -100,6 +107,24 @@ class TradingOrchestrator:
             "consecutive_losses": 0,
         }
 
+    @staticmethod
+    def _should_attempt_auto_resume(trigger_event: str) -> bool:
+        return trigger_event != "historical_replay"
+
+    def _ensure_auto_resume(
+        self,
+        *,
+        trigger_event: str,
+        auto_resume_checked: bool,
+    ) -> dict[str, object] | None:
+        if auto_resume_checked or not self._should_attempt_auto_resume(trigger_event):
+            return None
+        return attempt_auto_resume(
+            self.session,
+            self.settings_row,
+            trigger_source=trigger_event,
+        )
+
     def _collect_market_snapshot(
         self,
         *,
@@ -136,7 +161,13 @@ class TradingOrchestrator:
         upto_index: int | None = None,
         force_stale: bool = False,
         status: str = "market_refresh",
+        trigger_event: str = TriggerEvent.MANUAL.value,
+        auto_resume_checked: bool = False,
     ) -> dict[str, object]:
+        auto_resume_result = self._ensure_auto_resume(
+            trigger_event=trigger_event,
+            auto_resume_checked=auto_resume_checked,
+        )
         timeframe = timeframe or self.settings_row.default_timeframe
         symbols = get_effective_symbols(self.settings_row)
         results: list[dict[str, object]] = []
@@ -163,6 +194,7 @@ class TradingOrchestrator:
             "results": results,
             "account": self._account_snapshot_preview(),
             "settings": serialize_settings(self.settings_row),
+            "auto_resume": auto_resume_result,
         }
 
 
@@ -173,7 +205,12 @@ class TradingOrchestrator:
         trigger_event: str = TriggerEvent.MANUAL.value,
         upto_index: int | None = None,
         force_stale: bool = False,
+        auto_resume_checked: bool = False,
     ) -> dict[str, object]:
+        auto_resume_result = self._ensure_auto_resume(
+            trigger_event=trigger_event,
+            auto_resume_checked=auto_resume_checked,
+        )
         symbol = (symbol or self.settings_row.default_symbol).upper()
         timeframe = timeframe or self.settings_row.default_timeframe
         market_snapshot, market_row = self._collect_market_snapshot(
@@ -196,14 +233,21 @@ class TradingOrchestrator:
                 "status": "market_data_only",
                 "account": self._account_snapshot_preview(),
                 "settings": serialize_settings(self.settings_row),
+                "auto_resume": auto_resume_result,
             }
         feature_payload = compute_features(market_snapshot)
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
         open_positions = get_open_positions(self.session, symbol)
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
+        effective_leverage_cap = min(
+            self.settings_row.max_leverage,
+            HARD_MAX_GLOBAL_LEVERAGE,
+            get_symbol_leverage_cap(symbol),
+        )
         risk_context = {
-            "max_risk_per_trade": self.settings_row.max_risk_per_trade,
-            "max_leverage": self.settings_row.max_leverage,
+            "max_risk_per_trade": min(self.settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE),
+            "max_leverage": effective_leverage_cap,
+            "symbol_risk_tier": get_symbol_risk_tier(symbol),
             "daily_pnl": latest_pnl.daily_pnl,
             "consecutive_losses": latest_pnl.consecutive_losses,
         }
@@ -292,6 +336,7 @@ class TradingOrchestrator:
             "execution": execution_result,
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
+            "auto_resume": auto_resume_result,
         }
 
 
@@ -302,7 +347,12 @@ class TradingOrchestrator:
         timeframe: str | None = None,
         upto_index: int | None = None,
         force_stale: bool = False,
+        auto_resume_checked: bool = False,
     ) -> dict[str, object]:
+        auto_resume_result = self._ensure_auto_resume(
+            trigger_event=trigger_event,
+            auto_resume_checked=auto_resume_checked,
+        )
         symbols = get_effective_symbols(self.settings_row)
         results: list[dict[str, object]] = []
         failed_symbols: list[str] = []
@@ -315,6 +365,7 @@ class TradingOrchestrator:
                         trigger_event=trigger_event,
                         upto_index=upto_index,
                         force_stale=force_stale,
+                        auto_resume_checked=True,
                     )
                 )
             except Exception as exc:
@@ -350,6 +401,7 @@ class TradingOrchestrator:
             "results": results,
             "account": self._account_snapshot_preview() if not self.settings_row.ai_enabled else account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
+            "auto_resume": auto_resume_result,
         }
 
 

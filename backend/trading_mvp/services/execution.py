@@ -23,11 +23,15 @@ from trading_mvp.services.account import (
 )
 from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
-from trading_mvp.services.settings import get_effective_symbols, get_runtime_credentials
+from trading_mvp.services.settings import (
+    get_effective_symbols,
+    get_runtime_credentials,
+    set_trading_pause,
+)
 from trading_mvp.time_utils import utcnow_naive
-from trading_mvp.services.settings import set_trading_pause
 
 FINAL_ORDER_STATUSES = {"filled", "canceled", "rejected", "expired"}
+AUTO_RESUME_DELAY_MINUTES = 5
 
 
 def _entry_price(decision: TradeDecision, market_snapshot: MarketSnapshotPayload) -> float:
@@ -54,6 +58,76 @@ def _build_client(settings_row: Setting) -> BinanceClient:
         futures_enabled=settings_row.binance_futures_enabled,
         recv_window_ms=defaults.exchange_recv_window_ms,
     )
+
+
+def _classify_exchange_state_error(exc: Exception, default_reason: str) -> str:
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE"
+    if isinstance(exc, BinanceAPIError) and exc.code in {-1021, -1001, -1007, -1003}:
+        return "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE"
+    return default_reason
+
+
+def _pause_for_system_issue(
+    session: Session,
+    settings_row: Setting,
+    *,
+    reason_code: str,
+    symbol: str,
+    error: str,
+    event_type: str,
+    component: str,
+    alert_title: str,
+    alert_message: str,
+) -> None:
+    set_trading_pause(
+        session,
+        True,
+        reason_code=reason_code,
+        reason_detail={"symbol": symbol, "error": error},
+        pause_origin="system",
+        auto_resume_after=utcnow_naive() + timedelta(minutes=AUTO_RESUME_DELAY_MINUTES),
+        preserve_live_arm=True,
+    )
+    record_audit_event(
+        session,
+        event_type="trading_paused",
+        entity_type="settings",
+        entity_id=str(settings_row.id),
+        severity="warning",
+        message=alert_message,
+        payload={
+            "reason_code": reason_code,
+            "pause_origin": "system",
+            "symbol": symbol,
+            "error": error,
+        },
+    )
+    create_alert(
+        session,
+        category="execution",
+        severity="error",
+        title=alert_title,
+        message=alert_message,
+        payload={"reason_code": reason_code, "symbol": symbol, "error": error},
+    )
+    record_audit_event(
+        session,
+        event_type=event_type,
+        entity_type=component,
+        entity_id=symbol,
+        severity="error",
+        message=alert_message,
+        payload={"reason_code": reason_code, "symbol": symbol, "error": error},
+    )
+    record_health_event(
+        session,
+        component=component,
+        status="error",
+        message=alert_message,
+        payload={"reason_code": reason_code, "symbol": symbol, "error": error},
+    )
+    session.flush()
 
 
 def _live_account_balances(account_info: dict[str, object]) -> dict[str, float]:
@@ -469,7 +543,26 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         for order in live_orders:
             if not order.external_order_id and not order.client_order_id:
                 continue
-            exchange_order = client.get_order(symbol=order.symbol, order_id=order.external_order_id, client_order_id=order.client_order_id)
+            try:
+                exchange_order = client.get_order(
+                    symbol=order.symbol,
+                    order_id=order.external_order_id,
+                    client_order_id=order.client_order_id,
+                )
+            except Exception as exc:
+                reason_code = _classify_exchange_state_error(exc, "TEMPORARY_SYNC_FAILURE")
+                _pause_for_system_issue(
+                    session,
+                    settings_row,
+                    reason_code=reason_code,
+                    symbol=order.symbol,
+                    error=str(exc),
+                    event_type="live_order_sync_failed",
+                    component="live_sync",
+                    alert_title="Live order sync failed",
+                    alert_message="거래소 주문 상태를 동기화하지 못해 거래를 일시 중지했습니다.",
+                )
+                raise RuntimeError(f"{reason_code}: {exc}") from exc
             order.status = _map_exchange_status(str(exchange_order.get("status", "NEW")))
             order.exchange_status = str(exchange_order.get("status", "")) or None
             order.last_exchange_update_at = utcnow_naive()
@@ -478,10 +571,56 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
             if avg_price > 0:
                 order.average_fill_price = avg_price
             session.add(order)
-            _record_live_trades(session, order, client.get_account_trades(symbol=order.symbol, order_id=order.external_order_id))
+            try:
+                trades = client.get_account_trades(symbol=order.symbol, order_id=order.external_order_id)
+            except Exception as exc:
+                reason_code = _classify_exchange_state_error(exc, "TEMPORARY_SYNC_FAILURE")
+                _pause_for_system_issue(
+                    session,
+                    settings_row,
+                    reason_code=reason_code,
+                    symbol=order.symbol,
+                    error=str(exc),
+                    event_type="live_trade_sync_failed",
+                    component="live_sync",
+                    alert_title="Live trade sync failed",
+                    alert_message="거래소 체결 내역을 동기화하지 못해 거래를 일시 중지했습니다.",
+                )
+                raise RuntimeError(f"{reason_code}: {exc}") from exc
+            _record_live_trades(session, order, trades)
             synced_orders += 1
-        open_orders = client.get_open_orders(item_symbol)
-        sync_live_positions(session, settings_row, symbol=item_symbol, client=client, open_orders=open_orders)
+        try:
+            open_orders = client.get_open_orders(item_symbol)
+        except Exception as exc:
+            reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
+            _pause_for_system_issue(
+                session,
+                settings_row,
+                reason_code=reason_code,
+                symbol=item_symbol,
+                error=str(exc),
+                event_type="live_open_orders_sync_failed",
+                component="live_sync",
+                alert_title="Open orders sync failed",
+                alert_message="거래소 미체결 주문을 동기화하지 못해 거래를 일시 중지했습니다.",
+            )
+            raise RuntimeError(f"{reason_code}: {exc}") from exc
+        try:
+            sync_live_positions(session, settings_row, symbol=item_symbol, client=client, open_orders=open_orders)
+        except Exception as exc:
+            reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
+            _pause_for_system_issue(
+                session,
+                settings_row,
+                reason_code=reason_code,
+                symbol=item_symbol,
+                error=str(exc),
+                event_type="live_position_sync_failed",
+                component="live_sync",
+                alert_title="Position sync failed",
+                alert_message="거래소 포지션 상태를 동기화하지 못해 거래를 일시 중지했습니다.",
+            )
+            raise RuntimeError(f"{reason_code}: {exc}") from exc
         synced_positions += 1
     latest_prices = {
         item_symbol: position.mark_price
@@ -490,7 +629,22 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
     }
     if latest_prices:
         refresh_open_position_marks(session, latest_prices)
-    account_info = client.get_account_info()
+    try:
+        account_info = client.get_account_info()
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=symbols[0],
+            error=str(exc),
+            event_type="live_account_sync_failed",
+            component="live_sync",
+            alert_title="Live account state unavailable",
+            alert_message="거래소 계좌 상태를 읽지 못해 거래를 일시 중지했습니다.",
+        )
+        raise RuntimeError(f"{reason_code}: {exc}") from exc
     pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, account_info)
     return {"symbols": symbols, "synced_orders": synced_orders, "synced_positions": synced_positions, "equity": pnl_snapshot.equity}
 
@@ -547,22 +701,17 @@ def execute_live_trade(
     try:
         account_info = client.get_account_info()
     except Exception as exc:
-        set_trading_pause(
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
+        _pause_for_system_issue(
             session,
-            True,
-            reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
-            reason_detail={"symbol": decision.symbol, "error": str(exc)},
-            pause_origin="system",
-            auto_resume_after=utcnow_naive() + timedelta(minutes=5),
-            preserve_live_arm=True,
-        )
-        create_alert(
-            session,
-            category="execution",
-            severity="error",
-            title="Live account state unavailable",
-            message="실계좌 정보를 불러오지 못해 주문을 중단했습니다.",
-            payload={"symbol": decision.symbol, "error": str(exc)},
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_account_state_unavailable",
+            component="live_execution",
+            alert_title="Live account state unavailable",
+            alert_message="실계좌 정보를 다시 확인할 수 없어 거래를 일시 중지했습니다.",
         )
         record_audit_event(
             session,
@@ -571,17 +720,10 @@ def execute_live_trade(
             entity_id=str(decision_run_id),
             severity="error",
             message="Live execution skipped because exchange account state was unavailable.",
-            payload={"symbol": decision.symbol, "error": str(exc)},
-        )
-        record_health_event(
-            session,
-            component="live_execution",
-            status="error",
-            message="Exchange account state unavailable during live execution.",
-            payload={"symbol": decision.symbol, "error": str(exc)},
+            payload={"symbol": decision.symbol, "error": str(exc), "reason_code": reason_code},
         )
         session.flush()
-        return {"status": "error", "reason_codes": ["ACCOUNT_STATE_UNAVAILABLE"], "error": str(exc)}
+        return {"status": "error", "reason_codes": [reason_code], "error": str(exc)}
 
     latest_pnl = create_exchange_pnl_snapshot(session, settings_row, account_info)
     session.refresh(latest_pnl)
@@ -597,8 +739,39 @@ def execute_live_trade(
     if decision.decision == "hold":
         return {"status": "skipped", "reason_codes": ["HOLD_DECISION"]}
 
-    open_orders = client.get_open_orders(decision.symbol)
-    sync_live_positions(session, settings_row, symbol=decision.symbol, client=client, open_orders=open_orders)
+    try:
+        open_orders = client.get_open_orders(decision.symbol)
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_preflight_open_orders_failed",
+            component="live_execution",
+            alert_title="Pre-trade open orders sync failed",
+            alert_message="실주문 전 미체결 주문 상태를 확인하지 못해 거래를 일시 중지했습니다.",
+        )
+        return {"status": "error", "reason_codes": [reason_code], "error": str(exc)}
+
+    try:
+        sync_live_positions(session, settings_row, symbol=decision.symbol, client=client, open_orders=open_orders)
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_preflight_position_sync_failed",
+            component="live_execution",
+            alert_title="Pre-trade position sync failed",
+            alert_message="실주문 전 포지션 상태를 확인하지 못해 거래를 일시 중지했습니다.",
+        )
+        return {"status": "error", "reason_codes": [reason_code], "error": str(exc)}
     existing_position = get_open_position(session, decision.symbol)
 
     if decision.decision in {"long", "short"}:
@@ -761,8 +934,63 @@ def execute_live_trade(
         reduce_only=reduce_only,
         close_only=decision.decision == "exit",
     )
-    fee_paid, realized_pnl = _record_live_trades(session, order, client.get_account_trades(symbol=decision.symbol, order_id=order.external_order_id))
-    synced_position = sync_live_positions(session, settings_row, symbol=decision.symbol, client=client, open_orders=client.get_open_orders(decision.symbol))
+    try:
+        trades = client.get_account_trades(symbol=decision.symbol, order_id=order.external_order_id)
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "TEMPORARY_SYNC_FAILURE")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_post_trade_sync_failed",
+            component="live_execution",
+            alert_title="Post-trade sync failed",
+            alert_message="주문 체결 이후 계정 동기화를 완료하지 못해 거래를 일시 중지했습니다.",
+        )
+        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc)}
+    fee_paid, realized_pnl = _record_live_trades(session, order, trades)
+
+    try:
+        post_trade_open_orders = client.get_open_orders(decision.symbol)
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_post_order_open_orders_failed",
+            component="live_execution",
+            alert_title="Post-order open orders sync failed",
+            alert_message="주문 이후 미체결 주문 상태를 확인하지 못해 거래를 일시 중지했습니다.",
+        )
+        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc)}
+
+    try:
+        synced_position = sync_live_positions(
+            session,
+            settings_row,
+            symbol=decision.symbol,
+            client=client,
+            open_orders=post_trade_open_orders,
+        )
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_post_order_position_sync_failed",
+            component="live_execution",
+            alert_title="Post-order position sync failed",
+            alert_message="주문 이후 포지션 상태를 확인하지 못해 거래를 일시 중지했습니다.",
+        )
+        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc)}
     position = get_open_position(session, decision.symbol)
     if position is not None:
         order.position_id = position.id
@@ -780,6 +1008,21 @@ def execute_live_trade(
                 reason_code="PROTECTIVE_ORDER_FAILURE",
                 reason_detail={"symbol": decision.symbol, "error": str(exc), "order_id": order.id},
                 pause_origin="system",
+            )
+            record_audit_event(
+                session,
+                event_type="trading_paused",
+                entity_type="settings",
+                entity_id=str(settings_row.id),
+                severity="critical",
+                message="Trading paused because protective orders could not be created.",
+                payload={
+                    "reason_code": "PROTECTIVE_ORDER_FAILURE",
+                    "pause_origin": "system",
+                    "symbol": decision.symbol,
+                    "error": str(exc),
+                    "order_id": order.id,
+                },
             )
             create_alert(
                 session,
@@ -813,7 +1056,22 @@ def execute_live_trade(
 
     latest_price = position.mark_price if position is not None else market_snapshot.latest_price
     refresh_open_position_marks(session, {decision.symbol: latest_price})
-    refreshed_account_info = client.get_account_info()
+    try:
+        refreshed_account_info = client.get_account_info()
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=decision.symbol,
+            error=str(exc),
+            event_type="live_post_order_account_sync_failed",
+            component="live_execution",
+            alert_title="Post-order account sync failed",
+            alert_message="주문 이후 계좌 상태를 다시 확인하지 못해 거래를 일시 중지했습니다.",
+        )
+        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc)}
     pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, refreshed_account_info)
     record_audit_event(
         session,

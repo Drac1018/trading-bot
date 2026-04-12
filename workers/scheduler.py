@@ -9,7 +9,6 @@ from trading_mvp.config import get_settings
 from trading_mvp.database import SessionLocal
 from trading_mvp.models import SchedulerRun
 from trading_mvp.services.audit import record_health_event
-from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.scheduler import (
     WINDOW_HOURS,
     is_interval_decision_due,
@@ -61,9 +60,6 @@ def main() -> None:
 
     while True:
         try:
-            with SessionLocal() as session:
-                attempt_auto_resume(session, get_or_create_settings(session))
-                session.commit()
             windows = _due_windows()
             with SessionLocal() as session:
                 interval_due = is_interval_decision_due(session)

@@ -1,0 +1,98 @@
+{
+  "$defs": {
+    "SignalPerformanceEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "rationale_code": {
+          "title": "Rationale Code",
+          "type": "string"
+        },
+        "decisions": {
+          "minimum": 0,
+          "title": "Decisions",
+          "type": "integer"
+        },
+        "approvals": {
+          "minimum": 0,
+          "title": "Approvals",
+          "type": "integer"
+        },
+        "orders": {
+          "minimum": 0,
+          "title": "Orders",
+          "type": "integer"
+        },
+        "fills": {
+          "minimum": 0,
+          "title": "Fills",
+          "type": "integer"
+        },
+        "wins": {
+          "minimum": 0,
+          "title": "Wins",
+          "type": "integer"
+        },
+        "losses": {
+          "minimum": 0,
+          "title": "Losses",
+          "type": "integer"
+        },
+        "realized_pnl_total": {
+          "title": "Realized Pnl Total",
+          "type": "number"
+        },
+        "average_slippage_pct": {
+          "minimum": 0.0,
+          "title": "Average Slippage Pct",
+          "type": "number"
+        },
+        "latest_seen_at": {
+          "format": "date-time",
+          "title": "Latest Seen At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rationale_code",
+        "decisions",
+        "approvals",
+        "orders",
+        "fills",
+        "wins",
+        "losses",
+        "realized_pnl_total",
+        "average_slippage_pct",
+        "latest_seen_at"
+      ],
+      "title": "SignalPerformanceEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "window_hours": {
+      "maximum": 168,
+      "minimum": 1,
+      "title": "Window Hours",
+      "type": "integer"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/SignalPerformanceEntry"
+      },
+      "title": "Items",
+      "type": "array"
+    }
+  },
+  "required": [
+    "generated_at",
+    "window_hours"
+  ],
+  "title": "SignalPerformanceReportResponse",
+  "type": "object"
+}

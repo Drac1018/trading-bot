@@ -128,16 +128,16 @@ def get_backlog_board(session: Session) -> BacklogBoardResponse:
         if request_row.linked_backlog_id is None:
             continue
         request_rows_by_backlog.setdefault(request_row.linked_backlog_id, []).append(request_row)
-    for items in request_rows_by_backlog.values():
-        items.sort(key=_latest_request_activity, reverse=True)
+    for request_items in request_rows_by_backlog.values():
+        request_items.sort(key=_latest_request_activity, reverse=True)
 
     applied_rows_by_backlog: dict[int, list[AppliedChangeRecord]] = {}
     for applied_row in applied_rows:
         if applied_row.related_backlog_id is None:
             continue
         applied_rows_by_backlog.setdefault(applied_row.related_backlog_id, []).append(applied_row)
-    for items in applied_rows_by_backlog.values():
-        items.sort(key=_latest_applied_activity, reverse=True)
+    for applied_items in applied_rows_by_backlog.values():
+        applied_items.sort(key=_latest_applied_activity, reverse=True)
 
     backlog_rows = sorted(
         raw_backlog_rows,

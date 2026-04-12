@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     manual_live_approval: bool = False
     trading_paused: bool = False
     starting_equity: float = 100000.0
-    max_leverage: float = 3.0
-    max_risk_per_trade: float = 0.01
-    max_daily_loss: float = 0.02
+    max_leverage: float = 5.0
+    max_risk_per_trade: float = 0.02
+    max_daily_loss: float = 0.05
     max_consecutive_losses: int = 3
     stale_market_seconds: int = 1800
     slippage_threshold_pct: float = 0.003

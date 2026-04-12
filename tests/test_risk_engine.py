@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pytest
 from pydantic import ValidationError
-from trading_mvp.models import PnLSnapshot
+from trading_mvp.models import PnLSnapshot, Position
 from trading_mvp.schemas import TradeDecision
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import evaluate_risk, validate_decision_schema
@@ -68,12 +68,12 @@ def test_risk_blocks_daily_loss_limit(db_session) -> None:
     db_session.add(
         PnLSnapshot(
             snapshot_date=date.today(),
-            equity=97000.0,
-            cash_balance=97000.0,
-            realized_pnl=-3000.0,
+            equity=94000.0,
+            cash_balance=94000.0,
+            realized_pnl=-6000.0,
             unrealized_pnl=0.0,
-            daily_pnl=-3000.0,
-            cumulative_pnl=-3000.0,
+            daily_pnl=-6000.0,
+            cumulative_pnl=-6000.0,
             consecutive_losses=1,
         )
     )
@@ -192,3 +192,144 @@ def test_live_risk_blocks_when_env_gate_is_disabled(db_session) -> None:
         assert "LIVE_ENV_DISABLED" in result.reason_codes
     finally:
         risk_service.get_settings = original_get_settings  # type: ignore[assignment]
+
+
+def test_btc_uses_five_x_hard_cap(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_leverage = 5.0
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=64000.0,
+        take_profit=66500.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=5.0,
+        rationale_codes=["TEST"],
+        explanation_short="btc cap",
+        explanation_detailed="btc should use the 5x hard cap without adding a leverage error.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.effective_leverage_cap == 5.0
+    assert result.symbol_risk_tier == "btc"
+    assert "LEVERAGE_EXCEEDS_LIMIT" not in result.reason_codes
+
+
+def test_major_alt_blocks_leverage_above_three_x(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_leverage = 5.0
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="ETHUSDT",
+        timeframe="15m",
+        entry_zone_min=3200.0,
+        entry_zone_max=3210.0,
+        stop_loss=3100.0,
+        take_profit=3340.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=4.0,
+        rationale_codes=["TEST"],
+        explanation_short="major alt cap",
+        explanation_detailed="major alts should be blocked above the 3x hard leverage cap.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.effective_leverage_cap == 3.0
+    assert result.symbol_risk_tier == "major_alt"
+    assert "LEVERAGE_EXCEEDS_LIMIT" in result.reason_codes
+
+
+def test_general_alt_blocks_leverage_above_two_x(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_leverage = 5.0
+    snapshot = build_market_snapshot("APTUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="APTUSDT",
+        timeframe="15m",
+        entry_zone_min=10.0,
+        entry_zone_max=10.1,
+        stop_loss=9.5,
+        take_profit=10.8,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=3.0,
+        rationale_codes=["TEST"],
+        explanation_short="alt cap",
+        explanation_detailed="general alts should be blocked above the 2x hard leverage cap.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.effective_leverage_cap == 2.0
+    assert result.symbol_risk_tier == "alt"
+    assert "LEVERAGE_EXCEEDS_LIMIT" in result.reason_codes
+
+
+def test_risk_result_includes_exposure_metrics(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    db_session.add_all(
+        [
+            Position(
+                symbol="BTCUSDT",
+                mode="live",
+                side="long",
+                status="open",
+                quantity=0.01,
+                entry_price=65000.0,
+                mark_price=66000.0,
+                leverage=2.0,
+                stop_loss=64000.0,
+                take_profit=68000.0,
+            ),
+            Position(
+                symbol="ETHUSDT",
+                mode="live",
+                side="short",
+                status="open",
+                quantity=0.5,
+                entry_price=3200.0,
+                mark_price=3150.0,
+                leverage=2.0,
+                stop_loss=3300.0,
+                take_profit=3000.0,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="hold",
+        confidence=0.55,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=64000.0,
+        take_profit=66500.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="metrics",
+        explanation_detailed="exposure metrics should be included in the risk payload for live monitoring.",
+    )
+
+    result, row = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.exposure_metrics["open_position_count"] == 2.0
+    assert result.exposure_metrics["gross_exposure_pct_equity"] > 0
+    assert row.payload["exposure_metrics"]["same_tier_concentration_pct"] >= 0.0

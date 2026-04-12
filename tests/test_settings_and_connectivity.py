@@ -232,6 +232,20 @@ def test_get_or_create_settings_provides_new_defaults(db_session) -> None:
     assert serialized["tracked_symbols"]
 
 
+def test_serialize_settings_applies_hard_runtime_caps(db_session) -> None:
+    row = get_or_create_settings(db_session)
+    row.max_leverage = 9.0
+    row.max_risk_per_trade = 0.2
+    row.max_daily_loss = 0.5
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["max_leverage"] == 5.0
+    assert serialized["max_risk_per_trade"] == 0.02
+    assert serialized["max_daily_loss"] == 0.05
+
+
 def test_update_settings_does_not_change_trading_pause_state(db_session) -> None:
     row = get_or_create_settings(db_session)
     row.trading_paused = True

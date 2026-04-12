@@ -94,6 +94,41 @@
       "title": "AppliedChangeRecordResponse",
       "type": "object"
     },
+    "BacklogCodexDraftResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "prompt": {
+          "title": "Prompt",
+          "type": "string"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "available",
+        "title",
+        "prompt",
+        "generated_at",
+        "note"
+      ],
+      "title": "BacklogCodexDraftResponse",
+      "type": "object"
+    },
     "UserChangeRequestResponse": {
       "additionalProperties": false,
       "properties": {
@@ -274,6 +309,17 @@
       },
       "title": "Applied Records",
       "type": "array"
+    },
+    "codex_prompt_draft": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BacklogCodexDraftResponse"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

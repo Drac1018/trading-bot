@@ -94,6 +94,41 @@
       "title": "AppliedChangeRecordResponse",
       "type": "object"
     },
+    "BacklogCodexDraftResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "prompt": {
+          "title": "Prompt",
+          "type": "string"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "available",
+        "title",
+        "prompt",
+        "generated_at",
+        "note"
+      ],
+      "title": "BacklogCodexDraftResponse",
+      "type": "object"
+    },
     "ProductBacklogDetailResponse": {
       "additionalProperties": false,
       "properties": {
@@ -203,6 +238,17 @@
           },
           "title": "Applied Records",
           "type": "array"
+        },
+        "codex_prompt_draft": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BacklogCodexDraftResponse"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -221,6 +267,178 @@
         "updated_at"
       ],
       "title": "ProductBacklogDetailResponse",
+      "type": "object"
+    },
+    "SignalPerformanceEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "rationale_code": {
+          "title": "Rationale Code",
+          "type": "string"
+        },
+        "decisions": {
+          "minimum": 0,
+          "title": "Decisions",
+          "type": "integer"
+        },
+        "approvals": {
+          "minimum": 0,
+          "title": "Approvals",
+          "type": "integer"
+        },
+        "orders": {
+          "minimum": 0,
+          "title": "Orders",
+          "type": "integer"
+        },
+        "fills": {
+          "minimum": 0,
+          "title": "Fills",
+          "type": "integer"
+        },
+        "wins": {
+          "minimum": 0,
+          "title": "Wins",
+          "type": "integer"
+        },
+        "losses": {
+          "minimum": 0,
+          "title": "Losses",
+          "type": "integer"
+        },
+        "realized_pnl_total": {
+          "title": "Realized Pnl Total",
+          "type": "number"
+        },
+        "average_slippage_pct": {
+          "minimum": 0.0,
+          "title": "Average Slippage Pct",
+          "type": "number"
+        },
+        "latest_seen_at": {
+          "format": "date-time",
+          "title": "Latest Seen At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rationale_code",
+        "decisions",
+        "approvals",
+        "orders",
+        "fills",
+        "wins",
+        "losses",
+        "realized_pnl_total",
+        "average_slippage_pct",
+        "latest_seen_at"
+      ],
+      "title": "SignalPerformanceEntry",
+      "type": "object"
+    },
+    "SignalPerformanceReportResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "window_hours": {
+          "maximum": 168,
+          "minimum": 1,
+          "title": "Window Hours",
+          "type": "integer"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/SignalPerformanceEntry"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "generated_at",
+        "window_hours"
+      ],
+      "title": "SignalPerformanceReportResponse",
+      "type": "object"
+    },
+    "StructuredCompetitorNote": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "category": {
+          "title": "Category",
+          "type": "string"
+        },
+        "differentiation": {
+          "title": "Differentiation",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "category",
+        "differentiation",
+        "summary",
+        "created_at"
+      ],
+      "title": "StructuredCompetitorNote",
+      "type": "object"
+    },
+    "StructuredCompetitorNotesResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "category_breakdown": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Category Breakdown",
+          "type": "object"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/StructuredCompetitorNote"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "generated_at"
+      ],
+      "title": "StructuredCompetitorNotesResponse",
       "type": "object"
     },
     "UserChangeRequestResponse": {
@@ -317,6 +535,28 @@
       },
       "title": "Unlinked Applied Records",
       "type": "array"
+    },
+    "signal_performance_report": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SignalPerformanceReportResponse"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "structured_competitor_notes": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StructuredCompetitorNotesResponse"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "title": "BacklogBoardResponse",
