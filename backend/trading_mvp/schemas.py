@@ -346,9 +346,16 @@ class OverviewResponse(StrictBaseModel):
     protection_recovery_failure_count: int = 0
     missing_protection_symbols: list[str] = Field(default_factory=list)
     missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
+    pnl_summary: dict[str, Any] = Field(default_factory=dict)
+    account_sync_summary: dict[str, Any] = Field(default_factory=dict)
+    exposure_summary: dict[str, Any] = Field(default_factory=dict)
+    execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
+    market_context_summary: dict[str, Any] = Field(default_factory=dict)
+    adaptive_protection_summary: dict[str, Any] = Field(default_factory=dict)
     daily_pnl: float
     cumulative_pnl: float
     blocked_reasons: list[str]
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
     protected_positions: int = 0
     unprotected_positions: int = 0
     position_protection_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -383,6 +390,7 @@ class AppSettingsResponse(StrictBaseModel):
     auto_resume_eligible: bool = False
     auto_resume_status: str = "not_paused"
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
     pause_severity: str | None = None
     pause_recovery_class: str | None = None
     operating_state: str = "TRADABLE"
@@ -391,6 +399,12 @@ class AppSettingsResponse(StrictBaseModel):
     protection_recovery_failure_count: int = 0
     missing_protection_symbols: list[str] = Field(default_factory=list)
     missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
+    pnl_summary: dict[str, Any] = Field(default_factory=dict)
+    account_sync_summary: dict[str, Any] = Field(default_factory=dict)
+    exposure_summary: dict[str, Any] = Field(default_factory=dict)
+    execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
+    market_context_summary: dict[str, Any] = Field(default_factory=dict)
+    adaptive_protection_summary: dict[str, Any] = Field(default_factory=dict)
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str
@@ -516,6 +530,11 @@ class BinanceAccountSummary(StrictBaseModel):
     futures_enabled: bool
     tracked_symbols: list[str] = Field(default_factory=list)
     can_trade: bool = False
+    exchange_can_trade: bool = False
+    app_live_execution_ready: bool = False
+    app_trading_paused: bool = False
+    app_operating_state: str = "TRADABLE"
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
     fee_tier: int = 0
     total_wallet_balance: float = 0.0
     available_balance: float = 0.0

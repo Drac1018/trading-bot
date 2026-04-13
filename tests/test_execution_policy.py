@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import timedelta
 from types import SimpleNamespace
 
+from sqlalchemy import select
+from trading_mvp.models import AuditEvent
 from trading_mvp.schemas import (
     ExecutionIntent,
     MarketCandle,
@@ -197,6 +199,98 @@ class PolicyCaptureClient:
         return {"orderId": order_id or "lookup", "status": "NEW", "executedQty": "0.0", "avgPrice": "0"}
 
 
+class LimitRepriceFallbackClient(PolicyCaptureClient):
+    def __init__(self, *, partial_fill_qty: float = 0.0, market_price: float = 70000.0) -> None:
+        super().__init__(initial_position_qty=0.0)
+        self.partial_fill_qty = partial_fill_qty
+        self.market_price = market_price
+        self.partial_fill_applied = False
+        self.order_states: dict[str, str] = {}
+        self.order_exec_qty: dict[str, float] = {}
+        self.order_avg_price: dict[str, float] = {}
+        self.order_trades: dict[str, list[dict[str, object]]] = {}
+
+    def get_symbol_price(self, symbol: str) -> float:
+        return self.market_price
+
+    def new_order(self, **kwargs):
+        order_type = str(kwargs["order_type"])
+        if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            return super().new_order(**kwargs)
+        self.primary_order_calls.append(kwargs)
+        order_id = f"primary-{len(self.primary_order_calls)}"
+        client_order_id = kwargs.get("client_order_id", order_id)
+        quantity = float(kwargs.get("quantity") or 0.0)
+        price = float(kwargs.get("price") or self.market_price)
+        if order_type == "LIMIT":
+            fill_qty = self.partial_fill_qty if self.partial_fill_qty > 0 and not self.partial_fill_applied else 0.0
+            self.partial_fill_applied = self.partial_fill_applied or fill_qty > 0
+            self.order_states[order_id] = "PARTIALLY_FILLED" if fill_qty > 0 else "NEW"
+            self.order_exec_qty[order_id] = fill_qty
+            self.order_avg_price[order_id] = price
+            if fill_qty > 0:
+                self.current_position_qty += fill_qty
+                self.order_trades[order_id] = [
+                    {
+                        "id": f"trade-{order_id}",
+                        "price": str(price),
+                        "qty": str(fill_qty),
+                        "commission": "0.04",
+                        "commissionAsset": "USDT",
+                        "realizedPnl": "0.0",
+                    }
+                ]
+            else:
+                self.order_trades[order_id] = []
+            return {
+                "orderId": order_id,
+                "clientOrderId": client_order_id,
+                "status": self.order_states[order_id],
+                "executedQty": str(self.order_exec_qty[order_id]),
+                "avgPrice": str(self.order_avg_price[order_id]),
+            }
+
+        self.current_position_qty += quantity
+        self.order_states[order_id] = "FILLED"
+        self.order_exec_qty[order_id] = quantity
+        self.order_avg_price[order_id] = self.market_price
+        self.order_trades[order_id] = [
+            {
+                "id": f"trade-{order_id}",
+                "price": str(self.market_price),
+                "qty": str(quantity),
+                "commission": "0.06",
+                "commissionAsset": "USDT",
+                "realizedPnl": "0.0",
+            }
+        ]
+        return {
+            "orderId": order_id,
+            "clientOrderId": client_order_id,
+            "status": "FILLED",
+            "executedQty": str(quantity),
+            "avgPrice": str(self.market_price),
+        }
+
+    def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        key = order_id or client_order_id or ""
+        return {
+            "orderId": key,
+            "clientOrderId": client_order_id or key,
+            "status": self.order_states.get(key, "NEW"),
+            "executedQty": str(self.order_exec_qty.get(key, 0.0)),
+            "avgPrice": str(self.order_avg_price.get(key, self.market_price)),
+        }
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        return list(self.order_trades.get(order_id or "", []))
+
+    def cancel_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        key = order_id or client_order_id or ""
+        self.order_states[key] = "CANCELED"
+        return {"status": "CANCELED"}
+
+
 def test_entry_policy_prefers_limit_under_passive_conditions() -> None:
     settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
     plan = select_execution_plan(
@@ -363,3 +457,55 @@ def test_protection_path_stays_separate_from_primary_execution(monkeypatch, db_s
         "STOP_MARKET",
         "TAKE_PROFIT_MARKET",
     }
+
+
+def test_entry_limit_timeout_reprices_then_falls_back_to_market(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = LimitRepriceFallbackClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr("trading_mvp.services.execution._execution_policy_sleep", lambda _seconds: None)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=15,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    order_types = [call["order_type"] for call in client.primary_order_calls]
+
+    assert result["status"] == "filled"
+    assert order_types[:3] == ["LIMIT", "LIMIT", "LIMIT"]
+    assert order_types[-1] == "MARKET"
+    assert len(result["execution_attempts"]) == 4
+    audit_types = set(db_session.scalars(select(AuditEvent.event_type)))
+    assert "live_limit_timeout" in audit_types
+    assert "live_limit_repriced" in audit_types
+    assert "live_limit_aggressive_fallback" in audit_types
+
+
+def test_partial_fill_is_preserved_before_aggressive_fallback(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = LimitRepriceFallbackClient(partial_fill_qty=0.001, market_price=71250.0)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr("trading_mvp.services.execution._execution_policy_sleep", lambda _seconds: None)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=16,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert result["status"] == "filled"
+    assert result["fill_quantity"] >= 0.001
+    assert result["execution_attempts"][0]["filled_quantity"] == 0.001
+    assert result["execution_attempts"][-1]["order_type"] == "MARKET"
+    assert result["fill_quantity"] > result["execution_attempts"][0]["filled_quantity"]
+    audit_types = list(db_session.scalars(select(AuditEvent.event_type).order_by(AuditEvent.id.asc())))
+    assert "live_limit_partial_fill" in audit_types
+    assert "live_limit_aggressive_fallback" in audit_types

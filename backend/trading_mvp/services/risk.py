@@ -152,6 +152,65 @@ def _build_exposure_metrics(
     }
 
 
+def build_current_exposure_summary(
+    session: Session,
+    settings_row: Setting,
+    *,
+    equity: float,
+    reference_symbol: str | None = None,
+) -> dict[str, object]:
+    symbol = (reference_symbol or settings_row.default_symbol).upper()
+    limits = get_exposure_limits(settings_row)
+    metrics = _build_exposure_metrics(session, symbol, equity)
+    headroom = {
+        "gross_exposure_pct": round(
+            max(limits["gross_exposure_pct"] - metrics["gross_exposure_pct_equity"], 0.0),
+            6,
+        ),
+        "largest_position_pct": round(
+            max(limits["largest_position_pct"] - metrics["largest_position_pct_equity"], 0.0),
+            6,
+        ),
+        "directional_bias_pct": round(
+            max(limits["directional_bias_pct"] - metrics["directional_bias_pct"], 0.0),
+            6,
+        ),
+        "same_tier_concentration_pct": round(
+            max(
+                limits["same_tier_concentration_pct"]
+                - metrics["same_tier_concentration_pct"],
+                0.0,
+            ),
+            6,
+        ),
+    }
+    blocked = [
+        headroom["gross_exposure_pct"] <= 0.0,
+        headroom["largest_position_pct"] <= 0.0,
+        headroom["directional_bias_pct"] <= 0.0,
+        headroom["same_tier_concentration_pct"] <= 0.0,
+    ]
+    near_limit = [
+        headroom["gross_exposure_pct"] < 0.1,
+        headroom["largest_position_pct"] < 0.05,
+        headroom["directional_bias_pct"] < 0.1,
+        headroom["same_tier_concentration_pct"] < 0.1,
+    ]
+    status = "ok"
+    if any(blocked):
+        status = "at_limit"
+    elif any(near_limit):
+        status = "near_limit"
+    return {
+        "reference_symbol": symbol,
+        "reference_tier": get_symbol_risk_tier(symbol),
+        "metrics": metrics,
+        "limits": limits,
+        "headroom": headroom,
+        "status": status,
+    }
+
+
 def evaluate_risk(
     session: Session,
     settings_row: Setting,

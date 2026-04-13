@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -23,7 +24,11 @@ from trading_mvp.services.account import (
 )
 from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
-from trading_mvp.services.execution_policy import select_execution_plan
+from trading_mvp.services.execution_policy import (
+    ExecutionPlan,
+    select_execution_plan,
+    should_fallback_aggressively,
+)
 from trading_mvp.services.pause_control import (
     clear_symbol_protection_state,
     mark_manage_only_state,
@@ -464,6 +469,10 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
     return fee_total, realized_total
 
 
+def _sum_trade_quantity(trades: list[dict[str, object]]) -> float:
+    return sum(abs(_to_float(trade.get("qty"))) for trade in trades)
+
+
 def _upsert_exchange_order_row(
     session: Session,
     *,
@@ -637,6 +646,64 @@ def _safe_submit_order(
     return client_order_id, response
 
 
+def _execution_policy_sleep(seconds: int) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def _resolve_live_reference_price(
+    client: BinanceClient,
+    *,
+    symbol: str,
+    fallback_price: float,
+) -> float:
+    try:
+        if hasattr(client, "get_symbol_price"):
+            return max(float(client.get_symbol_price(symbol)), 0.0) or fallback_price
+    except Exception:
+        return fallback_price
+    return fallback_price
+
+
+def _compute_limit_reprice(
+    client: BinanceClient,
+    *,
+    symbol: str,
+    side: str,
+    current_price: float,
+    live_reference_price: float,
+    reprice_bps: float,
+) -> float:
+    adjustment = max(reprice_bps, 0.0) / 10000.0
+    if side.upper() == "BUY":
+        candidate = min(live_reference_price, current_price * (1.0 + adjustment))
+    else:
+        candidate = max(live_reference_price, current_price * (1.0 - adjustment))
+    if hasattr(client, "normalize_price"):
+        return client.normalize_price(symbol, candidate)
+    return candidate
+
+
+def _normalize_remaining_quantity(
+    client: BinanceClient,
+    *,
+    symbol: str,
+    remaining_quantity: float,
+    reference_price: float,
+) -> float:
+    if remaining_quantity <= 0:
+        return 0.0
+    normalized = client.normalize_order_quantity(
+        symbol,
+        remaining_quantity,
+        reference_price=reference_price,
+        enforce_min_notional=False,
+    )
+    if normalized > remaining_quantity:
+        return 0.0
+    return normalized
+
+
 def _protective_prices(open_orders: list[dict[str, object]], existing: Position | None) -> tuple[float | None, float | None]:
     stop_loss = existing.stop_loss if existing is not None else None
     take_profit = existing.take_profit if existing is not None else None
@@ -743,6 +810,306 @@ def _cancel_exit_orders(session: Session, client: BinanceClient, symbol: str) ->
             local.last_exchange_update_at = utcnow_naive()
             session.add(local)
     session.flush()
+
+
+def _execute_primary_order_with_policy(
+    session: Session,
+    *,
+    client: BinanceClient,
+    settings_row: Setting,
+    symbol: str,
+    side: str,
+    execution_plan: ExecutionPlan,
+    requested_quantity: float,
+    requested_price: float,
+    decision_run_id: int,
+    risk_row: RiskCheck | None,
+    reduce_only: bool,
+    close_only: bool,
+    intent_type: str,
+) -> dict[str, Any]:
+    root_order: Order | None = None
+    final_order: Order | None = None
+    total_fee_paid = 0.0
+    total_realized_pnl = 0.0
+    total_filled_quantity = 0.0
+    total_fill_notional = 0.0
+    current_quantity = requested_quantity
+    current_price = requested_price
+    current_order_type: str = execution_plan.order_type
+    attempt_index = 0
+    execution_attempts: list[dict[str, object]] = []
+
+    while current_quantity > 0:
+        submit_price = current_price if current_order_type == "LIMIT" else None
+        submit_tif = execution_plan.time_in_force if current_order_type == "LIMIT" else None
+        client_order_id, exchange_order = _safe_submit_order(
+            client,
+            symbol=symbol,
+            side=side,
+            order_type=current_order_type,
+            quantity=current_quantity,
+            price=submit_price,
+            reduce_only=reduce_only,
+            close_position=close_only and current_order_type == "MARKET",
+            response_type="RESULT",
+            time_in_force=submit_tif,
+        )
+        parent_order_id = root_order.id if root_order is not None else None
+        order = _upsert_exchange_order_row(
+            session,
+            symbol=symbol,
+            requested_price=submit_price if submit_price is not None else requested_price,
+            requested_quantity=current_quantity,
+            order_type=current_order_type,
+            side=side.lower(),
+            exchange_order={**exchange_order, "clientOrderId": client_order_id},
+            decision_run_id=decision_run_id,
+            risk_row=risk_row,
+            reduce_only=reduce_only,
+            close_only=close_only,
+            parent_order_id=parent_order_id,
+        )
+        order.metadata_json = {
+            **(order.metadata_json or {}),
+            "execution_policy": execution_plan.to_payload(),
+            "execution_attempt": attempt_index + 1,
+        }
+        session.add(order)
+        session.flush()
+        if root_order is None:
+            root_order = order
+        final_order = order
+
+        latest_exchange_order = dict(exchange_order)
+        timed_out = False
+        if current_order_type == "LIMIT" and execution_plan.timeout_seconds > 0 and order.status in {"pending", "partially_filled"}:
+            poll_cycles = max(
+                int(max(execution_plan.timeout_seconds, execution_plan.poll_interval_seconds) / max(execution_plan.poll_interval_seconds, 1)),
+                1,
+            )
+            for _ in range(poll_cycles):
+                _execution_policy_sleep(execution_plan.poll_interval_seconds)
+                latest_exchange_order = _fetch_exchange_order(
+                    client,
+                    symbol=symbol,
+                    order_type=current_order_type,
+                    order_id=order.external_order_id,
+                    client_order_id=order.client_order_id,
+                )
+                order = _upsert_exchange_order_row(
+                    session,
+                    symbol=symbol,
+                    requested_price=submit_price if submit_price is not None else requested_price,
+                    requested_quantity=current_quantity,
+                    order_type=current_order_type,
+                    side=side.lower(),
+                    exchange_order=latest_exchange_order,
+                    decision_run_id=decision_run_id,
+                    risk_row=risk_row,
+                    reduce_only=reduce_only,
+                    close_only=close_only,
+                    parent_order_id=root_order.id if root_order is not None and root_order.id != order.id else parent_order_id,
+                )
+                final_order = order
+                if order.status not in {"pending", "partially_filled"}:
+                    break
+            if order.status in {"pending", "partially_filled"}:
+                timed_out = True
+                record_audit_event(
+                    session,
+                    event_type="live_limit_timeout",
+                    entity_type="order",
+                    entity_id=str(order.id),
+                    severity="warning",
+                    message="Passive limit order timed out before full execution.",
+                    payload={
+                        "symbol": symbol,
+                        "intent_type": intent_type,
+                        "attempt": attempt_index + 1,
+                        "order_type": current_order_type,
+                        "requested_quantity": current_quantity,
+                        "requested_price": submit_price,
+                        "execution_policy": execution_plan.to_payload(),
+                    },
+                )
+
+        trades = client.get_account_trades(symbol=symbol, order_id=order.external_order_id)
+        fee_paid, realized_pnl = _record_live_trades(session, order, trades)
+        filled_quantity = min(_sum_trade_quantity(trades), current_quantity)
+        if filled_quantity > 0:
+            total_fee_paid += fee_paid
+            total_realized_pnl += realized_pnl
+            total_filled_quantity += filled_quantity
+            total_fill_notional += filled_quantity * max(order.average_fill_price or submit_price or requested_price, 0.0)
+            if filled_quantity < current_quantity:
+                record_audit_event(
+                    session,
+                    event_type="live_limit_partial_fill",
+                    entity_type="order",
+                    entity_id=str(order.id),
+                    severity="info",
+                    message="Limit order received a partial fill.",
+                    payload={
+                        "symbol": symbol,
+                        "intent_type": intent_type,
+                        "attempt": attempt_index + 1,
+                        "filled_quantity": filled_quantity,
+                        "remaining_quantity": max(current_quantity - filled_quantity, 0.0),
+                        "execution_policy": execution_plan.to_payload(),
+                    },
+                )
+
+        execution_attempts.append(
+            {
+                "order_id": order.id,
+                "exchange_status": order.exchange_status,
+                "status": order.status,
+                "order_type": current_order_type,
+                "requested_quantity": current_quantity,
+                "requested_price": submit_price,
+                "filled_quantity": filled_quantity,
+                "timed_out": timed_out,
+            }
+        )
+
+        remaining_quantity = max(requested_quantity - total_filled_quantity, 0.0)
+        if current_order_type != "LIMIT" or remaining_quantity <= 0.0:
+            break
+        if not timed_out and order.status == "filled":
+            break
+
+        if order.status not in FINAL_ORDER_STATUSES:
+            _cancel_exchange_order(
+                client,
+                symbol=symbol,
+                order_id=order.external_order_id,
+                client_order_id=order.client_order_id,
+                order_type=current_order_type,
+            )
+            latest_exchange_order = _fetch_exchange_order(
+                client,
+                symbol=symbol,
+                order_type=current_order_type,
+                order_id=order.external_order_id,
+                client_order_id=order.client_order_id,
+            )
+            order = _upsert_exchange_order_row(
+                session,
+                symbol=symbol,
+                requested_price=submit_price if submit_price is not None else requested_price,
+                requested_quantity=current_quantity,
+                order_type=current_order_type,
+                side=side.lower(),
+                exchange_order=latest_exchange_order,
+                decision_run_id=decision_run_id,
+                risk_row=risk_row,
+                reduce_only=reduce_only,
+                close_only=close_only,
+                parent_order_id=root_order.id if root_order is not None and root_order.id != order.id else parent_order_id,
+            )
+            final_order = order
+
+        live_reference_price = _resolve_live_reference_price(
+            client,
+            symbol=symbol,
+            fallback_price=submit_price if submit_price is not None else requested_price,
+        )
+        current_slippage_pct = abs(live_reference_price - max(submit_price or requested_price, 1.0)) / max(live_reference_price, 1.0)
+        if should_fallback_aggressively(
+            execution_plan,
+            reprice_attempt=attempt_index,
+            current_slippage_pct=current_slippage_pct,
+            slippage_threshold_pct=settings_row.slippage_threshold_pct,
+            current_volatility_pct=execution_plan.volatility_pct,
+        ):
+            record_audit_event(
+                session,
+                event_type="live_limit_aggressive_fallback",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="warning",
+                message="Limit order escalated to aggressive execution fallback.",
+                payload={
+                    "symbol": symbol,
+                    "intent_type": intent_type,
+                    "attempt": attempt_index + 1,
+                    "remaining_quantity": remaining_quantity,
+                    "current_slippage_pct": current_slippage_pct,
+                    "execution_policy": execution_plan.to_payload(),
+                },
+            )
+            current_order_type = execution_plan.fallback_order_type
+            current_quantity = _normalize_remaining_quantity(
+                client,
+                symbol=symbol,
+                remaining_quantity=remaining_quantity,
+                reference_price=live_reference_price,
+            )
+            current_price = live_reference_price
+            if current_quantity <= 0:
+                break
+            attempt_index += 1
+            continue
+
+        next_quantity = _normalize_remaining_quantity(
+            client,
+            symbol=symbol,
+            remaining_quantity=remaining_quantity,
+            reference_price=live_reference_price,
+        )
+        if next_quantity <= 0:
+            break
+        current_quantity = next_quantity
+        current_price = _compute_limit_reprice(
+            client,
+            symbol=symbol,
+            side=side,
+            current_price=max(submit_price or requested_price, 1.0),
+            live_reference_price=live_reference_price,
+            reprice_bps=execution_plan.reprice_bps,
+        )
+        record_audit_event(
+            session,
+            event_type="live_limit_repriced",
+            entity_type="order",
+            entity_id=str(order.id),
+            severity="info",
+            message="Limit order was canceled and repriced for another passive attempt.",
+            payload={
+                "symbol": symbol,
+                "intent_type": intent_type,
+                "attempt": attempt_index + 2,
+                "remaining_quantity": current_quantity,
+                "repriced_limit": current_price,
+                "execution_policy": execution_plan.to_payload(),
+            },
+        )
+        attempt_index += 1
+        if attempt_index > execution_plan.max_requotes and execution_plan.fallback_order_type == "NONE":
+            break
+
+    if final_order is None:
+        raise RuntimeError("Execution policy did not produce an exchange order.")
+
+    aggregate_avg_fill_price = (
+        total_fill_notional / total_filled_quantity if total_filled_quantity > 0 else final_order.average_fill_price
+    )
+    final_status = final_order.status
+    if total_filled_quantity > 0 and total_filled_quantity + 1e-9 < requested_quantity:
+        final_status = "partially_filled"
+    elif total_filled_quantity >= requested_quantity:
+        final_status = "filled"
+
+    return {
+        "order": final_order,
+        "fees": total_fee_paid,
+        "realized_pnl": total_realized_pnl,
+        "filled_quantity": total_filled_quantity,
+        "average_fill_price": aggregate_avg_fill_price,
+        "status": final_status,
+        "attempts": execution_attempts,
+    }
 
 
 def _create_protective_orders(
@@ -1638,16 +2005,20 @@ def execute_live_trade(
             execution_price = execution_plan.price
     try:
         client.change_initial_leverage(decision.symbol, max(1, int(round(intent.leverage))))
-        client_order_id, exchange_order = _safe_submit_order(
-            client,
+        execution_result = _execute_primary_order_with_policy(
+            session,
+            client=client,
+            settings_row=settings_row,
             symbol=decision.symbol,
             side=side,
-            order_type=execution_plan.order_type,
-            quantity=normalized_quantity,
-            price=execution_price if execution_plan.order_type == "LIMIT" else None,
+            execution_plan=execution_plan,
+            requested_quantity=normalized_quantity,
+            requested_price=execution_price,
+            decision_run_id=decision_run_id,
+            risk_row=risk_row,
             reduce_only=reduce_only,
-            response_type="RESULT",
-            time_in_force=execution_plan.time_in_force,
+            close_only=decision.decision == "exit",
+            intent_type=intent_type,
         )
     except BinanceAPIError as exc:
         reason_codes = ["BINANCE_ORDER_REJECTED"]
@@ -1671,6 +2042,8 @@ def execute_live_trade(
                 "available_balance": live_balances["available_balance"],
                 "equity": live_balances["equity"],
                 "intent_type": intent_type,
+                "requested_quantity": normalized_quantity,
+                "requested_price": execution_price,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -1687,6 +2060,7 @@ def execute_live_trade(
                 "requested_quantity": normalized_quantity,
                 "available_balance": live_balances["available_balance"],
                 "intent_type": intent_type,
+                "requested_price": execution_price,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -1705,6 +2079,7 @@ def execute_live_trade(
                 "available_balance": live_balances["available_balance"],
                 "equity": live_balances["equity"],
                 "intent_type": intent_type,
+                "requested_price": execution_price,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -1734,6 +2109,8 @@ def execute_live_trade(
             metadata_json={
                 "error": str(exc),
                 "intent_type": intent_type,
+                "requested_quantity": normalized_quantity,
+                "requested_price": execution_price,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -1747,6 +2124,8 @@ def execute_live_trade(
                 "symbol": decision.symbol,
                 "error": str(exc),
                 "intent_type": intent_type,
+                "requested_quantity": normalized_quantity,
+                "requested_price": execution_price,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -1761,6 +2140,8 @@ def execute_live_trade(
                 "symbol": decision.symbol,
                 "error": str(exc),
                 "intent_type": intent_type,
+                "requested_quantity": normalized_quantity,
+                "requested_price": execution_price,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -1785,43 +2166,12 @@ def execute_live_trade(
             "intent_type": intent_type,
             "execution_policy": execution_plan.to_payload(),
         }
-
-    order = _upsert_exchange_order_row(
-        session,
-        symbol=decision.symbol,
-        requested_price=execution_price,
-        requested_quantity=normalized_quantity,
-        order_type=execution_plan.order_type,
-        side=decision.decision,
-        exchange_order={**exchange_order, "clientOrderId": client_order_id},
-        decision_run_id=decision_run_id,
-        risk_row=risk_row,
-        reduce_only=reduce_only,
-        close_only=decision.decision == "exit",
-    )
-    order.metadata_json = {
-        **(order.metadata_json or {}),
-        "execution_policy": execution_plan.to_payload(),
-    }
-    session.add(order)
-    session.flush()
-    try:
-        trades = client.get_account_trades(symbol=decision.symbol, order_id=order.external_order_id)
-    except Exception as exc:
-        reason_code = _classify_exchange_state_error(exc, "TEMPORARY_SYNC_FAILURE")
-        _pause_for_system_issue(
-            session,
-            settings_row,
-            reason_code=reason_code,
-            symbol=decision.symbol,
-            error=str(exc),
-            event_type="live_post_trade_sync_failed",
-            component="live_execution",
-            alert_title="Post-trade sync failed",
-            alert_message="?? ?? ?? ???? ??? ?? ??? ?? ??????.",
-        )
-        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
-    fee_paid, realized_pnl = _record_live_trades(session, order, trades)
+    order = execution_result["order"]
+    fee_paid = float(execution_result["fees"])
+    realized_pnl = float(execution_result["realized_pnl"])
+    aggregate_fill_price = float(execution_result["average_fill_price"])
+    aggregate_filled_quantity = float(execution_result["filled_quantity"])
+    final_execution_status = str(execution_result["status"])
     create_exchange_pnl_snapshot(session, settings_row)
 
     try:
@@ -1839,7 +2189,7 @@ def execute_live_trade(
             alert_title="Post-order open orders sync failed",
             alert_message="?? ?? ??? ?? ??? ???? ?? ??? ?? ??????.",
         )
-        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
+        return {"order_id": order.id, "status": final_execution_status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
 
     try:
         synced_position = sync_live_positions(
@@ -1862,7 +2212,7 @@ def execute_live_trade(
             alert_title="Post-order position sync failed",
             alert_message="?? ?? ??? ??? ???? ?? ??? ?? ??????.",
         )
-        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
+        return {"order_id": order.id, "status": final_execution_status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
 
     position = get_open_position(session, decision.symbol)
     if position is not None:
@@ -1898,22 +2248,23 @@ def execute_live_trade(
                 "position_id": order.position_id,
                 "status": "emergency_exit",
                 "exchange_status": order.exchange_status,
-                "fill_price": order.average_fill_price,
-                "fill_quantity": order.filled_quantity,
+                "fill_price": aggregate_fill_price,
+                "fill_quantity": aggregate_filled_quantity,
                 "realized_pnl": realized_pnl,
                 "fees": fee_paid,
                 "protective_order_ids": protective_order_ids,
                 "protective_state": protection_result["protection_state"],
                 "emergency_action": protection_result["emergency_action"],
                 "intent_type": intent_type,
+                "execution_attempts": execution_result["attempts"],
             }
     else:
         _cancel_exit_orders(session, client, decision.symbol)
 
     slippage_pct = 0.0
-    if order.filled_quantity > 0 and order.average_fill_price > 0:
-        slippage_pct = abs(order.average_fill_price - execution_price) / max(execution_price, 1.0)
-    if order.filled_quantity > 0 and slippage_pct > settings_row.slippage_threshold_pct:
+    if aggregate_filled_quantity > 0 and aggregate_fill_price > 0:
+        slippage_pct = abs(aggregate_fill_price - execution_price) / max(execution_price, 1.0)
+    if aggregate_filled_quantity > 0 and slippage_pct > settings_row.slippage_threshold_pct:
         create_alert(
             session,
             category="execution",
@@ -1945,7 +2296,7 @@ def execute_live_trade(
             alert_title="Post-order account sync failed",
             alert_message="?? ?? ?? ??? ?? ???? ?? ??? ?? ??????.",
         )
-        return {"order_id": order.id, "status": order.status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
+        return {"order_id": order.id, "status": final_execution_status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
     pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, refreshed_account_info)
     record_audit_event(
         session,
@@ -1962,15 +2313,16 @@ def execute_live_trade(
             "slippage_pct": slippage_pct,
             "intent_type": intent_type,
             "execution_policy": execution_plan.to_payload(),
+            "execution_attempts": execution_result["attempts"],
         },
     )
     return {
         "order_id": order.id,
         "position_id": order.position_id,
-        "status": order.status,
+        "status": final_execution_status,
         "exchange_status": order.exchange_status,
-        "fill_price": order.average_fill_price,
-        "fill_quantity": order.filled_quantity,
+        "fill_price": aggregate_fill_price,
+        "fill_quantity": aggregate_filled_quantity,
         "realized_pnl": realized_pnl,
         "fees": fee_paid,
         "equity": pnl_snapshot.equity,
@@ -1978,4 +2330,5 @@ def execute_live_trade(
         "protective_state": protection_result["protection_state"] if protection_result is not None else pre_trade_protection,
         "intent_type": intent_type,
         "execution_policy": execution_plan.to_payload(),
+        "execution_attempts": execution_result["attempts"],
     }

@@ -19,6 +19,12 @@ class ExecutionPlan:
     marketable: bool
     estimated_slippage_pct: float
     volatility_pct: float
+    timeout_seconds: int
+    poll_interval_seconds: int
+    max_requotes: int
+    reprice_bps: float
+    fallback_order_type: Literal["MARKET", "LIMIT", "NONE"]
+    allow_partial_fill: bool
     reason: str
 
     def to_payload(self) -> dict[str, object]:
@@ -32,6 +38,12 @@ class ExecutionPlan:
             "marketable": self.marketable,
             "estimated_slippage_pct": self.estimated_slippage_pct,
             "volatility_pct": self.volatility_pct,
+            "timeout_seconds": self.timeout_seconds,
+            "poll_interval_seconds": self.poll_interval_seconds,
+            "max_requotes": self.max_requotes,
+            "reprice_bps": self.reprice_bps,
+            "fallback_order_type": self.fallback_order_type,
+            "allow_partial_fill": self.allow_partial_fill,
             "reason": self.reason,
         }
 
@@ -50,6 +62,23 @@ def _estimate_window_volatility_pct(market_snapshot: MarketSnapshotPayload, samp
     lowest = min(candle.low for candle in candles)
     latest_price = max(market_snapshot.latest_price, 1.0)
     return max(highest - lowest, 0.0) / latest_price
+
+
+def should_fallback_aggressively(
+    plan: ExecutionPlan,
+    *,
+    reprice_attempt: int,
+    current_slippage_pct: float,
+    slippage_threshold_pct: float,
+    current_volatility_pct: float,
+) -> bool:
+    if plan.order_type != "LIMIT" or plan.fallback_order_type != "MARKET":
+        return False
+    if reprice_attempt >= plan.max_requotes:
+        return True
+    if current_slippage_pct >= max(slippage_threshold_pct * 1.5, plan.estimated_slippage_pct * 1.5):
+        return True
+    return current_volatility_pct >= max(slippage_threshold_pct * 6.0, plan.volatility_pct * 1.25)
 
 
 def select_execution_plan(
@@ -77,6 +106,12 @@ def select_execution_plan(
                 marketable=True,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
+                timeout_seconds=0,
+                poll_interval_seconds=0,
+                max_requotes=0,
+                reprice_bps=0.0,
+                fallback_order_type="NONE",
+                allow_partial_fill=True,
                 reason="market_data_not_reliable",
             )
         if estimated_slippage_pct <= slippage_threshold and volatility_pct <= slippage_threshold * 4:
@@ -90,6 +125,12 @@ def select_execution_plan(
                 marketable=False,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
+                timeout_seconds=6,
+                poll_interval_seconds=2,
+                max_requotes=2,
+                reprice_bps=4.0,
+                fallback_order_type="MARKET",
+                allow_partial_fill=True,
                 reason="passive_entry_allowed",
             )
         return ExecutionPlan(
@@ -102,6 +143,12 @@ def select_execution_plan(
             marketable=True,
             estimated_slippage_pct=estimated_slippage_pct,
             volatility_pct=volatility_pct,
+            timeout_seconds=0,
+            poll_interval_seconds=0,
+            max_requotes=0,
+            reprice_bps=0.0,
+            fallback_order_type="NONE",
+            allow_partial_fill=True,
             reason="slippage_or_volatility_above_threshold",
         )
 
@@ -117,6 +164,12 @@ def select_execution_plan(
                 marketable=True,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
+                timeout_seconds=0,
+                poll_interval_seconds=0,
+                max_requotes=0,
+                reprice_bps=0.0,
+                fallback_order_type="NONE",
+                allow_partial_fill=True,
                 reason="market_data_not_reliable",
             )
         if estimated_slippage_pct <= slippage_threshold * 1.25 and volatility_pct <= slippage_threshold * 5:
@@ -130,6 +183,12 @@ def select_execution_plan(
                 marketable=False,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
+                timeout_seconds=5,
+                poll_interval_seconds=2,
+                max_requotes=2,
+                reprice_bps=5.0,
+                fallback_order_type="MARKET",
+                allow_partial_fill=True,
                 reason="passive_scale_in_allowed",
             )
         return ExecutionPlan(
@@ -142,6 +201,12 @@ def select_execution_plan(
             marketable=True,
             estimated_slippage_pct=estimated_slippage_pct,
             volatility_pct=volatility_pct,
+            timeout_seconds=0,
+            poll_interval_seconds=0,
+            max_requotes=0,
+            reprice_bps=0.0,
+            fallback_order_type="NONE",
+            allow_partial_fill=True,
             reason="scale_in_needs_immediate_execution",
         )
 
@@ -157,6 +222,12 @@ def select_execution_plan(
                 marketable=True,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
+                timeout_seconds=0,
+                poll_interval_seconds=0,
+                max_requotes=0,
+                reprice_bps=0.0,
+                fallback_order_type="NONE",
+                allow_partial_fill=True,
                 reason="full_exit_prioritizes_certainty",
             )
         if not stale_or_incomplete and protected_position and estimated_slippage_pct <= slippage_threshold * 1.5:
@@ -170,6 +241,12 @@ def select_execution_plan(
                 marketable=False,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
+                timeout_seconds=4,
+                poll_interval_seconds=2,
+                max_requotes=1,
+                reprice_bps=3.0,
+                fallback_order_type="MARKET",
+                allow_partial_fill=True,
                 reason="protected_reduce_can_rest_passively",
             )
         return ExecutionPlan(
@@ -182,6 +259,12 @@ def select_execution_plan(
             marketable=True,
             estimated_slippage_pct=estimated_slippage_pct,
             volatility_pct=volatility_pct,
+            timeout_seconds=0,
+            poll_interval_seconds=0,
+            max_requotes=0,
+            reprice_bps=0.0,
+            fallback_order_type="NONE",
+            allow_partial_fill=True,
             reason="reduce_needs_immediate_execution",
         )
 
@@ -195,5 +278,48 @@ def select_execution_plan(
         marketable=True,
         estimated_slippage_pct=estimated_slippage_pct,
         volatility_pct=volatility_pct,
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+        max_requotes=0,
+        reprice_bps=0.0,
+        fallback_order_type="NONE",
+        allow_partial_fill=True,
         reason="intent_managed_by_protection_or_emergency_path",
     )
+
+
+def summarize_execution_policy(settings_row: Setting) -> dict[str, object]:
+    return {
+        "slippage_threshold_pct": settings_row.slippage_threshold_pct,
+        "entry": {
+            "preferred_order_type": "LIMIT",
+            "fallback_order_type": "MARKET",
+            "timeout_seconds": 6,
+            "max_requotes": 2,
+            "summary": "Passive entry limit with timeout, cancel/reprice, then aggressive market fallback when urgency dominates.",
+        },
+        "scale_in": {
+            "preferred_order_type": "LIMIT",
+            "fallback_order_type": "MARKET",
+            "timeout_seconds": 5,
+            "max_requotes": 2,
+            "summary": "Scale-in prefers passive limit, reprices once or twice, then falls back market if fill risk grows.",
+        },
+        "reduce": {
+            "preferred_order_type": "LIMIT",
+            "fallback_order_type": "MARKET",
+            "timeout_seconds": 4,
+            "max_requotes": 1,
+            "summary": "Protected reductions may rest passively briefly, then cancel/reprice or fall back market to finish.",
+        },
+        "exit": {
+            "preferred_order_type": "MARKET",
+            "fallback_order_type": "MARKET",
+            "summary": "Full exit prioritizes certainty over maker preference.",
+        },
+        "protection": {
+            "preferred_order_type": "ALGO",
+            "fallback_order_type": "EMERGENCY_EXIT",
+            "summary": "Exchange-resident stop/take-profit orders are required; failed protection recreates or exits.",
+        },
+    }

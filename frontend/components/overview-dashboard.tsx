@@ -48,9 +48,16 @@ type Overview = {
   protection_recovery_failure_count: number;
   missing_protection_symbols: string[];
   missing_protection_items: Record<string, string[]>;
+  pnl_summary: Record<string, unknown>;
+  account_sync_summary: Record<string, unknown>;
+  exposure_summary: Record<string, unknown>;
+  execution_policy_summary: Record<string, unknown>;
+  market_context_summary: Record<string, unknown>;
+  adaptive_protection_summary: Record<string, unknown>;
   daily_pnl: number;
   cumulative_pnl: number;
   blocked_reasons: string[];
+  latest_blocked_reasons: string[];
   protected_positions: number;
   unprotected_positions: number;
   position_protection_summary: ProtectionSummary[];
@@ -91,6 +98,26 @@ function StatusBadge({
     danger: "border border-rose-200 bg-rose-50 text-rose-800",
   }[tone];
   return <span className={`rounded-full px-4 py-2 text-sm font-semibold ${className}`}>{label}</span>;
+}
+
+function renderCodeList(values: unknown): string {
+  if (!Array.isArray(values) || values.length === 0) {
+    return "-";
+  }
+  return values.map((item) => formatDisplayValue(item)).join(" / ");
+}
+
+function renderNumberMap(values: unknown): string {
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    return "-";
+  }
+  const entries = Object.entries(values as Record<string, unknown>);
+  if (entries.length === 0) {
+    return "-";
+  }
+  return entries
+    .map(([key, value]) => `${formatDisplayValue(key)} ${formatDisplayValue(value, key)}`)
+    .join(" / ");
 }
 
 function SmallList({
@@ -296,15 +323,36 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
         .map((item) => formatDisplayValue(item))
         .join(" / ");
     }
+    if (payload.overview.latest_blocked_reasons.length > 0) {
+      return payload.overview.latest_blocked_reasons.map((item) => formatDisplayValue(item)).join(" / ");
+    }
     if (payload.overview.blocked_reasons.length > 0) {
       return payload.overview.blocked_reasons.map((item) => formatDisplayValue(item)).join(" / ");
     }
     return "차단 사유 없음";
-  }, [payload.overview.auto_resume_last_blockers, payload.overview.blocked_reasons]);
+  }, [payload.overview.auto_resume_last_blockers, payload.overview.latest_blocked_reasons, payload.overview.blocked_reasons]);
   const latestDecisionText =
     typeof payload.overview.latest_decision?.explanation_short === "string"
       ? payload.overview.latest_decision.explanation_short
       : "최신 의사결정 설명이 아직 없습니다.";
+  const pnlSummary = payload.overview.pnl_summary ?? {};
+  const accountSyncSummary = payload.overview.account_sync_summary ?? {};
+  const exposureSummary = payload.overview.exposure_summary ?? {};
+  const executionPolicySummary = payload.overview.execution_policy_summary ?? {};
+  const marketContextSummary = payload.overview.market_context_summary ?? {};
+  const adaptiveProtectionSummary = payload.overview.adaptive_protection_summary ?? {};
+  const exposureHeadroom =
+    exposureSummary && typeof exposureSummary === "object" && !Array.isArray(exposureSummary)
+      ? ((exposureSummary as Record<string, unknown>).headroom as Record<string, unknown> | undefined)
+      : undefined;
+  const exposureMetrics =
+    exposureSummary && typeof exposureSummary === "object" && !Array.isArray(exposureSummary)
+      ? ((exposureSummary as Record<string, unknown>).metrics as Record<string, unknown> | undefined)
+      : undefined;
+  const contextFrames =
+    marketContextSummary && typeof marketContextSummary === "object" && !Array.isArray(marketContextSummary)
+      ? (((marketContextSummary as Record<string, unknown>).context_timeframes as string[] | undefined) ?? [])
+      : [];
   const protectionSummaryText =
     payload.overview.unprotected_positions > 0
       ? `${payload.overview.unprotected_positions}개 포지션이 보호 확인 필요 상태입니다.`
@@ -390,6 +438,121 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
           value={`${payload.overview.protected_positions}/${payload.overview.open_positions}`}
           hint={protectionSummaryText}
         />
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-3">
+        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">PnL Basis</p>
+          <h2 className="mt-2 text-xl font-semibold text-ink">손익 집계 기준</h2>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">기준</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue((pnlSummary as Record<string, unknown>).basis, "pnl_basis")}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">순실현 / 일손익 / 누적손익</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue((pnlSummary as Record<string, unknown>).net_realized_pnl, "daily_pnl")} /{" "}
+                {formatDisplayValue((pnlSummary as Record<string, unknown>).daily_pnl, "daily_pnl")} /{" "}
+                {formatDisplayValue((pnlSummary as Record<string, unknown>).cumulative_pnl, "cumulative_pnl")}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">연속 손실 / 스냅샷 시각</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue((pnlSummary as Record<string, unknown>).consecutive_losses, "consecutive_losses")} /{" "}
+                {formatDisplayValue((pnlSummary as Record<string, unknown>).snapshot_time, "snapshot_time")}
+              </p>
+            </div>
+          </div>
+          <p className="mt-4 text-sm leading-6 text-slate-600">
+            {String(
+              (pnlSummary as Record<string, unknown>).basis_note ??
+                "실거래 체결 ledger를 우선 사용하고, 과거 snapshot 수치와 차이가 날 수 있습니다.",
+            )}
+          </p>
+        </div>
+
+        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Account Sync</p>
+          <h2 className="mt-2 text-xl font-semibold text-ink">계좌 동기화 / 보정</h2>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">동기화 상태</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (accountSyncSummary as Record<string, unknown>).status,
+                  "account_sync_status",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">보정 방식 / 마지막 동기화</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (accountSyncSummary as Record<string, unknown>).reconciliation_mode,
+                  "account_reconciliation_mode",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (accountSyncSummary as Record<string, unknown>).last_synced_at,
+                  "last_synced_at",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">신선도 / 마지막 경고</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (accountSyncSummary as Record<string, unknown>).freshness_seconds,
+                  "freshness_seconds",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (accountSyncSummary as Record<string, unknown>).last_warning_reason_code,
+                  "pause_reason_code",
+                )}
+              </p>
+            </div>
+          </div>
+          <p className="mt-4 text-sm leading-6 text-slate-600">
+            {String(
+              (accountSyncSummary as Record<string, unknown>).note ??
+                "계좌 동기화 상세가 아직 없습니다.",
+            )}
+          </p>
+        </div>
+
+        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Exposure</p>
+          <h2 className="mt-2 text-xl font-semibold text-ink">노출도 한도 / 헤드룸</h2>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">현재 상태 / 기준 심볼</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (exposureSummary as Record<string, unknown>).status,
+                  "exposure_status",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (exposureSummary as Record<string, unknown>).reference_symbol,
+                  "symbol",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">현재 노출도</p>
+              <p className="mt-2 text-sm font-semibold text-ink">{renderNumberMap(exposureMetrics)}</p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">남은 헤드룸</p>
+              <p className="mt-2 text-sm font-semibold text-ink">{renderNumberMap(exposureHeadroom)}</p>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section className="grid gap-4 lg:grid-cols-3">
@@ -493,6 +656,148 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
               상태에서도 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.
             </p>
           </div>
+        </div>
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-3">
+        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Execution Policy</p>
+          <h2 className="mt-2 text-xl font-semibold text-ink">실행 정책 요약</h2>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">슬리피지 임계값</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (executionPolicySummary as Record<string, unknown>).slippage_threshold_pct,
+                  "slippage_threshold_pct",
+                )}
+              </p>
+            </div>
+            {["entry", "scale_in", "reduce", "exit"].map((key) => {
+              const item =
+                executionPolicySummary && typeof executionPolicySummary === "object"
+                  ? (executionPolicySummary as Record<string, unknown>)[key]
+                  : undefined;
+              const summary =
+                item && typeof item === "object"
+                  ? String((item as Record<string, unknown>).summary ?? "-")
+                  : "-";
+              return (
+                <div key={key} className="rounded-2xl bg-canvas p-4">
+                  <p className="text-xs text-slate-500">{formatDisplayValue(key, "execution_policy_key")}</p>
+                  <p className="mt-2 text-sm font-semibold text-ink">{summary}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Multi Timeframe</p>
+          <h2 className="mt-2 text-xl font-semibold text-ink">상위 타임프레임 컨텍스트</h2>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">기준 심볼 / 베이스</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue((marketContextSummary as Record<string, unknown>).symbol, "symbol")} /{" "}
+                {formatDisplayValue(
+                  (marketContextSummary as Record<string, unknown>).base_timeframe,
+                  "timeframe",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">컨텍스트 프레임</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {contextFrames.length > 0 ? contextFrames.join(", ") : "-"}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">레짐 / 정렬</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (marketContextSummary as Record<string, unknown>).primary_regime,
+                  "primary_regime",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (marketContextSummary as Record<string, unknown>).trend_alignment,
+                  "trend_alignment",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">변동성 / 거래량 / 모멘텀</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (marketContextSummary as Record<string, unknown>).volatility_regime,
+                  "volatility_regime",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (marketContextSummary as Record<string, unknown>).volume_regime,
+                  "volume_regime",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (marketContextSummary as Record<string, unknown>).momentum_state,
+                  "momentum_state",
+                )}
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 rounded-2xl bg-canvas p-4">
+            <p className="text-xs text-slate-500">데이터 품질 플래그</p>
+            <p className="mt-2 text-sm font-semibold text-ink">
+              {renderCodeList((marketContextSummary as Record<string, unknown>).data_quality_flags)}
+            </p>
+          </div>
+        </div>
+
+        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Adaptive Protection</p>
+          <h2 className="mt-2 text-xl font-semibold text-ink">적응형 보호 상태</h2>
+          <div className="mt-4 space-y-3">
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">보호 로직</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (adaptiveProtectionSummary as Record<string, unknown>).mode,
+                  "adaptive_protection_mode",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">복구 상태 / 활성 여부</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {formatDisplayValue(
+                  (adaptiveProtectionSummary as Record<string, unknown>).status,
+                  "protection_recovery_status",
+                )}{" "}
+                /{" "}
+                {formatDisplayValue(
+                  (adaptiveProtectionSummary as Record<string, unknown>).active,
+                  "protection_recovery_active",
+                )}
+              </p>
+            </div>
+            <div className="rounded-2xl bg-canvas p-4">
+              <p className="text-xs text-slate-500">누락 심볼 / 실패 누적</p>
+              <p className="mt-2 text-sm font-semibold text-ink">
+                {renderCodeList((adaptiveProtectionSummary as Record<string, unknown>).missing_symbols)} /{" "}
+                {formatDisplayValue(
+                  (adaptiveProtectionSummary as Record<string, unknown>).failure_count,
+                  "protection_recovery_failure_count",
+                )}
+              </p>
+            </div>
+          </div>
+          <p className="mt-4 text-sm leading-6 text-slate-600">
+            {String(
+              (adaptiveProtectionSummary as Record<string, unknown>).summary ??
+                "적응형 보호 상태 요약이 아직 없습니다.",
+            )}
+          </p>
         </div>
       </section>
 

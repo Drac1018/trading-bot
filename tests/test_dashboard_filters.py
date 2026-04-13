@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from trading_mvp.models import AuditEvent, Execution, Order, Position
+from trading_mvp.models import AuditEvent, Execution, Order, Position, RiskCheck
 from trading_mvp.services.dashboard import (
     get_audit_timeline,
     get_executions,
@@ -144,6 +144,17 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
             metadata_json={},
         )
     )
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision="long",
+            allowed=False,
+            reason_codes=["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"reason_codes": ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]},
+        )
+    )
     db_session.flush()
 
     overview = get_overview(db_session)
@@ -157,12 +168,19 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
     assert overview.pause_origin == "system"
     assert overview.auto_resume_status == "not_eligible"
     assert overview.auto_resume_last_blockers == ["MISSING_PROTECTIVE_ORDERS"]
+    assert overview.latest_blocked_reasons == ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]
     assert overview.pause_severity == "critical"
     assert overview.pause_recovery_class == "portfolio_unsafe"
     assert overview.protection_recovery_status == "idle"
     assert overview.protection_recovery_active is False
     assert overview.missing_protection_symbols == ["BTCUSDT"]
     assert overview.missing_protection_items == {"BTCUSDT": ["take_profit"]}
+    assert overview.pnl_summary["basis"] == "execution_ledger_truth"
+    assert "status" in overview.account_sync_summary
+    assert "headroom" in overview.exposure_summary
+    assert "entry" in overview.execution_policy_summary
+    assert "primary_regime" in overview.market_context_summary
+    assert "mode" in overview.adaptive_protection_summary
     assert overview.position_protection_summary[0]["symbol"] == "BTCUSDT"
     assert overview.position_protection_summary[0]["missing_components"] == ["take_profit"]
     assert overview.position_protection_summary[0]["status"] == "missing"

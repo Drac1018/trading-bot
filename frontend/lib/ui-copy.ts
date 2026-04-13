@@ -42,34 +42,28 @@ const labelMap: Record<string, string> = {
   opened_at: "오픈 시각",
   closed_at: "종료 시각",
   applied_at: "적용 시각",
-  verification_summary: "검증 내용",
-  files_changed: "변경 파일",
-  linked_backlog_id: "연결 backlog ID",
-  related_backlog_id: "연결 backlog ID",
-  linked_backlog_title: "연결 backlog 제목",
-  related_backlog_title: "연결 backlog 제목",
   order_type: "주문 유형",
   side: "주문 방향",
   requested_quantity: "요청 수량",
   requested_price: "요청 가격",
-  filled_quantity: "누적 체결 수량",
+  filled_quantity: "체결 수량",
   average_fill_price: "평균 체결가",
   fill_price: "체결가",
   fill_quantity: "체결 수량",
   fee_paid: "수수료",
   slippage_pct: "슬리피지",
-  event_type: "이벤트 유형",
-  entity_type: "대상 유형",
-  entity_id: "대상 ID",
-  message: "메시지",
-  payload: "상세 Payload",
   live_trading_enabled: "실거래 사용",
   live_execution_ready: "실행 준비",
   trading_paused: "거래 일시중지",
-  open_positions: "오픈 포지션 수",
+  exchange_can_trade: "거래소 주문 권한",
+  app_live_execution_ready: "앱 실주문 준비",
+  app_trading_paused: "앱 거래 중지",
+  app_operating_state: "앱 운영 상태",
+  open_positions: "오픈 포지션",
   daily_pnl: "일일 손익",
   cumulative_pnl: "누적 손익",
   blocked_reasons: "차단 사유",
+  latest_blocked_reasons: "현재 거래 차단 사유",
   manual_live_approval: "수동 승인 정책",
   live_execution_armed_until: "실거래 승인 만료 시각",
   ai_enabled: "AI 사용",
@@ -124,6 +118,48 @@ const labelMap: Record<string, string> = {
   evaluated_symbols: "평가 대상 심볼",
   protective_orders: "보호 주문 상태",
   trigger_source: "실행 경로",
+  pnl_summary: "손익 요약",
+  account_sync_summary: "계좌 동기화 요약",
+  exposure_summary: "노출도 요약",
+  execution_policy_summary: "실행 정책 요약",
+  market_context_summary: "멀티 타임프레임 요약",
+  adaptive_protection_summary: "적응형 보호 요약",
+  basis: "계산 기준",
+  basis_note: "계산 기준 설명",
+  net_realized_pnl: "순실현 손익",
+  account_sync_status: "계좌 동기화 상태",
+  reconciliation_mode: "보정 방식",
+  account_reconciliation_mode: "보정 방식",
+  freshness_seconds: "동기화 신선도",
+  stale_after_seconds: "신선도 기준",
+  last_synced_at: "마지막 계좌 동기화",
+  last_warning_reason_code: "마지막 경고 사유",
+  last_warning_message: "마지막 경고 메시지",
+  metrics: "현재 노출도",
+  limits: "노출 한도",
+  headroom: "남은 헤드룸",
+  reference_symbol: "기준 심볼",
+  reference_tier: "기준 리스크 티어",
+  primary_regime: "주 레짐",
+  trend_alignment: "상위 추세 정렬",
+  volatility_regime: "변동성 레짐",
+  volume_regime: "거래량 레짐",
+  momentum_state: "모멘텀 상태",
+  data_quality_flags: "데이터 품질 플래그",
+  context_timeframes: "상위 타임프레임",
+  adaptive_protection_mode: "적응형 보호 로직",
+  gross_exposure_pct_equity: "총 노출도",
+  long_exposure_pct_equity: "롱 노출도",
+  short_exposure_pct_equity: "숏 노출도",
+  directional_bias_pct: "방향 편중",
+  decision_symbol_concentration_pct: "심볼 집중도",
+  same_tier_concentration_pct: "동일 티어 집중도",
+  largest_position_pct_equity: "최대 단일 포지션",
+  projected_trade_notional_pct_equity: "예상 신규 진입 노출",
+  gross_exposure_pct: "총 노출도 한도/헤드룸",
+  largest_position_pct: "최대 포지션 한도/헤드룸",
+  exposure_status: "노출 상태",
+  execution_policy_key: "실행 정책",
 };
 
 const valueMap: Record<string, string> = {
@@ -182,7 +218,7 @@ const valueMap: Record<string, string> = {
   hard_risk_lock: "하드 리스크 잠금",
   config_block: "설정/정책 차단",
   portfolio_unsafe: "포트폴리오 위험 상태",
-  unknown: "미분류",
+  unknown: "미확인",
   TRADABLE: "거래 가능",
   PROTECTION_REQUIRED: "보호 복구 필요",
   DEGRADED_MANAGE_ONLY: "관리 전용",
@@ -207,26 +243,48 @@ const valueMap: Record<string, string> = {
   market_data_unavailable: "시장 데이터 조회 실패",
   open_orders_unavailable: "보호 주문 조회 실패",
   positions_unavailable: "포지션 조회 실패",
-  armed: "승인 창 열림",
-  grace: "승인 유예 허용",
-  required: "추가 승인 필요",
-  not_checked: "미확인",
+  execution_ledger_truth: "체결 ledger 기준",
+  exchange_synced: "거래소 동기화 기준",
+  fallback_reconciled: "보정값 사용 중",
+  stale_snapshot: "스냅샷 오래됨",
+  exchange_confirmed: "거래소 계좌 기준",
+  deterministic_delta_fallback: "이전 스냅샷 + 실현손익 보정",
+  stale: "오래됨",
+  at_limit: "한도 도달",
+  near_limit: "한도 근접",
+  adaptive_atr_regime_aware: "ATR + 레짐 적응형",
+  bullish: "상승 레짐",
+  bearish: "하락 레짐",
+  range: "횡보 레짐",
+  transition: "전환 레짐",
+  bullish_aligned: "상승 정렬",
+  bearish_aligned: "하락 정렬",
+  mixed: "혼합",
+  compressed: "압축",
+  normal: "보통",
+  expanded: "확장",
+  weak: "약함",
+  strong: "강함",
+  strengthening: "강화",
+  stable: "안정",
+  weakening: "약화",
+  overextended: "과열",
 };
 
 const reasonCodeMap: Record<string, string> = {
-  TRADING_PAUSED: "거래가 일시중지 상태여서 실행이 차단됐습니다.",
+  TRADING_PAUSED: "거래가 일시중지 상태라 신규 진입이 차단됐습니다.",
   STALE_MARKET_DATA: "시장 데이터가 오래되어 신규 진입이 차단됐습니다.",
-  INCOMPLETE_MARKET_DATA: "시장 데이터가 불완전하여 실행이 차단됐습니다.",
+  INCOMPLETE_MARKET_DATA: "시장 데이터가 불완전해 신규 진입이 차단됐습니다.",
   DAILY_LOSS_LIMIT_REACHED: "일일 손실 한도에 도달해 추가 진입이 차단됐습니다.",
   MAX_CONSECUTIVE_LOSSES_REACHED: "연속 손실 한도에 도달해 보수적으로 제한됩니다.",
   LEVERAGE_EXCEEDS_LIMIT: "레버리지가 허용 한도를 초과했습니다.",
   RISK_PCT_EXCEEDS_LIMIT: "거래당 리스크 비중이 허용 한도를 초과했습니다.",
-  MISSING_STOP_OR_TARGET: "손절가 또는 익절가가 없어 진입이 차단됐습니다.",
-  INVALID_LONG_BRACKETS: "롱 포지션의 손절/익절 구조가 유효하지 않습니다.",
-  INVALID_SHORT_BRACKETS: "숏 포지션의 손절/익절 구조가 유효하지 않습니다.",
+  MISSING_STOP_OR_TARGET: "손절 또는 익절 값이 없어 진입이 차단됐습니다.",
+  INVALID_LONG_BRACKETS: "롱 포지션 보호 가격 구조가 유효하지 않습니다.",
+  INVALID_SHORT_BRACKETS: "숏 포지션 보호 가격 구조가 유효하지 않습니다.",
   SLIPPAGE_THRESHOLD_EXCEEDED: "슬리피지가 허용 범위를 초과했습니다.",
-  HOLD_DECISION: "현재 판단이 HOLD라 신규 진입이 차단됐습니다.",
-  LIVE_ENV_DISABLED: "실거래 환경 플래그가 비활성화되어 있습니다.",
+  HOLD_DECISION: "현재 판단은 HOLD입니다.",
+  LIVE_ENV_DISABLED: "실거래 환경 플래그가 꺼져 있습니다.",
   LIVE_TRADING_DISABLED: "실거래 사용 설정이 꺼져 있습니다.",
   LIVE_APPROVAL_POLICY_DISABLED: "수동 승인 정책이 꺼져 있습니다.",
   LIVE_APPROVAL_REQUIRED: "실거래 승인 창이 열려 있지 않습니다.",
@@ -234,27 +292,31 @@ const reasonCodeMap: Record<string, string> = {
   EXCHANGE_ACCOUNT_STATE_UNAVAILABLE: "거래소 계좌 상태를 확인할 수 없습니다.",
   EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE: "거래소 또는 네트워크 연결이 일시적으로 불안정합니다.",
   TEMPORARY_MARKET_DATA_FAILURE: "시장 데이터 확인에 일시 장애가 있습니다.",
-  TEMPORARY_SYNC_FAILURE: "실거래 상태 동기화에 일시 장애가 있습니다.",
+  TEMPORARY_SYNC_FAILURE: "거래소 상태 동기화에 일시 장애가 있습니다.",
   EXCHANGE_POSITION_SYNC_FAILED: "거래소 포지션 상태를 동기화하지 못했습니다.",
   EXCHANGE_OPEN_ORDERS_SYNC_FAILED: "거래소 미체결 주문 상태를 동기화하지 못했습니다.",
   MANUAL_USER_REQUEST: "운영자가 수동으로 거래를 중지했습니다.",
   HARD_RISK_LOCK_DAILY_LOSS: "일일 손실 하드 락이 걸려 자동 복구가 금지됩니다.",
   HARD_RISK_LOCK_CONSECUTIVE_LOSS: "연속 손실 하드 락이 걸려 자동 복구가 금지됩니다.",
-  PROTECTIVE_ORDER_FAILURE: "보호 주문 생성에 실패해 자동 복구가 금지됩니다.",
+  PROTECTIVE_ORDER_FAILURE: "보호 주문 생성 실패로 자동 복구가 금지됩니다.",
   MISSING_PROTECTIVE_ORDERS: "무보호 포지션이 감지되어 자동 복구가 금지됩니다.",
-  PROTECTION_REQUIRED: "무보호 포지션이 감지되어 신규 진입이 차단되고 보호 복구가 우선됩니다.",
+  PROTECTION_REQUIRED: "무보호 포지션이 감지되어 신규 진입이 차단되고 보호 복구가 우선입니다.",
   DEGRADED_MANAGE_ONLY: "보호 복구가 반복 실패해 관리 전용 상태로 전환되었습니다.",
   EMERGENCY_EXIT: "비상 청산 상태가 진행 중이라 신규 진입이 차단됩니다.",
   INVALID_PROTECTION_BRACKETS: "보호 복구를 위한 손절/익절 값이 현재 포지션 방향과 맞지 않습니다.",
   PORTFOLIO_RISK_UNCERTAIN: "포트폴리오 위험 상태를 신뢰할 수 없습니다.",
   ACCOUNT_STATE_INCONSISTENT: "로컬 상태와 거래소 상태가 일치하지 않습니다.",
   AI_DISABLED: "AI가 꺼져 있어 배치 실행을 건너뜁니다.",
+  GROSS_EXPOSURE_LIMIT_REACHED: "총 노출도 한도를 초과했습니다.",
+  LARGEST_POSITION_LIMIT_REACHED: "최대 단일 포지션 한도를 초과했습니다.",
+  DIRECTIONAL_BIAS_LIMIT_REACHED: "방향 편중 한도를 초과했습니다.",
+  SAME_TIER_CONCENTRATION_LIMIT_REACHED: "동일 티어 집중도 한도를 초과했습니다.",
   protection_verification_failed: "보호 주문 검증에 실패했습니다.",
   protection_recreate_attempted: "보호 주문 재생성을 시도했습니다.",
   protection_recreate_failed: "보호 주문 재생성에 실패했습니다.",
   unprotected_position_detected: "무보호 포지션이 감지됐습니다.",
   emergency_exit_triggered: "비상 청산을 시작했습니다.",
-  emergency_exit_completed: "비상 청산이 완료됐습니다.",
+  emergency_exit_completed: "비상 청산을 완료했습니다.",
 };
 
 const percentKeys = new Set([
@@ -266,6 +328,16 @@ const percentKeys = new Set([
   "max_risk_per_trade",
   "max_daily_loss",
   "slippage_threshold_pct",
+  "gross_exposure_pct_equity",
+  "long_exposure_pct_equity",
+  "short_exposure_pct_equity",
+  "directional_bias_pct",
+  "decision_symbol_concentration_pct",
+  "same_tier_concentration_pct",
+  "largest_position_pct_equity",
+  "projected_trade_notional_pct_equity",
+  "gross_exposure_pct",
+  "largest_position_pct",
 ]);
 
 const priceKeys = new Set([
@@ -280,6 +352,7 @@ const priceKeys = new Set([
   "daily_pnl",
   "cumulative_pnl",
   "realized_pnl",
+  "net_realized_pnl",
   "unrealized_pnl",
   "fee_paid",
   "entry_price",
@@ -291,9 +364,11 @@ const priceKeys = new Set([
   "available_balance",
   "equity",
   "starting_equity",
+  "cash_balance",
 ]);
 
 const leverageKeys = new Set(["leverage", "approved_leverage", "max_leverage"]);
+const durationKeys = new Set(["freshness_seconds", "stale_after_seconds"]);
 const datetimeKeys = new Set([
   "created_at",
   "updated_at",
@@ -311,6 +386,7 @@ const datetimeKeys = new Set([
   "generated_at",
   "exchange_update_time",
   "update_time",
+  "last_synced_at",
 ]);
 
 const isoDatePattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
@@ -342,21 +418,11 @@ function formatDateTime(value: string) {
 }
 
 function formatBoolean(key: string | undefined, value: boolean) {
-  if (key === "allowed") {
-    return value ? "허용" : "차단";
-  }
-  if (key === "schema_valid") {
-    return value ? "정상" : "실패";
-  }
-  if (key === "trading_paused") {
-    return value ? "중지" : "가동 중";
-  }
-  if (key?.endsWith("_configured")) {
-    return value ? "설정됨" : "미설정";
-  }
-  if (key?.endsWith("_enabled")) {
-    return value ? "활성화" : "비활성화";
-  }
+  if (key === "allowed") return value ? "허용" : "차단";
+  if (key === "schema_valid") return value ? "정상" : "실패";
+  if (key === "trading_paused") return value ? "중지" : "가동 중";
+  if (key?.endsWith("_configured")) return value ? "설정됨" : "미설정";
+  if (key?.endsWith("_enabled")) return value ? "활성화" : "비활성화";
   if (key === "auto_resume_whitelisted" || key === "auto_resume_eligible" || key === "protected") {
     return value ? "예" : "아니오";
   }
@@ -367,6 +433,9 @@ function formatBoolean(key: string | undefined, value: boolean) {
 }
 
 function formatNumber(key: string | undefined, value: number) {
+  if (durationKeys.has(key ?? "")) {
+    return `${value.toLocaleString("ko-KR")}초`;
+  }
   if (percentKeys.has(key ?? "")) {
     return `${(value * 100).toLocaleString("ko-KR", {
       minimumFractionDigits: 0,

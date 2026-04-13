@@ -138,6 +138,33 @@
           "title": "Can Trade",
           "type": "boolean"
         },
+        "exchange_can_trade": {
+          "default": false,
+          "title": "Exchange Can Trade",
+          "type": "boolean"
+        },
+        "app_live_execution_ready": {
+          "default": false,
+          "title": "App Live Execution Ready",
+          "type": "boolean"
+        },
+        "app_trading_paused": {
+          "default": false,
+          "title": "App Trading Paused",
+          "type": "boolean"
+        },
+        "app_operating_state": {
+          "default": "TRADABLE",
+          "title": "App Operating State",
+          "type": "string"
+        },
+        "latest_blocked_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Latest Blocked Reasons",
+          "type": "array"
+        },
         "fee_tier": {
           "default": 0,
           "title": "Fee Tier",

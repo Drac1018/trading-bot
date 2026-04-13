@@ -17,8 +17,11 @@ from trading_mvp.schemas import (
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.settings import (
     get_effective_symbols,
+    get_latest_blocked_reasons,
     get_or_create_settings,
     get_runtime_credentials,
+    is_live_execution_ready,
+    serialize_settings,
 )
 from trading_mvp.time_utils import utcnow_naive
 
@@ -76,12 +79,18 @@ def _build_client(settings_row: Setting) -> BinanceClient:
 def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
     settings_row = get_or_create_settings(session)
     credentials = get_runtime_credentials(settings_row)
+    settings_payload = serialize_settings(settings_row)
+    latest_blocked_reasons = get_latest_blocked_reasons(session)
     base_summary = BinanceAccountSummary(
         connected=False,
         message="바이낸스 API 키가 설정되지 않았습니다.",
         testnet_enabled=settings_row.binance_testnet_enabled,
         futures_enabled=settings_row.binance_futures_enabled,
         tracked_symbols=get_effective_symbols(settings_row),
+        app_live_execution_ready=is_live_execution_ready(settings_row),
+        app_trading_paused=settings_row.trading_paused,
+        app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
+        latest_blocked_reasons=latest_blocked_reasons,
         exchange_update_time=utcnow_naive(),
     )
 
@@ -187,6 +196,11 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         futures_enabled=settings_row.binance_futures_enabled,
         tracked_symbols=get_effective_symbols(settings_row),
         can_trade=_to_bool(account_info.get("canTrade", False)),
+        exchange_can_trade=_to_bool(account_info.get("canTrade", False)),
+        app_live_execution_ready=is_live_execution_ready(settings_row),
+        app_trading_paused=settings_row.trading_paused,
+        app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
+        latest_blocked_reasons=latest_blocked_reasons,
         fee_tier=_to_int(account_info.get("feeTier")),
         total_wallet_balance=_to_float(account_info.get("totalWalletBalance")),
         available_balance=_to_float(account_info.get("availableBalance")),

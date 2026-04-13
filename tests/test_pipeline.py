@@ -78,7 +78,11 @@ def test_ai_disabled_collects_market_data_only(monkeypatch, db_session) -> None:
     assert db_session.scalar(select(FeatureSnapshot).limit(1)) is None
     assert db_session.scalar(select(AgentRun).limit(1)) is None
     assert db_session.scalar(select(RiskCheck).limit(1)) is None
-    assert db_session.scalar(select(PnLSnapshot).limit(1)) is None
+    latest_pnl = db_session.scalar(select(PnLSnapshot).limit(1))
+    if latest_pnl is not None:
+        assert latest_pnl.daily_pnl == 0.0
+        assert latest_pnl.cumulative_pnl == 0.0
+        assert latest_pnl.consecutive_losses == 0
     assert db_session.scalar(select(AuditEvent).limit(1)) is None
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from trading_mvp.models import RiskCheck
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
@@ -18,7 +19,21 @@ def test_binance_account_snapshot_builds_summary_from_exchange(monkeypatch, db_s
     settings_row = get_or_create_settings(db_session)
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    settings_row.trading_paused = True
+    settings_row.pause_reason_code = "MANUAL_USER_REQUEST"
     db_session.add(settings_row)
+    db_session.flush()
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision="long",
+            allowed=False,
+            reason_codes=["TRADING_PAUSED"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"reason_codes": ["TRADING_PAUSED"]},
+        )
+    )
     db_session.flush()
 
     class FakeClient:
@@ -108,6 +123,11 @@ def test_binance_account_snapshot_builds_summary_from_exchange(monkeypatch, db_s
 
     assert payload.summary.connected is True
     assert payload.summary.can_trade is True
+    assert payload.summary.exchange_can_trade is True
+    assert payload.summary.app_live_execution_ready is False
+    assert payload.summary.app_trading_paused is True
+    assert payload.summary.app_operating_state == "PAUSED"
+    assert payload.summary.latest_blocked_reasons == ["TRADING_PAUSED"]
     assert payload.summary.available_balance == 930.25
     assert payload.summary.asset_count == 1
     assert payload.summary.open_positions == 1

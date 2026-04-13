@@ -28,9 +28,16 @@ type Overview = {
   protection_recovery_failure_count: number;
   missing_protection_symbols: string[];
   missing_protection_items: Record<string, string[]>;
+  pnl_summary: Record<string, unknown>;
+  account_sync_summary: Record<string, unknown>;
+  exposure_summary: Record<string, unknown>;
+  execution_policy_summary: Record<string, unknown>;
+  market_context_summary: Record<string, unknown>;
+  adaptive_protection_summary: Record<string, unknown>;
   daily_pnl: number;
   cumulative_pnl: number;
   blocked_reasons: string[];
+  latest_blocked_reasons: string[];
   protected_positions: number;
   unprotected_positions: number;
   position_protection_summary: Array<{

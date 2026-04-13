@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session, object_session
 
 from trading_mvp.config import Settings as AppConfig
 from trading_mvp.config import get_settings
-from trading_mvp.models import Setting
+from trading_mvp.models import FeatureSnapshot, PnLSnapshot, RiskCheck, Setting, SystemHealthEvent
 from trading_mvp.schemas import AppSettingsResponse, AppSettingsUpdateRequest
 from trading_mvp.services.account import get_latest_pnl_snapshot
 from trading_mvp.services.ai_usage import (
@@ -17,6 +18,7 @@ from trading_mvp.services.ai_usage import (
     get_openai_call_gate,
     manual_ai_guard_minutes,
 )
+from trading_mvp.services.execution_policy import summarize_execution_policy
 from trading_mvp.services.pause_policy import (
     get_pause_reason_policy,
     pause_reason_allows_auto_resume,
@@ -45,6 +47,13 @@ DISPLAY_MAX_DIRECTIONAL_BIAS_PCT = 2.0
 DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT = 2.5
 AUTO_RESUME_GRACE_MAX_MINUTES = 15
 RUNTIME_STATE_DETAIL_KEYS = {"operating_state", "protection_recovery"}
+ACCOUNT_SYNC_WARNING_REASON_CODES = {
+    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+    "TEMPORARY_SYNC_FAILURE",
+    "EXCHANGE_POSITION_SYNC_FAILED",
+    "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+    "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+}
 
 
 def _default_windows(defaults: AppConfig) -> list[str]:
@@ -128,6 +137,172 @@ def get_runtime_credentials(settings_row: Setting, defaults: AppConfig | None = 
     )
 
 
+def _account_sync_stale_seconds(settings_row: Setting) -> int:
+    return max(300, settings_row.decision_cycle_interval_minutes * 120)
+
+
+def _build_pnl_summary(settings_row: Setting, latest_pnl: PnLSnapshot) -> dict[str, object]:
+    return {
+        "basis": "execution_ledger_truth",
+        "basis_note": (
+            "Net realized, daily, cumulative PnL and consecutive losses are derived from live executions first."
+        ),
+        "equity": latest_pnl.equity,
+        "cash_balance": latest_pnl.cash_balance,
+        "net_realized_pnl": latest_pnl.realized_pnl,
+        "unrealized_pnl": latest_pnl.unrealized_pnl,
+        "daily_pnl": latest_pnl.daily_pnl,
+        "cumulative_pnl": latest_pnl.cumulative_pnl,
+        "consecutive_losses": latest_pnl.consecutive_losses,
+        "snapshot_time": latest_pnl.created_at,
+    }
+
+
+def _build_account_sync_summary(
+    session: Session | None,
+    settings_row: Setting,
+    latest_pnl: PnLSnapshot,
+) -> dict[str, object]:
+    freshness_seconds = max(int((utcnow_naive() - latest_pnl.created_at).total_seconds()), 0)
+    stale_after_seconds = _account_sync_stale_seconds(settings_row)
+    latest_warning: SystemHealthEvent | None = None
+    if session is not None:
+        events = list(
+            session.scalars(
+                select(SystemHealthEvent)
+                .where(SystemHealthEvent.component.in_(["live_execution", "live_sync"]))
+                .order_by(SystemHealthEvent.created_at.desc())
+                .limit(20)
+            )
+        )
+        latest_warning = next(
+            (
+                event
+                for event in events
+                if str(event.payload.get("reason_code", "")) in ACCOUNT_SYNC_WARNING_REASON_CODES
+            ),
+            None,
+        )
+
+    status = "exchange_synced"
+    note = "Cash/equity is currently aligned with the latest exchange account snapshot."
+    reconciliation_mode = "exchange_confirmed"
+    if freshness_seconds > stale_after_seconds:
+        status = "stale"
+        reconciliation_mode = "stale_snapshot"
+        note = "The latest account snapshot is stale. Freshness should be confirmed before relying on cash/equity."
+    elif latest_warning is not None and latest_warning.created_at >= latest_pnl.created_at:
+        status = "fallback_reconciled"
+        reconciliation_mode = "deterministic_delta_fallback"
+        note = (
+            "Recent account sync degraded. Cash/equity may be temporarily reconciled from the prior snapshot "
+            "plus deterministic realized PnL delta until the next successful exchange sync."
+        )
+
+    return {
+        "status": status,
+        "reconciliation_mode": reconciliation_mode,
+        "freshness_seconds": freshness_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "last_synced_at": latest_pnl.created_at,
+        "last_warning_reason_code": (
+            str(latest_warning.payload.get("reason_code"))
+            if latest_warning is not None and latest_warning.payload.get("reason_code") not in {None, ""}
+            else None
+        ),
+        "last_warning_message": latest_warning.message if latest_warning is not None else None,
+        "note": note,
+    }
+
+
+def _build_market_context_summary(session: Session | None, settings_row: Setting) -> dict[str, object]:
+    if session is None:
+        return {
+            "symbol": settings_row.default_symbol.upper(),
+            "base_timeframe": settings_row.default_timeframe,
+            "context_timeframes": [],
+            "primary_regime": "unknown",
+            "trend_alignment": "unknown",
+            "volatility_regime": "unknown",
+            "volume_regime": "unknown",
+            "momentum_state": "unknown",
+            "data_quality_flags": [],
+        }
+
+    latest_feature = session.scalar(
+        select(FeatureSnapshot).order_by(FeatureSnapshot.feature_time.desc()).limit(1)
+    )
+    if latest_feature is None:
+        return {
+            "symbol": settings_row.default_symbol.upper(),
+            "base_timeframe": settings_row.default_timeframe,
+            "context_timeframes": [],
+            "primary_regime": "unknown",
+            "trend_alignment": "unknown",
+            "volatility_regime": "unknown",
+            "volume_regime": "unknown",
+            "momentum_state": "unknown",
+            "data_quality_flags": [],
+        }
+
+    payload = dict(latest_feature.payload or {})
+    regime = dict(payload.get("regime", {})) if isinstance(payload.get("regime"), dict) else {}
+    multi_timeframe = (
+        dict(payload.get("multi_timeframe", {}))
+        if isinstance(payload.get("multi_timeframe"), dict)
+        else {}
+    )
+    return {
+        "symbol": latest_feature.symbol,
+        "base_timeframe": latest_feature.timeframe,
+        "context_timeframes": sorted(str(item) for item in multi_timeframe),
+        "primary_regime": str(regime.get("primary_regime", "unknown")),
+        "trend_alignment": str(regime.get("trend_alignment", "unknown")),
+        "volatility_regime": str(regime.get("volatility_regime", "unknown")),
+        "volume_regime": str(regime.get("volume_regime", "unknown")),
+        "momentum_state": str(regime.get("momentum_state", "unknown")),
+        "data_quality_flags": [str(item) for item in payload.get("data_quality_flags", []) if item],
+    }
+
+
+def _build_adaptive_protection_summary(
+    runtime_state: dict[str, object],
+    market_context_summary: dict[str, object],
+) -> dict[str, object]:
+    missing_symbols = [
+        str(item)
+        for item in cast(list[object], runtime_state.get("missing_protection_symbols", []))
+    ]
+    raw_missing_items = runtime_state.get("missing_protection_items", {})
+    missing_items = cast(dict[object, object], raw_missing_items) if isinstance(raw_missing_items, dict) else {}
+    return {
+        "mode": "adaptive_atr_regime_aware",
+        "status": str(runtime_state["protection_recovery_status"]),
+        "active": bool(runtime_state["protection_recovery_active"]),
+        "failure_count": _coerce_int(runtime_state.get("protection_recovery_failure_count")),
+        "missing_symbols": missing_symbols,
+        "missing_items": {
+            str(key): [str(item) for item in cast(list[object], value)]
+            for key, value in missing_items.items()
+            if isinstance(value, list)
+        },
+        "primary_regime": str(market_context_summary.get("primary_regime", "unknown")),
+        "volatility_regime": str(market_context_summary.get("volatility_regime", "unknown")),
+        "summary": (
+            "Protective brackets remain ATR-based but adapt to regime, volatility, volume, and momentum weakening."
+        ),
+    }
+
+
+def get_latest_blocked_reasons(session: Session | None) -> list[str]:
+    if session is None:
+        return []
+    latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
+    if latest_risk is None or latest_risk.allowed:
+        return []
+    return [str(item) for item in latest_risk.reason_codes if item not in {None, ""}]
+
+
 def get_exposure_limits(settings_row: Setting) -> dict[str, float]:
     return {
         "gross_exposure_pct": min(settings_row.max_gross_exposure_pct, DISPLAY_MAX_GROSS_EXPOSURE_PCT),
@@ -138,6 +313,34 @@ def get_exposure_limits(settings_row: Setting) -> dict[str, float]:
             DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT,
         ),
     }
+
+
+def _coerce_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
 
 
 def is_live_execution_armed(settings_row: Setting) -> bool:
@@ -238,6 +441,64 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
     auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
     runtime_state = summarize_runtime_state(settings_row)
+    latest_blocked_reasons = get_latest_blocked_reasons(current_session)
+    latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
+    pnl_summary = (
+        _build_pnl_summary(settings_row, latest_pnl)
+        if latest_pnl is not None
+        else {
+            "basis": "execution_ledger_truth",
+            "basis_note": (
+                "Net realized, daily, cumulative PnL and consecutive losses are derived from live executions first."
+            ),
+            "equity": settings_row.starting_equity,
+            "cash_balance": settings_row.starting_equity,
+            "net_realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "daily_pnl": 0.0,
+            "cumulative_pnl": 0.0,
+            "consecutive_losses": 0,
+            "snapshot_time": None,
+        }
+    )
+    account_sync_summary = (
+        _build_account_sync_summary(current_session, settings_row, latest_pnl)
+        if latest_pnl is not None
+        else {
+            "status": "unknown",
+            "reconciliation_mode": "unknown",
+            "freshness_seconds": None,
+            "stale_after_seconds": _account_sync_stale_seconds(settings_row),
+            "last_synced_at": None,
+            "last_warning_reason_code": None,
+            "last_warning_message": None,
+            "note": "Account sync status is not available until the first live snapshot is created.",
+        }
+    )
+    if current_session is not None:
+        from trading_mvp.services.risk import build_current_exposure_summary
+
+        exposure_summary = build_current_exposure_summary(
+            current_session,
+            settings_row,
+            equity=_coerce_float(pnl_summary.get("equity"), settings_row.starting_equity),
+            reference_symbol=settings_row.default_symbol,
+        )
+    else:
+        exposure_summary = {
+            "reference_symbol": settings_row.default_symbol.upper(),
+            "reference_tier": "unknown",
+            "metrics": {},
+            "limits": exposure_limits,
+            "headroom": {},
+            "status": "unknown",
+        }
+    market_context_summary = _build_market_context_summary(current_session, settings_row)
+    adaptive_protection_summary = _build_adaptive_protection_summary(
+        runtime_state,
+        market_context_summary,
+    )
+    execution_policy_summary = summarize_execution_policy(settings_row)
 
     payload = AppSettingsResponse(
         id=settings_row.id,
@@ -258,6 +519,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         auto_resume_eligible=pause_policy.auto_resume_eligible if settings_row.trading_paused else False,
         auto_resume_status=str(auto_resume_state.get("status", "not_paused" if not settings_row.trading_paused else "idle")),
         auto_resume_last_blockers=[str(item) for item in auto_resume_state.get("blockers", [])],
+        latest_blocked_reasons=latest_blocked_reasons,
         pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         operating_state=str(runtime_state["operating_state"]),
@@ -269,6 +531,12 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
             str(key): [str(item) for item in value]
             for key, value in runtime_state["missing_protection_items"].items()
         },
+        pnl_summary=pnl_summary,
+        account_sync_summary=account_sync_summary,
+        exposure_summary=exposure_summary,
+        execution_policy_summary=execution_policy_summary,
+        market_context_summary=market_context_summary,
+        adaptive_protection_summary=adaptive_protection_summary,
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,

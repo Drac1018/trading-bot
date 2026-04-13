@@ -7,7 +7,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
-from trading_mvp.models import AgentRun
+from trading_mvp.models import (
+    AgentRun,
+    FeatureSnapshot,
+    MarketSnapshot,
+    PnLSnapshot,
+    RiskCheck,
+    SystemHealthEvent,
+)
 from trading_mvp.schemas import (
     AppSettingsUpdateRequest,
     BinanceConnectionTestRequest,
@@ -270,6 +277,17 @@ def test_update_settings_does_not_change_trading_pause_state(db_session) -> None
 
 def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> None:
     row = get_or_create_settings(db_session)
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision="long",
+            allowed=False,
+            reason_codes=["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"reason_codes": ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]},
+        )
+    )
     row.trading_paused = True
     row.pause_reason_code = "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE"
     row.pause_origin = "system"
@@ -290,12 +308,95 @@ def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> 
     assert serialized["pause_origin"] == "system"
     assert serialized["auto_resume_status"] == "blocked"
     assert serialized["auto_resume_last_blockers"] == ["MISSING_PROTECTIVE_ORDERS"]
+    assert serialized["latest_blocked_reasons"] == ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]
     assert serialized["pause_severity"] == "warning"
     assert serialized["pause_recovery_class"] == "recoverable_system"
     assert serialized["operating_state"] == "PAUSED"
     assert serialized["protection_recovery_status"] == "idle"
     assert serialized["missing_protection_symbols"] == []
     assert serialized["missing_protection_items"] == {}
+
+
+def test_serialize_settings_includes_operational_summary_sections(db_session) -> None:
+    row = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        PnLSnapshot(
+            snapshot_date=(now - timedelta(minutes=5)).date(),
+            cash_balance=100250.0,
+            equity=100125.0,
+            unrealized_pnl=-125.0,
+            realized_pnl=250.0,
+            daily_pnl=120.0,
+            cumulative_pnl=250.0,
+            consecutive_losses=1,
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.add(
+        MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=now - timedelta(minutes=4),
+            latest_price=71000.0,
+            latest_volume=1250.0,
+            candle_count=96,
+            is_stale=False,
+            is_complete=True,
+            payload={},
+        )
+    )
+    db_session.flush()
+    market_snapshot = db_session.query(MarketSnapshot).order_by(MarketSnapshot.id.desc()).first()
+    assert market_snapshot is not None
+
+    db_session.add(
+        FeatureSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            market_snapshot_id=market_snapshot.id,
+            feature_time=now - timedelta(minutes=3),
+            trend_score=0.72,
+            volatility_pct=0.018,
+            volume_ratio=1.2,
+            drawdown_pct=0.01,
+            rsi=58.0,
+            atr=210.0,
+            payload={
+                "multi_timeframe": {
+                    "1h": {"timeframe": "1h"},
+                    "4h": {"timeframe": "4h"},
+                },
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volatility_regime": "normal",
+                    "volume_regime": "strong",
+                    "momentum_state": "stable",
+                },
+                "data_quality_flags": [],
+            },
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="live_sync",
+            status="warning",
+            message="Account sync degraded.",
+            payload={"reason_code": "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE"},
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["pnl_summary"]["basis"] == "execution_ledger_truth"
+    assert serialized["account_sync_summary"]["status"] == "fallback_reconciled"
+    assert serialized["exposure_summary"]["reference_symbol"] == "BTCUSDT"
+    assert "entry" in serialized["execution_policy_summary"]
+    assert serialized["market_context_summary"]["context_timeframes"] == ["1h", "4h"]
+    assert serialized["adaptive_protection_summary"]["mode"] == "adaptive_atr_regime_aware"
 
 
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:

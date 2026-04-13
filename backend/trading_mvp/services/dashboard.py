@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import String, cast, desc, func, or_, select
 from sqlalchemy.orm import Session
@@ -124,6 +125,12 @@ def _as_int(value: object, default: int = 0) -> int:
     return default
 
 
+def _as_dict(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): item for key, item in value.items()}
+
+
 def get_overview(session: Session) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
     settings_payload = serialize_settings(settings_row)
@@ -147,8 +154,15 @@ def get_overview(session: Session) -> OverviewResponse:
         operating_state = PROTECTION_REQUIRED_STATE
     blocked_reasons = latest_risk.reason_codes if latest_risk is not None and not latest_risk.allowed else []
     auto_resume_last_blockers = _as_string_list(settings_payload.get("auto_resume_last_blockers", []))
+    latest_blocked_reasons = _as_string_list(settings_payload.get("latest_blocked_reasons", []))
     serialized_missing_symbols = _as_string_list(settings_payload.get("missing_protection_symbols", []))
     runtime_missing_items = _as_missing_items(runtime_state["missing_protection_items"])
+    pnl_summary = _as_dict(settings_payload.get("pnl_summary", {}))
+    account_sync_summary = _as_dict(settings_payload.get("account_sync_summary", {}))
+    exposure_summary = _as_dict(settings_payload.get("exposure_summary", {}))
+    execution_policy_summary = _as_dict(settings_payload.get("execution_policy_summary", {}))
+    market_context_summary = _as_dict(settings_payload.get("market_context_summary", {}))
+    adaptive_protection_summary = _as_dict(settings_payload.get("adaptive_protection_summary", {}))
     return OverviewResponse(
         mode=str(settings_payload["mode"]),
         symbol=settings_row.default_symbol,
@@ -184,9 +198,16 @@ def get_overview(session: Session) -> OverviewResponse:
         or serialized_missing_symbols,
         missing_protection_items=missing_protection_items
         or runtime_missing_items,
+        pnl_summary=pnl_summary,
+        account_sync_summary=account_sync_summary,
+        exposure_summary=exposure_summary,
+        execution_policy_summary=execution_policy_summary,
+        market_context_summary=market_context_summary,
+        adaptive_protection_summary=adaptive_protection_summary,
         daily_pnl=latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
         cumulative_pnl=latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
         blocked_reasons=blocked_reasons,
+        latest_blocked_reasons=latest_blocked_reasons or blocked_reasons,
         protected_positions=protected_positions,
         unprotected_positions=unprotected_positions,
         position_protection_summary=protection_summary,

@@ -55,6 +55,12 @@ export type SettingsPayload = {
   protection_recovery_failure_count: number;
   missing_protection_symbols: string[];
   missing_protection_items: Record<string, string[]>;
+  pnl_summary: Record<string, unknown>;
+  account_sync_summary: Record<string, unknown>;
+  exposure_summary: Record<string, unknown>;
+  execution_policy_summary: Record<string, unknown>;
+  market_context_summary: Record<string, unknown>;
+  adaptive_protection_summary: Record<string, unknown>;
   live_trading_enabled: boolean;
   live_trading_env_enabled: boolean;
   manual_live_approval: boolean;
@@ -72,6 +78,7 @@ export type SettingsPayload = {
   auto_resume_eligible: boolean;
   auto_resume_status: string;
   auto_resume_last_blockers: string[];
+  latest_blocked_reasons: string[];
   pause_severity: string | null;
   pause_recovery_class: string | null;
   default_symbol: string;
@@ -144,9 +151,10 @@ type FormState = Omit<
   SettingsPayload,
   | "id" | "mode" | "operating_state" | "protection_recovery_status" | "protection_recovery_active"
   | "protection_recovery_failure_count" | "missing_protection_symbols" | "missing_protection_items"
+  | "pnl_summary" | "account_sync_summary" | "exposure_summary" | "execution_policy_summary" | "market_context_summary" | "adaptive_protection_summary"
   | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
-  | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "pause_severity"
+  | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
   | "pause_recovery_class" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
   | "estimated_monthly_ai_calls" | "estimated_monthly_ai_calls_breakdown" | "projected_monthly_ai_calls_if_enabled"
   | "projected_monthly_ai_calls_breakdown_if_enabled" | "recent_ai_calls_24h" | "recent_ai_calls_7d" | "recent_ai_successes_24h"
@@ -267,6 +275,15 @@ function renderMissingProtectionItems(
     .join(" / ");
 }
 
+function renderMetricMap(values: unknown, empty = "-") {
+  if (!values || typeof values !== "object" || Array.isArray(values)) return empty;
+  const entries = Object.entries(values as Record<string, unknown>);
+  if (entries.length === 0) return empty;
+  return entries
+    .map(([key, value]) => `${formatDisplayValue(key)} ${formatDisplayValue(value, key)}`)
+    .join(" / ");
+}
+
 function AutoResumeStatusCard({ result, title }: { result: AutoResumeResult | null | undefined; title: string }) {
   if (!result) return null;
   const blockers = result.blockers ?? [];
@@ -351,8 +368,18 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
 }
 
 function OperationalStatusPanel({ state }: { state: SettingsPayload }) {
+  const latestBlockedReasonsText =
+    state.latest_blocked_reasons.length > 0
+      ? state.latest_blocked_reasons.map((item) => formatDisplayValue(item)).join(" / ")
+      : "최신 리스크 차단 사유 없음";
   const blockerText = state.auto_resume_last_blockers.length > 0 ? state.auto_resume_last_blockers.map((item) => formatDisplayValue(item)).join(" / ") : "차단 사유 없음";
   const missingProtectionText = renderMissingProtectionItems(state.missing_protection_items);
+  const pnlSummary = state.pnl_summary ?? {};
+  const accountSyncSummary = state.account_sync_summary ?? {};
+  const exposureSummary = state.exposure_summary ?? {};
+  const executionPolicySummary = state.execution_policy_summary ?? {};
+  const marketContextSummary = state.market_context_summary ?? {};
+  const adaptiveProtectionSummary = state.adaptive_protection_summary ?? {};
   return (
     <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
       <div className="flex flex-wrap items-center gap-2">
@@ -379,10 +406,52 @@ function OperationalStatusPanel({ state }: { state: SettingsPayload }) {
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 정책 대상</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_whitelisted, "auto_resume_whitelisted")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 가능</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_eligible, "auto_resume_eligible")}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">자동 복구 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_status, "auto_resume_status")}</p></div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">현재 거래 차단 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{latestBlockedReasonsText}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">자동 복구 차단 사유</p><p className="mt-2 text-sm font-semibold text-slate-900">{blockerText}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">누락 보호 항목</p><p className="mt-2 text-sm font-semibold text-slate-900">{missingProtectionText}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">중지 상세</p><p className="mt-2 text-sm leading-6 text-slate-900">{stringifyPauseDetail(state.pause_reason_detail)}</p></div>
         <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3 md:col-span-2 xl:col-span-3"><p className="text-xs text-slate-500">다음 자동 복구 재시도 시각</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(state.auto_resume_after, "auto_resume_after")}</p></div>
+      </div>
+      <div className="mt-5 grid gap-4 xl:grid-cols-2">
+        <div className="rounded-2xl border border-amber-200 bg-white p-4">
+          <p className="text-sm font-semibold text-slate-900">손익 집계 기준</p>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">기준</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((pnlSummary as Record<string, unknown>).basis, "pnl_basis")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">스냅샷 시각</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((pnlSummary as Record<string, unknown>).snapshot_time, "snapshot_time")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">순실현 / 일손익</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((pnlSummary as Record<string, unknown>).net_realized_pnl, "daily_pnl")} / {formatDisplayValue((pnlSummary as Record<string, unknown>).daily_pnl, "daily_pnl")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">누적손익 / 연속손실</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((pnlSummary as Record<string, unknown>).cumulative_pnl, "cumulative_pnl")} / {formatDisplayValue((pnlSummary as Record<string, unknown>).consecutive_losses, "consecutive_losses")}</p></div>
+          </div>
+          <p className="mt-3 text-sm leading-6 text-slate-600">{String((pnlSummary as Record<string, unknown>).basis_note ?? "손익 집계 기준 설명이 아직 없습니다.")}</p>
+        </div>
+
+        <div className="rounded-2xl border border-amber-200 bg-white p-4">
+          <p className="text-sm font-semibold text-slate-900">계좌 동기화 / 보정</p>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">동기화 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((accountSyncSummary as Record<string, unknown>).status, "account_sync_status")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">보정 방식</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((accountSyncSummary as Record<string, unknown>).reconciliation_mode, "account_reconciliation_mode")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">마지막 동기화 / 신선도</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((accountSyncSummary as Record<string, unknown>).last_synced_at, "last_synced_at")} / {formatDisplayValue((accountSyncSummary as Record<string, unknown>).freshness_seconds, "freshness_seconds")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">마지막 경고</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((accountSyncSummary as Record<string, unknown>).last_warning_reason_code, "pause_reason_code")}</p></div>
+          </div>
+          <p className="mt-3 text-sm leading-6 text-slate-600">{String((accountSyncSummary as Record<string, unknown>).note ?? "계좌 동기화 설명이 아직 없습니다.")}</p>
+        </div>
+
+        <div className="rounded-2xl border border-amber-200 bg-white p-4">
+          <p className="text-sm font-semibold text-slate-900">노출도 한도 / 헤드룸</p>
+          <div className="mt-3 grid gap-3">
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">상태 / 기준 심볼</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((exposureSummary as Record<string, unknown>).status, "exposure_status")} / {formatDisplayValue((exposureSummary as Record<string, unknown>).reference_symbol, "symbol")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">현재 노출도</p><p className="mt-2 text-sm font-semibold text-slate-900">{renderMetricMap((exposureSummary as Record<string, unknown>).metrics)}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">남은 헤드룸</p><p className="mt-2 text-sm font-semibold text-slate-900">{renderMetricMap((exposureSummary as Record<string, unknown>).headroom)}</p></div>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-amber-200 bg-white p-4">
+          <p className="text-sm font-semibold text-slate-900">실행 정책 / 컨텍스트</p>
+          <div className="mt-3 space-y-3">
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">실행 정책</p><p className="mt-2 text-sm font-semibold text-slate-900">{String(((executionPolicySummary as Record<string, unknown>).entry as Record<string, unknown> | undefined)?.summary ?? "-")}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">멀티 타임프레임</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((marketContextSummary as Record<string, unknown>).primary_regime, "primary_regime")} / {formatDisplayValue((marketContextSummary as Record<string, unknown>).trend_alignment, "trend_alignment")} / {Array.isArray((marketContextSummary as Record<string, unknown>).context_timeframes) && ((marketContextSummary as Record<string, unknown>).context_timeframes as string[]).length > 0 ? ((marketContextSummary as Record<string, unknown>).context_timeframes as string[]).join(", ") : "-"}</p></div>
+            <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">적응형 보호</p><p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue((adaptiveProtectionSummary as Record<string, unknown>).mode, "adaptive_protection_mode")} / {formatDisplayValue((adaptiveProtectionSummary as Record<string, unknown>).status, "protection_recovery_status")}</p><p className="mt-2 text-sm leading-6 text-slate-600">{String((adaptiveProtectionSummary as Record<string, unknown>).summary ?? "-")}</p></div>
+          </div>
+        </div>
       </div>
     </section>
   );
