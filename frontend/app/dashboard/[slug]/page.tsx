@@ -2,18 +2,22 @@ import { notFound } from "next/navigation";
 
 import { BacklogBoard, type BacklogBoardPayload } from "../../../components/backlog-board";
 import { DataTable } from "../../../components/data-table";
+import { LogExplorer, type AuditRow } from "../../../components/log-explorer";
 import { PageShell } from "../../../components/page-shell";
 import { SettingsControls, type SettingsPayload } from "../../../components/settings-controls";
 import { fetchJson } from "../../../lib/api";
 import { dashboardPages } from "../../../lib/page-config";
 
 export default async function DashboardPage({
-  params
+  params,
+  searchParams
 }: {
   params: Promise<{ slug: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { slug } = await params;
   const config = dashboardPages[slug];
+  const query = await searchParams;
 
   if (!config) {
     notFound();
@@ -28,6 +32,13 @@ export default async function DashboardPage({
         <BacklogBoard initial={board} />
       </div>
     );
+  }
+
+  if (slug === "audit") {
+    const auditRows = await fetchJson<AuditRow[]>("/api/audit?limit=100");
+    const initialTab = typeof query.tab === "string" ? query.tab : "all";
+
+    return <LogExplorer initialRows={auditRows} initialTab={initialTab} initialLimit={100} />;
   }
 
   const sections = await Promise.all(

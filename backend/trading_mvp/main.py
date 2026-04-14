@@ -21,6 +21,7 @@ from trading_mvp.schemas import (
     ManualLiveApprovalRequest,
     OpenAIConnectionTestRequest,
     ProductBacklogDetailResponse,
+    ReplayValidationRequest,
     UserChangeRequestCreate,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
@@ -30,6 +31,7 @@ from trading_mvp.services.backlog import (
     get_backlog_board,
     get_backlog_detail,
 )
+from trading_mvp.services.backlog_insights import build_signal_performance_report
 from trading_mvp.services.backlog_auto_apply import (
     auto_apply_backlog_item,
     auto_apply_supported_backlogs,
@@ -41,6 +43,9 @@ from trading_mvp.services.dashboard import (
     get_alerts,
     get_audit_timeline,
     get_decisions,
+    get_operator_dashboard,
+    get_profitability_dashboard,
+    get_execution_quality_report,
     get_executions,
     get_feature_snapshots,
     get_market_snapshots,
@@ -53,6 +58,7 @@ from trading_mvp.services.dashboard import (
 from trading_mvp.services.execution import run_live_test_order, sync_live_state
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
+from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.scheduler import run_window
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import (
@@ -94,6 +100,16 @@ def seed_system(db: Session = Depends(get_db)) -> dict[str, object]:
 @app.get("/api/dashboard/overview")
 def dashboard_overview(db: Session = Depends(get_db)) -> dict[str, object]:
     return get_overview(db).model_dump(mode="json")
+
+
+@app.get("/api/dashboard/operator")
+def dashboard_operator(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_operator_dashboard(db).model_dump(mode="json")
+
+
+@app.get("/api/dashboard/profitability")
+def dashboard_profitability(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_profitability_dashboard(db).model_dump(mode="json")
 
 
 @app.get("/api/market/snapshots")
@@ -138,6 +154,11 @@ def executions(
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
     return get_executions(db, mode=mode, symbol=symbol, status=status, search=search, limit=limit)
+
+
+@app.get("/api/executions/report")
+def execution_quality_report(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_execution_quality_report(db)
 
 
 @app.get("/api/risk/checks")
@@ -368,6 +389,15 @@ def run_replay(cycles: int = 5, start_index: int = 120, db: Session = Depends(ge
     return {"cycles": cycles, "results": results}
 
 
+@app.post("/api/replay/validation")
+def replay_validation(
+    payload: ReplayValidationRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    report = build_replay_validation_report(db, payload)
+    return report.model_dump(mode="json")
+
+
 @app.post("/api/live/sync")
 def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
     settings_row = get_or_create_settings(db)
@@ -443,6 +473,12 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
 @app.get("/api/backlog")
 def backlog(db: Session = Depends(get_db)) -> dict[str, object]:
     payload: BacklogBoardResponse = get_backlog_board(db)
+    return payload.model_dump(mode="json")
+
+
+@app.get("/api/performance")
+def performance_report(db: Session = Depends(get_db)) -> dict[str, object]:
+    payload = build_signal_performance_report(db)
     return payload.model_dump(mode="json")
 
 

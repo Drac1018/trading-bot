@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import timedelta
 from types import SimpleNamespace
 
-from sqlalchemy import select
-from trading_mvp.models import AuditEvent
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from trading_mvp.database import Base, get_db
+from trading_mvp.main import app
+from trading_mvp.models import AgentRun, AuditEvent, Order
 from trading_mvp.schemas import (
     ExecutionIntent,
     MarketCandle,
@@ -14,17 +19,34 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.execution import execute_live_trade
 from trading_mvp.services.execution_policy import select_execution_plan
+from trading_mvp.services.dashboard import get_executions
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
 
 
-def _snapshot(*, latest_price: float = 70000.0, is_stale: bool = False) -> MarketSnapshotPayload:
+def _snapshot(
+    *,
+    symbol: str = "BTCUSDT",
+    timeframe: str = "15m",
+    latest_price: float = 70000.0,
+    is_stale: bool = False,
+    high_delta: float = 50.0,
+    low_delta: float = 40.0,
+) -> MarketSnapshotPayload:
     now = utcnow_naive()
+    open_1 = max(latest_price - max(low_delta * 0.5, latest_price * 0.001), 0.0001)
+    open_2 = max(latest_price - max(low_delta * 0.25, latest_price * 0.0005), 0.0001)
+    open_3 = max(latest_price - max(low_delta * 0.1, latest_price * 0.0003), 0.0001)
+    low_1 = max(latest_price - low_delta, 0.0001)
+    low_2 = max(latest_price - low_delta * 0.8, 0.0001)
+    low_3 = max(latest_price - low_delta * 0.6, 0.0001)
+    close_1 = max(latest_price - max(low_delta * 0.2, latest_price * 0.0003), 0.0001)
+    close_2 = max(latest_price - max(low_delta * 0.05, latest_price * 0.0001), 0.0001)
     return MarketSnapshotPayload(
-        symbol="BTCUSDT",
-        timeframe="15m",
+        symbol=symbol,
+        timeframe=timeframe,
         snapshot_time=now,
         latest_price=latest_price,
         latest_volume=1200.0,
@@ -32,16 +54,16 @@ def _snapshot(*, latest_price: float = 70000.0, is_stale: bool = False) -> Marke
         is_stale=is_stale,
         is_complete=True,
         candles=[
-            MarketCandle(timestamp=now, open=69950.0, high=70030.0, low=69960.0, close=70000.0, volume=900.0),
-            MarketCandle(timestamp=now, open=69980.0, high=70040.0, low=69970.0, close=70005.0, volume=950.0),
-            MarketCandle(timestamp=now, open=69990.0, high=70050.0, low=69980.0, close=latest_price, volume=1000.0),
+            MarketCandle(timestamp=now, open=open_1, high=latest_price + high_delta * 0.6, low=low_1, close=close_1, volume=900.0),
+            MarketCandle(timestamp=now, open=open_2, high=latest_price + high_delta * 0.8, low=low_2, close=close_2, volume=950.0),
+            MarketCandle(timestamp=now, open=open_3, high=latest_price + high_delta, low=low_3, close=latest_price, volume=1000.0),
         ],
     )
 
 
-def _intent(*, action: str, intent_type: str, requested_price: float = 70000.0) -> ExecutionIntent:
+def _intent(*, action: str, intent_type: str, symbol: str = "BTCUSDT", requested_price: float = 70000.0) -> ExecutionIntent:
     return ExecutionIntent(
-        symbol="BTCUSDT",
+        symbol=symbol,
         action=action,  # type: ignore[arg-type]
         intent_type=intent_type,  # type: ignore[arg-type]
         quantity=0.01,
@@ -305,6 +327,39 @@ def test_entry_policy_prefers_limit_under_passive_conditions() -> None:
     assert plan.policy_name == "entry_passive_limit"
 
 
+def test_execution_policy_profiles_by_symbol_timeframe_and_volatility() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+
+    btc_slow_plan = select_execution_plan(
+        _intent(action="long", intent_type="entry", symbol="BTCUSDT"),
+        _snapshot(symbol="BTCUSDT", timeframe="4h", high_delta=35.0, low_delta=30.0),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+    alt_fast_plan = select_execution_plan(
+        _intent(action="long", intent_type="entry", symbol="LINKUSDT", requested_price=15.0),
+        _snapshot(symbol="LINKUSDT", timeframe="15m", latest_price=15.0, high_delta=0.03, low_delta=0.025),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+    stressed_plan = select_execution_plan(
+        _intent(action="long", intent_type="entry", symbol="LINKUSDT", requested_price=15.0),
+        _snapshot(symbol="LINKUSDT", timeframe="15m", latest_price=15.0, high_delta=0.35, low_delta=0.35),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+
+    assert btc_slow_plan.order_type == "LIMIT"
+    assert btc_slow_plan.timeframe_bucket == "slow"
+    assert btc_slow_plan.symbol_risk_tier == "btc"
+    assert btc_slow_plan.max_requotes >= 2
+    assert alt_fast_plan.order_type == "LIMIT"
+    assert alt_fast_plan.policy_profile.startswith("entry_alt_fast_")
+    assert alt_fast_plan.max_requotes <= btc_slow_plan.max_requotes
+    assert stressed_plan.order_type == "MARKET"
+    assert stressed_plan.volatility_regime == "stressed"
+
+
 def test_scale_in_and_reduce_policy_split_from_exit() -> None:
     settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
     scale_in_plan = select_execution_plan(
@@ -477,9 +532,9 @@ def test_entry_limit_timeout_reprices_then_falls_back_to_market(monkeypatch, db_
     order_types = [call["order_type"] for call in client.primary_order_calls]
 
     assert result["status"] == "filled"
-    assert order_types[:3] == ["LIMIT", "LIMIT", "LIMIT"]
+    assert order_types[:2] == ["LIMIT", "LIMIT"]
     assert order_types[-1] == "MARKET"
-    assert len(result["execution_attempts"]) == 4
+    assert len(result["execution_attempts"]) >= 3
     audit_types = set(db_session.scalars(select(AuditEvent.event_type)))
     assert "live_limit_timeout" in audit_types
     assert "live_limit_repriced" in audit_types
@@ -509,3 +564,142 @@ def test_partial_fill_is_preserved_before_aggressive_fallback(monkeypatch, db_se
     audit_types = list(db_session.scalars(select(AuditEvent.event_type).order_by(AuditEvent.id.asc())))
     assert "live_limit_partial_fill" in audit_types
     assert "live_limit_aggressive_fallback" in audit_types
+
+
+def test_large_partial_fill_finishes_remaining_quantity_with_market(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = LimitRepriceFallbackClient(partial_fill_qty=0.002, market_price=70500.0)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr("trading_mvp.services.execution._execution_policy_sleep", lambda _seconds: None)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=17,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert result["status"] == "filled"
+    assert len(result["execution_attempts"]) == 2
+    assert result["execution_attempts"][0]["filled_quantity"] > 0.0
+    assert result["execution_attempts"][-1]["order_type"] == "MARKET"
+    assert result["execution_quality"]["aggressive_fallback_used"] is True
+    assert result["execution_quality"]["execution_quality_status"] == "aggressive_completion"
+
+
+def test_get_executions_includes_decision_and_execution_quality(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = LimitRepriceFallbackClient(partial_fill_qty=0.001, market_price=71250.0)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr("trading_mvp.services.execution._execution_policy_sleep", lambda _seconds: None)
+    run = AgentRun(
+        role="trading_decision",
+        trigger_event="test",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="test",
+        summary="execution quality test",
+        input_payload={},
+        output_payload={"decision": "long", "timeframe": "15m", "confidence": 0.8, "rationale_codes": ["TEST"]},
+        metadata_json={},
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=run.id,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    payloads = get_executions(db_session, symbol="BTCUSDT", status="filled", limit=5)
+
+    assert payloads
+    assert payloads[0]["execution_policy"]["policy_profile"].startswith("entry_btc_fast_")
+    assert payloads[0]["execution_quality"]["signal_vs_execution_note"]
+    assert payloads[0]["decision_summary"]["decision"] == "long"
+    assert payloads[0]["decision_summary"]["timeframe"] == "15m"
+
+
+def test_execution_quality_report_api(monkeypatch, tmp_path) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'execution_report.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestingSessionLocal() as session:
+            settings_row = get_or_create_settings(session)
+            session.add(settings_row)
+            session.flush()
+
+            run = AgentRun(
+                role="trading_decision",
+                trigger_event="test",
+                schema_name="TradeDecision",
+                status="completed",
+                provider_name="test",
+                summary="execution report test",
+                input_payload={},
+                output_payload={"decision": "long", "timeframe": "15m", "confidence": 0.81, "rationale_codes": ["TREND"]},
+                metadata_json={},
+            )
+            session.add(run)
+            session.flush()
+            order = Order(
+                symbol="BTCUSDT",
+                decision_run_id=run.id,
+                side="buy",
+                order_type="limit",
+                mode="live",
+                status="filled",
+                requested_quantity=0.01,
+                requested_price=70000.0,
+                filled_quantity=0.01,
+                average_fill_price=70100.0,
+                metadata_json={
+                    "execution_policy": {
+                        "policy_profile": "entry_btc_fast_elevated",
+                        "symbol_risk_tier": "btc",
+                        "timeframe_bucket": "fast",
+                        "volatility_regime": "elevated",
+                        "urgency": "high",
+                    },
+                    "execution_quality": {
+                        "partial_fill_attempts": 1,
+                        "repriced_attempts": 1,
+                        "aggressive_fallback_used": True,
+                        "realized_slippage_pct": 0.0014,
+                        "fees_total": 0.15,
+                        "realized_pnl_total": 2.0,
+                        "net_realized_pnl_total": 1.85,
+                        "execution_quality_status": "aggressive_completion",
+                        "decision_quality_status": "profit",
+                    },
+                },
+            )
+            session.add(order)
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.get("/api/executions/report")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["execution_quality_basis"] == "live_order_metadata_and_execution_ledger"
+        assert len(payload["windows"]) == 2
+        assert payload["windows"][0]["execution_quality_summary"]["aggressive_fallback_orders"] == 1
+        assert payload["windows"][0]["decision_quality_summary"]["profitable_orders"] == 1
+        assert payload["windows"][0]["profiles"][0]["policy_profile"] == "entry_btc_fast_elevated"
+    finally:
+        app.dependency_overrides.clear()

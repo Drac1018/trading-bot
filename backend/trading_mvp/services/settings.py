@@ -9,9 +9,13 @@ from sqlalchemy.orm import Session, object_session
 
 from trading_mvp.config import Settings as AppConfig
 from trading_mvp.config import get_settings
-from trading_mvp.models import FeatureSnapshot, PnLSnapshot, RiskCheck, Setting, SystemHealthEvent
+from trading_mvp.models import AgentRun, FeatureSnapshot, PnLSnapshot, Position, RiskCheck, Setting, SystemHealthEvent
 from trading_mvp.schemas import AppSettingsResponse, AppSettingsUpdateRequest
 from trading_mvp.services.account import get_latest_pnl_snapshot
+from trading_mvp.services.adaptive_signal import (
+    build_adaptive_signal_context,
+    summarize_adaptive_signal_state,
+)
 from trading_mvp.services.ai_usage import (
     AIUsageMetrics,
     build_ai_usage_metrics,
@@ -25,7 +29,12 @@ from trading_mvp.services.pause_policy import (
     pause_reason_recovery_class,
     pause_reason_severity,
 )
-from trading_mvp.services.runtime_state import summarize_runtime_state
+from trading_mvp.services.runtime_state import (
+    DEGRADED_MANAGE_ONLY_STATE,
+    EMERGENCY_EXIT_STATE,
+    PROTECTION_REQUIRED_STATE,
+    summarize_runtime_state,
+)
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
 from trading_mvp.time_utils import utcnow_naive
 
@@ -53,6 +62,30 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_POSITION_SYNC_FAILED",
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+}
+
+GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
+    "TRADING_PAUSED": "거래가 일시 중지되어 가드 모드입니다.",
+    "MANUAL_USER_REQUEST": "운영자가 수동으로 거래를 중지해 가드 모드입니다.",
+    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE": "거래소 계좌 상태 동기화 실패로 시스템 pause 상태입니다.",
+    "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE": "거래소 연결 장애가 감지되어 가드 모드입니다.",
+    "TEMPORARY_SYNC_FAILURE": "계좌 상태 동기화가 일시 실패해 가드 모드입니다.",
+    "EXCHANGE_POSITION_SYNC_FAILED": "거래소 포지션 동기화 실패로 가드 모드입니다.",
+    "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": "거래소 주문 동기화 실패로 가드 모드입니다.",
+    "PROTECTION_REQUIRED": "무보호 포지션이 감지되어 보호 복구 우선 상태입니다.",
+    "DEGRADED_MANAGE_ONLY": "보호 복구가 반복 실패해 관리 전용 상태로 가드 모드입니다.",
+    "EMERGENCY_EXIT": "비상 청산 상태가 진행 중이라 가드 모드입니다.",
+    "LIVE_ENV_DISABLED": "실거래 환경이 비활성화되어 가드 모드입니다.",
+    "LIVE_TRADING_DISABLED": "앱에서 실거래 사용이 꺼져 있어 가드 모드입니다.",
+    "LIVE_APPROVAL_POLICY_DISABLED": "앱의 실거래 승인 정책이 비활성화되어 가드 모드입니다.",
+    "LIVE_APPROVAL_REQUIRED": "실거래 승인 창이 닫혀 있어 가드 모드입니다.",
+    "LIVE_CREDENTIALS_MISSING": "Binance API 키 또는 시크릿이 없어 가드 모드입니다.",
+    "MISSING_PROTECTIVE_ORDERS": "무보호 포지션이 남아 있어 가드 모드입니다.",
+    "PROTECTIVE_ORDER_FAILURE": "보호 주문 복구 실패로 가드 모드입니다.",
+    "ACCOUNT_STATE_INCONSISTENT": "거래소와 로컬 계좌 상태가 불일치해 가드 모드입니다.",
+    "PORTFOLIO_RISK_UNCERTAIN": "포트폴리오 위험을 신뢰할 수 없어 가드 모드입니다.",
+    "STALE_MARKET_DATA": "시장 데이터가 오래되어 신규 진입이 차단된 상태입니다.",
+    "INCOMPLETE_MARKET_DATA": "시장 데이터가 불완전해 신규 진입이 차단된 상태입니다.",
 }
 
 
@@ -91,7 +124,7 @@ def get_or_create_settings(session: Session) -> Setting:
         manual_live_approval=defaults.manual_live_approval,
         live_execution_armed=False,
         live_execution_armed_until=None,
-        live_approval_window_minutes=15,
+        live_approval_window_minutes=0,
         trading_paused=defaults.trading_paused,
         default_symbol=tracked_symbols[0],
         tracked_symbols=tracked_symbols,
@@ -107,6 +140,13 @@ def get_or_create_settings(session: Session) -> Setting:
         max_same_tier_concentration_pct=defaults.max_same_tier_concentration_pct,
         stale_market_seconds=defaults.stale_market_seconds,
         slippage_threshold_pct=defaults.slippage_threshold_pct,
+        adaptive_signal_enabled=defaults.adaptive_signal_enabled,
+        position_management_enabled=defaults.position_management_enabled,
+        break_even_enabled=defaults.break_even_enabled,
+        atr_trailing_stop_enabled=defaults.atr_trailing_stop_enabled,
+        partial_take_profit_enabled=defaults.partial_take_profit_enabled,
+        holding_edge_decay_enabled=defaults.holding_edge_decay_enabled,
+        reduce_on_regime_shift_enabled=defaults.reduce_on_regime_shift_enabled,
         starting_equity=defaults.starting_equity,
         ai_enabled=defaults.ai_enabled,
         ai_provider=defaults.ai_provider,
@@ -294,6 +334,69 @@ def _build_adaptive_protection_summary(
     }
 
 
+def _build_position_management_summary(
+    session: Session | None,
+    settings_row: Setting,
+) -> dict[str, object]:
+    active_positions = 0
+    managed_positions = 0
+    partial_take_profit_taken = 0
+    if session is not None:
+        positions = list(
+            session.scalars(
+                select(Position).where(
+                    Position.mode == "live",
+                    Position.status == "open",
+                    Position.quantity > 0,
+                )
+            )
+        )
+        active_positions = len(positions)
+        for position in positions:
+            metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+            management = metadata.get("position_management")
+            if not isinstance(management, dict):
+                continue
+            managed_positions += 1
+            if bool(management.get("partial_take_profit_taken")):
+                partial_take_profit_taken += 1
+
+    return {
+        "mode": "conservative_dynamic_profit_protection",
+        "enabled": settings_row.position_management_enabled,
+        "protective_bias": "tighten_only",
+        "rules_enabled": {
+            "break_even": settings_row.position_management_enabled and settings_row.break_even_enabled,
+            "atr_trailing_stop": settings_row.position_management_enabled and settings_row.atr_trailing_stop_enabled,
+            "partial_take_profit": settings_row.position_management_enabled
+            and settings_row.partial_take_profit_enabled,
+            "holding_edge_decay": settings_row.position_management_enabled
+            and settings_row.holding_edge_decay_enabled,
+            "reduce_on_regime_shift": settings_row.position_management_enabled
+            and settings_row.reduce_on_regime_shift_enabled,
+        },
+        "fixed_parameters": {
+            "break_even_trigger_r": 1.0,
+            "trailing_activation_r": 1.0,
+            "trailing_atr_multiple": 1.2,
+            "partial_take_profit_trigger_r": 1.5,
+            "partial_take_profit_fraction": 0.25,
+            "edge_decay_start_ratio": 0.75,
+        },
+        "active_positions": active_positions,
+        "managed_positions_with_baseline": managed_positions,
+        "partial_take_profit_taken_positions": partial_take_profit_taken,
+        "data_fallback_rule": (
+            "If initial stop or holding-plan metadata is missing, the layer keeps the current stop and skips "
+            "time-decay or partial-take-profit automation."
+        ),
+        "summary": (
+            "Break-even, ATR trailing, partial take-profit, holding-time decay, and regime weakening only tighten "
+            "protection or reduce exposure. They never widen stop loss."
+        ),
+    }
+
+
 def get_latest_blocked_reasons(session: Session | None) -> list[str]:
     if session is None:
         return []
@@ -346,8 +449,10 @@ def _coerce_int(value: object, default: int = 0) -> int:
 def is_live_execution_armed(settings_row: Setting) -> bool:
     return bool(
         settings_row.live_execution_armed
-        and settings_row.live_execution_armed_until is not None
-        and settings_row.live_execution_armed_until > utcnow_naive()
+        and (
+            settings_row.live_execution_armed_until is None
+            or settings_row.live_execution_armed_until > utcnow_naive()
+        )
     )
 
 
@@ -364,10 +469,107 @@ def is_live_execution_ready(settings_row: Setting, defaults: AppConfig | None = 
     )
 
 
+def _humanize_guard_code(code: str) -> str:
+    return code.replace("_", " ").strip().title()
+
+
+def _guard_message_for_code(code: str, fallback_suffix: str = "가드 모드입니다.") -> str:
+    return GUARD_MODE_REASON_MESSAGES.get(code, f"{_humanize_guard_code(code)} 상태로 {fallback_suffix}")
+
+
+def _derive_live_execution_guard_reason(
+    settings_row: Setting,
+    *,
+    defaults: AppConfig | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    app_defaults = defaults or get_settings()
+    credentials = get_runtime_credentials(settings_row, defaults=app_defaults)
+    if not app_defaults.live_trading_env_enabled:
+        code = "LIVE_ENV_DISABLED"
+    elif not settings_row.live_trading_enabled:
+        code = "LIVE_TRADING_DISABLED"
+    elif not credentials.binance_api_key or not credentials.binance_api_secret:
+        code = "LIVE_CREDENTIALS_MISSING"
+    elif not settings_row.manual_live_approval:
+        code = "LIVE_APPROVAL_POLICY_DISABLED"
+    elif not is_live_execution_armed(settings_row):
+        code = "LIVE_APPROVAL_REQUIRED"
+    else:
+        return None, None, None
+    return "readiness", code, _guard_message_for_code(code)
+
+
+def derive_guard_mode_reason(
+    settings_row: Setting,
+    *,
+    defaults: AppConfig | None = None,
+    runtime_state: dict[str, object] | None = None,
+    latest_blocked_reasons: list[str] | None = None,
+    auto_resume_last_blockers: list[str] | None = None,
+) -> dict[str, str | None]:
+    app_defaults = defaults or get_settings()
+    runtime = runtime_state or summarize_runtime_state(settings_row)
+    blocked_reasons = [str(item) for item in (latest_blocked_reasons or []) if item]
+    auto_resume_blockers = [str(item) for item in (auto_resume_last_blockers or []) if item]
+    operating_state = str(runtime.get("operating_state", "TRADABLE"))
+
+    if settings_row.trading_paused:
+        code = str(settings_row.pause_reason_code or "TRADING_PAUSED")
+        return {
+            "guard_mode_reason_category": "pause",
+            "guard_mode_reason_code": code,
+            "guard_mode_reason_message": _guard_message_for_code(code),
+        }
+    if operating_state == EMERGENCY_EXIT_STATE:
+        return {
+            "guard_mode_reason_category": "operating_state",
+            "guard_mode_reason_code": EMERGENCY_EXIT_STATE,
+            "guard_mode_reason_message": _guard_message_for_code(EMERGENCY_EXIT_STATE),
+        }
+    if operating_state == DEGRADED_MANAGE_ONLY_STATE:
+        return {
+            "guard_mode_reason_category": "operating_state",
+            "guard_mode_reason_code": DEGRADED_MANAGE_ONLY_STATE,
+            "guard_mode_reason_message": _guard_message_for_code(DEGRADED_MANAGE_ONLY_STATE),
+        }
+    if operating_state == PROTECTION_REQUIRED_STATE:
+        return {
+            "guard_mode_reason_category": "operating_state",
+            "guard_mode_reason_code": PROTECTION_REQUIRED_STATE,
+            "guard_mode_reason_message": _guard_message_for_code(PROTECTION_REQUIRED_STATE),
+        }
+    if not is_live_execution_ready(settings_row, defaults=app_defaults):
+        category, code, message = _derive_live_execution_guard_reason(settings_row, defaults=app_defaults)
+        return {
+            "guard_mode_reason_category": category,
+            "guard_mode_reason_code": code,
+            "guard_mode_reason_message": message,
+        }
+    if blocked_reasons:
+        code = blocked_reasons[0]
+        return {
+            "guard_mode_reason_category": "risk_block",
+            "guard_mode_reason_code": code,
+            "guard_mode_reason_message": _guard_message_for_code(code),
+        }
+    if auto_resume_blockers:
+        code = auto_resume_blockers[0]
+        return {
+            "guard_mode_reason_category": "auto_resume",
+            "guard_mode_reason_code": code,
+            "guard_mode_reason_message": _guard_message_for_code(code, fallback_suffix="자동 복구가 차단되어 가드 모드입니다."),
+        }
+    return {
+        "guard_mode_reason_category": None,
+        "guard_mode_reason_code": None,
+        "guard_mode_reason_message": None,
+    }
+
+
 def arm_live_execution(session: Session, minutes: int | None = None) -> Setting:
     row = get_or_create_settings(session)
     row.live_execution_armed = True
-    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=minutes or row.live_approval_window_minutes)
+    row.live_execution_armed_until = None
     session.add(row)
     session.flush()
     return row
@@ -442,6 +644,14 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
     runtime_state = summarize_runtime_state(settings_row)
     latest_blocked_reasons = get_latest_blocked_reasons(current_session)
+    auto_resume_last_blockers = [str(item) for item in auto_resume_state.get("blockers", [])]
+    guard_mode_reason = derive_guard_mode_reason(
+        settings_row,
+        defaults=defaults,
+        runtime_state=runtime_state,
+        latest_blocked_reasons=latest_blocked_reasons,
+        auto_resume_last_blockers=auto_resume_last_blockers,
+    )
     latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
     pnl_summary = (
         _build_pnl_summary(settings_row, latest_pnl)
@@ -498,7 +708,35 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         runtime_state,
         market_context_summary,
     )
+    adaptive_signal_context = build_adaptive_signal_context(
+        current_session,
+        enabled=settings_row.adaptive_signal_enabled,
+        symbol=settings_row.default_symbol.upper(),
+        timeframe=settings_row.default_timeframe,
+        regime=str(market_context_summary.get("primary_regime", "unknown")),
+    )
+    latest_decision_rationale_codes: list[str] = []
+    latest_decision_code: str | None = None
+    if current_session is not None:
+        latest_trading_run = current_session.scalar(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(1)
+        )
+        if latest_trading_run is not None:
+            payload = latest_trading_run.output_payload or {}
+            latest_decision_code = str(payload.get("decision") or "") or None
+            raw_codes = payload.get("rationale_codes", [])
+            if isinstance(raw_codes, list):
+                latest_decision_rationale_codes = [str(item) for item in raw_codes if item not in {None, ""}]
+    adaptive_signal_summary = summarize_adaptive_signal_state(
+        adaptive_signal_context,
+        latest_rationale_codes=latest_decision_rationale_codes,
+        latest_decision=latest_decision_code,
+    )
     execution_policy_summary = summarize_execution_policy(settings_row)
+    position_management_summary = _build_position_management_summary(current_session, settings_row)
 
     payload = AppSettingsResponse(
         id=settings_row.id,
@@ -510,6 +748,9 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         live_approval_window_minutes=settings_row.live_approval_window_minutes,
         live_execution_ready=is_live_execution_ready(settings_row, defaults=defaults),
         trading_paused=settings_row.trading_paused,
+        guard_mode_reason_category=guard_mode_reason["guard_mode_reason_category"],
+        guard_mode_reason_code=guard_mode_reason["guard_mode_reason_code"],
+        guard_mode_reason_message=guard_mode_reason["guard_mode_reason_message"],
         pause_reason_code=settings_row.pause_reason_code,
         pause_origin=settings_row.pause_origin,
         pause_reason_detail=settings_row.pause_reason_detail,
@@ -518,7 +759,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         auto_resume_whitelisted=pause_reason_allows_auto_resume(settings_row.pause_reason_code),
         auto_resume_eligible=pause_policy.auto_resume_eligible if settings_row.trading_paused else False,
         auto_resume_status=str(auto_resume_state.get("status", "not_paused" if not settings_row.trading_paused else "idle")),
-        auto_resume_last_blockers=[str(item) for item in auto_resume_state.get("blockers", [])],
+        auto_resume_last_blockers=auto_resume_last_blockers,
         latest_blocked_reasons=latest_blocked_reasons,
         pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
@@ -537,6 +778,8 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         execution_policy_summary=execution_policy_summary,
         market_context_summary=market_context_summary,
         adaptive_protection_summary=adaptive_protection_summary,
+        adaptive_signal_summary=adaptive_signal_summary,
+        position_management_summary=position_management_summary,
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
@@ -551,6 +794,13 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         max_same_tier_concentration_pct=exposure_limits["same_tier_concentration_pct"],
         stale_market_seconds=settings_row.stale_market_seconds,
         slippage_threshold_pct=settings_row.slippage_threshold_pct,
+        adaptive_signal_enabled=settings_row.adaptive_signal_enabled,
+        position_management_enabled=settings_row.position_management_enabled,
+        break_even_enabled=settings_row.break_even_enabled,
+        atr_trailing_stop_enabled=settings_row.atr_trailing_stop_enabled,
+        partial_take_profit_enabled=settings_row.partial_take_profit_enabled,
+        holding_edge_decay_enabled=settings_row.holding_edge_decay_enabled,
+        reduce_on_regime_shift_enabled=settings_row.reduce_on_regime_shift_enabled,
         starting_equity=settings_row.starting_equity,
         ai_enabled=settings_row.ai_enabled,
         ai_provider=settings_row.ai_provider,
@@ -624,6 +874,13 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.max_same_tier_concentration_pct = payload.max_same_tier_concentration_pct
     row.stale_market_seconds = payload.stale_market_seconds
     row.slippage_threshold_pct = payload.slippage_threshold_pct
+    row.adaptive_signal_enabled = payload.adaptive_signal_enabled
+    row.position_management_enabled = payload.position_management_enabled
+    row.break_even_enabled = payload.break_even_enabled
+    row.atr_trailing_stop_enabled = payload.atr_trailing_stop_enabled
+    row.partial_take_profit_enabled = payload.partial_take_profit_enabled
+    row.holding_edge_decay_enabled = payload.holding_edge_decay_enabled
+    row.reduce_on_regime_shift_enabled = payload.reduce_on_regime_shift_enabled
     row.starting_equity = payload.starting_equity
     row.ai_enabled = payload.ai_enabled
     row.ai_provider = payload.ai_provider

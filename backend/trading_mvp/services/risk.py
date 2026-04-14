@@ -140,6 +140,11 @@ def _build_exposure_metrics(
     dominant_side_notional = max(long_notional, short_notional)
     largest_symbol_notional = max(symbol_notionals.values(), default=0.0)
     return {
+        "total_notional": round(total_notional, 6),
+        "long_notional": round(long_notional, 6),
+        "short_notional": round(short_notional, 6),
+        "decision_symbol_notional": round(decision_symbol_notional, 6),
+        "largest_symbol_notional": round(largest_symbol_notional, 6),
         "gross_exposure_pct_equity": round(total_notional / safe_equity, 6),
         "long_exposure_pct_equity": round(long_notional / safe_equity, 6),
         "short_exposure_pct_equity": round(short_notional / safe_equity, 6),
@@ -149,6 +154,55 @@ def _build_exposure_metrics(
         "largest_position_pct_equity": round(largest_symbol_notional / safe_equity, 6),
         "projected_trade_notional_pct_equity": round(projected_notional / safe_equity, 6),
         "open_position_count": float(len(positions)),
+    }
+
+
+def build_ai_risk_budget_context(
+    session: Session,
+    settings_row: Setting,
+    *,
+    decision_symbol: str,
+    equity: float,
+) -> dict[str, float]:
+    symbol = decision_symbol.upper()
+    limits = get_exposure_limits(settings_row)
+    metrics = _build_exposure_metrics(session, symbol, equity)
+    safe_equity = max(equity, 1.0)
+    effective_leverage_cap = _effective_leverage_cap(settings_row, symbol)
+
+    total_exposure_headroom = max(
+        limits["gross_exposure_pct"] - float(metrics["gross_exposure_pct_equity"]),
+        0.0,
+    ) * safe_equity
+    directional_long_headroom = max(
+        limits["directional_bias_pct"] - float(metrics["long_exposure_pct_equity"]),
+        0.0,
+    ) * safe_equity
+    directional_short_headroom = max(
+        limits["directional_bias_pct"] - float(metrics["short_exposure_pct_equity"]),
+        0.0,
+    ) * safe_equity
+    single_position_headroom = max(
+        limits["largest_position_pct"] - float(metrics["decision_symbol_concentration_pct"]),
+        0.0,
+    ) * safe_equity
+
+    max_additional_long_notional = min(total_exposure_headroom, directional_long_headroom)
+    max_additional_short_notional = min(total_exposure_headroom, directional_short_headroom)
+    max_new_position_notional_for_symbol = min(
+        total_exposure_headroom,
+        single_position_headroom,
+        max(max_additional_long_notional, max_additional_short_notional),
+    )
+
+    return {
+        "max_additional_long_notional": round(max(max_additional_long_notional, 0.0), 4),
+        "max_additional_short_notional": round(max(max_additional_short_notional, 0.0), 4),
+        "max_new_position_notional_for_symbol": round(max(max_new_position_notional_for_symbol, 0.0), 4),
+        "max_leverage_for_symbol": round(effective_leverage_cap, 4),
+        "directional_bias_headroom": round(max(max(directional_long_headroom, directional_short_headroom), 0.0), 4),
+        "single_position_headroom": round(max(single_position_headroom, 0.0), 4),
+        "total_exposure_headroom": round(max(total_exposure_headroom, 0.0), 4),
     }
 
 
@@ -218,6 +272,7 @@ def evaluate_risk(
     market_snapshot: MarketSnapshotPayload,
     decision_run_id: int | None = None,
     market_snapshot_id: int | None = None,
+    execution_mode: Literal["live", "historical_replay"] = "live",
 ) -> tuple[RiskCheckResult, RiskCheck]:
     reason_codes: list[str] = []
     defaults = get_settings()
@@ -311,17 +366,18 @@ def evaluate_risk(
         reason_codes.append("HOLD_DECISION")
         operating_mode = "hold" if operating_mode != "paused" else operating_mode
 
-    if not credentials.binance_api_key or not credentials.binance_api_secret:
+    enforce_live_readiness = execution_mode != "historical_replay"
+    if enforce_live_readiness and (not credentials.binance_api_key or not credentials.binance_api_secret):
         if decision.decision != "hold":
             reason_codes.append("LIVE_CREDENTIALS_MISSING")
-    if is_entry_decision and live_requested:
+    if enforce_live_readiness and is_entry_decision and live_requested:
         if not defaults.live_trading_env_enabled:
             reason_codes.append("LIVE_ENV_DISABLED")
         if not settings_row.manual_live_approval:
             reason_codes.append("LIVE_APPROVAL_POLICY_DISABLED")
         if not is_live_execution_armed(settings_row):
             reason_codes.append("LIVE_APPROVAL_REQUIRED")
-    elif is_entry_decision:
+    elif enforce_live_readiness and is_entry_decision:
         reason_codes.append("LIVE_TRADING_DISABLED")
     allowed = len(reason_codes) == 0
     result = RiskCheckResult(

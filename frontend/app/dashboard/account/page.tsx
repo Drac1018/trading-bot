@@ -13,6 +13,12 @@ type AccountSummary = {
   app_live_execution_ready?: boolean;
   app_trading_paused?: boolean;
   app_operating_state?: string;
+  app_pause_reason_code?: string | null;
+  app_pause_origin?: string | null;
+  app_auto_resume_last_blockers?: string[];
+  guard_mode_reason_category?: string | null;
+  guard_mode_reason_code?: string | null;
+  guard_mode_reason_message?: string | null;
   latest_blocked_reasons?: string[];
   available_balance: number;
   total_wallet_balance: number;
@@ -77,6 +83,11 @@ export default async function BinanceAccountPage() {
   const appLiveReady = summary.app_live_execution_ready ?? false;
   const appTradingPaused = summary.app_trading_paused ?? false;
   const appOperatingState = summary.app_operating_state ?? "TRADABLE";
+  const appPauseReasonCode = summary.app_pause_reason_code ?? null;
+  const autoResumeBlockers = summary.app_auto_resume_last_blockers ?? [];
+  const guardModeReasonMessage =
+    summary.guard_mode_reason_message ??
+    (appLiveReady ? "가드 모드가 아닙니다." : "실주문 준비 조건이 충족되지 않아 가드 모드입니다.");
   const latestBlockedReasons = summary.latest_blocked_reasons ?? [];
 
   return (
@@ -94,6 +105,16 @@ export default async function BinanceAccountPage() {
           <StatusBadge tone={appTradingPaused ? "danger" : appLiveReady ? "good" : "warn"} label={`앱 실주문 준비 ${appLiveReady ? "완료" : "미완료"}`} />
           <StatusBadge tone={appOperatingState === "TRADABLE" ? "good" : appOperatingState === "PAUSED" ? "danger" : "warn"} label={`운영 상태 ${formatDisplayValue(appOperatingState, "operating_state")}`} />
         </div>
+        {summary.guard_mode_reason_code ? (
+          <div className="mt-5 rounded-[1.6rem] border border-amber-200 bg-amber-50 p-5 text-slate-900">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">Guard Mode</p>
+            <p className="mt-2 text-base font-semibold">{guardModeReasonMessage}</p>
+            <p className="mt-3 text-sm leading-7">
+              {formatDisplayValue(summary.guard_mode_reason_category, "guard_mode_reason_category")} /{" "}
+              {formatDisplayValue(summary.guard_mode_reason_code, "guard_mode_reason_code")}
+            </p>
+          </div>
+        ) : null}
 
         <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <MetricCard
@@ -116,6 +137,21 @@ export default async function BinanceAccountPage() {
             value={formatReasonList(latestBlockedReasons)}
             hint="최신 deterministic risk 차단 코드입니다."
           />
+          <MetricCard
+            label="Guard"
+            value={formatDisplayValue(summary.guard_mode_reason_code, "guard_mode_reason_code")}
+            hint={guardModeReasonMessage}
+          />
+          <MetricCard
+            label="Operating"
+            value={formatDisplayValue(appOperatingState, "operating_state")}
+            hint={`pause ${formatDisplayValue(appPauseReasonCode, "pause_reason_code")}`}
+          />
+          <MetricCard
+            label="Auto-resume"
+            value={formatReasonList(autoResumeBlockers)}
+            hint={`origin ${formatDisplayValue(summary.app_pause_origin, "pause_origin")}`}
+          />
           <MetricCard label="사용 가능 잔고" value={formatDisplayValue(summary.available_balance, "available_balance")} />
           <MetricCard label="총 지갑 잔고" value={formatDisplayValue(summary.total_wallet_balance, "total_wallet_balance")} />
           <MetricCard label="미실현 손익" value={formatDisplayValue(summary.total_unrealized_profit, "total_unrealized_profit")} />
@@ -137,7 +173,9 @@ export default async function BinanceAccountPage() {
             </p>
             <p className="mt-3 text-sm leading-7">
               앱 실주문 준비: {formatDisplayValue(appLiveReady, "app_live_execution_ready")} / 운영 상태:{" "}
-              {formatDisplayValue(appOperatingState, "operating_state")} / 차단 사유: {formatReasonList(latestBlockedReasons)}
+              {formatDisplayValue(appOperatingState, "operating_state")} / pause reason:{" "}
+              {formatDisplayValue(appPauseReasonCode, "pause_reason_code")} / 차단 사유: {formatReasonList(latestBlockedReasons)} / 자동 복구 blocker:{" "}
+              {formatReasonList(autoResumeBlockers)}
             </p>
           </div>
         </div>

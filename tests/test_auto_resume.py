@@ -357,7 +357,7 @@ def test_recoverable_system_pause_can_resume_via_approval_grace_window(db_sessio
     assert result["status"] == "resumed"
     assert refreshed.trading_paused is False
     assert refreshed.live_execution_armed is True
-    assert refreshed.live_execution_armed_until is not None
+    assert refreshed.live_execution_armed_until is None
 
 
 def test_auto_resume_attempts_are_written_to_audit_log(db_session, monkeypatch) -> None:

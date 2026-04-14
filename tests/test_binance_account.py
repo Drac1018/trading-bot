@@ -127,6 +127,10 @@ def test_binance_account_snapshot_builds_summary_from_exchange(monkeypatch, db_s
     assert payload.summary.app_live_execution_ready is False
     assert payload.summary.app_trading_paused is True
     assert payload.summary.app_operating_state == "PAUSED"
+    assert payload.summary.app_pause_reason_code == "MANUAL_USER_REQUEST"
+    assert payload.summary.guard_mode_reason_category == "pause"
+    assert payload.summary.guard_mode_reason_code == "MANUAL_USER_REQUEST"
+    assert payload.summary.guard_mode_reason_message == "운영자가 수동으로 거래를 중지해 가드 모드입니다."
     assert payload.summary.latest_blocked_reasons == ["TRADING_PAUSED"]
     assert payload.summary.available_balance == 930.25
     assert payload.summary.asset_count == 1

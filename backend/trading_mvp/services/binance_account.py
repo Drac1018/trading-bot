@@ -16,6 +16,7 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.settings import (
+    derive_guard_mode_reason,
     get_effective_symbols,
     get_latest_blocked_reasons,
     get_or_create_settings,
@@ -81,6 +82,12 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
     credentials = get_runtime_credentials(settings_row)
     settings_payload = serialize_settings(settings_row)
     latest_blocked_reasons = get_latest_blocked_reasons(session)
+    auto_resume_last_blockers = [str(item) for item in settings_payload.get("auto_resume_last_blockers", []) if item]
+    guard_mode_reason = derive_guard_mode_reason(
+        settings_row,
+        latest_blocked_reasons=latest_blocked_reasons,
+        auto_resume_last_blockers=auto_resume_last_blockers,
+    )
     base_summary = BinanceAccountSummary(
         connected=False,
         message="바이낸스 API 키가 설정되지 않았습니다.",
@@ -90,6 +97,12 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         app_live_execution_ready=is_live_execution_ready(settings_row),
         app_trading_paused=settings_row.trading_paused,
         app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
+        app_pause_reason_code=str(settings_payload.get("pause_reason_code") or "") or None,
+        app_pause_origin=str(settings_payload.get("pause_origin") or "") or None,
+        app_auto_resume_last_blockers=auto_resume_last_blockers,
+        guard_mode_reason_category=guard_mode_reason["guard_mode_reason_category"],
+        guard_mode_reason_code=guard_mode_reason["guard_mode_reason_code"],
+        guard_mode_reason_message=guard_mode_reason["guard_mode_reason_message"],
         latest_blocked_reasons=latest_blocked_reasons,
         exchange_update_time=utcnow_naive(),
     )
@@ -200,6 +213,12 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         app_live_execution_ready=is_live_execution_ready(settings_row),
         app_trading_paused=settings_row.trading_paused,
         app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
+        app_pause_reason_code=str(settings_payload.get("pause_reason_code") or "") or None,
+        app_pause_origin=str(settings_payload.get("pause_origin") or "") or None,
+        app_auto_resume_last_blockers=auto_resume_last_blockers,
+        guard_mode_reason_category=guard_mode_reason["guard_mode_reason_category"],
+        guard_mode_reason_code=guard_mode_reason["guard_mode_reason_code"],
+        guard_mode_reason_message=guard_mode_reason["guard_mode_reason_message"],
         latest_blocked_reasons=latest_blocked_reasons,
         fee_tier=_to_int(account_info.get("feeTier")),
         total_wallet_balance=_to_float(account_info.get("totalWalletBalance")),

@@ -27,6 +27,46 @@ class TradeDecision(StrictBaseModel):
     explanation_detailed: str = Field(min_length=10, max_length=600)
 
 
+class TradeDecisionCandidateScore(StrictBaseModel):
+    regime_fit: float = 0.0
+    expected_rr: float = 0.0
+    recent_signal_performance: float = 0.0
+    slippage_sensitivity: float = 0.0
+    exposure_impact: float = 0.0
+    confidence_consistency: float = 0.0
+    total_score: float = 0.0
+
+
+class TradeDecisionCandidate(StrictBaseModel):
+    candidate_id: str = Field(min_length=1, max_length=80)
+    scenario: Literal[
+        "hold",
+        "trend_follow",
+        "pullback_entry",
+        "reduce",
+        "exit",
+        "protection_restore",
+    ]
+    decision: Literal["hold", "long", "short", "reduce", "exit"]
+    symbol: str = Field(min_length=1, max_length=30)
+    timeframe: str = Field(min_length=1, max_length=20)
+    confidence: float = Field(ge=0.0, le=1.0)
+    entry_zone_min: float | None = None
+    entry_zone_max: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    max_holding_minutes: int = Field(ge=1, le=10080)
+    risk_pct: float = Field(ge=0.0, le=1.0)
+    leverage: float = Field(ge=0.0, le=10.0)
+    rationale_codes: list[str] = Field(default_factory=list)
+    explanation_short: str = Field(min_length=3, max_length=240)
+    explanation_detailed: str = Field(min_length=10, max_length=600)
+
+
+class TradeDecisionCandidateBatch(StrictBaseModel):
+    items: list[TradeDecisionCandidate] = Field(default_factory=list)
+
+
 class ChiefReviewSummary(StrictBaseModel):
     summary: str
     recommended_mode: Literal["hold", "monitor", "act"]
@@ -157,17 +197,378 @@ class SignalPerformanceEntry(StrictBaseModel):
     approvals: int = Field(ge=0)
     orders: int = Field(ge=0)
     fills: int = Field(ge=0)
+    holds: int = Field(ge=0)
+    longs: int = Field(ge=0)
+    shorts: int = Field(ge=0)
+    reduces: int = Field(ge=0)
+    exits: int = Field(ge=0)
     wins: int = Field(ge=0)
     losses: int = Field(ge=0)
     realized_pnl_total: float
+    fee_total: float = 0.0
+    net_realized_pnl_total: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
+    average_holding_minutes: float = Field(ge=0.0)
+    holding_over_plan_count: int = Field(ge=0)
+    open_positions: int = Field(ge=0)
+    closed_positions: int = Field(ge=0)
     latest_seen_at: datetime
+
+
+class PerformanceAggregateEntry(StrictBaseModel):
+    key: str
+    decisions: int = Field(ge=0)
+    approvals: int = Field(ge=0)
+    orders: int = Field(ge=0)
+    fills: int = Field(ge=0)
+    holds: int = Field(ge=0)
+    longs: int = Field(ge=0)
+    shorts: int = Field(ge=0)
+    reduces: int = Field(ge=0)
+    exits: int = Field(ge=0)
+    wins: int = Field(ge=0)
+    losses: int = Field(ge=0)
+    realized_pnl_total: float = 0.0
+    fee_total: float = 0.0
+    net_realized_pnl_total: float = 0.0
+    average_slippage_pct: float = Field(ge=0.0)
+    average_holding_minutes: float = Field(ge=0.0)
+    holding_over_plan_count: int = Field(ge=0)
+    open_positions: int = Field(ge=0)
+    closed_positions: int = Field(ge=0)
+    stop_loss_closes: int = Field(ge=0)
+    take_profit_closes: int = Field(ge=0)
+    manual_closes: int = Field(ge=0)
+    unclassified_closes: int = Field(ge=0)
+    latest_seen_at: datetime
+
+
+class FeatureFlagPerformanceEntry(StrictBaseModel):
+    flag_name: str
+    enabled: PerformanceAggregateEntry
+    disabled: PerformanceAggregateEntry
+
+
+class DecisionPerformanceEntry(StrictBaseModel):
+    decision_run_id: int
+    created_at: datetime
+    symbol: str
+    timeframe: str
+    decision: str
+    regime: str = "unknown"
+    trend_alignment: str = "unknown"
+    weak_volume: bool = False
+    volatility_expanded: bool = False
+    momentum_weakening: bool = False
+    rationale_codes: list[str] = Field(default_factory=list)
+    approved: bool = False
+    approved_risk_pct: float = 0.0
+    approved_leverage: float = 0.0
+    orders: int = Field(ge=0)
+    fills: int = Field(ge=0)
+    wins: int = Field(ge=0)
+    losses: int = Field(ge=0)
+    realized_pnl_total: float = 0.0
+    fee_total: float = 0.0
+    net_realized_pnl_total: float = 0.0
+    average_slippage_pct: float = Field(ge=0.0)
+    max_holding_minutes_planned: int | None = None
+    holding_minutes_observed: float = Field(ge=0.0)
+    holding_result_status: str = "unlinked"
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    planned_risk_reward_ratio: float | None = None
+    close_outcome: str = "not_closed"
+    position_ids: list[int] = Field(default_factory=list)
+    fill_basis: str = "execution_ledger_truth"
+    mfe_mae_tracking_status: str = "hook_ready"
+    mfe_mae_tracking_basis: str = "market_snapshot_replay_required"
+
+
+class PerformanceWindowSummary(StrictBaseModel):
+    decisions: int = Field(ge=0)
+    approvals: int = Field(ge=0)
+    orders: int = Field(ge=0)
+    fills: int = Field(ge=0)
+    holds: int = Field(ge=0)
+    longs: int = Field(ge=0)
+    shorts: int = Field(ge=0)
+    reduces: int = Field(ge=0)
+    exits: int = Field(ge=0)
+    wins: int = Field(ge=0)
+    losses: int = Field(ge=0)
+    realized_pnl_total: float = 0.0
+    fee_total: float = 0.0
+    net_realized_pnl_total: float = 0.0
+    average_slippage_pct: float = Field(ge=0.0)
+    average_holding_minutes: float = Field(ge=0.0)
+    holding_over_plan_count: int = Field(ge=0)
+    open_positions: int = Field(ge=0)
+    closed_positions: int = Field(ge=0)
+    stop_loss_closes: int = Field(ge=0)
+    take_profit_closes: int = Field(ge=0)
+    manual_closes: int = Field(ge=0)
+    unclassified_closes: int = Field(ge=0)
+    execution_pnl_basis: str = "execution_ledger_truth"
+    snapshot_pnl_basis: str = "pnl_snapshot_delta_estimate"
+    snapshot_net_pnl_estimate: float = 0.0
+    decision_context_basis: str = "agent_run_input_features_regime"
+    stop_take_profit_efficiency_basis: str = "decision_template_vs_close_order_type"
+    mfe_mae_tracking_status: str = "hook_ready"
+    mfe_mae_tracking_note: str = "Replay intratrade highs and lows against linked positions to compute MFE/MAE."
+
+
+class PerformanceWindowReport(StrictBaseModel):
+    window_label: str
+    window_hours: int = Field(ge=1, le=24 * 30)
+    summary: PerformanceWindowSummary
+    decisions: list[DecisionPerformanceEntry] = Field(default_factory=list)
+    rationale_codes: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    symbols: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    timeframes: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    regimes: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    trend_alignments: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    directions: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    hold_conditions: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    close_outcomes: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    feature_flags: list[FeatureFlagPerformanceEntry] = Field(default_factory=list)
 
 
 class SignalPerformanceReportResponse(StrictBaseModel):
     generated_at: datetime
     window_hours: int = Field(ge=1, le=168)
     items: list[SignalPerformanceEntry] = Field(default_factory=list)
+    windows: list[PerformanceWindowReport] = Field(default_factory=list)
+
+
+class ReplayValidationRequest(StrictBaseModel):
+    cycles: int = Field(default=30, ge=5, le=500)
+    start_index: int = Field(default=90, ge=20, le=2000)
+    timeframe: str = Field(default="15m", min_length=1, max_length=20)
+    symbols: list[str] = Field(default_factory=list)
+    data_source_type: Literal["synthetic_seed"] = "synthetic_seed"
+
+
+class ReplayMetricSummary(StrictBaseModel):
+    decisions: int = Field(ge=0)
+    closed_trades: int = Field(ge=0)
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    fees: float = 0.0
+    max_drawdown: float = Field(ge=0.0, default=0.0)
+    win_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    profit_factor: float = Field(ge=0.0, default=0.0)
+    hold_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    blocked_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+
+
+class ReplayBreakdownEntry(StrictBaseModel):
+    key: str
+    decisions: int = Field(ge=0)
+    closed_trades: int = Field(ge=0)
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    fees: float = 0.0
+    max_drawdown: float = Field(ge=0.0, default=0.0)
+    win_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    profit_factor: float = Field(ge=0.0, default=0.0)
+    hold_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    blocked_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+
+
+class ReplayVariantReport(StrictBaseModel):
+    logic_variant: Literal["baseline_old", "improved"]
+    title: str
+    data_source_type: Literal["synthetic_seed"]
+    summary: ReplayMetricSummary
+    by_symbol: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_timeframe: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_regime: list[ReplayBreakdownEntry] = Field(default_factory=list)
+
+
+class ReplayComparisonEntry(StrictBaseModel):
+    key: str
+    baseline_old: ReplayMetricSummary
+    improved: ReplayMetricSummary
+    net_pnl_delta: float = 0.0
+    gross_pnl_delta: float = 0.0
+    fees_delta: float = 0.0
+    max_drawdown_delta: float = 0.0
+    win_rate_delta: float = 0.0
+    profit_factor_delta: float = 0.0
+    hold_ratio_delta: float = 0.0
+    blocked_ratio_delta: float = 0.0
+
+
+class ReplayValidationResponse(StrictBaseModel):
+    generated_at: datetime
+    data_source_type: Literal["synthetic_seed"]
+    data_source_basis: str
+    execution_basis: str
+    live_execution_guarantee: str
+    start_index: int = Field(ge=0)
+    end_index: int = Field(ge=0)
+    cycles: int = Field(ge=1)
+    timeframe: str
+    symbols: list[str] = Field(default_factory=list)
+    variants: list[ReplayVariantReport] = Field(default_factory=list)
+    symbol_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    timeframe_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    regime_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+
+
+class DashboardExecutionProfileSummary(StrictBaseModel):
+    policy_profile: str
+    symbol: str | None = None
+    timeframe: str | None = None
+    orders: int = Field(ge=0)
+    partial_fill_orders: int = Field(ge=0)
+    aggressive_fallback_orders: int = Field(ge=0)
+    average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+
+
+class DashboardExecutionWindowSummary(StrictBaseModel):
+    window: str
+    decision_quality_summary: dict[str, int] = Field(default_factory=dict)
+    execution_quality_summary: dict[str, float | int] = Field(default_factory=dict)
+    worst_profiles: list[DashboardExecutionProfileSummary] = Field(default_factory=list)
+
+
+class DashboardProfitabilityWindow(StrictBaseModel):
+    window_label: str
+    window_hours: int = Field(ge=1, le=24 * 30)
+    summary: PerformanceWindowSummary
+    rationale_winners: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    rationale_losers: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    top_regimes: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    top_symbols: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    top_timeframes: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    top_hold_conditions: list[PerformanceAggregateEntry] = Field(default_factory=list)
+
+
+class DashboardHoldBlockedSummary(StrictBaseModel):
+    hold_top_conditions: list[PerformanceAggregateEntry] = Field(default_factory=list)
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
+    auto_resume_blockers: list[str] = Field(default_factory=list)
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
+
+
+class DashboardProfitabilityResponse(StrictBaseModel):
+    generated_at: datetime
+    operating_state: str
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
+    adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
+    latest_decision: dict[str, Any] | None = None
+    latest_risk: dict[str, Any] | None = None
+    windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
+    execution_windows: list[DashboardExecutionWindowSummary] = Field(default_factory=list)
+    hold_blocked_summary: DashboardHoldBlockedSummary
+
+
+class OperatorControlState(StrictBaseModel):
+    generated_at: datetime
+    can_enter_new_position: bool = False
+    mode: str
+    symbol: str
+    timeframe: str
+    tracked_symbols: list[str] = Field(default_factory=list)
+    latest_price: float = 0.0
+    live_trading_enabled: bool = False
+    live_execution_ready: bool = False
+    approval_armed: bool = False
+    approval_expires_at: datetime | None = None
+    trading_paused: bool = False
+    operating_state: str = "TRADABLE"
+    guard_mode_reason_category: str | None = None
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
+    pause_reason_code: str | None = None
+    pause_origin: str | None = None
+    pause_triggered_at: datetime | None = None
+    auto_resume_status: str = "not_paused"
+    auto_resume_eligible: bool = False
+    auto_resume_after: datetime | None = None
+    auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
+    protection_recovery_status: str = "idle"
+    protected_positions: int = 0
+    unprotected_positions: int = 0
+    open_positions: int = 0
+    scheduler_status: str | None = None
+    scheduler_window: str | None = None
+    scheduler_triggered_by: str | None = None
+    scheduler_last_run_at: datetime | None = None
+    scheduler_next_run_at: datetime | None = None
+
+
+class OperatorDecisionSnapshot(StrictBaseModel):
+    decision_run_id: int | None = None
+    created_at: datetime | None = None
+    provider_name: str | None = None
+    trigger_event: str | None = None
+    status: str | None = None
+    summary: str | None = None
+    symbol: str | None = None
+    timeframe: str | None = None
+    decision: str | None = None
+    confidence: float | None = None
+    rationale_codes: list[str] = Field(default_factory=list)
+    explanation_short: str | None = None
+    raw_output: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorRiskSnapshot(StrictBaseModel):
+    risk_check_id: int | None = None
+    decision_run_id: int | None = None
+    created_at: datetime | None = None
+    allowed: bool | None = None
+    decision: str | None = None
+    operating_state: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    approved_risk_pct: float | None = None
+    approved_leverage: float | None = None
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorExecutionSnapshot(StrictBaseModel):
+    order_id: int | None = None
+    execution_id: int | None = None
+    decision_run_id: int | None = None
+    created_at: datetime | None = None
+    execution_created_at: datetime | None = None
+    symbol: str | None = None
+    side: str | None = None
+    order_type: str | None = None
+    order_status: str | None = None
+    execution_status: str | None = None
+    requested_quantity: float | None = None
+    filled_quantity: float | None = None
+    average_fill_price: float | None = None
+    fill_price: float | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    execution_policy: dict[str, Any] = Field(default_factory=dict)
+    execution_quality: dict[str, Any] = Field(default_factory=dict)
+    decision_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorMarketSignalSummary(StrictBaseModel):
+    market_context_summary: dict[str, Any] = Field(default_factory=dict)
+    performance_windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
+    hold_blocked_summary: DashboardHoldBlockedSummary
+    adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorDashboardResponse(StrictBaseModel):
+    generated_at: datetime
+    control: OperatorControlState
+    market_signal: OperatorMarketSignalSummary
+    ai_decision: OperatorDecisionSnapshot
+    risk_guard: OperatorRiskSnapshot
+    execution: OperatorExecutionSnapshot
+    execution_windows: list[DashboardExecutionWindowSummary] = Field(default_factory=list)
+    audit_events: list[AuditTimelineEntry] = Field(default_factory=list)
 
 
 class StructuredCompetitorNote(StrictBaseModel):
@@ -293,6 +694,59 @@ class TimeframeFeatureContext(StrictBaseModel):
     momentum_score: float
 
 
+class BreakoutFeatureContext(StrictBaseModel):
+    lookback_bars: int = Field(ge=1, default=8)
+    swing_high: float = Field(ge=0.0, default=0.0)
+    swing_low: float = Field(ge=0.0, default=0.0)
+    range_high: float = Field(ge=0.0, default=0.0)
+    range_low: float = Field(ge=0.0, default=0.0)
+    range_width_pct: float = Field(ge=0.0, default=0.0)
+    broke_swing_high: bool = False
+    broke_swing_low: bool = False
+    range_breakout_direction: Literal["up", "down", "none"] = "none"
+
+
+class CandleStructureFeatureContext(StrictBaseModel):
+    body_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    upper_wick_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    lower_wick_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    wick_to_body_ratio: float = Field(ge=0.0, default=0.0)
+    bullish_streak: int = Field(ge=0, default=0)
+    bearish_streak: int = Field(ge=0, default=0)
+    bullish_streak_strength: float = Field(ge=0.0, default=0.0)
+    bearish_streak_strength: float = Field(ge=0.0, default=0.0)
+
+
+class LocationFeatureContext(StrictBaseModel):
+    distance_from_recent_high_pct: float = 0.0
+    distance_from_recent_low_pct: float = 0.0
+    range_position_pct: float = 0.5
+    vwap_distance_pct: float = 0.0
+
+
+class VolumePersistenceFeatureContext(StrictBaseModel):
+    recent_window: int = Field(ge=1, default=5)
+    persistence_ratio: float = Field(ge=0.0, default=0.0)
+    high_volume_bars: int = Field(ge=0, default=0)
+    low_volume_bars: int = Field(ge=0, default=0)
+    sustained_high_volume: bool = False
+    sustained_low_volume: bool = False
+
+
+class PullbackContinuationFeatureContext(StrictBaseModel):
+    higher_timeframe_bias: Literal["bullish", "bearish", "range", "mixed", "unknown"] = "unknown"
+    state: Literal[
+        "bullish_continuation",
+        "bearish_continuation",
+        "bullish_pullback",
+        "bearish_pullback",
+        "countertrend",
+        "range",
+        "unclear",
+    ] = "unclear"
+    aligned_with_higher_timeframe: bool = False
+
+
 class RegimeFeatureContext(StrictBaseModel):
     primary_regime: Literal["bullish", "bearish", "range", "transition"]
     trend_alignment: Literal["bullish_aligned", "bearish_aligned", "mixed", "range"]
@@ -316,7 +770,12 @@ class FeaturePayload(StrictBaseModel):
     momentum_score: float
     multi_timeframe: dict[str, TimeframeFeatureContext] = Field(default_factory=dict)
     regime: RegimeFeatureContext
-    data_quality_flags: list[str]
+    breakout: BreakoutFeatureContext = Field(default_factory=BreakoutFeatureContext)
+    candle_structure: CandleStructureFeatureContext = Field(default_factory=CandleStructureFeatureContext)
+    location: LocationFeatureContext = Field(default_factory=LocationFeatureContext)
+    volume_persistence: VolumePersistenceFeatureContext = Field(default_factory=VolumePersistenceFeatureContext)
+    pullback_context: PullbackContinuationFeatureContext = Field(default_factory=PullbackContinuationFeatureContext)
+    data_quality_flags: list[str] = Field(default_factory=list)
 
 
 class OverviewResponse(StrictBaseModel):
@@ -331,6 +790,9 @@ class OverviewResponse(StrictBaseModel):
     live_trading_enabled: bool
     live_execution_ready: bool
     trading_paused: bool
+    guard_mode_reason_category: str | None = None
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
     pause_reason_code: str | None = None
     pause_origin: str | None = None
     pause_triggered_at: datetime | None = None
@@ -352,6 +814,8 @@ class OverviewResponse(StrictBaseModel):
     execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     adaptive_protection_summary: dict[str, Any] = Field(default_factory=dict)
+    adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
+    position_management_summary: dict[str, Any] = Field(default_factory=dict)
     daily_pnl: float
     cumulative_pnl: float
     blocked_reasons: list[str]
@@ -362,6 +826,7 @@ class OverviewResponse(StrictBaseModel):
 
 
 class AuditTimelineEntry(StrictBaseModel):
+    event_category: str = "health_system"
     event_type: str
     entity_type: str
     entity_id: str
@@ -381,6 +846,9 @@ class AppSettingsResponse(StrictBaseModel):
     live_approval_window_minutes: int
     live_execution_ready: bool
     trading_paused: bool
+    guard_mode_reason_category: str | None = None
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
     pause_reason_code: str | None = None
     pause_origin: str | None = None
     pause_reason_detail: dict[str, Any] = Field(default_factory=dict)
@@ -405,6 +873,8 @@ class AppSettingsResponse(StrictBaseModel):
     execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     adaptive_protection_summary: dict[str, Any] = Field(default_factory=dict)
+    adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
+    position_management_summary: dict[str, Any] = Field(default_factory=dict)
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str
@@ -419,6 +889,13 @@ class AppSettingsResponse(StrictBaseModel):
     max_same_tier_concentration_pct: float
     stale_market_seconds: int
     slippage_threshold_pct: float
+    adaptive_signal_enabled: bool
+    position_management_enabled: bool
+    break_even_enabled: bool
+    atr_trailing_stop_enabled: bool
+    partial_take_profit_enabled: bool
+    holding_edge_decay_enabled: bool
+    reduce_on_regime_shift_enabled: bool
     starting_equity: float
     ai_enabled: bool
     ai_provider: str
@@ -459,7 +936,7 @@ class AppSettingsResponse(StrictBaseModel):
 class AppSettingsUpdateRequest(StrictBaseModel):
     live_trading_enabled: bool
     manual_live_approval: bool
-    live_approval_window_minutes: int = Field(ge=1, le=240)
+    live_approval_window_minutes: int = Field(ge=0, le=240)
     default_symbol: str = Field(min_length=1, max_length=30)
     tracked_symbols: list[str] = Field(min_length=1)
     default_timeframe: str = Field(min_length=1, max_length=20)
@@ -474,6 +951,13 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     max_same_tier_concentration_pct: float = Field(default=2.5, gt=0.0, le=2.5)
     stale_market_seconds: int = Field(ge=30, le=86400)
     slippage_threshold_pct: float = Field(gt=0.0, le=0.1)
+    adaptive_signal_enabled: bool = False
+    position_management_enabled: bool = True
+    break_even_enabled: bool = True
+    atr_trailing_stop_enabled: bool = True
+    partial_take_profit_enabled: bool = True
+    holding_edge_decay_enabled: bool = True
+    reduce_on_regime_shift_enabled: bool = True
     starting_equity: float = Field(gt=0.0)
     ai_enabled: bool
     ai_provider: Literal["openai", "mock"]
@@ -514,7 +998,7 @@ class ConnectionTestResponse(StrictBaseModel):
 
 
 class ManualLiveApprovalRequest(StrictBaseModel):
-    minutes: int | None = Field(default=None, ge=1, le=240)
+    minutes: int | None = Field(default=None, ge=0, le=240)
 
 
 class BinanceLiveTestOrderRequest(StrictBaseModel):
@@ -534,6 +1018,12 @@ class BinanceAccountSummary(StrictBaseModel):
     app_live_execution_ready: bool = False
     app_trading_paused: bool = False
     app_operating_state: str = "TRADABLE"
+    app_pause_reason_code: str | None = None
+    app_pause_origin: str | None = None
+    app_auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    guard_mode_reason_category: str | None = None
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     fee_tier: int = 0
     total_wallet_balance: float = 0.0

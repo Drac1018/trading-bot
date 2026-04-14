@@ -684,7 +684,7 @@ def attempt_auto_resume(
         grace_until = _parse_datetime(approval_detail.get("approval_grace_until"))
         if grace_until is not None:
             settings_row.live_execution_armed = True
-            settings_row.live_execution_armed_until = grace_until
+            settings_row.live_execution_armed_until = None
             session.add(settings_row)
             session.flush()
     set_trading_pause(session, False)

@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     max_same_tier_concentration_pct: float = 2.5
     stale_market_seconds: int = 1800
     slippage_threshold_pct: float = 0.003
+    adaptive_signal_enabled: bool = False
+    position_management_enabled: bool = True
+    break_even_enabled: bool = True
+    atr_trailing_stop_enabled: bool = True
+    partial_take_profit_enabled: bool = True
+    holding_edge_decay_enabled: bool = True
+    reduce_on_regime_shift_enabled: bool = True
     schedule_windows: str = "1h,4h,12h,24h"
     mock_provider_enabled: bool = True
     ai_enabled: bool = False

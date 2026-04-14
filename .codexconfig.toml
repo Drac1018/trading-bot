@@ -1,0 +1,15 @@
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+web_search = "cached"
+personality = "pragmatic"
+
+project_root_markers = [".git"]
+
+[shell_environment_policy]
+include_only = ["PATH", "HOME", "SHELL", "TERM", "PYTHONPATH"]
+
+[features]
+multi_agent = true
+fast_mode = true

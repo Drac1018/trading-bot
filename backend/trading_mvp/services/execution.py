@@ -13,6 +13,7 @@ from trading_mvp.config import get_settings
 from trading_mvp.models import Execution, Order, Position, RiskCheck, Setting
 from trading_mvp.schemas import (
     ExecutionIntent,
+    FeaturePayload,
     MarketSnapshotPayload,
     RiskCheckResult,
     TradeDecision,
@@ -33,6 +34,13 @@ from trading_mvp.services.pause_control import (
     clear_symbol_protection_state,
     mark_manage_only_state,
     set_symbol_protection_state,
+)
+from trading_mvp.services.position_management import (
+    PARTIAL_TAKE_PROFIT_FRACTION,
+    build_position_management_context,
+    mark_partial_take_profit_taken,
+    seed_position_management_metadata,
+    store_position_management_context,
 )
 from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
@@ -205,6 +213,15 @@ def _classify_execution_intent(
     return "entry"
 
 
+def _reduce_fraction_for_decision(decision: TradeDecision) -> float:
+    rationale_codes = set(decision.rationale_codes)
+    if "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in rationale_codes:
+        return PARTIAL_TAKE_PROFIT_FRACTION
+    if {"POSITION_MANAGEMENT_EDGE_DECAY", "POSITION_MANAGEMENT_REGIME_SHIFT", "POSITION_MANAGEMENT_MOMENTUM_WEAKENING"} & rationale_codes:
+        return 0.35
+    return 0.5
+
+
 def _is_protective_order(order_payload: dict[str, object]) -> bool:
     order_type = str(order_payload.get("type", "")).upper()
     return order_type.startswith("STOP") or order_type.startswith("TAKE_PROFIT")
@@ -375,6 +392,187 @@ def _has_valid_protection_template(position: Position | None, stop_loss: float |
     return stop_loss > reference_price and take_profit < reference_price
 
 
+def _is_more_protective_stop(side: str, current_stop: float | None, candidate_stop: float | None) -> bool:
+    if candidate_stop is None:
+        return False
+    if current_stop is None:
+        return True
+    if side == "long":
+        return candidate_stop > current_stop + 1e-9
+    return candidate_stop < current_stop - 1e-9
+
+
+def _replace_stop_loss_order(
+    session: Session,
+    *,
+    client: BinanceClient,
+    position: Position,
+    symbol: str,
+    stop_loss: float,
+    decision_run_id: int | None,
+    risk_row: RiskCheck | None,
+    trigger_source: str,
+    open_orders: list[dict[str, object]],
+) -> dict[str, object]:
+    exit_side = "SELL" if position.side == "long" else "BUY"
+    cancelled_order_ids: list[str] = []
+    for item in open_orders:
+        if _protective_bucket(item) != "stop_loss":
+            continue
+        remote_order_id = str(item.get("orderId", ""))
+        remote_client_order_id = str(item.get("clientOrderId", ""))
+        _cancel_exchange_order(
+            client,
+            symbol=symbol,
+            order_payload=item,
+            order_id=remote_order_id or None,
+            client_order_id=remote_client_order_id or None,
+        )
+        if remote_order_id:
+            cancelled_order_ids.append(remote_order_id)
+        local_order = None
+        if remote_order_id:
+            local_order = session.scalar(select(Order).where(Order.external_order_id == remote_order_id).limit(1))
+        if local_order is None and remote_client_order_id:
+            local_order = session.scalar(select(Order).where(Order.client_order_id == remote_client_order_id).limit(1))
+        if local_order is not None:
+            local_order.status = "canceled"
+            local_order.exchange_status = "CANCELED"
+            local_order.last_exchange_update_at = utcnow_naive()
+            session.add(local_order)
+
+    normalized_stop = client.normalize_price(symbol, stop_loss) if hasattr(client, "normalize_price") else stop_loss
+    client_order_id, exchange_order = _safe_submit_order(
+        client,
+        symbol=symbol,
+        side=exit_side,
+        order_type="STOP_MARKET",
+        stop_price=normalized_stop,
+        close_position=True,
+        response_type="ACK",
+    )
+    order = _upsert_exchange_order_row(
+        session,
+        symbol=symbol,
+        requested_price=normalized_stop,
+        requested_quantity=position.quantity,
+        order_type="STOP_MARKET",
+        side=exit_side.lower(),
+        exchange_order={**exchange_order, "clientOrderId": client_order_id},
+        decision_run_id=decision_run_id,
+        risk_row=risk_row,
+        reduce_only=True,
+        close_only=True,
+        parent_order_id=None,
+    )
+    order.position_id = position.id
+    order.metadata_json = {
+        **(order.metadata_json or {}),
+        "position_management": {
+            "trigger_source": trigger_source,
+            "applied_rule": "STOP_TIGHTENED",
+            "tightened_stop_loss": normalized_stop,
+        },
+    }
+    position.stop_loss = normalized_stop
+    session.add(position)
+    session.add(order)
+    session.flush()
+    record_audit_event(
+        session,
+        event_type="position_management_stop_tightened",
+        entity_type="position",
+        entity_id=str(position.id),
+        severity="info",
+        message="Position management tightened the live stop loss.",
+        payload={
+            "symbol": symbol,
+            "trigger_source": trigger_source,
+            "cancelled_order_ids": cancelled_order_ids,
+            "new_order_id": order.id,
+            "tightened_stop_loss": normalized_stop,
+        },
+    )
+    return {
+        "status": "applied",
+        "tightened_stop_loss": normalized_stop,
+        "cancelled_order_ids": cancelled_order_ids,
+        "order_id": order.id,
+    }
+
+
+def apply_position_management(
+    session: Session,
+    settings_row: Setting,
+    *,
+    symbol: str,
+    feature_payload: FeaturePayload,
+    decision_run_id: int | None = None,
+    risk_row: RiskCheck | None = None,
+    client: BinanceClient | None = None,
+) -> dict[str, object]:
+    position = get_open_position(session, symbol)
+    context = build_position_management_context(position, feature_payload=feature_payload, settings_row=settings_row)
+    if position is None:
+        return {"status": "no_open_position", "position_management_context": context}
+
+    store_position_management_context(position, context)
+    session.add(position)
+    session.flush()
+
+    if not context.get("enabled"):
+        return {"status": "disabled", "position_management_context": context}
+
+    client = client or _build_client(settings_row)
+    open_orders = client.get_open_orders(symbol)
+    protection_state = _build_protection_state(position, open_orders)
+    tightened_stop_loss = _to_float(context.get("tightened_stop_loss"))
+    if (
+        protection_state["status"] != "protected"
+        or not protection_state.get("has_stop_loss")
+        or not _is_more_protective_stop(position.side, position.stop_loss, tightened_stop_loss)
+    ):
+        return {
+            "status": "monitoring",
+            "position_management_context": context,
+            "protection_state": protection_state,
+        }
+
+    applied = _replace_stop_loss_order(
+        session,
+        client=client,
+        position=position,
+        symbol=symbol,
+        stop_loss=float(tightened_stop_loss),
+        decision_run_id=decision_run_id,
+        risk_row=risk_row,
+        trigger_source="position_management",
+        open_orders=open_orders,
+    )
+    refreshed_open_orders = client.get_open_orders(symbol)
+    protection_result = _ensure_protected_position(
+        session,
+        settings_row,
+        client,
+        symbol=symbol,
+        position=position,
+        stop_loss=position.stop_loss,
+        take_profit=position.take_profit,
+        decision_run_id=decision_run_id,
+        risk_row=risk_row,
+        parent_order=None,
+        trigger_source="position_management",
+        pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+    )
+    return {
+        "status": "applied",
+        "position_management_context": context,
+        "position_management_action": applied,
+        "protection_state": _build_protection_state(position, refreshed_open_orders),
+        "protection_result": protection_result,
+    }
+
+
 def build_execution_intent(
     decision: TradeDecision,
     market_snapshot: MarketSnapshotPayload,
@@ -460,7 +658,13 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
             commission_asset=str(trade.get("commissionAsset", "")) or None,
             slippage_pct=abs(fill_price - order.requested_price) / max(order.requested_price, 1.0),
             realized_pnl=realized_pnl,
-            payload={"trade": trade},
+            payload={
+                "trade": trade,
+                "requested_price": order.requested_price,
+                "requested_quantity": order.requested_quantity,
+                "order_type": order.order_type,
+                "execution_policy": (order.metadata_json or {}).get("execution_policy"),
+            },
         )
         session.add(execution)
         fee_total += fee_paid
@@ -532,7 +736,11 @@ def _upsert_exchange_order_row(
     avg_price = _to_float(exchange_order.get("avgPrice") or exchange_order.get("price"), row.average_fill_price)
     if avg_price > 0:
         row.average_fill_price = avg_price
-    row.metadata_json = {"exchange_order": exchange_order}
+    existing_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    row.metadata_json = {
+        **existing_metadata,
+        "exchange_order": exchange_order,
+    }
     session.add(row)
     session.flush()
     return row
@@ -704,6 +912,105 @@ def _normalize_remaining_quantity(
     return normalized
 
 
+def _remaining_fill_ratio(*, requested_quantity: float, filled_quantity: float) -> float:
+    if requested_quantity <= 0:
+        return 0.0
+    remaining = max(requested_quantity - filled_quantity, 0.0)
+    return remaining / requested_quantity
+
+
+def _classify_execution_quality(
+    *,
+    requested_quantity: float,
+    filled_quantity: float,
+    execution_attempts: list[dict[str, object]],
+    aggressive_fallback_used: bool,
+    slippage_pct: float,
+    slippage_threshold_pct: float,
+) -> tuple[str, str]:
+    fill_ratio = 0.0 if requested_quantity <= 0 else min(filled_quantity / requested_quantity, 1.0)
+    partial_fill_attempts = sum(
+        1
+        for attempt in execution_attempts
+        if float(attempt.get("filled_quantity") or 0.0) > 0
+        and float(attempt.get("filled_quantity") or 0.0) + 1e-9 < float(attempt.get("requested_quantity") or 0.0)
+    )
+    repriced_attempts = max(len(execution_attempts) - 1, 0)
+    timed_out_attempts = sum(1 for attempt in execution_attempts if bool(attempt.get("timed_out")))
+
+    if fill_ratio < 0.999:
+        return "incomplete_fill", "signal_outcome_pending"
+    if aggressive_fallback_used:
+        return "aggressive_completion", "signal_outcome_pending"
+    if timed_out_attempts > 0 or repriced_attempts > 0:
+        return "repriced_completion", "signal_outcome_pending"
+    if partial_fill_attempts > 0:
+        return "partial_fill_recovered", "signal_outcome_pending"
+    if slippage_pct > slippage_threshold_pct:
+        return "high_slippage", "signal_outcome_pending"
+    return "clean_fill", "signal_outcome_pending"
+
+
+def _build_execution_quality_summary(
+    *,
+    plan: ExecutionPlan,
+    requested_quantity: float,
+    requested_price: float,
+    filled_quantity: float,
+    average_fill_price: float,
+    fee_paid: float,
+    realized_pnl: float,
+    execution_attempts: list[dict[str, object]],
+    slippage_threshold_pct: float,
+    aggressive_fallback_used: bool,
+) -> dict[str, object]:
+    slippage_pct = 0.0
+    if filled_quantity > 0 and average_fill_price > 0:
+        slippage_pct = abs(average_fill_price - requested_price) / max(requested_price, 1.0)
+    fill_ratio = 0.0 if requested_quantity <= 0 else min(filled_quantity / requested_quantity, 1.0)
+    timed_out_attempts = sum(1 for attempt in execution_attempts if bool(attempt.get("timed_out")))
+    partial_fill_attempts = sum(
+        1
+        for attempt in execution_attempts
+        if float(attempt.get("filled_quantity") or 0.0) > 0
+        and float(attempt.get("filled_quantity") or 0.0) + 1e-9 < float(attempt.get("requested_quantity") or 0.0)
+    )
+    execution_quality_status, decision_quality_status = _classify_execution_quality(
+        requested_quantity=requested_quantity,
+        filled_quantity=filled_quantity,
+        execution_attempts=execution_attempts,
+        aggressive_fallback_used=aggressive_fallback_used,
+        slippage_pct=slippage_pct,
+        slippage_threshold_pct=slippage_threshold_pct,
+    )
+    return {
+        "policy_profile": plan.policy_profile,
+        "symbol_risk_tier": plan.symbol_risk_tier,
+        "timeframe_bucket": plan.timeframe_bucket,
+        "volatility_regime": plan.volatility_regime,
+        "urgency": plan.urgency,
+        "requested_quantity": requested_quantity,
+        "filled_quantity": filled_quantity,
+        "remaining_quantity": max(requested_quantity - filled_quantity, 0.0),
+        "fill_ratio": fill_ratio,
+        "attempt_count": len(execution_attempts),
+        "repriced_attempts": max(len(execution_attempts) - 1, 0),
+        "timed_out_attempts": timed_out_attempts,
+        "partial_fill_attempts": partial_fill_attempts,
+        "aggressive_fallback_used": aggressive_fallback_used,
+        "realized_slippage_pct": slippage_pct,
+        "slippage_threshold_pct": slippage_threshold_pct,
+        "fees_total": fee_paid,
+        "realized_pnl_total": realized_pnl,
+        "net_realized_pnl_total": realized_pnl - fee_paid,
+        "execution_quality_status": execution_quality_status,
+        "decision_quality_status": decision_quality_status,
+        "signal_vs_execution_note": (
+            "Execution quality is measured separately from signal outcome; signal outcome stays pending until realized PnL closes."
+        ),
+    }
+
+
 def _protective_prices(open_orders: list[dict[str, object]], existing: Position | None) -> tuple[float | None, float | None]:
     stop_loss = existing.stop_loss if existing is not None else None
     take_profit = existing.take_profit if existing is not None else None
@@ -768,6 +1075,10 @@ def sync_live_positions(
         session.add(local)
         session.flush()
     else:
+        metadata = local.metadata_json if isinstance(local.metadata_json, dict) else {}
+        if "origin" not in metadata:
+            metadata["origin"] = "binance_sync"
+        local.metadata_json = metadata
         local.mode = "live"
         local.side = side
         local.status = "open"
@@ -839,6 +1150,7 @@ def _execute_primary_order_with_policy(
     current_order_type: str = execution_plan.order_type
     attempt_index = 0
     execution_attempts: list[dict[str, object]] = []
+    aggressive_fallback_used = False
 
     while current_quantity > 0:
         submit_price = current_price if current_order_type == "LIMIT" else None
@@ -937,11 +1249,15 @@ def _execute_primary_order_with_policy(
         trades = client.get_account_trades(symbol=symbol, order_id=order.external_order_id)
         fee_paid, realized_pnl = _record_live_trades(session, order, trades)
         filled_quantity = min(_sum_trade_quantity(trades), current_quantity)
+        average_fill_price = order.average_fill_price or submit_price or requested_price
+        fill_slippage_pct = 0.0
+        if filled_quantity > 0 and average_fill_price > 0:
+            fill_slippage_pct = abs(average_fill_price - requested_price) / max(requested_price, 1.0)
         if filled_quantity > 0:
             total_fee_paid += fee_paid
             total_realized_pnl += realized_pnl
             total_filled_quantity += filled_quantity
-            total_fill_notional += filled_quantity * max(order.average_fill_price or submit_price or requested_price, 0.0)
+            total_fill_notional += filled_quantity * max(average_fill_price, 0.0)
             if filled_quantity < current_quantity:
                 record_audit_event(
                     session,
@@ -956,10 +1272,16 @@ def _execute_primary_order_with_policy(
                         "attempt": attempt_index + 1,
                         "filled_quantity": filled_quantity,
                         "remaining_quantity": max(current_quantity - filled_quantity, 0.0),
+                        "fill_slippage_pct": fill_slippage_pct,
                         "execution_policy": execution_plan.to_payload(),
                     },
                 )
 
+        remaining_quantity = max(requested_quantity - total_filled_quantity, 0.0)
+        remaining_ratio = _remaining_fill_ratio(
+            requested_quantity=requested_quantity,
+            filled_quantity=total_filled_quantity,
+        )
         execution_attempts.append(
             {
                 "order_id": order.id,
@@ -969,11 +1291,22 @@ def _execute_primary_order_with_policy(
                 "requested_quantity": current_quantity,
                 "requested_price": submit_price,
                 "filled_quantity": filled_quantity,
+                "average_fill_price": average_fill_price if filled_quantity > 0 else None,
+                "fill_slippage_pct": fill_slippage_pct,
+                "remaining_quantity": remaining_quantity,
+                "remaining_ratio": remaining_ratio,
                 "timed_out": timed_out,
             }
         )
+        order.metadata_json = {
+            **(order.metadata_json or {}),
+            "execution_policy": execution_plan.to_payload(),
+            "execution_attempt": attempt_index + 1,
+            "execution_attempts": execution_attempts,
+        }
+        session.add(order)
+        session.flush()
 
-        remaining_quantity = max(requested_quantity - total_filled_quantity, 0.0)
         if current_order_type != "LIMIT" or remaining_quantity <= 0.0:
             break
         if not timed_out and order.status == "filled":
@@ -1022,7 +1355,9 @@ def _execute_primary_order_with_policy(
             current_slippage_pct=current_slippage_pct,
             slippage_threshold_pct=settings_row.slippage_threshold_pct,
             current_volatility_pct=execution_plan.volatility_pct,
+            remaining_ratio=remaining_ratio if filled_quantity > 0 else None,
         ):
+            aggressive_fallback_used = True
             record_audit_event(
                 session,
                 event_type="live_limit_aggressive_fallback",
@@ -1036,6 +1371,7 @@ def _execute_primary_order_with_policy(
                     "attempt": attempt_index + 1,
                     "remaining_quantity": remaining_quantity,
                     "current_slippage_pct": current_slippage_pct,
+                    "remaining_ratio": remaining_ratio,
                     "execution_policy": execution_plan.to_payload(),
                 },
             )
@@ -1100,6 +1436,26 @@ def _execute_primary_order_with_policy(
         final_status = "partially_filled"
     elif total_filled_quantity >= requested_quantity:
         final_status = "filled"
+    execution_quality = _build_execution_quality_summary(
+        plan=execution_plan,
+        requested_quantity=requested_quantity,
+        requested_price=requested_price,
+        filled_quantity=total_filled_quantity,
+        average_fill_price=float(aggregate_avg_fill_price or 0.0),
+        fee_paid=total_fee_paid,
+        realized_pnl=total_realized_pnl,
+        execution_attempts=execution_attempts,
+        slippage_threshold_pct=settings_row.slippage_threshold_pct,
+        aggressive_fallback_used=aggressive_fallback_used,
+    )
+    final_order.metadata_json = {
+        **(final_order.metadata_json or {}),
+        "execution_policy": execution_plan.to_payload(),
+        "execution_attempts": execution_attempts,
+        "execution_quality": execution_quality,
+    }
+    session.add(final_order)
+    session.flush()
 
     return {
         "order": final_order,
@@ -1109,6 +1465,7 @@ def _execute_primary_order_with_policy(
         "average_fill_price": aggregate_avg_fill_price,
         "status": final_status,
         "attempts": execution_attempts,
+        "execution_quality": execution_quality,
     }
 
 
@@ -1977,12 +2334,14 @@ def execute_live_trade(
     side = "BUY" if decision.decision == "long" else "SELL"
     requested_quantity = intent.quantity
     reduce_only = False
+    reduce_fraction = 1.0
 
     if decision.decision in {"reduce", "exit"}:
         if existing_position is None:
             return {"status": "rejected", "reason_codes": ["NO_OPEN_POSITION"], "intent_type": intent_type}
         side = "SELL" if existing_position.side == "long" else "BUY"
-        requested_quantity = existing_position.quantity if decision.decision == "exit" else existing_position.quantity * 0.5
+        reduce_fraction = 1.0 if decision.decision == "exit" else _reduce_fraction_for_decision(decision)
+        requested_quantity = existing_position.quantity * reduce_fraction
         reduce_only = True
 
     normalized_quantity = client.normalize_order_quantity(
@@ -2172,6 +2531,19 @@ def execute_live_trade(
     aggregate_fill_price = float(execution_result["average_fill_price"])
     aggregate_filled_quantity = float(execution_result["filled_quantity"])
     final_execution_status = str(execution_result["status"])
+    execution_quality = dict(execution_result.get("execution_quality") or {})
+    net_realized_pnl = realized_pnl - fee_paid
+    if execution_quality:
+        if aggregate_filled_quantity > 0 and abs(net_realized_pnl) > 1e-9:
+            execution_quality["decision_quality_status"] = "profit" if net_realized_pnl > 0 else "loss"
+        elif aggregate_filled_quantity > 0 and abs(net_realized_pnl) <= 1e-9:
+            execution_quality["decision_quality_status"] = "flat_or_pending"
+        order.metadata_json = {
+            **(order.metadata_json or {}),
+            "execution_quality": execution_quality,
+        }
+        session.add(order)
+        session.flush()
     create_exchange_pnl_snapshot(session, settings_row)
 
     try:
@@ -2220,6 +2592,28 @@ def execute_live_trade(
         session.add(order)
         session.flush()
 
+    position_management_payload: dict[str, object] | None = None
+    if position is not None:
+        if decision.decision in {"long", "short"}:
+            position_management_payload = seed_position_management_metadata(
+                position,
+                max_holding_minutes=decision.max_holding_minutes,
+                timeframe=decision.timeframe,
+                stop_loss=intent.stop_loss or position.stop_loss,
+                take_profit=intent.take_profit or position.take_profit,
+                reset_partial_take_profit=True,
+            )
+        elif decision.decision in {"reduce", "exit"}:
+            position_management_payload = (
+                position.metadata_json.get("position_management")
+                if isinstance(position.metadata_json, dict)
+                and isinstance(position.metadata_json.get("position_management"), dict)
+                else None
+            )
+        if position_management_payload is not None:
+            session.add(position)
+            session.flush()
+
     protection_result: dict[str, object] | None = None
     protective_order_ids: list[int] = []
     if position is not None and position.quantity > 0:
@@ -2257,6 +2651,12 @@ def execute_live_trade(
                 "emergency_action": protection_result["emergency_action"],
                 "intent_type": intent_type,
                 "execution_attempts": execution_result["attempts"],
+                "execution_quality": execution_quality,
+                "position_management": {
+                    "reduce_fraction": reduce_fraction,
+                    "rationale_codes": decision.rationale_codes,
+                    "metadata": position_management_payload,
+                },
             }
     else:
         _cancel_exit_orders(session, client, decision.symbol)
@@ -2276,11 +2676,21 @@ def execute_live_trade(
                 "slippage_pct": slippage_pct,
                 "intent_type": intent_type,
                 "execution_policy": execution_plan.to_payload(),
+                "execution_quality": execution_quality,
             },
         )
 
     latest_price = position.mark_price if position is not None else market_snapshot.latest_price
     refresh_open_position_marks(session, {decision.symbol: latest_price})
+    if (
+        position is not None
+        and decision.decision == "reduce"
+        and "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in set(decision.rationale_codes)
+        and aggregate_filled_quantity > 0
+    ):
+        position_management_payload = mark_partial_take_profit_taken(position)
+        session.add(position)
+        session.flush()
     try:
         refreshed_account_info = client.get_account_info()
     except Exception as exc:
@@ -2314,8 +2724,24 @@ def execute_live_trade(
             "intent_type": intent_type,
             "execution_policy": execution_plan.to_payload(),
             "execution_attempts": execution_result["attempts"],
+            "execution_quality": execution_quality,
+            "position_management": {
+                "reduce_fraction": reduce_fraction,
+                "rationale_codes": decision.rationale_codes,
+                "metadata": position_management_payload,
+            },
         },
     )
+    order.metadata_json = {
+        **(order.metadata_json or {}),
+        "position_management": {
+            "reduce_fraction": reduce_fraction,
+            "rationale_codes": decision.rationale_codes,
+            "metadata": position_management_payload,
+        },
+    }
+    session.add(order)
+    session.flush()
     return {
         "order_id": order.id,
         "position_id": order.position_id,
@@ -2331,4 +2757,10 @@ def execute_live_trade(
         "intent_type": intent_type,
         "execution_policy": execution_plan.to_payload(),
         "execution_attempts": execution_result["attempts"],
+        "execution_quality": execution_quality,
+        "position_management": {
+            "reduce_fraction": reduce_fraction,
+            "rationale_codes": decision.rationale_codes,
+            "metadata": position_management_payload,
+        },
     }

@@ -49,6 +49,13 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         max_same_tier_concentration_pct=2.5,
         stale_market_seconds=1800,
         slippage_threshold_pct=0.003,
+        adaptive_signal_enabled=True,
+        position_management_enabled=True,
+        break_even_enabled=True,
+        atr_trailing_stop_enabled=True,
+        partial_take_profit_enabled=True,
+        holding_edge_decay_enabled=True,
+        reduce_on_regime_shift_enabled=True,
         starting_equity=100000.0,
         ai_enabled=True,
         ai_provider="openai",
@@ -79,6 +86,13 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["binance_api_key_configured"] is True
     assert serialized["binance_api_secret_configured"] is True
     assert serialized["tracked_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert serialized["adaptive_signal_enabled"] is True
+    assert serialized["position_management_enabled"] is True
+    assert serialized["break_even_enabled"] is True
+    assert serialized["atr_trailing_stop_enabled"] is True
+    assert serialized["partial_take_profit_enabled"] is True
+    assert serialized["holding_edge_decay_enabled"] is True
+    assert serialized["reduce_on_regime_shift_enabled"] is True
     assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 2880
 
 
@@ -241,6 +255,29 @@ def test_get_or_create_settings_provides_new_defaults(db_session) -> None:
     assert serialized["ai_call_interval_minutes"] >= 5
     assert serialized["decision_cycle_interval_minutes"] >= 1
     assert serialized["tracked_symbols"]
+    assert serialized["adaptive_signal_enabled"] is False
+
+
+def test_serialize_settings_includes_adaptive_signal_summary(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    serialized = serialize_settings(row)
+
+    assert serialized["adaptive_signal_summary"]["enabled"] is True
+    assert "bounds" in serialized["adaptive_signal_summary"]
+    assert serialized["adaptive_signal_summary"]["data_fallback_rule"]
+
+
+def test_serialize_settings_includes_position_management_summary(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    serialized = serialize_settings(row)
+
+    assert serialized["position_management_summary"]["enabled"] is True
+    assert serialized["position_management_summary"]["protective_bias"] == "tighten_only"
+    assert serialized["position_management_summary"]["rules_enabled"]["break_even"] is True
+    assert serialized["position_management_summary"]["fixed_parameters"]["partial_take_profit_fraction"] == 0.25
+    assert serialized["position_management_summary"]["data_fallback_rule"]
 
 
 def test_serialize_settings_applies_hard_runtime_caps(db_session) -> None:
@@ -312,6 +349,9 @@ def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> 
     assert serialized["pause_severity"] == "warning"
     assert serialized["pause_recovery_class"] == "recoverable_system"
     assert serialized["operating_state"] == "PAUSED"
+    assert serialized["guard_mode_reason_category"] == "pause"
+    assert serialized["guard_mode_reason_code"] == "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE"
+    assert serialized["guard_mode_reason_message"] == "거래소 계좌 상태 동기화 실패로 시스템 pause 상태입니다."
     assert serialized["protection_recovery_status"] == "idle"
     assert serialized["missing_protection_symbols"] == []
     assert serialized["missing_protection_items"] == {}
@@ -397,6 +437,96 @@ def test_serialize_settings_includes_operational_summary_sections(db_session) ->
     assert "entry" in serialized["execution_policy_summary"]
     assert serialized["market_context_summary"]["context_timeframes"] == ["1h", "4h"]
     assert serialized["adaptive_protection_summary"]["mode"] == "adaptive_atr_regime_aware"
+
+
+def test_serialize_settings_reports_live_readiness_guard_reason(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.live_execution_armed = False
+    row.live_execution_armed_until = None
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["guard_mode_reason_category"] == "readiness"
+    assert serialized["guard_mode_reason_code"] == "LIVE_APPROVAL_REQUIRED"
+    assert serialized["guard_mode_reason_message"] == "실거래 승인 창이 닫혀 있어 가드 모드입니다."
+
+
+def test_serialize_settings_treats_manual_live_approval_as_indefinite_when_armed(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.live_execution_armed = True
+    row.live_execution_armed_until = None
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["live_execution_ready"] is True
+    assert serialized["guard_mode_reason_code"] is None
+
+
+def test_serialize_settings_reports_operating_state_guard_reason(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.trading_paused = False
+    row.pause_reason_code = None
+    row.pause_origin = None
+    row.pause_triggered_at = None
+    row.pause_reason_detail = {
+        "operating_state": "PROTECTION_REQUIRED",
+        "protection_recovery": {
+            "status": "recreating",
+            "missing_symbols": ["BTCUSDT"],
+            "missing_items": {"BTCUSDT": ["stop_loss", "take_profit"]},
+        },
+    }
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["guard_mode_reason_category"] == "operating_state"
+    assert serialized["guard_mode_reason_code"] == "PROTECTION_REQUIRED"
+    assert serialized["guard_mode_reason_message"] == "무보호 포지션이 감지되어 보호 복구 우선 상태입니다."
+
+
+def test_serialize_settings_reports_degraded_manage_only_guard_reason(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.trading_paused = False
+    row.pause_reason_code = None
+    row.pause_reason_detail = {
+        "operating_state": "DEGRADED_MANAGE_ONLY",
+        "protection_recovery": {
+            "status": "manage_only",
+            "missing_symbols": ["BTCUSDT"],
+            "missing_items": {"BTCUSDT": ["take_profit"]},
+        },
+    }
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["guard_mode_reason_category"] == "operating_state"
+    assert serialized["guard_mode_reason_code"] == "DEGRADED_MANAGE_ONLY"
+    assert serialized["guard_mode_reason_message"] == "보호 복구가 반복 실패해 관리 전용 상태로 가드 모드입니다."
+
+
+def test_serialize_settings_reports_emergency_exit_guard_reason(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.trading_paused = False
+    row.pause_reason_code = None
+    row.pause_reason_detail = {
+        "operating_state": "EMERGENCY_EXIT",
+        "protection_recovery": {
+            "status": "emergency_exit",
+            "missing_symbols": ["BTCUSDT"],
+            "missing_items": {"BTCUSDT": ["stop_loss"]},
+        },
+    }
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["guard_mode_reason_category"] == "operating_state"
+    assert serialized["guard_mode_reason_code"] == "EMERGENCY_EXIT"
+    assert serialized["guard_mode_reason_message"] == "비상 청산 상태가 진행 중이라 가드 모드입니다."
 
 
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:

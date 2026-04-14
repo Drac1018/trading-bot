@@ -6,8 +6,8 @@ import { AppNav } from "../components/nav";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "멀티 에이전트 트레이딩 콘솔",
-  description: "실거래 운영, 리스크 차단, 감사 로그를 위한 멀티 에이전트 트레이딩 운영 콘솔",
+  title: "실거래 운영 대시보드",
+  description: "실거래 상태, 리스크 차단, 수동 승인, 감사 로그를 위한 운영 대시보드",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

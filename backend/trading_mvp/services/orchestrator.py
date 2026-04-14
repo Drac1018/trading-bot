@@ -32,12 +32,13 @@ from trading_mvp.services.agents import (
     persist_agent_run,
 )
 from trading_mvp.services.ai_usage import get_openai_call_gate
+from trading_mvp.services.adaptive_signal import build_adaptive_signal_context
 from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
 from trading_mvp.services.backlog_insights import (
     build_signal_performance_report,
     build_structured_competitor_notes,
 )
-from trading_mvp.services.execution import execute_live_trade
+from trading_mvp.services.execution import apply_position_management, execute_live_trade
 from trading_mvp.services.features import compute_features, persist_feature_snapshot
 from trading_mvp.services.market_data import (
     build_market_context,
@@ -45,9 +46,11 @@ from trading_mvp.services.market_data import (
     persist_market_snapshot,
 )
 from trading_mvp.services.pause_control import attempt_auto_resume
+from trading_mvp.services.position_management import build_position_management_context
 from trading_mvp.services.risk import (
     HARD_MAX_GLOBAL_LEVERAGE,
     HARD_MAX_RISK_PER_TRADE,
+    build_ai_risk_budget_context,
     evaluate_risk,
     get_symbol_leverage_cap,
     get_symbol_risk_tier,
@@ -60,6 +63,22 @@ from trading_mvp.services.settings import (
     serialize_settings,
 )
 from trading_mvp.time_utils import utcnow_naive
+
+
+def _decision_analysis_context(feature_payload) -> dict[str, object]:
+    regime = feature_payload.regime
+    return {
+        "regime": {
+            "primary_regime": regime.primary_regime,
+            "trend_alignment": regime.trend_alignment,
+            "volatility_regime": regime.volatility_regime,
+        },
+        "flags": {
+            "weak_volume": regime.weak_volume,
+            "volatility_expanded": regime.volatility_regime == "expanded",
+            "momentum_weakening": regime.momentum_weakening,
+        },
+    }
 
 
 class TradingOrchestrator:
@@ -211,6 +230,7 @@ class TradingOrchestrator:
         upto_index: int | None = None,
         force_stale: bool = False,
         auto_resume_checked: bool = False,
+        logic_variant: str = "improved",
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
@@ -255,6 +275,23 @@ class TradingOrchestrator:
         feature_payload = compute_features(market_snapshot, higher_timeframe_context)
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
         open_positions = get_open_positions(self.session, symbol)
+        position_management_context = build_position_management_context(
+            open_positions[0] if open_positions else None,
+            feature_payload=feature_payload,
+            settings_row=self.settings_row,
+        )
+        position_management_result: dict[str, object] | None = None
+        if open_positions and self._should_execute_live(trigger_event):
+            position_management_result = apply_position_management(
+                self.session,
+                self.settings_row,
+                symbol=symbol,
+                feature_payload=feature_payload,
+            )
+            open_positions = get_open_positions(self.session, symbol)
+            position_management_context = dict(
+                position_management_result.get("position_management_context") or position_management_context
+            )
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
         runtime_state = summarize_runtime_state(self.settings_row)
         effective_leverage_cap = min(
@@ -272,6 +309,20 @@ class TradingOrchestrator:
             "protection_recovery_status": runtime_state["protection_recovery_status"],
             "missing_protection_symbols": runtime_state["missing_protection_symbols"],
             "missing_protection_items": runtime_state["missing_protection_items"],
+            "risk_budget": build_ai_risk_budget_context(
+                self.session,
+                self.settings_row,
+                decision_symbol=symbol,
+                equity=latest_pnl.equity,
+            ),
+            "position_management_context": position_management_context,
+            "adaptive_signal_context": build_adaptive_signal_context(
+                self.session,
+                enabled=self.settings_row.adaptive_signal_enabled,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=feature_payload.regime.primary_regime,
+            ),
         }
         openai_gate = get_openai_call_gate(
             self.session,
@@ -287,8 +338,15 @@ class TradingOrchestrator:
             risk_context,
             use_ai=openai_gate.allowed,
             max_input_candles=self.settings_row.ai_max_input_candles,
+            logic_variant=logic_variant,
         )
-        decision_metadata = {**decision_metadata, "gate": openai_gate.as_metadata()}
+        decision_metadata = {
+            **decision_metadata,
+            "gate": openai_gate.as_metadata(),
+            "logic_variant": logic_variant,
+            "analysis_context": _decision_analysis_context(feature_payload),
+            "position_management": position_management_result or {"position_management_context": position_management_context},
+        }
         decision_run = persist_agent_run(
             self.session,
             AgentRole.TRADING_DECISION,
@@ -307,7 +365,15 @@ class TradingOrchestrator:
             metadata_json=decision_metadata,
         )
         record_audit_event(self.session, event_type="agent_output", entity_type="agent_run", entity_id=str(decision_run.id), message="Trading decision generated.", payload={"provider": provider_name, "decision": decision.model_dump(mode="json")})
-        risk_result, risk_row = evaluate_risk(self.session, self.settings_row, decision, market_snapshot, decision_run_id=decision_run.id, market_snapshot_id=market_row.id)
+        risk_result, risk_row = evaluate_risk(
+            self.session,
+            self.settings_row,
+            decision,
+            market_snapshot,
+            decision_run_id=decision_run.id,
+            market_snapshot_id=market_row.id,
+            execution_mode="historical_replay" if trigger_event == "historical_replay" else "live",
+        )
         record_audit_event(self.session, event_type="risk_check", entity_type="risk_check", entity_id=str(risk_row.id), severity="warning" if not risk_result.allowed else "info", message="Risk check completed.", payload=risk_result.model_dump(mode="json"))
 
         execution_result: dict[str, object] | None = None
@@ -360,6 +426,7 @@ class TradingOrchestrator:
             "decision": decision.model_dump(mode="json"),
             "risk_result": risk_result.model_dump(mode="json"),
             "execution": execution_result,
+            "logic_variant": logic_variant,
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
@@ -374,6 +441,7 @@ class TradingOrchestrator:
         upto_index: int | None = None,
         force_stale: bool = False,
         auto_resume_checked: bool = False,
+        logic_variant: str = "improved",
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
@@ -392,6 +460,7 @@ class TradingOrchestrator:
                         upto_index=upto_index,
                         force_stale=force_stale,
                         auto_resume_checked=True,
+                        logic_variant=logic_variant,
                     )
                 )
             except Exception as exc:
@@ -424,6 +493,7 @@ class TradingOrchestrator:
             "cycles": len(results),
             "mode": "market_data_only" if not self.settings_row.ai_enabled else "ai_active",
             "failed_symbols": failed_symbols,
+            "logic_variant": logic_variant,
             "results": results,
             "account": self._account_snapshot_preview() if not self.settings_row.ai_enabled else account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),

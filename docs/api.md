@@ -4,7 +4,7 @@
 
 - `GET /health`
 
-서비스와 데이터베이스 초기화 상태를 확인한다. FastAPI `lifespan` 초기화가 끝난 뒤에만 `database=ready`가 반환된다.
+서비스와 데이터베이스 초기화 상태를 확인합니다.
 
 ## Settings
 
@@ -17,96 +17,39 @@
 
 ### `GET /api/settings`
 
-운영자가 설정 화면에서 바로 확인해야 하는 핵심 상태:
+운영 설정 화면에서 즉시 확인해야 하는 핵심 상태를 반환합니다.
 
-- `mode`
 - `live_execution_ready`
 - `trading_paused`
+- `guard_mode_reason_category`
+- `guard_mode_reason_code`
+- `guard_mode_reason_message`
 - `pause_reason_code`
 - `pause_origin`
-- `pause_reason_detail`
-- `pause_triggered_at`
-- `pause_severity`
-- `pause_recovery_class`
-- `auto_resume_after`
-- `auto_resume_whitelisted`
-- `auto_resume_eligible`
 - `auto_resume_status`
 - `auto_resume_last_blockers`
 - `latest_blocked_reasons`
 - `operating_state`
-- `protection_recovery_status`
-- `protection_recovery_active`
-- `protection_recovery_failure_count`
-- `missing_protection_symbols`
-- `missing_protection_items`
-
-운영 요약 필드:
-
 - `pnl_summary`
-  - `basis`
-  - `basis_note`
-  - `equity`
-  - `cash_balance`
-  - `net_realized_pnl`
-  - `unrealized_pnl`
-  - `daily_pnl`
-  - `cumulative_pnl`
-  - `consecutive_losses`
-  - `snapshot_time`
 - `account_sync_summary`
-  - `status`
-  - `reconciliation_mode`
-  - `freshness_seconds`
-  - `stale_after_seconds`
-  - `last_synced_at`
-  - `last_warning_reason_code`
-  - `last_warning_message`
-  - `note`
 - `exposure_summary`
-  - `reference_symbol`
-  - `reference_tier`
-  - `metrics`
-  - `limits`
-  - `headroom`
-  - `status`
 - `execution_policy_summary`
-  - `slippage_threshold_pct`
-  - `entry`
-  - `scale_in`
-  - `reduce`
-  - `exit`
-  - `protection`
 - `market_context_summary`
-  - `symbol`
-  - `base_timeframe`
-  - `context_timeframes`
-  - `primary_regime`
-  - `trend_alignment`
-  - `volatility_regime`
-  - `volume_regime`
-  - `momentum_state`
-  - `data_quality_flags`
-- `adaptive_protection_summary`
-  - `mode`
-  - `status`
-  - `active`
-  - `failure_count`
-  - `missing_symbols`
-  - `missing_items`
-  - `primary_regime`
-  - `volatility_regime`
-  - `summary`
+- `adaptive_signal_summary`
+- `position_management_summary`
 
 ## Dashboard
 
 - `GET /api/dashboard/overview`
+- `GET /api/dashboard/operator`
+- `GET /api/dashboard/profitability`
 - `GET /api/market/snapshots`
 - `GET /api/market/features`
 - `GET /api/decisions`
 - `GET /api/positions`
 - `GET /api/orders`
 - `GET /api/executions`
+- `GET /api/executions/report`
 - `GET /api/risk/checks`
 - `GET /api/agents`
 - `GET /api/scheduler`
@@ -115,105 +58,156 @@
 
 ### `GET /api/dashboard/overview`
 
-개요 화면에서 사용하는 주요 운영 상태:
+기존 overview 화면과 운영 요약 카드가 사용하는 기본 상태 응답입니다.
 
+- `mode`
+- `symbol`
+- `timeframe`
+- `latest_price`
+- `latest_decision`
+- `latest_risk`
+- `live_execution_ready`
 - `trading_paused`
+- `guard_mode_reason_*`
 - `pause_reason_code`
 - `pause_origin`
-- `pause_triggered_at`
-- `auto_resume_after`
 - `auto_resume_status`
-- `auto_resume_eligible`
 - `auto_resume_last_blockers`
 - `latest_blocked_reasons`
-- `pause_severity`
-- `pause_recovery_class`
 - `operating_state`
 - `protection_recovery_status`
-- `protection_recovery_active`
-- `protection_recovery_failure_count`
-- `missing_protection_symbols`
-- `missing_protection_items`
-- `protected_positions`
-- `unprotected_positions`
-- `position_protection_summary`
 - `pnl_summary`
 - `account_sync_summary`
 - `exposure_summary`
 - `execution_policy_summary`
 - `market_context_summary`
-- `adaptive_protection_summary`
+- `adaptive_signal_summary`
+
+### `GET /api/dashboard/operator`
+
+운영자 메인 화면 전용 snapshot입니다. 같은 흐름의 정보를 한 응답으로 묶어 보여줍니다.
+
+- `control`
+  - 지금 신규 진입 가능한지 판단하는 제어 상태
+  - `can_enter_new_position`
+  - `live_execution_ready`
+  - `approval_armed`
+  - `trading_paused`
+  - `operating_state`
+  - `guard_mode_reason_message`
+  - `pause_reason_code`
+  - `auto_resume_status`
+  - `latest_blocked_reasons`
+  - `auto_resume_last_blockers`
+  - `protected_positions`
+  - `unprotected_positions`
+  - `scheduler_status`
+  - `scheduler_window`
+- `market_signal`
+  - 최근 24h / 7d / 30d 성과 요약
+  - `performance_windows`
+  - `hold_blocked_summary`
+  - `adaptive_signal_summary`
+  - `market_context_summary`
+- `ai_decision`
+  - 최신 AI 제안
+  - `decision`
+  - `confidence`
+  - `rationale_codes`
+  - `explanation_short`
+  - `provider_name`
+  - `trigger_event`
+  - `decision_run_id`
+- `risk_guard`
+  - 최신 결정론적 승인 결과
+  - `allowed`
+  - `decision`
+  - `reason_codes`
+  - `approved_risk_pct`
+  - `approved_leverage`
+  - `operating_state`
+- `execution`
+  - 최신 판단과 연결된 주문/체결 결과
+  - `order_status`
+  - `execution_status`
+  - `requested_quantity`
+  - `filled_quantity`
+  - `average_fill_price`
+  - `execution_quality`
+- `execution_windows`
+  - 최근 실행 품질 요약
+  - `average_realized_slippage_pct`
+  - `partial_fill_orders`
+  - `repriced_orders`
+  - `aggressive_fallback_orders`
+- `audit_events`
+  - 최근 감사 이벤트 목록
+
+### `GET /api/dashboard/profitability`
+
+수익성 해석 전용 응답입니다.
+
+- `windows`
+  - `24h`, `7d`, `30d`
+  - 각 window에 `summary`, `rationale_winners`, `rationale_losers`, `top_regimes`, `top_symbols`, `top_timeframes`, `top_hold_conditions`
+- `execution_windows`
+- `hold_blocked_summary`
+- `adaptive_signal_summary`
+- `latest_decision`
+- `latest_risk`
+
+### `GET /api/audit`
+
+감사 로그 타임라인입니다. 감사 로그 화면의 탭 분류는 각 row의 `event_category`를 기준으로 동작합니다.
+
+지원 query:
+
+- `event_type`
+- `severity`
+- `search`
+- `limit`
+
+주요 응답 필드:
+
+- `event_type`
+- `event_category`
+  - `risk`
+  - `execution`
+  - `approval_control`
+  - `protection`
+  - `health_system`
+  - `ai_decision`
+- `entity_type`
+- `entity_id`
+- `severity`
+- `message`
+- `payload`
+- `created_at`
 
 ## Live Sync
 
 - `POST /api/live/sync`
 
-거래소 주문, 포지션, 계좌, 보호주문 상태를 동기화하고 운영 상태를 함께 반환한다.
-
-기본 응답 필드:
-
-- `symbols`
-- `synced_orders`
-- `synced_positions`
-- `equity`
-- `symbol_protection_state`
-- `unprotected_positions`
-- `emergency_actions_taken`
-- `operating_state`
-- `protection_recovery_status`
-- `protection_recovery_active`
-- `missing_protection_symbols`
-- `missing_protection_items`
-
-auto-resume 관련 필드:
-
-- `auto_resume_precheck`
-- `auto_resume_postcheck`
-- `auto_resume`
-
-각 auto-resume 결과의 공통 shape:
-
-- `attempted`
-- `resumed`
-- `allowed`
-- `status`
-- `reason_code`
-- `pause_origin`
-- `pause_severity`
-- `pause_recovery_class`
-- `trigger_source`
-- `blockers`
-- `symbol_blockers`
-- `blocker_details`
-- `evaluated_symbols`
-- `protective_orders`
-- `market_data_status`
-- `sync_status`
-- `approval_state`
-- `approval_detail`
+거래소 주문, 포지션, 계좌, 보호 주문 상태를 동기화하고 운영 상태를 다시 계산합니다.
 
 ## Binance Account
 
 - `GET /api/binance/account`
 
-Binance 계정 응답은 아래 세 가지를 분리해서 보여준다.
+Binance 원본 권한과 앱 내부 실주문 readiness를 분리해서 보여줍니다.
 
 - `exchange_can_trade`
-  - Binance 원본 `account_info.canTrade`
-  - 거래소 계정 권한만 의미하며, 앱 내부 실주문 가능 여부를 뜻하지 않는다.
 - `app_live_execution_ready`
-  - 앱 내부 `live_execution_ready`
-  - 키, 승인창, 환경 게이트 등 앱 실행 준비 상태를 의미한다.
-- `app_trading_paused` / `app_operating_state` / `latest_blocked_reasons`
-  - 현재 앱이 왜 신규 진입을 막고 있는지 보여주는 운영 상태 요약이다.
-
-호환성을 위해 기존 `can_trade` 필드는 유지되며, 값은 `exchange_can_trade`와 동일하다.
+- `app_trading_paused`
+- `app_operating_state`
+- `latest_blocked_reasons`
 
 ## Reviews / Cycles
 
 - `POST /api/cycles/run`
 - `POST /api/reviews/{window}`
 - `POST /api/replay/run`
+- `POST /api/replay/validation`
 
 ## Backlog
 
@@ -231,4 +225,5 @@ Binance 계정 응답은 아래 세 가지를 분리해서 보여준다.
 - `python -m trading_mvp.cli cycle`
 - `python -m trading_mvp.cli replay --cycles 5 --start-index 140`
 - `python -m trading_mvp.cli review --window 24h`
+- `python -m trading_mvp.cli replay-compare --cycles 12 --start-index 90 --timeframe 15m --symbols BTCUSDT`
 - `python -m trading_mvp.cli export-schemas`

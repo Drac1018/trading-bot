@@ -78,17 +78,91 @@ type SignalPerformanceEntry = {
   approvals: number;
   orders: number;
   fills: number;
+  holds: number;
+  longs: number;
+  shorts: number;
+  reduces: number;
+  exits: number;
   wins: number;
   losses: number;
   realized_pnl_total: number;
+  fee_total: number;
+  net_realized_pnl_total: number;
   average_slippage_pct: number;
   latest_seen_at: string;
+};
+
+type PerformanceAggregateEntry = {
+  key: string;
+  decisions: number;
+  approvals: number;
+  orders: number;
+  fills: number;
+  holds: number;
+  longs: number;
+  shorts: number;
+  reduces: number;
+  exits: number;
+  wins: number;
+  losses: number;
+  realized_pnl_total: number;
+  fee_total: number;
+  net_realized_pnl_total: number;
+  average_slippage_pct: number;
+  latest_seen_at: string;
+};
+
+type FeatureFlagPerformanceEntry = {
+  flag_name: string;
+  enabled: PerformanceAggregateEntry;
+  disabled: PerformanceAggregateEntry;
+};
+
+type PerformanceWindowSummary = {
+  decisions: number;
+  approvals: number;
+  orders: number;
+  fills: number;
+  holds: number;
+  longs: number;
+  shorts: number;
+  reduces: number;
+  exits: number;
+  wins: number;
+  losses: number;
+  realized_pnl_total: number;
+  fee_total: number;
+  net_realized_pnl_total: number;
+  average_slippage_pct: number;
+  average_holding_minutes: number;
+  holding_over_plan_count: number;
+  stop_loss_closes: number;
+  take_profit_closes: number;
+  manual_closes: number;
+  unclassified_closes: number;
+  snapshot_net_pnl_estimate: number;
+};
+
+type PerformanceWindowReport = {
+  window_label: string;
+  window_hours: number;
+  summary: PerformanceWindowSummary;
+  rationale_codes: PerformanceAggregateEntry[];
+  symbols: PerformanceAggregateEntry[];
+  timeframes: PerformanceAggregateEntry[];
+  regimes: PerformanceAggregateEntry[];
+  trend_alignments: PerformanceAggregateEntry[];
+  directions: PerformanceAggregateEntry[];
+  hold_conditions: PerformanceAggregateEntry[];
+  close_outcomes: PerformanceAggregateEntry[];
+  feature_flags: FeatureFlagPerformanceEntry[];
 };
 
 type SignalPerformanceReport = {
   generated_at: string;
   window_hours: number;
   items: SignalPerformanceEntry[];
+  windows: PerformanceWindowReport[];
 };
 
 type StructuredCompetitorNote = {
@@ -223,6 +297,163 @@ function SignalPerformanceSection({ report }: { report: SignalPerformanceReport 
             </div>
           </article>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function PerformanceMiniTable({
+  title,
+  description,
+  items,
+}: {
+  title: string;
+  description: string;
+  items: PerformanceAggregateEntry[];
+}) {
+  return (
+    <section className="rounded-2xl border border-amber-100 bg-white p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h4 className="text-sm font-semibold text-slate-900">{title}</h4>
+          <p className="mt-1 text-xs leading-5 text-slate-500">{description}</p>
+        </div>
+        <Badge>{items.length}</Badge>
+      </div>
+      <div className="mt-4 space-y-3">
+        {items.length > 0 ? (
+          items.map((item) => (
+            <div key={item.key} className="rounded-2xl bg-canvas p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-sm font-semibold text-slate-900">{item.key}</p>
+                <Badge>hold {item.holds}</Badge>
+              </div>
+              <div className="mt-2 grid gap-2 text-xs text-slate-600 sm:grid-cols-3">
+                <span>net {formatDisplayValue(item.net_realized_pnl_total, "realized_pnl")}</span>
+                <span>decisions {item.decisions}</span>
+                <span>fills {item.fills}</span>
+              </div>
+            </div>
+          ))
+        ) : (
+          <EmptyState message="No data in this window." />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function SignalPerformanceInsightsSection({ report }: { report: SignalPerformanceReport | null }) {
+  if (!report || report.windows.length === 0) {
+    return null;
+  }
+
+  const primaryWindow = report.windows.find((item) => item.window_hours === report.window_hours) ?? report.windows[0];
+  const topRationales = report.items.slice(0, 4);
+
+  return (
+    <section className="rounded-[1.8rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+      <SectionHeader
+        title="Strategy Analytics"
+        description={`Recent ${report.window_hours}h performance by regime, direction, hold conditions, and feature flags.`}
+        count={primaryWindow.summary.decisions}
+      />
+      <p className="mt-3 text-xs text-slate-500">Generated {formatDisplayValue(report.generated_at, "created_at")}</p>
+      <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-2xl bg-canvas p-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Net Realized</p>
+          <p className="mt-2 text-lg font-semibold text-slate-900">
+            {formatDisplayValue(primaryWindow.summary.net_realized_pnl_total, "realized_pnl")}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            fee {formatDisplayValue(primaryWindow.summary.fee_total, "realized_pnl")}
+          </p>
+        </div>
+        <div className="rounded-2xl bg-canvas p-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Decision Mix</p>
+          <p className="mt-2 text-sm text-slate-700">
+            hold {primaryWindow.summary.holds} / long {primaryWindow.summary.longs} / short {primaryWindow.summary.shorts}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            fills {primaryWindow.summary.fills} / approvals {primaryWindow.summary.approvals}
+          </p>
+        </div>
+        <div className="rounded-2xl bg-canvas p-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Close Outcome</p>
+          <p className="mt-2 text-sm text-slate-700">
+            TP {primaryWindow.summary.take_profit_closes} / SL {primaryWindow.summary.stop_loss_closes}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            manual {primaryWindow.summary.manual_closes} / other {primaryWindow.summary.unclassified_closes}
+          </p>
+        </div>
+        <div className="rounded-2xl bg-canvas p-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Tracking Basis</p>
+          <p className="mt-2 text-sm text-slate-700">
+            snapshot {formatDisplayValue(primaryWindow.summary.snapshot_net_pnl_estimate, "realized_pnl")}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">MFE/MAE hook ready via replay path</p>
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-4 xl:grid-cols-3">
+        <PerformanceMiniTable
+          title="Regime"
+          description="Which market regime produced the best net result."
+          items={primaryWindow.regimes.slice(0, 4)}
+        />
+        <PerformanceMiniTable
+          title="Direction"
+          description="Long, short, and hold mix in the same window."
+          items={primaryWindow.directions.slice(0, 4)}
+        />
+        <PerformanceMiniTable
+          title="Hold Conditions"
+          description="Conditions where hold decisions clustered most often."
+          items={primaryWindow.hold_conditions.slice(0, 4)}
+        />
+      </div>
+
+      <div className="mt-5 grid gap-4 xl:grid-cols-2">
+        <section className="rounded-2xl border border-amber-100 bg-white p-4">
+          <h4 className="text-sm font-semibold text-slate-900">Rationale Codes</h4>
+          <p className="mt-1 text-xs text-slate-500">Loss-heavy rationale codes surface here first.</p>
+          <div className="mt-4 space-y-3">
+            {topRationales.map((item) => (
+              <div key={item.rationale_code} className="rounded-2xl bg-canvas p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-semibold text-slate-900">{item.rationale_code}</p>
+                  <Badge>hold {item.holds}</Badge>
+                </div>
+                <div className="mt-2 grid gap-2 text-xs text-slate-600 sm:grid-cols-4">
+                  <span>net {formatDisplayValue(item.net_realized_pnl_total, "realized_pnl")}</span>
+                  <span>w/l {item.wins}/{item.losses}</span>
+                  <span>orders {item.orders}</span>
+                  <span>fills {item.fills}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-amber-100 bg-white p-4">
+          <h4 className="text-sm font-semibold text-slate-900">Feature Flags</h4>
+          <p className="mt-1 text-xs text-slate-500">Enabled vs disabled performance for the core regime flags.</p>
+          <div className="mt-4 space-y-3">
+            {primaryWindow.feature_flags.map((item) => (
+              <div key={item.flag_name} className="rounded-2xl bg-canvas p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-semibold text-slate-900">{item.flag_name}</p>
+                  <Badge>enabled {item.enabled.decisions}</Badge>
+                </div>
+                <div className="mt-2 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
+                  <span>on {formatDisplayValue(item.enabled.net_realized_pnl_total, "realized_pnl")}</span>
+                  <span>off {formatDisplayValue(item.disabled.net_realized_pnl_total, "realized_pnl")}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
       </div>
     </section>
   );
@@ -667,7 +898,7 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
       </section>
 
       <section className="grid gap-5 xl:grid-cols-2">
-        <SignalPerformanceSection report={board.signal_performance_report} />
+        <SignalPerformanceInsightsSection report={board.signal_performance_report} />
         <StructuredCompetitorSection digest={board.structured_competitor_notes} />
       </section>
 

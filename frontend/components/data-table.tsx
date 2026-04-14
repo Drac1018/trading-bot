@@ -10,6 +10,7 @@ type Row = Record<string, unknown>;
 
 const preferredColumnOrder = [
   "status",
+  "event_category",
   "protected",
   "protective_order_count",
   "has_stop_loss",
@@ -35,6 +36,7 @@ const preferredColumnOrder = [
 ];
 
 const detailColumnSet = new Set([
+  "event_category",
   "input_payload",
   "output_payload",
   "payload",
@@ -101,11 +103,15 @@ function splitColumns(rows: Row[]) {
 export function DataTable({
   title,
   description,
-  rows
+  rows,
+  emptyStateTitle,
+  emptyStateDescription
 }: {
   title: string;
   description: string;
   rows: Row[];
+  emptyStateTitle?: string;
+  emptyStateDescription?: string;
 }) {
   const { primary, detail } = splitColumns(rows);
 
@@ -123,7 +129,8 @@ export function DataTable({
 
       {rows.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-amber-300 px-4 py-8 text-sm text-slate-500">
-          아직 표시할 데이터가 없습니다.
+          <p className="font-semibold text-slate-700">{emptyStateTitle ?? "표시할 데이터가 없습니다."}</p>
+          <p className="mt-2 leading-6">{emptyStateDescription ?? "현재 조건에 맞는 항목이 아직 없습니다."}</p>
         </div>
       ) : (
         <div className="grid gap-4 2xl:grid-cols-2">
@@ -145,21 +152,21 @@ export function DataTable({
                       {formatDisplayValue(row.provider_name, "provider_name")}
                     </span>
                   ) : null}
-                {typeof row.mode === "string" ? (
-                  <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
-                    {formatDisplayValue(row.mode, "mode")}
-                  </span>
-                ) : null}
-                {typeof row.protected === "boolean" ? (
-                  <span
-                    className={`rounded-full px-3 py-1 text-xs font-medium ${
-                      row.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
-                    }`}
-                  >
-                    {row.protected ? "보호됨" : "보호 확인 필요"}
-                  </span>
-                ) : null}
-              </div>
+                  {typeof row.mode === "string" ? (
+                    <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                      {formatDisplayValue(row.mode, "mode")}
+                    </span>
+                  ) : null}
+                  {typeof row.protected === "boolean" ? (
+                    <span
+                      className={`rounded-full px-3 py-1 text-xs font-medium ${
+                        row.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
+                      }`}
+                    >
+                      {row.protected ? "보호됨" : "보호 확인 필요"}
+                    </span>
+                  ) : null}
+                </div>
               </div>
 
               <dl className="mt-4 grid gap-3 md:grid-cols-2">
@@ -176,7 +183,7 @@ export function DataTable({
               {detail.length > 0 ? (
                 <details className="mt-4 rounded-2xl border border-amber-200 bg-white">
                   <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-ink">
-                    세부 Payload 보기
+                    세부 payload 보기
                   </summary>
                   <div className="space-y-4 border-t border-amber-100 px-4 py-4">
                     {detail.map((column) => (

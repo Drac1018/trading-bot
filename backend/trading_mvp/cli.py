@@ -19,6 +19,7 @@ from trading_mvp.schemas import (
     MarketSnapshotPayload,
     ProductBacklogDetailResponse,
     ProductBacklogItem,
+    ReplayValidationRequest,
     RiskCheckResult,
     SchedulerRunRecord,
     SignalPerformanceReportResponse,
@@ -29,6 +30,7 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.backlog_auto_apply import auto_apply_supported_backlogs
 from trading_mvp.services.orchestrator import TradingOrchestrator
+from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.scheduler import run_window
 from trading_mvp.services.seed import seed_demo_data
 
@@ -69,6 +71,12 @@ def main() -> None:
     replay_parser.add_argument("--cycles", type=int, default=10)
     replay_parser.add_argument("--start-index", type=int, default=90)
 
+    replay_compare_parser = subparsers.add_parser("replay-compare")
+    replay_compare_parser.add_argument("--cycles", type=int, default=30)
+    replay_compare_parser.add_argument("--start-index", type=int, default=90)
+    replay_compare_parser.add_argument("--timeframe", default="15m")
+    replay_compare_parser.add_argument("--symbols", nargs="*", default=[])
+
     review_parser = subparsers.add_parser("review")
     review_parser.add_argument("--window", required=True, choices=["1h", "4h", "12h", "24h"])
 
@@ -102,6 +110,14 @@ def main() -> None:
                 )
             session.commit()
             output = {"cycles": len(outputs), "results": outputs}
+        elif args.command == "replay-compare":
+            payload = ReplayValidationRequest(
+                cycles=args.cycles,
+                start_index=args.start_index,
+                timeframe=args.timeframe,
+                symbols=args.symbols,
+            )
+            output = build_replay_validation_report(session, payload).model_dump(mode="json")
         elif args.command == "export-schemas":
             export_schemas(Path("schemas/generated"))
             output = {"status": "ok", "target": "schemas/generated"}

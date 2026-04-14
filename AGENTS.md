@@ -1,53 +1,218 @@
 # AGENTS.md
 
-이 저장소의 현재 최우선 목표는 **실거래에 안전한 Binance Futures 단기/단타 트레이딩 코어 안정화**다.
-장기적으로는 멀티 에이전트 자동매매 플랫폼으로 확장 가능해야 하지만, 현재는 실거래 코어가 우선이다.
+## Project
+This repository is a real-trading-oriented crypto trading bot.
+The system must prioritize safety, deterministic behavior, auditability, and operational clarity over aggressiveness.
 
-## 작업 원칙
+Primary goals:
+- protect capital first
+- keep execution deterministic
+- separate AI judgment from hard risk controls
+- preserve clear operator visibility in dashboard / scheduler / audit log
+- prevent silent state mismatch
 
-* 먼저 현재 저장소 구조와 실제 구현 상태를 점검할 것
-* 불필요한 전면 재작성은 하지 말 것
-* AI 판단, 결정론적 리스크 검증, 주문 실행, 상태 관리, 설정/제어, 감사/로그를 분리할 것
-* 실거래 안전성과 추적 가능성을 해치는 변경은 금지
-* 세부 규칙은 각 하위 디렉터리의 `AGENTS.md`가 있으면 그것을 따를 것
+---
 
-## 현재 우선순위
+## Core principles
 
-1. 거래 루프와 시스템 경계 파악
-2. 위험한 결합 구조와 누락된 안전장치 식별
-3. 실거래 안전 구조로 리팩터링
-4. `risk_guard` 중심의 최종 실행 관문 정리
-5. 테스트와 문서 정합성 유지
+1. AI is advisory or decision-producing, but never the final unrestricted authority.
+2. A hard risk guard must always run before any live order submission.
+3. If data is stale, missing, contradictory, or low-confidence, prefer HOLD / BLOCK / NO-TRADE.
+4. Position protection is more important than new entry.
+5. Dashboard values, scheduler values, and audit-log values must be derived from consistent sources of truth.
+6. Never fake successful execution. If uncertain, expose degraded/unknown state explicitly.
+7. Live trading safety is more important than UI completeness.
 
-## 하드 안전 원칙
+---
 
-* 결정론적 정책은 항상 AI보다 우선
-* 실주문은 AI 출력만으로 실행되면 안 됨
-* pause / emergency / manual control / audit trail 유지 필수
-* 계좌/시장 상태를 신뢰할 수 없으면 신규 진입 차단
-* 슬리피지, 레버리지, 손실 한도는 하드 규칙으로 검증
+## Architecture intent
 
-## 필수 리스크 기준
+The expected high-level flow is:
 
-* BTC 최대 5x
-* 메이저 알트 최대 3x
-* 일반 알트 최대 2x
-* 1회 거래 최대 손실 2%
-* 일일 손실 한도 5%
-* 연속 손실 3회 이후 보수적 제한
-* 총 증거금, 방향 편중, 상관관계 위험, 포지션 합산 위험 계산 필수
+1. market/account/position data collection
+2. AI or rule-based decision generation
+3. hard risk validation
+4. execution eligibility check
+5. exchange order submission
+6. order/protection sync
+7. state persistence
+8. dashboard / scheduler / audit-log reflection
 
-## 검증
+AI must not bypass:
+- exchange tradability checks
+- app-level live-trading approval state
+- risk limits
+- protection-order requirements
+- failure backoff / guard mode
 
-변경 범위에 필요한 최소 테스트만 우선 실행하라.
-루트 `AGENTS.md`에는 무거운 전체 테스트를 강제하지 말고, 세부 테스트는 하위 `AGENTS.md`에 둘 것.
+---
 
-## 최종 보고
+## Non-negotiable rules
 
-최종 인계에는 반드시 아래를 포함할 것:
+- Do not remove hard risk checks in order to increase trading frequency.
+- Do not merge app-level approval and exchange-level tradability into one ambiguous field.
+- Do not mark an order as successful until exchange acknowledgement is confirmed.
+- Do not show optimistic UI states that are not backed by persisted state.
+- Do not silently swallow exceptions in live-order paths.
+- Do not introduce broad refactors unless required for correctness.
+- Do not break existing API response shapes unless explicitly updating schema and docs together.
 
-1. 무엇이 바뀌었는지
-2. 생성/수정된 `AGENTS.md` 파일 목록
-3. 각 파일의 적용 범위
-4. 실행한 검증 명령
-5. 남은 리스크 또는 다음 단계
+---
+
+## Trading safety requirements
+
+### Approval and tradability
+The system must clearly separate:
+- exchange raw tradability status (example: canTrade)
+- app internal live-trading approval status
+- risk-engine allow/block result
+- temporary guard/backoff state
+
+These must never be conflated into a single boolean without explanation.
+
+### Risk guard
+Before live execution, always validate at minimum:
+- max single-position limit
+- directional bias limit
+- total exposure
+- available margin / balance sanity
+- daily loss limit
+- consecutive loss limit
+- manual guard mode
+- failure backoff
+- required protection-order constraints if applicable
+
+### Protection orders
+Protection-order handling must be consistent across:
+- submit
+- query
+- cancel
+- sync
+- dashboard reflection
+
+### Fail-safe behavior
+When exchange/account sync fails:
+- degrade safely
+- block new live entry if correctness is uncertain
+- preserve observability
+- expose reason in API/UI/audit trail
+
+---
+
+## Code change policy
+
+When making changes:
+1. first inspect related schemas, services, routes, UI bindings, tests, and docs
+2. prefer minimal targeted patches
+3. keep naming explicit and operator-readable
+4. preserve backward compatibility when possible
+5. update tests with every behavior change
+6. update docs/api.md or equivalent when response fields or meanings change
+
+Do not patch UI text only if the underlying state logic is incorrect.
+Do not patch backend logic only if the dashboard interpretation remains inconsistent.
+
+---
+
+## Repository areas to inspect first
+
+Typical priority:
+- backend/trading_mvp/services/
+- backend/trading_mvp/schemas.py
+- backend/trading_mvp/main.py
+- frontend/components/
+- frontend/app/
+- docs/api.md
+- tests/
+
+If issue is about order execution, inspect first:
+- execution service
+- exchange/binance service
+- risk service
+- pause/guard/backoff control
+- dashboard aggregation logic
+
+If issue is about UI inconsistency, inspect both:
+- backend response generation
+- frontend rendering / label mapping / fallback copy
+
+---
+
+## Expected response style for analysis tasks
+
+When asked to analyze before coding, respond in this structure:
+
+1. Current behavior
+2. Root cause
+3. Risk / impact
+4. Files to change
+5. Proposed patch plan
+6. Test cases
+7. Open assumptions / uncertainties
+
+Be concrete. Prefer file-level guidance over generic advice.
+
+---
+
+## Expected response style for implementation tasks
+
+When asked to implement:
+- summarize intended change briefly
+- list files you will modify
+- implement minimal coherent patch
+- add/update tests
+- note any migrations or manual verification steps
+- report remaining edge cases honestly
+
+---
+
+## Testing expectations
+
+At minimum, after code changes:
+- run the most relevant unit/integration tests for modified area
+- verify schemas and API docs if response meanings changed
+- verify UI state mapping if dashboard text changed
+
+Priority test themes:
+- approval state separation
+- risk block reasons
+- guard/backoff transitions
+- protection-order sync
+- scheduler/dashboard/audit consistency
+- stale account/position handling
+- deterministic fallback behavior
+
+---
+
+## Auditability requirements
+
+Any block/hold/guard/live-trading denial should be explainable through user-visible fields.
+Reasons should be operator-readable, not only developer-readable.
+Avoid ambiguous labels like "unavailable" if the actual state is:
+- approval missing
+- exchange denied
+- risk blocked
+- backoff active
+- account sync stale
+
+---
+
+## Performance and scope discipline
+
+- Prefer correctness over premature optimization.
+- Avoid large rewrites unless needed to eliminate repeated inconsistency.
+- If a fix is too broad, propose phased patches:
+  - phase 1: correctness and safety
+  - phase 2: UX cleanup
+  - phase 3: refactor
+
+---
+
+## Done definition
+
+A task is considered done only when:
+- logic is corrected
+- UI meaning matches backend meaning
+- tests are updated
+- docs are updated where needed
+- no known silent inconsistency remains in the modified path
