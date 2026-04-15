@@ -147,6 +147,20 @@ def _recent_role_runs(session: Session, role: str, *, limit: int = 25) -> list[A
     )
 
 
+def _agent_run_symbol(row: AgentRun) -> str | None:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    if isinstance(metadata.get("symbol"), str) and metadata.get("symbol"):
+        return str(metadata["symbol"]).upper()
+    input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+    market_snapshot = input_payload.get("market_snapshot")
+    if isinstance(market_snapshot, dict) and isinstance(market_snapshot.get("symbol"), str):
+        return str(market_snapshot["symbol"]).upper()
+    output_payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    if isinstance(output_payload.get("symbol"), str) and output_payload.get("symbol"):
+        return str(output_payload["symbol"]).upper()
+    return None
+
+
 def get_openai_call_gate(
     session: Session,
     settings_row: Setting,
@@ -154,6 +168,9 @@ def get_openai_call_gate(
     trigger_event: str,
     *,
     has_openai_key: bool,
+    symbol: str | None = None,
+    cooldown_minutes_override: int | None = None,
+    manual_guard_minutes_override: int | None = None,
 ) -> OpenAICallGate:
     if not settings_row.ai_enabled:
         return OpenAICallGate(allowed=False, reason="ai_disabled")
@@ -165,7 +182,10 @@ def get_openai_call_gate(
         return OpenAICallGate(allowed=False, reason="historical_replay_disabled")
 
     now = utcnow_naive()
-    recent_runs = _recent_role_runs(session, role)
+    recent_runs = _recent_role_runs(session, role, limit=100 if symbol else 25)
+    if symbol is not None:
+        symbol_upper = symbol.upper()
+        recent_runs = [row for row in recent_runs if _agent_run_symbol(row) == symbol_upper]
     latest_attempt = next((row for row in recent_runs if is_ai_attempt(row)), None)
     latest_success = next((row for row in recent_runs if is_ai_success(row)), None)
 
@@ -186,7 +206,11 @@ def get_openai_call_gate(
     if role != "trading_decision":
         return OpenAICallGate(allowed=True, reason="allowed")
 
-    manual_guard = manual_ai_guard_minutes(settings_row)
+    manual_guard = (
+        manual_guard_minutes_override
+        if manual_guard_minutes_override is not None
+        else manual_ai_guard_minutes(settings_row)
+    )
     if trigger_event == "manual":
         if latest_attempt is not None:
             retry_at = latest_attempt.created_at + timedelta(minutes=manual_guard)
@@ -200,9 +224,14 @@ def get_openai_call_gate(
                 )
         return OpenAICallGate(allowed=True, reason="allowed", manual_guard_minutes=manual_guard)
 
-    cooldown_cutoff = now - timedelta(minutes=settings_row.ai_call_interval_minutes)
+    cooldown_minutes = (
+        cooldown_minutes_override
+        if cooldown_minutes_override is not None
+        else settings_row.ai_call_interval_minutes
+    )
+    cooldown_cutoff = now - timedelta(minutes=cooldown_minutes)
     if latest_success is not None and latest_success.created_at > cooldown_cutoff:
-        retry_at = latest_success.created_at + timedelta(minutes=settings_row.ai_call_interval_minutes)
+        retry_at = latest_success.created_at + timedelta(minutes=cooldown_minutes)
         return OpenAICallGate(
             allowed=False,
             reason="success_cooldown_active",

@@ -22,7 +22,14 @@ from trading_mvp.services.execution import execute_live_trade, sync_live_state
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_success
-from trading_mvp.services.scheduler import run_interval_decision_cycle, run_window
+from trading_mvp.services.scheduler import (
+    is_interval_decision_due,
+    run_exchange_sync_cycle,
+    run_interval_decision_cycle,
+    run_market_refresh_cycle,
+    run_position_management_cycle,
+    run_window,
+)
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import get_or_create_settings
@@ -178,7 +185,7 @@ def test_ai_enabled_hourly_window_only_refreshes_market_data(monkeypatch, db_ses
     assert result["window"] == "1h"
     assert result["outcome"]["mode"] == "market_refresh"
     assert scheduler_run is not None
-    assert scheduler_run.workflow == "market_refresh"
+    assert scheduler_run.workflow == "market_refresh_cycle"
     assert db_session.scalar(select(MarketSnapshot).limit(1)) is not None
     assert db_session.scalar(select(FeatureSnapshot).limit(1)) is None
     assert db_session.scalar(select(AgentRun).limit(1)) is None
@@ -677,20 +684,247 @@ def test_run_exchange_sync_cycle_records_failure_without_raising(monkeypatch, db
     assert "interval failure" in result["error"]
 
 
+def test_scheduler_exchange_sync_cycle_records_workflow(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.sync_live_state",
+        lambda session, settings_row, symbol=None: {"status": "ok", "symbols": ["BTCUSDT"]},
+    )
+
+    result = run_exchange_sync_cycle(db_session, triggered_by="scheduler")
+    scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
+
+    assert result["workflow"] == "exchange_sync_cycle"
+    assert scheduler_run is not None
+    assert scheduler_run.workflow == "exchange_sync_cycle"
+    assert scheduler_run.status == "success"
+
+
 def test_run_interval_decision_cycle_marks_failure_instead_of_raising(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
     db_session.add(settings_row)
     db_session.flush()
 
     def fail_cycle(self, trigger_event="realtime_cycle", **kwargs):
         raise RuntimeError("interval failure")
 
-    monkeypatch.setattr(TradingOrchestrator, "run_selected_symbols_cycle", fail_cycle)
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fail_cycle)
 
     result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
     scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
 
-    assert result["outcome"]["error"] == "interval failure"
+    assert result["results"][0]["outcome"]["error"] == "interval failure"
     assert scheduler_run is not None
     assert scheduler_run.status == "failed"
+
+
+def test_scheduler_market_refresh_cycle_runs_without_ai_or_new_entry(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = False
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    db_session.flush()
+
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=utcnow_naive(),
+        latest_price=70100.0,
+        latest_volume=1000.0,
+        candle_count=1,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(
+                timestamp=utcnow_naive(),
+                open=70000.0,
+                high=70200.0,
+                low=69900.0,
+                close=70100.0,
+                volume=1000.0,
+            )
+        ],
+    )
+    monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+
+    result = run_market_refresh_cycle(db_session, triggered_by="scheduler")
+
+    assert result["workflow"] == "market_refresh_cycle"
+    assert result["results"][0]["status"] == "success"
+    assert db_session.scalar(select(MarketSnapshot).limit(1)) is not None
+    assert db_session.scalar(select(AgentRun).limit(1)) is None
+    assert db_session.scalar(select(Order).limit(1)) is None
+
+
+def test_scheduler_position_management_cycle_does_not_create_new_entry(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.position_management_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.flush()
+
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=utcnow_naive(),
+        latest_price=70050.0,
+        latest_volume=1000.0,
+        candle_count=1,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(
+                timestamp=utcnow_naive(),
+                open=70000.0,
+                high=70100.0,
+                low=69900.0,
+                close=70050.0,
+                volume=1000.0,
+            )
+        ],
+    )
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_market_context",
+        lambda **kwargs: {
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+            "4h": snapshot.model_copy(update={"timeframe": "4h"}),
+        },
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.apply_position_management",
+        lambda *args, **kwargs: {"status": "applied", "position_management_action": {"action": "tighten_stop"}},
+    )
+
+    from trading_mvp.models import Position
+
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=69500.0,
+            mark_price=70050.0,
+            leverage=2.0,
+            stop_loss=69000.0,
+            take_profit=71000.0,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    result = run_position_management_cycle(db_session, triggered_by="scheduler")
+
+    assert result["workflow"] == "position_management_cycle"
+    assert result["results"][0]["status"] == "success"
+    assert db_session.scalar(select(AgentRun).limit(1)) is None
+    assert db_session.scalar(select(RiskCheck).limit(1)) is None
+
+
+def test_decision_cycle_skips_duplicate_same_candle_entry(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.live_trading_enabled = False
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.flush()
+
+    snapshot_time = utcnow_naive()
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70000.0,
+        latest_volume=1000.0,
+        candle_count=1,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(
+                timestamp=snapshot_time,
+                open=69900.0,
+                high=70100.0,
+                low=69800.0,
+                close=70000.0,
+                volume=1000.0,
+            )
+        ],
+    )
+    monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_market_context",
+        lambda **kwargs: {
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+            "4h": snapshot.model_copy(update={"timeframe": "4h"}),
+        },
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_exchange_sync_cycle",
+        lambda self, **kwargs: {"status": "ok", "symbols": ["BTCUSDT"]},
+    )
+
+    orchestrator = TradingOrchestrator(db_session)
+    first = orchestrator.run_decision_cycle(trigger_event="manual", exchange_sync_checked=True)
+    second = orchestrator.run_decision_cycle(trigger_event="manual", exchange_sync_checked=True)
+
+    assert first["decision_run_id"] is not None
+    assert second["status"] == "same_candle_skipped"
+    assert second["decision_run_id"] is None
+
+
+def test_symbol_due_uses_override_specific_interval(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+    settings_row.decision_cycle_interval_minutes = 15
+    settings_row.symbol_cadence_overrides = [
+        {"symbol": "BTCUSDT", "decision_cycle_interval_minutes_override": 5, "ai_call_interval_minutes_override": 10},
+        {"symbol": "ETHUSDT", "decision_cycle_interval_minutes_override": 10, "ai_call_interval_minutes_override": 15},
+        {"symbol": "XRPUSDT", "decision_cycle_interval_minutes_override": 30, "ai_call_interval_minutes_override": 30},
+    ]
+    now = utcnow_naive()
+    db_session.add_all(
+        [
+            SchedulerRun(
+                schedule_window="5m",
+                workflow="interval_decision_cycle",
+                status="success",
+                triggered_by="scheduler",
+                next_run_at=now - timedelta(minutes=1),
+                outcome={"symbol": "BTCUSDT"},
+            ),
+            SchedulerRun(
+                schedule_window="10m",
+                workflow="interval_decision_cycle",
+                status="success",
+                triggered_by="scheduler",
+                next_run_at=now + timedelta(minutes=3),
+                outcome={"symbol": "ETHUSDT"},
+            ),
+            SchedulerRun(
+                schedule_window="30m",
+                workflow="interval_decision_cycle",
+                status="success",
+                triggered_by="scheduler",
+                next_run_at=now + timedelta(minutes=20),
+                outcome={"symbol": "XRPUSDT"},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    assert is_interval_decision_due(db_session, "BTCUSDT") is True
+    assert is_interval_decision_due(db_session, "ETHUSDT") is False
+    assert is_interval_decision_due(db_session, "XRPUSDT") is False

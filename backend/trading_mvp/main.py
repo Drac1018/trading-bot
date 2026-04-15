@@ -60,7 +60,7 @@ from trading_mvp.services.execution import run_live_test_order, sync_live_state
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.replay_validation import build_replay_validation_report
-from trading_mvp.services.scheduler import run_window
+from trading_mvp.services.scheduler import run_due_operational_cycles, run_due_windows, run_window
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import (
     arm_live_execution,
@@ -72,23 +72,41 @@ from trading_mvp.services.settings import (
 )
 
 
-async def _background_exchange_poll_loop() -> None:
+async def _background_scheduler_loop() -> None:
     while True:
         polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
         with polling_session_factory() as session:
-            orchestrator = TradingOrchestrator(session)
-            result = orchestrator.run_exchange_sync_cycle(trigger_event="background_poll")
-            session.commit()
-            interval_seconds = max(30, int(orchestrator.settings_row.decision_cycle_interval_minutes) * 60)
-            if result.get("status") == "error":
-                interval_seconds = min(interval_seconds, 60)
+            settings_row = get_or_create_settings(session)
+            try:
+                run_due_operational_cycles(session)
+                run_due_windows(session)
+                session.commit()
+            except Exception as exc:
+                record_audit_event(
+                    session,
+                    event_type="background_scheduler_failed",
+                    entity_type="scheduler",
+                    entity_id="background",
+                    severity="error",
+                    message="Background scheduler loop failed.",
+                    payload={"error": str(exc)},
+                )
+                record_health_event(
+                    session,
+                    component="scheduler",
+                    status="error",
+                    message="Background scheduler loop failed.",
+                    payload={"error": str(exc)},
+                )
+                session.commit()
+            interval_seconds = max(15, min(int(settings_row.exchange_sync_interval_seconds), 30))
         await asyncio.sleep(interval_seconds)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
-    poll_task = asyncio.create_task(_background_exchange_poll_loop())
+    poll_task = asyncio.create_task(_background_scheduler_loop())
     try:
         yield
     finally:

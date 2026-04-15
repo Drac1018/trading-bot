@@ -1,52 +1,63 @@
 # Execution Flow
 
-현재 저장소의 기본 흐름은 **시장/계좌 상태 수집 -> AI 판단 -> `risk_guard` 검증 -> 주문 실행 -> 감사/동기화**입니다.
+현재 운영 루프는 하나의 interval decision cycle에 모든 책임을 몰아넣지 않고, 아래 4개 cycle로 분리됩니다.
 
-## 실거래 결정 루프
+## 운영 cycle
 
-1. Binance 시장 데이터를 수집해 `market_snapshots`에 저장
-2. 특징을 계산해 `feature_snapshots`에 저장
-3. Trading Decision AI가 구조화된 `TradeDecision` 생성
-4. 스키마 검증 통과 여부 확인
-5. `risk_guard`가 아래를 최종 검증
-   - pause 상태
-   - 계좌 / 시장 데이터 신뢰성
-   - 레버리지 / 거래당 리스크 / 일일 손실 한도
-   - 손절 / 익절 유효성
-   - 슬리피지
-   - live approval / 환경 게이트
-6. 허용되면 실행 계층이 Binance 주문 생성
-7. 주문 / 체결 / 포지션 / PnL / 감사 로그 갱신
-8. 실패하면 alert / audit / health event 기록
+1. `exchange_sync_cycle`
+   - 계좌, 포지션, 오픈 오더, 보호주문 상태 동기화만 수행
+   - AI 호출 금지
+   - 신규 진입 판단 금지
+   - 전역 `exchange_sync_interval_seconds`만 사용
 
-## 상태 제어 경계
+2. `market_refresh_cycle`
+   - 심볼별 시장 스냅샷 수집
+   - 필요 시 feature 계산을 위한 기반만 갱신
+   - 신규 진입 판단 금지
+   - 심볼별 `market_refresh_interval_minutes` effective cadence 사용
 
-- `settings.py`
-  - pause / resume
-  - live arm / disarm
-  - approval window
-  - 운영 설정 직렬화
-- `risk.py`
-  - 최종 허용 / 차단 관문
-- `execution.py`
-  - 실주문 생성
-  - 보호 주문 생성
-  - 동기화 / 거절 처리
-- `audit.py`
-  - alert / audit event / health event 기록
+3. `position_management_cycle`
+   - 열린 포지션이 있을 때만 break-even, trailing, partial take-profit, edge decay, reduce 강화 수행
+   - 신규 진입 금지
+   - `tighten_only` 유지
+   - 심볼별 `position_management_interval_seconds` effective cadence 사용
 
-## 중요한 보수 규칙
+4. `interval_decision_cycle`
+   - 신규 진입/축소/청산 판단의 중심 루프
+   - AI 판단, deterministic baseline, `risk_guard`, live execution 담당
+   - exchange sync / position management를 매번 강제로 포함하지 않음
+   - 심볼별 `decision_cycle_interval_minutes` effective cadence 사용
 
-- AI가 `long` 또는 `short`를 제안해도 `risk_guard`가 막으면 주문은 나가지 않습니다.
-- pause 상태에서는 신규 거래가 차단됩니다.
-- 보호 주문 생성 실패는 시스템 중지 사유가 됩니다.
-- 거래소 계좌 상태를 읽지 못하면 신규 진입보다 중지가 우선합니다.
+## 전역 기본값 + symbol override
 
-## 스케줄러
+- 전역 설정:
+  - `default_timeframe`
+  - `exchange_sync_interval_seconds`
+  - `market_refresh_interval_minutes`
+  - `position_management_interval_seconds`
+  - `decision_cycle_interval_minutes`
+  - `ai_call_interval_minutes`
+- 심볼별 override:
+  - `timeframe_override`
+  - `market_refresh_interval_minutes_override`
+  - `position_management_interval_seconds_override`
+  - `decision_cycle_interval_minutes_override`
+  - `ai_call_interval_minutes_override`
+  - `enabled`
 
-- `decision_cycle_interval_minutes`
-  - 시장 갱신 및 거래 의사결정 루프
-- `4h`, `12h`, `24h`
-  - Integration Planner, UI/UX, Product Improvement 배치 리뷰
+override가 비어 있으면 전역값을 그대로 상속합니다.
 
-`1h` 창은 중복 AI 호출을 만들지 않도록 현재는 시장 새로고침/상태 점검 성격으로 제한됩니다.
+## 중복 신규 진입 방지
+
+- base timeframe이 `15m`여도 decision cycle을 `5m`로 더 촘촘히 돌릴 수 있습니다.
+- 단, 같은 base candle 안에서는 동일 symbol의 신규 진입 평가를 다시 만들지 않습니다.
+- 현재 1차 구현은 `latest decision market_snapshot.snapshot_time == current snapshot_time`이면 same-candle 신규 진입 평가를 skip합니다.
+- 열린 포지션의 보호 관리는 `position_management_cycle`에서 더 자주 실행할 수 있습니다.
+
+## 안전 경계
+
+- `risk_guard`는 여전히 최종 허용/차단 관문입니다.
+- pause, guard mode, live approval, protection recovery, stale sync 차단 로직은 그대로 유지됩니다.
+- `historical_replay`는 live execution을 절대 수행하지 않습니다.
+- AI가 꺼져 있어도 exchange sync, market refresh, position management는 계속 실행할 수 있습니다.
+- 보호주문 관련 stop widening은 허용되지 않으며, 관리 로직은 항상 보호 방향 우선입니다.

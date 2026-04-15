@@ -46,6 +46,36 @@ type ProtectionSyncState = {
   missing_components?: string[];
 };
 
+type SymbolCadenceOverride = {
+  symbol: string;
+  enabled: boolean;
+  timeframe_override: string | null;
+  market_refresh_interval_minutes_override: number | null;
+  position_management_interval_seconds_override: number | null;
+  decision_cycle_interval_minutes_override: number | null;
+  ai_call_interval_minutes_override: number | null;
+};
+
+type SymbolEffectiveCadence = {
+  symbol: string;
+  enabled: boolean;
+  uses_global_defaults: boolean;
+  timeframe: string;
+  market_refresh_interval_minutes: number;
+  position_management_interval_seconds: number;
+  decision_cycle_interval_minutes: number;
+  ai_call_interval_minutes: number;
+  estimated_monthly_ai_calls: number;
+  last_market_refresh_at: string | null;
+  last_position_management_at: string | null;
+  last_decision_at: string | null;
+  last_ai_decision_at: string | null;
+  next_market_refresh_due_at: string | null;
+  next_position_management_due_at: string | null;
+  next_decision_due_at: string | null;
+  next_ai_call_due_at: string | null;
+};
+
 export type SettingsPayload = {
   id: number;
   mode: string;
@@ -89,7 +119,12 @@ export type SettingsPayload = {
   default_symbol: string;
   tracked_symbols: string[];
   default_timeframe: string;
+  exchange_sync_interval_seconds: number;
+  market_refresh_interval_minutes: number;
+  position_management_interval_seconds: number;
   schedule_windows: string[];
+  symbol_cadence_overrides: SymbolCadenceOverride[];
+  symbol_effective_cadences: SymbolEffectiveCadence[];
   max_leverage: number;
   max_risk_per_trade: number;
   max_daily_loss: number;
@@ -164,7 +199,7 @@ type FormState = Omit<
   | "id" | "mode" | "operating_state" | "protection_recovery_status" | "protection_recovery_active"
   | "protection_recovery_failure_count" | "missing_protection_symbols" | "missing_protection_items"
   | "pnl_summary" | "account_sync_summary" | "exposure_summary" | "execution_policy_summary" | "market_context_summary" | "adaptive_protection_summary" | "adaptive_signal_summary"
-  | "position_management_summary"
+  | "position_management_summary" | "symbol_effective_cadences"
   | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
@@ -199,6 +234,27 @@ class ApiRequestError extends Error {
 
 function uniqueSymbols(values: string[]) { return Array.from(new Set(values.map((item) => item.trim().toUpperCase()).filter(Boolean))); }
 
+function numberOrNull(value: string) {
+  if (!value.trim()) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeSymbolOverrides(overrides: SymbolCadenceOverride[]) {
+  const seen = new Set<string>();
+  return overrides
+    .map((item) => ({
+      ...item,
+      symbol: item.symbol.trim().toUpperCase(),
+      timeframe_override: item.timeframe_override?.trim() ? item.timeframe_override.trim() : null,
+    }))
+    .filter((item) => {
+      if (!item.symbol || seen.has(item.symbol)) return false;
+      seen.add(item.symbol);
+      return true;
+    });
+}
+
 function toFormState(initial: SettingsPayload): FormState {
   return {
     live_trading_enabled: initial.live_trading_enabled,
@@ -207,7 +263,11 @@ function toFormState(initial: SettingsPayload): FormState {
     default_symbol: initial.default_symbol,
     tracked_symbols: initial.tracked_symbols,
     default_timeframe: initial.default_timeframe,
+    exchange_sync_interval_seconds: initial.exchange_sync_interval_seconds,
+    market_refresh_interval_minutes: initial.market_refresh_interval_minutes,
+    position_management_interval_seconds: initial.position_management_interval_seconds,
     schedule_windows: initial.schedule_windows,
+    symbol_cadence_overrides: initial.symbol_cadence_overrides,
     max_leverage: initial.max_leverage,
     max_risk_per_trade: initial.max_risk_per_trade,
     max_daily_loss: initial.max_daily_loss,
@@ -579,6 +639,28 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
 
   const projectedBreakdown = useMemo(() => Object.entries(state.projected_monthly_ai_calls_breakdown_if_enabled), [state.projected_monthly_ai_calls_breakdown_if_enabled]);
   const mergedSymbols = useMemo(() => uniqueSymbols([...form.tracked_symbols, ...form.custom_symbols.split(",")]), [form.custom_symbols, form.tracked_symbols]);
+  const overrideRows = useMemo(
+    () =>
+      mergedSymbols.map((symbol) => {
+        const existing = form.symbol_cadence_overrides.find((item) => item.symbol === symbol);
+        return (
+          existing ?? {
+            symbol,
+            enabled: true,
+            timeframe_override: null,
+            market_refresh_interval_minutes_override: null,
+            position_management_interval_seconds_override: null,
+            decision_cycle_interval_minutes_override: null,
+            ai_call_interval_minutes_override: null,
+          }
+        );
+      }),
+    [form.symbol_cadence_overrides, mergedSymbols],
+  );
+  const effectiveCadenceBySymbol = useMemo(
+    () => Object.fromEntries(state.symbol_effective_cadences.map((item) => [item.symbol, item])),
+    [state.symbol_effective_cadences],
+  );
   const adaptiveSignalSummary = state.adaptive_signal_summary ?? {};
   const positionManagementSummary = state.position_management_summary ?? {};
 
@@ -595,6 +677,30 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
 
   const syncSettings = (next: SettingsPayload) => { setState(next); setForm(toFormState(next)); };
   const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((current) => ({ ...current, [key]: value }));
+  const updateSymbolOverride = (
+    symbol: string,
+    patch: Partial<SymbolCadenceOverride>,
+  ) => {
+    setForm((current) => {
+      const currentRows = normalizeSymbolOverrides(current.symbol_cadence_overrides);
+      const existing = currentRows.find((item) => item.symbol === symbol);
+      const nextRow: SymbolCadenceOverride = {
+        symbol,
+        enabled: existing?.enabled ?? true,
+        timeframe_override: existing?.timeframe_override ?? null,
+        market_refresh_interval_minutes_override: existing?.market_refresh_interval_minutes_override ?? null,
+        position_management_interval_seconds_override: existing?.position_management_interval_seconds_override ?? null,
+        decision_cycle_interval_minutes_override: existing?.decision_cycle_interval_minutes_override ?? null,
+        ai_call_interval_minutes_override: existing?.ai_call_interval_minutes_override ?? null,
+        ...patch,
+      };
+      const withoutCurrent = currentRows.filter((item) => item.symbol !== symbol);
+      return {
+        ...current,
+        symbol_cadence_overrides: normalizeSymbolOverrides([...withoutCurrent, nextRow]),
+      };
+    });
+  };
 
   const payload = {
     live_trading_enabled: form.live_trading_enabled,
@@ -603,7 +709,13 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     default_symbol: form.default_symbol,
     tracked_symbols: mergedSymbols.length > 0 ? mergedSymbols : [form.default_symbol],
     default_timeframe: form.default_timeframe,
+    exchange_sync_interval_seconds: form.exchange_sync_interval_seconds,
+    market_refresh_interval_minutes: form.market_refresh_interval_minutes,
+    position_management_interval_seconds: form.position_management_interval_seconds,
     schedule_windows: form.schedule_windows,
+    symbol_cadence_overrides: normalizeSymbolOverrides(
+      form.symbol_cadence_overrides.filter((item) => mergedSymbols.includes(item.symbol)),
+    ),
     max_leverage: form.max_leverage,
     max_risk_per_trade: form.max_risk_per_trade,
     max_daily_loss: form.max_daily_loss,
@@ -611,6 +723,12 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     stale_market_seconds: form.stale_market_seconds,
     slippage_threshold_pct: form.slippage_threshold_pct,
     adaptive_signal_enabled: form.adaptive_signal_enabled,
+    position_management_enabled: form.position_management_enabled,
+    break_even_enabled: form.break_even_enabled,
+    atr_trailing_stop_enabled: form.atr_trailing_stop_enabled,
+    partial_take_profit_enabled: form.partial_take_profit_enabled,
+    holding_edge_decay_enabled: form.holding_edge_decay_enabled,
+    reduce_on_regime_shift_enabled: form.reduce_on_regime_shift_enabled,
     starting_equity: form.starting_equity,
     ai_enabled: form.ai_enabled,
     ai_provider: form.ai_provider,
@@ -769,6 +887,15 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               <Field label="기본 타임프레임">
                 <input className={inputClass} value={form.default_timeframe} onChange={(event) => updateField("default_timeframe", event.target.value)} />
               </Field>
+              <Field label="거래소 동기화 주기(초)" hint="계좌/포지션/오더 상태는 전역 공용 주기로만 동기화합니다.">
+                <input className={inputClass} type="number" min={30} max={3600} value={form.exchange_sync_interval_seconds} onChange={(event) => updateField("exchange_sync_interval_seconds", Number(event.target.value))} />
+              </Field>
+              <Field label="시장 갱신 주기(분)" hint="신규 진입 판단 없이 시세 스냅샷만 수집합니다.">
+                <input className={inputClass} type="number" min={1} max={1440} value={form.market_refresh_interval_minutes} onChange={(event) => updateField("market_refresh_interval_minutes", Number(event.target.value))} />
+              </Field>
+              <Field label="포지션 관리 주기(초)" hint="열린 포지션 보호 관리만 수행합니다. 신규 진입 판단은 하지 않습니다.">
+                <input className={inputClass} type="number" min={30} max={3600} value={form.position_management_interval_seconds} onChange={(event) => updateField("position_management_interval_seconds", Number(event.target.value))} />
+              </Field>
               <Field label="최대 레버리지" hint="런타임 하드 상한은 5x로 유지됩니다.">
                 <input className={inputClass} type="number" min={1} max={5} step="0.1" value={form.max_leverage} onChange={(event) => updateField("max_leverage", Number(event.target.value))} />
               </Field>
@@ -790,6 +917,96 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               <Field label="시작 자본">
                 <input className={inputClass} type="number" min={1} value={form.starting_equity} onChange={(event) => updateField("starting_equity", Number(event.target.value))} />
               </Field>
+            </div>
+
+            <div className="rounded-2xl border border-amber-200 bg-white p-4">
+              <p className="text-sm font-semibold text-slate-900">운영 주기 기본값</p>
+              <p className="mt-2 text-sm leading-6 text-slate-600">
+                전역 기본값은 전체 tracked symbol의 기준 cadence입니다. symbol override를 비우면 전역값을 그대로 상속합니다.
+              </p>
+              <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">신규 판단 주기</p><p className="mt-2 text-sm font-semibold text-slate-900">{form.decision_cycle_interval_minutes}분</p></div>
+                <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">AI 최소 호출 간격</p><p className="mt-2 text-sm font-semibold text-slate-900">{form.ai_call_interval_minutes}분</p></div>
+                <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">시장 갱신</p><p className="mt-2 text-sm font-semibold text-slate-900">{form.market_refresh_interval_minutes}분</p></div>
+                <div className="rounded-2xl bg-canvas px-4 py-3"><p className="text-xs text-slate-500">포지션 관리</p><p className="mt-2 text-sm font-semibold text-slate-900">{form.position_management_interval_seconds}초</p></div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-amber-200 bg-white p-4">
+              <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">심볼별 운영 주기 override</p>
+                  <p className="text-sm leading-6 text-slate-600">BTC/ETH 같은 core symbol은 더 짧게, satellite symbol은 더 보수적으로 운영할 수 있습니다.</p>
+                </div>
+                <StatusPill>{mergedSymbols.length}개 심볼</StatusPill>
+              </div>
+              <div className="mt-4 overflow-x-auto">
+                <table className="min-w-full divide-y divide-amber-100 text-sm">
+                  <thead className="bg-canvas text-left text-xs uppercase tracking-[0.2em] text-slate-500">
+                    <tr>
+                      <th className="px-3 py-3">심볼</th>
+                      <th className="px-3 py-3">사용</th>
+                      <th className="px-3 py-3">타임프레임</th>
+                      <th className="px-3 py-3">시장 갱신</th>
+                      <th className="px-3 py-3">포지션 관리</th>
+                      <th className="px-3 py-3">신규 판단</th>
+                      <th className="px-3 py-3">AI 최소 호출</th>
+                      <th className="px-3 py-3">실효 cadence</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-amber-100">
+                    {overrideRows.map((row) => {
+                      const effective = effectiveCadenceBySymbol[row.symbol];
+                      return (
+                        <tr key={row.symbol} className="align-top">
+                          <td className="px-3 py-3 font-semibold text-slate-900">{row.symbol}</td>
+                          <td className="px-3 py-3">
+                            <input checked={row.enabled} onChange={(event) => updateSymbolOverride(row.symbol, { enabled: event.target.checked })} type="checkbox" />
+                          </td>
+                          <td className="px-3 py-3">
+                            <input className={inputClass} value={row.timeframe_override ?? ""} onChange={(event) => updateSymbolOverride(row.symbol, { timeframe_override: event.target.value || null })} placeholder="전역값 사용" />
+                          </td>
+                          <td className="px-3 py-3">
+                            <input className={inputClass} type="number" min={1} max={1440} value={row.market_refresh_interval_minutes_override ?? ""} onChange={(event) => updateSymbolOverride(row.symbol, { market_refresh_interval_minutes_override: numberOrNull(event.target.value) })} placeholder={`${form.market_refresh_interval_minutes}`} />
+                          </td>
+                          <td className="px-3 py-3">
+                            <input className={inputClass} type="number" min={30} max={3600} value={row.position_management_interval_seconds_override ?? ""} onChange={(event) => updateSymbolOverride(row.symbol, { position_management_interval_seconds_override: numberOrNull(event.target.value) })} placeholder={`${form.position_management_interval_seconds}`} />
+                          </td>
+                          <td className="px-3 py-3">
+                            <input className={inputClass} type="number" min={1} max={1440} value={row.decision_cycle_interval_minutes_override ?? ""} onChange={(event) => updateSymbolOverride(row.symbol, { decision_cycle_interval_minutes_override: numberOrNull(event.target.value) })} placeholder={`${form.decision_cycle_interval_minutes}`} />
+                          </td>
+                          <td className="px-3 py-3">
+                            <input className={inputClass} type="number" min={5} max={1440} value={row.ai_call_interval_minutes_override ?? ""} onChange={(event) => updateSymbolOverride(row.symbol, { ai_call_interval_minutes_override: numberOrNull(event.target.value) })} placeholder={`${form.ai_call_interval_minutes}`} />
+                          </td>
+                          <td className="px-3 py-3">
+                            {effective ? (
+                              <div className="space-y-2">
+                                <p className="font-semibold text-slate-900">
+                                  {effective.uses_global_defaults ? "전역 상속" : "override 적용"}
+                                </p>
+                                <p className="text-xs leading-5 text-slate-600">
+                                  {effective.timeframe} / 시장 {effective.market_refresh_interval_minutes}분 / 관리 {effective.position_management_interval_seconds}초 / 판단 {effective.decision_cycle_interval_minutes}분 / AI {effective.ai_call_interval_minutes}분
+                                </p>
+                                <p className="text-xs leading-5 text-slate-500">
+                                  월간 AI 예상 {effective.estimated_monthly_ai_calls.toLocaleString("ko-KR")}회
+                                </p>
+                                <p className="text-xs leading-5 text-slate-500">
+                                  마지막 시장 갱신 {formatDisplayValue(effective.last_market_refresh_at, "last_market_refresh_at")} / 마지막 판단 {formatDisplayValue(effective.last_decision_at, "last_decision_at")}
+                                </p>
+                                <p className="text-xs leading-5 text-slate-500">
+                                  다음 시장 갱신 {formatDisplayValue(effective.next_market_refresh_due_at, "next_run_at")} / 다음 판단 {formatDisplayValue(effective.next_decision_due_at, "next_run_at")}
+                                </p>
+                              </div>
+                            ) : (
+                              <p className="text-xs text-slate-500">저장 후 실효 cadence가 계산됩니다.</p>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
             <Toggle checked={form.adaptive_signal_enabled} label="적응형 신호 조정 사용" onChange={(value) => updateField("adaptive_signal_enabled", value)} />
@@ -859,8 +1076,8 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <Field label="제공자"><select className={inputClass} value={form.ai_provider} onChange={(event) => updateField("ai_provider", event.target.value as "openai" | "mock")}><option value="openai">OpenAI</option><option value="mock">Mock</option></select></Field>
             <Field label="모델"><input className={inputClass} value={form.ai_model} onChange={(event) => updateField("ai_model", event.target.value)} /></Field>
             <Field label="Temperature"><input className={inputClass} type="number" min={0} max={1} step="0.05" value={form.ai_temperature} onChange={(event) => updateField("ai_temperature", Number(event.target.value))} /></Field>
-            <Field label="의사결정 주기(분)"><input className={inputClass} type="number" min={1} value={form.decision_cycle_interval_minutes} onChange={(event) => updateField("decision_cycle_interval_minutes", Number(event.target.value))} /></Field>
-            <Field label="최소 AI 호출 간격(분)"><input className={inputClass} type="number" min={5} value={form.ai_call_interval_minutes} onChange={(event) => updateField("ai_call_interval_minutes", Number(event.target.value))} /></Field>
+            <Field label="전역 신규 판단 주기(분)" hint="symbol override가 없을 때만 사용됩니다. 같은 15m 캔들 안에서는 중복 신규 진입 평가를 막습니다."><input className={inputClass} type="number" min={1} value={form.decision_cycle_interval_minutes} onChange={(event) => updateField("decision_cycle_interval_minutes", Number(event.target.value))} /></Field>
+            <Field label="전역 AI 최소 호출 간격(분)" hint="의사결정 주기보다 짧아도 AI 호출은 이 간격보다 더 자주 일어나지 않습니다."><input className={inputClass} type="number" min={5} value={form.ai_call_interval_minutes} onChange={(event) => updateField("ai_call_interval_minutes", Number(event.target.value))} /></Field>
             <Field label="AI 입력 캔들 수"><input className={inputClass} type="number" min={16} max={200} value={form.ai_max_input_candles} onChange={(event) => updateField("ai_max_input_candles", Number(event.target.value))} /></Field>
             <Field label="OpenAI API Key"><input className={inputClass} type="password" autoComplete="off" value={form.openai_api_key} onChange={(event) => updateField("openai_api_key", event.target.value)} placeholder="sk-..." /></Field>
           </div>

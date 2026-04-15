@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     default_symbol: str = "BTCUSDT"
     tracked_symbols: str = "BTCUSDT"
     default_timeframe: str = "15m"
+    exchange_sync_interval_seconds: int = 60
+    market_refresh_interval_minutes: int = 1
+    position_management_interval_seconds: int = 60
     live_trading_enabled: bool = False
     live_trading_env_enabled: bool = False
     manual_live_approval: bool = False
@@ -46,8 +49,8 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4.1-mini"
     app_secret_seed: str = "change-me-local-dev-secret"
     ai_provider: str = "openai"
-    ai_call_interval_minutes: int = 30
-    decision_cycle_interval_minutes: int = 15
+    ai_call_interval_minutes: int = 10
+    decision_cycle_interval_minutes: int = 5
     ai_max_input_candles: int = 32
     ai_temperature: float = 0.1
     binance_market_data_enabled: bool = False

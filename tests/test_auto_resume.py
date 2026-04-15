@@ -281,8 +281,8 @@ def test_scheduler_path_attempts_auto_resume_before_interval_cycle(db_session, m
     )
     monkeypatch.setattr(
         TradingOrchestrator,
-        "run_selected_symbols_cycle",
-        lambda self, **kwargs: {"status": "ok", "results": [], "mode": "ai_active"},
+        "run_decision_cycle",
+        lambda self, **kwargs: {"symbol": "BTCUSDT", "status": "ok"},
     )
 
     result = run_interval_decision_cycle(db_session, triggered_by="scheduler")

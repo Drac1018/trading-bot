@@ -58,6 +58,8 @@ from trading_mvp.services.risk import (
 from trading_mvp.services.runtime_state import summarize_runtime_state
 from trading_mvp.services.settings import (
     get_effective_symbols,
+    get_effective_symbol_schedule,
+    get_effective_symbol_settings,
     get_or_create_settings,
     get_runtime_credentials,
     serialize_settings,
@@ -118,6 +120,47 @@ class TradingOrchestrator:
             "background_poll",
         }
 
+    def _effective_symbol_settings(self, symbol: str):
+        return get_effective_symbol_settings(self.settings_row, symbol.upper())
+
+    def _latest_decision_snapshot_time(self, symbol: str, timeframe: str) -> str | None:
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(AgentRun.role == AgentRole.TRADING_DECISION.value)
+                .order_by(desc(AgentRun.created_at))
+                .limit(100)
+            )
+        )
+        symbol_upper = symbol.upper()
+        for row in rows:
+            input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+            market_snapshot = input_payload.get("market_snapshot")
+            if not isinstance(market_snapshot, dict):
+                continue
+            if str(market_snapshot.get("symbol", "")).upper() != symbol_upper:
+                continue
+            if str(market_snapshot.get("timeframe", "")) != timeframe:
+                continue
+            snapshot_time = market_snapshot.get("snapshot_time")
+            if isinstance(snapshot_time, str) and snapshot_time:
+                return snapshot_time
+        return None
+
+    def _should_skip_same_candle_entry(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        market_snapshot: MarketSnapshotPayload,
+        has_open_position: bool,
+    ) -> bool:
+        if has_open_position:
+            return False
+        latest_snapshot_time = self._latest_decision_snapshot_time(symbol, timeframe)
+        if latest_snapshot_time is None:
+            return False
+        return latest_snapshot_time == market_snapshot.snapshot_time.isoformat()
 
     def _latest_alerts(self, limit: int = 5) -> list[Alert]:
         return list(self.session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(limit)))
@@ -239,33 +282,37 @@ class TradingOrchestrator:
     def run_market_refresh_cycle(
         self,
         *,
+        symbols: list[str] | None = None,
         timeframe: str | None = None,
         upto_index: int | None = None,
         force_stale: bool = False,
         status: str = "market_refresh",
         trigger_event: str = TriggerEvent.MANUAL.value,
         auto_resume_checked: bool = False,
+        include_exchange_sync: bool = False,
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
             auto_resume_checked=auto_resume_checked,
         )
-        timeframe = timeframe or self.settings_row.default_timeframe
         exchange_sync_result: dict[str, object] | None = None
-        if self._should_poll_exchange_state(trigger_event):
+        if include_exchange_sync and self._should_poll_exchange_state(trigger_event):
             exchange_sync_result = self.run_exchange_sync_cycle(trigger_event=trigger_event)
-        symbols = get_effective_symbols(self.settings_row)
+        selected_symbols = [item.upper() for item in symbols] if symbols else get_effective_symbols(self.settings_row)
         results: list[dict[str, object]] = []
-        for symbol in symbols:
+        for symbol in selected_symbols:
+            effective_settings = self._effective_symbol_settings(symbol)
+            effective_timeframe = timeframe or effective_settings.timeframe
             market_snapshot, market_row = self._collect_market_snapshot(
                 symbol=symbol,
-                timeframe=timeframe,
+                timeframe=effective_timeframe,
                 upto_index=upto_index,
                 force_stale=force_stale,
             )
             results.append(
                 {
                     "symbol": symbol,
+                    "timeframe": effective_timeframe,
                     "market_snapshot_id": market_row.id,
                     "snapshot_time": market_snapshot.snapshot_time.isoformat(),
                     "latest_price": market_snapshot.latest_price,
@@ -273,7 +320,7 @@ class TradingOrchestrator:
                 }
             )
         return {
-            "symbols": symbols,
+            "symbols": selected_symbols,
             "cycles": len(results),
             "mode": status,
             "results": results,
@@ -281,6 +328,65 @@ class TradingOrchestrator:
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
             "exchange_sync": exchange_sync_result,
+        }
+
+    def run_position_management_cycle(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        upto_index: int | None = None,
+        force_stale: bool = False,
+        trigger_event: str = TriggerEvent.MANUAL.value,
+    ) -> dict[str, object]:
+        symbol = symbol.upper()
+        effective_settings = self._effective_symbol_settings(symbol)
+        effective_timeframe = timeframe or effective_settings.timeframe
+        open_positions = get_open_positions(self.session, symbol)
+        if not open_positions:
+            return {
+                "symbol": symbol,
+                "timeframe": effective_timeframe,
+                "status": "no_open_position",
+                "new_entries_allowed": False,
+                "execution": None,
+            }
+        market_snapshot, market_row = self._collect_market_snapshot(
+            symbol=symbol,
+            timeframe=effective_timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+        )
+        market_context = build_market_context(
+            symbol=symbol,
+            base_timeframe=effective_timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+            use_binance=self.settings_row.binance_market_data_enabled,
+            binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+            stale_threshold_seconds=self.settings_row.stale_market_seconds,
+        )
+        higher_timeframe_context = {
+            tf: payload for tf, payload in market_context.items() if tf != effective_timeframe
+        }
+        feature_payload = compute_features(market_snapshot, higher_timeframe_context)
+        feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
+        result = apply_position_management(
+            self.session,
+            self.settings_row,
+            symbol=symbol,
+            feature_payload=feature_payload,
+        )
+        return {
+            "symbol": symbol,
+            "timeframe": effective_timeframe,
+            "market_snapshot_id": market_row.id,
+            "feature_snapshot_id": feature_row.id,
+            "status": str(result.get("status", "monitoring")),
+            "new_entries_allowed": False,
+            "execution": result.get("position_management_action"),
+            "position_management": result,
+            "trigger_event": trigger_event,
         }
 
 
@@ -294,13 +400,15 @@ class TradingOrchestrator:
         auto_resume_checked: bool = False,
         logic_variant: str = "improved",
         exchange_sync_checked: bool = False,
+        include_inline_position_management: bool = False,
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
             auto_resume_checked=auto_resume_checked,
         )
         symbol = (symbol or self.settings_row.default_symbol).upper()
-        timeframe = timeframe or self.settings_row.default_timeframe
+        effective_settings = self._effective_symbol_settings(symbol)
+        timeframe = timeframe or effective_settings.timeframe
         exchange_sync_result: dict[str, object] | None = None
         if self._should_poll_exchange_state(trigger_event) and not exchange_sync_checked:
             exchange_sync_result = self.run_exchange_sync_cycle(symbol=symbol, trigger_event=trigger_event)
@@ -348,7 +456,7 @@ class TradingOrchestrator:
             settings_row=self.settings_row,
         )
         position_management_result: dict[str, object] | None = None
-        if open_positions and self._should_execute_live(trigger_event):
+        if include_inline_position_management and open_positions and self._should_execute_live(trigger_event):
             position_management_result = apply_position_management(
                 self.session,
                 self.settings_row,
@@ -361,6 +469,28 @@ class TradingOrchestrator:
             )
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
         runtime_state = summarize_runtime_state(self.settings_row)
+        if self._should_skip_same_candle_entry(
+            symbol=symbol,
+            timeframe=timeframe,
+            market_snapshot=market_snapshot,
+            has_open_position=bool(open_positions),
+        ):
+            return {
+                "symbol": symbol,
+                "market_snapshot_id": market_row.id,
+                "feature_snapshot_id": feature_row.id,
+                "decision_run_id": None,
+                "risk_check_id": None,
+                "chief_review_run_id": None,
+                "decision": None,
+                "risk_result": None,
+                "execution": None,
+                "status": "same_candle_skipped",
+                "account": account_snapshot_to_dict(latest_pnl),
+                "settings": serialize_settings(self.settings_row),
+                "auto_resume": auto_resume_result,
+                "exchange_sync": exchange_sync_result,
+            }
         effective_leverage_cap = min(
             self.settings_row.max_leverage,
             HARD_MAX_GLOBAL_LEVERAGE,
@@ -397,6 +527,9 @@ class TradingOrchestrator:
             AgentRole.TRADING_DECISION.value,
             trigger_event,
             has_openai_key=bool(self.credentials.openai_api_key),
+            symbol=symbol,
+            cooldown_minutes_override=effective_settings.ai_call_interval_minutes,
+            manual_guard_minutes_override=max(2, min(effective_settings.ai_call_interval_minutes, 5)),
         )
         decision, provider_name, decision_metadata = self.trading_agent.run(
             market_snapshot,
@@ -411,6 +544,12 @@ class TradingOrchestrator:
             **decision_metadata,
             "gate": openai_gate.as_metadata(),
             "logic_variant": logic_variant,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "effective_cadence": {
+                "decision_cycle_interval_minutes": effective_settings.decision_cycle_interval_minutes,
+                "ai_call_interval_minutes": effective_settings.ai_call_interval_minutes,
+            },
             "analysis_context": _decision_analysis_context(feature_payload),
             "position_management": position_management_result or {"position_management_context": position_management_context},
         }
@@ -504,6 +643,7 @@ class TradingOrchestrator:
     def run_selected_symbols_cycle(
         self,
         *,
+        symbols: list[str] | None = None,
         trigger_event: str = TriggerEvent.MANUAL.value,
         timeframe: str | None = None,
         upto_index: int | None = None,
@@ -515,13 +655,15 @@ class TradingOrchestrator:
             trigger_event=trigger_event,
             auto_resume_checked=auto_resume_checked,
         )
-        exchange_sync_result: dict[str, object] | None = None
-        if self._should_poll_exchange_state(trigger_event):
-            exchange_sync_result = self.run_exchange_sync_cycle(trigger_event=trigger_event)
-        symbols = get_effective_symbols(self.settings_row)
+        selected_symbols = [item.upper() for item in symbols] if symbols else get_effective_symbols(self.settings_row)
+        decision_symbols = [
+            effective.symbol
+            for effective in get_effective_symbol_schedule(self.settings_row)
+            if effective.enabled and effective.symbol in selected_symbols
+        ]
         results: list[dict[str, object]] = []
         failed_symbols: list[str] = []
-        for symbol in symbols:
+        for symbol in decision_symbols:
             try:
                 results.append(
                     self.run_decision_cycle(
@@ -532,7 +674,7 @@ class TradingOrchestrator:
                         force_stale=force_stale,
                         auto_resume_checked=True,
                         logic_variant=logic_variant,
-                        exchange_sync_checked=exchange_sync_result is not None,
+                        exchange_sync_checked=True,
                     )
                 )
             except Exception as exc:
@@ -561,7 +703,7 @@ class TradingOrchestrator:
                     }
                 )
         return {
-            "symbols": symbols,
+            "symbols": decision_symbols,
             "cycles": len(results),
             "mode": "market_data_only" if not self.settings_row.ai_enabled else "ai_active",
             "failed_symbols": failed_symbols,
@@ -570,7 +712,7 @@ class TradingOrchestrator:
             "account": self._account_snapshot_preview() if not self.settings_row.ai_enabled else account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
-            "exchange_sync": exchange_sync_result,
+            "exchange_sync": None,
         }
 
 

@@ -883,6 +883,36 @@ class AuditTimelineEntry(StrictBaseModel):
     created_at: datetime
 
 
+class SymbolCadenceOverride(StrictBaseModel):
+    symbol: str = Field(min_length=1, max_length=30)
+    enabled: bool = True
+    timeframe_override: str | None = Field(default=None, min_length=1, max_length=20)
+    market_refresh_interval_minutes_override: int | None = Field(default=None, ge=1, le=1440)
+    position_management_interval_seconds_override: int | None = Field(default=None, ge=30, le=86400)
+    decision_cycle_interval_minutes_override: int | None = Field(default=None, ge=1, le=1440)
+    ai_call_interval_minutes_override: int | None = Field(default=None, ge=5, le=1440)
+
+
+class SymbolEffectiveCadence(StrictBaseModel):
+    symbol: str
+    enabled: bool = True
+    uses_global_defaults: bool = True
+    timeframe: str
+    market_refresh_interval_minutes: int = Field(ge=1, le=1440)
+    position_management_interval_seconds: int = Field(ge=30, le=86400)
+    decision_cycle_interval_minutes: int = Field(ge=1, le=1440)
+    ai_call_interval_minutes: int = Field(ge=5, le=1440)
+    estimated_monthly_ai_calls: int = Field(ge=0)
+    last_market_refresh_at: datetime | None = None
+    last_position_management_at: datetime | None = None
+    last_decision_at: datetime | None = None
+    last_ai_decision_at: datetime | None = None
+    next_market_refresh_due_at: datetime | None = None
+    next_position_management_due_at: datetime | None = None
+    next_decision_due_at: datetime | None = None
+    next_ai_call_due_at: datetime | None = None
+
+
 class AppSettingsResponse(StrictBaseModel):
     id: int
     live_trading_enabled: bool
@@ -926,7 +956,12 @@ class AppSettingsResponse(StrictBaseModel):
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str
+    exchange_sync_interval_seconds: int
+    market_refresh_interval_minutes: int
+    position_management_interval_seconds: int
     schedule_windows: list[str]
+    symbol_cadence_overrides: list[SymbolCadenceOverride] = Field(default_factory=list)
+    symbol_effective_cadences: list[SymbolEffectiveCadence] = Field(default_factory=list)
     max_leverage: float
     max_risk_per_trade: float
     max_daily_loss: float
@@ -988,7 +1023,11 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     default_symbol: str = Field(min_length=1, max_length=30)
     tracked_symbols: list[str] = Field(min_length=1)
     default_timeframe: str = Field(min_length=1, max_length=20)
+    exchange_sync_interval_seconds: int = Field(default=60, ge=30, le=3600)
+    market_refresh_interval_minutes: int = Field(default=1, ge=1, le=1440)
+    position_management_interval_seconds: int = Field(default=60, ge=30, le=3600)
     schedule_windows: list[str]
+    symbol_cadence_overrides: list[SymbolCadenceOverride] = Field(default_factory=list)
     max_leverage: float = Field(gt=0.0, le=5.0)
     max_risk_per_trade: float = Field(gt=0.0, le=0.02)
     max_daily_loss: float = Field(gt=0.0, le=0.05)

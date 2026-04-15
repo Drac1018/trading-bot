@@ -38,7 +38,18 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         default_symbol="BTCUSDT",
         tracked_symbols=["BTCUSDT", "ETHUSDT"],
         default_timeframe="15m",
+        exchange_sync_interval_seconds=60,
+        market_refresh_interval_minutes=1,
+        position_management_interval_seconds=60,
         schedule_windows=["1h", "4h", "12h", "24h"],
+        symbol_cadence_overrides=[
+            {
+                "symbol": "BTCUSDT",
+                "enabled": True,
+                "decision_cycle_interval_minutes_override": 5,
+                "ai_call_interval_minutes_override": 10,
+            }
+        ],
         max_leverage=3.0,
         max_risk_per_trade=0.01,
         max_daily_loss=0.02,
@@ -86,6 +97,9 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["binance_api_key_configured"] is True
     assert serialized["binance_api_secret_configured"] is True
     assert serialized["tracked_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert serialized["exchange_sync_interval_seconds"] == 60
+    assert serialized["market_refresh_interval_minutes"] == 1
+    assert serialized["position_management_interval_seconds"] == 60
     assert serialized["adaptive_signal_enabled"] is True
     assert serialized["position_management_enabled"] is True
     assert serialized["break_even_enabled"] is True
@@ -93,7 +107,9 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["partial_take_profit_enabled"] is True
     assert serialized["holding_edge_decay_enabled"] is True
     assert serialized["reduce_on_regime_shift_enabled"] is True
-    assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 2880
+    assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 5760
+    assert serialized["symbol_effective_cadences"][0]["symbol"] == "BTCUSDT"
+    assert serialized["symbol_effective_cadences"][0]["estimated_monthly_ai_calls"] == 4320
 
 
 def test_should_call_openai_respects_manual_and_replay(db_session) -> None:
@@ -252,6 +268,9 @@ def test_get_or_create_settings_provides_new_defaults(db_session) -> None:
     row = get_or_create_settings(db_session)
     serialized = serialize_settings(row)
 
+    assert serialized["exchange_sync_interval_seconds"] == 60
+    assert serialized["market_refresh_interval_minutes"] == 1
+    assert serialized["position_management_interval_seconds"] == 60
     assert serialized["ai_call_interval_minutes"] >= 5
     assert serialized["decision_cycle_interval_minutes"] >= 1
     assert serialized["tracked_symbols"]
@@ -278,6 +297,18 @@ def test_serialize_settings_includes_position_management_summary(db_session) -> 
     assert serialized["position_management_summary"]["rules_enabled"]["break_even"] is True
     assert serialized["position_management_summary"]["fixed_parameters"]["partial_take_profit_fraction"] == 0.25
     assert serialized["position_management_summary"]["data_fallback_rule"]
+
+
+def test_serialize_settings_merges_global_and_symbol_cadence_overrides(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    serialized = serialize_settings(row)
+    effective = {item["symbol"]: item for item in serialized["symbol_effective_cadences"]}
+
+    assert effective["BTCUSDT"]["decision_cycle_interval_minutes"] == 5
+    assert effective["BTCUSDT"]["ai_call_interval_minutes"] == 10
+    assert effective["ETHUSDT"]["decision_cycle_interval_minutes"] == 15
+    assert effective["ETHUSDT"]["uses_global_defaults"] is True
 
 
 def test_serialize_settings_applies_hard_runtime_caps(db_session) -> None:

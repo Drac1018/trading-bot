@@ -2,15 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import cast
+from typing import Any, cast
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session, object_session
 
 from trading_mvp.config import Settings as AppConfig
 from trading_mvp.config import get_settings
-from trading_mvp.models import AgentRun, FeatureSnapshot, PnLSnapshot, Position, RiskCheck, Setting, SystemHealthEvent
-from trading_mvp.schemas import AppSettingsResponse, AppSettingsUpdateRequest
+from trading_mvp.models import (
+    AgentRun,
+    FeatureSnapshot,
+    MarketSnapshot,
+    PnLSnapshot,
+    Position,
+    RiskCheck,
+    SchedulerRun,
+    Setting,
+    SystemHealthEvent,
+)
+from trading_mvp.schemas import (
+    AppSettingsResponse,
+    AppSettingsUpdateRequest,
+    SymbolCadenceOverride,
+    SymbolEffectiveCadence,
+)
 from trading_mvp.services.account import get_latest_pnl_snapshot
 from trading_mvp.services.adaptive_signal import (
     build_adaptive_signal_context,
@@ -45,6 +60,18 @@ class RuntimeCredentials:
     openai_api_key: str
     binance_api_key: str
     binance_api_secret: str
+
+
+@dataclass(slots=True)
+class EffectiveSymbolSettings:
+    symbol: str
+    enabled: bool
+    uses_global_defaults: bool
+    timeframe: str
+    market_refresh_interval_minutes: int
+    position_management_interval_seconds: int
+    decision_cycle_interval_minutes: int
+    ai_call_interval_minutes: int
 
 
 MINUTES_PER_30_DAY_MONTH = 30 * 24 * 60
@@ -123,11 +150,108 @@ def normalize_symbols(symbols: list[str]) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def normalize_symbol_cadence_overrides(
+    overrides: list[dict[str, Any]] | list[SymbolCadenceOverride] | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in overrides or []:
+        raw = item.model_dump(mode="json") if isinstance(item, SymbolCadenceOverride) else dict(item or {})
+        symbol = str(raw.get("symbol", "")).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        normalized.append(
+            {
+                "symbol": symbol,
+                "enabled": bool(raw.get("enabled", True)),
+                "timeframe_override": str(raw["timeframe_override"]).strip()
+                if raw.get("timeframe_override")
+                else None,
+                "market_refresh_interval_minutes_override": (
+                    int(raw["market_refresh_interval_minutes_override"])
+                    if raw.get("market_refresh_interval_minutes_override") not in {None, ""}
+                    else None
+                ),
+                "position_management_interval_seconds_override": (
+                    int(raw["position_management_interval_seconds_override"])
+                    if raw.get("position_management_interval_seconds_override") not in {None, ""}
+                    else None
+                ),
+                "decision_cycle_interval_minutes_override": (
+                    int(raw["decision_cycle_interval_minutes_override"])
+                    if raw.get("decision_cycle_interval_minutes_override") not in {None, ""}
+                    else None
+                ),
+                "ai_call_interval_minutes_override": (
+                    int(raw["ai_call_interval_minutes_override"])
+                    if raw.get("ai_call_interval_minutes_override") not in {None, ""}
+                    else None
+                ),
+            }
+        )
+    return normalized
+
+
+def get_symbol_cadence_overrides(settings_row: Setting) -> list[dict[str, Any]]:
+    raw = settings_row.symbol_cadence_overrides
+    if not isinstance(raw, list):
+        return []
+    return normalize_symbol_cadence_overrides(raw)
+
+
 def get_effective_symbols(settings_row: Setting) -> list[str]:
     symbols = normalize_symbols(settings_row.tracked_symbols)
     if settings_row.default_symbol.upper() not in symbols:
         symbols.insert(0, settings_row.default_symbol.upper())
     return symbols
+
+
+def get_effective_symbol_settings(settings_row: Setting, symbol: str) -> EffectiveSymbolSettings:
+    symbol = symbol.upper()
+    raw_override = next(
+        (item for item in get_symbol_cadence_overrides(settings_row) if item.get("symbol") == symbol),
+        None,
+    )
+    override = raw_override or {}
+    uses_global_defaults = True
+    if raw_override is not None:
+        uses_global_defaults = not any(
+            override.get(key) not in {None, ""}
+            for key in (
+                "timeframe_override",
+                "market_refresh_interval_minutes_override",
+                "position_management_interval_seconds_override",
+                "decision_cycle_interval_minutes_override",
+                "ai_call_interval_minutes_override",
+            )
+        )
+    return EffectiveSymbolSettings(
+        symbol=symbol,
+        enabled=bool(override.get("enabled", True)),
+        uses_global_defaults=uses_global_defaults,
+        timeframe=str(override.get("timeframe_override") or settings_row.default_timeframe),
+        market_refresh_interval_minutes=int(
+            override.get("market_refresh_interval_minutes_override")
+            or settings_row.market_refresh_interval_minutes
+        ),
+        position_management_interval_seconds=int(
+            override.get("position_management_interval_seconds_override")
+            or settings_row.position_management_interval_seconds
+        ),
+        decision_cycle_interval_minutes=int(
+            override.get("decision_cycle_interval_minutes_override")
+            or settings_row.decision_cycle_interval_minutes
+        ),
+        ai_call_interval_minutes=int(
+            override.get("ai_call_interval_minutes_override")
+            or settings_row.ai_call_interval_minutes
+        ),
+    )
+
+
+def get_effective_symbol_schedule(settings_row: Setting) -> list[EffectiveSymbolSettings]:
+    return [get_effective_symbol_settings(settings_row, symbol) for symbol in get_effective_symbols(settings_row)]
 
 
 def get_or_create_settings(session: Session) -> Setting:
@@ -147,7 +271,11 @@ def get_or_create_settings(session: Session) -> Setting:
         default_symbol=tracked_symbols[0],
         tracked_symbols=tracked_symbols,
         default_timeframe=defaults.default_timeframe,
+        exchange_sync_interval_seconds=defaults.exchange_sync_interval_seconds,
+        market_refresh_interval_minutes=defaults.market_refresh_interval_minutes,
+        position_management_interval_seconds=defaults.position_management_interval_seconds,
         schedule_windows=_default_windows(defaults),
+        symbol_cadence_overrides=[],
         max_leverage=defaults.max_leverage,
         max_risk_per_trade=defaults.max_risk_per_trade,
         max_daily_loss=defaults.max_daily_loss,
@@ -424,6 +552,146 @@ def get_latest_blocked_reasons(session: Session | None) -> list[str]:
     return [str(item) for item in latest_risk.reason_codes if item not in {None, ""}]
 
 
+def _scheduler_symbol_timestamps(
+    session: Session | None,
+    workflow: str,
+    symbol: str,
+) -> tuple[datetime | None, datetime | None]:
+    if session is None:
+        return None, None
+    rows = list(
+        session.scalars(
+            select(SchedulerRun)
+            .where(SchedulerRun.workflow == workflow)
+            .order_by(desc(SchedulerRun.created_at))
+            .limit(100)
+        )
+    )
+    symbol_upper = symbol.upper()
+    for row in rows:
+        outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        if str(outcome.get("symbol", "")).upper() == symbol_upper:
+            return row.created_at, row.next_run_at
+    return None, None
+
+
+def _latest_symbol_decision_run(session: Session | None, symbol: str) -> AgentRun | None:
+    if session is None:
+        return None
+    symbol_upper = symbol.upper()
+    rows = list(
+        session.scalars(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(100)
+        )
+    )
+    for row in rows:
+        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+        market_snapshot = input_payload.get("market_snapshot")
+        if isinstance(market_snapshot, dict) and str(market_snapshot.get("symbol", "")).upper() == symbol_upper:
+            return row
+    return None
+
+
+def _latest_symbol_ai_attempt_at(session: Session | None, symbol: str) -> datetime | None:
+    if session is None:
+        return None
+    symbol_upper = symbol.upper()
+    rows = list(
+        session.scalars(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(100)
+        )
+    )
+    for row in rows:
+        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+        market_snapshot = input_payload.get("market_snapshot")
+        if not isinstance(market_snapshot, dict) or str(market_snapshot.get("symbol", "")).upper() != symbol_upper:
+            continue
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        if row.provider_name == "openai" or metadata.get("source") in {"llm", "llm_fallback"}:
+            return row.created_at
+    return None
+
+
+def build_symbol_effective_cadences(
+    session: Session | None,
+    settings_row: Setting,
+) -> list[SymbolEffectiveCadence]:
+    items: list[SymbolEffectiveCadence] = []
+    now = utcnow_naive()
+    for effective in get_effective_symbol_schedule(settings_row):
+        latest_market_snapshot = (
+            session.scalar(
+                select(MarketSnapshot)
+                .where(
+                    MarketSnapshot.symbol == effective.symbol,
+                    MarketSnapshot.timeframe == effective.timeframe,
+                )
+                .order_by(desc(MarketSnapshot.snapshot_time))
+                .limit(1)
+            )
+            if session is not None
+            else None
+        )
+        market_run_at, market_next_due = _scheduler_symbol_timestamps(session, "market_refresh_cycle", effective.symbol)
+        position_run_at, position_next_due = _scheduler_symbol_timestamps(
+            session,
+            "position_management_cycle",
+            effective.symbol,
+        )
+        decision_run_at, decision_next_due = _scheduler_symbol_timestamps(
+            session,
+            "interval_decision_cycle",
+            effective.symbol,
+        )
+        decision_agent_run = _latest_symbol_decision_run(session, effective.symbol)
+        last_ai_decision_at = _latest_symbol_ai_attempt_at(session, effective.symbol)
+        last_market_refresh_at = market_run_at or (
+            latest_market_snapshot.snapshot_time if latest_market_snapshot is not None else None
+        )
+        if last_market_refresh_at is not None:
+            market_next_due = last_market_refresh_at + timedelta(minutes=effective.market_refresh_interval_minutes)
+        if position_run_at is not None:
+            position_next_due = position_run_at + timedelta(seconds=effective.position_management_interval_seconds)
+        if decision_run_at is not None:
+            decision_next_due = decision_run_at + timedelta(minutes=effective.decision_cycle_interval_minutes)
+        if last_ai_decision_at is not None:
+            ai_next_due = last_ai_decision_at + timedelta(minutes=effective.ai_call_interval_minutes)
+        else:
+            ai_next_due = now
+        trading_interval = max(
+            int(effective.decision_cycle_interval_minutes),
+            int(effective.ai_call_interval_minutes),
+        )
+        items.append(
+            SymbolEffectiveCadence(
+                symbol=effective.symbol,
+                enabled=effective.enabled,
+                uses_global_defaults=effective.uses_global_defaults,
+                timeframe=effective.timeframe,
+                market_refresh_interval_minutes=effective.market_refresh_interval_minutes,
+                position_management_interval_seconds=effective.position_management_interval_seconds,
+                decision_cycle_interval_minutes=effective.decision_cycle_interval_minutes,
+                ai_call_interval_minutes=effective.ai_call_interval_minutes,
+                estimated_monthly_ai_calls=MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1),
+                last_market_refresh_at=last_market_refresh_at,
+                last_position_management_at=position_run_at,
+                last_decision_at=decision_run_at or (decision_agent_run.created_at if decision_agent_run else None),
+                last_ai_decision_at=last_ai_decision_at,
+                next_market_refresh_due_at=market_next_due,
+                next_position_management_due_at=position_next_due,
+                next_decision_due_at=decision_next_due,
+                next_ai_call_due_at=ai_next_due,
+            )
+        )
+    return items
+
+
 def get_exposure_limits(settings_row: Setting) -> dict[str, float]:
     return {
         "gross_exposure_pct": min(settings_row.max_gross_exposure_pct, DISPLAY_MAX_GROSS_EXPOSURE_PCT),
@@ -612,9 +880,14 @@ def estimate_monthly_ai_calls(settings_row: Setting, *, assume_enabled: bool = F
     if settings_row.ai_provider != "openai" or not (assume_enabled or settings_row.ai_enabled):
         return 0, breakdown
 
-    symbol_count = max(len(get_effective_symbols(settings_row)), 1)
-    trading_interval = max(int(settings_row.decision_cycle_interval_minutes), int(settings_row.ai_call_interval_minutes))
-    breakdown["trading_decision"] = (MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1)) * symbol_count
+    for effective in get_effective_symbol_schedule(settings_row):
+        if not effective.enabled:
+            continue
+        trading_interval = max(
+            int(effective.decision_cycle_interval_minutes),
+            int(effective.ai_call_interval_minutes),
+        )
+        breakdown["trading_decision"] += MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1)
     if "4h" in settings_row.schedule_windows:
         breakdown["integration_planner"] = 30 * 6
     if "12h" in settings_row.schedule_windows:
@@ -756,6 +1029,10 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)
+    symbol_cadence_overrides = [
+        SymbolCadenceOverride(**item) for item in get_symbol_cadence_overrides(settings_row)
+    ]
+    symbol_effective_cadences = build_symbol_effective_cadences(current_session, settings_row)
 
     payload = AppSettingsResponse(
         id=settings_row.id,
@@ -803,7 +1080,12 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
+        exchange_sync_interval_seconds=settings_row.exchange_sync_interval_seconds,
+        market_refresh_interval_minutes=settings_row.market_refresh_interval_minutes,
+        position_management_interval_seconds=settings_row.position_management_interval_seconds,
         schedule_windows=settings_row.schedule_windows,
+        symbol_cadence_overrides=symbol_cadence_overrides,
+        symbol_effective_cadences=symbol_effective_cadences,
         max_leverage=effective_max_leverage,
         max_risk_per_trade=effective_max_risk_per_trade,
         max_daily_loss=effective_max_daily_loss,
@@ -883,7 +1165,11 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.default_symbol = payload.default_symbol.upper()
     row.tracked_symbols = tracked_symbols
     row.default_timeframe = payload.default_timeframe
+    row.exchange_sync_interval_seconds = payload.exchange_sync_interval_seconds
+    row.market_refresh_interval_minutes = payload.market_refresh_interval_minutes
+    row.position_management_interval_seconds = payload.position_management_interval_seconds
     row.schedule_windows = payload.schedule_windows
+    row.symbol_cadence_overrides = normalize_symbol_cadence_overrides(payload.symbol_cadence_overrides)
     row.max_leverage = payload.max_leverage
     row.max_risk_per_trade = payload.max_risk_per_trade
     row.max_daily_loss = payload.max_daily_loss
