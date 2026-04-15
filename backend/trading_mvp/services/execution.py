@@ -48,8 +48,11 @@ from trading_mvp.services.runtime_state import (
     PROTECTION_RECOVERY_THRESHOLD,
     PROTECTION_REQUIRED_STATE,
     TRADABLE_STATE,
+    build_sync_freshness_summary,
     get_operating_state,
     get_protection_recovery_detail,
+    mark_sync_issue,
+    mark_sync_success,
 )
 from trading_mvp.services.settings import (
     get_effective_symbols,
@@ -378,6 +381,33 @@ def _cancel_duplicate_protective_orders(
                 local.exchange_status = "CANCELED"
                 local.last_exchange_update_at = utcnow_naive()
                 session.add(local)
+    session.flush()
+
+
+def _record_sync_success(
+    session: Session,
+    settings_row: Setting,
+    *,
+    scope: str,
+    detail: dict[str, object] | None = None,
+    status: str = "synced",
+) -> None:
+    mark_sync_success(settings_row, scope=scope, detail=detail, status=status)
+    session.add(settings_row)
+    session.flush()
+
+
+def _record_sync_issue(
+    session: Session,
+    settings_row: Setting,
+    *,
+    scope: str,
+    status: str,
+    reason_code: str,
+    detail: dict[str, object] | None = None,
+) -> None:
+    mark_sync_issue(settings_row, scope=scope, status=status, reason_code=reason_code, detail=detail)
+    session.add(settings_row)
     session.flush()
 
 
@@ -1047,6 +1077,12 @@ def sync_live_positions(
             local.closed_at = utcnow_naive()
             session.add(local)
             session.flush()
+        _record_sync_success(
+            session,
+            settings_row,
+            scope="positions",
+            detail={"symbol": symbol, "position_status": "flat"},
+        )
         return {"symbol": symbol, "status": "flat"}
 
     position_amount = _to_float(active_remote.get("positionAmt"))
@@ -1094,6 +1130,12 @@ def sync_live_positions(
     local.unrealized_pnl = (mark_price - entry_price) * quantity if side == "long" else (entry_price - mark_price) * quantity
     session.add(local)
     session.flush()
+    _record_sync_success(
+        session,
+        settings_row,
+        scope="positions",
+        detail={"symbol": symbol, "position_status": "open", "side": side},
+    )
     return {"symbol": symbol, "status": "open", "position_id": local.id, "quantity": local.quantity, "side": local.side}
 
 
@@ -1989,6 +2031,14 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                 )
             except Exception as exc:
                 reason_code = _classify_exchange_state_error(exc, "TEMPORARY_SYNC_FAILURE")
+                _record_sync_issue(
+                    session,
+                    settings_row,
+                    scope="open_orders",
+                    status="failed",
+                    reason_code=reason_code,
+                    detail={"symbol": order.symbol, "stage": "trade_lookup"},
+                )
                 _pause_for_system_issue(
                     session,
                     settings_row,
@@ -2016,6 +2066,14 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                 trades = client.get_account_trades(symbol=order.symbol, order_id=order.external_order_id)
             except Exception as exc:
                 reason_code = _classify_exchange_state_error(exc, "TEMPORARY_SYNC_FAILURE")
+                _record_sync_issue(
+                    session,
+                    settings_row,
+                    scope="open_orders",
+                    status="failed",
+                    reason_code=reason_code,
+                    detail={"symbol": order.symbol, "stage": "order_lookup"},
+                )
                 _pause_for_system_issue(
                     session,
                     settings_row,
@@ -2033,8 +2091,22 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
             synced_orders += 1
         try:
             open_orders = client.get_open_orders(item_symbol)
+            _record_sync_success(
+                session,
+                settings_row,
+                scope="open_orders",
+                detail={"symbol": item_symbol, "open_order_count": len(open_orders)},
+            )
         except Exception as exc:
             reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
+            _record_sync_issue(
+                session,
+                settings_row,
+                scope="open_orders",
+                status="failed",
+                reason_code=reason_code,
+                detail={"symbol": item_symbol},
+            )
             _pause_for_system_issue(
                 session,
                 settings_row,
@@ -2067,6 +2139,14 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         protection_state = _build_protection_state(position, open_orders)
         symbol_protection_state[item_symbol] = protection_state
         if protection_state["status"] == "missing":
+            _record_sync_issue(
+                session,
+                settings_row,
+                scope="protective_orders",
+                status="incomplete",
+                reason_code="PROTECTION_STATE_UNVERIFIED",
+                detail={"symbol": item_symbol, "missing_components": protection_state.get("missing_components", [])},
+            )
             unprotected_positions.append(item_symbol)
             protection_result = _ensure_protected_position(
                 session,
@@ -2091,7 +2171,23 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                         "result": protection_result["emergency_action"],
                     }
                 )
+            else:
+                _record_sync_success(
+                    session,
+                    settings_row,
+                    scope="protective_orders",
+                    detail={
+                        "symbol": item_symbol,
+                        "status": protection_result["protection_state"].get("status", "protected"),
+                    },
+                )
         else:
+            _record_sync_success(
+                session,
+                settings_row,
+                scope="protective_orders",
+                detail={"symbol": item_symbol, "status": protection_state["status"]},
+            )
             clear_symbol_protection_state(
                 session,
                 settings_row,
@@ -2110,6 +2206,14 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         account_info = client.get_account_info()
     except Exception as exc:
         reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="account",
+            status="failed",
+            reason_code=reason_code,
+            detail={"symbol": symbols[0]},
+        )
         _pause_for_system_issue(
             session,
             settings_row,
@@ -2123,12 +2227,19 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         )
         raise RuntimeError(f"{reason_code}: {exc}") from exc
     pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, account_info)
+    _record_sync_success(
+        session,
+        settings_row,
+        scope="account",
+        detail={"symbol": symbols[0], "equity": pnl_snapshot.equity},
+    )
     runtime_state = get_protection_recovery_detail(settings_row)
     return {
         "symbols": symbols,
         "synced_orders": synced_orders,
         "synced_positions": synced_positions,
         "equity": pnl_snapshot.equity,
+        "sync_freshness_summary": build_sync_freshness_summary(settings_row),
         "symbol_protection_state": symbol_protection_state,
         "unprotected_positions": unprotected_positions,
         "emergency_actions_taken": emergency_actions_taken,
@@ -2183,6 +2294,147 @@ def run_live_test_order(session: Session, settings_row: Setting, *, symbol: str,
     }
 
 
+def _resync_exchange_state(
+    session: Session,
+    settings_row: Setting,
+    *,
+    client: BinanceClient,
+    symbol: str,
+    event_prefix: str,
+    component: str,
+    verify_protection: bool,
+) -> dict[str, object]:
+    try:
+        open_orders = client.get_open_orders(symbol)
+        _record_sync_success(
+            session,
+            settings_row,
+            scope="open_orders",
+            detail={"symbol": symbol, "open_order_count": len(open_orders)},
+        )
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="open_orders",
+            status="failed",
+            reason_code=reason_code,
+            detail={"symbol": symbol},
+        )
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=symbol,
+            error=str(exc),
+            event_type=f"{event_prefix}_open_orders_failed",
+            component=component,
+            alert_title="Open orders resync failed",
+            alert_message="Exchange open orders resync failed after order processing.",
+        )
+        raise RuntimeError(f"{reason_code}: {exc}") from exc
+
+    try:
+        synced_position = sync_live_positions(
+            session,
+            settings_row,
+            symbol=symbol,
+            client=client,
+            open_orders=open_orders,
+        )
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="positions",
+            status="failed",
+            reason_code=reason_code,
+            detail={"symbol": symbol},
+        )
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=symbol,
+            error=str(exc),
+            event_type=f"{event_prefix}_position_sync_failed",
+            component=component,
+            alert_title="Position resync failed",
+            alert_message="Exchange position resync failed after order processing.",
+        )
+        raise RuntimeError(f"{reason_code}: {exc}") from exc
+
+    position = get_open_position(session, symbol)
+    protection_state = _build_protection_state(position, open_orders)
+    if verify_protection:
+        if position is not None and position.quantity > 0 and protection_state["status"] != "protected":
+            _record_sync_issue(
+                session,
+                settings_row,
+                scope="protective_orders",
+                status="incomplete",
+                reason_code="PROTECTION_STATE_UNVERIFIED",
+                detail={
+                    "symbol": symbol,
+                    "missing_components": protection_state.get("missing_components", []),
+                    "protective_order_count": protection_state.get("protective_order_count", 0),
+                },
+            )
+        else:
+            _record_sync_success(
+                session,
+                settings_row,
+                scope="protective_orders",
+                detail={
+                    "symbol": symbol,
+                    "status": protection_state["status"],
+                    "protective_order_count": protection_state.get("protective_order_count", 0),
+                },
+            )
+
+    try:
+        account_info = client.get_account_info()
+        pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, account_info)
+        _record_sync_success(
+            session,
+            settings_row,
+            scope="account",
+            detail={"symbol": symbol, "equity": pnl_snapshot.equity},
+        )
+    except Exception as exc:
+        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="account",
+            status="failed",
+            reason_code=reason_code,
+            detail={"symbol": symbol},
+        )
+        _pause_for_system_issue(
+            session,
+            settings_row,
+            reason_code=reason_code,
+            symbol=symbol,
+            error=str(exc),
+            event_type=f"{event_prefix}_account_sync_failed",
+            component=component,
+            alert_title="Account resync failed",
+            alert_message="Exchange account resync failed after order processing.",
+        )
+        raise RuntimeError(f"{reason_code}: {exc}") from exc
+
+    return {
+        "open_orders": open_orders,
+        "position": synced_position,
+        "protection_state": protection_state,
+        "account_info": account_info,
+        "pnl_snapshot": pnl_snapshot,
+    }
+
+
 def execute_live_trade(
     session: Session,
     settings_row: Setting,
@@ -2229,8 +2481,22 @@ def execute_live_trade(
 
     try:
         open_orders = client.get_open_orders(decision.symbol)
+        _record_sync_success(
+            session,
+            settings_row,
+            scope="open_orders",
+            detail={"symbol": decision.symbol, "open_order_count": len(open_orders)},
+        )
     except Exception as exc:
         reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="open_orders",
+            status="failed",
+            reason_code=reason_code,
+            detail={"symbol": decision.symbol},
+        )
         _pause_for_system_issue(
             session,
             settings_row,
@@ -2248,6 +2514,14 @@ def execute_live_trade(
         sync_live_positions(session, settings_row, symbol=decision.symbol, client=client, open_orders=open_orders)
     except Exception as exc:
         reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="positions",
+            status="failed",
+            reason_code=reason_code,
+            detail={"symbol": decision.symbol},
+        )
         _pause_for_system_issue(
             session,
             settings_row,
@@ -2547,44 +2821,27 @@ def execute_live_trade(
     create_exchange_pnl_snapshot(session, settings_row)
 
     try:
-        post_trade_open_orders = client.get_open_orders(decision.symbol)
-    except Exception as exc:
-        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
-        _pause_for_system_issue(
+        post_trade_sync = _resync_exchange_state(
             session,
             settings_row,
-            reason_code=reason_code,
-            symbol=decision.symbol,
-            error=str(exc),
-            event_type="live_post_order_open_orders_failed",
-            component="live_execution",
-            alert_title="Post-order open orders sync failed",
-            alert_message="?? ?? ??? ?? ??? ???? ?? ??? ?? ??????.",
-        )
-        return {"order_id": order.id, "status": final_execution_status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
-
-    try:
-        synced_position = sync_live_positions(
-            session,
-            settings_row,
-            symbol=decision.symbol,
             client=client,
-            open_orders=post_trade_open_orders,
-        )
-    except Exception as exc:
-        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
-        _pause_for_system_issue(
-            session,
-            settings_row,
-            reason_code=reason_code,
             symbol=decision.symbol,
-            error=str(exc),
-            event_type="live_post_order_position_sync_failed",
+            event_prefix="live_post_order",
             component="live_execution",
-            alert_title="Post-order position sync failed",
-            alert_message="?? ?? ??? ??? ???? ?? ??? ?? ??????.",
+            verify_protection=False,
         )
-        return {"order_id": order.id, "status": final_execution_status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
+    except RuntimeError as exc:
+        error_text = str(exc)
+        reason_code = error_text.split(":", 1)[0]
+        return {
+            "order_id": order.id,
+            "status": final_execution_status,
+            "reason_codes": [reason_code],
+            "error": error_text,
+            "intent_type": intent_type,
+        }
+
+    synced_position = post_trade_sync["position"]
 
     position = get_open_position(session, decision.symbol)
     if position is not None:
@@ -2661,6 +2918,33 @@ def execute_live_trade(
     else:
         _cancel_exit_orders(session, client, decision.symbol)
 
+    try:
+        final_resync = _resync_exchange_state(
+            session,
+            settings_row,
+            client=client,
+            symbol=decision.symbol,
+            event_prefix="live_post_protection",
+            component="live_execution",
+            verify_protection=True,
+        )
+    except RuntimeError as exc:
+        error_text = str(exc)
+        reason_code = error_text.split(":", 1)[0]
+        return {
+            "order_id": order.id,
+            "status": final_execution_status,
+            "reason_codes": [reason_code],
+            "error": error_text,
+            "intent_type": intent_type,
+        }
+
+    synced_position = final_resync["position"]
+    if protection_result is None:
+        final_protection_state = final_resync["protection_state"]
+    else:
+        final_protection_state = protection_result["protection_state"]
+
     slippage_pct = 0.0
     if aggregate_filled_quantity > 0 and aggregate_fill_price > 0:
         slippage_pct = abs(aggregate_fill_price - execution_price) / max(execution_price, 1.0)
@@ -2691,23 +2975,7 @@ def execute_live_trade(
         position_management_payload = mark_partial_take_profit_taken(position)
         session.add(position)
         session.flush()
-    try:
-        refreshed_account_info = client.get_account_info()
-    except Exception as exc:
-        reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
-        _pause_for_system_issue(
-            session,
-            settings_row,
-            reason_code=reason_code,
-            symbol=decision.symbol,
-            error=str(exc),
-            event_type="live_post_order_account_sync_failed",
-            component="live_execution",
-            alert_title="Post-order account sync failed",
-            alert_message="?? ?? ?? ??? ?? ???? ?? ??? ?? ??????.",
-        )
-        return {"order_id": order.id, "status": final_execution_status, "reason_codes": [reason_code], "error": str(exc), "intent_type": intent_type}
-    pnl_snapshot = create_exchange_pnl_snapshot(session, settings_row, refreshed_account_info)
+    pnl_snapshot = final_resync["pnl_snapshot"]
     record_audit_event(
         session,
         event_type="live_execution",
@@ -2718,7 +2986,7 @@ def execute_live_trade(
         payload={
             "position": synced_position,
             "protective_order_ids": protective_order_ids,
-            "protective_state": protection_result["protection_state"] if protection_result is not None else pre_trade_protection,
+            "protective_state": final_protection_state if protection_result is not None else final_protection_state,
             "pre_trade_protection": pre_trade_protection,
             "slippage_pct": slippage_pct,
             "intent_type": intent_type,
@@ -2753,7 +3021,7 @@ def execute_live_trade(
         "fees": fee_paid,
         "equity": pnl_snapshot.equity,
         "protective_order_ids": protective_order_ids,
-        "protective_state": protection_result["protection_state"] if protection_result is not None else pre_trade_protection,
+        "protective_state": final_protection_state,
         "intent_type": intent_type,
         "execution_policy": execution_plan.to_payload(),
         "execution_attempts": execution_result["attempts"],

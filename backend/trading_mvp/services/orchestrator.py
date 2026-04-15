@@ -38,7 +38,7 @@ from trading_mvp.services.backlog_insights import (
     build_signal_performance_report,
     build_structured_competitor_notes,
 )
-from trading_mvp.services.execution import apply_position_management, execute_live_trade
+from trading_mvp.services.execution import apply_position_management, execute_live_trade, sync_live_state
 from trading_mvp.services.features import compute_features, persist_feature_snapshot
 from trading_mvp.services.market_data import (
     build_market_context,
@@ -108,6 +108,16 @@ class TradingOrchestrator:
             "test",
         }
 
+    @staticmethod
+    def _should_poll_exchange_state(trigger_event: str) -> bool:
+        return trigger_event in {
+            TriggerEvent.MANUAL.value,
+            TriggerEvent.REALTIME.value,
+            TriggerEvent.SCHEDULED.value,
+            "test",
+            "background_poll",
+        }
+
 
     def _latest_alerts(self, limit: int = 5) -> list[Alert]:
         return list(self.session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(limit)))
@@ -115,6 +125,54 @@ class TradingOrchestrator:
 
     def _latest_health_events(self, limit: int = 10) -> list[SystemHealthEvent]:
         return list(self.session.scalars(select(SystemHealthEvent).order_by(desc(SystemHealthEvent.created_at)).limit(limit)))
+
+    def run_exchange_sync_cycle(
+        self,
+        *,
+        symbol: str | None = None,
+        trigger_event: str = "background_poll",
+    ) -> dict[str, object]:
+        if not self.credentials.binance_api_key or not self.credentials.binance_api_secret:
+            return {
+                "status": "skipped",
+                "reason": "LIVE_CREDENTIALS_MISSING",
+                "symbol": symbol or self.settings_row.default_symbol,
+            }
+        try:
+            result = sync_live_state(self.session, self.settings_row, symbol=symbol)
+        except Exception as exc:
+            record_audit_event(
+                self.session,
+                event_type="live_poll_sync_failed",
+                entity_type="binance",
+                entity_id=symbol or self.settings_row.default_symbol,
+                severity="warning",
+                message="Background exchange polling sync failed.",
+                payload={"trigger_event": trigger_event, "error": str(exc)},
+            )
+            record_health_event(
+                self.session,
+                component="live_sync",
+                status="error",
+                message="Background exchange polling sync failed.",
+                payload={"trigger_event": trigger_event, "error": str(exc)},
+            )
+            return {
+                "status": "error",
+                "symbol": symbol or self.settings_row.default_symbol,
+                "trigger_event": trigger_event,
+                "error": str(exc),
+            }
+        record_audit_event(
+            self.session,
+            event_type="live_poll_sync",
+            entity_type="binance",
+            entity_id=symbol or self.settings_row.default_symbol,
+            severity="info",
+            message="Background exchange polling sync completed.",
+            payload={"trigger_event": trigger_event, **result},
+        )
+        return {"status": "ok", "trigger_event": trigger_event, **result}
 
     def _account_snapshot_preview(self) -> dict[str, float | int | str]:
         latest = self.session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
@@ -193,6 +251,9 @@ class TradingOrchestrator:
             auto_resume_checked=auto_resume_checked,
         )
         timeframe = timeframe or self.settings_row.default_timeframe
+        exchange_sync_result: dict[str, object] | None = None
+        if self._should_poll_exchange_state(trigger_event):
+            exchange_sync_result = self.run_exchange_sync_cycle(trigger_event=trigger_event)
         symbols = get_effective_symbols(self.settings_row)
         results: list[dict[str, object]] = []
         for symbol in symbols:
@@ -219,6 +280,7 @@ class TradingOrchestrator:
             "account": self._account_snapshot_preview(),
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
+            "exchange_sync": exchange_sync_result,
         }
 
 
@@ -231,6 +293,7 @@ class TradingOrchestrator:
         force_stale: bool = False,
         auto_resume_checked: bool = False,
         logic_variant: str = "improved",
+        exchange_sync_checked: bool = False,
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
@@ -238,6 +301,9 @@ class TradingOrchestrator:
         )
         symbol = (symbol or self.settings_row.default_symbol).upper()
         timeframe = timeframe or self.settings_row.default_timeframe
+        exchange_sync_result: dict[str, object] | None = None
+        if self._should_poll_exchange_state(trigger_event) and not exchange_sync_checked:
+            exchange_sync_result = self.run_exchange_sync_cycle(symbol=symbol, trigger_event=trigger_event)
         market_snapshot, market_row = self._collect_market_snapshot(
             symbol=symbol,
             timeframe=timeframe,
@@ -271,6 +337,7 @@ class TradingOrchestrator:
                 "account": self._account_snapshot_preview(),
                 "settings": serialize_settings(self.settings_row),
                 "auto_resume": auto_resume_result,
+                "exchange_sync": exchange_sync_result,
             }
         feature_payload = compute_features(market_snapshot, higher_timeframe_context)
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
@@ -430,6 +497,7 @@ class TradingOrchestrator:
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
+            "exchange_sync": exchange_sync_result,
         }
 
 
@@ -447,6 +515,9 @@ class TradingOrchestrator:
             trigger_event=trigger_event,
             auto_resume_checked=auto_resume_checked,
         )
+        exchange_sync_result: dict[str, object] | None = None
+        if self._should_poll_exchange_state(trigger_event):
+            exchange_sync_result = self.run_exchange_sync_cycle(trigger_event=trigger_event)
         symbols = get_effective_symbols(self.settings_row)
         results: list[dict[str, object]] = []
         failed_symbols: list[str] = []
@@ -461,6 +532,7 @@ class TradingOrchestrator:
                         force_stale=force_stale,
                         auto_resume_checked=True,
                         logic_variant=logic_variant,
+                        exchange_sync_checked=exchange_sync_result is not None,
                     )
                 )
             except Exception as exc:
@@ -498,6 +570,7 @@ class TradingOrchestrator:
             "account": self._account_snapshot_preview() if not self.settings_row.ai_enabled else account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
+            "exchange_sync": exchange_sync_result,
         }
 
 

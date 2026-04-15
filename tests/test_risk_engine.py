@@ -8,9 +8,16 @@ from trading_mvp.models import PnLSnapshot, Position
 from trading_mvp.schemas import TradeDecision
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import evaluate_risk, validate_decision_schema
+from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
+
+
+def _mark_all_sync_scopes_fresh(settings_row) -> None:
+    now = utcnow_naive()
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings_row, scope=scope, synced_at=now)
 
 
 def test_risk_blocks_invalid_long_brackets(db_session) -> None:
@@ -551,6 +558,125 @@ def test_reduce_and_exit_remain_allowed_under_exposure_limits(db_session) -> Non
     assert exit_result.allowed is True
     assert "GROSS_EXPOSURE_LIMIT_REACHED" not in reduce_result.reason_codes
     assert "DIRECTIONAL_BIAS_LIMIT_REACHED" not in exit_result.reason_codes
+
+
+def test_live_entry_keeps_existing_path_when_sync_state_is_fresh(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=64000.0,
+        take_profit=66500.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="fresh sync",
+        explanation_detailed="Fresh exchange sync state should not add stale state blockers.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert "ACCOUNT_STATE_STALE" not in result.reason_codes
+    assert "POSITION_STATE_STALE" not in result.reason_codes
+    assert "OPEN_ORDERS_STATE_STALE" not in result.reason_codes
+    assert "PROTECTION_STATE_UNVERIFIED" not in result.reason_codes
+
+
+def test_live_entry_is_blocked_when_exchange_state_is_stale(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    stale_at = utcnow_naive() - timedelta(hours=2)
+    mark_sync_success(settings_row, scope="account", synced_at=stale_at, stale_after_seconds=60)
+    mark_sync_success(settings_row, scope="positions", synced_at=utcnow_naive())
+    mark_sync_success(settings_row, scope="open_orders", synced_at=utcnow_naive())
+    mark_sync_issue(
+        settings_row,
+        scope="protective_orders",
+        status="incomplete",
+        reason_code="PROTECTION_STATE_UNVERIFIED",
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=64000.0,
+        take_profit=66500.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="stale sync",
+        explanation_detailed="Stale or incomplete exchange state should block new entries.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert "ACCOUNT_STATE_STALE" in result.reason_codes
+    assert "PROTECTION_STATE_UNVERIFIED" in result.reason_codes
+
+
+def test_reduce_path_stays_open_when_exchange_state_is_stale(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    mark_sync_issue(settings_row, scope="account", status="failed", reason_code="ACCOUNT_STATE_STALE")
+    mark_sync_issue(settings_row, scope="positions", status="failed", reason_code="POSITION_STATE_STALE")
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="reduce",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=64000.0,
+        take_profit=66500.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="stale but reduce",
+        explanation_detailed="Reduce-only path should remain available even when entry state freshness is degraded.",
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is True
+    assert "ACCOUNT_STATE_STALE" not in result.reason_codes
+    assert "POSITION_STATE_STALE" not in result.reason_codes
 
 
 def test_unprotected_state_blocks_new_entry_but_allows_reduce(db_session) -> None:

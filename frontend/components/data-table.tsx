@@ -3,7 +3,7 @@ import {
   formatListValue,
   getRowTitle,
   normalizeDisplayValue,
-  translateLabel
+  translateLabel,
 } from "../lib/ui-copy";
 
 type Row = Record<string, unknown>;
@@ -32,7 +32,7 @@ const preferredColumnOrder = [
   "workflow",
   "next_run_at",
   "created_at",
-  "updated_at"
+  "updated_at",
 ];
 
 const detailColumnSet = new Set([
@@ -41,7 +41,7 @@ const detailColumnSet = new Set([
   "output_payload",
   "payload",
   "metadata_json",
-  "outcome"
+  "outcome",
 ]);
 
 function renderValue(value: unknown, key?: string) {
@@ -105,7 +105,7 @@ export function DataTable({
   description,
   rows,
   emptyStateTitle,
-  emptyStateDescription
+  emptyStateDescription,
 }: {
   title: string;
   description: string;
@@ -183,7 +183,7 @@ export function DataTable({
               {detail.length > 0 ? (
                 <details className="mt-4 rounded-2xl border border-amber-200 bg-white">
                   <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-ink">
-                    세부 payload 보기
+                    상세 payload 보기
                   </summary>
                   <div className="space-y-4 border-t border-amber-100 px-4 py-4">
                     {detail.map((column) => (

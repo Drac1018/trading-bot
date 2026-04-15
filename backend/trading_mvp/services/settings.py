@@ -33,6 +33,7 @@ from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
+    build_sync_freshness_summary,
     summarize_runtime_state,
 )
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
@@ -55,7 +56,21 @@ DISPLAY_MAX_LARGEST_POSITION_PCT = 1.5
 DISPLAY_MAX_DIRECTIONAL_BIAS_PCT = 2.0
 DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT = 2.5
 AUTO_RESUME_GRACE_MAX_MINUTES = 15
-RUNTIME_STATE_DETAIL_KEYS = {"operating_state", "protection_recovery"}
+RUNTIME_STATE_DETAIL_KEYS = {"operating_state", "protection_recovery", "exchange_sync"}
+"""
+ACCOUNT_SYNC_WARNING_REASON_CODES = {
+    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+    "TEMPORARY_SYNC_FAILURE",
+    "EXCHANGE_POSITION_SYNC_FAILED",
+    "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+    "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+    "ACCOUNT_STATE_STALE": "거래소 계좌 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
+    "POSITION_STATE_STALE": "거래소 포지션 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
+    "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
+    "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
+}
+
+"""
 ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
     "TEMPORARY_SYNC_FAILURE",
@@ -63,7 +78,6 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
 }
-
 GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "TRADING_PAUSED": "거래가 일시 중지되어 가드 모드입니다.",
     "MANUAL_USER_REQUEST": "운영자가 수동으로 거래를 중지해 가드 모드입니다.",
@@ -86,6 +100,10 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "PORTFOLIO_RISK_UNCERTAIN": "포트폴리오 위험을 신뢰할 수 없어 가드 모드입니다.",
     "STALE_MARKET_DATA": "시장 데이터가 오래되어 신규 진입이 차단된 상태입니다.",
     "INCOMPLETE_MARKET_DATA": "시장 데이터가 불완전해 신규 진입이 차단된 상태입니다.",
+    "ACCOUNT_STATE_STALE": "거래소 계좌 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
+    "POSITION_STATE_STALE": "거래소 포지션 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
+    "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
+    "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
 }
 
 
@@ -685,6 +703,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
             "note": "Account sync status is not available until the first live snapshot is created.",
         }
     )
+    sync_freshness_summary = build_sync_freshness_summary(settings_row)
     if current_session is not None:
         from trading_mvp.services.risk import build_current_exposure_summary
 
@@ -774,6 +793,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         },
         pnl_summary=pnl_summary,
         account_sync_summary=account_sync_summary,
+        sync_freshness_summary=sync_freshness_summary,
         exposure_summary=exposure_summary,
         execution_policy_summary=execution_policy_summary,
         market_context_summary=market_context_summary,

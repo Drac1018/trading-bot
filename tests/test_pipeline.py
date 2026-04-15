@@ -21,11 +21,18 @@ from trading_mvp.services.binance import BinanceAPIError
 from trading_mvp.services.execution import execute_live_trade, sync_live_state
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.orchestrator import TradingOrchestrator
+from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.scheduler import run_interval_decision_cycle, run_window
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
+
+
+def _mark_pipeline_sync_fresh(settings_row) -> None:
+    now = utcnow_naive()
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings_row, scope=scope, synced_at=now)
 
 
 def test_seed_bootstraps_without_demo_trading_data(db_session) -> None:
@@ -187,6 +194,7 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_pipeline_sync_fresh(settings_row)
     db_session.add(settings_row)
     db_session.flush()
 
@@ -194,6 +202,11 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
         live_trading_env_enabled = True
 
     monkeypatch.setattr("trading_mvp.services.risk.get_settings", lambda: EnabledSettings())
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_exchange_sync_cycle",
+        lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
+    )
 
     def fake_execute_live_trade(session, settings_row, decision_run_id, decision, market_snapshot, risk_result, risk_row=None):
         order = Order(
@@ -264,6 +277,7 @@ def test_historical_replay_never_executes_live(monkeypatch, db_session) -> None:
     settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_pipeline_sync_fresh(settings_row)
     db_session.add(settings_row)
     db_session.flush()
 
@@ -271,6 +285,11 @@ def test_historical_replay_never_executes_live(monkeypatch, db_session) -> None:
         live_trading_env_enabled = True
 
     monkeypatch.setattr("trading_mvp.services.risk.get_settings", lambda: EnabledSettings())
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_exchange_sync_cycle",
+        lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
+    )
 
     def fail_execute(*args, **kwargs):
         raise AssertionError("historical replay must not place live orders")
@@ -619,6 +638,43 @@ def test_run_selected_symbols_cycle_isolates_symbol_failures(monkeypatch, db_ses
     assert result["failed_symbols"] == ["BTCUSDT"]
     assert result["results"][0]["status"] == "failed"
     assert result["results"][1]["status"] == "ok"
+
+
+def test_run_exchange_sync_cycle_calls_live_sync_and_records_success(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    db_session.flush()
+    calls: list[str | None] = []
+
+    def fake_sync_live_state(session, settings_row, *, symbol=None):
+        calls.append(symbol)
+        return {"symbols": [symbol or settings_row.default_symbol], "synced_positions": 1, "synced_orders": 1}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.sync_live_state", fake_sync_live_state)
+
+    result = TradingOrchestrator(db_session).run_exchange_sync_cycle(symbol="BTCUSDT", trigger_event="background_poll")
+
+    assert result["status"] == "ok"
+    assert calls == ["BTCUSDT"]
+
+
+def test_run_exchange_sync_cycle_records_failure_without_raising(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    db_session.flush()
+
+    def fake_sync_live_state(session, settings_row, *, symbol=None):
+        raise RuntimeError("interval failure")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.sync_live_state", fake_sync_live_state)
+
+    result = TradingOrchestrator(db_session).run_exchange_sync_cycle(symbol="BTCUSDT", trigger_event="background_poll")
+
+    assert result["status"] == "error"
+    assert result["symbol"] == "BTCUSDT"
+    assert "interval failure" in result["error"]
 
 
 def test_run_interval_decision_cycle_marks_failure_instead_of_raising(monkeypatch, db_session) -> None:

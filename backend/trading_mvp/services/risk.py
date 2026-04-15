@@ -16,6 +16,7 @@ from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
+    build_sync_freshness_summary,
     get_operating_state,
 )
 from trading_mvp.services.settings import (
@@ -29,6 +30,12 @@ HARD_MAX_RISK_PER_TRADE = 0.02
 HARD_MAX_DAILY_LOSS = 0.05
 BTC_SYMBOLS = {"BTCUSDT"}
 MAJOR_ALT_SYMBOLS = {"ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"}
+SYNC_BLOCKING_REASON_CODES = {
+    "account": "ACCOUNT_STATE_STALE",
+    "positions": "POSITION_STATE_STALE",
+    "open_orders": "OPEN_ORDERS_STATE_STALE",
+    "protective_orders": "PROTECTION_STATE_UNVERIFIED",
+}
 
 
 def validate_decision_schema(payload: dict[str, Any]) -> TradeDecision:
@@ -312,6 +319,7 @@ def evaluate_risk(
         projected_side=decision.decision if is_entry_decision else None,
         projected_notional=projected_notional,
     )
+    sync_freshness_summary = build_sync_freshness_summary(settings_row)
 
     if settings_row.trading_paused and is_entry_decision:
         reason_codes.append("TRADING_PAUSED")
@@ -347,6 +355,14 @@ def evaluate_risk(
         and exposure_metrics["same_tier_concentration_pct"] > exposure_limits["same_tier_concentration_pct"]
     ):
         reason_codes.append("SAME_TIER_CONCENTRATION_LIMIT_REACHED")
+    if is_entry_decision and live_requested:
+        for scope, reason_code in SYNC_BLOCKING_REASON_CODES.items():
+            scope_summary = sync_freshness_summary.get(scope)
+            if not isinstance(scope_summary, dict):
+                reason_codes.append(reason_code)
+                continue
+            if bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
+                reason_codes.append(reason_code)
 
     if is_protection_recovery and existing_position is not None:
         entry = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price
@@ -391,6 +407,7 @@ def evaluate_risk(
         effective_leverage_cap=effective_leverage_cap,
         symbol_risk_tier=symbol_risk_tier,
         exposure_metrics=exposure_metrics,
+        sync_freshness_summary=sync_freshness_summary,
     )
     row = RiskCheck(
         symbol=decision.symbol,

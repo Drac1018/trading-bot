@@ -32,7 +32,10 @@ from trading_mvp.schemas import (
     OperatorDecisionSnapshot,
     OperatorExecutionSnapshot,
     OperatorMarketSignalSummary,
+    OperatorPositionSummary,
+    OperatorProtectionSummary,
     OperatorRiskSnapshot,
+    OperatorSymbolSummary,
     DashboardProfitabilityResponse,
     DashboardProfitabilityWindow,
     OverviewResponse,
@@ -290,6 +293,9 @@ def get_overview(session: Session) -> OverviewResponse:
     runtime_missing_items = _as_missing_items(runtime_state["missing_protection_items"])
     pnl_summary = _as_dict(settings_payload.get("pnl_summary", {}))
     account_sync_summary = _as_dict(settings_payload.get("account_sync_summary", {}))
+    sync_freshness_summary = _as_dict(
+        settings_payload.get("sync_freshness_summary", runtime_state.get("sync_freshness_summary", {}))
+    )
     exposure_summary = _as_dict(settings_payload.get("exposure_summary", {}))
     execution_policy_summary = _as_dict(settings_payload.get("execution_policy_summary", {}))
     market_context_summary = _as_dict(settings_payload.get("market_context_summary", {}))
@@ -336,6 +342,7 @@ def get_overview(session: Session) -> OverviewResponse:
         or runtime_missing_items,
         pnl_summary=pnl_summary,
         account_sync_summary=account_sync_summary,
+        sync_freshness_summary=sync_freshness_summary,
         exposure_summary=exposure_summary,
         execution_policy_summary=execution_policy_summary,
         market_context_summary=market_context_summary,
@@ -810,35 +817,51 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     )
 
 
-def _build_execution_snapshot(session: Session, decision_run_id: int | None) -> OperatorExecutionSnapshot:
-    order_row: Order | None = None
-    if decision_run_id is not None:
-        order_row = session.scalar(
-            select(Order)
-            .where(Order.mode == "live", Order.decision_run_id == decision_run_id)
-            .order_by(desc(Order.created_at))
-            .limit(1)
-        )
-        if order_row is None:
-            return OperatorExecutionSnapshot(decision_run_id=decision_run_id)
-    if order_row is None:
-        order_row = session.scalar(select(Order).where(Order.mode == "live").order_by(desc(Order.created_at)).limit(1))
-    if order_row is None:
-        return OperatorExecutionSnapshot()
+def _decision_symbol(row: AgentRun | None) -> str | None:
+    if row is None or not isinstance(row.output_payload, dict):
+        return None
+    symbol = str(row.output_payload.get("symbol") or "").upper()
+    return symbol or None
 
-    execution_row = session.scalar(
-        select(Execution)
-        .where(Execution.order_id == order_row.id)
-        .order_by(desc(Execution.created_at))
-        .limit(1)
-    )
-    decision_output = {}
-    if order_row.decision_run_id is not None:
-        decision_output = (
-            session.scalar(select(AgentRun.output_payload).where(AgentRun.id == order_row.decision_run_id).limit(1)) or {}
+
+def _decision_timeframe(row: AgentRun | None) -> str | None:
+    if row is None or not isinstance(row.output_payload, dict):
+        return None
+    timeframe = str(row.output_payload.get("timeframe") or "")
+    return timeframe or None
+
+
+def _extract_symbol_market_context(row: AgentRun | None, market_row: MarketSnapshot | None) -> dict[str, Any]:
+    if row is not None and isinstance(row.input_payload, dict):
+        features = _as_dict(row.input_payload.get("features", {}))
+        regime = _as_dict(features.get("regime", {}))
+        if regime:
+            return {
+                "primary_regime": regime.get("primary_regime"),
+                "trend_alignment": regime.get("trend_alignment"),
+                "volatility_regime": regime.get("volatility_regime"),
+                "volume_regime": regime.get("volume_regime"),
+                "momentum_state": regime.get("momentum_state"),
+                "weak_volume": regime.get("weak_volume"),
+                "momentum_weakening": regime.get("momentum_weakening"),
+            }
+    if market_row is not None and isinstance(market_row.payload, dict):
+        return _as_dict(market_row.payload.get("regime_summary", {}))
+    return {}
+
+
+def _build_execution_snapshot_from_rows(
+    order_row: Order | None,
+    execution_row: Execution | None,
+    decision_row: AgentRun | None,
+) -> OperatorExecutionSnapshot:
+    if order_row is None:
+        return OperatorExecutionSnapshot(
+            decision_run_id=decision_row.id if decision_row is not None else None,
+            symbol=_decision_symbol(decision_row),
         )
+    decision_payload = decision_row.output_payload if decision_row is not None and isinstance(decision_row.output_payload, dict) else {}
     order_metadata = order_row.metadata_json if isinstance(order_row.metadata_json, dict) else {}
-    decision_payload = decision_output if isinstance(decision_output, dict) else {}
     return OperatorExecutionSnapshot(
         order_id=order_row.id,
         execution_id=execution_row.id if execution_row is not None else None,
@@ -866,6 +889,82 @@ def _build_execution_snapshot(session: Session, decision_run_id: int | None) -> 
     )
 
 
+def _build_position_snapshot(position: Position | None) -> OperatorPositionSummary:
+    if position is None:
+        return OperatorPositionSummary()
+    return OperatorPositionSummary(
+        is_open=position.status == "open" and position.quantity > 0,
+        position_id=position.id,
+        side=position.side,
+        status=position.status,
+        quantity=position.quantity,
+        entry_price=position.entry_price,
+        mark_price=position.mark_price,
+        unrealized_pnl=position.unrealized_pnl,
+        realized_pnl=position.realized_pnl,
+        leverage=position.leverage,
+        opened_at=position.opened_at,
+    )
+
+
+def _build_protection_snapshot(protection_state: dict[str, object]) -> OperatorProtectionSummary:
+    return OperatorProtectionSummary(
+        status=str(protection_state.get("status") or "unknown"),
+        protected=bool(protection_state.get("protected", False)),
+        protective_order_count=_as_int(protection_state.get("protective_order_count"), default=0),
+        has_stop_loss=bool(protection_state.get("has_stop_loss", False)),
+        has_take_profit=bool(protection_state.get("has_take_profit", False)),
+        missing_components=_as_string_list(protection_state.get("missing_components", [])),
+        order_ids=[
+            int(item)
+            for item in protection_state.get("order_ids", [])
+            if isinstance(item, int)
+        ]
+        if isinstance(protection_state.get("order_ids"), list)
+        else [],
+    )
+
+
+def _build_symbol_stale_flags(
+    sync_freshness_summary: dict[str, Any],
+    market_row: MarketSnapshot | None,
+) -> list[str]:
+    flags: list[str] = []
+    for scope, payload in sync_freshness_summary.items():
+        if not isinstance(payload, dict):
+            continue
+        if bool(payload.get("stale")):
+            flags.append(str(scope))
+        elif bool(payload.get("incomplete")):
+            flags.append(f"{scope}_incomplete")
+    if market_row is not None:
+        if market_row.is_stale:
+            flags.append("market_snapshot")
+        if not market_row.is_complete:
+            flags.append("market_snapshot_incomplete")
+    return flags
+
+
+def _latest_timestamp(*timestamps: datetime | None) -> datetime | None:
+    values = [item for item in timestamps if item is not None]
+    return max(values) if values else None
+
+
+def _audit_event_matches_symbol(row: dict[str, object], symbol: str) -> bool:
+    symbol_key = symbol.upper()
+    entity_id = str(row.get("entity_id") or "").upper()
+    if entity_id == symbol_key:
+        return True
+    payload = _as_dict(row.get("payload", {}))
+    for key in ("symbol", "tracked_symbol"):
+        if str(payload.get(key) or "").upper() == symbol_key:
+            return True
+    symbols = payload.get("symbols")
+    if isinstance(symbols, list) and symbol_key in {str(item).upper() for item in symbols}:
+        return True
+    return False
+
+
 def _build_audit_entry(payload: dict[str, object]) -> AuditTimelineEntry:
     created_at = payload.get("created_at")
     if isinstance(created_at, str):
@@ -890,39 +989,171 @@ def _build_audit_entry(payload: dict[str, object]) -> AuditTimelineEntry:
     )
 
 
+def _build_operator_symbol_summaries(
+    session: Session,
+    *,
+    tracked_symbols: list[str],
+    overview: OverviewResponse,
+) -> list[OperatorSymbolSummary]:
+    symbol_keys = [item.upper() for item in tracked_symbols if item]
+    latest_markets: dict[str, MarketSnapshot] = {}
+    for row in session.scalars(
+        select(MarketSnapshot)
+        .where(MarketSnapshot.symbol.in_(symbol_keys))
+        .order_by(desc(MarketSnapshot.snapshot_time))
+    ):
+        symbol = row.symbol.upper()
+        latest_markets.setdefault(symbol, row)
+
+    latest_decisions: dict[str, AgentRun] = {}
+    for row in session.scalars(
+        select(AgentRun)
+        .where(AgentRun.role == "trading_decision")
+        .order_by(desc(AgentRun.created_at))
+    ):
+        symbol = _decision_symbol(row)
+        if symbol in symbol_keys and symbol not in latest_decisions:
+            latest_decisions[symbol] = row
+        if len(latest_decisions) == len(symbol_keys):
+            break
+
+    latest_risks: dict[str, RiskCheck] = {}
+    for row in session.scalars(
+        select(RiskCheck)
+        .where(RiskCheck.symbol.in_(symbol_keys))
+        .order_by(desc(RiskCheck.created_at))
+    ):
+        symbol = row.symbol.upper()
+        latest_risks.setdefault(symbol, row)
+
+    latest_orders: dict[str, Order] = {}
+    for row in session.scalars(
+        select(Order)
+        .where(Order.mode == "live", Order.symbol.in_(symbol_keys))
+        .order_by(desc(Order.created_at))
+    ):
+        symbol = row.symbol.upper()
+        latest_orders.setdefault(symbol, row)
+
+    latest_executions_by_order_id: dict[int, Execution] = {}
+    order_ids = [row.id for row in latest_orders.values()]
+    if order_ids:
+        for row in session.scalars(
+            select(Execution)
+            .where(Execution.order_id.in_(order_ids))
+            .order_by(desc(Execution.created_at))
+        ):
+            if row.order_id is None:
+                continue
+            latest_executions_by_order_id.setdefault(row.order_id, row)
+
+    open_positions = {
+        row.symbol.upper(): row
+        for row in session.scalars(
+            select(Position).where(
+                Position.mode == "live",
+                Position.status == "open",
+                Position.quantity > 0,
+                Position.symbol.in_(symbol_keys),
+            )
+        )
+    }
+
+    audit_rows = get_audit_timeline(session, limit=max(20, len(symbol_keys) * 6))
+    audit_entries_by_symbol: dict[str, list[AuditTimelineEntry]] = {symbol: [] for symbol in symbol_keys}
+    for row in audit_rows:
+        if not isinstance(row, dict):
+            continue
+        for symbol in symbol_keys:
+            if len(audit_entries_by_symbol[symbol]) >= 4:
+                continue
+            if _audit_event_matches_symbol(row, symbol):
+                audit_entries_by_symbol[symbol].append(_build_audit_entry(row))
+
+    summaries: list[OperatorSymbolSummary] = []
+    for symbol in tracked_symbols:
+        symbol_key = symbol.upper()
+        decision_row = latest_decisions.get(symbol_key)
+        risk_row = latest_risks.get(symbol_key)
+        order_row = latest_orders.get(symbol_key)
+        execution_row = latest_executions_by_order_id.get(order_row.id) if order_row is not None else None
+        position_row = open_positions.get(symbol_key)
+        market_row = latest_markets.get(symbol_key)
+        protection_state = (
+            _build_position_protection_state(session, position_row)
+            if position_row is not None
+            else {
+                "status": "flat",
+                "protected": True,
+                "protective_order_count": 0,
+                "has_stop_loss": False,
+                "has_take_profit": False,
+                "missing_components": [],
+                "order_ids": [],
+            }
+        )
+        stale_flags = _build_symbol_stale_flags(overview.sync_freshness_summary, market_row)
+        last_updated_at = _latest_timestamp(
+            market_row.snapshot_time if market_row is not None else None,
+            decision_row.created_at if decision_row is not None else None,
+            risk_row.created_at if risk_row is not None else None,
+            order_row.created_at if order_row is not None else None,
+            execution_row.created_at if execution_row is not None else None,
+            position_row.created_at if position_row is not None else None,
+        )
+        summaries.append(
+            OperatorSymbolSummary(
+                symbol=symbol_key,
+                timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
+                latest_price=market_row.latest_price if market_row is not None else None,
+                market_snapshot_time=market_row.snapshot_time if market_row is not None else None,
+                market_context_summary=_extract_symbol_market_context(decision_row, market_row),
+                ai_decision=_build_decision_snapshot(decision_row),
+                risk_guard=_build_risk_snapshot(risk_row),
+                execution=_build_execution_snapshot_from_rows(order_row, execution_row, decision_row),
+                open_position=_build_position_snapshot(position_row),
+                protection_status=_build_protection_snapshot(protection_state),
+                blocked_reasons=_as_string_list(risk_row.reason_codes if risk_row is not None else []),
+                live_execution_ready=overview.live_execution_ready and len(stale_flags) == 0,
+                stale_flags=stale_flags,
+                last_updated_at=last_updated_at,
+                audit_events=audit_entries_by_symbol.get(symbol_key, []),
+            )
+        )
+    return summaries
+
+
 def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
     overview = get_overview(session)
     profitability = get_profitability_dashboard(session)
     settings_row = get_or_create_settings(session)
     latest_scheduler = session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
-    latest_decision_row = session.scalar(
-        select(AgentRun)
-        .where(AgentRun.role == "trading_decision")
-        .order_by(desc(AgentRun.created_at))
-        .limit(1)
+    symbol_summaries = _build_operator_symbol_summaries(
+        session,
+        tracked_symbols=overview.tracked_symbols,
+        overview=overview,
     )
-    latest_risk_row = None
-    if latest_decision_row is not None:
-        latest_risk_row = session.scalar(
-            select(RiskCheck)
-            .where(RiskCheck.decision_run_id == latest_decision_row.id)
-            .order_by(desc(RiskCheck.created_at))
-            .limit(1)
-        )
-    if latest_risk_row is None:
-        latest_risk_row = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
-
     audit_rows = get_audit_timeline(session, limit=6)
+    sync_blocks_entry = any(
+        isinstance(scope_payload, dict) and (bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete")))
+        for scope_payload in overview.sync_freshness_summary.values()
+        if isinstance(scope_payload, dict)
+    )
     return OperatorDashboardResponse(
         generated_at=utcnow_naive(),
         control=OperatorControlState(
             generated_at=utcnow_naive(),
-            can_enter_new_position=overview.live_execution_ready and not overview.trading_paused and overview.operating_state == "TRADABLE",
+            can_enter_new_position=(
+                overview.live_execution_ready
+                and not overview.trading_paused
+                and overview.operating_state == "TRADABLE"
+                and not sync_blocks_entry
+            ),
             mode=overview.mode,
-            symbol=overview.symbol,
-            timeframe=overview.timeframe,
+            default_symbol=overview.symbol,
+            default_timeframe=overview.timeframe,
             tracked_symbols=overview.tracked_symbols,
-            latest_price=overview.latest_price,
+            tracked_symbol_count=len(overview.tracked_symbols),
             live_trading_enabled=overview.live_trading_enabled,
             live_execution_ready=overview.live_execution_ready,
             approval_armed=settings_row.live_execution_armed,
@@ -940,25 +1171,28 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
             auto_resume_after=overview.auto_resume_after,
             auto_resume_last_blockers=overview.auto_resume_last_blockers,
             latest_blocked_reasons=overview.latest_blocked_reasons,
+            sync_freshness_summary=overview.sync_freshness_summary,
             protection_recovery_status=overview.protection_recovery_status,
             protected_positions=overview.protected_positions,
             unprotected_positions=overview.unprotected_positions,
             open_positions=overview.open_positions,
+            daily_pnl=overview.daily_pnl,
+            cumulative_pnl=overview.cumulative_pnl,
+            account_sync_summary=overview.account_sync_summary,
+            exposure_summary=overview.exposure_summary,
             scheduler_status=latest_scheduler.status if latest_scheduler is not None else None,
             scheduler_window=latest_scheduler.schedule_window if latest_scheduler is not None else None,
             scheduler_triggered_by=latest_scheduler.triggered_by if latest_scheduler is not None else None,
             scheduler_last_run_at=latest_scheduler.created_at if latest_scheduler is not None else None,
             scheduler_next_run_at=latest_scheduler.next_run_at if latest_scheduler is not None else None,
         ),
+        symbols=symbol_summaries,
         market_signal=OperatorMarketSignalSummary(
             market_context_summary=overview.market_context_summary,
             performance_windows=profitability.windows,
             hold_blocked_summary=profitability.hold_blocked_summary,
             adaptive_signal_summary=profitability.adaptive_signal_summary,
         ),
-        ai_decision=_build_decision_snapshot(latest_decision_row),
-        risk_guard=_build_risk_snapshot(latest_risk_row),
-        execution=_build_execution_snapshot(session, latest_decision_row.id if latest_decision_row is not None else None),
         execution_windows=profitability.execution_windows,
         audit_events=[_build_audit_entry(item) for item in audit_rows if isinstance(item, dict)],
     )

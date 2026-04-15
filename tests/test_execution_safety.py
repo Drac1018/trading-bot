@@ -483,8 +483,12 @@ class EntrySuccessClient:
     def __init__(self) -> None:
         self.entry_submitted = False
         self.orders: list[dict[str, object]] = []
+        self.account_info_calls = 0
+        self.open_orders_calls = 0
+        self.position_information_calls = 0
 
     def get_account_info(self):
+        self.account_info_calls += 1
         return {
             "availableBalance": "100.0",
             "totalWalletBalance": "100.0",
@@ -493,9 +497,11 @@ class EntrySuccessClient:
         }
 
     def get_open_orders(self, symbol: str):
+        self.open_orders_calls += 1
         return list(self.orders)
 
     def get_position_information(self, symbol: str):
+        self.position_information_calls += 1
         if not self.entry_submitted:
             return []
         return [{"positionAmt": "0.01", "entryPrice": "70000", "markPrice": "70120", "leverage": "2"}]
@@ -720,7 +726,8 @@ def test_entry_protection_failure_triggers_emergency_close(monkeypatch, db_sessi
 
 def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
-    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: EntrySuccessClient())
+    client = EntrySuccessClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
 
     result = execute_live_trade(
         db_session,
@@ -742,6 +749,33 @@ def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_sess
     assert result["position_management"]["metadata"]["initial_take_profit"] == 72000.0
     assert result["position_management"]["metadata"]["planned_max_holding_minutes"] == 120
     assert result["position_management"]["metadata"]["partial_take_profit_taken"] is False
+    assert client.account_info_calls >= 3
+    assert client.open_orders_calls >= 3
+    assert client.position_information_calls >= 3
+
+
+def test_post_order_resync_updates_sync_freshness_summary(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = EntrySuccessClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=55,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(get_or_create_settings(db_session))
+
+    assert serialized["sync_freshness_summary"]["account"]["stale"] is False
+    assert serialized["sync_freshness_summary"]["positions"]["stale"] is False
+    assert serialized["sync_freshness_summary"]["open_orders"]["stale"] is False
+    assert serialized["sync_freshness_summary"]["protective_orders"]["stale"] is False
+    assert serialized["sync_freshness_summary"]["protective_orders"]["last_sync_at"] is not None
 
 
 def test_sync_live_state_recreates_missing_protection_and_logs(monkeypatch, db_session) -> None:
@@ -774,6 +808,8 @@ def test_sync_live_state_recreates_missing_protection_and_logs(monkeypatch, db_s
     assert "BTCUSDT" in result["unprotected_positions"]
     assert result["symbol_protection_state"]["BTCUSDT"]["status"] == "protected"
     assert serialized["operating_state"] == "TRADABLE"
+    assert serialized["sync_freshness_summary"]["account"]["stale"] is False
+    assert serialized["sync_freshness_summary"]["protective_orders"]["stale"] is False
     assert any(event.event_type == "unprotected_position_detected" for event in events)
     assert any(event.event_type == "protection_recreate_attempted" for event in events)
 

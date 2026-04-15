@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from trading_mvp.database import Base, engine, get_db
 from trading_mvp.schemas import (
@@ -71,10 +72,31 @@ from trading_mvp.services.settings import (
 )
 
 
+async def _background_exchange_poll_loop() -> None:
+    while True:
+        polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+        with polling_session_factory() as session:
+            orchestrator = TradingOrchestrator(session)
+            result = orchestrator.run_exchange_sync_cycle(trigger_event="background_poll")
+            session.commit()
+            interval_seconds = max(30, int(orchestrator.settings_row.decision_cycle_interval_minutes) * 60)
+            if result.get("status") == "error":
+                interval_seconds = min(interval_seconds, 60)
+        await asyncio.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
-    yield
+    poll_task = asyncio.create_task(_background_exchange_poll_loop())
+    try:
+        yield
+    finally:
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Trading MVP API", version="0.2.0", lifespan=lifespan)

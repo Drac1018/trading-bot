@@ -471,10 +471,10 @@ class OperatorControlState(StrictBaseModel):
     generated_at: datetime
     can_enter_new_position: bool = False
     mode: str
-    symbol: str
-    timeframe: str
+    default_symbol: str
+    default_timeframe: str
     tracked_symbols: list[str] = Field(default_factory=list)
-    latest_price: float = 0.0
+    tracked_symbol_count: int = 0
     live_trading_enabled: bool = False
     live_execution_ready: bool = False
     approval_armed: bool = False
@@ -492,10 +492,15 @@ class OperatorControlState(StrictBaseModel):
     auto_resume_after: datetime | None = None
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
     latest_blocked_reasons: list[str] = Field(default_factory=list)
+    sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     protection_recovery_status: str = "idle"
     protected_positions: int = 0
     unprotected_positions: int = 0
     open_positions: int = 0
+    daily_pnl: float = 0.0
+    cumulative_pnl: float = 0.0
+    account_sync_summary: dict[str, Any] = Field(default_factory=dict)
+    exposure_summary: dict[str, Any] = Field(default_factory=dict)
     scheduler_status: str | None = None
     scheduler_window: str | None = None
     scheduler_triggered_by: str | None = None
@@ -553,6 +558,48 @@ class OperatorExecutionSnapshot(StrictBaseModel):
     decision_summary: dict[str, Any] = Field(default_factory=dict)
 
 
+class OperatorPositionSummary(StrictBaseModel):
+    is_open: bool = False
+    position_id: int | None = None
+    side: str | None = None
+    status: str | None = None
+    quantity: float | None = None
+    entry_price: float | None = None
+    mark_price: float | None = None
+    unrealized_pnl: float | None = None
+    realized_pnl: float | None = None
+    leverage: float | None = None
+    opened_at: datetime | None = None
+
+
+class OperatorProtectionSummary(StrictBaseModel):
+    status: str = "unknown"
+    protected: bool = False
+    protective_order_count: int = 0
+    has_stop_loss: bool = False
+    has_take_profit: bool = False
+    missing_components: list[str] = Field(default_factory=list)
+    order_ids: list[int] = Field(default_factory=list)
+
+
+class OperatorSymbolSummary(StrictBaseModel):
+    symbol: str
+    timeframe: str | None = None
+    latest_price: float | None = None
+    market_snapshot_time: datetime | None = None
+    market_context_summary: dict[str, Any] = Field(default_factory=dict)
+    ai_decision: OperatorDecisionSnapshot = Field(default_factory=OperatorDecisionSnapshot)
+    risk_guard: OperatorRiskSnapshot = Field(default_factory=OperatorRiskSnapshot)
+    execution: OperatorExecutionSnapshot = Field(default_factory=OperatorExecutionSnapshot)
+    open_position: OperatorPositionSummary = Field(default_factory=OperatorPositionSummary)
+    protection_status: OperatorProtectionSummary = Field(default_factory=OperatorProtectionSummary)
+    blocked_reasons: list[str] = Field(default_factory=list)
+    live_execution_ready: bool = False
+    stale_flags: list[str] = Field(default_factory=list)
+    last_updated_at: datetime | None = None
+    audit_events: list[AuditTimelineEntry] = Field(default_factory=list)
+
+
 class OperatorMarketSignalSummary(StrictBaseModel):
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     performance_windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
@@ -563,10 +610,8 @@ class OperatorMarketSignalSummary(StrictBaseModel):
 class OperatorDashboardResponse(StrictBaseModel):
     generated_at: datetime
     control: OperatorControlState
+    symbols: list[OperatorSymbolSummary] = Field(default_factory=list)
     market_signal: OperatorMarketSignalSummary
-    ai_decision: OperatorDecisionSnapshot
-    risk_guard: OperatorRiskSnapshot
-    execution: OperatorExecutionSnapshot
     execution_windows: list[DashboardExecutionWindowSummary] = Field(default_factory=list)
     audit_events: list[AuditTimelineEntry] = Field(default_factory=list)
 
@@ -621,6 +666,7 @@ class RiskCheckResult(StrictBaseModel):
     effective_leverage_cap: float = Field(gt=0.0, le=10.0)
     symbol_risk_tier: Literal["btc", "major_alt", "alt"]
     exposure_metrics: dict[str, float] = Field(default_factory=dict)
+    sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionIntent(StrictBaseModel):
@@ -810,6 +856,7 @@ class OverviewResponse(StrictBaseModel):
     missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
     pnl_summary: dict[str, Any] = Field(default_factory=dict)
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
+    sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     exposure_summary: dict[str, Any] = Field(default_factory=dict)
     execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
@@ -869,6 +916,7 @@ class AppSettingsResponse(StrictBaseModel):
     missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
     pnl_summary: dict[str, Any] = Field(default_factory=dict)
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
+    sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     exposure_summary: dict[str, Any] = Field(default_factory=dict)
     execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
     market_context_summary: dict[str, Any] = Field(default_factory=dict)

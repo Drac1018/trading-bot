@@ -32,6 +32,7 @@
 - `operating_state`
 - `pnl_summary`
 - `account_sync_summary`
+- `sync_freshness_summary`
 - `exposure_summary`
 - `execution_policy_summary`
 - `market_context_summary`
@@ -78,12 +79,26 @@
 - `protection_recovery_status`
 - `pnl_summary`
 - `account_sync_summary`
+- `sync_freshness_summary`
 - `exposure_summary`
 - `execution_policy_summary`
 - `market_context_summary`
 - `adaptive_signal_summary`
 
 ### `GET /api/dashboard/operator`
+
+2026-04 멀티 심볼 개편 기준:
+
+- `control`에는 계좌/시스템 전역 상태만 남습니다.
+- `default_symbol`, `default_timeframe`, `tracked_symbols`, `tracked_symbol_count`
+- `can_enter_new_position`, `live_execution_ready`, `approval_armed`, `trading_paused`
+- `operating_state`, `guard_mode_reason_message`, `pause_reason_code`
+- `auto_resume_status`, `latest_blocked_reasons`, `auto_resume_last_blockers`
+- `sync_freshness_summary`, `protected_positions`, `unprotected_positions`, `open_positions`
+- `daily_pnl`, `cumulative_pnl`, `account_sync_summary`, `exposure_summary`
+- `symbols`는 tracked symbol별 최신 snapshot 배열입니다.
+- 각 symbol row는 `symbol`, `timeframe`, `latest_price`, `market_snapshot_time`, `ai_decision`, `risk_guard`, `execution`, `open_position`, `protection_status`, `blocked_reasons`, `live_execution_ready`, `stale_flags`, `last_updated_at`, `audit_events`를 포함합니다.
+- 전역 최신 1건 `ai_decision / risk_guard / execution` 필드는 더 이상 대표값으로 내려주지 않습니다.
 
 운영자 메인 화면 전용 snapshot입니다. 같은 흐름의 정보를 한 응답으로 묶어 보여줍니다.
 
@@ -99,6 +114,7 @@
   - `auto_resume_status`
   - `latest_blocked_reasons`
   - `auto_resume_last_blockers`
+  - `sync_freshness_summary`
   - `protected_positions`
   - `unprotected_positions`
   - `scheduler_status`
@@ -187,6 +203,12 @@
 ## Live Sync
 
 - `POST /api/live/sync`
+- `sync_freshness_summary`
+  - `account`
+  - `positions`
+  - `open_orders`
+  - `protective_orders`
+  - each scope includes `last_sync_at`, `freshness_seconds`, `stale_after_seconds`, `stale`, `incomplete`, `last_failure_reason`
 
 거래소 주문, 포지션, 계좌, 보호 주문 상태를 동기화하고 운영 상태를 다시 계산합니다.
 
