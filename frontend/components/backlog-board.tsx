@@ -32,14 +32,6 @@ type AppliedRecord = {
   updated_at: string;
 };
 
-type CodexPromptDraft = {
-  available: boolean;
-  title: string;
-  prompt: string;
-  generated_at: string;
-  note: string;
-};
-
 type BacklogItem = {
   id: number;
   title: string;
@@ -52,24 +44,10 @@ type BacklogItem = {
   rationale: string;
   source: string;
   status: string;
-  auto_apply_supported: boolean;
-  auto_apply_label: string | null;
   created_at: string;
   updated_at: string;
   user_requests: UserRequest[];
   applied_records: AppliedRecord[];
-  codex_prompt_draft: CodexPromptDraft | null;
-};
-
-type AutoApplyResult = {
-  backlog_id: number;
-  title: string;
-  backlog_status: string;
-  auto_apply_supported: boolean;
-  handler_key: string | null;
-  already_applied: boolean;
-  message: string;
-  applied_record: AppliedRecord | null;
 };
 
 type SignalPerformanceEntry = {
@@ -567,92 +545,7 @@ function AppliedRecordList({ items }: { items: AppliedRecord[] }) {
   );
 }
 
-function CodexPromptSection({ draft }: { draft: CodexPromptDraft | null }) {
-  const [copied, setCopied] = useState(false);
-
-  if (!draft || !draft.available) {
-    return null;
-  }
-
-  const copyPrompt = async () => {
-    try {
-      await navigator.clipboard.writeText(draft.prompt);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setCopied(false);
-    }
-  };
-
-  return (
-    <section className="mt-6 rounded-[1.6rem] border border-dashed border-amber-300 bg-amber-50/60 p-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <p className="text-sm font-semibold text-slate-900">{draft.title}</p>
-          <p className="mt-2 text-xs leading-6 text-slate-600">{draft.note}</p>
-          <p className="mt-1 text-xs text-slate-500">
-            생성 {formatDisplayValue(draft.generated_at, "created_at")}
-          </p>
-        </div>
-        <button
-          className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white"
-          onClick={() => {
-            void copyPrompt();
-          }}
-          type="button"
-        >
-          {copied ? "복사 완료" : "프롬프트 복사"}
-        </button>
-      </div>
-      <textarea
-        className="mt-4 min-h-72 w-full rounded-2xl border border-amber-200 bg-white px-4 py-3 text-sm leading-6 text-slate-800"
-        readOnly
-        value={draft.prompt}
-      />
-    </section>
-  );
-}
-
-function AutoApplyButton({
-  supported,
-  label,
-  disabled,
-  onClick,
-}: {
-  supported: boolean;
-  label: string | null;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  if (!supported) {
-    return (
-      <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-500">
-        자동 적용 미지원
-      </span>
-    );
-  }
-
-  return (
-    <button
-      className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
-      disabled={disabled}
-      onClick={onClick}
-      type="button"
-    >
-      {label ?? "자동 적용"}
-    </button>
-  );
-}
-
-function BacklogCard({
-  item,
-  isPending,
-  onAutoApply,
-}: {
-  item: BacklogItem;
-  isPending: boolean;
-  onAutoApply: (id: number) => void;
-}) {
+function BacklogCard({ item }: { item: BacklogItem }) {
   return (
     <article className="rounded-[1.8rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -669,12 +562,6 @@ function BacklogCard({
           <div className="rounded-2xl bg-canvas px-4 py-3 text-sm text-slate-600">
             생성 {formatDisplayValue(item.created_at, "created_at")}
           </div>
-          <AutoApplyButton
-            supported={item.auto_apply_supported}
-            label={item.auto_apply_label}
-            disabled={isPending}
-            onClick={() => onAutoApply(item.id)}
-          />
         </div>
       </div>
 
@@ -703,8 +590,6 @@ function BacklogCard({
           <AppliedRecordList items={item.applied_records} />
         </section>
       </div>
-
-      <CodexPromptSection draft={item.codex_prompt_draft} />
     </article>
   );
 }
@@ -834,49 +719,13 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
     });
   };
 
-  const runAutoApply = (backlogId: number) => {
-    startTransition(() => {
-      void fetch(`${apiBaseUrl}/api/backlog/${backlogId}/auto-apply`, { method: "POST" })
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error((await response.text()) || "자동 적용에 실패했습니다.");
-          }
-          const result = (await response.json()) as AutoApplyResult;
-          await refreshBoard();
-          setMessage(result.message);
-        })
-        .catch((error: unknown) => {
-          setMessage(error instanceof Error ? error.message : "자동 적용에 실패했습니다.");
-        });
-    });
-  };
-
-  const runAutoApplyBatch = () => {
-    startTransition(() => {
-      void fetch(`${apiBaseUrl}/api/backlog/auto-apply-supported`, { method: "POST" })
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error((await response.text()) || "지원 backlog 자동 적용에 실패했습니다.");
-          }
-          const result = (await response.json()) as { items: AutoApplyResult[] };
-          await refreshBoard();
-          const appliedCount = result.items.filter((item) => item.auto_apply_supported).length;
-          setMessage(`지원되는 backlog ${appliedCount}건에 자동 적용을 실행했습니다.`);
-        })
-        .catch((error: unknown) => {
-          setMessage(error instanceof Error ? error.message : "지원 backlog 자동 적용에 실패했습니다.");
-        });
-    });
-  };
-
   const backlogOptions = board.ai_backlog.map((item) => ({ id: item.id, title: item.title }));
-  const supportedCount = board.ai_backlog.filter((item) => item.auto_apply_supported).length;
 
   return (
     <div className="space-y-6">
-      <section className="grid gap-4 lg:grid-cols-4">
+      <section className="grid gap-4 lg:grid-cols-3">
         <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">AI 제안</p>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">개선 항목</p>
           <p className="mt-3 text-3xl font-semibold text-ink">{board.ai_backlog.length}</p>
         </div>
         <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
@@ -891,10 +740,6 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
             {board.ai_backlog.reduce((acc, item) => acc + item.applied_records.length, 0) + board.unlinked_applied_records.length}
           </p>
         </div>
-        <div className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">자동 적용 가능</p>
-          <p className="mt-3 text-3xl font-semibold text-ink">{supportedCount}</p>
-        </div>
       </section>
 
       <section className="grid gap-5 xl:grid-cols-2">
@@ -906,7 +751,7 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
         <div className="rounded-[1.8rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
           <SectionHeader
             title="사용자 요청 등록"
-            description="직접 요청한 개선 사항을 AI 백로그와 연결해 기록합니다."
+            description="직접 요청한 개선 사항을 backlog 항목과 연결해 기록합니다."
           />
           <div className="mt-5 space-y-4">
             <input
@@ -939,7 +784,7 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
                   setRequestForm((current) => ({ ...current, linked_backlog_id: event.target.value }))
                 }
               >
-                <option value="">AI 백로그와 연결 안 함</option>
+                <option value="">backlog와 연결 안 함</option>
                 {backlogOptions.map((item) => (
                   <option key={item.id} value={String(item.id)}>
                     #{item.id} {item.title}
@@ -1007,7 +852,7 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
                   setAppliedForm((current) => ({ ...current, related_backlog_id: event.target.value }))
                 }
               >
-                <option value="">AI 백로그와 연결 안 함</option>
+                <option value="">backlog와 연결 안 함</option>
                 {backlogOptions.map((item) => (
                   <option key={item.id} value={String(item.id)}>
                     #{item.id} {item.title}
@@ -1045,28 +890,16 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
 
       <section className="space-y-5">
         <SectionHeader
-          title="AI 제안 백로그"
-          description="문제, 제안, 근거와 함께 연결된 사용자 요청과 적용/검증 내역을 같은 화면에서 추적합니다."
+          title="개선 backlog"
+          description="문제, 제안, 근거와 연결된 사용자 요청, 실제 적용 이력, 검증 결과를 같은 화면에서 추적합니다."
           count={board.ai_backlog.length}
-          actions={
-            supportedCount > 0 ? (
-              <button
-                className="rounded-full bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-900 disabled:opacity-60"
-                disabled={isPending}
-                onClick={runAutoApplyBatch}
-                type="button"
-              >
-                지원되는 backlog 자동 적용
-              </button>
-            ) : null
-          }
         />
         {board.ai_backlog.length === 0 ? (
-          <EmptyState message="AI가 생성한 개선 백로그가 아직 없습니다." />
+          <EmptyState message="등록된 개선 backlog 항목이 아직 없습니다." />
         ) : (
           <div className="space-y-5">
             {board.ai_backlog.map((item) => (
-              <BacklogCard key={item.id} item={item} isPending={isPending} onAutoApply={runAutoApply} />
+              <BacklogCard key={item.id} item={item} />
             ))}
           </div>
         )}
@@ -1074,7 +907,7 @@ export function BacklogBoard({ initial }: { initial: BacklogBoardPayload }) {
 
       <LooseList
         title="연결 전 항목"
-        description="아직 AI 백로그와 직접 연결하지 않은 사용자 요청과 적용 내역입니다."
+        description="아직 backlog 항목과 직접 연결하지 않은 사용자 요청과 적용 내역입니다."
         requests={board.unlinked_user_requests}
         applied={board.unlinked_applied_records}
       />

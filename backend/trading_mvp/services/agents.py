@@ -218,6 +218,103 @@ class TradingDecisionAgent:
         actionable_threshold = self._minimum_actionable_notional(price)
         return side_budget >= actionable_threshold and symbol_budget >= actionable_threshold and leverage_budget >= 1.0
 
+    @staticmethod
+    def _timeframe_minutes(timeframe: str) -> int:
+        value = timeframe.strip().lower()
+        if value.endswith("m"):
+            return max(int(value[:-1]), 1)
+        if value.endswith("h"):
+            return max(int(value[:-1]) * 60, 1)
+        if value.endswith("d"):
+            return max(int(value[:-1]) * 1440, 1)
+        return 15
+
+    def _build_entry_trigger_defaults(
+        self,
+        decision: Literal["hold", "long", "short", "reduce", "exit"],
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        stop_loss: float | None,
+    ) -> dict[str, Any]:
+        if decision not in {"long", "short"}:
+            return {
+                "entry_mode": "none",
+                "invalidation_price": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+            }
+
+        breakout_up = features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
+        breakout_down = features.breakout.broke_swing_low or features.breakout.range_breakout_direction == "down"
+        bullish_pullback = features.pullback_context.state == "bullish_pullback"
+        bearish_pullback = features.pullback_context.state == "bearish_pullback"
+
+        if decision == "long":
+            if breakout_up:
+                entry_mode = "breakout_confirm"
+            elif bullish_pullback:
+                entry_mode = "pullback_confirm"
+            else:
+                entry_mode = "immediate"
+        else:
+            if breakout_down:
+                entry_mode = "breakout_confirm"
+            elif bearish_pullback:
+                entry_mode = "pullback_confirm"
+            else:
+                entry_mode = "immediate"
+
+        if entry_mode == "breakout_confirm":
+            max_chase_bps = 12.0
+        elif entry_mode == "pullback_confirm":
+            max_chase_bps = 8.0
+        else:
+            max_chase_bps = 5.0
+
+        return {
+            "entry_mode": entry_mode,
+            "invalidation_price": stop_loss,
+            "max_chase_bps": max_chase_bps,
+            "idea_ttl_minutes": min(max(self._timeframe_minutes(market_snapshot.timeframe), 5), 60),
+        }
+
+    def _normalize_entry_trigger_fields(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+    ) -> TradeDecision:
+        defaults = self._build_entry_trigger_defaults(
+            decision.decision,
+            market_snapshot=market_snapshot,
+            features=features,
+            stop_loss=decision.stop_loss,
+        )
+        if decision.decision not in {"long", "short"}:
+            return decision.model_copy(update=defaults)
+        return decision.model_copy(
+            update={
+                "entry_mode": decision.entry_mode or defaults["entry_mode"],
+                "invalidation_price": (
+                    decision.invalidation_price
+                    if decision.invalidation_price is not None
+                    else defaults["invalidation_price"]
+                ),
+                "max_chase_bps": (
+                    decision.max_chase_bps
+                    if decision.max_chase_bps is not None
+                    else defaults["max_chase_bps"]
+                ),
+                "idea_ttl_minutes": (
+                    decision.idea_ttl_minutes
+                    if decision.idea_ttl_minutes is not None
+                    else defaults["idea_ttl_minutes"]
+                ),
+            }
+        )
+
     def _apply_adaptive_adjustment(
         self,
         decision: TradeDecision,
@@ -271,6 +368,10 @@ class TradingDecisionAgent:
                 update={
                     "decision": "hold",
                     "confidence": round(max(0.24, adjusted_confidence), 4),
+                    "entry_mode": "none",
+                    "invalidation_price": None,
+                    "max_chase_bps": None,
+                    "idea_ttl_minutes": None,
                     "stop_loss": None,
                     "take_profit": None,
                     "risk_pct": 0.001,
@@ -514,21 +615,25 @@ class TradingDecisionAgent:
             stop_loss = open_position.stop_loss
             take_profit = open_position.take_profit
 
-        return TradeDecision(
-            decision=decision,
-            confidence=round(confidence, 4),
-            symbol=market_snapshot.symbol,
-            timeframe=market_snapshot.timeframe,
-            entry_zone_min=float(entry_min),
-            entry_zone_max=float(entry_max),
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            max_holding_minutes=240,
-            risk_pct=float(risk_pct),
-            leverage=float(leverage),
-            rationale_codes=rationale,
-            explanation_short=short_explanation,
-            explanation_detailed=detailed_explanation,
+        return self._normalize_entry_trigger_fields(
+            TradeDecision(
+                decision=decision,
+                confidence=round(confidence, 4),
+                symbol=market_snapshot.symbol,
+                timeframe=market_snapshot.timeframe,
+                entry_zone_min=float(entry_min),
+                entry_zone_max=float(entry_max),
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                max_holding_minutes=240,
+                risk_pct=float(risk_pct),
+                leverage=float(leverage),
+                rationale_codes=rationale,
+                explanation_short=short_explanation,
+                explanation_detailed=detailed_explanation,
+            ),
+            market_snapshot=market_snapshot,
+            features=features,
         )
 
     def _deterministic_decision_baseline_old(
@@ -675,21 +780,25 @@ class TradingDecisionAgent:
             stop_loss = open_position.stop_loss
             take_profit = open_position.take_profit
 
-        return TradeDecision(
-            decision=decision,
-            confidence=round(confidence, 4),
-            symbol=market_snapshot.symbol,
-            timeframe=market_snapshot.timeframe,
-            entry_zone_min=float(entry_min),
-            entry_zone_max=float(entry_max),
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            max_holding_minutes=240,
-            risk_pct=float(risk_pct),
-            leverage=float(leverage),
-            rationale_codes=rationale,
-            explanation_short=short_explanation,
-            explanation_detailed=detailed_explanation,
+        return self._normalize_entry_trigger_fields(
+            TradeDecision(
+                decision=decision,
+                confidence=round(confidence, 4),
+                symbol=market_snapshot.symbol,
+                timeframe=market_snapshot.timeframe,
+                entry_zone_min=float(entry_min),
+                entry_zone_max=float(entry_max),
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                max_holding_minutes=240,
+                risk_pct=float(risk_pct),
+                leverage=float(leverage),
+                rationale_codes=rationale,
+                explanation_short=short_explanation,
+                explanation_detailed=detailed_explanation,
+            ),
+            market_snapshot=market_snapshot,
+            features=features,
         )
 
     def _deterministic_decision(
@@ -835,6 +944,10 @@ class TradingDecisionAgent:
                     "confidence": baseline.confidence,
                     "entry_zone_min": baseline.entry_zone_min,
                     "entry_zone_max": baseline.entry_zone_max,
+                    "entry_mode": baseline.entry_mode,
+                    "invalidation_price": baseline.invalidation_price,
+                    "max_chase_bps": baseline.max_chase_bps,
+                    "idea_ttl_minutes": baseline.idea_ttl_minutes,
                     "stop_loss": baseline.stop_loss,
                     "take_profit": baseline.take_profit,
                     "risk_pct": baseline.risk_pct,
@@ -855,10 +968,20 @@ class TradingDecisionAgent:
                     "Never propose size or leverage beyond the provided risk budget. "
                     "If the remaining budget is small or zero, prefer hold. "
                     "If an open position already exists, prefer reduce, protect, or exit before proposing a new entry. "
-                    "If confidence is weak, return hold. Keep explanation_short brief and explanation_detailed under 3 sentences."
+                    "If confidence is weak, return hold. "
+                    "For new long or short ideas, treat your output as a directional idea, not direct execution authority. "
+                    "Set entry_mode to breakout_confirm, pullback_confirm, immediate, or none. "
+                    "Provide a valid invalidation_price on the wrong side of the trade, plus a conservative max_chase_bps. "
+                    "Use entry_mode=none for hold, reduce, or exit. "
+                    "Do not use immediate unless the current snapshot already supports immediate execution. "
+                    "Keep explanation_short brief and explanation_detailed under 3 sentences."
                 ),
             )
-            decision = TradeDecision.model_validate(provider_result.output)
+            decision = self._normalize_entry_trigger_fields(
+                TradeDecision.model_validate(provider_result.output),
+                market_snapshot=market_snapshot,
+                features=features,
+            )
             decision, adaptive_adjustment = self._apply_adaptive_adjustment(
                 decision,
                 risk_context=risk_context,

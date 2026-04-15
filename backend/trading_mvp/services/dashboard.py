@@ -813,6 +813,24 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
         reason_codes=_as_string_list(row.reason_codes),
         approved_risk_pct=row.approved_risk_pct,
         approved_leverage=row.approved_leverage,
+        raw_projected_notional=_as_float(payload.get("raw_projected_notional"), default=0.0)
+        if payload.get("raw_projected_notional") is not None
+        else None,
+        approved_projected_notional=_as_float(payload.get("approved_projected_notional"), default=0.0)
+        if payload.get("approved_projected_notional") is not None
+        else None,
+        approved_quantity=_as_float(payload.get("approved_quantity"), default=0.0)
+        if payload.get("approved_quantity") is not None
+        else None,
+        auto_resized_entry=bool(payload.get("auto_resized_entry")),
+        size_adjustment_ratio=_as_float(payload.get("size_adjustment_ratio"), default=0.0)
+        if payload.get("size_adjustment_ratio") is not None
+        else None,
+        auto_resize_reason=str(payload.get("auto_resize_reason") or "") or None,
+        exposure_headroom_snapshot={
+            str(key): _as_float(value, default=0.0)
+            for key, value in _as_dict(payload.get("exposure_headroom_snapshot")).items()
+        },
         raw_payload=payload,
     )
 

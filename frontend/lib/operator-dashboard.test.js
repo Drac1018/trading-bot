@@ -1,15 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "./operator-dashboard.ts";
+import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "./selected-symbol.ts";
 
 test("resolveSelectedSymbol defaults to ALL for multi-symbol view", () => {
-  const selected = resolveSelectedSymbol(null, ["BTCUSDT", "ETHUSDT"], "BTCUSDT");
+  const selected = resolveSelectedSymbol(null, ["BTCUSDT", "ETHUSDT"], "BTCUSDT", { mode: "all" });
   assert.equal(selected, ALL_SYMBOLS);
 });
 
 test("resolveSelectedSymbol preserves valid symbol query", () => {
-  const selected = resolveSelectedSymbol("ethusdt", ["BTCUSDT", "ETHUSDT"], "BTCUSDT");
+  const selected = resolveSelectedSymbol("ethusdt", ["BTCUSDT", "ETHUSDT"], "BTCUSDT", { mode: "all" });
+  assert.equal(selected, "ETHUSDT");
+});
+
+test("resolveSelectedSymbol defaults to default_symbol for single-symbol detail views", () => {
+  const selected = resolveSelectedSymbol(null, ["BTCUSDT", "ETHUSDT"], "ETHUSDT", { mode: "single" });
+  assert.equal(selected, "ETHUSDT");
+});
+
+test("resolveSelectedSymbol falls back to first tracked symbol when default_symbol is missing", () => {
+  const selected = resolveSelectedSymbol(null, ["BTCUSDT", "ETHUSDT"], "SOLUSDT", { mode: "single" });
+  assert.equal(selected, "BTCUSDT");
+});
+
+test("resolveSelectedSymbol ignores ALL query for single-symbol detail views", () => {
+  const selected = resolveSelectedSymbol("ALL", ["BTCUSDT", "ETHUSDT"], "ETHUSDT", { mode: "single" });
   assert.equal(selected, "ETHUSDT");
 });
 

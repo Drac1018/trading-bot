@@ -291,6 +291,12 @@ def get_or_create_settings(session: Session) -> Setting:
         break_even_enabled=defaults.break_even_enabled,
         atr_trailing_stop_enabled=defaults.atr_trailing_stop_enabled,
         partial_take_profit_enabled=defaults.partial_take_profit_enabled,
+        partial_tp_rr=defaults.partial_tp_rr,
+        partial_tp_size_pct=defaults.partial_tp_size_pct,
+        move_stop_to_be_rr=defaults.move_stop_to_be_rr,
+        time_stop_enabled=defaults.time_stop_enabled,
+        time_stop_minutes=defaults.time_stop_minutes,
+        time_stop_profit_floor=defaults.time_stop_profit_floor,
         holding_edge_decay_enabled=defaults.holding_edge_decay_enabled,
         reduce_on_regime_shift_enabled=defaults.reduce_on_regime_shift_enabled,
         starting_equity=defaults.starting_equity,
@@ -516,17 +522,20 @@ def _build_position_management_summary(
             "atr_trailing_stop": settings_row.position_management_enabled and settings_row.atr_trailing_stop_enabled,
             "partial_take_profit": settings_row.position_management_enabled
             and settings_row.partial_take_profit_enabled,
+            "time_stop": settings_row.position_management_enabled and settings_row.time_stop_enabled,
             "holding_edge_decay": settings_row.position_management_enabled
             and settings_row.holding_edge_decay_enabled,
             "reduce_on_regime_shift": settings_row.position_management_enabled
             and settings_row.reduce_on_regime_shift_enabled,
         },
         "fixed_parameters": {
-            "break_even_trigger_r": 1.0,
+            "break_even_trigger_r": settings_row.move_stop_to_be_rr,
             "trailing_activation_r": 1.0,
             "trailing_atr_multiple": 1.2,
-            "partial_take_profit_trigger_r": 1.5,
-            "partial_take_profit_fraction": 0.25,
+            "partial_take_profit_trigger_r": settings_row.partial_tp_rr,
+            "partial_take_profit_fraction": settings_row.partial_tp_size_pct,
+            "time_stop_minutes": settings_row.time_stop_minutes,
+            "time_stop_profit_floor": settings_row.time_stop_profit_floor,
             "edge_decay_start_ratio": 0.75,
         },
         "active_positions": active_positions,
@@ -534,11 +543,11 @@ def _build_position_management_summary(
         "partial_take_profit_taken_positions": partial_take_profit_taken,
         "data_fallback_rule": (
             "If initial stop or holding-plan metadata is missing, the layer keeps the current stop and skips "
-            "time-decay or partial-take-profit automation."
+            "time stop or partial-take-profit automation."
         ),
         "summary": (
-            "Break-even, ATR trailing, partial take-profit, holding-time decay, and regime weakening only tighten "
-            "protection or reduce exposure. They never widen stop loss."
+            "Break-even, ATR trailing, partial take-profit, time stop, holding-time decay, and regime weakening "
+            "only tighten protection or reduce exposure. They never widen stop loss."
         ),
     }
 
@@ -1101,6 +1110,12 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         break_even_enabled=settings_row.break_even_enabled,
         atr_trailing_stop_enabled=settings_row.atr_trailing_stop_enabled,
         partial_take_profit_enabled=settings_row.partial_take_profit_enabled,
+        partial_tp_rr=settings_row.partial_tp_rr,
+        partial_tp_size_pct=settings_row.partial_tp_size_pct,
+        move_stop_to_be_rr=settings_row.move_stop_to_be_rr,
+        time_stop_enabled=settings_row.time_stop_enabled,
+        time_stop_minutes=settings_row.time_stop_minutes,
+        time_stop_profit_floor=settings_row.time_stop_profit_floor,
         holding_edge_decay_enabled=settings_row.holding_edge_decay_enabled,
         reduce_on_regime_shift_enabled=settings_row.reduce_on_regime_shift_enabled,
         starting_equity=settings_row.starting_equity,
@@ -1185,6 +1200,12 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.break_even_enabled = payload.break_even_enabled
     row.atr_trailing_stop_enabled = payload.atr_trailing_stop_enabled
     row.partial_take_profit_enabled = payload.partial_take_profit_enabled
+    row.partial_tp_rr = payload.partial_tp_rr
+    row.partial_tp_size_pct = payload.partial_tp_size_pct
+    row.move_stop_to_be_rr = payload.move_stop_to_be_rr
+    row.time_stop_enabled = payload.time_stop_enabled
+    row.time_stop_minutes = payload.time_stop_minutes
+    row.time_stop_profit_floor = payload.time_stop_profit_floor
     row.holding_edge_decay_enabled = payload.holding_edge_decay_enabled
     row.reduce_on_regime_shift_enabled = payload.reduce_on_regime_shift_enabled
     row.starting_equity = payload.starting_equity

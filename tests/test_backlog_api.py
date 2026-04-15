@@ -18,7 +18,6 @@ from trading_mvp.models import (
     UserChangeRequest,
 )
 from trading_mvp.services.backlog import get_backlog_board
-from trading_mvp.services.backlog_auto_apply import auto_apply_backlog_item
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -68,6 +67,9 @@ def test_backlog_board_groups_related_items(db_session) -> None:
     assert len(board.ai_backlog) == 1
     assert board.ai_backlog[0].user_requests[0].title == "백로그에 사용자 요청 표시"
     assert board.ai_backlog[0].applied_records[0].title == "백로그 카드 시안 적용"
+    assert "codex_prompt_draft" not in board.ai_backlog[0].model_dump()
+    assert "auto_apply_supported" not in board.ai_backlog[0].model_dump()
+    assert "auto_apply_label" not in board.ai_backlog[0].model_dump()
 
 
 def test_backlog_board_sorts_by_latest_activity_and_includes_insights(db_session) -> None:
@@ -194,45 +196,7 @@ def test_backlog_board_sorts_by_latest_activity_and_includes_insights(db_session
     assert board.signal_performance_report.items[0].rationale_code == "TREND_UP"
     assert board.structured_competitor_notes is not None
     assert board.structured_competitor_notes.items[0].category == "dashboard"
-
-
-def test_auto_apply_supports_signal_and_competitor_backlogs(db_session) -> None:
-    signal_backlog = ProductBacklog(
-        title="시그널 성과 분해 리포트 추가",
-        problem="성과 분해가 어렵습니다.",
-        proposal="rationale code 기준 성과 분해 리포트를 추가합니다.",
-        severity="medium",
-        effort="medium",
-        impact="high",
-        priority="high",
-        rationale="신호 신뢰도를 빨리 판단할 수 있습니다.",
-        source="product_improvement_agent",
-        status="open",
-    )
-    competitor_backlog = ProductBacklog(
-        title="경쟁사 메모 구조화",
-        problem="메모가 자유 형식입니다.",
-        proposal="기능 카테고리와 차별점 기준으로 메모 구조를 통일합니다.",
-        severity="low",
-        effort="small",
-        impact="medium",
-        priority="medium",
-        rationale="개선 근거를 안정적으로 축적할 수 있습니다.",
-        source="product_improvement_agent",
-        status="open",
-    )
-    db_session.add_all([signal_backlog, competitor_backlog])
-    db_session.flush()
-
-    signal_result = auto_apply_backlog_item(db_session, signal_backlog.id)
-    competitor_result = auto_apply_backlog_item(db_session, competitor_backlog.id)
-
-    assert signal_result.auto_apply_supported is True
-    assert competitor_result.auto_apply_supported is True
-    assert signal_result.applied_record is not None
-    assert competitor_result.applied_record is not None
-    assert db_session.get(ProductBacklog, signal_backlog.id).status == "verified"
-    assert db_session.get(ProductBacklog, competitor_backlog.id).status == "verified"
+    assert "codex_prompt_draft" not in board.ai_backlog[0].model_dump()
 
 
 def test_backlog_endpoints_create_and_return_related_data(tmp_path, monkeypatch) -> None:
@@ -287,6 +251,9 @@ def test_backlog_endpoints_create_and_return_related_data(tmp_path, monkeypatch)
             assert len(board["ai_backlog"]) == 1
             assert len(board["ai_backlog"][0]["user_requests"]) == 1
             assert len(board["ai_backlog"][0]["applied_records"]) == 1
+            assert "codex_prompt_draft" not in board["ai_backlog"][0]
+            assert "auto_apply_supported" not in board["ai_backlog"][0]
+            assert "auto_apply_label" not in board["ai_backlog"][0]
 
             detail_response = client.get(f"/api/backlog/{backlog_id}")
             assert detail_response.status_code == 200
@@ -294,19 +261,12 @@ def test_backlog_endpoints_create_and_return_related_data(tmp_path, monkeypatch)
             assert detail["id"] == backlog_id
             assert detail["user_requests"][0]["title"] == "사용자 요청 등록 테스트"
             assert detail["applied_records"][0]["title"] == "적용 내역 등록 테스트"
-
-            auto_apply_response = client.post(f"/api/backlog/{backlog_id}/auto-apply")
-            assert auto_apply_response.status_code == 200
-            auto_apply = auto_apply_response.json()
-            assert auto_apply["auto_apply_supported"] is True
-            assert auto_apply["backlog_status"] == "verified"
-            assert auto_apply["applied_record"]["related_backlog_id"] == backlog_id
-
-            detail_after_apply = client.get(f"/api/backlog/{backlog_id}")
-            assert detail_after_apply.status_code == 200
-            detail_payload = detail_after_apply.json()
-            assert detail_payload["status"] == "verified"
-            assert len(detail_payload["applied_records"]) == 2
+            assert "codex_prompt_draft" not in detail
+            assert "auto_apply_supported" not in detail
+            assert "auto_apply_label" not in detail
+            assert client.get(f"/api/backlog/{backlog_id}/codex-draft").status_code == 404
+            assert client.post(f"/api/backlog/{backlog_id}/auto-apply").status_code == 404
+            assert client.post("/api/backlog/auto-apply-supported").status_code == 405
             assert "signal_performance_report" in board
             assert "structured_competitor_notes" in board
     finally:

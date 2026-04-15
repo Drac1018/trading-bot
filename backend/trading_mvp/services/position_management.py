@@ -11,6 +11,8 @@ TRAILING_STOP_ACTIVATION_R = 1.0
 TRAILING_STOP_ATR_MULTIPLIER = 1.2
 PARTIAL_TAKE_PROFIT_TRIGGER_R = 1.5
 PARTIAL_TAKE_PROFIT_FRACTION = 0.25
+TIME_STOP_MINUTES = 120
+TIME_STOP_PROFIT_FLOOR = 0.15
 EDGE_DECAY_START_RATIO = 0.75
 EDGE_DECAY_HARD_REDUCE_RATIO = 1.0
 
@@ -113,6 +115,17 @@ def mark_partial_take_profit_taken(position: Position) -> dict[str, Any]:
     return management
 
 
+def mark_time_stop_action(position: Position, *, action: str) -> dict[str, Any]:
+    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    management = _management_metadata(position)
+    management["time_stop_action_taken"] = action
+    management["time_stop_action_taken_at"] = utcnow_naive().isoformat()
+    management["last_updated_at"] = utcnow_naive().isoformat()
+    metadata["position_management"] = management
+    position.metadata_json = metadata
+    return management
+
+
 def store_position_management_context(position: Position, context: dict[str, Any]) -> dict[str, Any]:
     metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
     management = _management_metadata(position)
@@ -172,10 +185,11 @@ def build_position_management_context(
 
     regime = feature_payload.regime if feature_payload is not None else None
     current_stop_loss = position.stop_loss if _valid_stop_for_side(position.side, position.entry_price, position.stop_loss) else None
+    break_even_trigger_r = max(_coerce_float(getattr(settings_row, "move_stop_to_be_rr", BREAK_EVEN_TRIGGER_R)) or BREAK_EVEN_TRIGGER_R, 0.0)
     break_even_eligible = bool(
         settings_row.break_even_enabled
         and current_r_multiple is not None
-        and current_r_multiple >= BREAK_EVEN_TRIGGER_R
+        and current_r_multiple >= break_even_trigger_r
     )
     break_even_stop_loss = position.entry_price if break_even_eligible else None
 
@@ -203,14 +217,55 @@ def build_position_management_context(
         applied_rule_candidates.append("POSITION_MANAGEMENT_ATR_TRAIL")
 
     partial_take_profit_taken = bool(management.get("partial_take_profit_taken"))
+    partial_take_profit_trigger_r = max(
+        _coerce_float(getattr(settings_row, "partial_tp_rr", PARTIAL_TAKE_PROFIT_TRIGGER_R))
+        or PARTIAL_TAKE_PROFIT_TRIGGER_R,
+        0.0,
+    )
+    partial_take_profit_fraction = min(
+        max(
+            _coerce_float(getattr(settings_row, "partial_tp_size_pct", PARTIAL_TAKE_PROFIT_FRACTION))
+            or PARTIAL_TAKE_PROFIT_FRACTION,
+            0.01,
+        ),
+        1.0,
+    )
     partial_take_profit_ready = bool(
         settings_row.partial_take_profit_enabled
         and not partial_take_profit_taken
         and current_r_multiple is not None
-        and current_r_multiple >= PARTIAL_TAKE_PROFIT_TRIGGER_R
+        and current_r_multiple >= partial_take_profit_trigger_r
     )
     if partial_take_profit_ready:
         applied_rule_candidates.append("POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT")
+
+    reduce_reason_codes: list[str] = []
+
+    time_stop_minutes = max(
+        int(getattr(settings_row, "time_stop_minutes", TIME_STOP_MINUTES) or TIME_STOP_MINUTES),
+        1,
+    )
+    time_stop_profit_floor = _coerce_float(getattr(settings_row, "time_stop_profit_floor", TIME_STOP_PROFIT_FLOOR))
+    if time_stop_profit_floor is None:
+        time_stop_profit_floor = TIME_STOP_PROFIT_FLOOR
+    time_stop_action_taken = str(management.get("time_stop_action_taken", "") or "").lower() or None
+    time_stop_elapsed = time_in_trade_minutes >= time_stop_minutes
+    time_stop_ready = bool(
+        settings_row.time_stop_enabled
+        and time_stop_action_taken is None
+        and current_r_multiple is not None
+        and time_stop_elapsed
+        and current_r_multiple <= time_stop_profit_floor
+    )
+    time_stop_action: str | None = None
+    if time_stop_ready:
+        if current_r_multiple is not None and current_r_multiple <= 0:
+            time_stop_action = "exit"
+            reduce_reason_codes.append("POSITION_MANAGEMENT_TIME_STOP_EXIT")
+        else:
+            time_stop_action = "reduce"
+            reduce_reason_codes.append("POSITION_MANAGEMENT_TIME_STOP_REDUCE")
+        applied_rule_candidates.append("POSITION_MANAGEMENT_TIME_STOP")
 
     regime_transition_detected = bool(regime is not None and regime.primary_regime == "transition")
     momentum_weakening = bool(regime is not None and regime.momentum_weakening)
@@ -223,7 +278,6 @@ def build_position_management_context(
         and holding_ratio is not None
         and holding_ratio >= EDGE_DECAY_START_RATIO
     )
-    reduce_reason_codes: list[str] = []
     if partial_take_profit_ready:
         reduce_reason_codes.extend(
             ["POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT", "POSITION_MANAGEMENT_LOCK_PARTIAL_PROFIT"]
@@ -267,11 +321,20 @@ def build_position_management_context(
         "current_r_multiple": round(current_r_multiple, 4) if current_r_multiple is not None else None,
         "break_even_eligible": break_even_eligible,
         "break_even_stop_loss": break_even_stop_loss,
+        "break_even_trigger_r": break_even_trigger_r,
         "trailing_stop_loss": trailing_stop_loss,
         "tightened_stop_loss": tightened_stop_loss,
         "partial_take_profit_ready": partial_take_profit_ready,
         "partial_take_profit_taken": partial_take_profit_taken,
-        "partial_take_profit_fraction": PARTIAL_TAKE_PROFIT_FRACTION,
+        "partial_take_profit_trigger_r": partial_take_profit_trigger_r,
+        "partial_take_profit_fraction": partial_take_profit_fraction,
+        "time_stop_enabled": settings_row.time_stop_enabled,
+        "time_stop_minutes": time_stop_minutes,
+        "time_stop_elapsed": time_stop_elapsed,
+        "time_stop_profit_floor": time_stop_profit_floor,
+        "time_stop_ready": time_stop_ready,
+        "time_stop_action": time_stop_action,
+        "time_stop_action_taken": time_stop_action_taken,
         "holding_edge_decay_active": holding_edge_decay_active,
         "regime_transition_detected": regime_transition_detected,
         "momentum_weakening": momentum_weakening,
@@ -280,6 +343,6 @@ def build_position_management_context(
         "applied_rule_candidates": list(dict.fromkeys(applied_rule_candidates)),
         "data_fallback_rule": (
             "Without initial stop metadata, stop tightening can still use the current stop, but partial take-profit "
-            "and edge-decay automation stay conservative."
+            "and time-stop automation stay conservative."
         ),
     }

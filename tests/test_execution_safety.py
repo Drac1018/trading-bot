@@ -4,10 +4,19 @@ from datetime import timedelta
 
 from sqlalchemy import select
 from trading_mvp.models import AuditEvent, Order, Position
-from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
+from trading_mvp.schemas import (
+    FeaturePayload,
+    MarketCandle,
+    MarketSnapshotPayload,
+    RegimeFeatureContext,
+    RiskCheckResult,
+    TradeDecision,
+)
 from trading_mvp.services.execution import (
+    _cap_quantity_to_approved_notional,
     _cancel_exit_orders,
     apply_position_management,
+    build_execution_intent,
     execute_live_trade,
     sync_live_state,
 )
@@ -44,6 +53,30 @@ def _market_snapshot() -> MarketSnapshotPayload:
     )
 
 
+def _feature_payload(*, atr: float = 200.0) -> FeaturePayload:
+    return FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=1.0,
+        volatility_pct=0.01,
+        volume_ratio=1.1,
+        drawdown_pct=0.0,
+        rsi=58.0,
+        atr=atr,
+        atr_pct=0.003,
+        momentum_score=0.6,
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime="normal",
+            momentum_state="stable",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+    )
+
+
 def _risk_result(decision: str) -> RiskCheckResult:
     return RiskCheckResult(
         allowed=True,
@@ -66,6 +99,10 @@ def _live_decision(decision: str) -> TradeDecision:
         timeframe="15m",
         entry_zone_min=69950.0,
         entry_zone_max=70050.0,
+        entry_mode="immediate" if decision in {"long", "short"} else "none",
+        invalidation_price=69000.0 if decision in {"long", "short"} else None,
+        max_chase_bps=15.0 if decision in {"long", "short"} else None,
+        idea_ttl_minutes=15 if decision in {"long", "short"} else None,
         stop_loss=69000.0,
         take_profit=72000.0,
         max_holding_minutes=120,
@@ -87,6 +124,104 @@ def _prime_live_settings(db_session) -> None:
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
     db_session.add(settings_row)
     db_session.flush()
+
+
+def test_execute_live_trade_returns_blocked_without_touching_exchange_when_risk_disallows(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    called = False
+
+    def _unexpected_client(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("exchange client should not be built for blocked intents")
+
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", _unexpected_client)
+
+    decision = _live_decision("long").model_copy(
+        update={
+            "entry_mode": "breakout_confirm",
+            "max_chase_bps": 8.0,
+        }
+    )
+    risk_result = RiskCheckResult(
+        allowed=False,
+        decision="long",
+        reason_codes=["ENTRY_TRIGGER_NOT_MET"],
+        approved_risk_pct=0.0,
+        approved_leverage=0.0,
+        operating_mode="hold",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
+    )
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=123,
+        decision=decision,
+        market_snapshot=_market_snapshot(),
+        risk_result=risk_result,
+        risk_row=None,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason_codes"] == ["ENTRY_TRIGGER_NOT_MET"]
+    assert called is False
+
+
+def test_build_execution_intent_uses_approved_quantity_from_risk_result(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    decision = _live_decision("long")
+    risk_result = RiskCheckResult(
+        allowed=True,
+        decision="long",
+        reason_codes=["ENTRY_AUTO_RESIZED", "ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT"],
+        approved_risk_pct=0.0075,
+        approved_leverage=2.0,
+        raw_projected_notional=158000.0,
+        approved_projected_notional=150000.0,
+        approved_quantity=2.142857,
+        auto_resized_entry=True,
+        size_adjustment_ratio=0.949367,
+        exposure_headroom_snapshot={"limiting_headroom_notional": 150000.0},
+        auto_resize_reason="CLAMPED_TO_SINGLE_POSITION_HEADROOM",
+        operating_mode="live",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
+    )
+
+    intent = build_execution_intent(
+        decision,
+        _market_snapshot(),
+        risk_result,
+        settings_row,
+        equity=100000.0,
+        existing_position=None,
+    )
+
+    assert intent.quantity == 2.142857
+    assert intent.requested_price == 70000.0
+    assert intent.entry_mode == "immediate"
+
+
+def test_capped_quantity_never_overshoots_approved_notional_after_normalize() -> None:
+    class FilterClient:
+        @staticmethod
+        def get_symbol_filters(symbol: str):
+            return {"step_size": 0.001, "min_qty": 0.001, "min_notional": 5.0}
+
+    capped = _cap_quantity_to_approved_notional(
+        FilterClient(),
+        symbol="BTCUSDT",
+        quantity=2.143,
+        reference_price=70000.0,
+        approved_notional=150000.0,
+    )
+
+    assert capped * 70000.0 <= 150000.0
+    assert capped == 2.142
 
 
 class ProtectionFailureClient:
@@ -699,6 +834,57 @@ def test_apply_position_management_tightens_stop_and_records_audit(monkeypatch, 
     assert any(order.external_order_id == "stop-tightened" for order in orders)
 
 
+def test_apply_position_management_never_widens_stop_for_break_even(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=70400.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=4.0,
+        metadata_json={"position_management": {"initial_stop_loss": 69000.0, "initial_risk_per_unit": 1000.0}},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    client = PositionManagementStopClient()
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "tightened_stop_loss": 68950.0,
+            "reduce_reason_codes": [],
+            "applied_rule_candidates": ["POSITION_MANAGEMENT_BREAK_EVEN"],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=21,
+        client=client,
+    )
+    db_session.flush()
+
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    stop_orders = list(db_session.scalars(select(Order).where(Order.external_order_id == "stop-tightened")))
+
+    assert result["status"] == "monitoring"
+    assert refreshed is not None and refreshed.stop_loss == 69000.0
+    assert stop_orders == []
+
+
 def test_entry_protection_failure_triggers_emergency_close(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: ProtectionFailureClient())
@@ -907,6 +1093,126 @@ def test_reduce_execution_uses_partial_take_profit_fraction_and_marks_metadata(m
     assert position is not None
 
 
+def test_apply_position_management_executes_partial_tp_once_and_stays_reduce_only(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.partial_tp_size_pct = 0.25
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70300.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=6.0,
+        metadata_json={"position_management": {"partial_take_profit_taken": False}},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    client = ReduceSuccessClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    def _context(position, *, feature_payload, settings_row):
+        management = position.metadata_json.get("position_management", {}) if isinstance(position.metadata_json, dict) else {}
+        taken = bool(management.get("partial_take_profit_taken"))
+        return {
+            "enabled": True,
+            "status": "active",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": []
+            if taken
+            else [
+                "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT",
+                "POSITION_MANAGEMENT_LOCK_PARTIAL_PROFIT",
+            ],
+            "partial_take_profit_taken": taken,
+            "partial_take_profit_fraction": 0.25,
+            "applied_rule_candidates": ["POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT"] if not taken else [],
+        }
+
+    monkeypatch.setattr("trading_mvp.services.execution.build_position_management_context", _context)
+
+    first = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=31,
+        client=client,
+    )
+    second = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=32,
+        client=client,
+    )
+    db_session.flush()
+
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    reduce_orders = list(db_session.scalars(select(Order).where(Order.external_order_id == "reduce-1")))
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT", Position.status == "open"))
+
+    assert first["status"] == "executed"
+    assert first["position_management_action"]["status"] == "filled"
+    assert second["status"] == "monitoring"
+    assert len(reduce_orders) == 1
+    assert reduce_orders[0].reduce_only is True
+    assert reduce_orders[0].requested_quantity == 0.005
+    assert refreshed is not None
+    assert refreshed.metadata_json["position_management"]["partial_take_profit_taken"] is True
+    assert sum(1 for event in events if event.event_type == "partial_tp_executed") == 1
+
+
+def test_apply_position_management_does_nothing_when_time_stop_is_disabled(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = False
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=70020.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=0.2,
+        opened_at=utcnow_naive() - timedelta(hours=4),
+        metadata_json={"position_management": {"initial_stop_loss": 69000.0, "initial_risk_per_unit": 1000.0}},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(atr=0.0),
+        decision_run_id=42,
+        client=PositionManagementStopClient(),
+    )
+
+    assert result["status"] == "monitoring"
+    assert result["position_management_context"]["time_stop_enabled"] is False
+    assert result["position_management_context"]["time_stop_ready"] is False
+
+
 def test_scale_in_does_not_cancel_existing_protection_before_fill(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     db_session.add(
@@ -965,6 +1271,106 @@ def test_protection_failure_falls_back_to_manage_only_when_emergency_close_fails
     assert serialized["operating_state"] == "DEGRADED_MANAGE_ONLY"
     assert serialized["protection_recovery_failure_count"] >= 1
     assert any(event.event_type == "protection_manage_only_enabled" for event in events)
+
+
+def test_apply_position_management_executes_time_stop_exit(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.time_stop_enabled = True
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=69950.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=-0.5,
+        opened_at=utcnow_naive() - timedelta(hours=3),
+        metadata_json={"position_management": {"initial_stop_loss": 69000.0, "initial_risk_per_unit": 1000.0}},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    client = ExitWhilePausedClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": ["POSITION_MANAGEMENT_TIME_STOP_EXIT"],
+            "time_stop_minutes": 120,
+            "time_stop_profit_floor": 0.15,
+            "applied_rule_candidates": ["POSITION_MANAGEMENT_TIME_STOP"],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=41,
+        client=client,
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "executed"
+    assert result["position_management_action"]["status"] == "filled"
+    assert any(event.event_type == "time_stop_exit" for event in events)
+
+
+def test_apply_position_management_skips_aggressive_action_when_protection_is_unverified(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=69950.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=-0.5,
+        metadata_json={"position_management": {"initial_stop_loss": 69000.0, "initial_risk_per_unit": 1000.0}},
+    )
+    db_session.add(position)
+    db_session.flush()
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": ["POSITION_MANAGEMENT_TIME_STOP_REDUCE"],
+            "time_stop_minutes": 120,
+            "time_stop_profit_floor": 0.15,
+            "applied_rule_candidates": ["POSITION_MANAGEMENT_TIME_STOP"],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=43,
+        client=UnprotectedSyncClient(),
+    )
+
+    assert result["status"] == "monitoring"
+    assert result["position_management_action"]["status"] == "skipped_unverified_protection"
 
 
 def test_sync_live_state_uses_algo_lookup_for_protective_orders(monkeypatch, db_session) -> None:

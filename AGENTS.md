@@ -1,218 +1,147 @@
 # AGENTS.md
 
-## Project
-This repository is a real-trading-oriented crypto trading bot.
-The system must prioritize safety, deterministic behavior, auditability, and operational clarity over aggressiveness.
+## 현재 단계
 
-Primary goals:
-- protect capital first
-- keep execution deterministic
-- separate AI judgment from hard risk controls
-- preserve clear operator visibility in dashboard / scheduler / audit log
-- prevent silent state mismatch
+이 저장소의 현재 단계는 **실거래 코어 안정화**다.
+지금 우선순위는 기능 확장이 아니라 아래 4가지를 안전하게 유지하는 것이다.
 
----
+- 실거래 안전성
+- 리스크 검증
+- 실행 통제
+- 감사 가능성
 
-## Core principles
+멀티 에이전트 확장, UI 확장, 부가 워크플로우는 이후 단계다.
 
-1. AI is advisory or decision-producing, but never the final unrestricted authority.
-2. A hard risk guard must always run before any live order submission.
-3. If data is stale, missing, contradictory, or low-confidence, prefer HOLD / BLOCK / NO-TRADE.
-4. Position protection is more important than new entry.
-5. Dashboard values, scheduler values, and audit-log values must be derived from consistent sources of truth.
-6. Never fake successful execution. If uncertain, expose degraded/unknown state explicitly.
-7. Live trading safety is more important than UI completeness.
+## 역할 분리
 
----
+### ChatGPT
 
-## Architecture intent
+- 구조 분석
+- 문제 분해
+- 리팩터링 방향 정리
+- 우선순위와 단계 계획 제시
 
-The expected high-level flow is:
+### Codex
 
-1. market/account/position data collection
-2. AI or rule-based decision generation
-3. hard risk validation
-4. execution eligibility check
-5. exchange order submission
-6. order/protection sync
-7. state persistence
-8. dashboard / scheduler / audit-log reflection
+- 작은 구현 작업 수행
+- 국소 수정과 테스트 갱신
+- 문서/API/UI 의미 정합성 유지
 
-AI must not bypass:
-- exchange tradability checks
-- app-level live-trading approval state
-- risk limits
-- protection-order requirements
-- failure backoff / guard mode
+Codex는 큰 방향을 새로 정의하기보다, **이미 합의된 작은 문제를 안전하게 구현하는 역할**에 집중한다.
 
----
+## 현재 최우선 목표
 
-## Non-negotiable rules
+1. 계좌, 포지션, 주문, 보호주문 상태를 신뢰할 수 있게 유지한다.
+2. AI 판단과 결정론적 `risk_guard`를 명확히 분리한다.
+3. 실주문 경로에서 승인, 차단, 실행, 실패 이유를 추적 가능하게 남긴다.
+4. pause, approval, degraded, stale sync, protection recovery 같은 안전장치를 후퇴시키지 않는다.
+5. 운영자가 대시보드와 감사 로그만 보고 현재 상태를 설명할 수 있게 만든다.
 
-- Do not remove hard risk checks in order to increase trading frequency.
-- Do not merge app-level approval and exchange-level tradability into one ambiguous field.
-- Do not mark an order as successful until exchange acknowledgement is confirmed.
-- Do not show optimistic UI states that are not backed by persisted state.
-- Do not silently swallow exceptions in live-order paths.
-- Do not introduce broad refactors unless required for correctness.
-- Do not break existing API response shapes unless explicitly updating schema and docs together.
+## 작업 원칙
 
----
+### 기본 원칙
 
-## Trading safety requirements
+- 먼저 현재 구현과 데이터 흐름을 읽고 들어간다.
+- 불필요한 전면 재작성은 하지 않는다.
+- 작은 diff로 정확성을 올리는 쪽을 우선한다.
+- 백엔드 상태 의미와 프런트 표시 의미를 같이 맞춘다.
+- 실거래 안전성과 감사 가능성을 해치는 변경은 금지한다.
 
-### Approval and tradability
-The system must clearly separate:
-- exchange raw tradability status (example: canTrade)
-- app internal live-trading approval status
-- risk-engine allow/block result
-- temporary guard/backoff state
+### Codex 작업 단위
 
-These must never be conflated into a single boolean without explanation.
+Codex 기본 작업 단위는 아래를 따른다.
 
-### Risk guard
-Before live execution, always validate at minimum:
-- max single-position limit
-- directional bias limit
-- total exposure
-- available margin / balance sanity
-- daily loss limit
-- consecutive loss limit
-- manual guard mode
-- failure backoff
-- required protection-order constraints if applicable
+- 파일 `1~3개` 우선
+- 문제 `1개` 우선
+- 레이어 `1개` 우선
+- 작은 diff 우선
 
-### Protection orders
-Protection-order handling must be consistent across:
-- submit
-- query
-- cancel
-- sync
-- dashboard reflection
+예외적으로 범위가 넓어져야 하면, 먼저 분석으로 쪼개고 단계별로 나눈다.
 
-### Fail-safe behavior
-When exchange/account sync fails:
-- degrade safely
-- block new live entry if correctness is uncertain
-- preserve observability
-- expose reason in API/UI/audit trail
+### 변경 시 기본 확인 범위
 
----
+필요한 범위만 최소로 확인하되, 의미가 연결된 계층은 같이 본다.
 
-## Code change policy
+- `backend/trading_mvp/services/`
+- `backend/trading_mvp/schemas.py`
+- `backend/trading_mvp/main.py`
+- `frontend/components/`
+- `frontend/app/`
+- `docs/api.md`
+- `tests/`
 
-When making changes:
-1. first inspect related schemas, services, routes, UI bindings, tests, and docs
-2. prefer minimal targeted patches
-3. keep naming explicit and operator-readable
-4. preserve backward compatibility when possible
-5. update tests with every behavior change
-6. update docs/api.md or equivalent when response fields or meanings change
+## 하드 안전 원칙
 
-Do not patch UI text only if the underlying state logic is incorrect.
-Do not patch backend logic only if the dashboard interpretation remains inconsistent.
+- 결정론적 정책은 항상 AI보다 우선한다.
+- 실주문은 AI 출력만으로 실행되면 안 된다.
+- `risk_guard`는 최종 허용/차단 관문으로 유지한다.
+- pause, emergency, manual control, audit trail은 유지해야 한다.
+- 계좌/시장/포지션/주문 상태를 신뢰할 수 없으면 신규 진입을 차단한다.
+- 보호주문 검증이 불확실하면 신규 진입을 차단한다.
+- stale 또는 incomplete 상태를 숨기지 말고 명시적으로 드러낸다.
 
----
+## 현재 운영 리스크 기준
 
-## Repository areas to inspect first
+현재 문서 기준의 하드 리스크 수치는 아래만 사용한다.
+다른 문서에 충돌하는 수치가 있으면 이 기준과 `docs/risk-policy.md`를 우선한다.
 
-Typical priority:
-- backend/trading_mvp/services/
-- backend/trading_mvp/schemas.py
-- backend/trading_mvp/main.py
-- frontend/components/
-- frontend/app/
-- docs/api.md
-- tests/
+- BTC 최대 레버리지: `5x`
+- 메이저 알트 최대 레버리지: `3x`
+- 일반 알트 최대 레버리지: `2x`
+- 1회 거래 최대 손실: 계좌 자산 기준 `2%`
+- 일일 손실 한도: 계좌 자산 기준 `5%`
+- 연속 손실 `3회` 이후 보수적 제한 적용
 
-If issue is about order execution, inspect first:
-- execution service
-- exchange/binance service
-- risk service
-- pause/guard/backoff control
-- dashboard aggregation logic
+추가 운영 원칙:
 
-If issue is about UI inconsistency, inspect both:
-- backend response generation
-- frontend rendering / label mapping / fallback copy
+- stale / incomplete account, positions, open orders, protection 상태에서는 신규 진입 차단
+- pause / degraded / approval 미승인 상태에서는 신규 진입 차단
+- 생존 경로(`reduce`, `exit`, `reduce_only`, `protection recovery`, `emergency_exit`)는 신규 진입 차단과 구분해 다룬다.
 
----
+## 금지 사항
 
-## Expected response style for analysis tasks
+- 리스크 체크를 완화해서 거래 빈도를 늘리는 변경
+- 승인 상태와 거래소 거래 가능 상태를 하나의 불명확한 값으로 합치는 변경
+- persisted state 없이 낙관적 성공 상태를 표시하는 변경
+- live order 경로에서 예외를 조용히 삼키는 변경
+- 일반 작업에서 `prompts/first-task.md`를 자동 기본 브리프로 취급하는 해석
+- 테스트나 문서 갱신 없이 의미를 바꾸는 변경
 
-When asked to analyze before coding, respond in this structure:
+## 프롬프트 사용 원칙
 
-1. Current behavior
-2. Root cause
-3. Risk / impact
-4. Files to change
-5. Proposed patch plan
-6. Test cases
-7. Open assumptions / uncertainties
+`prompts/first-task.md`는 **초기 저장소 인수, 부트스트랩, 아카이브 참고용 문서**다.
+일반적인 Codex 작업에서는 자동 기본 브리프로 사용하지 않는다.
 
-Be concrete. Prefer file-level guidance over generic advice.
+일반 작업 우선순위는 아래 순서를 따른다.
 
----
+1. 현재 사용자 요청
+2. 루트 `AGENTS.md`
+3. 하위 디렉터리 `AGENTS.md`
+4. 필요한 경우에만 보조 프롬프트 문서
 
-## Expected response style for implementation tasks
+## 검증 원칙
 
-When asked to implement:
-- summarize intended change briefly
-- list files you will modify
-- implement minimal coherent patch
-- add/update tests
-- note any migrations or manual verification steps
-- report remaining edge cases honestly
+- 변경 범위에 필요한 최소 테스트만 우선 실행한다.
+- 응답 필드나 의미가 바뀌면 `docs/api.md`를 같이 갱신한다.
+- UI 문구를 바꾸면 실제 상태 의미와 매핑이 맞는지 함께 확인한다.
+- 위험 경로를 건드렸다면 차단 이유, pause/guard, stale 처리 테스트를 우선 본다.
 
----
+## 완료 기준
 
-## Testing expectations
+작업은 아래가 충족되어야 끝난 것으로 본다.
 
-At minimum, after code changes:
-- run the most relevant unit/integration tests for modified area
-- verify schemas and API docs if response meanings changed
-- verify UI state mapping if dashboard text changed
+- 수정한 경로의 논리가 맞다.
+- 백엔드 의미와 UI 의미가 어긋나지 않는다.
+- 필요한 테스트가 갱신되었다.
+- 필요한 문서가 함께 갱신되었다.
+- 수정 경로에 조용한 불일치가 남아 있지 않다.
 
-Priority test themes:
-- approval state separation
-- risk block reasons
-- guard/backoff transitions
-- protection-order sync
-- scheduler/dashboard/audit consistency
-- stale account/position handling
-- deterministic fallback behavior
+## 최종 보고
 
----
+최종 인계에는 반드시 아래를 포함한다.
 
-## Auditability requirements
-
-Any block/hold/guard/live-trading denial should be explainable through user-visible fields.
-Reasons should be operator-readable, not only developer-readable.
-Avoid ambiguous labels like "unavailable" if the actual state is:
-- approval missing
-- exchange denied
-- risk blocked
-- backoff active
-- account sync stale
-
----
-
-## Performance and scope discipline
-
-- Prefer correctness over premature optimization.
-- Avoid large rewrites unless needed to eliminate repeated inconsistency.
-- If a fix is too broad, propose phased patches:
-  - phase 1: correctness and safety
-  - phase 2: UX cleanup
-  - phase 3: refactor
-
----
-
-## Done definition
-
-A task is considered done only when:
-- logic is corrected
-- UI meaning matches backend meaning
-- tests are updated
-- docs are updated where needed
-- no known silent inconsistency remains in the modified path
+1. 무엇이 바뀌었는지
+2. 생성/수정된 `AGENTS.md` 파일 목록
+3. 각 파일의 적용 범위
+4. 실행한 검증 명령
+5. 남은 리스크 또는 다음 단계

@@ -1,23 +1,4 @@
-# Codex 초안과 자동 Resume
-
-## Codex 프롬프트 초안
-
-백로그 항목이 아직 미적용 상태이고 적용 이력이 없으면 시스템이 `Codex에 붙여넣을 초안 프롬프트`를 로컬에서 자동 생성합니다.
-
-특징:
-
-- Codex API를 호출하지 않습니다.
-- OpenAI 추가 호출도 하지 않습니다.
-- 현재 backlog 제목, 문제, 제안 내용, 근거, 연결된 사용자 요청을 묶어 한 번에 실행 가능한 초안으로 만듭니다.
-- 이미 적용되었거나 `verified` 상태인 backlog에는 초안을 만들지 않습니다.
-
-관련 API:
-
-- `GET /api/backlog`
-- `GET /api/backlog/{backlog_id}`
-- `GET /api/backlog/{backlog_id}/codex-draft`
-
-화면에서는 backlog 카드 안에서 바로 초안을 복사할 수 있습니다.
+# 자동 Resume 메모
 
 ## Pause 원인 분리
 

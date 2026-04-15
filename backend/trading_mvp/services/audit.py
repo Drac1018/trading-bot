@@ -63,3 +63,22 @@ def record_health_event(
     session.add(event)
     return event
 
+
+def record_position_management_event(
+    session: Session,
+    *,
+    event_type: str,
+    position_id: int | str,
+    message: str,
+    severity: str = "info",
+    payload: dict[str, Any] | None = None,
+) -> AuditEvent:
+    return record_audit_event(
+        session,
+        event_type=event_type,
+        entity_type="position",
+        entity_id=str(position_id),
+        message=message,
+        severity=severity,
+        payload=payload,
+    )

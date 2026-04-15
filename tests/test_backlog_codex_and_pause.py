@@ -56,7 +56,7 @@ def _build_live_settings_payload() -> AppSettingsUpdateRequest:
     )
 
 
-def test_backlog_endpoints_expose_codex_prompt_draft(tmp_path, monkeypatch) -> None:
+def test_backlog_removed_ai_assist_endpoints_return_404(tmp_path, monkeypatch) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'backlog_codex.db'}", future=True)
     testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(bind=test_engine)
@@ -90,32 +90,12 @@ def test_backlog_endpoints_expose_codex_prompt_draft(tmp_path, monkeypatch) -> N
             detail_response = client.get(f"/api/backlog/{backlog_id}")
             assert detail_response.status_code == 200
             detail_payload = detail_response.json()
-            assert detail_payload["codex_prompt_draft"]["available"] is True
-            assert "Token usage optimization follow-up" in detail_payload["codex_prompt_draft"]["prompt"]
-
-            draft_response = client.get(f"/api/backlog/{backlog_id}/codex-draft")
-            assert draft_response.status_code == 200
-            draft_payload = draft_response.json()
-            assert draft_payload["available"] is True
-            assert "Codex API" in draft_payload["note"]
-
-            applied_response = client.post(
-                "/api/backlog/applied",
-                json={
-                    "title": "Optimization applied",
-                    "summary": "Applied the retry and cooldown changes.",
-                    "detail": "The latest retry guard is now active and verified.",
-                    "related_backlog_id": backlog_id,
-                    "source_type": "manual",
-                    "files_changed": ["backend/trading_mvp/services/ai_usage.py"],
-                    "verification_summary": "Verified with local tests.",
-                },
-            )
-            assert applied_response.status_code == 200
-
-            unavailable_response = client.get(f"/api/backlog/{backlog_id}/codex-draft")
-            assert unavailable_response.status_code == 200
-            assert unavailable_response.json()["available"] is False
+            assert "codex_prompt_draft" not in detail_payload
+            assert "auto_apply_supported" not in detail_payload
+            assert "auto_apply_label" not in detail_payload
+            assert client.get(f"/api/backlog/{backlog_id}/codex-draft").status_code == 404
+            assert client.post(f"/api/backlog/{backlog_id}/auto-apply").status_code == 404
+            assert client.post("/api/backlog/auto-apply-supported").status_code == 405
     finally:
         app.dependency_overrides.clear()
 

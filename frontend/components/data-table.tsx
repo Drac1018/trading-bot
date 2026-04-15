@@ -5,44 +5,7 @@ import {
   normalizeDisplayValue,
   translateLabel,
 } from "../lib/ui-copy";
-
-type Row = Record<string, unknown>;
-
-const preferredColumnOrder = [
-  "status",
-  "event_category",
-  "protected",
-  "protective_order_count",
-  "has_stop_loss",
-  "has_take_profit",
-  "missing_components",
-  "decision",
-  "symbol",
-  "timeframe",
-  "mode",
-  "provider_name",
-  "confidence",
-  "latest_price",
-  "approved_leverage",
-  "approved_risk_pct",
-  "realized_pnl",
-  "daily_pnl",
-  "cumulative_pnl",
-  "schedule_window",
-  "workflow",
-  "next_run_at",
-  "created_at",
-  "updated_at",
-];
-
-const detailColumnSet = new Set([
-  "event_category",
-  "input_payload",
-  "output_payload",
-  "payload",
-  "metadata_json",
-  "outcome",
-]);
+import { buildTableRowKeys, splitTableColumns, type TableRow } from "../lib/data-table";
 
 function renderValue(value: unknown, key?: string) {
   if (value === null || value === undefined) {
@@ -80,40 +43,23 @@ function renderValue(value: unknown, key?: string) {
   return <span>{formatDisplayValue(value, key)}</span>;
 }
 
-function orderColumns(columns: string[]) {
-  const rank = new Map(preferredColumnOrder.map((key, index) => [key, index]));
-  return [...columns].sort((left, right) => {
-    const leftRank = rank.get(left) ?? 999;
-    const rightRank = rank.get(right) ?? 999;
-    if (leftRank !== rightRank) {
-      return leftRank - rightRank;
-    }
-    return left.localeCompare(right);
-  });
-}
-
-function splitColumns(rows: Row[]) {
-  const columns = rows.length > 0 ? orderColumns(Object.keys(rows[0])) : [];
-  const visiblePrimary = columns.filter((column) => !detailColumnSet.has(column));
-  const primary = visiblePrimary.slice(0, 10);
-  const detail = [...visiblePrimary.slice(10), ...columns.filter((column) => detailColumnSet.has(column))];
-  return { primary, detail };
-}
-
 export function DataTable({
   title,
   description,
   rows,
   emptyStateTitle,
   emptyStateDescription,
+  hiddenColumns = [],
 }: {
   title: string;
   description: string;
-  rows: Row[];
+  rows: TableRow[];
   emptyStateTitle?: string;
   emptyStateDescription?: string;
+  hiddenColumns?: string[];
 }) {
-  const { primary, detail } = splitColumns(rows);
+  const { primary, detail } = splitTableColumns(rows, new Set(hiddenColumns));
+  const rowKeys = buildTableRowKeys(rows);
 
   return (
     <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
@@ -135,7 +81,7 @@ export function DataTable({
       ) : (
         <div className="grid gap-4 2xl:grid-cols-2">
           {rows.map((row, index) => (
-            <article key={index} className="rounded-[1.6rem] border border-amber-100 bg-canvas/90 p-4 shadow-sm">
+            <article key={rowKeys[index]} className="rounded-[1.6rem] border border-amber-100 bg-canvas/90 p-4 shadow-sm">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <h3 className="text-base font-semibold text-ink">{getRowTitle(row, index)}</h3>

@@ -36,6 +36,65 @@
       "title": "Requested Price",
       "type": "number"
     },
+    "entry_mode": {
+      "anyOf": [
+        {
+          "enum": [
+            "breakout_confirm",
+            "pullback_confirm",
+            "immediate",
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Entry Mode"
+    },
+    "invalidation_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Invalidation Price"
+    },
+    "max_chase_bps": {
+      "anyOf": [
+        {
+          "maximum": 500.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Max Chase Bps"
+    },
+    "idea_ttl_minutes": {
+      "anyOf": [
+        {
+          "maximum": 1440,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Idea Ttl Minutes"
+    },
     "stop_loss": {
       "anyOf": [
         {

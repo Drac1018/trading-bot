@@ -36,16 +36,88 @@ SYNC_BLOCKING_REASON_CODES = {
     "open_orders": "OPEN_ORDERS_STATE_STALE",
     "protective_orders": "PROTECTION_STATE_UNVERIFIED",
 }
+SURVIVAL_PATH_DECISIONS = {"reduce", "exit"}
+AUTO_RESIZE_REASON_CODE_MAP = {
+    "gross_exposure_headroom_notional": "ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT",
+    "directional_headroom_notional": "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT",
+    "single_position_headroom_notional": "ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT",
+    "same_tier_headroom_notional": "ENTRY_CLAMPED_TO_SAME_TIER_LIMIT",
+}
 
 
 def validate_decision_schema(payload: dict[str, Any]) -> TradeDecision:
     return TradeDecision.model_validate(payload)
 
 
+def is_survival_path_decision(decision: TradeDecision | str) -> bool:
+    value = decision.decision if isinstance(decision, TradeDecision) else str(decision)
+    return value in SURVIVAL_PATH_DECISIONS
+
+
 def _entry_price(decision: TradeDecision, market_snapshot: MarketSnapshotPayload) -> float:
     if decision.entry_zone_min is not None and decision.entry_zone_max is not None:
         return (decision.entry_zone_min + decision.entry_zone_max) / 2
     return market_snapshot.latest_price
+
+
+def _entry_zone_bounds(decision: TradeDecision, market_snapshot: MarketSnapshotPayload) -> tuple[float, float]:
+    entry_min = decision.entry_zone_min if decision.entry_zone_min is not None else market_snapshot.latest_price
+    entry_max = decision.entry_zone_max if decision.entry_zone_max is not None else market_snapshot.latest_price
+    if entry_min > entry_max:
+        return entry_max, entry_min
+    return entry_min, entry_max
+
+
+def _entry_trigger_reason_codes(
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+) -> list[str]:
+    if decision.decision not in {"long", "short"}:
+        return []
+
+    latest_price = market_snapshot.latest_price
+    entry_price = _entry_price(decision, market_snapshot)
+    entry_min, entry_max = _entry_zone_bounds(decision, market_snapshot)
+    invalidation_price = decision.invalidation_price
+    mode = decision.entry_mode or "none"
+    last_candle = market_snapshot.candles[-1] if market_snapshot.candles else None
+    reason_codes: list[str] = []
+
+    if invalidation_price is None or invalidation_price <= 0:
+        reason_codes.append("INVALID_INVALIDATION_PRICE")
+    elif decision.decision == "long":
+        if invalidation_price >= min(entry_price, latest_price):
+            reason_codes.append("INVALID_INVALIDATION_PRICE")
+    elif invalidation_price <= max(entry_price, latest_price):
+        reason_codes.append("INVALID_INVALIDATION_PRICE")
+
+    if decision.max_chase_bps is not None:
+        if decision.decision == "long":
+            chase_anchor = max(entry_price, entry_max)
+            chase_bps = max(((latest_price - chase_anchor) / max(chase_anchor, 1.0)) * 10_000, 0.0)
+        else:
+            chase_anchor = min(entry_price, entry_min)
+            chase_bps = max(((chase_anchor - latest_price) / max(chase_anchor, 1.0)) * 10_000, 0.0)
+        if chase_bps > decision.max_chase_bps:
+            reason_codes.append("CHASE_LIMIT_EXCEEDED")
+
+    if mode == "immediate":
+        return list(dict.fromkeys(reason_codes))
+
+    if mode == "breakout_confirm":
+        if decision.decision == "long":
+            breakout_confirmed = latest_price >= entry_max or (last_candle is not None and last_candle.high >= entry_max)
+        else:
+            breakout_confirmed = latest_price <= entry_min or (last_candle is not None and last_candle.low <= entry_min)
+        if not breakout_confirmed:
+            reason_codes.append("ENTRY_TRIGGER_NOT_MET")
+    elif mode == "pullback_confirm":
+        if not (entry_min <= latest_price <= entry_max):
+            reason_codes.append("ENTRY_TRIGGER_NOT_MET")
+    else:
+        reason_codes.append("ENTRY_TRIGGER_NOT_MET")
+
+    return list(dict.fromkeys(reason_codes))
 
 
 def get_symbol_risk_tier(symbol: str) -> Literal["btc", "major_alt", "alt"]:
@@ -98,6 +170,74 @@ def _estimate_projected_notional(
     max_notional_quantity = (max(equity, 0.0) * approved_leverage) / safe_entry_price
     quantity = min(risk_budget / per_unit_risk, max_notional_quantity)
     return _position_notional(quantity, safe_entry_price)
+
+
+def _estimate_projected_entry_size(
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    *,
+    equity: float,
+    approved_risk_pct: float,
+    approved_leverage: float,
+) -> dict[str, float]:
+    entry_price = _entry_price(decision, market_snapshot)
+    safe_entry_price = max(entry_price, 1.0)
+    if decision.stop_loss is None:
+        quantity = max((equity * min(approved_leverage, 1.0)) / safe_entry_price, 0.0001)
+    else:
+        per_unit_risk = abs(entry_price - decision.stop_loss)
+        if per_unit_risk == 0:
+            quantity = 0.0
+        else:
+            risk_budget = max(equity, 0.0) * approved_risk_pct
+            max_notional_quantity = (max(equity, 0.0) * approved_leverage) / safe_entry_price
+            quantity = min(risk_budget / per_unit_risk, max_notional_quantity)
+    notional = _position_notional(quantity, safe_entry_price)
+    return {
+        "entry_price": round(safe_entry_price, 6),
+        "quantity": round(max(quantity, 0.0), 6),
+        "notional": round(max(notional, 0.0), 6),
+    }
+
+
+def _minimum_actionable_notional(entry_price: float) -> float:
+    return round(max(25.0, max(entry_price, 1.0) * 0.0005), 6)
+
+
+def _build_exposure_headroom_snapshot(
+    *,
+    exposure_metrics: dict[str, float],
+    exposure_limits: dict[str, float],
+    equity: float,
+    decision_side: str,
+) -> dict[str, float]:
+    safe_equity = max(equity, 1.0)
+    directional_metric_key = "long_exposure_pct_equity" if decision_side == "long" else "short_exposure_pct_equity"
+    snapshot = {
+        "gross_exposure_headroom_notional": max(
+            exposure_limits["gross_exposure_pct"] - exposure_metrics["gross_exposure_pct_equity"],
+            0.0,
+        )
+        * safe_equity,
+        "directional_headroom_notional": max(
+            exposure_limits["directional_bias_pct"] - exposure_metrics[directional_metric_key],
+            0.0,
+        )
+        * safe_equity,
+        "single_position_headroom_notional": max(
+            exposure_limits["largest_position_pct"] - exposure_metrics["decision_symbol_concentration_pct"],
+            0.0,
+        )
+        * safe_equity,
+        "same_tier_headroom_notional": max(
+            exposure_limits["same_tier_concentration_pct"] - exposure_metrics["same_tier_concentration_pct"],
+            0.0,
+        )
+        * safe_equity,
+    }
+    limiting_key = min(snapshot, key=snapshot.get)
+    snapshot["limiting_headroom_notional"] = round(snapshot[limiting_key], 6)
+    return {key: round(value, 6) for key, value in snapshot.items()}
 
 
 def _build_exposure_metrics(
@@ -303,22 +443,38 @@ def evaluate_risk(
     effective_risk_cap = min(settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE)
     effective_daily_loss_cap = min(settings_row.max_daily_loss, HARD_MAX_DAILY_LOSS)
     exposure_limits = get_exposure_limits(settings_row)
-    projected_notional = 0.0
+    raw_projected_notional = 0.0
+    approved_projected_notional = 0.0
+    approved_quantity: float | None = None
+    auto_resized_entry = False
+    size_adjustment_ratio = 0.0
+    auto_resize_reason: str | None = None
+    current_exposure_metrics = _build_exposure_metrics(
+        session,
+        decision.symbol,
+        latest_pnl.equity,
+    )
+    exposure_metrics = current_exposure_metrics
+    exposure_headroom_snapshot: dict[str, float] = {}
+    raw_projected_quantity = 0.0
     if is_entry_decision:
-        projected_notional = _estimate_projected_notional(
+        raw_size = _estimate_projected_entry_size(
             decision,
             market_snapshot,
             equity=latest_pnl.equity,
             approved_risk_pct=min(decision.risk_pct, effective_risk_cap),
             approved_leverage=min(decision.leverage, effective_leverage_cap),
         )
-    exposure_metrics = _build_exposure_metrics(
-        session,
-        decision.symbol,
-        latest_pnl.equity,
-        projected_side=decision.decision if is_entry_decision else None,
-        projected_notional=projected_notional,
-    )
+        raw_projected_notional = raw_size["notional"]
+        raw_projected_quantity = raw_size["quantity"]
+        approved_projected_notional = raw_projected_notional
+        approved_quantity = raw_projected_quantity if raw_projected_quantity > 0 else None
+        exposure_headroom_snapshot = _build_exposure_headroom_snapshot(
+            exposure_metrics=current_exposure_metrics,
+            exposure_limits=exposure_limits,
+            equity=latest_pnl.equity,
+            decision_side=decision.decision,
+        )
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
 
     if settings_row.trading_paused and is_entry_decision:
@@ -344,17 +500,8 @@ def evaluate_risk(
         reason_codes.append("RISK_PCT_EXCEEDS_LIMIT")
     if is_entry_decision and (decision.stop_loss is None or decision.take_profit is None):
         reason_codes.append("MISSING_STOP_OR_TARGET")
-    if is_entry_decision and exposure_metrics["gross_exposure_pct_equity"] > exposure_limits["gross_exposure_pct"]:
-        reason_codes.append("GROSS_EXPOSURE_LIMIT_REACHED")
-    if is_entry_decision and exposure_metrics["largest_position_pct_equity"] > exposure_limits["largest_position_pct"]:
-        reason_codes.append("LARGEST_POSITION_LIMIT_REACHED")
-    if is_entry_decision and exposure_metrics["directional_bias_pct"] > exposure_limits["directional_bias_pct"]:
-        reason_codes.append("DIRECTIONAL_BIAS_LIMIT_REACHED")
-    if (
-        is_entry_decision
-        and exposure_metrics["same_tier_concentration_pct"] > exposure_limits["same_tier_concentration_pct"]
-    ):
-        reason_codes.append("SAME_TIER_CONCENTRATION_LIMIT_REACHED")
+    if is_entry_decision:
+        reason_codes.extend(_entry_trigger_reason_codes(decision, market_snapshot))
     if is_entry_decision and live_requested:
         for scope, reason_code in SYNC_BLOCKING_REASON_CODES.items():
             scope_summary = sync_freshness_summary.get(scope)
@@ -395,13 +542,110 @@ def evaluate_risk(
             reason_codes.append("LIVE_APPROVAL_REQUIRED")
     elif enforce_live_readiness and is_entry_decision:
         reason_codes.append("LIVE_TRADING_DISABLED")
-    allowed = len(reason_codes) == 0
+
+    hard_blockers_present = len(reason_codes) > 0
+    exposure_limit_codes: list[str] = []
+    if is_entry_decision:
+        gross_headroom = exposure_headroom_snapshot.get("gross_exposure_headroom_notional", 0.0)
+        directional_headroom = exposure_headroom_snapshot.get("directional_headroom_notional", 0.0)
+        single_position_headroom = exposure_headroom_snapshot.get("single_position_headroom_notional", 0.0)
+        same_tier_headroom = exposure_headroom_snapshot.get("same_tier_headroom_notional", 0.0)
+        limiting_key = min(
+            AUTO_RESIZE_REASON_CODE_MAP,
+            key=lambda key: exposure_headroom_snapshot.get(key, 0.0),
+        )
+        max_additional_notional = max(exposure_headroom_snapshot.get(limiting_key, 0.0), 0.0)
+        minimum_actionable_notional = _minimum_actionable_notional(_entry_price(decision, market_snapshot))
+        exposure_headroom_snapshot["minimum_actionable_notional"] = minimum_actionable_notional
+
+        if raw_projected_notional > gross_headroom:
+            exposure_limit_codes.append("GROSS_EXPOSURE_LIMIT_REACHED")
+        if raw_projected_notional > directional_headroom:
+            exposure_limit_codes.append("DIRECTIONAL_BIAS_LIMIT_REACHED")
+        if raw_projected_notional > single_position_headroom:
+            exposure_limit_codes.append("LARGEST_POSITION_LIMIT_REACHED")
+        if raw_projected_notional > same_tier_headroom:
+            exposure_limit_codes.append("SAME_TIER_CONCENTRATION_LIMIT_REACHED")
+
+        if exposure_limit_codes:
+            if not hard_blockers_present and max_additional_notional >= minimum_actionable_notional:
+                approved_projected_notional = min(raw_projected_notional, max_additional_notional)
+                if approved_projected_notional < raw_projected_notional:
+                    auto_resized_entry = True
+                    size_adjustment_ratio = round(
+                        approved_projected_notional / max(raw_projected_notional, 1e-9),
+                        6,
+                    )
+                    approved_quantity = round(
+                        min(
+                            raw_projected_quantity,
+                            approved_projected_notional / max(_entry_price(decision, market_snapshot), 1.0),
+                        ),
+                        6,
+                    )
+                    auto_resize_reason = {
+                        "gross_exposure_headroom_notional": "CLAMPED_TO_GROSS_EXPOSURE_HEADROOM",
+                        "directional_headroom_notional": "CLAMPED_TO_DIRECTIONAL_HEADROOM",
+                        "single_position_headroom_notional": "CLAMPED_TO_SINGLE_POSITION_HEADROOM",
+                        "same_tier_headroom_notional": "CLAMPED_TO_SAME_TIER_HEADROOM",
+                    }[limiting_key]
+                    reason_codes.extend(["ENTRY_AUTO_RESIZED", AUTO_RESIZE_REASON_CODE_MAP[limiting_key]])
+                else:
+                    size_adjustment_ratio = 1.0
+            else:
+                reason_codes.extend(exposure_limit_codes)
+                if max_additional_notional < minimum_actionable_notional:
+                    reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
+
+        if approved_projected_notional > 0:
+            exposure_metrics = _build_exposure_metrics(
+                session,
+                decision.symbol,
+                latest_pnl.equity,
+                projected_side=decision.decision,
+                projected_notional=approved_projected_notional,
+            )
+            if size_adjustment_ratio == 0.0 and raw_projected_notional > 0:
+                size_adjustment_ratio = round(
+                    approved_projected_notional / max(raw_projected_notional, 1e-9),
+                    6,
+                )
+
+    reason_codes = list(dict.fromkeys(reason_codes))
+    allowed = len(reason_codes) == 0 or (
+        is_entry_decision
+        and auto_resized_entry
+        and all(
+            code in {"ENTRY_AUTO_RESIZED", *AUTO_RESIZE_REASON_CODE_MAP.values()}
+            for code in reason_codes
+        )
+    )
+
+    approved_risk_pct = 0.0
+    if allowed:
+        if is_entry_decision and raw_projected_notional > 0:
+            approved_risk_pct = round(
+                min(
+                    decision.risk_pct * (approved_projected_notional / max(raw_projected_notional, 1e-9)),
+                    effective_risk_cap,
+                ),
+                6,
+            )
+        else:
+            approved_risk_pct = decision.risk_pct
     result = RiskCheckResult(
         allowed=allowed,
         decision=decision.decision,
         reason_codes=reason_codes,
-        approved_risk_pct=decision.risk_pct if allowed else 0.0,
+        approved_risk_pct=approved_risk_pct if allowed else 0.0,
         approved_leverage=min(decision.leverage, effective_leverage_cap) if allowed else 0.0,
+        raw_projected_notional=raw_projected_notional,
+        approved_projected_notional=approved_projected_notional if allowed else 0.0,
+        approved_quantity=approved_quantity if allowed else None,
+        auto_resized_entry=auto_resized_entry if allowed else False,
+        size_adjustment_ratio=size_adjustment_ratio if allowed else 0.0,
+        exposure_headroom_snapshot=exposure_headroom_snapshot,
+        auto_resize_reason=auto_resize_reason if allowed else None,
         operating_mode=operating_mode if not allowed else "live",
         operating_state=operating_state,
         effective_leverage_cap=effective_leverage_cap,

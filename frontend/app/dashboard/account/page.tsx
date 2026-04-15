@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import { DataTable } from "../../../components/data-table";
 import { PageShell } from "../../../components/page-shell";
 import { fetchJson } from "../../../lib/api";
@@ -10,16 +12,6 @@ type AccountSummary = {
   futures_enabled: boolean;
   can_trade: boolean;
   exchange_can_trade?: boolean;
-  app_live_execution_ready?: boolean;
-  app_trading_paused?: boolean;
-  app_operating_state?: string;
-  app_pause_reason_code?: string | null;
-  app_pause_origin?: string | null;
-  app_auto_resume_last_blockers?: string[];
-  guard_mode_reason_category?: string | null;
-  guard_mode_reason_code?: string | null;
-  guard_mode_reason_message?: string | null;
-  latest_blocked_reasons?: string[];
   available_balance: number;
   total_wallet_balance: number;
   total_unrealized_profit: number;
@@ -69,122 +61,62 @@ function StatusBadge({
   return <span className={`rounded-full px-4 py-2 text-sm font-semibold ${className}`}>{label}</span>;
 }
 
-function formatReasonList(values: string[] | undefined): string {
-  if (!values || values.length === 0) {
-    return "없음";
-  }
-  return values.map((item) => formatDisplayValue(item)).join(" / ");
-}
-
 export default async function BinanceAccountPage() {
   const payload = await fetchJson<AccountPayload>("/api/binance/account");
   const summary = payload.summary;
   const exchangeCanTrade = summary.exchange_can_trade ?? summary.can_trade;
-  const appLiveReady = summary.app_live_execution_ready ?? false;
-  const appTradingPaused = summary.app_trading_paused ?? false;
-  const appOperatingState = summary.app_operating_state ?? "TRADABLE";
-  const appPauseReasonCode = summary.app_pause_reason_code ?? null;
-  const autoResumeBlockers = summary.app_auto_resume_last_blockers ?? [];
-  const guardModeReasonMessage =
-    summary.guard_mode_reason_message ??
-    (appLiveReady ? "가드 모드가 아닙니다." : "실주문 준비 조건이 충족되지 않아 가드 모드입니다.");
-  const latestBlockedReasons = summary.latest_blocked_reasons ?? [];
+
+  const exchangeSummaryRow: Record<string, unknown> = {
+    connected: summary.connected,
+    exchange_can_trade: exchangeCanTrade,
+    testnet_enabled: summary.testnet_enabled,
+    futures_enabled: summary.futures_enabled,
+    available_balance: summary.available_balance,
+    total_wallet_balance: summary.total_wallet_balance,
+    total_unrealized_profit: summary.total_unrealized_profit,
+    open_positions: summary.open_positions,
+    open_orders: summary.open_orders,
+    exchange_update_time: summary.exchange_update_time,
+    message: summary.message,
+  };
 
   return (
     <div className="space-y-6">
       <PageShell
-        eyebrow="Binance Account"
-        title="연동된 Binance 계정"
-        description="거래소 원본 권한과 앱 내부 실주문 준비 상태를 분리해서 확인합니다."
+        eyebrow="Exchange Account"
+        title="거래소 계정 / 자산 현황"
+        description="이 페이지는 Binance 원본 계정, 자산, 포지션, 주문 정보만 보여줍니다. 실거래 가능 여부, pause, guard mode, blocked reason은 개요 화면에서 확인합니다."
       />
 
       <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
         <div className="flex flex-wrap gap-2">
           <StatusBadge tone={summary.connected ? "good" : "warn"} label={summary.connected ? "거래소 연결됨" : "거래소 연결 안 됨"} />
           <StatusBadge tone={exchangeCanTrade ? "good" : "warn"} label={`거래소 주문 권한 ${exchangeCanTrade ? "허용" : "제한"}`} />
-          <StatusBadge tone={appTradingPaused ? "danger" : appLiveReady ? "good" : "warn"} label={`앱 실주문 준비 ${appLiveReady ? "완료" : "미완료"}`} />
-          <StatusBadge tone={appOperatingState === "TRADABLE" ? "good" : appOperatingState === "PAUSED" ? "danger" : "warn"} label={`운영 상태 ${formatDisplayValue(appOperatingState, "operating_state")}`} />
+          <StatusBadge tone={summary.futures_enabled ? "good" : "warn"} label={`Futures ${summary.futures_enabled ? "사용" : "꺼짐"}`} />
+          <StatusBadge tone={summary.testnet_enabled ? "neutral" : "good"} label={summary.testnet_enabled ? "Testnet" : "Live Exchange"} />
         </div>
-        {summary.guard_mode_reason_code ? (
-          <div className="mt-5 rounded-[1.6rem] border border-amber-200 bg-amber-50 p-5 text-slate-900">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">Guard Mode</p>
-            <p className="mt-2 text-base font-semibold">{guardModeReasonMessage}</p>
-            <p className="mt-3 text-sm leading-7">
-              {formatDisplayValue(summary.guard_mode_reason_category, "guard_mode_reason_category")} /{" "}
-              {formatDisplayValue(summary.guard_mode_reason_code, "guard_mode_reason_code")}
-            </p>
-          </div>
-        ) : null}
+
+        <div className="mt-5 rounded-[1.6rem] border border-slate-200 bg-slate-50 p-5 text-sm leading-7 text-slate-700">
+          운영 상태 요약은 <Link className="font-semibold text-slate-950 underline decoration-amber-300 underline-offset-4" href="/">개요 화면</Link>에서 단일 기준으로 확인합니다.
+          계정 페이지는 거래소 원본 데이터와 내부 상태를 혼합하지 않습니다.
+        </div>
 
         <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <MetricCard
-            label="거래소 주문 권한"
-            value={formatDisplayValue(exchangeCanTrade, "exchange_can_trade")}
-            hint="Binance 원본 canTrade 값입니다. 앱 내부 실주문 가능 여부와는 다릅니다."
-          />
-          <MetricCard
-            label="앱 실주문 준비"
-            value={formatDisplayValue(appLiveReady, "app_live_execution_ready")}
-            hint="live_execution_ready 기준입니다. 키, 승인창, 환경 게이트를 함께 반영합니다."
-          />
-          <MetricCard
-            label="앱 거래 중지"
-            value={formatDisplayValue(appTradingPaused, "app_trading_paused")}
-            hint="켜져 있으면 신규 진입은 차단됩니다. 보호/축소/비상청산은 별도 규칙을 따릅니다."
-          />
-          <MetricCard
-            label="현재 차단 사유"
-            value={formatReasonList(latestBlockedReasons)}
-            hint="최신 deterministic risk 차단 코드입니다."
-          />
-          <MetricCard
-            label="Guard"
-            value={formatDisplayValue(summary.guard_mode_reason_code, "guard_mode_reason_code")}
-            hint={guardModeReasonMessage}
-          />
-          <MetricCard
-            label="Operating"
-            value={formatDisplayValue(appOperatingState, "operating_state")}
-            hint={`pause ${formatDisplayValue(appPauseReasonCode, "pause_reason_code")}`}
-          />
-          <MetricCard
-            label="Auto-resume"
-            value={formatReasonList(autoResumeBlockers)}
-            hint={`origin ${formatDisplayValue(summary.app_pause_origin, "pause_origin")}`}
-          />
           <MetricCard label="사용 가능 잔고" value={formatDisplayValue(summary.available_balance, "available_balance")} />
           <MetricCard label="총 지갑 잔고" value={formatDisplayValue(summary.total_wallet_balance, "total_wallet_balance")} />
           <MetricCard label="미실현 손익" value={formatDisplayValue(summary.total_unrealized_profit, "total_unrealized_profit")} />
           <MetricCard label="거래소 갱신 시각" value={formatDisplayValue(summary.exchange_update_time, "exchange_update_time")} />
-        </div>
-
-        <div className="mt-5 grid gap-4 xl:grid-cols-2">
-          <div className="rounded-[1.6rem] bg-ink p-5 text-canvas">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-canvas/70">설명</p>
-            <p className="mt-2 text-sm leading-7 sm:text-base">
-              거래소 주문 권한은 Binance 계정이 주문을 받을 수 있는지만 보여줍니다. 실제 앱 실주문 여부는
-              `live_execution_ready`, `trading_paused`, `operating_state`, 최신 차단 사유를 함께 봐야 합니다.
-            </p>
-          </div>
-          <div className="rounded-[1.6rem] border border-amber-200 bg-amber-50 p-5 text-slate-900">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">현재 판독</p>
-            <p className="mt-2 text-sm leading-7">
-              {summary.message}
-            </p>
-            <p className="mt-3 text-sm leading-7">
-              앱 실주문 준비: {formatDisplayValue(appLiveReady, "app_live_execution_ready")} / 운영 상태:{" "}
-              {formatDisplayValue(appOperatingState, "operating_state")} / pause reason:{" "}
-              {formatDisplayValue(appPauseReasonCode, "pause_reason_code")} / 차단 사유: {formatReasonList(latestBlockedReasons)} / 자동 복구 blocker:{" "}
-              {formatReasonList(autoResumeBlockers)}
-            </p>
-          </div>
+          <MetricCard label="열린 포지션 수" value={formatDisplayValue(summary.open_positions, "open_positions")} />
+          <MetricCard label="미체결 주문 수" value={formatDisplayValue(summary.open_orders, "open_orders")} />
+          <MetricCard label="거래소 권한" value={formatDisplayValue(exchangeCanTrade, "exchange_can_trade")} hint="Binance 원본 canTrade 값입니다." />
+          <MetricCard label="현재 안내" value={summary.connected ? "응답 정상" : "연결 확인 필요"} hint={summary.message} />
         </div>
       </section>
 
       <DataTable
-        title="계정 요약"
-        description="거래소 원본 상태와 앱 내부 상태를 함께 담은 계정 응답입니다."
-        rows={[summary as unknown as Record<string, unknown>]}
+        title="거래소 계정 요약"
+        description="운영 상태 해석용 앱 필드는 제외하고, 거래소 원본 계정 응답 중심으로 정리한 요약입니다."
+        rows={[exchangeSummaryRow]}
       />
       <DataTable
         title="보유 자산"
@@ -194,12 +126,12 @@ export default async function BinanceAccountPage() {
       <div className="grid gap-6 xl:grid-cols-2">
         <DataTable
           title="포지션"
-          description="현재 Binance Futures에 열린 실포지션입니다."
+          description="현재 Binance Futures에 열린 포지션입니다."
           rows={payload.positions}
         />
         <DataTable
           title="미체결 주문"
-          description="일반 주문과 보호 주문을 함께 표시합니다."
+          description="일반 주문과 보호 주문을 포함한 거래소 원본 미체결 주문 목록입니다."
           rows={payload.open_orders}
         />
       </div>

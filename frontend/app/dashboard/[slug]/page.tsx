@@ -14,7 +14,7 @@ import { PageShell } from "../../../components/page-shell";
 import { SettingsControls, type SettingsPayload } from "../../../components/settings-controls";
 import { type OperatorDashboardPayload } from "../../../components/overview-dashboard";
 import { fetchJson } from "../../../lib/api";
-import { resolveSelectedSymbol } from "../../../lib/operator-dashboard";
+import { resolveSelectedSymbol } from "../../../lib/selected-symbol";
 import { dashboardPages } from "../../../lib/page-config";
 
 type Row = Record<string, unknown>;
@@ -41,6 +41,7 @@ export default async function DashboardPage({
     notFound();
   }
 
+  // Backlog is rendered only through the shared [slug] dashboard path.
   if (slug === "backlog") {
     const board = await fetchJson<BacklogBoardPayload>("/api/backlog");
 
@@ -52,6 +53,7 @@ export default async function DashboardPage({
     );
   }
 
+  // Audit uses the shared explorer component with audit-only data.
   if (slug === "audit") {
     const auditRows = await fetchJson<AuditRow[]>("/api/audit?limit=100");
     const initialTab = typeof query.tab === "string" ? query.tab : "all";
@@ -84,6 +86,7 @@ export default async function DashboardPage({
       queryValue(query.symbol),
       operatorPayload.control.tracked_symbols,
       operatorPayload.control.default_symbol,
+      { mode: "all" },
     );
     content = (
       <MarketSignalView
@@ -94,11 +97,12 @@ export default async function DashboardPage({
       />
     );
   } else if (slug === "decisions" && operatorPayload) {
-    const requested = queryValue(query.symbol);
-    const symbols = operatorPayload.control.tracked_symbols.map((item) => item.toUpperCase());
-    const selectedSymbol = requested && symbols.includes(requested.toUpperCase())
-      ? requested.toUpperCase()
-      : operatorPayload.control.default_symbol.toUpperCase();
+    const selectedSymbol = resolveSelectedSymbol(
+      queryValue(query.symbol),
+      operatorPayload.control.tracked_symbols,
+      operatorPayload.control.default_symbol,
+      { mode: "single" },
+    );
     content = (
       <DecisionView
         operator={operatorPayload}

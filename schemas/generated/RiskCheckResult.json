@@ -35,6 +35,62 @@
       "title": "Approved Leverage",
       "type": "number"
     },
+    "raw_projected_notional": {
+      "default": 0.0,
+      "minimum": 0.0,
+      "title": "Raw Projected Notional",
+      "type": "number"
+    },
+    "approved_projected_notional": {
+      "default": 0.0,
+      "minimum": 0.0,
+      "title": "Approved Projected Notional",
+      "type": "number"
+    },
+    "approved_quantity": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Approved Quantity"
+    },
+    "auto_resized_entry": {
+      "default": false,
+      "title": "Auto Resized Entry",
+      "type": "boolean"
+    },
+    "size_adjustment_ratio": {
+      "default": 0.0,
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Size Adjustment Ratio",
+      "type": "number"
+    },
+    "exposure_headroom_snapshot": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Exposure Headroom Snapshot",
+      "type": "object"
+    },
+    "auto_resize_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Auto Resize Reason"
+    },
     "operating_mode": {
       "enum": [
         "live",
@@ -69,6 +125,11 @@
         "type": "number"
       },
       "title": "Exposure Metrics",
+      "type": "object"
+    },
+    "sync_freshness_summary": {
+      "additionalProperties": true,
+      "title": "Sync Freshness Summary",
       "type": "object"
     }
   },

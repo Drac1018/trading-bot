@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     break_even_enabled: bool = True
     atr_trailing_stop_enabled: bool = True
     partial_take_profit_enabled: bool = True
+    partial_tp_rr: float = 1.5
+    partial_tp_size_pct: float = 0.25
+    move_stop_to_be_rr: float = 1.0
+    time_stop_enabled: bool = False
+    time_stop_minutes: int = 120
+    time_stop_profit_floor: float = 0.15
     holding_edge_decay_enabled: bool = True
     reduce_on_regime_shift_enabled: bool = True
     schedule_windows: str = "1h,4h,12h,24h"

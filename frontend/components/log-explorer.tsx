@@ -6,7 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
-  type KeyboardEvent
+  type KeyboardEvent,
 } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
@@ -19,7 +19,7 @@ import {
   parseAuditTab,
   type AuditRow,
   type AuditTab,
-  type SortMode
+  type SortMode,
 } from "../lib/audit-log";
 import { formatDisplayValue } from "../lib/ui-copy";
 import { DataTable } from "./data-table";
@@ -28,34 +28,15 @@ export type { AuditRow } from "../lib/audit-log";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshMs = 20000;
+const limitOptions = [50, 100, 200] as const;
 const inputClass =
   "w-full rounded-2xl border border-amber-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-amber-400";
-const limitOptions = [50, 100, 200] as const;
 
-type LegacyTab = "orders" | "executions" | "audit";
-type GenericRow = Record<string, unknown>;
-
-type LegacyPayload = {
-  orders: GenericRow[];
-  executions: GenericRow[];
-  audit: GenericRow[];
-};
-
-type AuditLogExplorerProps = {
+export type LogExplorerProps = {
   initialRows: AuditRow[];
   initialTab?: string;
   initialLimit?: number;
-  initial?: never;
 };
-
-type LegacyLogExplorerProps = {
-  initial: LegacyPayload;
-  initialRows?: never;
-  initialTab?: never;
-  initialLimit?: never;
-};
-
-type LogExplorerProps = AuditLogExplorerProps | LegacyLogExplorerProps;
 
 async function fetchAuditLogs(limit: number): Promise<AuditRow[]> {
   const response = await fetch(`${apiBaseUrl}/api/audit?limit=${limit}`, { cache: "no-store" });
@@ -63,23 +44,6 @@ async function fetchAuditLogs(limit: number): Promise<AuditRow[]> {
     throw new Error(`Failed to load audit logs: ${response.status}`);
   }
   return (await response.json()) as AuditRow[];
-}
-
-async function fetchJsonArray(path: string): Promise<GenericRow[]> {
-  const response = await fetch(`${apiBaseUrl}${path}`, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`Failed to load ${path}: ${response.status}`);
-  }
-  return (await response.json()) as GenericRow[];
-}
-
-async function fetchLegacyLogs(): Promise<LegacyPayload> {
-  const [orders, executions, audit] = await Promise.all([
-    fetchJsonArray("/api/orders?limit=100"),
-    fetchJsonArray("/api/executions?limit=100"),
-    fetchJsonArray("/api/audit?limit=100")
-  ]);
-  return { orders, executions, audit };
 }
 
 function updateTabQuery(pathname: string, searchParams: URLSearchParams, nextTab: AuditTab) {
@@ -94,29 +58,7 @@ function updateTabQuery(pathname: string, searchParams: URLSearchParams, nextTab
   return queryString ? `${pathname}?${queryString}` : pathname;
 }
 
-export function LogExplorer(props: LogExplorerProps) {
-  if (props.initial !== undefined) {
-    return <LegacyLogExplorer initial={props.initial} />;
-  }
-
-  return (
-    <AuditLogExplorer
-      initialRows={props.initialRows}
-      initialTab={props.initialTab}
-      initialLimit={props.initialLimit}
-    />
-  );
-}
-
-function AuditLogExplorer({
-  initialRows,
-  initialTab = "all",
-  initialLimit = 100
-}: {
-  initialRows: AuditRow[];
-  initialTab?: string;
-  initialLimit?: number;
-}) {
+export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 100 }: LogExplorerProps) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -162,7 +104,7 @@ function AuditLogExplorer({
 
   const categoryRows = useMemo(
     () => (activeTab === "all" ? rows : rows.filter((row) => getAuditEventCategory(row) === activeTab)),
-    [activeTab, rows]
+    [activeTab, rows],
   );
 
   const tabCounts = useMemo(() => getAuditTabCounts(rows), [rows]);
@@ -183,9 +125,9 @@ function AuditLogExplorer({
         activeTab,
         severityFilter,
         searchFilter: deferredSearch,
-        sortMode
+        sortMode,
       }),
-    [activeTab, deferredSearch, rows, severityFilter, sortMode]
+    [activeTab, deferredSearch, rows, severityFilter, sortMode],
   );
 
   const currentTab = AUDIT_TAB_CONFIG[activeTab];
@@ -194,17 +136,17 @@ function AuditLogExplorer({
     categoryRows.length === 0
       ? {
           title: currentTab.emptyTitle,
-          description: currentTab.emptyDescription
+          description: currentTab.emptyDescription,
         }
       : {
           title: "현재 필터 조건에 맞는 감사 이벤트가 없습니다.",
-          description: "검색어, 심각도, 정렬 조건을 조정하면 필요한 감사 이벤트를 더 빠르게 찾을 수 있습니다."
+          description: "검색어, 심각도, 정렬 조건을 조정하면 필요한 감사 이벤트를 더 빠르게 찾을 수 있습니다.",
         };
 
   const selectTab = (nextTab: AuditTab) => {
     setActiveTab(nextTab);
     router.replace(updateTabQuery(pathname, new URLSearchParams(searchParams.toString()), nextTab), {
-      scroll: false
+      scroll: false,
     });
   };
 
@@ -232,10 +174,10 @@ function AuditLogExplorer({
   return (
     <div className="space-y-6">
       <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">감사 로그</p>
-        <h2 className="mt-2 text-2xl font-semibold text-ink">운영 감사 이벤트 탐색</h2>
+        <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">Audit Explorer</p>
+        <h2 className="mt-2 text-2xl font-semibold text-ink">감사 이벤트 탐색</h2>
         <p className="mt-3 text-sm leading-7 text-slate-600">
-          리스크, 실행, 승인/운영제어, 보호주문, 헬스/시스템, AI/의사결정 이벤트를 성격별로 나눠 빠르게 확인합니다.
+          리스크, 실행, 승인/운영제어, 보호주문, 헬스/시스템, AI/의사결정 이벤트를 같은 규칙으로 탐색합니다.
         </p>
 
         <div className="mt-4 flex flex-wrap gap-2" role="tablist" aria-label="감사 이벤트 분류 탭">
@@ -251,9 +193,7 @@ function AuditLogExplorer({
                 aria-selected={selected}
                 aria-controls={panelId}
                 className={`rounded-full px-4 py-2 text-sm font-semibold ${
-                  selected
-                    ? "bg-amber-400 text-slate-900"
-                    : "border border-amber-200 bg-white text-slate-700"
+                  selected ? "bg-amber-400 text-slate-900" : "border border-amber-200 bg-white text-slate-700"
                 }`}
                 onClick={() => selectTab(tab)}
                 onKeyDown={(event) => handleTabKeyDown(event, index)}
@@ -274,7 +214,7 @@ function AuditLogExplorer({
             <input
               aria-label="감사 로그 검색"
               className={inputClass}
-              placeholder="이벤트 유형, 메시지, payload로 검색"
+              placeholder="이벤트 유형, 메시지, payload 검색"
               value={searchFilter}
               onChange={(event) => setSearchFilter(event.target.value)}
             />
@@ -324,176 +264,6 @@ function AuditLogExplorer({
           emptyStateDescription={emptyState.description}
         />
       </section>
-    </div>
-  );
-}
-
-function LegacyLogExplorer({ initial }: { initial: LegacyPayload }) {
-  const [payload, setPayload] = useState(initial);
-  const [activeTab, setActiveTab] = useState<LegacyTab>("orders");
-  const [symbolFilter, setSymbolFilter] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
-  const [searchFilter, setSearchFilter] = useState("");
-
-  useEffect(() => {
-    let active = true;
-
-    const refresh = async () => {
-      try {
-        const next = await fetchLegacyLogs();
-        if (active) {
-          setPayload(next);
-        }
-      } catch {
-        return;
-      }
-    };
-
-    void refresh();
-
-    const interval = window.setInterval(() => {
-      void refresh();
-    }, refreshMs);
-
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, []);
-
-  const symbolOptions = useMemo(() => {
-    const values = new Set<string>();
-    [payload.orders, payload.executions].forEach((rows) => {
-      rows.forEach((row) => {
-        if (typeof row.symbol === "string") {
-          values.add(row.symbol);
-        }
-      });
-    });
-    return [...values].sort();
-  }, [payload.executions, payload.orders]);
-
-  const statusOptions = useMemo(() => {
-    const values = new Set<string>();
-    const rows =
-      activeTab === "orders" ? payload.orders : activeTab === "executions" ? payload.executions : payload.audit;
-    const key = activeTab === "audit" ? "severity" : "status";
-    rows.forEach((row) => {
-      const value = row[key];
-      if (typeof value === "string") {
-        values.add(value);
-      }
-    });
-    return [...values].sort();
-  }, [activeTab, payload.audit, payload.executions, payload.orders]);
-
-  const filteredRows = useMemo(() => {
-    const rows =
-      activeTab === "orders" ? payload.orders : activeTab === "executions" ? payload.executions : payload.audit;
-    const keyword = searchFilter.trim().toLowerCase();
-
-    return rows.filter((row) => {
-      if (symbolFilter && row.symbol !== symbolFilter) {
-        return false;
-      }
-      if (statusFilter) {
-        const key = activeTab === "audit" ? "severity" : "status";
-        if (row[key] !== statusFilter) {
-          return false;
-        }
-      }
-      if (!keyword) {
-        return true;
-      }
-      return JSON.stringify(row).toLowerCase().includes(keyword);
-    });
-  }, [activeTab, payload.audit, payload.executions, payload.orders, searchFilter, statusFilter, symbolFilter]);
-
-  const current = {
-    orders: {
-      title: "주문 로그",
-      description: "실거래 주문과 보호 주문 상태를 함께 확인합니다.",
-      statusLabel: "주문 상태"
-    },
-    executions: {
-      title: "체결 로그",
-      description: "부분 체결을 포함한 실제 체결 이력을 확인합니다.",
-      statusLabel: "체결 상태"
-    },
-    audit: {
-      title: "감사 로그",
-      description: "리스크, 연동 상태, 운영 제어 관련 감사 이벤트를 확인합니다.",
-      statusLabel: "심각도"
-    }
-  }[activeTab];
-
-  return (
-    <div className="space-y-6">
-      <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">로그 탐색기</p>
-        <h2 className="mt-2 text-2xl font-semibold text-ink">주문 / 체결 / 감사 로그 탐색</h2>
-        <p className="mt-3 text-sm leading-7 text-slate-600">
-          주문, 체결, 감사 로그를 영역별로 나누고 검색과 상태 필터로 빠르게 확인합니다.
-        </p>
-        <div className="mt-4 flex flex-wrap gap-2">
-          {(["orders", "executions", "audit"] as LegacyTab[]).map((tab) => (
-            <button
-              key={tab}
-              className={`rounded-full px-4 py-2 text-sm font-semibold ${
-                activeTab === tab
-                  ? "bg-amber-400 text-slate-900"
-                  : "border border-amber-200 bg-white text-slate-700"
-              }`}
-              onClick={() => setActiveTab(tab)}
-              type="button"
-            >
-              {tab === "orders" ? "주문" : tab === "executions" ? "체결" : "감사"}
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="rounded-[1.8rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-        <div className="grid gap-3 lg:grid-cols-3">
-          <select
-            aria-label="심볼 필터"
-            className={inputClass}
-            value={symbolFilter}
-            onChange={(event) => setSymbolFilter(event.target.value)}
-          >
-            <option value="">모든 심볼</option>
-            {activeTab === "audit"
-              ? null
-              : symbolOptions.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-          </select>
-          <select
-            aria-label="상태 필터"
-            className={inputClass}
-            value={statusFilter}
-            onChange={(event) => setStatusFilter(event.target.value)}
-          >
-            <option value="">모든 {current.statusLabel}</option>
-            {statusOptions.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-          <input
-            aria-label="로그 검색"
-            className={inputClass}
-            placeholder="검색어로 필터링"
-            value={searchFilter}
-            onChange={(event) => setSearchFilter(event.target.value)}
-          />
-        </div>
-      </section>
-
-      <DataTable title={current.title} description={current.description} rows={filteredRows} />
     </div>
   );
 }

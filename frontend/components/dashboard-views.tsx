@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import type { OperatorDashboardPayload } from "./overview-dashboard";
 import { DataTable } from "./data-table";
+import { getSelectedSymbolPolicyHint } from "../lib/selected-symbol";
 
 type Row = Record<string, unknown>;
 
@@ -189,6 +190,7 @@ export function MarketSignalView({
         rows={filteredSnapshots}
         emptyStateTitle="표시할 시장 스냅샷이 없습니다."
         emptyStateDescription="선택한 심볼 기준으로 아직 수집된 시장 스냅샷이 없습니다."
+        hiddenColumns={["candle_count", "candles", "payload"]}
       />
 
       <DataTable
@@ -244,6 +246,9 @@ export function DecisionView({
             symbols={operator.control.tracked_symbols}
             selectedSymbol={symbol.symbol}
           />
+        </div>
+        <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          {getSelectedSymbolPolicyHint("single")}
         </div>
         <div className="mt-5 grid gap-4 lg:grid-cols-4">
           {metricCard("마지막 평가", formatDateTime(symbol.ai_decision.created_at), "선택 심볼 기준 최신 평가 시각")}

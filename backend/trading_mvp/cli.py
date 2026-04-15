@@ -8,10 +8,7 @@ from trading_mvp.database import Base, SessionLocal, engine
 from trading_mvp.schemas import (
     AgentRunRecord,
     AppliedChangeRecordResponse,
-    BacklogAutoApplyBatchResponse,
-    BacklogAutoApplyResult,
     BacklogBoardResponse,
-    BacklogCodexDraftResponse,
     BinanceAccountResponse,
     ChiefReviewSummary,
     ExecutionIntent,
@@ -28,7 +25,6 @@ from trading_mvp.schemas import (
     UserChangeRequestResponse,
     UXSuggestion,
 )
-from trading_mvp.services.backlog_auto_apply import auto_apply_supported_backlogs
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.scheduler import run_window
@@ -47,12 +43,9 @@ def export_schemas(target_dir: Path) -> None:
         "ProductBacklogDetailResponse": ProductBacklogDetailResponse.model_json_schema(),
         "UserChangeRequestResponse": UserChangeRequestResponse.model_json_schema(),
         "AppliedChangeRecordResponse": AppliedChangeRecordResponse.model_json_schema(),
-        "BacklogCodexDraftResponse": BacklogCodexDraftResponse.model_json_schema(),
         "BacklogBoardResponse": BacklogBoardResponse.model_json_schema(),
         "SignalPerformanceReportResponse": SignalPerformanceReportResponse.model_json_schema(),
         "StructuredCompetitorNotesResponse": StructuredCompetitorNotesResponse.model_json_schema(),
-        "BacklogAutoApplyResult": BacklogAutoApplyResult.model_json_schema(),
-        "BacklogAutoApplyBatchResponse": BacklogAutoApplyBatchResponse.model_json_schema(),
         "RiskCheckResult": RiskCheckResult.model_json_schema(),
         "ExecutionIntent": ExecutionIntent.model_json_schema(),
         "AgentRunRecord": AgentRunRecord.model_json_schema(),
@@ -83,7 +76,6 @@ def main() -> None:
     subparsers.add_parser("seed")
     subparsers.add_parser("cycle")
     subparsers.add_parser("export-schemas")
-    subparsers.add_parser("backlog-auto-apply-supported")
 
     args = parser.parse_args()
     Base.metadata.create_all(bind=engine)
@@ -121,10 +113,6 @@ def main() -> None:
         elif args.command == "export-schemas":
             export_schemas(Path("schemas/generated"))
             output = {"status": "ok", "target": "schemas/generated"}
-        elif args.command == "backlog-auto-apply-supported":
-            payload = auto_apply_supported_backlogs(session)
-            session.commit()
-            output = payload.model_dump(mode="json")
         else:
             output = {"status": "unknown"}
         print(json.dumps(output, indent=2, ensure_ascii=False, default=str))

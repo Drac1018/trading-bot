@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "../lib/operator-dashboard";
+import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "../lib/selected-symbol";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshIntervalMs = 15000;
@@ -84,6 +84,13 @@ type OperatorRiskSnapshot = {
   reason_codes: string[];
   approved_risk_pct: number | null;
   approved_leverage: number | null;
+  raw_projected_notional: number | null;
+  approved_projected_notional: number | null;
+  approved_quantity: number | null;
+  auto_resized_entry: boolean;
+  size_adjustment_ratio: number | null;
+  auto_resize_reason: string | null;
+  exposure_headroom_snapshot: Record<string, number>;
 };
 
 type OperatorExecutionSnapshot = {
@@ -311,7 +318,30 @@ function translateReasonCode(value: string | null | undefined) {
   if (!value) {
     return "-";
   }
-  return reasonCodeLabelMap[value] ?? value;
+  const extraReasonCodeLabelMap: Record<string, string> = {
+    ENTRY_AUTO_RESIZED: "리스크 한도 내 자동 축소 진입",
+    ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT: "총 노출도 한도에 맞춘 자동 축소",
+    ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT: "방향 편중 한도에 맞춘 자동 축소",
+    ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "단일 포지션 한도에 맞춘 자동 축소",
+    ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "동일 티어 집중도 한도에 맞춘 자동 축소",
+    ENTRY_SIZE_BELOW_MIN_NOTIONAL: "최소 실행 가능 주문 미만",
+    ENTRY_TRIGGER_NOT_MET: "진입 트리거 미충족",
+    CHASE_LIMIT_EXCEEDED: "추격 진입 한도 초과",
+    INVALID_INVALIDATION_PRICE: "무효화 가격 기준 이상",
+  };
+  return extraReasonCodeLabelMap[value] ?? reasonCodeLabelMap[value] ?? value;
+}
+
+function translateAutoResizeReason(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  return {
+    CLAMPED_TO_GROSS_EXPOSURE_HEADROOM: "총 노출도 여유 범위에 맞춰 축소",
+    CLAMPED_TO_DIRECTIONAL_HEADROOM: "방향 편중 여유 범위에 맞춰 축소",
+    CLAMPED_TO_SINGLE_POSITION_HEADROOM: "단일 포지션 여유 범위에 맞춰 축소",
+    CLAMPED_TO_SAME_TIER_HEADROOM: "동일 티어 여유 범위에 맞춰 축소",
+  }[value] ?? value;
 }
 
 function translateSeverity(value: string | null | undefined) {
@@ -443,8 +473,8 @@ function GlobalOperatorSummary({
             전역 운영 상태와 심볼별 현황
           </h1>
           <p className="mt-4 max-w-3xl text-sm leading-7 text-slate-600 sm:text-base">
-            상단은 계좌와 시스템 전역 상태만 보여주고, 그 아래에서 심볼별 AI 판단, risk 결과,
-            실행 상태를 분리해서 확인합니다.
+            이 화면이 운영 상태의 단일 기준 화면입니다. 상단은 계좌와 시스템 전역 상태만 보여주고,
+            그 아래에서 심볼별 AI 판단, risk 결과, 실행 상태를 분리해서 확인합니다.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -888,6 +918,7 @@ function SymbolDetailPanel({
   }
 
   const blockedReasons = filteredBlockedReasons(symbol);
+  const autoResized = symbol.risk_guard.auto_resized_entry;
 
   return (
     <section className="space-y-6 rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
@@ -999,7 +1030,7 @@ function SymbolDetailPanel({
             )}
           </div>
         </div>
-        <div className="grid gap-4">
+        <div className="grid gap-4 sm:grid-cols-2">
           {valueCard(
             "승인 risk_pct",
             symbol.risk_guard.approved_risk_pct !== null ? formatRatio(symbol.risk_guard.approved_risk_pct) : "-",
@@ -1011,6 +1042,54 @@ function SymbolDetailPanel({
               ? `${formatNumber(symbol.risk_guard.approved_leverage, 2)}x`
               : "-",
             "결정론적 리스크 엔진이 허용한 최대 레버리지",
+          )}
+          {valueCard(
+            "raw projected notional",
+            symbol.risk_guard.raw_projected_notional !== null
+              ? formatNumber(symbol.risk_guard.raw_projected_notional, 2)
+              : "-",
+            "원래 계산된 신규 진입 예상 notional",
+          )}
+          {valueCard(
+            "approved projected notional",
+            symbol.risk_guard.approved_projected_notional !== null
+              ? formatNumber(symbol.risk_guard.approved_projected_notional, 2)
+              : "-",
+            autoResized
+              ? `축소 비율 ${
+                  symbol.risk_guard.size_adjustment_ratio !== null
+                    ? formatRatio(symbol.risk_guard.size_adjustment_ratio)
+                    : "-"
+                }`
+              : "리스크 승인 기준 최종 notional",
+          )}
+          {valueCard(
+            "approved quantity",
+            symbol.risk_guard.approved_quantity !== null
+              ? formatNumber(symbol.risk_guard.approved_quantity, 6)
+              : "-",
+            "execution이 그대로 따라야 하는 최종 수량",
+          )}
+          {valueCard(
+            "자동 축소",
+            autoResized ? "적용" : "없음",
+            autoResized ? "리스크 여유 한도에 맞춰 신규 진입 크기를 자동 축소했습니다." : "원래 요청 크기가 그대로 승인되었습니다.",
+          )}
+          {valueCard(
+            "축소 비율",
+            symbol.risk_guard.size_adjustment_ratio !== null
+              ? formatRatio(symbol.risk_guard.size_adjustment_ratio)
+              : "-",
+            autoResized ? "raw 요청 크기 대비 최종 승인 크기 비율입니다." : "축소가 적용되지 않았습니다.",
+          )}
+          {valueCard(
+            "headroom",
+            symbol.risk_guard.exposure_headroom_snapshot.limiting_headroom_notional !== undefined
+              ? formatNumber(symbol.risk_guard.exposure_headroom_snapshot.limiting_headroom_notional, 2)
+              : "-",
+            symbol.risk_guard.auto_resize_reason
+              ? translateAutoResizeReason(symbol.risk_guard.auto_resize_reason)
+              : "가장 타이트한 노출도 여유 한도",
           )}
         </div>
       </div>
@@ -1177,6 +1256,7 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
         searchParams.get("symbol"),
         operator.control.tracked_symbols,
         operator.control.default_symbol,
+        { mode: "all" },
       ),
     [operator.control.default_symbol, operator.control.tracked_symbols, searchParams],
   );

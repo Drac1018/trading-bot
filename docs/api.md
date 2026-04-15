@@ -41,6 +41,14 @@
 - `exchange_sync_interval_seconds`
 - `market_refresh_interval_minutes`
 - `position_management_interval_seconds`
+- `break_even_enabled`
+- `move_stop_to_be_rr`
+- `partial_take_profit_enabled`
+- `partial_tp_rr`
+- `partial_tp_size_pct`
+- `time_stop_enabled`
+- `time_stop_minutes`
+- `time_stop_profit_floor`
 - `symbol_cadence_overrides`
 - `symbol_effective_cadences`
 
@@ -194,6 +202,30 @@
 - `audit_events`
   - 최근 감사 이벤트 목록
 
+### Decision / Risk trigger note
+
+- `TradeDecision` payload는 신규 진입 아이디어에 대해 optional `entry_mode`, `invalidation_price`, `max_chase_bps`, `idea_ttl_minutes`를 포함할 수 있습니다.
+- `risk_guard`는 신규 `long / short`에 한해 결정론적 entry trigger를 다시 검사합니다.
+- 신규 차단 사유는 `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `INVALID_INVALIDATION_PRICE`를 `reason_codes`로 남깁니다.
+- `reduce / exit / protection / emergency` 계열은 이 trigger 때문에 막지 않습니다.
+
+#### Entry trigger and auto-resize
+
+- `TradeDecision` payload에는 신규 진입 아이디어를 제한하기 위한 optional 필드 `entry_mode`, `invalidation_price`, `max_chase_bps`, `idea_ttl_minutes`가 포함될 수 있습니다.
+- `risk_guard`는 신규 `long / short`에 대해 결정론적 entry trigger를 다시 검사합니다.
+- 신규 진입 차단 사유는 `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `INVALID_INVALIDATION_PRICE`를 `reason_codes`로 남깁니다.
+- 익스포저 초과가 유일한 문제이면 `risk_guard`는 신규 진입을 전면 차단하지 않고 `approved_projected_notional`과 `approved_quantity`로 자동 축소 승인할 수 있습니다.
+- 이 경우 payload에는 아래 필드가 추가됩니다.
+  - `raw_projected_notional`
+  - `approved_projected_notional`
+  - `approved_quantity`
+  - `auto_resized_entry`
+  - `size_adjustment_ratio`
+  - `exposure_headroom_snapshot`
+  - `auto_resize_reason`
+- 자동 축소 승인 정보 코드는 `ENTRY_AUTO_RESIZED`, `ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT`, `ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT`, `ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT`, `ENTRY_CLAMPED_TO_SAME_TIER_LIMIT`입니다.
+- `reduce / exit / protection / emergency` 계열은 trigger와 auto-resize 정책 때문에 막히지 않습니다.
+
 ### `GET /api/dashboard/profitability`
 
 수익성 해석 전용 응답입니다.
@@ -278,11 +310,11 @@ Scheduler workflow names:
 
 - `GET /api/backlog`
 - `GET /api/backlog/{backlog_id}`
-- `GET /api/backlog/{backlog_id}/codex-draft`
 - `POST /api/backlog/requests`
 - `POST /api/backlog/applied`
-- `POST /api/backlog/{backlog_id}/auto-apply`
-- `POST /api/backlog/auto-apply-supported`
+
+`/api/backlog` 응답은 backlog 항목, 연결된 사용자 요청, 적용 이력, 시그널 성과 리포트, 구조화된 경쟁사 메모만 포함한다.
+기존 backlog 전용 AI 보조 기능이던 `codex-draft`, `auto-apply` 관련 endpoint와 응답 필드는 제거되었다.
 
 ## CLI
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import timedelta
+from math import floor
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from trading_mvp.models import Execution, Order, Position, RiskCheck, Setting
 from trading_mvp.schemas import (
     ExecutionIntent,
     FeaturePayload,
+    MarketCandle,
     MarketSnapshotPayload,
     RiskCheckResult,
     TradeDecision,
@@ -23,7 +25,12 @@ from trading_mvp.services.account import (
     get_open_position,
     refresh_open_position_marks,
 )
-from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
+from trading_mvp.services.audit import (
+    create_alert,
+    record_audit_event,
+    record_health_event,
+    record_position_management_event,
+)
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
 from trading_mvp.services.execution_policy import (
     ExecutionPlan,
@@ -39,9 +46,11 @@ from trading_mvp.services.position_management import (
     PARTIAL_TAKE_PROFIT_FRACTION,
     build_position_management_context,
     mark_partial_take_profit_taken,
+    mark_time_stop_action,
     seed_position_management_metadata,
     store_position_management_context,
 )
+from trading_mvp.services.risk import evaluate_risk, is_survival_path_decision
 from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
@@ -193,6 +202,57 @@ def _calculate_quantity(entry_price: float, stop_loss: float | None, equity: flo
     return round(min(risk_budget / per_unit_risk, max_notional_quantity), 6)
 
 
+def _quantity_for_notional(notional: float, price: float) -> float:
+    if notional <= 0 or price <= 0:
+        return 0.0
+    return round(notional / price, 6)
+
+
+def _cap_quantity_to_approved_notional(
+    client: Any,
+    *,
+    symbol: str,
+    quantity: float,
+    reference_price: float,
+    approved_notional: float,
+) -> float:
+    if approved_notional <= 0 or reference_price <= 0 or quantity <= 0:
+        return quantity
+    max_quantity = approved_notional / reference_price
+    if quantity <= max_quantity + 1e-9:
+        return quantity
+    if not hasattr(client, "get_symbol_filters"):
+        return round(max(max_quantity, 0.0), 6)
+    filters = client.get_symbol_filters(symbol)
+    step_size = _to_float(filters.get("step_size"))
+    min_qty = _to_float(filters.get("min_qty"))
+    capped = max_quantity
+    if step_size > 0:
+        capped = floor(max_quantity / step_size) * step_size
+    if capped < min_qty:
+        return 0.0
+    return round(max(capped, 0.0), 6)
+
+
+def _execution_minimum_notional_failure(
+    client: Any,
+    *,
+    symbol: str,
+    quantity: float,
+    reference_price: float,
+) -> str | None:
+    if quantity <= 0 or reference_price <= 0 or not hasattr(client, "get_symbol_filters"):
+        return "APPROVED_SIZE_BELOW_EXECUTION_MINIMUM" if quantity <= 0 else None
+    filters = client.get_symbol_filters(symbol)
+    min_qty = _to_float(filters.get("min_qty"))
+    min_notional = _to_float(filters.get("min_notional"))
+    if min_qty > 0 and quantity < min_qty:
+        return "APPROVED_SIZE_BELOW_EXECUTION_MINIMUM"
+    if min_notional > 0 and quantity * reference_price < min_notional:
+        return "APPROVED_SIZE_BELOW_EXECUTION_MINIMUM"
+    return None
+
+
 def _decision_matches_position_side(decision: TradeDecision, existing_position: Position | None) -> bool:
     if existing_position is None:
         return False
@@ -216,13 +276,92 @@ def _classify_execution_intent(
     return "entry"
 
 
-def _reduce_fraction_for_decision(decision: TradeDecision) -> float:
+def _reduce_fraction_for_decision(decision: TradeDecision, settings_row: Setting) -> float:
     rationale_codes = set(decision.rationale_codes)
     if "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in rationale_codes:
-        return PARTIAL_TAKE_PROFIT_FRACTION
+        configured = _to_float(getattr(settings_row, "partial_tp_size_pct", PARTIAL_TAKE_PROFIT_FRACTION))
+        return min(max(configured, 0.01), 1.0)
+    if "POSITION_MANAGEMENT_TIME_STOP_REDUCE" in rationale_codes:
+        return 0.5
     if {"POSITION_MANAGEMENT_EDGE_DECAY", "POSITION_MANAGEMENT_REGIME_SHIFT", "POSITION_MANAGEMENT_MOMENTUM_WEAKENING"} & rationale_codes:
         return 0.35
     return 0.5
+
+
+def _is_effectively_zero(value: float | None) -> bool:
+    return value is None or abs(value) <= 1e-9
+
+
+def _build_market_snapshot_from_position(position: Position, feature_payload: FeaturePayload) -> MarketSnapshotPayload:
+    snapshot_time = utcnow_naive()
+    latest_price = position.mark_price if position.mark_price > 0 else position.entry_price
+    return MarketSnapshotPayload(
+        symbol=position.symbol,
+        timeframe=feature_payload.timeframe,
+        snapshot_time=snapshot_time,
+        latest_price=latest_price,
+        latest_volume=max(feature_payload.volume_ratio, 0.0),
+        candle_count=1,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(
+                timestamp=snapshot_time,
+                open=latest_price,
+                high=latest_price,
+                low=latest_price,
+                close=latest_price,
+                volume=max(feature_payload.volume_ratio, 0.0),
+            )
+        ],
+    )
+
+
+def _build_position_management_trade_decision(
+    position: Position,
+    *,
+    feature_payload: FeaturePayload,
+    context: dict[str, object],
+    settings_row: Setting,
+) -> TradeDecision | None:
+    reason_codes = [str(item) for item in _get_string_list(context, "reduce_reason_codes")]
+    if not reason_codes:
+        return None
+
+    if "POSITION_MANAGEMENT_TIME_STOP_EXIT" in reason_codes:
+        decision_type = "exit"
+        explanation_short = "time stop exit"
+        explanation_detailed = "Time stop triggered a deterministic exit because the trade failed to show acceptable progress."
+    else:
+        decision_type = "reduce"
+        if "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in reason_codes:
+            explanation_short = "partial take profit"
+            explanation_detailed = (
+                "Partial take profit triggered after the configured R threshold and keeps the position in reduce-only mode."
+            )
+        elif "POSITION_MANAGEMENT_TIME_STOP_REDUCE" in reason_codes:
+            explanation_short = "time stop reduce"
+            explanation_detailed = "Time stop triggered a deterministic size reduction because edge decayed before target follow-through."
+        else:
+            explanation_short = "position management reduce"
+            explanation_detailed = "Deterministic position management requested a reduce-only adjustment."
+
+    return TradeDecision(
+        decision=decision_type,  # type: ignore[arg-type]
+        confidence=0.9,
+        symbol=position.symbol,
+        timeframe=feature_payload.timeframe,
+        entry_zone_min=position.mark_price if position.mark_price > 0 else position.entry_price,
+        entry_zone_max=position.mark_price if position.mark_price > 0 else position.entry_price,
+        stop_loss=position.stop_loss,
+        take_profit=position.take_profit,
+        max_holding_minutes=max(getattr(settings_row, "time_stop_minutes", 120), 1),
+        risk_pct=min(settings_row.max_risk_per_trade, 0.01),
+        leverage=max(min(position.leverage, settings_row.max_leverage), 1.0),
+        rationale_codes=reason_codes,
+        explanation_short=explanation_short,
+        explanation_detailed=explanation_detailed,
+    )
 
 
 def _is_protective_order(order_payload: dict[str, object]) -> bool:
@@ -508,11 +647,10 @@ def _replace_stop_loss_order(
     session.add(position)
     session.add(order)
     session.flush()
-    record_audit_event(
+    record_position_management_event(
         session,
         event_type="position_management_stop_tightened",
-        entity_type="position",
-        entity_id=str(position.id),
+        position_id=position.id,
         severity="info",
         message="Position management tightened the live stop loss.",
         payload={
@@ -557,49 +695,177 @@ def apply_position_management(
     open_orders = client.get_open_orders(symbol)
     protection_state = _build_protection_state(position, open_orders)
     tightened_stop_loss = _to_float(context.get("tightened_stop_loss"))
-    if (
-        protection_state["status"] != "protected"
-        or not protection_state.get("has_stop_loss")
-        or not _is_more_protective_stop(position.side, position.stop_loss, tightened_stop_loss)
-    ):
+    stop_can_tighten = (
+        protection_state["status"] == "protected"
+        and bool(protection_state.get("has_stop_loss"))
+        and not _is_effectively_zero(tightened_stop_loss)
+        and _is_more_protective_stop(position.side, position.stop_loss, tightened_stop_loss)
+    )
+    if stop_can_tighten:
+        applied = _replace_stop_loss_order(
+            session,
+            client=client,
+            position=position,
+            symbol=symbol,
+            stop_loss=float(tightened_stop_loss),
+            decision_run_id=decision_run_id,
+            risk_row=risk_row,
+            trigger_source="position_management",
+            open_orders=open_orders,
+        )
+        break_even_stop = _to_float(context.get("break_even_stop_loss"))
+        if (
+            "POSITION_MANAGEMENT_BREAK_EVEN" in set(_get_string_list(context, "applied_rule_candidates"))
+            and break_even_stop is not None
+            and abs(float(applied["tightened_stop_loss"]) - break_even_stop) <= 1e-9
+        ):
+            record_position_management_event(
+                session,
+                event_type="moved_stop_to_breakeven",
+                position_id=position.id,
+                severity="info",
+                message="Position management moved the live stop to break-even.",
+                payload={
+                    "symbol": symbol,
+                    "decision_run_id": decision_run_id,
+                    "tightened_stop_loss": applied["tightened_stop_loss"],
+                    "break_even_trigger_r": context.get("break_even_trigger_r"),
+                },
+            )
+        refreshed_open_orders = client.get_open_orders(symbol)
+        protection_result = _ensure_protected_position(
+            session,
+            settings_row,
+            client,
+            symbol=symbol,
+            position=position,
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
+            decision_run_id=decision_run_id,
+            risk_row=risk_row,
+            parent_order=None,
+            trigger_source="position_management",
+            pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+        )
+        return {
+            "status": "applied",
+            "position_management_context": context,
+            "position_management_action": applied,
+            "protection_state": _build_protection_state(position, refreshed_open_orders),
+            "protection_result": protection_result,
+        }
+
+    management_decision = _build_position_management_trade_decision(
+        position,
+        feature_payload=feature_payload,
+        context=context,
+        settings_row=settings_row,
+    )
+    if management_decision is None:
         return {
             "status": "monitoring",
             "position_management_context": context,
             "protection_state": protection_state,
         }
+    if protection_state["status"] != "protected":
+        return {
+            "status": "monitoring",
+            "position_management_context": context,
+            "protection_state": protection_state,
+            "position_management_action": {
+                "status": "skipped_unverified_protection",
+                "decision": management_decision.model_dump(mode="json"),
+            },
+        }
 
-    applied = _replace_stop_loss_order(
-        session,
-        client=client,
-        position=position,
-        symbol=symbol,
-        stop_loss=float(tightened_stop_loss),
-        decision_run_id=decision_run_id,
-        risk_row=risk_row,
-        trigger_source="position_management",
-        open_orders=open_orders,
-    )
-    refreshed_open_orders = client.get_open_orders(symbol)
-    protection_result = _ensure_protected_position(
+    market_snapshot = _build_market_snapshot_from_position(position, feature_payload)
+    management_risk_result, management_risk_row = evaluate_risk(
         session,
         settings_row,
-        client,
-        symbol=symbol,
-        position=position,
-        stop_loss=position.stop_loss,
-        take_profit=position.take_profit,
+        management_decision,
+        market_snapshot,
         decision_run_id=decision_run_id,
-        risk_row=risk_row,
-        parent_order=None,
-        trigger_source="position_management",
-        pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+        execution_mode="live",
     )
+    if not management_risk_result.allowed or not is_survival_path_decision(management_decision):
+        return {
+            "status": "blocked",
+            "position_management_context": context,
+            "protection_state": protection_state,
+            "position_management_action": {
+                "status": "risk_blocked",
+                "decision": management_decision.model_dump(mode="json"),
+                "risk_result": management_risk_result.model_dump(mode="json"),
+            },
+        }
+
+    execution_result = execute_live_trade(
+        session,
+        settings_row,
+        decision_run_id=decision_run_id,
+        decision=management_decision,
+        market_snapshot=market_snapshot,
+        risk_result=management_risk_result,
+        risk_row=management_risk_row,
+    )
+
+    fill_quantity = _to_float(execution_result.get("fill_quantity"))
+    if fill_quantity > 0 and "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in set(management_decision.rationale_codes):
+        record_position_management_event(
+            session,
+            event_type="partial_tp_executed",
+            position_id=position.id,
+            severity="info",
+            message="Position management executed a partial take profit in reduce-only mode.",
+            payload={
+                "symbol": symbol,
+                "order_id": execution_result.get("order_id"),
+                "fill_quantity": fill_quantity,
+                "reduce_fraction": execution_result.get("position_management", {}).get("reduce_fraction"),
+            },
+        )
+    if fill_quantity > 0 and "POSITION_MANAGEMENT_TIME_STOP_EXIT" in set(management_decision.rationale_codes):
+        record_position_management_event(
+            session,
+            event_type="time_stop_exit",
+            position_id=position.id,
+            severity="info",
+            message="Position management exited the position because time stop conditions were met.",
+            payload={
+                "symbol": symbol,
+                "order_id": execution_result.get("order_id"),
+                "time_stop_minutes": context.get("time_stop_minutes"),
+                "time_stop_profit_floor": context.get("time_stop_profit_floor"),
+            },
+        )
+        mark_time_stop_action(position, action="exit")
+        session.add(position)
+        session.flush()
+    elif fill_quantity > 0 and "POSITION_MANAGEMENT_TIME_STOP_REDUCE" in set(management_decision.rationale_codes):
+        record_position_management_event(
+            session,
+            event_type="time_stop_reduce",
+            position_id=position.id,
+            severity="info",
+            message="Position management reduced the position because time stop conditions were met.",
+            payload={
+                "symbol": symbol,
+                "order_id": execution_result.get("order_id"),
+                "time_stop_minutes": context.get("time_stop_minutes"),
+                "time_stop_profit_floor": context.get("time_stop_profit_floor"),
+            },
+        )
+        mark_time_stop_action(position, action="reduce")
+        session.add(position)
+        session.flush()
+
     return {
-        "status": "applied",
+        "status": "executed",
         "position_management_context": context,
-        "position_management_action": applied,
-        "protection_state": _build_protection_state(position, refreshed_open_orders),
-        "protection_result": protection_result,
+        "position_management_action": execution_result,
+        "protection_state": protection_state,
+        "risk_result": management_risk_result.model_dump(mode="json"),
+        "decision": management_decision.model_dump(mode="json"),
     }
 
 
@@ -621,13 +887,22 @@ def build_execution_intent(
         entry_price = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price
         leverage = existing_position.leverage if existing_position.leverage > 0 else min(risk_result.approved_leverage, settings_row.max_leverage)
     else:
-        quantity = _calculate_quantity(
-            entry_price=entry_price,
-            stop_loss=decision.stop_loss,
-            equity=equity,
-            risk_pct=risk_result.approved_risk_pct,
-            leverage=risk_result.approved_leverage,
-        )
+        approved_quantity = risk_result.approved_quantity if risk_result.approved_quantity is not None else 0.0
+        if approved_quantity > 0:
+            quantity = approved_quantity
+        else:
+            quantity = _calculate_quantity(
+                entry_price=entry_price,
+                stop_loss=decision.stop_loss,
+                equity=equity,
+                risk_pct=risk_result.approved_risk_pct,
+                leverage=risk_result.approved_leverage,
+            )
+            if risk_result.approved_projected_notional > 0:
+                quantity = min(
+                    quantity,
+                    _quantity_for_notional(risk_result.approved_projected_notional, entry_price),
+                )
         leverage = min(risk_result.approved_leverage, settings_row.max_leverage)
     return ExecutionIntent(
         symbol=decision.symbol,
@@ -635,6 +910,10 @@ def build_execution_intent(
         intent_type=intent_type,  # type: ignore[arg-type]
         quantity=max(quantity, 0.0001),
         requested_price=entry_price,
+        entry_mode=decision.entry_mode,
+        invalidation_price=decision.invalidation_price,
+        max_chase_bps=decision.max_chase_bps,
+        idea_ttl_minutes=decision.idea_ttl_minutes,
         stop_loss=decision.stop_loss,
         take_profit=decision.take_profit,
         leverage=leverage,
@@ -2438,12 +2717,33 @@ def _resync_exchange_state(
 def execute_live_trade(
     session: Session,
     settings_row: Setting,
-    decision_run_id: int,
+    decision_run_id: int | None,
     decision: TradeDecision,
     market_snapshot: MarketSnapshotPayload,
     risk_result: RiskCheckResult,
     risk_row: RiskCheck | None = None,
 ) -> dict[str, Any]:
+    if not risk_result.allowed:
+        record_audit_event(
+            session,
+            event_type="live_execution_blocked",
+            entity_type="decision_run",
+            entity_id=str(decision_run_id),
+            severity="warning",
+            message="Live execution skipped because risk_guard blocked the intent.",
+            payload={
+                "symbol": decision.symbol,
+                "decision": decision.model_dump(mode="json"),
+                "reason_codes": list(risk_result.reason_codes),
+            },
+        )
+        session.flush()
+        return {
+            "status": "blocked",
+            "reason_codes": list(risk_result.reason_codes),
+            "decision": decision.decision,
+        }
+
     client = _build_client(settings_row)
     try:
         account_info = client.get_account_info()
@@ -2614,7 +2914,7 @@ def execute_live_trade(
         if existing_position is None:
             return {"status": "rejected", "reason_codes": ["NO_OPEN_POSITION"], "intent_type": intent_type}
         side = "SELL" if existing_position.side == "long" else "BUY"
-        reduce_fraction = 1.0 if decision.decision == "exit" else _reduce_fraction_for_decision(decision)
+        reduce_fraction = 1.0 if decision.decision == "exit" else _reduce_fraction_for_decision(decision, settings_row)
         requested_quantity = existing_position.quantity * reduce_fraction
         reduce_only = True
 
@@ -2622,8 +2922,43 @@ def execute_live_trade(
         decision.symbol,
         requested_quantity,
         reference_price=intent.requested_price,
-        enforce_min_notional=intent_type in {"entry", "scale_in"},
+        enforce_min_notional=intent_type in {"entry", "scale_in"} and risk_result.approved_projected_notional <= 0,
     )
+    if intent_type in {"entry", "scale_in"} and risk_result.approved_projected_notional > 0:
+        normalized_quantity = _cap_quantity_to_approved_notional(
+            client,
+            symbol=decision.symbol,
+            quantity=normalized_quantity,
+            reference_price=intent.requested_price,
+            approved_notional=risk_result.approved_projected_notional,
+        )
+        min_notional_failure = _execution_minimum_notional_failure(
+            client,
+            symbol=decision.symbol,
+            quantity=normalized_quantity,
+            reference_price=intent.requested_price,
+        )
+        if min_notional_failure is not None:
+            record_audit_event(
+                session,
+                event_type="live_execution_blocked",
+                entity_type="decision_run",
+                entity_id=str(decision_run_id),
+                severity="warning",
+                message="Live execution skipped because the approved auto-resized size is below the executable minimum.",
+                payload={
+                    "symbol": decision.symbol,
+                    "reason_code": min_notional_failure,
+                    "approved_projected_notional": risk_result.approved_projected_notional,
+                    "approved_quantity": risk_result.approved_quantity,
+                },
+            )
+            session.flush()
+            return {
+                "status": "blocked",
+                "reason_codes": [min_notional_failure],
+                "decision": decision.decision,
+            }
     execution_plan = select_execution_plan(
         intent,
         market_snapshot,

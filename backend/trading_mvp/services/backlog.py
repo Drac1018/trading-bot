@@ -16,8 +16,6 @@ from trading_mvp.schemas import (
     UserChangeRequestCreate,
     UserChangeRequestResponse,
 )
-from trading_mvp.services.backlog_auto_apply import describe_backlog_auto_apply
-from trading_mvp.services.backlog_codex_drafts import build_codex_prompt_draft
 from trading_mvp.services.backlog_insights import (
     build_signal_performance_report,
     build_structured_competitor_notes,
@@ -51,7 +49,6 @@ def _latest_backlog_activity(
 
 
 def _serialize_backlog_row(row: ProductBacklog) -> ProductBacklogResponse:
-    auto_apply_supported, auto_apply_label = describe_backlog_auto_apply(row)
     return ProductBacklogResponse(
         id=row.id,
         title=row.title,
@@ -64,8 +61,6 @@ def _serialize_backlog_row(row: ProductBacklog) -> ProductBacklogResponse:
         rationale=row.rationale,
         source=row.source,
         status=row.status,
-        auto_apply_supported=auto_apply_supported,
-        auto_apply_label=auto_apply_label,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -169,11 +164,6 @@ def get_backlog_board(session: Session) -> BacklogBoardResponse:
             **_serialize_backlog_row(row).model_dump(mode="python"),
             user_requests=requests_by_backlog.get(row.id, []),
             applied_records=applied_by_backlog.get(row.id, []),
-            codex_prompt_draft=build_codex_prompt_draft(
-                row,
-                user_requests=requests_by_backlog.get(row.id, []),
-                applied_records=applied_by_backlog.get(row.id, []),
-            ),
         )
         for row in backlog_rows
     ]

@@ -65,6 +65,12 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         break_even_enabled=True,
         atr_trailing_stop_enabled=True,
         partial_take_profit_enabled=True,
+        partial_tp_rr=1.4,
+        partial_tp_size_pct=0.3,
+        move_stop_to_be_rr=0.9,
+        time_stop_enabled=True,
+        time_stop_minutes=90,
+        time_stop_profit_floor=0.2,
         holding_edge_decay_enabled=True,
         reduce_on_regime_shift_enabled=True,
         starting_equity=100000.0,
@@ -105,6 +111,12 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["break_even_enabled"] is True
     assert serialized["atr_trailing_stop_enabled"] is True
     assert serialized["partial_take_profit_enabled"] is True
+    assert serialized["partial_tp_rr"] == 1.4
+    assert serialized["partial_tp_size_pct"] == 0.3
+    assert serialized["move_stop_to_be_rr"] == 0.9
+    assert serialized["time_stop_enabled"] is True
+    assert serialized["time_stop_minutes"] == 90
+    assert serialized["time_stop_profit_floor"] == 0.2
     assert serialized["holding_edge_decay_enabled"] is True
     assert serialized["reduce_on_regime_shift_enabled"] is True
     assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 5760
@@ -295,7 +307,10 @@ def test_serialize_settings_includes_position_management_summary(db_session) -> 
     assert serialized["position_management_summary"]["enabled"] is True
     assert serialized["position_management_summary"]["protective_bias"] == "tighten_only"
     assert serialized["position_management_summary"]["rules_enabled"]["break_even"] is True
-    assert serialized["position_management_summary"]["fixed_parameters"]["partial_take_profit_fraction"] == 0.25
+    assert serialized["position_management_summary"]["rules_enabled"]["time_stop"] is True
+    assert serialized["position_management_summary"]["fixed_parameters"]["partial_take_profit_fraction"] == 0.3
+    assert serialized["position_management_summary"]["fixed_parameters"]["break_even_trigger_r"] == 0.9
+    assert serialized["position_management_summary"]["fixed_parameters"]["time_stop_minutes"] == 90
     assert serialized["position_management_summary"]["data_fallback_rule"]
 
 

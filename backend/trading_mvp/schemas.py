@@ -17,6 +17,10 @@ class TradeDecision(StrictBaseModel):
     timeframe: str = Field(min_length=1, max_length=20)
     entry_zone_min: float | None = None
     entry_zone_max: float | None = None
+    entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    invalidation_price: float | None = Field(default=None, gt=0.0)
+    max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
+    idea_ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
     stop_loss: float | None = None
     take_profit: float | None = None
     max_holding_minutes: int = Field(ge=1, le=10080)
@@ -127,18 +131,8 @@ class ProductBacklogResponse(StrictBaseModel):
     rationale: str
     source: str
     status: str
-    auto_apply_supported: bool = False
-    auto_apply_label: str | None = None
     created_at: datetime
     updated_at: datetime
-
-
-class BacklogCodexDraftResponse(StrictBaseModel):
-    available: bool
-    title: str
-    prompt: str
-    generated_at: datetime
-    note: str
 
 
 class UserChangeRequestCreate(StrictBaseModel):
@@ -188,7 +182,6 @@ class AppliedChangeRecordResponse(StrictBaseModel):
 class ProductBacklogDetailResponse(ProductBacklogResponse):
     user_requests: list[UserChangeRequestResponse] = Field(default_factory=list)
     applied_records: list[AppliedChangeRecordResponse] = Field(default_factory=list)
-    codex_prompt_draft: BacklogCodexDraftResponse | None = None
 
 
 class SignalPerformanceEntry(StrictBaseModel):
@@ -534,6 +527,13 @@ class OperatorRiskSnapshot(StrictBaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     approved_risk_pct: float | None = None
     approved_leverage: float | None = None
+    raw_projected_notional: float | None = None
+    approved_projected_notional: float | None = None
+    approved_quantity: float | None = None
+    auto_resized_entry: bool = False
+    size_adjustment_ratio: float | None = None
+    auto_resize_reason: str | None = None
+    exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -640,27 +640,19 @@ class BacklogBoardResponse(StrictBaseModel):
     structured_competitor_notes: StructuredCompetitorNotesResponse | None = None
 
 
-class BacklogAutoApplyResult(StrictBaseModel):
-    backlog_id: int
-    title: str
-    backlog_status: str
-    auto_apply_supported: bool
-    handler_key: str | None = None
-    already_applied: bool = False
-    message: str
-    applied_record: AppliedChangeRecordResponse | None = None
-
-
-class BacklogAutoApplyBatchResponse(StrictBaseModel):
-    items: list[BacklogAutoApplyResult] = Field(default_factory=list)
-
-
 class RiskCheckResult(StrictBaseModel):
     allowed: bool
     decision: Literal["hold", "long", "short", "reduce", "exit"]
     reason_codes: list[str]
     approved_risk_pct: float = Field(ge=0.0, le=1.0)
     approved_leverage: float = Field(ge=0.0, le=10.0)
+    raw_projected_notional: float = Field(ge=0.0, default=0.0)
+    approved_projected_notional: float = Field(ge=0.0, default=0.0)
+    approved_quantity: float | None = Field(default=None, ge=0.0)
+    auto_resized_entry: bool = False
+    size_adjustment_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
+    auto_resize_reason: str | None = None
     operating_mode: Literal["live", "paused", "hold"]
     operating_state: str = "TRADABLE"
     effective_leverage_cap: float = Field(gt=0.0, le=10.0)
@@ -675,6 +667,10 @@ class ExecutionIntent(StrictBaseModel):
     intent_type: Literal["entry", "scale_in", "protection", "reduce_only", "emergency_exit"]
     quantity: float = Field(gt=0.0)
     requested_price: float = Field(gt=0.0)
+    entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    invalidation_price: float | None = Field(default=None, gt=0.0)
+    max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
+    idea_ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
     stop_loss: float | None = None
     take_profit: float | None = None
     leverage: float = Field(gt=0.0, le=10.0)
@@ -977,6 +973,12 @@ class AppSettingsResponse(StrictBaseModel):
     break_even_enabled: bool
     atr_trailing_stop_enabled: bool
     partial_take_profit_enabled: bool
+    partial_tp_rr: float
+    partial_tp_size_pct: float
+    move_stop_to_be_rr: float
+    time_stop_enabled: bool
+    time_stop_minutes: int
+    time_stop_profit_floor: float
     holding_edge_decay_enabled: bool
     reduce_on_regime_shift_enabled: bool
     starting_equity: float
@@ -1043,6 +1045,12 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     break_even_enabled: bool = True
     atr_trailing_stop_enabled: bool = True
     partial_take_profit_enabled: bool = True
+    partial_tp_rr: float = Field(default=1.5, ge=0.1, le=10.0)
+    partial_tp_size_pct: float = Field(default=0.25, gt=0.0, le=1.0)
+    move_stop_to_be_rr: float = Field(default=1.0, ge=0.0, le=10.0)
+    time_stop_enabled: bool = False
+    time_stop_minutes: int = Field(default=120, ge=1, le=10080)
+    time_stop_profit_floor: float = Field(default=0.15, ge=-1.0, le=2.0)
     holding_edge_decay_enabled: bool = True
     reduce_on_regime_shift_enabled: bool = True
     starting_equity: float = Field(gt=0.0)

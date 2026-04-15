@@ -12,10 +12,7 @@ from trading_mvp.database import Base, engine, get_db
 from trading_mvp.schemas import (
     AppliedChangeRecordCreate,
     AppSettingsUpdateRequest,
-    BacklogAutoApplyBatchResponse,
-    BacklogAutoApplyResult,
     BacklogBoardResponse,
-    BacklogCodexDraftResponse,
     BinanceAccountResponse,
     BinanceConnectionTestRequest,
     BinanceLiveTestOrderRequest,
@@ -33,10 +30,6 @@ from trading_mvp.services.backlog import (
     get_backlog_detail,
 )
 from trading_mvp.services.backlog_insights import build_signal_performance_report
-from trading_mvp.services.backlog_auto_apply import (
-    auto_apply_backlog_item,
-    auto_apply_supported_backlogs,
-)
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
 from trading_mvp.services.dashboard import (
@@ -571,57 +564,4 @@ def backlog_detail(backlog_id: int, db: Session = Depends(get_db)) -> dict[str, 
     payload: ProductBacklogDetailResponse | None = get_backlog_detail(db, backlog_id)
     if payload is None:
         raise HTTPException(status_code=404, detail=f"Backlog item {backlog_id} not found.")
-    return payload.model_dump(mode="json")
-
-
-@app.get("/api/backlog/{backlog_id}/codex-draft")
-def backlog_codex_draft(backlog_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
-    payload = get_backlog_detail(db, backlog_id)
-    if payload is None:
-        raise HTTPException(status_code=404, detail=f"Backlog item {backlog_id} not found.")
-    if payload.codex_prompt_draft is None:
-        draft = BacklogCodexDraftResponse(
-            available=False,
-            title=f"Codex 실행 초안 #{backlog_id}",
-            prompt="",
-            generated_at=payload.updated_at,
-            note="이미 적용되었거나 별도 초안이 필요하지 않은 backlog 항목입니다.",
-        )
-    else:
-        draft = payload.codex_prompt_draft
-    return draft.model_dump(mode="json")
-
-
-@app.post("/api/backlog/{backlog_id}/auto-apply")
-def backlog_auto_apply(backlog_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
-    try:
-        payload: BacklogAutoApplyResult = auto_apply_backlog_item(db, backlog_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    record_audit_event(
-        db,
-        event_type="backlog_auto_applied",
-        entity_type="product_backlog",
-        entity_id=str(backlog_id),
-        severity="info" if payload.auto_apply_supported else "warning",
-        message=payload.message,
-        payload=payload.model_dump(mode="json"),
-    )
-    db.commit()
-    return payload.model_dump(mode="json")
-
-
-@app.post("/api/backlog/auto-apply-supported")
-def backlog_auto_apply_supported(db: Session = Depends(get_db)) -> dict[str, object]:
-    payload: BacklogAutoApplyBatchResponse = auto_apply_supported_backlogs(db)
-    record_audit_event(
-        db,
-        event_type="backlog_auto_apply_batch",
-        entity_type="product_backlog",
-        entity_id="batch",
-        severity="info",
-        message="Supported backlog items were auto-applied.",
-        payload=payload.model_dump(mode="json"),
-    )
-    db.commit()
     return payload.model_dump(mode="json")
