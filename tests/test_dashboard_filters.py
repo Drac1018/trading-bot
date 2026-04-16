@@ -20,6 +20,11 @@ from trading_mvp.services.dashboard import (
     get_profitability_dashboard,
 )
 from trading_mvp.services.runtime_state import mark_sync_success
+from trading_mvp.services.runtime_state import (
+    set_candidate_selection_detail,
+    set_reconciliation_detail,
+    set_user_stream_detail,
+)
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.time_utils import utcnow_naive
@@ -198,7 +203,42 @@ def _seed_profitability_dashboard_rows(db_session) -> None:
         reason_codes=[],
         metadata_json={},
     )
-    db_session.add_all([entry_order, exit_order])
+    canceled_order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=long_run.id,
+        side="buy",
+        order_type="limit",
+        mode="live",
+        status="canceled",
+        external_order_id="btc-canceled",
+        requested_quantity=0.01,
+        requested_price=69980.0,
+        filled_quantity=0.0,
+        average_fill_price=0.0,
+        reason_codes=[],
+        metadata_json={"execution_policy": {"policy_profile": "entry_btc_fast"}},
+    )
+    expired_order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=long_run.id,
+        side="buy",
+        order_type="limit",
+        mode="live",
+        status="expired",
+        external_order_id="btc-expired",
+        requested_quantity=0.01,
+        requested_price=69970.0,
+        filled_quantity=0.0,
+        average_fill_price=0.0,
+        reason_codes=[],
+        metadata_json={"execution_policy": {"policy_profile": "entry_btc_fast"}},
+    )
+    db_session.add_all([entry_order, exit_order, canceled_order, expired_order])
+    db_session.flush()
+    entry_order.created_at = now - timedelta(minutes=89)
+    exit_order.created_at = now - timedelta(minutes=16)
+    canceled_order.created_at = now - timedelta(minutes=87)
+    expired_order.created_at = now - timedelta(minutes=86)
     db_session.flush()
 
     db_session.add_all(
@@ -233,6 +273,11 @@ def _seed_profitability_dashboard_rows(db_session) -> None:
             ),
         ]
     )
+    db_session.flush()
+    btc_entry_fill = db_session.query(Execution).filter_by(external_trade_id="btc-entry-fill").one()
+    btc_tp_fill = db_session.query(Execution).filter_by(external_trade_id="btc-tp-fill").one()
+    btc_entry_fill.created_at = now - timedelta(minutes=88, seconds=15)
+    btc_tp_fill.created_at = now - timedelta(minutes=15)
     db_session.flush()
 
     db_session.add(
@@ -277,9 +322,34 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
     settings.tracked_symbols = ["BTCUSDT", "ETHUSDT"]
     settings.default_timeframe = "15m"
     settings.live_trading_enabled = True
+    settings.rollout_mode = "limited_live"
+    settings.limited_live_max_notional = 600.0
+    settings.manual_live_approval = True
     settings.live_execution_armed = True
-    settings.live_execution_armed_until = None
+    settings.live_execution_armed_until = now + timedelta(minutes=15)
     settings.trading_paused = False
+    settings.pause_reason_detail = {
+        "protection_recovery": {
+            "status": "recovery_pending",
+            "auto_recovery_active": True,
+            "last_transition_at": now.isoformat(),
+            "last_error": "Protective orders were not verified on the exchange.",
+            "symbol_states": {
+                "BTCUSDT": {
+                    "state": "PROTECTION_REQUIRED",
+                    "missing_components": ["take_profit"],
+                    "failure_count": 2,
+                    "auto_recovery_active": True,
+                    "recovery_status": "recovery_pending",
+                    "last_error": "Protective orders were not verified on the exchange.",
+                    "last_transition_at": now.isoformat(),
+                    "trigger_source": "protection_verify",
+                }
+            },
+            "missing_symbols": ["BTCUSDT"],
+            "missing_items": {"BTCUSDT": ["take_profit"]},
+        }
+    }
     db_session.add(settings)
     db_session.flush()
 
@@ -543,23 +613,53 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
     db_session.add_all([btc_stop, eth_order])
     db_session.flush()
 
-    db_session.add(
-        Execution(
-            order_id=eth_order.id,
-            symbol="ETHUSDT",
-            status="filled",
-            external_trade_id="eth-fill",
-            fill_price=3396.0,
-            fill_quantity=0.3,
-            fee_paid=0.1,
-            commission_asset="USDT",
-            slippage_pct=0.0004,
-            realized_pnl=0.0,
-            payload={},
-        )
+    eth_fill_1 = Execution(
+        order_id=eth_order.id,
+        symbol="ETHUSDT",
+        status="filled",
+        external_trade_id="eth-fill-1",
+        fill_price=3395.5,
+        fill_quantity=0.1,
+        fee_paid=0.03,
+        commission_asset="USDT",
+        slippage_pct=0.0003,
+        realized_pnl=0.0,
+        payload={},
     )
+    eth_fill_2 = Execution(
+        order_id=eth_order.id,
+        symbol="ETHUSDT",
+        status="filled",
+        external_trade_id="eth-fill-2",
+        fill_price=3396.0,
+        fill_quantity=0.2,
+        fee_paid=0.07,
+        commission_asset="USDT",
+        slippage_pct=0.0004,
+        realized_pnl=0.0,
+        payload={},
+    )
+    db_session.add_all([eth_fill_1, eth_fill_2])
+    db_session.flush()
+    eth_fill_1.created_at = now - timedelta(seconds=20)
+    eth_fill_2.created_at = now - timedelta(seconds=5)
     db_session.add_all(
         [
+            AuditEvent(
+                event_type="live_approval_armed",
+                entity_type="settings",
+                entity_id=str(settings.id),
+                severity="warning",
+                message="Manual live execution window armed.",
+                payload={
+                    "approval_armed": True,
+                    "approval_window_open": True,
+                    "approval_state": "armed",
+                    "approval_expires_at": settings.live_execution_armed_until.isoformat(),
+                    "approval_window_minutes": 15,
+                    "trigger_source": "manual_live_approval",
+                },
+            ),
             AuditEvent(
                 event_type="risk_blocked",
                 entity_type="risk_check",
@@ -574,7 +674,26 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
                 entity_id="ETHUSDT",
                 severity="info",
                 message="ETH order filled.",
-                payload={"symbol": "ETHUSDT", "order_status": "filled"},
+                payload={"symbol": "ETHUSDT", "order_status": "filled", "filled_quantity": 0.3},
+            ),
+            AuditEvent(
+                event_type="protection_verification_failed",
+                entity_type="position",
+                entity_id="BTCUSDT",
+                severity="warning",
+                message="BTC protective orders were not verified.",
+                payload={
+                    "symbol": "BTCUSDT",
+                    "trigger_source": "protection_verify",
+                    "recovery_status": "recovery_pending",
+                    "missing_components": ["take_profit"],
+                    "last_error": "Protective orders were not verified on the exchange.",
+                    "to_state": "verify_failed",
+                    "verification_detail": {
+                        "error": "Protective orders were not verified on the exchange.",
+                        "expected_order_types": ["STOP_MARKET", "TAKE_PROFIT_MARKET"],
+                    },
+                },
             ),
         ]
     )
@@ -769,7 +888,7 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
     assert overview.protection_recovery_active is False
     assert overview.missing_protection_symbols == ["BTCUSDT"]
     assert overview.missing_protection_items == {"BTCUSDT": ["take_profit"]}
-    assert overview.pnl_summary["basis"] == "execution_ledger_truth"
+    assert overview.pnl_summary["basis"] == "live_account_snapshot_preferred"
     assert "status" in overview.account_sync_summary
     assert overview.operational_status.account_sync_summary["status"] == overview.account_sync_summary["status"]
     assert overview.sync_freshness_summary["account"]["stale"] is False
@@ -813,6 +932,60 @@ def test_operator_dashboard_exposes_sync_freshness_summary(db_session) -> None:
     assert payload.control.can_enter_new_position is False
 
 
+def test_overview_and_operator_expose_stream_reconcile_and_candidate_selection_summaries(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    set_user_stream_detail(
+        settings,
+        status="connected",
+        source="binance_futures_user_stream",
+        listen_key="listen-key-1",
+        listen_key_created_at=now,
+        listen_key_refreshed_at=now,
+        last_event_at=now,
+        last_event_type="ACCOUNT_UPDATE",
+        heartbeat_ok=True,
+        stream_source="user_stream",
+    )
+    set_reconciliation_detail(
+        settings,
+        status="completed",
+        source="rest_polling_reconciliation",
+        last_reconciled_at=now,
+        last_success_at=now,
+        last_symbol="BTCUSDT",
+        stream_fallback_active=False,
+        reconcile_source="rest_polling",
+    )
+    set_candidate_selection_detail(
+        settings,
+        generated_at=now,
+        mode="correlation_aware_top_n",
+        max_selected=2,
+        selected_symbols=["BTCUSDT", "ETHUSDT"],
+        skipped_symbols=["BNBUSDT"],
+        rankings=[
+            {"symbol": "BTCUSDT", "selected": True},
+            {"symbol": "ETHUSDT", "selected": True},
+            {"symbol": "BNBUSDT", "selected": False, "selection_reason": "correlation_limit"},
+        ],
+    )
+    db_session.add(settings)
+    db_session.flush()
+
+    overview = get_overview(db_session)
+    payload = get_operator_dashboard(db_session)
+
+    assert overview.user_stream_summary["status"] == "connected"
+    assert overview.user_stream_summary["stream_source"] == "user_stream"
+    assert overview.reconciliation_summary["status"] == "completed"
+    assert overview.candidate_selection_summary["mode"] == "correlation_aware_top_n"
+    assert overview.candidate_selection_summary["selected_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert payload.control.user_stream_summary["last_event_type"] == "ACCOUNT_UPDATE"
+    assert payload.control.reconciliation_summary["last_symbol"] == "BTCUSDT"
+    assert payload.control.candidate_selection_summary["rankings"][2]["selection_reason"] == "correlation_limit"
+
+
 def test_positions_hide_closed_rows_and_do_not_mark_them_missing(db_session) -> None:
     closed_position = Position(
         symbol="BTCUSDT",
@@ -851,6 +1024,13 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     assert payload.windows[0].top_symbols
     assert payload.execution_windows
     assert payload.execution_windows[0].worst_profiles
+    assert payload.execution_windows[0].execution_quality_summary["cancel_attempts"] == 2
+    assert payload.execution_windows[0].execution_quality_summary["cancel_successes"] == 1
+    assert payload.execution_windows[0].execution_quality_summary["cancel_success_rate"] == 0.5
+    assert payload.execution_windows[0].execution_quality_summary["average_arrival_slippage_pct"] > 0.0
+    assert payload.execution_windows[0].execution_quality_summary["average_first_fill_latency_seconds"] > 0.0
+    assert payload.execution_windows[0].worst_profiles[0].cancel_attempts == 2
+    assert payload.execution_windows[0].worst_profiles[0].cancel_success_rate == 0.5
     assert payload.hold_blocked_summary.latest_blocked_reasons == ["TRADING_PAUSED", "HOLD_DECISION"]
     assert payload.adaptive_signal_summary["status"] in {"active", "neutral", "insufficient_data", "disabled"}
     assert payload.latest_decision is not None
@@ -869,9 +1049,14 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert overview.last_market_refresh_at > overview.last_decision_snapshot_at
     assert overview.last_decision_reference.display_gap is True
     assert overview.last_decision_reference.display_gap_reason is not None
+    assert overview.operational_status.rollout_mode == "limited_live"
+    assert overview.operational_status.limited_live_max_notional == 600.0
     assert payload.control.default_symbol == "BTCUSDT"
     assert payload.control.tracked_symbol_count == 2
     assert payload.control.tracked_symbols == ["BTCUSDT", "ETHUSDT"]
+    assert payload.control.rollout_mode == "limited_live"
+    assert payload.control.exchange_submit_allowed is True
+    assert payload.control.limited_live_max_notional == 600.0
     assert payload.control.operational_status.live_execution_ready == payload.control.live_execution_ready
     assert payload.control.last_decision_at is not None
     assert payload.control.last_decision_snapshot_at is not None
@@ -879,23 +1064,48 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert payload.control.last_market_refresh_at > payload.control.last_decision_snapshot_at
     assert payload.control.last_decision_reference.display_gap is True
     assert payload.control.last_decision_reference.display_gap_reason is not None
+    assert "wallet_balance" in payload.control.pnl_summary
+    assert "available_balance" in payload.control.pnl_summary
+    assert "fee_total" in payload.control.pnl_summary
+    assert "funding_total" in payload.control.pnl_summary
+    assert payload.control.control_status_summary.approval_state == "armed"
+    assert payload.control.control_status_summary.approval_window_open is True
+    assert payload.control.control_status_summary.rollout_mode == "limited_live"
+    assert payload.control.control_status_summary.limited_live_max_notional == 600.0
 
     btc = next(item for item in payload.symbols if item.symbol == "BTCUSDT")
     eth = next(item for item in payload.symbols if item.symbol == "ETHUSDT")
 
     assert btc.latest_price == 70500.0
     assert btc.ai_decision.decision == "long"
+    assert btc.ai_decision.raw_output == {}
     assert btc.risk_guard.allowed is False
+    assert btc.risk_guard.raw_payload == {}
     assert btc.blocked_reasons == ["POSITION_STATE_STALE"]
     assert btc.open_position.is_open is True
     assert btc.protection_status.status == "missing"
+    assert btc.protection_status.recovery_status == "recovery_pending"
+    assert btc.protection_status.auto_recovery_active is True
+    assert btc.protection_status.failure_count == 2
+    assert btc.protection_status.trigger_source == "protection_verify"
+    assert btc.protection_status.verification_status == "verify_failed"
+    assert btc.protection_status.last_event_type == "protection_verification_failed"
+    assert btc.protection_status.last_error == "Protective orders were not verified on the exchange."
     assert btc.execution.order_id is not None
     assert btc.execution.symbol == "BTCUSDT"
-    assert btc.audit_events[0].entity_id == "BTCUSDT"
+    assert any(event.entity_id == "BTCUSDT" for event in btc.audit_events)
+    assert any(
+        event.event_type == "protection_verification_failed"
+        and event.payload.get("recovery_status") == "recovery_pending"
+        and event.payload.get("verification_detail", {}).get("error") == "Protective orders were not verified on the exchange."
+        for event in btc.audit_events
+    )
 
     assert eth.latest_price == 3400.0
     assert eth.ai_decision.decision == "long"
+    assert eth.ai_decision.raw_output == {}
     assert eth.risk_guard.allowed is True
+    assert eth.risk_guard.raw_payload == {}
     assert eth.risk_guard.auto_resized_entry is True
     assert eth.risk_guard.approved_projected_notional == 150000.0
     assert eth.risk_guard.approved_quantity == 44.117647
@@ -909,10 +1119,27 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert eth.ai_decision.decision_reference.display_gap_reason is not None
     assert eth.execution.order_status == "filled"
     assert eth.execution.symbol == "ETHUSDT"
-    assert eth.audit_events[0].entity_id == "ETHUSDT"
+    assert len(eth.execution.recent_fills) == 2
+    assert eth.execution.recent_fills[0].external_trade_id == "eth-fill-2"
+    assert eth.execution.recent_fills[1].external_trade_id == "eth-fill-1"
+    assert any(event.entity_id == "ETHUSDT" for event in eth.audit_events)
+    assert any(
+        event.event_type == "live_execution"
+        and event.payload.get("order_status") == "filled"
+        and event.payload.get("filled_quantity") == 0.3
+        for event in eth.audit_events
+    )
 
     assert payload.market_signal.performance_windows[0].window_label == "24h"
+    assert len(payload.market_signal.performance_windows) == 1
+    assert len(payload.execution_windows) == 1
     assert payload.audit_events
+    assert any(
+        event.event_type == "live_approval_armed"
+        and event.payload.get("approval_state") == "armed"
+        and event.payload.get("approval_window_open") is True
+        for event in payload.audit_events
+    )
 
 
 def test_overview_prioritizes_stale_sync_reasons_in_operational_status(db_session) -> None:
@@ -1010,6 +1237,9 @@ def test_operator_dashboard_api_returns_operator_flow(tmp_path, monkeypatch) -> 
         payload = response.json()
         assert payload["control"]["default_symbol"] == "BTCUSDT"
         assert payload["control"]["tracked_symbol_count"] == 2
+        assert "wallet_balance" in payload["control"]["pnl_summary"]
+        assert "available_balance" in payload["control"]["pnl_summary"]
+        assert "net_pnl" in payload["control"]["pnl_summary"]
         assert len(payload["symbols"]) == 2
         assert "ai_decision" not in payload
         assert "risk_guard" not in payload

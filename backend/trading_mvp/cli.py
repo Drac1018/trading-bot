@@ -59,6 +59,11 @@ def main() -> None:
     replay_compare_parser.add_argument("--start-index", type=int, default=90)
     replay_compare_parser.add_argument("--timeframe", default="15m")
     replay_compare_parser.add_argument("--symbols", nargs="*", default=[])
+    replay_compare_parser.add_argument(
+        "--data-source-type",
+        choices=["synthetic_seed", "binance_futures_klines"],
+        default="synthetic_seed",
+    )
 
     review_parser = subparsers.add_parser("review")
     review_parser.add_argument("--window", required=True, choices=["1h", "4h", "12h", "24h"])
@@ -98,6 +103,7 @@ def main() -> None:
                 start_index=args.start_index,
                 timeframe=args.timeframe,
                 symbols=args.symbols,
+                data_source_type=args.data_source_type,
             )
             output = build_replay_validation_report(session, payload).model_dump(mode="json")
         elif args.command == "export-schemas":

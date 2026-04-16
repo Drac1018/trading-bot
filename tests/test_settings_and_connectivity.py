@@ -34,6 +34,8 @@ from trading_mvp.time_utils import utcnow_naive
 def build_settings_payload() -> AppSettingsUpdateRequest:
     return AppSettingsUpdateRequest(
         live_trading_enabled=True,
+        rollout_mode="full_live",
+        limited_live_max_notional=750.0,
         manual_live_approval=True,
         live_approval_window_minutes=15,
         default_symbol="BTCUSDT",
@@ -120,11 +122,44 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["time_stop_profit_floor"] == 0.2
     assert serialized["holding_edge_decay_enabled"] is True
     assert serialized["reduce_on_regime_shift_enabled"] is True
+    assert serialized["rollout_mode"] == "full_live"
+    assert serialized["exchange_submit_allowed"] is True
+    assert serialized["limited_live_max_notional"] == 750.0
     assert serialized["operational_status"]["live_execution_ready"] == serialized["live_execution_ready"]
+    assert serialized["operational_status"]["rollout_mode"] == "full_live"
     assert serialized["operational_status"]["approval_armed"] == serialized["approval_armed"]
     assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 5760
     assert serialized["symbol_effective_cadences"][0]["symbol"] == "BTCUSDT"
     assert serialized["symbol_effective_cadences"][0]["estimated_monthly_ai_calls"] == 4320
+
+
+def test_serialize_settings_exposes_rollout_mode_and_submit_gate(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(
+            update={
+                "rollout_mode": "shadow",
+                "limited_live_max_notional": 250.0,
+            }
+        ),
+    )
+    row.live_execution_armed = True
+    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    db_session.add(row)
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["live_trading_enabled"] is True
+    assert serialized["rollout_mode"] == "shadow"
+    assert serialized["exchange_submit_allowed"] is False
+    assert serialized["limited_live_max_notional"] == 250.0
+    assert serialized["live_execution_ready"] is True
+    assert serialized["can_enter_new_position"] is False
+    assert serialized["guard_mode_reason_code"] == "ROLLOUT_MODE_SHADOW"
+    assert serialized["operational_status"]["rollout_mode"] == "shadow"
+    assert serialized["operational_status"]["exchange_submit_allowed"] is False
+    assert serialized["operational_status"]["control_status_summary"]["rollout_mode"] == "shadow"
 
 
 def test_should_call_openai_respects_manual_and_replay(db_session) -> None:
@@ -431,7 +466,7 @@ def test_serialize_settings_includes_operational_summary_sections(db_session) ->
     now = utcnow_naive()
     db_session.add(
         PnLSnapshot(
-            snapshot_date=date.today(),
+            snapshot_date=utcnow_naive().date(),
             cash_balance=100250.0,
             equity=100125.0,
             unrealized_pnl=-125.0,
@@ -500,9 +535,22 @@ def test_serialize_settings_includes_operational_summary_sections(db_session) ->
 
     serialized = serialize_settings(row)
 
-    assert serialized["pnl_summary"]["basis"] == "execution_ledger_truth"
-    assert serialized["account_sync_summary"]["status"] == "fallback_reconciled"
-    assert serialized["operational_status"]["account_sync_summary"]["status"] == "fallback_reconciled"
+    assert serialized["pnl_summary"]["basis"] == "live_account_snapshot_preferred"
+    assert "wallet_balance" in serialized["pnl_summary"]
+    assert "available_balance" in serialized["pnl_summary"]
+    assert "fee_total" in serialized["pnl_summary"]
+    assert "funding_total" in serialized["pnl_summary"]
+    assert "net_pnl" in serialized["pnl_summary"]
+    assert serialized["account_sync_summary"]["status"] in {"exchange_synced", "fallback_reconciled"}
+    assert "wallet_balance" in serialized["account_sync_summary"]
+    assert "available_balance" in serialized["account_sync_summary"]
+    assert "fee_total" in serialized["account_sync_summary"]
+    assert "funding_total" in serialized["account_sync_summary"]
+    assert "net_pnl" in serialized["account_sync_summary"]
+    assert serialized["operational_status"]["account_sync_summary"]["status"] in {
+        "exchange_synced",
+        "fallback_reconciled",
+    }
     assert serialized["operational_status"]["market_freshness_summary"]["symbol"] == "BTCUSDT"
     assert serialized["operational_status"]["market_freshness_summary"]["stale"] is False
     assert serialized["exposure_summary"]["reference_symbol"] == "BTCUSDT"

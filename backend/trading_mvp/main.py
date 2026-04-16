@@ -39,7 +39,7 @@ from trading_mvp.services.dashboard import (
     get_risk_checks,
     get_scheduler_runs,
 )
-from trading_mvp.services.execution import run_live_test_order, sync_live_state
+from trading_mvp.services.execution import poll_live_user_stream, run_live_test_order, sync_live_state
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.replay_validation import build_replay_validation_report
@@ -86,18 +86,65 @@ async def _background_scheduler_loop() -> None:
         await asyncio.sleep(interval_seconds)
 
 
+async def _background_user_stream_loop() -> None:
+    while True:
+        sleep_seconds = 5
+        polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+        with polling_session_factory() as session:
+            settings_row = get_or_create_settings(session)
+            tracked_symbols = settings_row.tracked_symbols or [settings_row.default_symbol]
+            try:
+                stream_result = poll_live_user_stream(
+                    session,
+                    settings_row,
+                    max_events=max(8, len(tracked_symbols) * 4),
+                    idle_timeout_seconds=2.0,
+                )
+                session.commit()
+                stream_health = str(stream_result.get("stream_health") or "idle")
+                if stream_health == "connected":
+                    sleep_seconds = 1
+                elif stream_health == "unavailable":
+                    sleep_seconds = 10
+                else:
+                    sleep_seconds = 5
+            except Exception as exc:
+                record_audit_event(
+                    session,
+                    event_type="background_user_stream_failed",
+                    entity_type="binance",
+                    entity_id=settings_row.default_symbol,
+                    severity="warning",
+                    message="Background Binance futures user stream loop failed.",
+                    payload={"error": str(exc)},
+                )
+                record_health_event(
+                    session,
+                    component="user_stream",
+                    status="error",
+                    message="Background Binance futures user stream loop failed.",
+                    payload={"error": str(exc)},
+                )
+                session.commit()
+                sleep_seconds = 5
+        await asyncio.sleep(sleep_seconds)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
     poll_task = asyncio.create_task(_background_scheduler_loop())
+    user_stream_task = asyncio.create_task(_background_user_stream_loop())
     try:
         yield
     finally:
-        poll_task.cancel()
-        try:
-            await poll_task
-        except asyncio.CancelledError:
-            pass
+        for task in (poll_task, user_stream_task):
+            task.cancel()
+        for task in (poll_task, user_stream_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Trading MVP API", version="0.2.0", lifespan=lifespan)

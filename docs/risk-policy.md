@@ -102,4 +102,10 @@ stale / incomplete / protection 검증 실패 관련 reason code:
 - 보호주문 복구
 - `emergency_exit`
 
+## Exchange Minimum Actionable Size
+
+- 신규 진입 quantity는 risk 단계에서 exchange `min_notional`, `min_qty`, `step_size`를 우선 참고해 실행 가능 크기로 정규화합니다.
+- headroom auto-resize 이후 quantity 또는 notional이 exchange minimum을 만족하지 못하면 `ENTRY_SIZE_BELOW_MIN_NOTIONAL`로 차단합니다.
+- `approved_projected_notional`과 `approved_quantity`는 exchange-actionable 기준 값이며, execution 단계는 이 값을 넘어서는 silent upsize를 하지 않습니다.
+
 즉 리스크 정책은 신규 진입을 막더라도 생존 경로까지 일괄 차단하지 않습니다.

@@ -22,6 +22,7 @@ from trading_mvp.schemas import (
     TradeDecision,
 )
 from trading_mvp.services.account import calculate_unrealized_pnl, create_exchange_pnl_snapshot, get_latest_pnl_snapshot
+from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.execution import _reduce_fraction_for_decision, build_execution_intent
 from trading_mvp.services.market_data import generate_seed_candles
 from trading_mvp.services.orchestrator import TradingOrchestrator
@@ -32,6 +33,59 @@ REPLAY_FEE_RATE = 0.0004
 LOGIC_VARIANTS = ("baseline_old", "improved")
 
 
+def _load_replay_series(
+    request: ReplayValidationRequest,
+    *,
+    source_settings: Setting,
+    symbols: list[str],
+    timeframe: str,
+) -> tuple[dict[tuple[str, str], list[MarketCandle]], str]:
+    required_points = max(request.start_index + request.cycles + 5, 160)
+    if request.data_source_type == "synthetic_seed":
+        return (
+            {(symbol, timeframe): generate_seed_candles(symbol=symbol, timeframe=timeframe, points=required_points) for symbol in symbols},
+            "synthetic_seed_candles_from_market_data.generate_seed_candles",
+        )
+    client = BinanceClient(
+        testnet_enabled=source_settings.binance_testnet_enabled,
+        futures_enabled=True,
+    )
+    series_map: dict[tuple[str, str], list[MarketCandle]] = {}
+    for symbol in symbols:
+        candles = client.fetch_klines(symbol=symbol, interval=timeframe, limit=min(required_points, 1500))
+        if len(candles) <= request.start_index:
+            raise RuntimeError(
+                f"Replay data for {symbol} {timeframe} is insufficient: need index {request.start_index}, got {len(candles)} candles."
+            )
+        series_map[(symbol, timeframe)] = candles
+    basis = "binance_futures_klines_from_services.binance.BinanceClient.fetch_klines"
+    return series_map, basis
+
+
+def _snapshot_from_series(
+    *,
+    symbol: str,
+    timeframe: str,
+    series: list[MarketCandle],
+    candle_index: int,
+    lookback: int = 60,
+) -> MarketSnapshotPayload:
+    safe_index = max(min(candle_index, len(series) - 1), 0)
+    candles = series[max(0, safe_index - lookback + 1) : safe_index + 1]
+    latest = candles[-1]
+    return MarketSnapshotPayload(
+        symbol=symbol,
+        timeframe=timeframe,
+        snapshot_time=latest.timestamp,
+        latest_price=latest.close,
+        latest_volume=latest.volume,
+        candle_count=len(candles),
+        is_stale=False,
+        is_complete=len(candles) >= min(lookback, 20),
+        candles=candles,
+    )
+
+
 @dataclass(slots=True)
 class ReplayDecisionRecord:
     symbol: str
@@ -39,6 +93,7 @@ class ReplayDecisionRecord:
     regime: str
     blocked: bool
     held: bool
+    rationale_codes: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -49,6 +104,17 @@ class ReplayTradeRecord:
     gross_pnl: float
     net_pnl: float
     fees: float
+    rationale_codes: list[str] = field(default_factory=list)
+    close_outcome: str = "manual_close"
+    arrival_slippage_pct: float = 0.0
+    realized_slippage_pct: float = 0.0
+    first_fill_latency_seconds: float = 0.0
+    cancel_attempted: bool = False
+    cancel_succeeded: bool = False
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
+    mfe_pnl: float = 0.0
+    mae_pnl: float = 0.0
 
 
 @dataclass(slots=True)
@@ -60,7 +126,14 @@ class ReplayAccumulator:
     gross_pnl: float = 0.0
     net_pnl: float = 0.0
     fees: float = 0.0
+    arrival_slippage_values: list[float] = field(default_factory=list)
+    realized_slippage_values: list[float] = field(default_factory=list)
+    first_fill_latency_values: list[float] = field(default_factory=list)
+    cancel_attempts: int = 0
+    cancel_successes: int = 0
     trade_nets: list[float] = field(default_factory=list)
+    mfe_pct_values: list[float] = field(default_factory=list)
+    mae_pct_values: list[float] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -154,6 +227,27 @@ def _position_replay_metadata(position: Position) -> dict[str, Any]:
     metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
     replay = metadata.get("replay") if isinstance(metadata.get("replay"), dict) else {}
     return replay
+
+
+def _update_position_replay_excursions(position: Position, *, high_price: float, low_price: float) -> None:
+    if position.entry_price <= 0 or position.quantity <= 0:
+        return
+    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    replay = metadata.get("replay") if isinstance(metadata.get("replay"), dict) else {}
+    existing_mfe_pct = float(replay.get("mfe_pct") or 0.0)
+    existing_mae_pct = float(replay.get("mae_pct") or 0.0)
+    if position.side == "long":
+        candidate_mfe_pct = max((high_price - position.entry_price) / position.entry_price, 0.0)
+        candidate_mae_pct = max((position.entry_price - low_price) / position.entry_price, 0.0)
+    else:
+        candidate_mfe_pct = max((position.entry_price - low_price) / position.entry_price, 0.0)
+        candidate_mae_pct = max((high_price - position.entry_price) / position.entry_price, 0.0)
+    replay["mfe_pct"] = round(max(existing_mfe_pct, candidate_mfe_pct), 8)
+    replay["mae_pct"] = round(max(existing_mae_pct, candidate_mae_pct), 8)
+    replay["mfe_pnl"] = round(replay["mfe_pct"] * position.entry_price * position.quantity, 8)
+    replay["mae_pnl"] = round(replay["mae_pct"] * position.entry_price * position.quantity, 8)
+    metadata["replay"] = replay
+    position.metadata_json = metadata
 
 
 def _create_order_row(
@@ -292,9 +386,28 @@ def _close_position_at_price(
         symbol=position.symbol,
         timeframe=str(replay_metadata.get("entry_timeframe") or "unknown"),
         regime=str(replay_metadata.get("entry_regime") or "unknown"),
+        rationale_codes=[
+            str(item)
+            for item in (replay_metadata.get("entry_rationale_codes") or [])
+            if item not in {None, ""}
+        ],
         gross_pnl=round(gross_pnl, 8),
         net_pnl=round(net_pnl, 8),
         fees=round(fee_paid, 8),
+        close_outcome=(
+            "take_profit"
+            if order_type.startswith("TAKE_PROFIT")
+            else "stop_loss"
+            if order_type.startswith("STOP")
+            else "manual_close"
+        ),
+        arrival_slippage_pct=round(float(replay_metadata.get("entry_arrival_slippage_pct") or 0.0), 8),
+        realized_slippage_pct=round(float(replay_metadata.get("entry_realized_slippage_pct") or 0.0), 8),
+        first_fill_latency_seconds=round(float(replay_metadata.get("entry_first_fill_latency_seconds") or 0.0), 8),
+        mfe_pct=round(float(replay_metadata.get("mfe_pct") or 0.0), 8),
+        mae_pct=round(float(replay_metadata.get("mae_pct") or 0.0), 8),
+        mfe_pnl=round(float(replay_metadata.get("mfe_pnl") or 0.0), 8),
+        mae_pnl=round(float(replay_metadata.get("mae_pnl") or 0.0), 8),
     )
 
 
@@ -306,6 +419,11 @@ def _advance_open_positions(
     variant_state: ReplayVariantState,
 ) -> None:
     for position in _open_positions(session, symbol):
+        _update_position_replay_excursions(
+            position,
+            high_price=float(candle.high),
+            low_price=float(candle.low),
+        )
         hit_stop = False
         hit_take_profit = False
         if position.side == "long":
@@ -371,6 +489,16 @@ def _apply_entry(
     fill_price = float(next_candle.open)
     side = "buy" if decision.decision == "long" else "sell"
     fee_paid = abs(quantity * fill_price) * REPLAY_FEE_RATE
+    requested_price = float(intent.requested_price)
+    entry_arrival_slippage_pct = _slippage_pct(
+        side=side,
+        requested_price=requested_price,
+        fill_price=fill_price,
+    )
+    entry_first_fill_latency_seconds = max(
+        (next_candle.timestamp - market_snapshot.snapshot_time).total_seconds(),
+        0.0,
+    )
     order = _create_order_row(
         session,
         symbol=decision.symbol,
@@ -380,7 +508,7 @@ def _apply_entry(
         side=side,
         order_type="MARKET",
         requested_quantity=quantity,
-        requested_price=float(intent.requested_price),
+        requested_price=requested_price,
         reduce_only=False,
         close_only=False,
         metadata_json={"replay": {"synthetic_execution": True, "logic_variant": logic_variant}},
@@ -406,6 +534,13 @@ def _apply_entry(
                 "logic_variant": logic_variant,
                 "entry_decision_run_id": decision_run_id,
                 "entry_rationale_codes": list(decision.rationale_codes),
+                "entry_arrival_slippage_pct": round(entry_arrival_slippage_pct, 8),
+                "entry_realized_slippage_pct": round(entry_arrival_slippage_pct, 8),
+                "entry_first_fill_latency_seconds": round(entry_first_fill_latency_seconds, 8),
+                "mfe_pct": 0.0,
+                "mae_pct": 0.0,
+                "mfe_pnl": 0.0,
+                "mae_pnl": 0.0,
             }
         },
         opened_at=next_candle.timestamp,
@@ -422,7 +557,7 @@ def _apply_entry(
         fill_price=fill_price,
         fill_quantity=quantity,
         fee_paid=fee_paid,
-        slippage_pct=_slippage_pct(side=side, requested_price=float(intent.requested_price), fill_price=fill_price),
+        slippage_pct=entry_arrival_slippage_pct,
         realized_pnl=0.0,
         payload={"synthetic_execution": True, "logic_variant": logic_variant},
     )
@@ -511,6 +646,46 @@ def _summarize_metrics(
         profit_factor=round((sum(wins) / abs(sum(losses))) if losses else (sum(wins) if wins else 0.0), 6),
         hold_ratio=round((accumulator.held / accumulator.decisions) if accumulator.decisions else 0.0, 6),
         blocked_ratio=round((accumulator.blocked / accumulator.decisions) if accumulator.decisions else 0.0, 6),
+        average_arrival_slippage_pct=round(
+            (sum(accumulator.arrival_slippage_values) / len(accumulator.arrival_slippage_values))
+            if accumulator.arrival_slippage_values
+            else 0.0,
+            8,
+        ),
+        average_realized_slippage_pct=round(
+            (sum(accumulator.realized_slippage_values) / len(accumulator.realized_slippage_values))
+            if accumulator.realized_slippage_values
+            else 0.0,
+            8,
+        ),
+        average_first_fill_latency_seconds=round(
+            (sum(accumulator.first_fill_latency_values) / len(accumulator.first_fill_latency_values))
+            if accumulator.first_fill_latency_values
+            else 0.0,
+            8,
+        ),
+        cancel_attempts=accumulator.cancel_attempts,
+        cancel_successes=accumulator.cancel_successes,
+        cancel_success_rate=round(
+            (accumulator.cancel_successes / accumulator.cancel_attempts)
+            if accumulator.cancel_attempts
+            else 0.0,
+            8,
+        ),
+        average_mfe_pct=round(
+            (sum(accumulator.mfe_pct_values) / len(accumulator.mfe_pct_values))
+            if accumulator.mfe_pct_values
+            else 0.0,
+            8,
+        ),
+        average_mae_pct=round(
+            (sum(accumulator.mae_pct_values) / len(accumulator.mae_pct_values))
+            if accumulator.mae_pct_values
+            else 0.0,
+            8,
+        ),
+        best_mfe_pct=round(max(accumulator.mfe_pct_values) if accumulator.mfe_pct_values else 0.0, 8),
+        worst_mae_pct=round(max(accumulator.mae_pct_values) if accumulator.mae_pct_values else 0.0, 8),
     )
 
 
@@ -520,21 +695,36 @@ def _build_breakdown(
     key_fn_decision,
     key_fn_trade,
 ) -> list[ReplayBreakdownEntry]:
+    def _group_keys(raw_value: object) -> list[str]:
+        if isinstance(raw_value, list):
+            keys = [str(item) for item in raw_value if item not in {None, ""}]
+            return keys or ["UNSPECIFIED"]
+        if raw_value in {None, ""}:
+            return ["UNSPECIFIED"]
+        return [str(raw_value)]
+
     grouped: dict[str, ReplayAccumulator] = defaultdict(ReplayAccumulator)
     for record in variant_state.decisions:
-        key = key_fn_decision(record)
-        bucket = grouped[key]
-        bucket.decisions += 1
-        bucket.blocked += int(record.blocked)
-        bucket.held += int(record.held)
+        for key in _group_keys(key_fn_decision(record)):
+            bucket = grouped[key]
+            bucket.decisions += 1
+            bucket.blocked += int(record.blocked)
+            bucket.held += int(record.held)
     for trade in variant_state.trades:
-        key = key_fn_trade(trade)
-        bucket = grouped[key]
-        bucket.closed_trades += 1
-        bucket.gross_pnl += trade.gross_pnl
-        bucket.net_pnl += trade.net_pnl
-        bucket.fees += trade.fees
-        bucket.trade_nets.append(trade.net_pnl)
+        for key in _group_keys(key_fn_trade(trade)):
+            bucket = grouped[key]
+            bucket.closed_trades += 1
+            bucket.gross_pnl += trade.gross_pnl
+            bucket.net_pnl += trade.net_pnl
+            bucket.fees += trade.fees
+            bucket.arrival_slippage_values.append(trade.arrival_slippage_pct)
+            bucket.realized_slippage_values.append(trade.realized_slippage_pct)
+            bucket.first_fill_latency_values.append(trade.first_fill_latency_seconds)
+            bucket.cancel_attempts += int(trade.cancel_attempted)
+            bucket.cancel_successes += int(trade.cancel_succeeded)
+            bucket.trade_nets.append(trade.net_pnl)
+            bucket.mfe_pct_values.append(trade.mfe_pct)
+            bucket.mae_pct_values.append(trade.mae_pct)
     items: list[ReplayBreakdownEntry] = []
     for key, bucket in grouped.items():
         summary = _summarize_metrics(bucket)
@@ -551,6 +741,16 @@ def _build_breakdown(
                 profit_factor=summary.profit_factor,
                 hold_ratio=summary.hold_ratio,
                 blocked_ratio=summary.blocked_ratio,
+                average_arrival_slippage_pct=summary.average_arrival_slippage_pct,
+                average_realized_slippage_pct=summary.average_realized_slippage_pct,
+                average_first_fill_latency_seconds=summary.average_first_fill_latency_seconds,
+                cancel_attempts=summary.cancel_attempts,
+                cancel_successes=summary.cancel_successes,
+                cancel_success_rate=summary.cancel_success_rate,
+                average_mfe_pct=summary.average_mfe_pct,
+                average_mae_pct=summary.average_mae_pct,
+                best_mfe_pct=summary.best_mfe_pct,
+                worst_mae_pct=summary.worst_mae_pct,
             )
         )
     return sorted(items, key=lambda item: (item.net_pnl, item.key), reverse=True)
@@ -580,6 +780,16 @@ def _comparison_entries(
                 profit_factor=baseline_item.profit_factor,
                 hold_ratio=baseline_item.hold_ratio,
                 blocked_ratio=baseline_item.blocked_ratio,
+                average_arrival_slippage_pct=baseline_item.average_arrival_slippage_pct,
+                average_realized_slippage_pct=baseline_item.average_realized_slippage_pct,
+                average_first_fill_latency_seconds=baseline_item.average_first_fill_latency_seconds,
+                cancel_attempts=baseline_item.cancel_attempts,
+                cancel_successes=baseline_item.cancel_successes,
+                cancel_success_rate=baseline_item.cancel_success_rate,
+                average_mfe_pct=baseline_item.average_mfe_pct,
+                average_mae_pct=baseline_item.average_mae_pct,
+                best_mfe_pct=baseline_item.best_mfe_pct,
+                worst_mae_pct=baseline_item.worst_mae_pct,
             )
             if baseline_item is not None
             else zero
@@ -596,6 +806,16 @@ def _comparison_entries(
                 profit_factor=improved_item.profit_factor,
                 hold_ratio=improved_item.hold_ratio,
                 blocked_ratio=improved_item.blocked_ratio,
+                average_arrival_slippage_pct=improved_item.average_arrival_slippage_pct,
+                average_realized_slippage_pct=improved_item.average_realized_slippage_pct,
+                average_first_fill_latency_seconds=improved_item.average_first_fill_latency_seconds,
+                cancel_attempts=improved_item.cancel_attempts,
+                cancel_successes=improved_item.cancel_successes,
+                cancel_success_rate=improved_item.cancel_success_rate,
+                average_mfe_pct=improved_item.average_mfe_pct,
+                average_mae_pct=improved_item.average_mae_pct,
+                best_mfe_pct=improved_item.best_mfe_pct,
+                worst_mae_pct=improved_item.worst_mae_pct,
             )
             if improved_item is not None
             else zero
@@ -630,7 +850,12 @@ def _run_variant(
     variant_state = ReplayVariantState()
     symbols = [symbol.upper() for symbol in (request.symbols or source_settings.tracked_symbols or [source_settings.default_symbol])]
     timeframe = request.timeframe
-    series_map = {(symbol, timeframe): generate_seed_candles(symbol=symbol, timeframe=timeframe) for symbol in symbols}
+    series_map, _data_source_basis = _load_replay_series(
+        request,
+        source_settings=source_settings,
+        symbols=symbols,
+        timeframe=timeframe,
+    )
 
     with SessionLocal() as session:
         settings_row = _copy_settings(
@@ -655,12 +880,20 @@ def _run_variant(
                     variant_state=variant_state,
                 )
                 create_exchange_pnl_snapshot(session, settings_row)
+                replay_snapshot = _snapshot_from_series(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    series=series,
+                    candle_index=candle_index,
+                )
                 result = orchestrator.run_decision_cycle(
                     symbol=symbol,
                     timeframe=timeframe,
                     trigger_event="historical_replay",
                     upto_index=candle_index,
                     logic_variant=logic_variant,
+                    market_snapshot_override=replay_snapshot,
+                    market_context_override={timeframe: replay_snapshot},
                 )
                 decision = TradeDecision.model_validate(result["decision"])
                 risk_result = RiskCheckResult.model_validate(result["risk_result"])
@@ -670,6 +903,7 @@ def _run_variant(
                         symbol=symbol,
                         timeframe=timeframe,
                         regime=regime,
+                        rationale_codes=list(decision.rationale_codes),
                         blocked=not risk_result.allowed,
                         held=decision.decision == "hold",
                     )
@@ -757,12 +991,19 @@ def _run_variant(
     overall.gross_pnl = sum(item.gross_pnl for item in variant_state.trades)
     overall.net_pnl = sum(item.net_pnl for item in variant_state.trades)
     overall.fees = sum(item.fees for item in variant_state.trades)
+    overall.arrival_slippage_values = [item.arrival_slippage_pct for item in variant_state.trades]
+    overall.realized_slippage_values = [item.realized_slippage_pct for item in variant_state.trades]
+    overall.first_fill_latency_values = [item.first_fill_latency_seconds for item in variant_state.trades]
+    overall.cancel_attempts = sum(int(item.cancel_attempted) for item in variant_state.trades)
+    overall.cancel_successes = sum(int(item.cancel_succeeded) for item in variant_state.trades)
     overall.trade_nets = [item.net_pnl for item in variant_state.trades]
+    overall.mfe_pct_values = [item.mfe_pct for item in variant_state.trades]
+    overall.mae_pct_values = [item.mae_pct for item in variant_state.trades]
 
     return ReplayVariantReport(
         logic_variant=logic_variant,  # type: ignore[arg-type]
         title="Baseline Old Logic" if logic_variant == "baseline_old" else "Improved Logic",
-        data_source_type="synthetic_seed",
+        data_source_type=request.data_source_type,
         summary=_summarize_metrics(overall, equity_points=variant_state.equity_points),
         by_symbol=_build_breakdown(
             variant_state,
@@ -779,6 +1020,11 @@ def _run_variant(
             key_fn_decision=lambda item: item.regime,
             key_fn_trade=lambda item: item.regime,
         ),
+        by_rationale_code=_build_breakdown(
+            variant_state,
+            key_fn_decision=lambda item: item.rationale_codes,
+            key_fn_trade=lambda item: item.rationale_codes,
+        ),
     )
 
 
@@ -791,15 +1037,21 @@ def build_replay_validation_report(
         settings_row = Setting()
         session.add(settings_row)
         session.flush()
+    symbols = [symbol.upper() for symbol in (request.symbols or settings_row.tracked_symbols or [settings_row.default_symbol])]
+    _, data_source_basis = _load_replay_series(
+        request,
+        source_settings=settings_row,
+        symbols=symbols,
+        timeframe=request.timeframe,
+    )
     variants = [_run_variant(settings_row, request, logic_variant=variant) for variant in LOGIC_VARIANTS]
     baseline = next(item for item in variants if item.logic_variant == "baseline_old")
     improved = next(item for item in variants if item.logic_variant == "improved")
     end_index = request.start_index + request.cycles - 1
-    symbols = [symbol.upper() for symbol in (request.symbols or settings_row.tracked_symbols or [settings_row.default_symbol])]
     return ReplayValidationResponse(
         generated_at=utcnow_naive(),
-        data_source_type="synthetic_seed",
-        data_source_basis="synthetic_seed_candles_from_market_data.generate_seed_candles",
+        data_source_type=request.data_source_type,
+        data_source_basis=data_source_basis,
         execution_basis="next_bar_open_entry_with_intrabar_stop_take_profit_and_synthetic_fees",
         live_execution_guarantee="Historical replay uses an isolated in-memory session and never submits live orders.",
         start_index=request.start_index,
@@ -811,4 +1063,5 @@ def build_replay_validation_report(
         symbol_comparison=_comparison_entries(baseline.by_symbol, improved.by_symbol),
         timeframe_comparison=_comparison_entries(baseline.by_timeframe, improved.by_timeframe),
         regime_comparison=_comparison_entries(baseline.by_regime, improved.by_regime),
+        rationale_comparison=_comparison_entries(baseline.by_rationale_code, improved.by_rationale_code),
     )

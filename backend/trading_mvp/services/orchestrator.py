@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from math import sqrt
+from uuid import uuid4
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
@@ -9,7 +11,9 @@ from trading_mvp.enums import AgentRole, TriggerEvent
 from trading_mvp.models import (
     AgentRun,
     Alert,
+    Execution,
     MarketSnapshot,
+    PendingEntryPlan,
     PnLSnapshot,
     RiskCheck,
     SchedulerRun,
@@ -17,7 +21,13 @@ from trading_mvp.models import (
     UIFeedback,
 )
 from trading_mvp.providers import build_model_provider
-from trading_mvp.schemas import MarketSnapshotPayload
+from trading_mvp.schemas import (
+    MarketSnapshotPayload,
+    PendingEntryPlanSnapshot,
+    TradeDecision,
+    TradeDecisionCandidate,
+    TradeDecisionCandidateScore,
+)
 from trading_mvp.services.account import (
     account_snapshot_to_dict,
     get_latest_pnl_snapshot,
@@ -33,7 +43,12 @@ from trading_mvp.services.agents import (
 )
 from trading_mvp.services.ai_usage import get_openai_call_gate
 from trading_mvp.services.adaptive_signal import build_adaptive_signal_context
-from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
+from trading_mvp.services.audit import (
+    create_alert,
+    normalize_correlation_ids,
+    record_audit_event,
+    record_health_event,
+)
 from trading_mvp.services.execution import apply_position_management, execute_live_trade, sync_live_state
 from trading_mvp.services.features import compute_features, persist_feature_snapshot
 from trading_mvp.services.market_data import (
@@ -51,7 +66,13 @@ from trading_mvp.services.risk import (
     get_symbol_leverage_cap,
     get_symbol_risk_tier,
 )
-from trading_mvp.services.runtime_state import build_sync_freshness_summary, mark_sync_skipped, summarize_runtime_state
+from trading_mvp.services.runtime_state import (
+    PROTECTION_REQUIRED_STATE,
+    build_sync_freshness_summary,
+    mark_sync_skipped,
+    set_candidate_selection_detail,
+    summarize_runtime_state,
+)
 from trading_mvp.services.settings import (
     build_operational_status_payload,
     get_effective_symbols,
@@ -62,6 +83,14 @@ from trading_mvp.services.settings import (
     serialize_settings,
 )
 from trading_mvp.time_utils import utcnow_naive
+
+ACTIVE_ENTRY_PLAN_STATUS = "armed"
+ENTRY_PLAN_WATCH_TIMEFRAME = "1m"
+ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS = {
+    "CHASE_LIMIT_EXCEEDED",
+    "ENTRY_TRIGGER_NOT_MET",
+    "SLIPPAGE_THRESHOLD_EXCEEDED",
+}
 
 
 def _decision_analysis_context(feature_payload) -> dict[str, object]:
@@ -78,6 +107,39 @@ def _decision_analysis_context(feature_payload) -> dict[str, object]:
             "momentum_weakening": regime.momentum_weakening,
         },
     }
+
+
+def _clamp_score(value: float, *, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _rolling_returns_from_snapshot(snapshot: MarketSnapshotPayload) -> list[float]:
+    closes = [float(candle.close) for candle in snapshot.candles if candle.close > 0]
+    if len(closes) < 3:
+        return []
+    returns: list[float] = []
+    for previous, current in zip(closes, closes[1:], strict=False):
+        if previous <= 0:
+            continue
+        returns.append((current - previous) / previous)
+    return returns
+
+
+def _pearson_correlation(left: list[float], right: list[float]) -> float:
+    sample_size = min(len(left), len(right))
+    if sample_size < 3:
+        return 0.0
+    lhs = left[-sample_size:]
+    rhs = right[-sample_size:]
+    lhs_mean = sum(lhs) / sample_size
+    rhs_mean = sum(rhs) / sample_size
+    covariance = sum((lhs_item - lhs_mean) * (rhs_item - rhs_mean) for lhs_item, rhs_item in zip(lhs, rhs, strict=False))
+    lhs_variance = sum((item - lhs_mean) ** 2 for item in lhs)
+    rhs_variance = sum((item - rhs_mean) ** 2 for item in rhs)
+    denominator = sqrt(lhs_variance * rhs_variance)
+    if denominator <= 0:
+        return 0.0
+    return covariance / denominator
 
 
 class TradingOrchestrator:
@@ -115,6 +177,10 @@ class TradingOrchestrator:
             "test",
             "background_poll",
         }
+
+    @staticmethod
+    def _build_cycle_id(*, trigger_event: str, symbol: str, snapshot_id: int) -> str:
+        return f"{trigger_event}:{symbol.upper()}:{snapshot_id}:{uuid4().hex[:8]}"
 
     def _effective_symbol_settings(self, symbol: str):
         return get_effective_symbol_settings(self.settings_row, symbol.upper())
@@ -164,6 +230,394 @@ class TradingOrchestrator:
 
     def _latest_health_events(self, limit: int = 10) -> list[SystemHealthEvent]:
         return list(self.session.scalars(select(SystemHealthEvent).order_by(desc(SystemHealthEvent.created_at)).limit(limit)))
+
+    @staticmethod
+    def _pending_entry_plan_idempotency_key(
+        *,
+        symbol: str,
+        side: str,
+        source_decision_run_id: int,
+        expires_at: datetime,
+    ) -> str:
+        return f"pending-plan:{symbol.upper()}:{side}:{source_decision_run_id}:{expires_at.isoformat()}"
+
+    @staticmethod
+    def _pending_entry_plan_metadata(plan: PendingEntryPlan) -> dict[str, object]:
+        return dict(plan.metadata_json) if isinstance(plan.metadata_json, dict) else {}
+
+    @staticmethod
+    def _pending_entry_plan_snapshot(plan: PendingEntryPlan | None) -> PendingEntryPlanSnapshot:
+        if plan is None:
+            return PendingEntryPlanSnapshot()
+        metadata = (
+            dict(plan.metadata_json)
+            if isinstance(plan.metadata_json, dict)
+            else {}
+        )
+        trigger_details = metadata.get("trigger_details")
+        return PendingEntryPlanSnapshot(
+            plan_id=plan.id,
+            symbol=plan.symbol,
+            side=plan.side if plan.side in {"long", "short"} else None,
+            plan_status=plan.plan_status if plan.plan_status in {"armed", "triggered", "expired", "canceled"} else None,
+            source_decision_run_id=plan.source_decision_run_id,
+            source_timeframe=plan.source_timeframe,
+            regime=plan.regime,
+            posture=plan.posture,
+            rationale_codes=list(plan.rationale_codes or []),
+            entry_mode=plan.entry_mode if plan.entry_mode in {"breakout_confirm", "pullback_confirm", "immediate", "none"} else None,
+            entry_zone_min=plan.entry_zone_min,
+            entry_zone_max=plan.entry_zone_max,
+            invalidation_price=plan.invalidation_price,
+            max_chase_bps=plan.max_chase_bps,
+            idea_ttl_minutes=plan.idea_ttl_minutes,
+            stop_loss=plan.stop_loss,
+            take_profit=plan.take_profit,
+            risk_pct_cap=plan.risk_pct_cap,
+            leverage_cap=plan.leverage_cap,
+            created_at=plan.created_at,
+            expires_at=plan.expires_at,
+            triggered_at=plan.triggered_at,
+            canceled_at=plan.canceled_at,
+            canceled_reason=plan.canceled_reason,
+            idempotency_key=plan.idempotency_key,
+            trigger_details=dict(trigger_details) if isinstance(trigger_details, dict) else {},
+        )
+
+    def _active_pending_entry_plans(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> list[PendingEntryPlan]:
+        query = select(PendingEntryPlan).where(PendingEntryPlan.plan_status == ACTIVE_ENTRY_PLAN_STATUS)
+        if symbol is not None:
+            query = query.where(PendingEntryPlan.symbol == symbol.upper())
+        return list(self.session.scalars(query.order_by(PendingEntryPlan.created_at.desc())))
+
+    def _entry_plan_posture(self, *, decision_side: str, feature_payload) -> str:
+        state = str(feature_payload.pullback_context.state or "unclear")
+        if decision_side == "long":
+            if state == "bullish_pullback":
+                return "bullish_pullback"
+            if state == "bullish_continuation":
+                return "bullish_continuation"
+            if feature_payload.breakout.range_breakout_direction == "up" or feature_payload.breakout.broke_swing_high:
+                return "breakout_exception"
+        if decision_side == "short":
+            if state == "bearish_pullback":
+                return "bearish_pullback"
+            if state == "bearish_continuation":
+                return "bearish_continuation"
+            if feature_payload.breakout.range_breakout_direction == "down" or feature_payload.breakout.broke_swing_low:
+                return "breakout_exception"
+        return state
+
+    def _cancel_pending_entry_plan(
+        self,
+        plan: PendingEntryPlan,
+        *,
+        reason: str,
+        cancel_status: str = "canceled",
+        detail: dict[str, object] | None = None,
+        correlation_ids: dict[str, object] | None = None,
+    ) -> PendingEntryPlan:
+        if plan.plan_status != ACTIVE_ENTRY_PLAN_STATUS:
+            return plan
+        now = utcnow_naive()
+        metadata = self._pending_entry_plan_metadata(plan)
+        metadata["last_transition_at"] = now.isoformat()
+        metadata["last_transition_reason"] = reason
+        if detail:
+            metadata["last_transition_detail"] = dict(detail)
+        plan.plan_status = "expired" if cancel_status == "expired" else "canceled"
+        plan.canceled_at = now
+        plan.canceled_reason = reason
+        plan.metadata_json = metadata
+        self.session.add(plan)
+        self.session.flush()
+        record_audit_event(
+            self.session,
+            event_type="pending_entry_plan_expired" if cancel_status == "expired" else "pending_entry_plan_canceled",
+            entity_type="pending_entry_plan",
+            entity_id=str(plan.id),
+            severity="info" if cancel_status == "expired" else "warning",
+            message="Pending entry plan transitioned out of armed status.",
+            payload={
+                "symbol": plan.symbol,
+                "side": plan.side,
+                "plan_status": plan.plan_status,
+                "reason": reason,
+                "source_decision_run_id": plan.source_decision_run_id,
+                "detail": dict(detail or {}),
+            },
+            correlation_ids=correlation_ids,
+        )
+        return plan
+
+    def _plan_entry_allowed_without_trigger(self, decision: object, risk_result) -> bool:
+        decision_side = str(getattr(decision, "decision", "") or "")
+        if decision_side not in {"long", "short"}:
+            return False
+        blockers = set(getattr(risk_result, "blocked_reason_codes", []) or getattr(risk_result, "reason_codes", []))
+        return len(blockers - ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS) == 0
+
+    def _arm_pending_entry_plan(
+        self,
+        *,
+        decision,
+        decision_run: AgentRun,
+        risk_result,
+        risk_row_id: int | None,
+        feature_payload,
+        cycle_id: str,
+        snapshot_id: int,
+        replace_reason: str = "REPLACED_BY_NEW_APPROVED_PLAN",
+    ) -> PendingEntryPlan:
+        symbol = decision.symbol.upper()
+        side = str(decision.decision)
+        expires_at = decision_run.created_at + timedelta(minutes=max(int(decision.idea_ttl_minutes or 15), 1))
+        idempotency_key = self._pending_entry_plan_idempotency_key(
+            symbol=symbol,
+            side=side,
+            source_decision_run_id=decision_run.id,
+            expires_at=expires_at,
+        )
+        decision_correlation_ids = normalize_correlation_ids(
+            cycle_id=cycle_id,
+            snapshot_id=snapshot_id,
+            decision_id=decision_run.id,
+        )
+        for existing in self._active_pending_entry_plans(symbol=symbol):
+            cancel_reason = "NEW_AI_HOLD_DECISION"
+            if existing.side == side:
+                cancel_reason = replace_reason
+            elif existing.side != side:
+                cancel_reason = "OPPOSITE_AI_PLAN_REPLACED"
+            self._cancel_pending_entry_plan(
+                existing,
+                reason=cancel_reason,
+                detail={"replacement_decision_run_id": decision_run.id, "replacement_side": side},
+                correlation_ids=decision_correlation_ids,
+            )
+        plan = PendingEntryPlan(
+            symbol=symbol,
+            side=side,
+            plan_status=ACTIVE_ENTRY_PLAN_STATUS,
+            source_decision_run_id=decision_run.id,
+            regime=feature_payload.regime.primary_regime,
+            posture=self._entry_plan_posture(decision_side=side, feature_payload=feature_payload),
+            rationale_codes=list(dict.fromkeys(decision.rationale_codes)),
+            source_timeframe=decision.timeframe,
+            entry_mode=decision.entry_mode or "pullback_confirm",
+            entry_zone_min=float(decision.entry_zone_min or 0.0),
+            entry_zone_max=float(decision.entry_zone_max or 0.0),
+            invalidation_price=decision.invalidation_price,
+            max_chase_bps=decision.max_chase_bps,
+            idea_ttl_minutes=decision.idea_ttl_minutes,
+            stop_loss=decision.stop_loss,
+            take_profit=decision.take_profit,
+            risk_pct_cap=(
+                float(risk_result.approved_risk_pct)
+                if float(risk_result.approved_risk_pct or 0.0) > 0.0
+                else float(decision.risk_pct)
+            ),
+            leverage_cap=(
+                float(risk_result.approved_leverage)
+                if float(risk_result.approved_leverage or 0.0) > 0.0
+                else float(decision.leverage)
+            ),
+            expires_at=expires_at,
+            idempotency_key=idempotency_key,
+            metadata_json={
+                "cycle_id": cycle_id,
+                "snapshot_id": snapshot_id,
+                "source_risk_check_id": risk_row_id,
+                "source_blocked_reason_codes": list(getattr(risk_result, "blocked_reason_codes", [])),
+                "source_adjustment_reason_codes": list(getattr(risk_result, "adjustment_reason_codes", [])),
+                "trigger_details": {},
+            },
+        )
+        self.session.add(plan)
+        self.session.flush()
+        record_audit_event(
+            self.session,
+            event_type="pending_entry_plan_armed",
+            entity_type="pending_entry_plan",
+            entity_id=str(plan.id),
+            severity="info",
+            message="A pending entry plan was armed from the latest AI decision.",
+            payload={
+                "symbol": plan.symbol,
+                "side": plan.side,
+                "source_decision_run_id": plan.source_decision_run_id,
+                "entry_mode": plan.entry_mode,
+                "entry_zone_min": plan.entry_zone_min,
+                "entry_zone_max": plan.entry_zone_max,
+                "expires_at": plan.expires_at.isoformat(),
+                "idempotency_key": plan.idempotency_key,
+            },
+            correlation_ids=decision_correlation_ids,
+        )
+        return plan
+
+    def _cancel_symbol_entry_plans_from_decision(
+        self,
+        *,
+        symbol: str,
+        decision_side: str,
+        decision_run_id: int | None,
+        cycle_id: str,
+        snapshot_id: int,
+    ) -> list[PendingEntryPlanSnapshot]:
+        decision_correlation_ids = normalize_correlation_ids(
+            cycle_id=cycle_id,
+            snapshot_id=snapshot_id,
+            decision_id=decision_run_id,
+        )
+        canceled: list[PendingEntryPlanSnapshot] = []
+        for plan in self._active_pending_entry_plans(symbol=symbol):
+            should_cancel = decision_side == "hold" or plan.side != decision_side
+            if not should_cancel:
+                continue
+            reason = "NEW_AI_HOLD_DECISION" if decision_side == "hold" else "OPPOSITE_AI_PLAN_REPLACED"
+            canceled.append(
+                self._pending_entry_plan_snapshot(
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason=reason,
+                        detail={"decision_side": decision_side},
+                        correlation_ids=decision_correlation_ids,
+                    )
+                )
+            )
+        return canceled
+
+    @staticmethod
+    def _plan_zone_interacted(plan: PendingEntryPlan, candle) -> bool:
+        return candle.low <= plan.entry_zone_max and candle.high >= plan.entry_zone_min
+
+    @staticmethod
+    def _plan_chase_bps(plan: PendingEntryPlan, latest_price: float) -> float:
+        if plan.side == "long":
+            anchor = max(plan.entry_zone_max, plan.entry_zone_min, 1.0)
+            return max(((latest_price - anchor) / anchor) * 10_000, 0.0)
+        anchor = max(min(plan.entry_zone_min, plan.entry_zone_max), 1.0)
+        return max(((anchor - latest_price) / anchor) * 10_000, 0.0)
+
+    @staticmethod
+    def _build_plan_confirm_detail(plan: PendingEntryPlan, market_snapshot: MarketSnapshotPayload) -> dict[str, object]:
+        candles = market_snapshot.candles
+        last_candle = candles[-1] if candles else None
+        previous_candle = candles[-2] if len(candles) >= 2 else None
+        if last_candle is None:
+            return {
+                "zone_entered": False,
+                "confirm_met": False,
+                "reason": "NO_1M_CANDLE",
+            }
+        zone_entered = TradingOrchestrator._plan_zone_interacted(plan, last_candle)
+        candle_range = max(last_candle.high - last_candle.low, 1e-9)
+        lower_wick_ratio = max(min(last_candle.open, last_candle.close) - last_candle.low, 0.0) / candle_range
+        upper_wick_ratio = max(last_candle.high - max(last_candle.open, last_candle.close), 0.0) / candle_range
+        if plan.side == "long":
+            close_reclaimed = last_candle.close >= plan.entry_zone_max
+            structure_break = previous_candle is not None and last_candle.close > previous_candle.high
+            wick_reclaim = lower_wick_ratio >= 0.35 and last_candle.close >= (last_candle.low + candle_range * 0.6)
+        else:
+            close_reclaimed = last_candle.close <= plan.entry_zone_min
+            structure_break = previous_candle is not None and last_candle.close < previous_candle.low
+            wick_reclaim = upper_wick_ratio >= 0.35 and last_candle.close <= (last_candle.high - candle_range * 0.6)
+        confirm_met = zone_entered and (close_reclaimed or structure_break or wick_reclaim)
+        return {
+            "zone_entered": zone_entered,
+            "confirm_met": confirm_met,
+            "close_reclaimed": close_reclaimed,
+            "structure_break": structure_break,
+            "wick_reclaim": wick_reclaim,
+            "last_candle": {
+                "timestamp": last_candle.timestamp.isoformat(),
+                "open": last_candle.open,
+                "high": last_candle.high,
+                "low": last_candle.low,
+                "close": last_candle.close,
+            },
+            "previous_candle": (
+                {
+                    "timestamp": previous_candle.timestamp.isoformat(),
+                    "open": previous_candle.open,
+                    "high": previous_candle.high,
+                    "low": previous_candle.low,
+                    "close": previous_candle.close,
+                }
+                if previous_candle is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _plan_invalidation_broken(plan: PendingEntryPlan, market_snapshot: MarketSnapshotPayload) -> bool:
+        if plan.invalidation_price is None or not market_snapshot.candles:
+            return False
+        last_candle = market_snapshot.candles[-1]
+        if plan.side == "long":
+            return market_snapshot.latest_price <= plan.invalidation_price or last_candle.low <= plan.invalidation_price
+        return market_snapshot.latest_price >= plan.invalidation_price or last_candle.high >= plan.invalidation_price
+
+    @staticmethod
+    def _trigger_execution_decision_from_plan(
+        plan: PendingEntryPlan,
+        market_snapshot: MarketSnapshotPayload,
+        source_decision: TradeDecision,
+    ) -> TradeDecision:
+        latest_price = market_snapshot.latest_price
+        return source_decision.model_copy(
+            update={
+                "entry_mode": "immediate",
+                "entry_zone_min": latest_price,
+                "entry_zone_max": latest_price,
+                "risk_pct": plan.risk_pct_cap if plan.risk_pct_cap > 0 else source_decision.risk_pct,
+                "leverage": plan.leverage_cap if plan.leverage_cap > 0 else source_decision.leverage,
+                "rationale_codes": list(dict.fromkeys([*source_decision.rationale_codes, "PENDING_ENTRY_PLAN_TRIGGERED"])),
+            }
+        )
+
+    def _mark_pending_entry_plan_triggered(
+        self,
+        plan: PendingEntryPlan,
+        *,
+        execution_result: dict[str, object],
+        correlation_ids: dict[str, object] | None = None,
+    ) -> PendingEntryPlan:
+        now = utcnow_naive()
+        metadata = self._pending_entry_plan_metadata(plan)
+        metadata["last_transition_at"] = now.isoformat()
+        metadata["last_transition_reason"] = "PLAN_EXECUTED"
+        metadata["execution_result"] = dict(execution_result)
+        plan.plan_status = "triggered"
+        plan.triggered_at = now
+        plan.metadata_json = metadata
+        self.session.add(plan)
+        self.session.flush()
+        record_audit_event(
+            self.session,
+            event_type="pending_entry_plan_triggered",
+            entity_type="pending_entry_plan",
+            entity_id=str(plan.id),
+            severity="info",
+            message="Pending entry plan triggered into live execution.",
+            payload={
+                "symbol": plan.symbol,
+                "side": plan.side,
+                "execution_result": dict(execution_result),
+            },
+            correlation_ids=correlation_ids,
+        )
+        return plan
+
+    def _latest_decision_run(self, *, decision_run_id: int | None) -> AgentRun | None:
+        if decision_run_id is None:
+            return None
+        return self.session.get(AgentRun, decision_run_id)
 
     def run_exchange_sync_cycle(
         self,
@@ -376,6 +830,397 @@ class TradingOrchestrator:
             )
         return market_snapshot, market_row
 
+    def _recent_symbol_decisions(self, symbol: str, *, limit: int = 8) -> list[AgentRun]:
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(AgentRun.role == AgentRole.TRADING_DECISION.value)
+                .order_by(desc(AgentRun.created_at))
+                .limit(max(limit * 6, 24))
+            )
+        )
+        symbol_key = symbol.upper()
+        return [
+            row
+            for row in rows
+            if isinstance(row.output_payload, dict)
+            and str(row.output_payload.get("symbol") or "").upper() == symbol_key
+        ][:limit]
+
+    def _recent_signal_performance_score(self, symbol: str) -> float:
+        decision_rows = self._recent_symbol_decisions(symbol, limit=6)
+        if not decision_rows:
+            return 0.55
+        decision_ids = [row.id for row in decision_rows]
+        risk_rows = list(
+            self.session.scalars(
+                select(RiskCheck)
+                .where(RiskCheck.decision_run_id.in_(decision_ids))
+                .order_by(desc(RiskCheck.created_at))
+            )
+        )
+        approval_by_decision: dict[int, bool] = {}
+        for row in risk_rows:
+            if row.decision_run_id is not None and row.decision_run_id not in approval_by_decision:
+                approval_by_decision[row.decision_run_id] = bool(row.allowed)
+        approvals = sum(1 for decision_id in decision_ids if approval_by_decision.get(decision_id))
+        approval_rate = approvals / max(len(decision_ids), 1)
+        return _clamp_score(0.35 + (approval_rate * 0.65))
+
+    def _slippage_sensitivity_score(self, symbol: str) -> float:
+        executions = list(
+            self.session.scalars(
+                select(Execution)
+                .where(Execution.symbol == symbol.upper())
+                .order_by(desc(Execution.created_at))
+                .limit(8)
+            )
+        )
+        if not executions:
+            return 0.65
+        avg_slippage = sum(abs(float(row.slippage_pct or 0.0)) for row in executions) / max(len(executions), 1)
+        threshold = max(float(self.settings_row.slippage_threshold_pct or 0.0), 0.001)
+        return _clamp_score(1.0 - min(avg_slippage / threshold, 1.0))
+
+    def _confidence_consistency_score(self, symbol: str, *, decision: str) -> float:
+        decision_rows = self._recent_symbol_decisions(symbol, limit=6)
+        if not decision_rows:
+            return 0.55
+        confidences: list[float] = []
+        same_direction = 0
+        directional_rows = 0
+        for row in decision_rows:
+            payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+            recent_decision = str(payload.get("decision") or "")
+            confidence = float(payload.get("confidence") or 0.0)
+            confidences.append(confidence)
+            if recent_decision in {"long", "short"}:
+                directional_rows += 1
+                if recent_decision == decision:
+                    same_direction += 1
+        avg_confidence = sum(confidences) / max(len(confidences), 1)
+        direction_ratio = same_direction / max(directional_rows, 1) if decision in {"long", "short"} else 0.5
+        return _clamp_score((avg_confidence * 0.6) + (direction_ratio * 0.4))
+
+    def _candidate_exposure_impact_score(self, *, symbol: str, priority: bool, total_open_positions: int) -> float:
+        if priority:
+            return 1.0
+        tracked_count = max(len(get_effective_symbols(self.settings_row)), 1)
+        crowding_ratio = total_open_positions / tracked_count
+        symbol_is_open = bool(get_open_positions(self.session, symbol))
+        base = 0.9 if not symbol_is_open else 0.75
+        return _clamp_score(base - (crowding_ratio * 0.25), lower=0.2, upper=1.0)
+
+    def _build_selection_candidate(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        upto_index: int | None,
+        force_stale: bool,
+        missing_protection_symbols: set[str],
+        total_open_positions: int,
+    ) -> dict[str, object]:
+        market_context = build_market_context(
+            symbol=symbol,
+            base_timeframe=timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+            use_binance=self.settings_row.binance_market_data_enabled,
+            binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+            stale_threshold_seconds=self.settings_row.stale_market_seconds,
+        )
+        market_snapshot = market_context[timeframe]
+        higher_timeframe_context = {key: value for key, value in market_context.items() if key != timeframe}
+        feature_payload = compute_features(market_snapshot, higher_timeframe_context)
+        open_positions = get_open_positions(self.session, symbol)
+        priority = bool(open_positions) or symbol in missing_protection_symbols
+
+        decision = "hold"
+        scenario = "hold"
+        explanation_short = "중립 심볼"
+        if priority and symbol in missing_protection_symbols:
+            decision = "reduce"
+            scenario = "protection_restore"
+            explanation_short = "보호주문 복구 우선 심볼"
+        elif priority:
+            decision = "reduce"
+            scenario = "reduce"
+            explanation_short = "오픈 포지션 관리 우선 심볼"
+        elif feature_payload.trend_score >= 0.15:
+            decision = "long"
+            scenario = "trend_follow"
+            explanation_short = "상승 정렬 진입 후보"
+        elif feature_payload.trend_score <= -0.15:
+            decision = "short"
+            scenario = "trend_follow"
+            explanation_short = "하락 정렬 진입 후보"
+        elif feature_payload.regime.weak_volume:
+            decision = "hold"
+            scenario = "hold"
+            explanation_short = "유동성 약화 관찰 심볼"
+        elif feature_payload.momentum_score > 0:
+            decision = "long"
+            scenario = "pullback_entry"
+            explanation_short = "당김목 진입 후보"
+
+        entry_price = float(market_snapshot.latest_price)
+        atr = max(float(feature_payload.atr or 0.0), entry_price * 0.0025, 1e-6)
+        if decision == "long":
+            stop_loss = entry_price - atr
+            take_profit = entry_price + (atr * 1.8)
+        elif decision == "short":
+            stop_loss = entry_price + atr
+            take_profit = entry_price - (atr * 1.8)
+        else:
+            stop_loss = None
+            take_profit = None
+        expected_rr_ratio = 0.0
+        if stop_loss is not None and take_profit is not None:
+            risk_distance = abs(entry_price - stop_loss)
+            reward_distance = abs(take_profit - entry_price)
+            if risk_distance > 0:
+                expected_rr_ratio = reward_distance / risk_distance
+
+        regime = feature_payload.regime
+        if priority:
+            regime_fit = 1.0
+        elif decision == "long":
+            regime_fit = 1.0 if regime.trend_alignment == "bullish_aligned" else 0.45
+        elif decision == "short":
+            regime_fit = 1.0 if regime.trend_alignment == "bearish_aligned" else 0.45
+        else:
+            regime_fit = 0.4
+        expected_rr = _clamp_score(expected_rr_ratio / 3.0)
+        recent_signal_performance = self._recent_signal_performance_score(symbol)
+        slippage_sensitivity = self._slippage_sensitivity_score(symbol)
+        confidence_consistency = self._confidence_consistency_score(symbol, decision=decision)
+        exposure_impact = self._candidate_exposure_impact_score(
+            symbol=symbol,
+            priority=priority,
+            total_open_positions=total_open_positions,
+        )
+        base_total = (
+            (regime_fit * 0.25)
+            + (expected_rr * 0.2)
+            + (recent_signal_performance * 0.15)
+            + (slippage_sensitivity * 0.1)
+            + (exposure_impact * 0.1)
+            + (confidence_consistency * 0.2)
+        )
+
+        candidate = TradeDecisionCandidate(
+            candidate_id=f"{symbol}:{timeframe}:{scenario}",
+            scenario=scenario,  # type: ignore[arg-type]
+            decision=decision,  # type: ignore[arg-type]
+            symbol=symbol,
+            timeframe=timeframe,
+            confidence=round(_clamp_score((feature_payload.momentum_score + 1.0) / 2.0), 6),
+            entry_zone_min=entry_price * (0.999 if decision == "long" else 1.001) if decision in {"long", "short"} else None,
+            entry_zone_max=entry_price * (1.001 if decision == "long" else 0.999) if decision in {"long", "short"} else None,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            max_holding_minutes=max(30, min(int(timeframe.rstrip("mh")) * 8 if timeframe[:-1].isdigit() else 120, 720)),
+            risk_pct=min(self.settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE),
+            leverage=min(self.settings_row.max_leverage, get_symbol_leverage_cap(symbol)),
+            rationale_codes=[
+                f"REGIME_{regime.primary_regime.upper()}",
+                f"TREND_{regime.trend_alignment.upper()}",
+            ],
+            explanation_short=explanation_short,
+            explanation_detailed=(
+                f"{symbol} {timeframe} candidate selected from market snapshot context. "
+                f"priority={priority}, regime_fit={regime_fit:.3f}, expected_rr={expected_rr_ratio:.3f}."
+            ),
+        )
+        score = TradeDecisionCandidateScore(
+            regime_fit=round(regime_fit, 6),
+            expected_rr=round(expected_rr, 6),
+            recent_signal_performance=round(recent_signal_performance, 6),
+            slippage_sensitivity=round(slippage_sensitivity, 6),
+            exposure_impact=round(exposure_impact, 6),
+            confidence_consistency=round(confidence_consistency, 6),
+            correlation_penalty=0.0,
+            total_score=round(base_total, 6),
+        )
+        return {
+            "symbol": symbol,
+            "priority": priority,
+            "candidate": candidate,
+            "score": score,
+            "returns": _rolling_returns_from_snapshot(market_snapshot),
+            "market_snapshot": market_snapshot,
+        }
+
+    def _rank_candidate_symbols(
+        self,
+        *,
+        decision_symbols: list[str],
+        timeframe: str | None,
+        upto_index: int | None,
+        force_stale: bool,
+    ) -> dict[str, object]:
+        generated_at = utcnow_naive()
+        if not self.settings_row.ai_enabled:
+            set_candidate_selection_detail(
+                self.settings_row,
+                generated_at=generated_at,
+                mode="disabled_ai_off",
+                max_selected=len(decision_symbols),
+                selected_symbols=decision_symbols,
+                skipped_symbols=[],
+                rankings=[],
+            )
+            self.session.add(self.settings_row)
+            self.session.flush()
+            return {
+                "mode": "disabled_ai_off",
+                "selected_symbols": decision_symbols,
+                "skipped_symbols": [],
+                "rankings": [],
+            }
+
+        runtime_state = summarize_runtime_state(self.settings_row)
+        missing_protection_symbols = {
+            str(item).upper()
+            for item in runtime_state.get("missing_protection_symbols", [])
+            if item
+        }
+        total_open_positions = len(get_open_positions(self.session))
+        candidate_rows: list[dict[str, object]] = []
+        for symbol in decision_symbols:
+            effective_timeframe = timeframe or self._effective_symbol_settings(symbol).timeframe
+            try:
+                candidate_rows.append(
+                    self._build_selection_candidate(
+                        symbol=symbol,
+                        timeframe=effective_timeframe,
+                        upto_index=upto_index,
+                        force_stale=force_stale,
+                        missing_protection_symbols=missing_protection_symbols,
+                        total_open_positions=total_open_positions,
+                    )
+                )
+            except Exception as exc:
+                fallback_candidate = TradeDecisionCandidate(
+                    candidate_id=f"{symbol}:{effective_timeframe}:fallback",
+                    scenario="hold",
+                    decision="hold",
+                    symbol=symbol,
+                    timeframe=effective_timeframe,
+                    confidence=0.0,
+                    entry_zone_min=None,
+                    entry_zone_max=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    max_holding_minutes=60,
+                    risk_pct=min(self.settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE),
+                    leverage=1.0,
+                    rationale_codes=["CANDIDATE_SELECTION_FALLBACK"],
+                    explanation_short="후보 선별 fallback",
+                    explanation_detailed=f"Candidate selection fell back because market context collection failed: {exc}",
+                )
+                candidate_rows.append(
+                    {
+                        "symbol": symbol,
+                        "priority": False,
+                        "candidate": fallback_candidate,
+                        "score": TradeDecisionCandidateScore(total_score=0.15),
+                        "returns": [],
+                        "market_snapshot": None,
+                    }
+                )
+
+        candidate_rows.sort(
+            key=lambda item: (
+                bool(item.get("priority")),
+                float(getattr(item.get("score"), "total_score", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        max_selected = min(max(3, len([item for item in candidate_rows if bool(item.get("priority"))])), len(candidate_rows))
+        selected_symbols: list[str] = []
+        selected_rows: list[dict[str, object]] = []
+        ranking_payloads: list[dict[str, object]] = []
+        skipped_symbols: list[str] = []
+
+        for item in candidate_rows:
+            candidate = item["candidate"]
+            score = item["score"]
+            symbol = str(item["symbol"])
+            returns = item["returns"]
+            priority = bool(item.get("priority"))
+            max_abs_correlation = 0.0
+            for selected in selected_rows:
+                correlation = abs(_pearson_correlation(returns, selected["returns"])) if returns and selected["returns"] else 0.0
+                max_abs_correlation = max(max_abs_correlation, correlation)
+            correlation_penalty = round(max(0.0, max_abs_correlation - 0.55) * 0.9, 6)
+            selected_flag = False
+            selection_reason = "capacity_reached"
+            if priority:
+                selected_flag = True
+                selection_reason = "priority_position_or_protection"
+            elif len(selected_rows) < max_selected:
+                adjusted_total = float(score.total_score) - correlation_penalty
+                if max_abs_correlation >= 0.92 and len(selected_rows) > 0:
+                    selected_flag = False
+                    selection_reason = "correlation_limit"
+                else:
+                    selected_flag = adjusted_total >= 0.28
+                    selection_reason = "ranked_top_n" if selected_flag else "score_below_threshold"
+                    score.total_score = round(adjusted_total, 6)
+            score.correlation_penalty = correlation_penalty
+            ranking_payload = {
+                "symbol": symbol,
+                "priority": priority,
+                "selected": selected_flag,
+                "selection_reason": selection_reason,
+                "max_abs_correlation": round(max_abs_correlation, 6),
+                "candidate": candidate.model_dump(mode="json"),
+                "score": score.model_dump(mode="json"),
+            }
+            ranking_payloads.append(ranking_payload)
+            if selected_flag:
+                selected_symbols.append(symbol)
+                selected_rows.append(item)
+            else:
+                skipped_symbols.append(symbol)
+
+        set_candidate_selection_detail(
+            self.settings_row,
+            generated_at=generated_at,
+            mode="correlation_aware_top_n",
+            max_selected=max_selected,
+            selected_symbols=selected_symbols,
+            skipped_symbols=skipped_symbols,
+            rankings=ranking_payloads,
+        )
+        self.session.add(self.settings_row)
+        self.session.flush()
+        record_audit_event(
+            self.session,
+            event_type="candidate_selection_ranked",
+            entity_type="symbol_batch",
+            entity_id="tracked_symbols",
+            severity="info",
+            message="Correlation-aware candidate ranking completed for tracked symbols.",
+            payload={
+                "mode": "correlation_aware_top_n",
+                "max_selected": max_selected,
+                "selected_symbols": selected_symbols,
+                "skipped_symbols": skipped_symbols,
+                "rankings": ranking_payloads,
+            },
+        )
+        return {
+            "mode": "correlation_aware_top_n",
+            "max_selected": max_selected,
+            "selected_symbols": selected_symbols,
+            "skipped_symbols": skipped_symbols,
+            "rankings": ranking_payloads,
+        }
+
     def run_market_refresh_cycle(
         self,
         *,
@@ -486,6 +1331,256 @@ class TradingOrchestrator:
             "trigger_event": trigger_event,
         }
 
+    def run_entry_plan_watcher_cycle(
+        self,
+        *,
+        symbols: list[str] | None = None,
+        trigger_event: str = "entry_plan_watcher",
+        upto_index: int | None = None,
+        force_stale: bool = False,
+        auto_resume_checked: bool = False,
+        exchange_sync_checked: bool = False,
+        market_snapshot_override: MarketSnapshotPayload | None = None,
+    ) -> dict[str, object]:
+        auto_resume_result = self._ensure_auto_resume(
+            trigger_event=trigger_event,
+            auto_resume_checked=auto_resume_checked,
+        )
+        watched_symbols = (
+            [item.upper() for item in symbols if item]
+            if symbols
+            else sorted({plan.symbol for plan in self._active_pending_entry_plans()})
+        )
+        results: list[dict[str, object]] = []
+        generated_at = utcnow_naive()
+        for symbol in watched_symbols:
+            active_plans = self._active_pending_entry_plans(symbol=symbol)
+            if not active_plans:
+                continue
+            exchange_sync_result: dict[str, object] | None = None
+            if self._should_poll_exchange_state(trigger_event) and not exchange_sync_checked:
+                exchange_sync_result = self.run_exchange_sync_cycle(symbol=symbol, trigger_event=trigger_event)
+            market_snapshot, market_row = (
+                (market_snapshot_override, persist_market_snapshot(self.session, market_snapshot_override))
+                if market_snapshot_override is not None
+                else self._collect_market_snapshot(
+                    symbol=symbol,
+                    timeframe=ENTRY_PLAN_WATCH_TIMEFRAME,
+                    upto_index=upto_index,
+                    force_stale=force_stale,
+                )
+            )
+            runtime_state = summarize_runtime_state(self.settings_row)
+            operational_status = build_operational_status_payload(
+                self.settings_row,
+                session=self.session,
+                runtime_state=runtime_state,
+            )
+            stale_scopes = [
+                scope
+                for scope in ("account", "positions", "open_orders", "protective_orders")
+                if isinstance(operational_status.sync_freshness_summary.get(scope), dict)
+                and (
+                    bool(operational_status.sync_freshness_summary[scope].get("stale"))
+                    or bool(operational_status.sync_freshness_summary[scope].get("incomplete"))
+                )
+            ]
+            symbol_missing_protection = symbol in runtime_state["missing_protection_symbols"]
+            protection_issue = (
+                operational_status.operating_state == PROTECTION_REQUIRED_STATE
+                or symbol_missing_protection
+            )
+            control_blocked = (
+                operational_status.trading_paused
+                or not operational_status.live_execution_ready
+            )
+            symbol_results: list[dict[str, object]] = []
+            for plan in active_plans:
+                metadata = self._pending_entry_plan_metadata(plan)
+                result_item: dict[str, object] = {
+                    "plan": self._pending_entry_plan_snapshot(plan).model_dump(mode="json"),
+                    "status": "armed",
+                    "execution": None,
+                    "risk_result": None,
+                }
+                if plan.expires_at <= generated_at:
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="PLAN_TTL_EXPIRED",
+                        cancel_status="expired",
+                        detail={"observed_at": generated_at.isoformat()},
+                    )
+                    result_item["status"] = "expired"
+                    symbol_results.append(result_item)
+                    continue
+                if self._plan_invalidation_broken(plan, market_snapshot):
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="PLAN_INVALIDATED",
+                        detail={
+                            "latest_price": market_snapshot.latest_price,
+                            "invalidation_price": plan.invalidation_price,
+                        },
+                    )
+                    result_item["status"] = "canceled"
+                    symbol_results.append(result_item)
+                    continue
+                if stale_scopes:
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="PLAN_CANCELED_STALE_SYNC",
+                        detail={"stale_scopes": stale_scopes},
+                    )
+                    result_item["status"] = "canceled"
+                    symbol_results.append(result_item)
+                    continue
+                if protection_issue:
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="PLAN_CANCELED_PROTECTION_BLOCK",
+                        detail={"operating_state": operational_status.operating_state},
+                    )
+                    result_item["status"] = "canceled"
+                    symbol_results.append(result_item)
+                    continue
+
+                confirm_detail = self._build_plan_confirm_detail(plan, market_snapshot)
+                observed_chase_bps = self._plan_chase_bps(plan, market_snapshot.latest_price)
+                trigger_details = {
+                    **confirm_detail,
+                    "observed_chase_bps": round(observed_chase_bps, 6),
+                    "max_chase_bps": plan.max_chase_bps,
+                    "latest_price": market_snapshot.latest_price,
+                    "market_snapshot_id": market_row.id,
+                    "market_snapshot_time": market_snapshot.snapshot_time.isoformat(),
+                }
+                metadata["trigger_details"] = trigger_details
+                metadata["last_watch_at"] = generated_at.isoformat()
+                metadata["last_watch_snapshot_id"] = market_row.id
+                metadata["last_watch_cycle_id"] = f"entry-plan-watch:{plan.id}:{market_row.id}"
+                plan.metadata_json = metadata
+                self.session.add(plan)
+                self.session.flush()
+                result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+
+                if control_blocked:
+                    result_item["status"] = "control_blocked"
+                    result_item["blocked_reasons"] = list(operational_status.blocked_reasons)
+                    symbol_results.append(result_item)
+                    continue
+                if not bool(confirm_detail.get("confirm_met")):
+                    result_item["status"] = "armed_waiting_confirmation"
+                    symbol_results.append(result_item)
+                    continue
+                if plan.max_chase_bps is not None and observed_chase_bps > plan.max_chase_bps:
+                    result_item["status"] = "armed_waiting_reentry"
+                    result_item["blocked_reasons"] = ["PLAN_MAX_CHASE_EXCEEDED"]
+                    symbol_results.append(result_item)
+                    continue
+
+                source_decision_run = self._latest_decision_run(decision_run_id=plan.source_decision_run_id)
+                if source_decision_run is None or not isinstance(source_decision_run.output_payload, dict):
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="SOURCE_DECISION_MISSING",
+                    )
+                    result_item["status"] = "canceled"
+                    symbol_results.append(result_item)
+                    continue
+                source_decision = self._trigger_execution_decision_from_plan(
+                    plan,
+                    market_snapshot,
+                    source_decision=TradeDecision.model_validate(source_decision_run.output_payload),
+                )
+                trigger_cycle_id = f"entry-plan-trigger:{plan.id}:{market_row.id}"
+                correlation_ids = normalize_correlation_ids(
+                    cycle_id=trigger_cycle_id,
+                    snapshot_id=market_row.id,
+                    decision_id=plan.source_decision_run_id,
+                )
+                risk_result, risk_row = evaluate_risk(
+                    self.session,
+                    self.settings_row,
+                    source_decision,
+                    market_snapshot,
+                    decision_run_id=plan.source_decision_run_id,
+                    market_snapshot_id=market_row.id,
+                    execution_mode="live",
+                )
+                risk_correlation_ids = normalize_correlation_ids(correlation_ids, risk_id=risk_row.id)
+                record_audit_event(
+                    self.session,
+                    event_type="risk_check",
+                    entity_type="risk_check",
+                    entity_id=str(risk_row.id),
+                    severity="warning" if not risk_result.allowed else "info",
+                    message="Pending entry plan trigger risk check completed.",
+                    payload=risk_result.model_dump(mode="json"),
+                    correlation_ids=risk_correlation_ids,
+                )
+                result_item["risk_result"] = risk_result.model_dump(mode="json")
+                if not risk_result.allowed:
+                    metadata = self._pending_entry_plan_metadata(plan)
+                    metadata["last_blocked_reason_codes"] = list(risk_result.blocked_reason_codes)
+                    metadata["last_risk_check_id"] = risk_row.id
+                    plan.metadata_json = metadata
+                    self.session.add(plan)
+                    self.session.flush()
+                    result_item["status"] = "risk_blocked"
+                    symbol_results.append(result_item)
+                    continue
+                execution_result = execute_live_trade(
+                    self.session,
+                    self.settings_row,
+                    decision_run_id=plan.source_decision_run_id,
+                    decision=source_decision,
+                    market_snapshot=market_snapshot,
+                    risk_result=risk_result,
+                    risk_row=risk_row,
+                    cycle_id=trigger_cycle_id,
+                    snapshot_id=market_row.id,
+                    idempotency_key=plan.idempotency_key,
+                )
+                result_item["execution"] = execution_result
+                success_status = str(execution_result.get("status") or "")
+                if success_status in {"filled", "partially_filled", "emergency_exit"} or (
+                    success_status == "deduplicated"
+                    and str(execution_result.get("dedupe_reason") or "") == "cycle_action_already_completed"
+                ):
+                    self._mark_pending_entry_plan_triggered(
+                        plan,
+                        execution_result={
+                            "risk_check_id": risk_row.id,
+                            **dict(execution_result),
+                        },
+                        correlation_ids=normalize_correlation_ids(
+                            risk_correlation_ids,
+                            execution_id=execution_result.get("order_id"),
+                        ),
+                    )
+                    result_item["status"] = "triggered"
+                else:
+                    result_item["status"] = success_status or "execution_pending"
+                symbol_results.append(result_item)
+            results.append(
+                {
+                    "symbol": symbol,
+                    "watch_timeframe": ENTRY_PLAN_WATCH_TIMEFRAME,
+                    "market_snapshot_id": market_row.id,
+                    "market_snapshot_time": market_snapshot.snapshot_time.isoformat(),
+                    "latest_price": market_snapshot.latest_price,
+                    "exchange_sync": exchange_sync_result,
+                    "plans": symbol_results,
+                }
+            )
+        return {
+            "workflow": "entry_plan_watcher_cycle",
+            "generated_at": generated_at.isoformat(),
+            "symbols": watched_symbols,
+            "results": results,
+            "auto_resume": auto_resume_result,
+        }
+
 
     def run_decision_cycle(
         self,
@@ -498,6 +1593,8 @@ class TradingOrchestrator:
         logic_variant: str = "improved",
         exchange_sync_checked: bool = False,
         include_inline_position_management: bool = False,
+        market_snapshot_override: MarketSnapshotPayload | None = None,
+        market_context_override: dict[str, MarketSnapshotPayload] | None = None,
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
@@ -509,20 +1606,33 @@ class TradingOrchestrator:
         exchange_sync_result: dict[str, object] | None = None
         if self._should_poll_exchange_state(trigger_event) and not exchange_sync_checked:
             exchange_sync_result = self.run_exchange_sync_cycle(symbol=symbol, trigger_event=trigger_event)
-        market_snapshot, market_row = self._collect_market_snapshot(
+        if market_snapshot_override is None:
+            market_snapshot, market_row = self._collect_market_snapshot(
+                symbol=symbol,
+                timeframe=timeframe,
+                upto_index=upto_index,
+                force_stale=force_stale,
+            )
+        else:
+            market_snapshot = market_snapshot_override
+            market_row = persist_market_snapshot(self.session, market_snapshot)
+        cycle_id = self._build_cycle_id(
+            trigger_event=trigger_event,
             symbol=symbol,
-            timeframe=timeframe,
-            upto_index=upto_index,
-            force_stale=force_stale,
+            snapshot_id=market_row.id,
         )
-        market_context = build_market_context(
-            symbol=symbol,
-            base_timeframe=timeframe,
-            upto_index=upto_index,
-            force_stale=force_stale,
-            use_binance=self.settings_row.binance_market_data_enabled,
-            binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
-            stale_threshold_seconds=self.settings_row.stale_market_seconds,
+        market_context = (
+            dict(market_context_override)
+            if market_context_override is not None
+            else build_market_context(
+                symbol=symbol,
+                base_timeframe=timeframe,
+                upto_index=upto_index,
+                force_stale=force_stale,
+                use_binance=self.settings_row.binance_market_data_enabled,
+                binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+                stale_threshold_seconds=self.settings_row.stale_market_seconds,
+            )
         )
         higher_timeframe_context = {
             tf: payload for tf, payload in market_context.items() if tf != timeframe
@@ -530,6 +1640,7 @@ class TradingOrchestrator:
         if not self.settings_row.ai_enabled:
             return {
                 "symbol": symbol,
+                "cycle_id": cycle_id,
                 "market_snapshot_id": market_row.id,
                 "feature_snapshot_id": None,
                 "decision_run_id": None,
@@ -581,6 +1692,7 @@ class TradingOrchestrator:
         ):
             return {
                 "symbol": symbol,
+                "cycle_id": cycle_id,
                 "market_snapshot_id": market_row.id,
                 "feature_snapshot_id": feature_row.id,
                 "decision_run_id": None,
@@ -657,6 +1769,8 @@ class TradingOrchestrator:
             },
             "analysis_context": _decision_analysis_context(feature_payload),
             "position_management": position_management_result or {"position_management_context": position_management_context},
+            "cycle_id": cycle_id,
+            "snapshot_id": market_row.id,
         }
         decision_run = persist_agent_run(
             self.session,
@@ -673,7 +1787,20 @@ class TradingOrchestrator:
             provider_name=provider_name,
             metadata_json=decision_metadata,
         )
-        record_audit_event(self.session, event_type="agent_output", entity_type="agent_run", entity_id=str(decision_run.id), message="Trading decision generated.", payload={"provider": provider_name, "decision": decision.model_dump(mode="json")})
+        decision_correlation_ids = normalize_correlation_ids(
+            cycle_id=cycle_id,
+            snapshot_id=market_row.id,
+            decision_id=decision_run.id,
+        )
+        record_audit_event(
+            self.session,
+            event_type="agent_output",
+            entity_type="agent_run",
+            entity_id=str(decision_run.id),
+            message="Trading decision generated.",
+            payload={"provider": provider_name, "decision": decision.model_dump(mode="json")},
+            correlation_ids=decision_correlation_ids,
+        )
         risk_result, risk_row = evaluate_risk(
             self.session,
             self.settings_row,
@@ -683,10 +1810,58 @@ class TradingOrchestrator:
             market_snapshot_id=market_row.id,
             execution_mode="historical_replay" if trigger_event == "historical_replay" else "live",
         )
-        record_audit_event(self.session, event_type="risk_check", entity_type="risk_check", entity_id=str(risk_row.id), severity="warning" if not risk_result.allowed else "info", message="Risk check completed.", payload=risk_result.model_dump(mode="json"))
+        risk_correlation_ids = normalize_correlation_ids(
+            decision_correlation_ids,
+            risk_id=risk_row.id,
+        )
+        record_audit_event(
+            self.session,
+            event_type="risk_check",
+            entity_type="risk_check",
+            entity_id=str(risk_row.id),
+            severity="warning" if not risk_result.allowed else "info",
+            message="Risk check completed.",
+            payload=risk_result.model_dump(mode="json"),
+            correlation_ids=risk_correlation_ids,
+        )
+
+        canceled_entry_plans: list[dict[str, object]] = []
+        armed_entry_plan: PendingEntryPlanSnapshot | None = None
+        if trigger_event != "historical_replay" and decision.decision in {"hold", "long", "short"}:
+            canceled_entry_plans = [
+                snapshot.model_dump(mode="json")
+                for snapshot in self._cancel_symbol_entry_plans_from_decision(
+                    symbol=symbol,
+                    decision_side=decision.decision,
+                    decision_run_id=decision_run.id,
+                    cycle_id=cycle_id,
+                    snapshot_id=market_row.id,
+                )
+            ]
+        if (
+            trigger_event != "historical_replay"
+            and not open_positions
+            and self._plan_entry_allowed_without_trigger(decision, risk_result)
+        ):
+            armed_entry_plan = self._pending_entry_plan_snapshot(
+                self._arm_pending_entry_plan(
+                    decision=decision,
+                    decision_run=decision_run,
+                    risk_result=risk_result,
+                    risk_row_id=risk_row.id,
+                    feature_payload=feature_payload,
+                    cycle_id=cycle_id,
+                    snapshot_id=market_row.id,
+                )
+            )
 
         execution_result: dict[str, object] | None = None
-        if risk_result.allowed and decision.decision != "hold" and self._should_execute_live(trigger_event):
+        if (
+            armed_entry_plan is None
+            and risk_result.allowed
+            and decision.decision != "hold"
+            and self._should_execute_live(trigger_event)
+        ):
             execution_result = execute_live_trade(
                 self.session,
                 self.settings_row,
@@ -695,8 +1870,10 @@ class TradingOrchestrator:
                 market_snapshot=market_snapshot,
                 risk_result=risk_result,
                 risk_row=risk_row,
+                cycle_id=cycle_id,
+                snapshot_id=market_row.id,
             )
-        elif risk_result.allowed and decision.decision != "hold":
+        elif armed_entry_plan is None and risk_result.allowed and decision.decision != "hold":
             record_audit_event(
                 self.session,
                 event_type="live_execution_skipped",
@@ -706,7 +1883,7 @@ class TradingOrchestrator:
                 message="Live execution skipped for non-live trigger.",
                 payload={"trigger_event": trigger_event, "symbol": symbol},
             )
-        elif not risk_result.allowed:
+        elif armed_entry_plan is None and not risk_result.allowed:
             create_alert(self.session, category="risk", severity="warning", title="Trade blocked", message="Deterministic risk policy blocked the execution.", payload={"reason_codes": risk_result.reason_codes, "decision": decision.decision, "symbol": symbol})
 
         chief_review, chief_provider_name, chief_metadata = self.chief_review_agent.run(
@@ -727,6 +1904,7 @@ class TradingOrchestrator:
         )
         return {
             "symbol": symbol,
+            "cycle_id": cycle_id,
             "market_snapshot_id": market_row.id,
             "feature_snapshot_id": feature_row.id,
             "decision_run_id": decision_run.id,
@@ -735,6 +1913,9 @@ class TradingOrchestrator:
             "decision": decision.model_dump(mode="json"),
             "risk_result": risk_result.model_dump(mode="json"),
             "execution": execution_result,
+            "entry_plan": armed_entry_plan.model_dump(mode="json") if armed_entry_plan is not None else None,
+            "canceled_entry_plans": canceled_entry_plans,
+            "status": "entry_plan_armed" if armed_entry_plan is not None else "completed",
             "decision_reference": decision_reference,
             "logic_variant": logic_variant,
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
@@ -765,9 +1946,20 @@ class TradingOrchestrator:
             for effective in get_effective_symbol_schedule(self.settings_row)
             if effective.enabled and effective.symbol in selected_symbols
         ]
+        candidate_selection = self._rank_candidate_symbols(
+            decision_symbols=decision_symbols,
+            timeframe=timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+        )
+        selected_cycle_symbols = [
+            str(item).upper()
+            for item in candidate_selection.get("selected_symbols", decision_symbols)
+            if item
+        ] or decision_symbols
         results: list[dict[str, object]] = []
         failed_symbols: list[str] = []
-        for symbol in decision_symbols:
+        for symbol in selected_cycle_symbols:
             try:
                 results.append(
                     self.run_decision_cycle(
@@ -807,11 +1999,13 @@ class TradingOrchestrator:
                     }
                 )
         return {
-            "symbols": decision_symbols,
+            "symbols": selected_cycle_symbols,
+            "tracked_symbols": decision_symbols,
             "cycles": len(results),
             "mode": "market_data_only" if not self.settings_row.ai_enabled else "ai_active",
             "failed_symbols": failed_symbols,
             "logic_variant": logic_variant,
+            "candidate_selection": candidate_selection,
             "results": results,
             "account": self._account_snapshot_preview() if not self.settings_row.ai_enabled else account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),

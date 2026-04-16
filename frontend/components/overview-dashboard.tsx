@@ -6,6 +6,9 @@ import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "..
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshIntervalMs = 15000;
+const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
+
+type RolloutMode = (typeof rolloutModeOptions)[number];
 
 type PerformanceEntry = {
   key: string;
@@ -46,6 +49,7 @@ type AuditEvent = {
   entity_id: string;
   severity: string;
   message: string;
+  payload: Record<string, unknown>;
   created_at: string;
 };
 
@@ -57,6 +61,21 @@ type SyncScopeStatus = {
   stale?: boolean;
   incomplete?: boolean;
   last_failure_reason?: string | null;
+};
+
+type ControlStatusSummary = {
+  exchange_can_trade: boolean | null;
+  rollout_mode: RolloutMode;
+  exchange_submit_allowed: boolean;
+  limited_live_max_notional: number | null;
+  app_live_armed: boolean;
+  approval_window_open: boolean;
+  approval_state?: string | null;
+  approval_detail?: Record<string, unknown>;
+  paused: boolean;
+  degraded: boolean;
+  risk_allowed: boolean | null;
+  blocked_reasons_current_cycle: string[];
 };
 
 type OperatorDecisionSnapshot = {
@@ -77,11 +96,15 @@ type OperatorDecisionSnapshot = {
 type OperatorRiskSnapshot = {
   risk_check_id: number | null;
   decision_run_id: number | null;
+  snapshot_id: number | null;
+  as_of: string | null;
   created_at: string | null;
   allowed: boolean | null;
   decision: string | null;
   operating_state: string | null;
   reason_codes: string[];
+  blocked_reason_codes: string[];
+  adjustment_reason_codes: string[];
   approved_risk_pct: number | null;
   approved_leverage: number | null;
   raw_projected_notional: number | null;
@@ -91,6 +114,19 @@ type OperatorRiskSnapshot = {
   size_adjustment_ratio: number | null;
   auto_resize_reason: string | null;
   exposure_headroom_snapshot: Record<string, number>;
+};
+
+type ExecutionFillSummary = {
+  execution_id: number | null;
+  order_id: number | null;
+  external_trade_id: string | null;
+  created_at: string | null;
+  status: string | null;
+  fill_price: number | null;
+  fill_quantity: number | null;
+  fee_paid: number | null;
+  commission_asset: string | null;
+  realized_pnl: number | null;
 };
 
 type OperatorExecutionSnapshot = {
@@ -110,6 +146,7 @@ type OperatorExecutionSnapshot = {
   fill_price: number | null;
   reason_codes: string[];
   execution_quality: Record<string, unknown>;
+  recent_fills: ExecutionFillSummary[];
 };
 
 type OperatorPositionSummary = {
@@ -131,6 +168,17 @@ type OperatorProtectionSummary = {
   has_stop_loss: boolean;
   has_take_profit: boolean;
   missing_components: string[];
+  recovery_status?: string | null;
+  auto_recovery_active: boolean;
+  failure_count: number;
+  last_error?: string | null;
+  last_transition_at?: string | null;
+  trigger_source?: string | null;
+  lifecycle_state?: string | null;
+  verification_status?: string | null;
+  last_event_type?: string | null;
+  last_event_message?: string | null;
+  last_event_at?: string | null;
 };
 
 type OperatorSymbolSummary = {
@@ -156,6 +204,9 @@ export type OperatorDashboardPayload = {
   control: {
     can_enter_new_position: boolean;
     mode: string;
+    rollout_mode: RolloutMode;
+    exchange_submit_allowed: boolean;
+    limited_live_max_notional: number | null;
     default_symbol: string;
     default_timeframe: string;
     tracked_symbols: string[];
@@ -174,6 +225,7 @@ export type OperatorDashboardPayload = {
     auto_resume_after: string | null;
     auto_resume_last_blockers: string[];
     latest_blocked_reasons: string[];
+    control_status_summary?: ControlStatusSummary | null;
     sync_freshness_summary: Record<string, SyncScopeStatus>;
     protection_recovery_status: string;
     protected_positions: number;
@@ -201,8 +253,6 @@ export type OperatorDashboardPayload = {
   execution_windows: ExecutionWindow[];
   audit_events: AuditEvent[];
 };
-
-type Payload = { operator: OperatorDashboardPayload };
 
 const decisionLabelMap: Record<string, string> = {
   hold: "보류",
@@ -342,6 +392,7 @@ function recommendationSummary(decision: string | null | undefined) {
 
 function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
   const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+  const adjustmentReasons = filteredAdjustmentReasons(symbol);
   if (symbol.risk_guard.allowed === null) {
     return {
       label: "risk 평가 없음",
@@ -358,6 +409,13 @@ function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
       };
     }
     if (isEntryDecision(decision)) {
+      if (symbol.risk_guard.auto_resized_entry && adjustmentReasons.length > 0) {
+        return {
+          label: "허용(자동 축소)",
+          detail: translateDecision(decision),
+          kind: "good" as const,
+        };
+      }
       return {
         label: "신규 진입 승인",
         detail: translateDecision(decision),
@@ -442,11 +500,11 @@ function translateReasonCode(value: string | null | undefined) {
     return "-";
   }
   const extraReasonCodeLabelMap: Record<string, string> = {
-    ENTRY_AUTO_RESIZED: "리스크 한도 내 자동 축소 진입",
-    ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT: "총 노출도 한도에 맞춘 자동 축소",
-    ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT: "방향 편중 한도에 맞춘 자동 축소",
-    ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "단일 포지션 한도에 맞춘 자동 축소",
-    ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "동일 티어 집중도 한도에 맞춘 자동 축소",
+    ENTRY_AUTO_RESIZED: "진입 수량이 자동 축소 승인되었습니다.",
+    ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT: "총 노출 한도에 맞게 진입 수량이 축소되었습니다.",
+    ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT: "방향 편향 한도에 맞게 진입 수량이 축소되었습니다.",
+    ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "최대 단일 포지션 한도에 맞게 진입 수량이 축소되었습니다.",
+    ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "동일 티어 집중도 한도에 맞게 진입 수량이 축소되었습니다.",
     ENTRY_SIZE_BELOW_MIN_NOTIONAL: "최소 실행 가능 주문 미만",
     ENTRY_TRIGGER_NOT_MET: "진입 트리거 미충족",
     CHASE_LIMIT_EXCEEDED: "추격 진입 한도 초과",
@@ -480,6 +538,84 @@ function translateSeverity(value: string | null | undefined) {
   return value ?? "-";
 }
 
+function approvalWindowValue(summary: ControlStatusSummary) {
+  if (summary.approval_state === "armed") {
+    return "승인됨";
+  }
+  if (summary.approval_state === "grace") {
+    return "유예";
+  }
+  if (summary.approval_state === "required") {
+    return "승인 필요";
+  }
+  if (summary.approval_state === "policy_disabled") {
+    return "정책 꺼짐";
+  }
+  return summary.approval_window_open ? "열림" : "닫힘";
+}
+
+function approvalWindowHint(control: OperatorDashboardPayload["control"], summary: ControlStatusSummary) {
+  const approvalGraceUntil = typeof summary.approval_detail?.approval_grace_until === "string"
+    ? summary.approval_detail.approval_grace_until
+    : null;
+  if (summary.approval_state === "armed") {
+    return control.approval_expires_at
+      ? `만료 ${formatDateTime(control.approval_expires_at)}`
+      : "수동 승인 창이 현재 열려 있습니다.";
+  }
+  if (summary.approval_state === "grace") {
+    return approvalGraceUntil
+      ? `자동 복구 유예 ${formatDateTime(approvalGraceUntil)}`
+      : "자동 복구 이후 승인 유예가 열려 있습니다.";
+  }
+  if (summary.approval_state === "policy_disabled") {
+    return "수동 승인 정책이 비활성화되어 있습니다.";
+  }
+  return "신규 진입 전 승인 창을 다시 열어야 합니다.";
+}
+
+function formatAuditValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "-";
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? String(value) : formatNumber(value, 4);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => formatAuditValue(item)).join(", ");
+  }
+  if (typeof value === "string") {
+    if (value.includes("T") && !Number.isNaN(Date.parse(value))) {
+      return formatDateTime(value);
+    }
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+function auditPayloadRows(payload: Record<string, unknown> | null | undefined): Array<[string, string]> {
+  if (!payload) {
+    return [];
+  }
+  const rows: Array<[string, string]> = [];
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === null || value === undefined) {
+      continue;
+    }
+    if (typeof value === "object" && !Array.isArray(value)) {
+      for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        rows.push([`${key}.${nestedKey}`, formatAuditValue(nestedValue)]);
+      }
+      continue;
+    }
+    rows.push([key, formatAuditValue(value)]);
+  }
+  return rows;
+}
+
 function translateSyncScope(value: string) {
   return syncScopeLabelMap[value] ?? value;
 }
@@ -507,17 +643,194 @@ function valueCard(title: string, value: string, hint: string) {
   );
 }
 
-async function fetchPayload(): Promise<Payload> {
+function dedupeReasons(values: string[]) {
+  return values.filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function rolloutModeLabel(mode: RolloutMode) {
+  switch (mode) {
+    case "paper":
+      return "paper";
+    case "shadow":
+      return "shadow";
+    case "live_dry_run":
+      return "live dry-run";
+    case "limited_live":
+      return "limited live";
+    case "full_live":
+      return "full live";
+    default:
+      return mode;
+  }
+}
+
+function resolveControlStatusSummary(control: OperatorDashboardPayload["control"]): ControlStatusSummary {
+  const summary = control.control_status_summary;
+  return {
+    exchange_can_trade: summary?.exchange_can_trade ?? null,
+    rollout_mode: summary?.rollout_mode ?? control.rollout_mode,
+    exchange_submit_allowed: summary?.exchange_submit_allowed ?? control.exchange_submit_allowed,
+    limited_live_max_notional: summary?.limited_live_max_notional ?? control.limited_live_max_notional,
+    app_live_armed: summary?.app_live_armed ?? control.approval_armed,
+    approval_window_open: summary?.approval_window_open ?? control.approval_armed,
+    approval_state: summary?.approval_state ?? null,
+    approval_detail: summary?.approval_detail ?? {},
+    paused: summary?.paused ?? control.trading_paused,
+    degraded: summary?.degraded ?? control.operating_state === "DEGRADED_MANAGE_ONLY",
+    risk_allowed: summary?.risk_allowed ?? null,
+    blocked_reasons_current_cycle: dedupeReasons(
+      summary?.blocked_reasons_current_cycle ?? control.latest_blocked_reasons,
+    ),
+  };
+}
+
+function controlGateCards(control: OperatorDashboardPayload["control"]) {
+  const summary = resolveControlStatusSummary(control);
+  const primaryBlocker = summary.blocked_reasons_current_cycle[0];
+  return [
+    {
+      title: "rollout mode",
+      value: rolloutModeLabel(summary.rollout_mode),
+      hint:
+        summary.rollout_mode === "paper"
+          ? "paper 경로만 사용하고 실제 거래소 submit은 비활성화됩니다."
+          : summary.rollout_mode === "shadow"
+            ? "시장/AI/risk와 execution intent, audit까지만 수행합니다."
+            : summary.rollout_mode === "live_dry_run"
+            ? "거래소 sync와 preflight를 수행하지만 submit은 금지됩니다."
+              : summary.rollout_mode === "limited_live"
+                ? `submit은 허용되지만 주문당 notional이 ${summary.limited_live_max_notional ?? 0} USDT 이하로 제한됩니다.`
+                : "기존 full live submit 경로를 사용합니다.",
+      kind:
+        summary.rollout_mode === "full_live"
+          ? ("good" as const)
+          : summary.rollout_mode === "limited_live"
+            ? ("warn" as const)
+            : ("neutral" as const),
+    },
+    {
+      title: "거래소 canTrade",
+      value:
+        summary.exchange_can_trade === null
+          ? "미확인"
+          : summary.exchange_can_trade
+            ? "주문 가능"
+            : "주문 차단",
+      hint:
+        summary.exchange_can_trade === null
+          ? "최근 account sync에 거래소 canTrade truth가 없습니다."
+          : summary.exchange_can_trade
+            ? "거래소 계좌 상태 기준으로 신규 주문이 가능합니다."
+            : "거래소 계좌 상태 기준으로 신규 주문이 차단됩니다.",
+      kind:
+        summary.exchange_can_trade === null
+          ? ("neutral" as const)
+          : summary.exchange_can_trade
+            ? ("good" as const)
+            : ("danger" as const),
+    },
+    {
+      title: "앱 live arm",
+      value: summary.app_live_armed ? "Arm됨" : "Arm 해제",
+      hint: summary.app_live_armed
+        ? "앱 실거래 경로가 arm 상태입니다."
+        : "앱 live arm이 내려가 있어 실거래 경로가 열리지 않습니다.",
+      kind: summary.app_live_armed ? ("good" as const) : ("warn" as const),
+    },
+    {
+      title: "approval window",
+      value: approvalWindowValue(summary),
+      hint: approvalWindowHint(control, summary),
+      kind: summary.approval_window_open ? ("good" as const) : ("warn" as const),
+    },
+    {
+      title: "pause",
+      value: summary.paused ? "중지" : "운영 중",
+      hint: summary.paused
+        ? translateReasonCode(control.pause_reason_code)
+        : "운영 중지 플래그가 활성화되어 있지 않습니다.",
+      kind: summary.paused ? ("danger" as const) : ("good" as const),
+    },
+    {
+      title: "degraded",
+      value: summary.degraded ? "관리 전용" : "정상",
+      hint: summary.degraded
+        ? `${translateOperatingState(control.operating_state)} / 보호 복구 ${control.protection_recovery_status}`
+        : "관리 전용 또는 비상 복구 상태로 내려가 있지 않습니다.",
+      kind: summary.degraded ? ("warn" as const) : ("good" as const),
+    },
+    {
+      title: "risk 허용",
+      value:
+        summary.risk_allowed === null
+          ? "미평가"
+          : summary.risk_allowed
+            ? "허용"
+            : "차단",
+      hint:
+        summary.risk_allowed === null
+          ? "현재 cycle risk 결과가 아직 집계되지 않았습니다."
+          : summary.risk_allowed
+            ? "현재 cycle risk_guard가 신규 진입을 허용했습니다."
+            : primaryBlocker
+              ? translateReasonCode(primaryBlocker)
+              : control.guard_mode_reason_message ?? "현재 cycle risk_guard가 신규 진입을 차단했습니다.",
+      kind:
+        summary.risk_allowed === null
+          ? ("neutral" as const)
+          : summary.risk_allowed
+            ? ("good" as const)
+            : ("danger" as const),
+    },
+  ];
+}
+
+async function fetchPayload(): Promise<OperatorDashboardPayload> {
   const response = await fetch(`${apiBaseUrl}/api/dashboard/operator`, { cache: "no-store" });
   if (!response.ok) {
     const body = await response.text();
     throw new Error(body || response.statusText);
   }
-  return { operator: (await response.json()) as OperatorDashboardPayload };
+  return (await response.json()) as OperatorDashboardPayload;
 }
 
 function filteredBlockedReasons(symbol: OperatorSymbolSummary) {
-  return symbol.blocked_reasons.filter((item, index, array) => array.indexOf(item) === index);
+  const source =
+    symbol.risk_guard.blocked_reason_codes.length > 0
+      ? symbol.risk_guard.blocked_reason_codes
+      : symbol.blocked_reasons;
+  return source.filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function filteredAdjustmentReasons(symbol: OperatorSymbolSummary) {
+  return symbol.risk_guard.adjustment_reason_codes.filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function latestActivityTimestamp(symbol: OperatorSymbolSummary) {
+  const value =
+    symbol.last_updated_at ??
+    symbol.execution.execution_created_at ??
+    symbol.execution.created_at ??
+    symbol.risk_guard.as_of ??
+    symbol.risk_guard.created_at ??
+    symbol.ai_decision.created_at;
+  if (!value) {
+    return 0;
+  }
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function resolveFocusSymbolSummary(
+  symbols: OperatorSymbolSummary[],
+  selectedSymbol: string,
+  defaultSymbol: string,
+) {
+  if (selectedSymbol !== ALL_SYMBOLS) {
+    return symbols.find((item) => item.symbol === selectedSymbol) ?? null;
+  }
+  const defaultMatch = symbols.find((item) => item.symbol === defaultSymbol);
+  return [...symbols].sort((left, right) => latestActivityTimestamp(right) - latestActivityTimestamp(left))[0] ?? defaultMatch ?? null;
 }
 
 function performanceRows(title: string, rows: PerformanceEntry[], empty: string) {
@@ -553,30 +866,56 @@ function GlobalOperatorSummary({
   market,
   execution24h,
   selectedSymbol,
+  focusSymbol,
+  globalAuditEvents,
 }: {
   control: OperatorDashboardPayload["control"];
   market: OperatorDashboardPayload["market_signal"];
   execution24h: ExecutionWindow | undefined;
   selectedSymbol: string;
+  focusSymbol: OperatorSymbolSummary | null;
+  globalAuditEvents: AuditEvent[];
 }) {
-  const status = control.trading_paused
+  const controlSummary = resolveControlStatusSummary(control);
+  const currentCycleBlockedReasons = controlSummary.blocked_reasons_current_cycle;
+  const gateCards = controlGateCards(control);
+  const status = controlSummary.paused
     ? {
         kind: "danger" as const,
-        label: "신규 진입 차단",
+        label: "pause 차단",
         detail: translateReasonCode(control.pause_reason_code),
       }
-    : !control.live_execution_ready
+    : controlSummary.degraded
       ? {
           kind: "warn" as const,
-          label: "가드 모드",
-          detail: control.guard_mode_reason_message ?? "진입 조건을 아직 충족하지 못했습니다.",
+          label: "관리 전용",
+          detail: `${translateOperatingState(control.operating_state)} / 보호 복구 ${control.protection_recovery_status}`,
         }
-      : {
-          kind: "good" as const,
-          label: "신규 진입 가능",
-          detail: "전역 운영 상태 기준으로 신규 진입과 기존 포지션 관리가 가능합니다.",
-        };
-
+      : controlSummary.exchange_can_trade === false
+        ? {
+            kind: "danger" as const,
+            label: "거래소 주문 차단",
+            detail: "거래소 canTrade가 false여서 신규 주문 경로가 열리지 않습니다.",
+          }
+        : controlSummary.risk_allowed === false
+          ? {
+              kind: "warn" as const,
+              label: "risk 차단",
+              detail: currentCycleBlockedReasons[0]
+                ? translateReasonCode(currentCycleBlockedReasons[0])
+                : control.guard_mode_reason_message ?? "현재 cycle risk_guard가 신규 진입을 차단했습니다.",
+            }
+          : control.live_execution_ready
+            ? {
+                kind: "good" as const,
+                label: "신규 진입 가능",
+                detail: "거래소, 앱, approval, pause, risk gate가 모두 현재 cycle 기준으로 통과 상태입니다.",
+              }
+            : {
+                kind: "warn" as const,
+                label: "가드 모드",
+                detail: control.guard_mode_reason_message ?? "진입 조건을 아직 충족하지 못했습니다.",
+              };
   const primaryWindow = market.performance_windows[0];
   const syncScopes = [
     ["account", "계좌"],
@@ -584,6 +923,10 @@ function GlobalOperatorSummary({
     ["open_orders", "오더"],
     ["protective_orders", "보호 주문"],
   ] as const;
+  const focusRecommendation = focusSymbol ? recommendationSummary(focusSymbol.ai_decision.decision) : null;
+  const focusRiskOutcome = focusSymbol ? riskOutcomeSummary(focusSymbol) : null;
+  const focusExecutionOutcome = focusSymbol ? executionOutcomeSummary(focusSymbol) : null;
+  const recentGlobalAuditEvents = globalAuditEvents.slice(0, 3);
 
   return (
     <section className="space-y-6 rounded-[2rem] border border-amber-200/70 bg-white/90 p-6 shadow-frame sm:p-7">
@@ -633,12 +976,8 @@ function GlobalOperatorSummary({
         )}
         {valueCard(
           "실거래 승인",
-          control.approval_armed ? (control.approval_expires_at ? "유효" : "무기한 승인") : "승인 필요",
-          control.approval_armed
-            ? control.approval_expires_at
-              ? `만료 ${formatDateTime(control.approval_expires_at)}`
-              : "승인 유지 시간 제한 없음"
-            : "승인 창을 다시 열어야 합니다.",
+          approvalWindowValue(controlSummary),
+          approvalWindowHint(control, controlSummary),
         )}
         {valueCard(
           "열린 포지션",
@@ -652,6 +991,40 @@ function GlobalOperatorSummary({
         )}
       </div>
 
+      {focusSymbol && focusRecommendation && focusRiskOutcome && focusExecutionOutcome ? (
+        <div className="grid gap-4 lg:grid-cols-3">
+          {valueCard(
+            `최신 AI 추천 (${focusSymbol.symbol})`,
+            focusRecommendation.label,
+            focusRecommendation.detail,
+          )}
+          {valueCard(
+            `최신 risk 결과 (${focusSymbol.symbol})`,
+            focusRiskOutcome.label,
+            focusRiskOutcome.detail,
+          )}
+          {valueCard(
+            `최신 실행 상태 (${focusSymbol.symbol})`,
+            focusExecutionOutcome.label,
+            focusExecutionOutcome.detail,
+          )}
+        </div>
+      ) : null}
+
+      <div className="grid gap-4 xl:grid-cols-3">
+        {gateCards.map((card) => (
+          <div key={card.title} className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium text-slate-500">{card.title}</p>
+              <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(card.kind)}`}>
+                {card.value}
+              </span>
+            </div>
+            <p className="mt-3 text-sm leading-6 text-slate-700">{card.hint}</p>
+          </div>
+        ))}
+      </div>
+
       <div className="grid gap-4 xl:grid-cols-2">
         <div className="rounded-2xl border border-slate-200 bg-white">
           {[
@@ -661,6 +1034,12 @@ function GlobalOperatorSummary({
             ["pause origin", control.pause_origin ?? "-"],
             ["자동 복구 가능", control.auto_resume_eligible ? "가능" : "불가"],
             ["자동 복구 예정", formatDateTime(control.auto_resume_after)],
+            [
+              "자동 복구 차단 사유",
+              control.auto_resume_last_blockers.length > 0
+                ? control.auto_resume_last_blockers.map(translateReasonCode).join(", ")
+                : "-",
+            ],
             [
               "스케줄러",
               control.scheduler_window || control.scheduler_status
@@ -682,21 +1061,19 @@ function GlobalOperatorSummary({
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <h3 className="text-sm font-semibold text-slate-950">전역 차단 사유</h3>
+          <h3 className="text-sm font-semibold text-slate-950">현재 cycle 차단 사유</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            hold 증가 조건과 별도로, 실제로 신규 진입을 막는 운영/리스크 사유만 보여줍니다.
+            현재 cycle risk 결과와 전역 제어 상태가 실제로 신규 진입을 막는 사유만 보여줍니다.
           </p>
           <div className="mt-4 space-y-2">
-            {[...control.latest_blocked_reasons, ...control.auto_resume_last_blockers]
-              .filter((item, index, array) => array.indexOf(item) === index)
-              .map((reason) => (
+            {currentCycleBlockedReasons.map((reason) => (
                 <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm text-slate-800">
                   {translateReasonCode(reason)}
                 </div>
               ))}
-            {control.latest_blocked_reasons.length === 0 && control.auto_resume_last_blockers.length === 0 ? (
+            {currentCycleBlockedReasons.length === 0 ? (
               <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
-                현재 전역 차단 사유는 없습니다.
+                현재 cycle 기준 차단 사유는 없습니다.
               </div>
             ) : null}
           </div>
@@ -736,61 +1113,39 @@ function GlobalOperatorSummary({
       <div className="space-y-4">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">
-            시장 / 신호 요약
+            운영 보조 요약
           </p>
-          <h2 className="mt-2 text-xl font-semibold text-slate-950">최근 성과와 실행 품질</h2>
+          <h2 className="mt-2 text-xl font-semibold text-slate-950">최근 24시간 기준 핵심 지표</h2>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            상위 성과 신호, 레짐별 성과, 슬리피지와 부분 체결 품질을 최근 윈도우 기준으로 확인합니다.
+            overview는 최근 윈도우의 핵심 지표만 먼저 보여주고, 상세 성과 집계는 접힌 섹션에서 확인합니다.
           </p>
         </div>
 
         <div className="grid gap-4 xl:grid-cols-3">
-          {market.performance_windows.map((window) => {
-            const holdRatio =
-              window.summary.decisions > 0 ? window.summary.holds / window.summary.decisions : 0;
-            const winRate =
-              window.summary.wins + window.summary.losses > 0
-                ? window.summary.wins / (window.summary.wins + window.summary.losses)
-                : 0;
-            return (
-              <div key={window.window_label} className="rounded-2xl border border-slate-200 bg-white p-4">
-                <h3 className="text-sm font-semibold text-slate-950">{window.window_label} 성과 요약</h3>
-                <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                  {valueCard("순실현 손익", formatMoney(window.summary.net_realized_pnl_total), `수수료 ${formatMoney(window.summary.fee_total)}`)}
-                  {valueCard("승률", formatRatio(winRate), `승 ${window.summary.wins} / 패 ${window.summary.losses}`)}
-                  {valueCard("보류 비중", formatRatio(holdRatio), `보류 ${window.summary.holds} / 판단 ${window.summary.decisions}`)}
-                  {valueCard(
-                    "실행 품질",
-                    `${formatNumber(Number(execution24h?.execution_quality_summary.average_realized_slippage_pct ?? 0), 2)}%`,
-                    window.window_label === "24h" ? "평균 실슬리피지" : "전역 실행 품질은 24h 기준으로 집계",
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="grid gap-4 xl:grid-cols-2">
-          {performanceRows(
-            "상위 수익 rationale",
-            primaryWindow?.rationale_winners ?? [],
-            "최근 구간에서 상위 수익 rationale 데이터가 없습니다.",
+          {valueCard(
+            "24h 순실현 손익",
+            primaryWindow ? formatMoney(primaryWindow.summary.net_realized_pnl_total) : "-",
+            primaryWindow ? `수수료 ${formatMoney(primaryWindow.summary.fee_total)}` : "최근 24h 집계 없음",
           )}
-          {performanceRows(
-            "상위 손실 rationale",
-            primaryWindow?.rationale_losers ?? [],
-            "최근 구간에서 상위 손실 rationale 데이터가 없습니다.",
+          {valueCard(
+            "24h 승률",
+            primaryWindow && primaryWindow.summary.wins + primaryWindow.summary.losses > 0
+              ? formatRatio(primaryWindow.summary.wins / (primaryWindow.summary.wins + primaryWindow.summary.losses))
+              : "-",
+            primaryWindow
+              ? `승 ${primaryWindow.summary.wins} / 패 ${primaryWindow.summary.losses} / 보류 ${primaryWindow.summary.holds}`
+              : "최근 24h 판단 집계 없음",
           )}
-        </div>
-
-        <div className="grid gap-4 xl:grid-cols-2">
-          {performanceRows("레짐별 성과", primaryWindow?.top_regimes ?? [], "레짐별 집계가 없습니다.")}
-          {performanceRows("심볼별 성과", primaryWindow?.top_symbols ?? [], "심볼별 집계가 없습니다.")}
+          {valueCard(
+            "24h 실행 품질",
+            `${formatNumber(Number(execution24h?.execution_quality_summary.average_realized_slippage_pct ?? 0), 2)}%`,
+            execution24h ? "평균 실슬리피지" : "최근 24h 실행 품질 집계 없음",
+          )}
         </div>
 
         <div className="grid gap-4 xl:grid-cols-2">
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
-            <h3 className="text-sm font-semibold text-slate-950">hold 증가 원인</h3>
+            <h3 className="text-sm font-semibold text-slate-950">hold / 차단 요약</h3>
             <div className="mt-4 space-y-2">
               {market.hold_blocked_summary.hold_top_conditions.length === 0 ? (
                 <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
@@ -807,7 +1162,7 @@ function GlobalOperatorSummary({
           </div>
 
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
-            <h3 className="text-sm font-semibold text-slate-950">Adaptive 개입 상태</h3>
+            <h3 className="text-sm font-semibold text-slate-950">Adaptive 개입 요약</h3>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {valueCard(
                 "상태",
@@ -815,23 +1170,81 @@ function GlobalOperatorSummary({
                 `입력 ${Array.isArray(market.adaptive_signal_summary.active_inputs) ? market.adaptive_signal_summary.active_inputs.join(", ") || "없음" : "없음"}`,
               )}
               {valueCard(
-                "signal weight",
-                formatNumber(Number(market.adaptive_signal_summary.signal_weight ?? 1), 2),
-                "최근 성과 기반 보수 조정치",
-              )}
-              {valueCard(
-                "confidence 배수",
+                "confidence / risk",
                 `${formatNumber(Number(market.adaptive_signal_summary.confidence_multiplier ?? 1), 2)}x`,
-                "손실 구간에서는 1보다 작아집니다.",
-              )}
-              {valueCard(
-                "hold bias",
-                formatNumber(Number(market.adaptive_signal_summary.hold_bias ?? 0), 2),
                 `risk 배수 ${formatNumber(Number(market.adaptive_signal_summary.risk_pct_multiplier ?? 1), 2)}x`,
               )}
             </div>
           </div>
         </div>
+
+        <details className="rounded-2xl border border-slate-200 bg-white p-4">
+          <summary className="cursor-pointer list-none text-sm font-semibold text-slate-950">
+            상세 성과 보기
+          </summary>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            상위 rationale, 레짐, 심볼 성과와 최근 감사 요약은 필요할 때만 펼쳐서 봅니다.
+          </p>
+          <div className="mt-4 grid gap-4 xl:grid-cols-2">
+            {performanceRows(
+              "상위 수익 rationale",
+              primaryWindow?.rationale_winners ?? [],
+              "최근 구간에서 상위 수익 rationale 데이터가 없습니다.",
+            )}
+            {performanceRows(
+              "상위 손실 rationale",
+              primaryWindow?.rationale_losers ?? [],
+              "최근 구간에서 상위 손실 rationale 데이터가 없습니다.",
+            )}
+          </div>
+          <div className="mt-4 grid gap-4 xl:grid-cols-2">
+            {performanceRows("레짐별 성과", primaryWindow?.top_regimes ?? [], "레짐별 집계가 없습니다.")}
+            {performanceRows("심볼별 성과", primaryWindow?.top_symbols ?? [], "심볼별 집계가 없습니다.")}
+          </div>
+          <div className="mt-4 rounded-2xl bg-slate-50 p-4">
+            <h4 className="text-sm font-semibold text-slate-950">최근 감사 요약</h4>
+            <div className="mt-3 space-y-3">
+              {recentGlobalAuditEvents.length === 0 ? (
+                <div className="rounded-2xl bg-white px-4 py-3 text-sm text-slate-500">
+                  최근 전역 감사 이벤트가 없습니다.
+                </div>
+              ) : (
+                recentGlobalAuditEvents.map((event) => (
+                  <div
+                    key={`${event.event_type}-${event.entity_id}-${event.created_at}`}
+                    className="rounded-2xl bg-white px-4 py-3"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
+                          event.severity === "error"
+                            ? "danger"
+                            : event.severity === "warning"
+                              ? "warn"
+                              : "neutral",
+                        )}`}
+                      >
+                        {translateSeverity(event.severity)}
+                      </span>
+                      <span className="text-xs text-slate-500">{formatDateTime(event.created_at)}</span>
+                    </div>
+                    <p className="mt-2 text-sm text-slate-800">{event.message}</p>
+                    {auditPayloadRows(event.payload).length > 0 ? (
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        {auditPayloadRows(event.payload).map(([label, value]) => (
+                          <div key={`${event.event_type}-${label}`} className="rounded-xl bg-slate-50 px-3 py-2">
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">{label}</p>
+                            <p className="mt-1 text-sm text-slate-700">{value}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </details>
       </div>
     </section>
   );
@@ -954,10 +1367,20 @@ function SymbolStatusBoard({
                       : "없음"}
                   </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
-                    {item.protection_status.status}
-                    {item.protection_status.missing_components.length > 0
-                      ? ` (${item.protection_status.missing_components.join(", ")})`
-                      : ""}
+                    <div className="space-y-1">
+                      <div>
+                        {item.protection_status.status}
+                        {item.protection_status.missing_components.length > 0
+                          ? ` (${item.protection_status.missing_components.join(", ")})`
+                          : ""}
+                      </div>
+                      {item.protection_status.recovery_status ? (
+                        <div className="text-xs text-slate-500">
+                          {item.protection_status.recovery_status}
+                          {item.protection_status.auto_recovery_active ? " / auto" : ""}
+                        </div>
+                      ) : null}
+                    </div>
                   </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
                     <div className="space-y-1">
@@ -999,11 +1422,9 @@ function detailList(rows: Array<[string, string]>) {
 function SymbolDetailPanel({
   selectedSymbol,
   symbol,
-  globalAuditEvents,
 }: {
   selectedSymbol: string;
   symbol: OperatorSymbolSummary | null;
-  globalAuditEvents: AuditEvent[];
 }) {
   if (selectedSymbol === ALL_SYMBOLS || symbol === null) {
     return (
@@ -1017,44 +1438,16 @@ function SymbolDetailPanel({
         <div className="mt-5 rounded-2xl border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-600">
           상세 AI 판단, risk_guard 결과, 실행 결과, 감사 이벤트를 보려면 심볼을 선택하세요.
         </div>
-        <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-4">
-          <h3 className="text-sm font-semibold text-slate-950">최근 전역 감사 이벤트</h3>
-          <div className="mt-4 space-y-3">
-            {globalAuditEvents.length === 0 ? (
-              <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
-                최근 전역 감사 이벤트가 없습니다.
-              </div>
-            ) : (
-              globalAuditEvents.map((event) => (
-                <div
-                  key={`${event.event_type}-${event.entity_id}-${event.created_at}`}
-                  className="rounded-2xl bg-slate-50 px-4 py-3"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
-                        event.severity === "error"
-                          ? "danger"
-                          : event.severity === "warning"
-                            ? "warn"
-                            : "neutral",
-                      )}`}
-                    >
-                      {translateSeverity(event.severity)}
-                    </span>
-                    <span className="text-xs text-slate-500">{formatDateTime(event.created_at)}</span>
-                  </div>
-                  <p className="mt-2 text-sm text-slate-800">{event.message}</p>
-                </div>
-              ))
-            )}
-          </div>
+        <div className="mt-5 rounded-2xl border border-slate-200 bg-white p-4 text-sm leading-6 text-slate-600">
+          최근 전역 감사 이벤트와 성과 세부는 상단 summary의 접힌 섹션에서 확인할 수 있습니다.
+          심볼을 선택하면 해당 심볼 기준의 AI 추천, risk 승인/차단, 실제 실행, 감사 흐름이 아래에 표시됩니다.
         </div>
       </section>
     );
   }
 
   const blockedReasons = filteredBlockedReasons(symbol);
+  const adjustmentReasons = filteredAdjustmentReasons(symbol);
   const autoResized = symbol.risk_guard.auto_resized_entry;
   const recommendation = recommendationSummary(symbol.ai_decision.decision);
   const riskOutcome = riskOutcomeSummary(symbol);
@@ -1096,9 +1489,11 @@ function SymbolDetailPanel({
         {valueCard(
           "보호 상태",
           symbol.protection_status.status,
-          symbol.protection_status.missing_components.length > 0
-            ? `누락 ${symbol.protection_status.missing_components.join(", ")}`
-            : "보호 주문 구성 정상",
+          symbol.protection_status.last_error
+            ? symbol.protection_status.last_error
+            : symbol.protection_status.missing_components.length > 0
+              ? `누락 ${symbol.protection_status.missing_components.join(", ")}`
+              : "보호 주문 구성 정상",
         )}
       </div>
 
@@ -1158,9 +1553,10 @@ function SymbolDetailPanel({
             운영 상태 {translateOperatingState(symbol.risk_guard.operating_state)}
           </p>
           <div className="mt-4 space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">차단 사유</p>
             {blockedReasons.length === 0 ? (
               <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
-                최신 risk 차단 사유는 없습니다. 허용 또는 보류 상태입니다.
+                최신 risk 차단 사유는 없습니다.
               </div>
             ) : (
               blockedReasons.map((code) => (
@@ -1170,6 +1566,16 @@ function SymbolDetailPanel({
               ))
             )}
           </div>
+          {adjustmentReasons.length > 0 ? (
+            <div className="mt-4 space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">조정 사유</p>
+              {adjustmentReasons.map((code) => (
+                <div key={code} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                  {translateReasonCode(code)}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
           {valueCard(
@@ -1183,13 +1589,6 @@ function SymbolDetailPanel({
               ? `${formatNumber(symbol.risk_guard.approved_leverage, 2)}x`
               : "-",
             "결정론적 리스크 엔진이 허용한 최대 레버리지",
-          )}
-          {valueCard(
-            "raw projected notional",
-            symbol.risk_guard.raw_projected_notional !== null
-              ? formatNumber(symbol.risk_guard.raw_projected_notional, 2)
-              : "-",
-            "원래 계산된 신규 진입 예상 notional",
           )}
           {valueCard(
             "approved projected notional",
@@ -1217,11 +1616,9 @@ function SymbolDetailPanel({
             autoResized ? "리스크 여유 한도에 맞춰 신규 진입 크기를 자동 축소했습니다." : "원래 요청 크기가 그대로 승인되었습니다.",
           )}
           {valueCard(
-            "축소 비율",
-            symbol.risk_guard.size_adjustment_ratio !== null
-              ? formatRatio(symbol.risk_guard.size_adjustment_ratio)
-              : "-",
-            autoResized ? "raw 요청 크기 대비 최종 승인 크기 비율입니다." : "축소가 적용되지 않았습니다.",
+            "risk snapshot",
+            symbol.risk_guard.snapshot_id !== null ? String(symbol.risk_guard.snapshot_id) : "-",
+            symbol.risk_guard.as_of ? `as of ${formatDateTime(symbol.risk_guard.as_of)}` : "현재 cycle risk 기준 시각",
           )}
           {valueCard(
             "headroom",
@@ -1233,6 +1630,27 @@ function SymbolDetailPanel({
               : "가장 타이트한 노출도 여유 한도",
           )}
         </div>
+        <details className="rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:col-span-2">
+          <summary className="cursor-pointer list-none text-sm font-semibold text-slate-950">
+            리스크 수치 세부
+          </summary>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            {valueCard(
+              "raw projected notional",
+              symbol.risk_guard.raw_projected_notional !== null
+                ? formatNumber(symbol.risk_guard.raw_projected_notional, 2)
+                : "-",
+              "원래 계산된 신규 진입 예상 notional",
+            )}
+            {valueCard(
+              "축소 비율",
+              symbol.risk_guard.size_adjustment_ratio !== null
+                ? formatRatio(symbol.risk_guard.size_adjustment_ratio)
+                : "-",
+              autoResized ? "raw 요청 크기 대비 최종 승인 크기 비율입니다." : "축소가 적용되지 않았습니다.",
+            )}
+          </div>
+        </details>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1.2fr,0.8fr]">
@@ -1252,31 +1670,60 @@ function SymbolDetailPanel({
             <span className="text-xs text-slate-500">{formatDateTime(symbol.execution.created_at)}</span>
           </div>
           {symbol.execution.order_id ? (
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              {valueCard(
-                "주문 상태",
-                `${symbol.execution.order_type ?? "-"} / ${symbol.execution.order_status ?? "-"}`,
-                `${symbol.execution.symbol ?? "-"} / ${symbol.execution.side ?? "-"}`,
-              )}
-              {valueCard(
-                "체결 상태",
-                symbol.execution.execution_status ?? "체결 없음",
-                `평균 체결가 ${
-                  symbol.execution.average_fill_price !== null
-                    ? formatNumber(symbol.execution.average_fill_price, 2)
-                    : "-"
-                }`,
-              )}
-              {valueCard(
-                "요청 / 체결 수량",
-                `${symbol.execution.requested_quantity ?? 0} / ${symbol.execution.filled_quantity ?? 0}`,
-                "부분 체결 여부 확인",
-              )}
-              {valueCard(
-                "실행 품질",
-                String(symbol.execution.execution_quality.execution_quality_status ?? "-"),
-                String(symbol.execution.execution_quality.decision_quality_status ?? "판단 품질 정보 없음"),
-              )}
+            <div className="mt-4 space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                {valueCard(
+                  "주문 상태",
+                  `${symbol.execution.order_type ?? "-"} / ${symbol.execution.order_status ?? "-"}`,
+                  `${symbol.execution.symbol ?? "-"} / ${symbol.execution.side ?? "-"}`,
+                )}
+                {valueCard(
+                  "체결 상태",
+                  symbol.execution.execution_status ?? "체결 없음",
+                  `평균 체결가 ${
+                    symbol.execution.average_fill_price !== null
+                      ? formatNumber(symbol.execution.average_fill_price, 2)
+                      : "-"
+                  }`,
+                )}
+                {valueCard(
+                  "요청 / 체결 수량",
+                  `${symbol.execution.requested_quantity ?? 0} / ${symbol.execution.filled_quantity ?? 0}`,
+                  "부분 체결 여부 확인",
+                )}
+                {valueCard(
+                  "실행 품질",
+                  String(symbol.execution.execution_quality.execution_quality_status ?? "-"),
+                  String(symbol.execution.execution_quality.decision_quality_status ?? "판단 품질 정보 없음"),
+                )}
+              </div>
+              <div className="rounded-2xl bg-slate-50 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <h4 className="text-sm font-semibold text-slate-950">최근 체결 요약</h4>
+                  <span className="text-xs text-slate-500">{symbol.execution.recent_fills.length}건</span>
+                </div>
+                {symbol.execution.recent_fills.length === 0 ? (
+                  <p className="mt-3 text-sm text-slate-500">최근 체결 세부가 없습니다.</p>
+                ) : (
+                  <div className="mt-3 space-y-2">
+                    {symbol.execution.recent_fills.map((fill) => (
+                      <div key={fill.execution_id ?? fill.external_trade_id ?? fill.created_at ?? "fill"} className="rounded-xl bg-white px-3 py-3">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <p className="text-sm font-medium text-slate-900">
+                            {fill.fill_quantity ?? 0} @ {fill.fill_price !== null ? formatNumber(fill.fill_price, 2) : "-"}
+                          </p>
+                          <span className="text-xs text-slate-500">{formatDateTime(fill.created_at)}</span>
+                        </div>
+                        <p className="mt-2 text-xs text-slate-600">
+                          fee {fill.fee_paid !== null ? formatNumber(fill.fee_paid, 4) : "-"} {fill.commission_asset ?? ""}
+                          {" / "}
+                          realized {fill.realized_pnl !== null ? formatMoney(fill.realized_pnl) : "-"}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           ) : (
             <div className="mt-4 rounded-2xl bg-slate-50 px-4 py-4 text-sm text-slate-600">
@@ -1311,7 +1758,26 @@ function SymbolDetailPanel({
                 symbol.protection_status.has_take_profit ? "있음" : "없음"
               }`,
             )}
+            {valueCard(
+              "protection recovery",
+              symbol.protection_status.recovery_status ?? "-",
+              symbol.protection_status.auto_recovery_active
+                ? `auto recovery / failures ${symbol.protection_status.failure_count}`
+                : `failures ${symbol.protection_status.failure_count}`,
+            )}
+            {valueCard(
+              "protective verify",
+              symbol.protection_status.verification_status ?? (symbol.protection_status.protected ? "verified" : "-"),
+              symbol.protection_status.last_event_type
+                ? `${symbol.protection_status.last_event_type} / ${formatDateTime(symbol.protection_status.last_event_at)}`
+                : "최근 protection 이벤트 없음",
+            )}
           </div>
+          {symbol.protection_status.last_error ? (
+            <div className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              {symbol.protection_status.last_error}
+            </div>
+          ) : null}
         </div>
       </div>
 
@@ -1346,6 +1812,16 @@ function SymbolDetailPanel({
                   </span>
                 </div>
                 <p className="mt-2 text-sm text-slate-800">{event.message}</p>
+                {auditPayloadRows(event.payload).length > 0 ? (
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {auditPayloadRows(event.payload).map(([label, value]) => (
+                      <div key={`${event.event_type}-${label}`} className="rounded-xl bg-white px-3 py-2">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">{label}</p>
+                        <p className="mt-1 text-sm text-slate-700">{value}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ))
           )}
@@ -1355,7 +1831,7 @@ function SymbolDetailPanel({
   );
 }
 
-export function OverviewDashboard({ initial }: { initial: Payload }) {
+export function OverviewDashboard({ initial }: { initial: OperatorDashboardPayload }) {
   const [payload, setPayload] = useState(initial);
   const [lastUpdated, setLastUpdated] = useState(() => new Date());
   const [refreshError, setRefreshError] = useState("");
@@ -1389,7 +1865,7 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
     };
   }, []);
 
-  const operator = payload.operator;
+  const operator = payload;
   const selectedSymbol = useMemo(
     () =>
       resolveSelectedSymbol(
@@ -1404,6 +1880,10 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
     selectedSymbol === ALL_SYMBOLS
       ? null
       : operator.symbols.find((item) => item.symbol === selectedSymbol) ?? null;
+  const focusSymbolSummary = useMemo(
+    () => resolveFocusSymbolSummary(operator.symbols, selectedSymbol, operator.control.default_symbol),
+    [operator.control.default_symbol, operator.symbols, selectedSymbol],
+  );
   const execution24h = operator.execution_windows.find((item) => item.window === "24h");
 
   const handleSymbolSelect = (value: string) => {
@@ -1426,6 +1906,8 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
         market={operator.market_signal}
         execution24h={execution24h}
         selectedSymbol={selectedSymbol}
+        focusSymbol={focusSymbolSummary}
+        globalAuditEvents={operator.audit_events}
       />
 
       <SymbolFilterBar
@@ -1440,11 +1922,7 @@ export function OverviewDashboard({ initial }: { initial: Payload }) {
         onSelect={handleSymbolSelect}
       />
 
-      <SymbolDetailPanel
-        selectedSymbol={selectedSymbol}
-        symbol={selectedSymbolSummary}
-        globalAuditEvents={operator.audit_events}
-      />
+      <SymbolDetailPanel selectedSymbol={selectedSymbol} symbol={selectedSymbolSummary} />
 
       <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500">
         <span>마지막 로컬 갱신 {lastUpdated.toLocaleTimeString("ko-KR", { hour12: false })}</span>

@@ -32,6 +32,8 @@ class Setting(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     live_trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    rollout_mode: Mapped[str] = mapped_column(String(20), default="paper")
+    limited_live_max_notional: Mapped[float] = mapped_column(Float, default=500.0)
     manual_live_approval: Mapped[bool] = mapped_column(Boolean, default=False)
     live_execution_armed: Mapped[bool] = mapped_column(Boolean, default=False)
     live_execution_armed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
@@ -154,6 +156,36 @@ class RiskCheck(TimestampMixin, Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class PendingEntryPlan(TimestampMixin, Base):
+    __tablename__ = "pending_entry_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    side: Mapped[str] = mapped_column(String(10), index=True)
+    plan_status: Mapped[str] = mapped_column(String(20), default="armed", index=True)
+    source_decision_run_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    regime: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    posture: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    rationale_codes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_timeframe: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    entry_mode: Mapped[str] = mapped_column(String(30), default="pullback_confirm")
+    entry_zone_min: Mapped[float] = mapped_column(Float)
+    entry_zone_max: Mapped[float] = mapped_column(Float)
+    invalidation_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_chase_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    idea_ttl_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_pct_cap: Mapped[float] = mapped_column(Float, default=0.0)
+    leverage_cap: Mapped[float] = mapped_column(Float, default=0.0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True)
+    triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    canceled_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class Position(TimestampMixin, Base):
     __tablename__ = "positions"
 
@@ -227,11 +259,30 @@ class PnLSnapshot(TimestampMixin, Base):
     snapshot_date: Mapped[date] = mapped_column(Date, index=True)
     equity: Mapped[float] = mapped_column(Float)
     cash_balance: Mapped[float] = mapped_column(Float)
+    wallet_balance: Mapped[float] = mapped_column(Float, default=0.0)
+    available_balance: Mapped[float] = mapped_column(Float, default=0.0)
+    gross_realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    fee_total: Mapped[float] = mapped_column(Float, default=0.0)
+    funding_total: Mapped[float] = mapped_column(Float, default=0.0)
+    net_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     daily_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     cumulative_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     consecutive_losses: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AccountLedgerEntry(TimestampMixin, Base):
+    __tablename__ = "account_ledger_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entry_type: Mapped[str] = mapped_column(String(30), index=True, default="funding")
+    asset: Mapped[str] = mapped_column(String(20), default="USDT")
+    symbol: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    amount: Mapped[float] = mapped_column(Float, default=0.0)
+    external_ref_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), index=True, default=utcnow_naive)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class Alert(TimestampMixin, Base):

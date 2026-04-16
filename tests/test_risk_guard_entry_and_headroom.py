@@ -72,6 +72,56 @@ def _seed_live_ready_settings(db_session):
     return settings_row
 
 
+class _RiskFilterClient:
+    def __init__(self, *, tick_size: float = 0.1, step_size: float = 0.001, min_qty: float = 0.001, min_notional: float = 5.0) -> None:
+        self.filters = {
+            "tick_size": tick_size,
+            "step_size": step_size,
+            "min_qty": min_qty,
+            "min_notional": min_notional,
+        }
+
+    def normalize_order_request(
+        self,
+        *,
+        symbol: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        stop_price: float | None = None,
+        reference_price: float | None = None,
+        approved_notional: float | None = None,
+        enforce_min_notional: bool = True,
+        close_position: bool = False,
+    ) -> dict[str, object]:
+        del price, stop_price, close_position
+        normalized_quantity = abs(float(quantity or 0.0))
+        step_size = self.filters["step_size"]
+        if step_size > 0:
+            normalized_quantity = float(int(normalized_quantity / step_size)) * step_size
+        safe_reference = max(float(reference_price or 0.0), 1.0)
+        if approved_notional is not None and approved_notional > 0:
+            max_quantity = approved_notional / safe_reference
+            if step_size > 0:
+                max_quantity = float(int(max_quantity / step_size)) * step_size
+            normalized_quantity = min(normalized_quantity, max(max_quantity, 0.0))
+        notional = normalized_quantity * safe_reference
+        reason_code = None
+        if normalized_quantity <= 0:
+            reason_code = "ORDER_QTY_ZERO_AFTER_STEP_SIZE"
+        elif normalized_quantity < self.filters["min_qty"]:
+            reason_code = "ORDER_QTY_BELOW_MIN_QTY"
+        elif enforce_min_notional and notional < self.filters["min_notional"]:
+            reason_code = "ORDER_NOTIONAL_BELOW_MIN_NOTIONAL"
+        return {
+            "symbol": symbol.upper(),
+            "quantity": round(normalized_quantity, 6),
+            "reference_price": round(safe_reference, 6),
+            "notional": round(max(notional, 0.0), 6),
+            "filters": dict(self.filters),
+            "reason_code": reason_code,
+        }
+
+
 def test_auto_resize_rechecks_directional_and_single_position_limits(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.max_largest_position_pct = 1.5
@@ -126,14 +176,26 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
         snapshot,
         execution_mode="historical_replay",
     )
+    overview = get_overview(db_session)
+    payload = get_operator_dashboard(db_session)
+    btc = next(item for item in payload.symbols if item.symbol == "BTCUSDT")
 
     assert result.allowed is True
     assert result.auto_resized_entry is True
-    assert "ENTRY_AUTO_RESIZED" in result.reason_codes
-    assert "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT" in result.reason_codes
+    assert result.reason_codes == []
+    assert result.blocked_reason_codes == []
+    assert "ENTRY_AUTO_RESIZED" in result.adjustment_reason_codes
+    assert "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT" in result.adjustment_reason_codes
     assert "DIRECTIONAL_BIAS_LIMIT_REACHED" not in result.reason_codes
     assert "LARGEST_POSITION_LIMIT_REACHED" not in result.reason_codes
     assert result.approved_projected_notional == pytest.approx(40000.0, abs=5.0)
+    assert overview.blocked_reasons == []
+    assert overview.latest_blocked_reasons == []
+    assert btc.blocked_reasons == []
+    assert btc.risk_guard.reason_codes == []
+    assert btc.risk_guard.blocked_reason_codes == []
+    assert "ENTRY_AUTO_RESIZED" in btc.risk_guard.adjustment_reason_codes
+    assert "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT" in btc.risk_guard.adjustment_reason_codes
     assert result.debug_payload["current_symbol_notional"] == pytest.approx(100000.03, abs=5.0)
     assert result.debug_payload["current_directional_notional"] == pytest.approx(160000.03, abs=5.0)
     assert result.debug_payload["projected_symbol_notional"] == pytest.approx(140000.03, abs=5.0)
@@ -145,6 +207,90 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
     assert result.debug_payload["final_exposure_limit_codes"] == []
     assert result.debug_payload["headroom"]["directional_headroom_notional"] == pytest.approx(40000.0, abs=5.0)
     assert result.debug_payload["headroom"]["single_position_headroom_notional"] == pytest.approx(50000.0, abs=5.0)
+
+
+def test_headroom_auto_resize_blocks_when_exchange_min_notional_cannot_be_met(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_directional_bias_pct = 0.64
+    db_session.add(
+        Position(
+            symbol="ETHUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=19.875,
+            entry_price=3200.0,
+            mark_price=3200.0,
+            leverage=2.0,
+            stop_loss=3100.0,
+            take_profit=3400.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        entry_zone_min=snapshot.latest_price - 5.0,
+        entry_zone_max=snapshot.latest_price + 5.0,
+        stop_loss=snapshot.latest_price - 1.0,
+        take_profit=snapshot.latest_price + 80.0,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        exchange_client=_RiskFilterClient(min_notional=5000.0),
+    )
+
+    assert result.allowed is False
+    assert result.auto_resized_entry is False
+    assert "ENTRY_SIZE_BELOW_MIN_NOTIONAL" in result.reason_codes
+    assert result.approved_projected_notional == 0.0
+    assert result.approved_quantity is None
+    assert "DIRECTIONAL_BIAS_LIMIT_REACHED" in result.debug_payload["requested_exposure_limit_codes"]
+    assert result.debug_payload["requested_exchange_reason_code"] is None
+    assert result.debug_payload["resized_exchange_reason_code"] is None
+    assert result.debug_payload["exchange_minimums"]["min_notional"] == 5000.0
+    assert result.debug_payload["exchange_minimums"]["filter_source"] == "exchange_filters"
+    assert result.debug_payload["headroom"]["limiting_headroom_notional"] < result.debug_payload["exchange_minimums"]["minimum_actionable_notional"]
+
+
+def test_entry_is_blocked_when_exchange_min_qty_cannot_be_met(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=snapshot.latest_price - 25.0,
+        entry_zone_max=snapshot.latest_price + 25.0,
+        stop_loss=snapshot.latest_price - 1000.0,
+        take_profit=snapshot.latest_price + 1500.0,
+        max_chase_bps=20.0,
+        risk_pct=0.00025,
+        leverage=0.5,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        exchange_client=_RiskFilterClient(step_size=0.01, min_qty=0.1, min_notional=10.0),
+    )
+
+    assert result.allowed is False
+    assert result.auto_resized_entry is False
+    assert result.reason_codes == ["ENTRY_SIZE_BELOW_MIN_NOTIONAL"]
+    assert result.approved_projected_notional == 0.0
+    assert result.approved_quantity is None
+    assert result.debug_payload["requested_exchange_reason_code"] == "ORDER_QTY_BELOW_MIN_QTY"
+    assert result.debug_payload["exchange_minimums"]["min_qty"] == 0.1
+    assert result.debug_payload["exchange_minimums"]["minimum_actionable_quantity"] == pytest.approx(0.1, abs=1e-6)
 
 
 def test_entry_trigger_failure_exposes_trigger_debug_payload(db_session) -> None:
@@ -173,6 +319,8 @@ def test_entry_trigger_failure_exposes_trigger_debug_payload(db_session) -> None
     trigger_debug = result.debug_payload["entry_trigger"]
     assert result.allowed is False
     assert result.reason_codes == ["ENTRY_TRIGGER_NOT_MET"]
+    assert result.blocked_reason_codes == ["ENTRY_TRIGGER_NOT_MET"]
+    assert result.adjustment_reason_codes == []
     assert trigger_debug["trigger_met"] is False
     assert trigger_debug["breakout_confirmed"] is False
     assert trigger_debug["mode"] == "breakout_confirm"
@@ -309,7 +457,7 @@ def test_stale_sync_reason_keeps_sync_timestamps_in_debug_payload(db_session) ->
     assert result.sync_freshness_summary["account"]["stale"] is True
 
 
-def test_dashboard_prefers_latest_risk_payload_reason_codes_and_debug_payload(db_session) -> None:
+def test_dashboard_prefers_blocked_reason_codes_from_latest_risk_payload(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     now = utcnow_naive()
     db_session.add(
@@ -377,7 +525,9 @@ def test_dashboard_prefers_latest_risk_payload_reason_codes_and_debug_payload(db
             payload={
                 "allowed": False,
                 "decision": "long",
-                "reason_codes": ["DIRECTIONAL_BIAS_LIMIT_REACHED"],
+                "reason_codes": ["ENTRY_AUTO_RESIZED"],
+                "blocked_reason_codes": ["DIRECTIONAL_BIAS_LIMIT_REACHED"],
+                "adjustment_reason_codes": ["ENTRY_AUTO_RESIZED"],
                 "approved_risk_pct": 0.0,
                 "approved_leverage": 0.0,
                 "debug_payload": debug_payload,
@@ -393,6 +543,61 @@ def test_dashboard_prefers_latest_risk_payload_reason_codes_and_debug_payload(db
     assert overview.blocked_reasons == ["DIRECTIONAL_BIAS_LIMIT_REACHED"]
     assert btc.blocked_reasons == ["DIRECTIONAL_BIAS_LIMIT_REACHED"]
     assert btc.risk_guard.reason_codes == ["DIRECTIONAL_BIAS_LIMIT_REACHED"]
+    assert btc.risk_guard.blocked_reason_codes == ["DIRECTIONAL_BIAS_LIMIT_REACHED"]
+    assert btc.risk_guard.adjustment_reason_codes == ["ENTRY_AUTO_RESIZED"]
     assert btc.risk_guard.debug_payload == debug_payload
     assert overview.latest_risk is not None
     assert overview.latest_risk["reason_codes"] == ["DIRECTIONAL_BIAS_LIMIT_REACHED"]
+    assert overview.latest_risk["blocked_reason_codes"] == ["DIRECTIONAL_BIAS_LIMIT_REACHED"]
+    assert overview.latest_risk["adjustment_reason_codes"] == ["ENTRY_AUTO_RESIZED"]
+
+
+def test_dashboard_falls_back_to_legacy_payload_reason_codes_when_blocked_field_missing(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        PnLSnapshot(
+            snapshot_date=date.today(),
+            equity=100000.0,
+            cash_balance=100000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+            daily_pnl=0.0,
+            cumulative_pnl=0.0,
+            consecutive_losses=0,
+        )
+    )
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision_run_id=None,
+            market_snapshot_id=None,
+            allowed=False,
+            decision="long",
+            reason_codes=["ENTRY_TRIGGER_NOT_MET"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={
+                "allowed": False,
+                "decision": "long",
+                "reason_codes": ["ENTRY_TRIGGER_NOT_MET"],
+                "approved_risk_pct": 0.0,
+                "approved_leverage": 0.0,
+            },
+        )
+    )
+    db_session.flush()
+
+    overview = get_overview(db_session)
+    payload = get_operator_dashboard(db_session)
+    btc = next(item for item in payload.symbols if item.symbol == "BTCUSDT")
+
+    assert overview.blocked_reasons == ["ENTRY_TRIGGER_NOT_MET"]
+    assert overview.latest_risk is not None
+    assert overview.latest_risk["reason_codes"] == ["ENTRY_TRIGGER_NOT_MET"]
+    assert overview.latest_risk["blocked_reason_codes"] == ["ENTRY_TRIGGER_NOT_MET"]
+    assert overview.latest_risk["adjustment_reason_codes"] == []
+    assert btc.blocked_reasons == ["ENTRY_TRIGGER_NOT_MET"]
+    assert btc.risk_guard.reason_codes == ["ENTRY_TRIGGER_NOT_MET"]
+    assert btc.risk_guard.blocked_reason_codes == ["ENTRY_TRIGGER_NOT_MET"]
+    assert btc.risk_guard.adjustment_reason_codes == []

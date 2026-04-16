@@ -9,6 +9,9 @@ const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:800
 const scheduleOptions = ["1h", "4h", "12h", "24h"] as const;
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기", "AI 설정", "Binance 연동"] as const;
+const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
+
+type RolloutMode = (typeof rolloutModeOptions)[number];
 
 type ProtectionSyncState = {
   status?: string;
@@ -49,6 +52,19 @@ type SymbolEffectiveCadence = {
   next_ai_call_due_at: string | null;
 };
 
+type ControlStatusSummary = {
+  exchange_can_trade: boolean | null;
+  rollout_mode: RolloutMode;
+  exchange_submit_allowed: boolean;
+  limited_live_max_notional: number | null;
+  app_live_armed: boolean;
+  approval_window_open: boolean;
+  paused: boolean;
+  degraded: boolean;
+  risk_allowed: boolean | null;
+  blocked_reasons_current_cycle: string[];
+};
+
 export type SettingsPayload = {
   id: number;
   mode: string;
@@ -66,6 +82,9 @@ export type SettingsPayload = {
   adaptive_protection_summary: Record<string, unknown>;
   adaptive_signal_summary: Record<string, unknown>;
   position_management_summary: Record<string, unknown>;
+  rollout_mode: RolloutMode;
+  exchange_submit_allowed: boolean;
+  limited_live_max_notional: number | null;
   live_trading_enabled: boolean;
   live_trading_env_enabled: boolean;
   manual_live_approval: boolean;
@@ -87,6 +106,7 @@ export type SettingsPayload = {
   auto_resume_status: string;
   auto_resume_last_blockers: string[];
   latest_blocked_reasons: string[];
+  control_status_summary?: ControlStatusSummary | null;
   pause_severity: string | null;
   pause_recovery_class: string | null;
   default_symbol: string;
@@ -165,10 +185,11 @@ type FormState = Omit<
   | "protection_recovery_failure_count" | "missing_protection_symbols" | "missing_protection_items"
   | "pnl_summary" | "account_sync_summary" | "exposure_summary" | "execution_policy_summary" | "market_context_summary" | "adaptive_protection_summary" | "adaptive_signal_summary"
   | "position_management_summary" | "symbol_effective_cadences"
+  | "exchange_submit_allowed"
   | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
-  | "pause_recovery_class" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
+  | "pause_recovery_class" | "control_status_summary" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
   | "estimated_monthly_ai_calls" | "estimated_monthly_ai_calls_breakdown" | "projected_monthly_ai_calls_if_enabled"
   | "projected_monthly_ai_calls_breakdown_if_enabled" | "recent_ai_calls_24h" | "recent_ai_calls_7d" | "recent_ai_successes_24h"
   | "recent_ai_successes_7d" | "recent_ai_failures_24h" | "recent_ai_failures_7d" | "recent_ai_tokens_24h"
@@ -223,6 +244,8 @@ function normalizeSymbolOverrides(overrides: SymbolCadenceOverride[]) {
 function toFormState(initial: SettingsPayload): FormState {
   return {
     live_trading_enabled: initial.live_trading_enabled,
+    rollout_mode: initial.rollout_mode,
+    limited_live_max_notional: initial.limited_live_max_notional ?? 500,
     manual_live_approval: initial.manual_live_approval,
     live_approval_window_minutes: initial.live_approval_window_minutes,
     default_symbol: initial.default_symbol,
@@ -289,6 +312,203 @@ function MetricCard({ label, value, tone = "default" }: { label: string; value: 
   if (tone === "dark") return <div className="rounded-[1.5rem] bg-slate-950 px-4 py-4 text-white"><p className="text-xs uppercase tracking-[0.24em] text-white/60">{label}</p><p className="mt-2 text-xl font-semibold">{value}</p></div>;
   if (tone === "warm") return <div className="rounded-[1.5rem] border border-amber-200 bg-amber-50 px-4 py-4"><p className="text-xs uppercase tracking-[0.24em] text-amber-900">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
   return <div className="rounded-[1.5rem] border border-slate-200 bg-white px-4 py-4"><p className="text-xs uppercase tracking-[0.24em] text-slate-500">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
+}
+
+function dedupeReasons(values: string[]) {
+  return values.filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function rolloutModeLabel(mode: RolloutMode) {
+  switch (mode) {
+    case "paper":
+      return "paper";
+    case "shadow":
+      return "shadow";
+    case "live_dry_run":
+      return "live dry-run";
+    case "limited_live":
+      return "limited live";
+    case "full_live":
+      return "full live";
+    default:
+      return mode;
+  }
+}
+
+function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSummary {
+  const summary = state.control_status_summary;
+  return {
+    exchange_can_trade: summary?.exchange_can_trade ?? null,
+    rollout_mode: summary?.rollout_mode ?? state.rollout_mode,
+    exchange_submit_allowed: summary?.exchange_submit_allowed ?? state.exchange_submit_allowed,
+    limited_live_max_notional: summary?.limited_live_max_notional ?? state.limited_live_max_notional,
+    app_live_armed: summary?.app_live_armed ?? state.live_execution_armed,
+    approval_window_open: summary?.approval_window_open ?? state.live_execution_armed,
+    paused: summary?.paused ?? state.trading_paused,
+    degraded: summary?.degraded ?? state.operating_state === "DEGRADED_MANAGE_ONLY",
+    risk_allowed: summary?.risk_allowed ?? null,
+    blocked_reasons_current_cycle: dedupeReasons(
+      summary?.blocked_reasons_current_cycle ?? state.latest_blocked_reasons,
+    ),
+  };
+}
+
+function ControlStatusPanel({ state }: { state: SettingsPayload }) {
+  const summary = resolveControlStatusSummary(state);
+  const currentCycleBlockedReasons = summary.blocked_reasons_current_cycle;
+  const primaryBlocker = currentCycleBlockedReasons[0];
+  const cards = [
+    {
+      label: "rollout mode",
+      value: rolloutModeLabel(summary.rollout_mode),
+      detail:
+        summary.rollout_mode === "paper"
+          ? "paper 경로만 사용하고 거래소 submit은 비활성화됩니다."
+          : summary.rollout_mode === "shadow"
+            ? "AI/risk/execution intent와 audit까지만 수행하고 실제 submit은 금지됩니다."
+            : summary.rollout_mode === "live_dry_run"
+              ? "거래소 sync와 preflight까지 수행하고 실제 submit은 금지됩니다."
+              : summary.rollout_mode === "limited_live"
+                ? `실제 submit은 허용되지만 주문당 notional이 ${formatDisplayValue(summary.limited_live_max_notional, "limited_live_max_notional")}로 제한됩니다.`
+                : "기존 full live submit 경로를 사용합니다.",
+      tone:
+        summary.rollout_mode === "full_live"
+          ? ("good" as const)
+          : summary.rollout_mode === "limited_live"
+            ? ("warn" as const)
+            : ("neutral" as const),
+    },
+    {
+      label: "거래소 canTrade",
+      value:
+        summary.exchange_can_trade === null
+          ? "미확인"
+          : summary.exchange_can_trade
+            ? "주문 가능"
+            : "주문 차단",
+      detail:
+        summary.exchange_can_trade === null
+          ? "최근 account sync에 거래소 canTrade truth가 없습니다."
+          : summary.exchange_can_trade
+            ? "거래소 계좌 상태 기준으로 신규 주문이 가능합니다."
+            : "거래소 계좌 상태 기준으로 신규 주문이 차단됩니다.",
+      tone:
+        summary.exchange_can_trade === null
+          ? ("neutral" as const)
+          : summary.exchange_can_trade
+            ? ("good" as const)
+            : ("danger" as const),
+    },
+    {
+      label: "앱 live arm",
+      value: summary.app_live_armed ? "Arm됨" : "Arm 해제",
+      detail: summary.app_live_armed
+        ? "앱 실거래 경로가 arm 상태입니다."
+        : "앱 live arm이 내려가 있어 실거래 경로가 열리지 않습니다.",
+      tone: summary.app_live_armed ? ("good" as const) : ("warn" as const),
+    },
+    {
+      label: "approval window",
+      value: summary.approval_window_open ? "열림" : "닫힘",
+      detail: summary.approval_window_open
+        ? state.live_execution_armed_until
+          ? `만료 ${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")}`
+          : "승인 창이 유효합니다."
+        : "실주문 승인 창을 다시 열어야 합니다.",
+      tone: summary.approval_window_open ? ("good" as const) : ("warn" as const),
+    },
+    {
+      label: "pause",
+      value: summary.paused ? "중지" : "운영 중",
+      detail: summary.paused
+        ? formatDisplayValue(state.pause_reason_code, "pause_reason_code")
+        : "운영 중지 플래그가 활성화되어 있지 않습니다.",
+      tone: summary.paused ? ("danger" as const) : ("good" as const),
+    },
+    {
+      label: "degraded",
+      value: summary.degraded ? "관리 전용" : "정상",
+      detail: summary.degraded
+        ? `${formatDisplayValue(state.operating_state, "operating_state")} / 보호 복구 ${formatDisplayValue(state.protection_recovery_status, "protection_recovery_status")}`
+        : "관리 전용 또는 비상 복구 상태로 내려가 있지 않습니다.",
+      tone: summary.degraded ? ("warn" as const) : ("good" as const),
+    },
+    {
+      label: "risk 허용",
+      value:
+        summary.risk_allowed === null
+          ? "미평가"
+          : summary.risk_allowed
+            ? "허용"
+            : "차단",
+      detail:
+        summary.risk_allowed === null
+          ? "현재 cycle risk 결과가 아직 집계되지 않았습니다."
+          : summary.risk_allowed
+            ? "현재 cycle risk_guard가 신규 진입을 허용했습니다."
+            : primaryBlocker
+              ? formatDisplayValue(primaryBlocker, "blocked_reason_codes")
+              : state.guard_mode_reason_message ?? "현재 cycle risk_guard가 신규 진입을 차단했습니다.",
+      tone:
+        summary.risk_allowed === null
+          ? ("neutral" as const)
+          : summary.risk_allowed
+            ? ("good" as const)
+            : ("danger" as const),
+    },
+  ];
+
+  return (
+    <div className="mt-4 space-y-4">
+      <div className="grid gap-3 xl:grid-cols-3">
+        {cards.map((card) => (
+          <div key={card.label} className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium text-slate-500">{card.label}</p>
+              <StatusPill tone={card.tone}>{card.value}</StatusPill>
+            </div>
+            <p className="mt-3 text-sm leading-6 text-slate-700">{card.detail}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-slate-900">현재 cycle 차단 사유</p>
+            <p className="mt-1 text-sm leading-6 text-slate-600">
+              과거 blocker나 auto-resume blocker를 섞지 않고, 지금 cycle 기준으로 신규 진입을 막는
+              이유만 보여줍니다.
+            </p>
+          </div>
+          <StatusPill tone={currentCycleBlockedReasons.length > 0 ? "warn" : "good"}>
+            {currentCycleBlockedReasons.length > 0 ? `${currentCycleBlockedReasons.length}건` : "없음"}
+          </StatusPill>
+        </div>
+        <div className="mt-4 space-y-2">
+          {currentCycleBlockedReasons.length === 0 ? (
+            <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
+              현재 cycle 기준 차단 사유는 없습니다.
+            </div>
+          ) : (
+            currentCycleBlockedReasons.map((reason) => (
+              <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm text-slate-800">
+                {formatDisplayValue(reason, "blocked_reason_codes")}
+              </div>
+            ))
+          )}
+        </div>
+        {state.auto_resume_last_blockers.length > 0 ? (
+          <div className="mt-4 rounded-2xl border border-dashed border-slate-200 px-4 py-3 text-sm text-slate-600">
+            자동 복구 차단 사유:{" "}
+            {state.auto_resume_last_blockers
+              .map((reason) => formatDisplayValue(reason, "auto_resume_last_blockers"))
+              .join(", ")}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function SymbolCadenceOverridePanel({
@@ -593,7 +813,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   };
 
   const payload = {
-    live_trading_enabled: form.live_trading_enabled,
+    live_trading_enabled: form.rollout_mode !== "paper",
+    rollout_mode: form.rollout_mode,
+    limited_live_max_notional: form.limited_live_max_notional,
     manual_live_approval: form.manual_live_approval,
     live_approval_window_minutes: form.live_approval_window_minutes,
     default_symbol: form.default_symbol,
@@ -660,13 +882,13 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">실거래 설정</p>
           <h2 className="mt-2 text-2xl font-semibold text-slate-900 sm:text-3xl">심볼, AI, 거래소 운영 제어</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면은 변경 가능한 설정값과 즉시 제어만 다룹니다. 실거래 준비 상태, 운영 중지, 가드 모드, 차단 사유는 개요 화면을 기준으로 확인합니다.</p>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면은 변경 가능한 설정값과 즉시 제어를 다루되, 현재 gate 상태도 함께 보여줍니다. 심볼별 AI 추천, risk 승인, 실제 실행 흐름은 개요 화면에서 이어서 확인합니다.</p>
         </div>
         <div className="grid gap-2 sm:grid-cols-2">
           <StatusPill tone={state.openai_api_key_configured ? "good" : "warn"}>OpenAI: {state.openai_api_key_configured ? "설정됨" : "없음"}</StatusPill>
           <StatusPill tone={state.binance_api_key_configured ? "good" : "warn"}>Binance Key: {state.binance_api_key_configured ? "설정됨" : "없음"}</StatusPill>
           <StatusPill tone={state.binance_api_secret_configured ? "good" : "warn"}>Binance Secret: {state.binance_api_secret_configured ? "설정됨" : "없음"}</StatusPill>
-          <StatusPill tone="neutral">운영 상태 모니터링은 개요에서 확인</StatusPill>
+          <StatusPill tone="neutral">심볼별 AI / risk / execution 흐름은 개요에서 확인</StatusPill>
         </div>
       </div>
 
@@ -689,20 +911,43 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            운영 중지, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어만 모았습니다. 현재 상태 해석은 개요 화면을 기준으로 봅니다.
+            운영 중지, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어를 모았습니다. 아래 상태는
+            백엔드가 내려준 현재 gate 요약이며, 심볼별 세부 흐름은 개요 화면에서 확인합니다.
           </p>
-          <div className="mt-4 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-600">
-            이 영역은 상태 모니터링이 아니라 제어와 설정 변경용입니다. 자동 복구 상태를 포함한 운영 상태 해석은 개요에서 확인하세요.
-          </div>
-          <div className="mt-4 grid gap-4 md:grid-cols-2">
-            <Field label="승인 유지 시간(분)"><input className={inputClass} min={0} max={240} type="number" value={form.live_approval_window_minutes} onChange={(event) => updateField("live_approval_window_minutes", Number(event.target.value))} /></Field>
-            <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">환경 게이트</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_trading_env_enabled ? "활성" : "비활성"}</p></div>
-            <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">승인 창 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_execution_armed ? `열림 (${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")})` : "닫힘"}</p></div>
-          </div>
-          <div className="mt-4 grid gap-3 md:grid-cols-2">
-            <Toggle checked={form.live_trading_enabled} label="실거래 경로 사용" onChange={(value) => updateField("live_trading_enabled", value)} />
-            <Toggle checked={form.manual_live_approval} label="수동 승인 정책 사용" onChange={(value) => updateField("manual_live_approval", value)} />
-          </div>
+            <ControlStatusPanel state={state} />
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Field label="rollout mode">
+                <select
+                  className={inputClass}
+                  value={form.rollout_mode}
+                  onChange={(event) => {
+                    const nextMode = event.target.value as RolloutMode;
+                    updateField("rollout_mode", nextMode);
+                    updateField("live_trading_enabled", nextMode !== "paper");
+                  }}
+                >
+                  {rolloutModeOptions.map((option) => (
+                    <option key={option} value={option}>{rolloutModeLabel(option)}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="승인 유지 시간(분)"><input className={inputClass} min={0} max={240} type="number" value={form.live_approval_window_minutes} onChange={(event) => updateField("live_approval_window_minutes", Number(event.target.value))} /></Field>
+              <Field label="limited live 주문당 최대 notional">
+                <input
+                  className={inputClass}
+                  min={1}
+                  step="1"
+                  type="number"
+                  value={form.limited_live_max_notional ?? 500}
+                  onChange={(event) => updateField("limited_live_max_notional", Number(event.target.value))}
+                />
+              </Field>
+              <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">환경 게이트</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_trading_env_enabled ? "활성" : "비활성"}</p></div>
+              <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">승인 창 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_execution_armed ? `열림 (${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")})` : "닫힘"}</p></div>
+            </div>
+            <div className="mt-4 grid gap-3 md:grid-cols-2">
+              <Toggle checked={form.manual_live_approval} label="수동 승인 정책 사용" onChange={(value) => updateField("manual_live_approval", value)} />
+            </div>
           <p className="mt-4 text-sm leading-6 text-slate-600">즉시 중지는 신규 진입만 막는 운영 중지입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/pause", "거래를 일시 중지했습니다.", syncSettings)} type="button">즉시 중지</button>

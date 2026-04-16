@@ -265,35 +265,53 @@ class TradingDecisionAgent:
         breakout_up = features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
         breakout_down = features.breakout.broke_swing_low or features.breakout.range_breakout_direction == "down"
         bullish_pullback = features.pullback_context.state == "bullish_pullback"
+        bullish_continuation = features.pullback_context.state == "bullish_continuation"
         bearish_pullback = features.pullback_context.state == "bearish_pullback"
+        bearish_continuation = features.pullback_context.state == "bearish_continuation"
+        strong_bullish_breakout_exception = (
+            breakout_up
+            and features.regime.trend_alignment == "bullish_aligned"
+            and not features.regime.weak_volume
+            and features.regime.momentum_state in {"strengthening", "stable"}
+            and features.trend_score >= 0.35
+            and features.momentum_score >= 0.2
+        )
+        strong_bearish_breakout_exception = (
+            breakout_down
+            and features.regime.trend_alignment == "bearish_aligned"
+            and not features.regime.weak_volume
+            and features.regime.momentum_state in {"strengthening", "stable"}
+            and features.trend_score <= -0.35
+            and features.momentum_score <= -0.2
+        )
 
         if decision == "long":
-            if breakout_up:
-                entry_mode = "breakout_confirm"
-            elif bullish_pullback:
+            if bullish_pullback or bullish_continuation:
                 entry_mode = "pullback_confirm"
+            elif strong_bullish_breakout_exception:
+                entry_mode = "breakout_confirm"
             else:
-                entry_mode = "immediate"
+                entry_mode = "pullback_confirm"
         else:
-            if breakout_down:
-                entry_mode = "breakout_confirm"
-            elif bearish_pullback:
+            if bearish_pullback or bearish_continuation:
                 entry_mode = "pullback_confirm"
+            elif strong_bearish_breakout_exception:
+                entry_mode = "breakout_confirm"
             else:
-                entry_mode = "immediate"
+                entry_mode = "pullback_confirm"
 
         if entry_mode == "breakout_confirm":
-            max_chase_bps = 12.0
+            max_chase_bps = 6.0
         elif entry_mode == "pullback_confirm":
-            max_chase_bps = 8.0
+            max_chase_bps = 4.0
         else:
-            max_chase_bps = 5.0
+            max_chase_bps = 2.0
 
         return {
             "entry_mode": entry_mode,
             "invalidation_price": stop_loss,
             "max_chase_bps": max_chase_bps,
-            "idea_ttl_minutes": min(max(self._timeframe_minutes(market_snapshot.timeframe), 5), 60),
+            "idea_ttl_minutes": min(max(self._timeframe_minutes(market_snapshot.timeframe), 10), 20),
         }
 
     def _normalize_entry_trigger_fields(
@@ -463,44 +481,86 @@ class TradingDecisionAgent:
             and features.candle_structure.body_ratio < 0.55
         )
         range_like_signal = regime_name == "range"
-        long_signal = (
-            trend_alignment == "bullish_aligned"
+        strong_bullish_breakout_exception = (
+            breakout_up
+            and trend_alignment == "bullish_aligned"
             and regime_name != "range"
-            and features.trend_score >= 0.22
-            and features.momentum_score >= 0.12
-            and 45.0 <= features.rsi <= 82.0
+            and features.trend_score >= 0.38
+            and features.momentum_score >= 0.24
             and not weak_volume
             and not bearish_rejection
+            and features.regime.momentum_state in {"strengthening", "stable"}
+            and features.volume_persistence.persistence_ratio >= 1.0
         )
-        if not long_signal:
-            long_signal = (
-                trend_alignment == "bullish_aligned"
-                and not weak_volume
-                and not countertrend
-                and (bullish_continuation or bullish_pullback or breakout_up)
-                and features.location.vwap_distance_pct >= -0.45
-                and (features.candle_structure.bullish_streak >= 2 or bullish_rejection or breakout_up)
-                and features.volume_persistence.persistence_ratio >= 0.9
-            )
-        short_signal = (
-            trend_alignment == "bearish_aligned"
+        strong_bearish_breakout_exception = (
+            breakout_down
+            and trend_alignment == "bearish_aligned"
             and regime_name != "range"
-            and features.trend_score <= -0.22
-            and features.momentum_score <= -0.12
-            and 18.0 <= features.rsi <= 55.0
+            and features.trend_score <= -0.38
+            and features.momentum_score <= -0.24
             and not weak_volume
             and not bullish_rejection
+            and features.regime.momentum_state in {"strengthening", "stable"}
+            and features.volume_persistence.persistence_ratio >= 1.0
         )
-        if not short_signal:
-            short_signal = (
-                trend_alignment == "bearish_aligned"
-                and not weak_volume
-                and not countertrend
-                and (bearish_continuation or bearish_pullback or breakout_down)
-                and features.location.vwap_distance_pct <= 0.45
-                and (features.candle_structure.bearish_streak >= 2 or bearish_rejection or breakout_down)
-                and features.volume_persistence.persistence_ratio >= 0.9
-            )
+        pullback_long_signal = (
+            trend_alignment == "bullish_aligned"
+            and regime_name != "range"
+            and features.trend_score >= 0.2
+            and features.momentum_score >= 0.1
+            and 42.0 <= features.rsi <= 78.0
+            and not weak_volume
+            and not bearish_rejection
+            and bullish_pullback
+            and features.location.vwap_distance_pct >= -0.65
+            and features.location.vwap_distance_pct <= 0.15
+            and not countertrend
+        )
+        continuation_long_signal = (
+            trend_alignment == "bullish_aligned"
+            and regime_name != "range"
+            and features.trend_score >= 0.2
+            and features.momentum_score >= 0.1
+            and 48.0 <= features.rsi <= 88.0
+            and not weak_volume
+            and not bearish_rejection
+            and bullish_continuation
+            and features.location.vwap_distance_pct >= -0.85
+            and features.location.vwap_distance_pct <= 6.0
+            and features.regime.momentum_state in {"strengthening", "stable", "overextended"}
+            and features.volume_persistence.persistence_ratio >= 0.95
+            and not countertrend
+        )
+        pullback_short_signal = (
+            trend_alignment == "bearish_aligned"
+            and regime_name != "range"
+            and features.trend_score <= -0.2
+            and features.momentum_score <= -0.1
+            and 22.0 <= features.rsi <= 58.0
+            and not weak_volume
+            and not bullish_rejection
+            and bearish_pullback
+            and features.location.vwap_distance_pct <= 0.65
+            and features.location.vwap_distance_pct >= -0.15
+            and not countertrend
+        )
+        continuation_short_signal = (
+            trend_alignment == "bearish_aligned"
+            and regime_name != "range"
+            and features.trend_score <= -0.2
+            and features.momentum_score <= -0.1
+            and 12.0 <= features.rsi <= 52.0
+            and not weak_volume
+            and not bullish_rejection
+            and bearish_continuation
+            and features.location.vwap_distance_pct <= 0.85
+            and features.location.vwap_distance_pct >= -6.0
+            and features.regime.momentum_state in {"strengthening", "stable", "overextended"}
+            and features.volume_persistence.persistence_ratio >= 0.95
+            and not countertrend
+        )
+        long_signal = pullback_long_signal or continuation_long_signal or strong_bullish_breakout_exception
+        short_signal = pullback_short_signal or continuation_short_signal or strong_bearish_breakout_exception
         weakening_signal = momentum_weakening or weak_volume or range_like_signal
         operating_state = str(risk_context.get("operating_state", "TRADABLE"))
         position_management_context = (
@@ -582,27 +642,31 @@ class TradingDecisionAgent:
             )
         elif decision == "hold" and long_signal:
             decision = "long"
-            rationale = ["TREND_UP", "VOLUME_SUPPORT", "RSI_HEALTHY"]
-            if breakout_up:
-                rationale.append("STRUCTURE_BREAKOUT_UP")
-            elif bullish_pullback:
+            rationale = ["TREND_UP", "PULLBACK_ENTRY_BIAS", "RSI_HEALTHY"]
+            if bullish_pullback:
                 rationale.append("ALIGNED_PULLBACK")
+            elif bullish_continuation:
+                rationale.append("BULLISH_CONTINUATION_PULLBACK")
+            elif strong_bullish_breakout_exception:
+                rationale.append("STRUCTURE_BREAKOUT_UP_EXCEPTION")
             short_explanation = "상승 추세와 거래량 지지가 확인돼 롱 진입을 제안합니다."
             detailed_explanation = (
-                "단기 추세 점수와 RSI, 거래량 지지가 함께 개선돼 리스크 대비 기대수익이 "
-                "상대적으로 양호한 구간으로 판단합니다."
+                "상위 추세 정렬 안에서 눌림 매수 구간을 기다리는 편이 추격 진입보다 보수적입니다. "
+                "현재는 즉시 추격보다 되돌림 확인 후 진입하는 시나리오가 우선입니다."
             )
         elif decision == "hold" and short_signal:
             decision = "short"
-            rationale = ["TREND_DOWN", "VOLUME_SUPPORT", "RSI_WEAK"]
-            if breakout_down:
-                rationale.append("STRUCTURE_BREAKOUT_DOWN")
-            elif bearish_pullback:
+            rationale = ["TREND_DOWN", "PULLBACK_ENTRY_BIAS", "RSI_WEAK"]
+            if bearish_pullback:
                 rationale.append("ALIGNED_PULLBACK")
+            elif bearish_continuation:
+                rationale.append("BEARISH_CONTINUATION_REBOUND")
+            elif strong_bearish_breakout_exception:
+                rationale.append("STRUCTURE_BREAKOUT_DOWN_EXCEPTION")
             short_explanation = "하락 추세가 우세해 숏 진입을 제안합니다."
             detailed_explanation = (
-                "추세 점수와 거래량 우위가 모두 약세를 가리켜 단기 숏 시나리오가 "
-                "상대적으로 우세한 구간으로 판단합니다."
+                "하락 추세 안에서 반등 매도 구간을 기다리는 편이 추격 숏보다 안전합니다. "
+                "현재는 1분 확인이 붙는 되돌림 진입 시나리오를 우선합니다."
             )
 
         risk_pct = max(0.003, round(confidence * 0.008, 4))
@@ -619,9 +683,18 @@ class TradingDecisionAgent:
             leverage *= 0.9
         leverage = min(float(risk_context["max_leverage"]), round(leverage, 2))
 
-        entry_band = atr * (0.08 if range_like_signal else 0.14)
-        entry_min = round(price - entry_band, 2)
-        entry_max = round(price + entry_band, 2)
+        pullback_outer = atr * (0.3 if range_like_signal else 0.42)
+        pullback_inner = atr * (0.1 if range_like_signal else 0.16)
+        if decision == "long":
+            entry_min = round(price - pullback_outer, 2)
+            entry_max = round(price - pullback_inner, 2)
+        elif decision == "short":
+            entry_min = round(price + pullback_inner, 2)
+            entry_max = round(price + pullback_outer, 2)
+        else:
+            entry_band = atr * (0.08 if range_like_signal else 0.12)
+            entry_min = round(price - entry_band, 2)
+            entry_max = round(price + entry_band, 2)
         stop_loss: float | None = None
         take_profit: float | None = None
         if decision == "long":
@@ -987,10 +1060,15 @@ class TradingDecisionAgent:
                     "If an open position already exists, prefer reduce, protect, or exit before proposing a new entry. "
                     "If confidence is weak, return hold. "
                     "For new long or short ideas, treat your output as a directional idea, not direct execution authority. "
+                    "Prefer pullback or rebound entries inside aligned trends over breakout chasing. "
+                    "Use breakout_confirm only as a rare exception when trend, momentum, and volume are strongly aligned. "
+                    "Keep immediate new entries disabled unless the market snapshot is unusually clean and urgent. "
                     "Set entry_mode to breakout_confirm, pullback_confirm, immediate, or none. "
+                    "For long entries, entry_zone should usually sit below the current price as a pullback zone. "
+                    "For short entries, entry_zone should usually sit above the current price as a rebound zone. "
                     "Provide a valid invalidation_price on the wrong side of the trade, plus a conservative max_chase_bps. "
                     "Use entry_mode=none for hold, reduce, or exit. "
-                    "Do not use immediate unless the current snapshot already supports immediate execution. "
+                    "Do not use immediate unless the current snapshot already supports immediate execution and pullback waiting is clearly worse. "
                     "Keep explanation_short brief and explanation_detailed under 3 sentences."
                 ),
             )

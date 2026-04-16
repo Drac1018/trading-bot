@@ -102,14 +102,14 @@ def test_risk_blocks_stale_market_data(db_session) -> None:
 
     result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
     assert result.allowed is False
-    assert "STALE_MARKET_DATA" in result.reason_codes
+    assert "MARKET_STATE_STALE" in result.reason_codes
 
 
 def test_risk_blocks_daily_loss_limit(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     db_session.add(
         PnLSnapshot(
-            snapshot_date=date.today(),
+            snapshot_date=utcnow_naive().date(),
             equity=94000.0,
             cash_balance=94000.0,
             realized_pnl=-6000.0,
@@ -147,7 +147,7 @@ def test_risk_blocks_consecutive_losses(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     db_session.add(
         PnLSnapshot(
-            snapshot_date=date.today(),
+            snapshot_date=utcnow_naive().date(),
             equity=99000.0,
             cash_balance=99000.0,
             realized_pnl=-1000.0,
@@ -601,8 +601,10 @@ def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_li
 
     assert result.allowed is True
     assert result.auto_resized_entry is True
-    assert "ENTRY_AUTO_RESIZED" in result.reason_codes
-    assert "ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT" in result.reason_codes
+    assert result.reason_codes == []
+    assert result.blocked_reason_codes == []
+    assert "ENTRY_AUTO_RESIZED" in result.adjustment_reason_codes
+    assert "ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT" in result.adjustment_reason_codes
     assert result.raw_projected_notional > result.approved_projected_notional
     assert result.approved_projected_notional <= 150000.0
     assert result.approved_quantity is not None and result.approved_quantity > 0
@@ -775,7 +777,7 @@ def test_hard_blockers_keep_entry_blocked_even_when_exposure_could_be_resized(db
 
     assert result.allowed is False
     assert result.auto_resized_entry is False
-    assert "STALE_MARKET_DATA" in result.reason_codes
+    assert "MARKET_STATE_STALE" in result.reason_codes
     assert "LIVE_APPROVAL_POLICY_DISABLED" in result.reason_codes
     assert "PROTECTION_REQUIRED" in result.reason_codes
     assert "ENTRY_AUTO_RESIZED" not in result.reason_codes

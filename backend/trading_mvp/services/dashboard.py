@@ -16,6 +16,7 @@ from trading_mvp.models import (
     FeatureSnapshot,
     MarketSnapshot,
     Order,
+    PendingEntryPlan,
     PnLSnapshot,
     Position,
     RiskCheck,
@@ -31,8 +32,10 @@ from trading_mvp.schemas import (
     OperatorControlState,
     OperatorDashboardResponse,
     OperatorDecisionSnapshot,
+    OperatorExecutionFillSummary,
     OperatorExecutionSnapshot,
     OperatorMarketSignalSummary,
+    PendingEntryPlanSnapshot,
     OperatorPositionSummary,
     OperatorProtectionSummary,
     OperatorRiskSnapshot,
@@ -42,10 +45,10 @@ from trading_mvp.schemas import (
     OverviewResponse,
     PerformanceAggregateEntry,
 )
+from trading_mvp.services.audit import compact_audit_payload
 from trading_mvp.services.backlog_insights import build_signal_performance_report
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
 from trading_mvp.services.settings import (
-    _prioritize_blocked_reasons,
     build_operational_status_payload,
     get_effective_symbols,
     get_or_create_settings,
@@ -61,6 +64,58 @@ AUDIT_CATEGORY_APPROVAL_CONTROL = "approval_control"
 AUDIT_CATEGORY_PROTECTION = "protection"
 AUDIT_CATEGORY_HEALTH_SYSTEM = "health_system"
 AUDIT_CATEGORY_AI_DECISION = "ai_decision"
+OPERATOR_AUDIT_LIMIT = 4
+SYMBOL_AUDIT_LIMIT = 3
+OPERATOR_PERFORMANCE_WINDOW_LIMIT = 1
+OPERATOR_PERFORMANCE_ENTRY_LIMIT = 3
+OPERATOR_EXECUTION_PROFILE_LIMIT = 2
+RECENT_FILL_LIMIT = 4
+
+MARKET_CONTEXT_SUMMARY_KEYS = (
+    "primary_regime",
+    "trend_alignment",
+    "volatility_regime",
+    "volume_regime",
+    "momentum_state",
+    "weak_volume",
+    "momentum_weakening",
+)
+ADAPTIVE_SIGNAL_SUMMARY_KEYS = (
+    "status",
+    "active_inputs",
+    "signal_weight",
+    "confidence_multiplier",
+    "hold_bias",
+    "risk_pct_multiplier",
+)
+EXECUTION_POLICY_SUMMARY_KEYS = (
+    "policy_profile",
+    "execution_style",
+    "order_type",
+    "time_in_force",
+    "timeout_seconds",
+)
+EXECUTION_QUALITY_SUMMARY_KEYS = (
+    "execution_quality_status",
+    "decision_quality_status",
+    "partial_fill_attempts",
+    "repriced_attempts",
+    "aggressive_fallback_used",
+    "arrival_slippage_pct",
+    "realized_slippage_pct",
+    "first_fill_latency_seconds",
+    "fees_total",
+    "net_realized_pnl_total",
+)
+RISK_DEBUG_NUMERIC_KEYS = (
+    "requested_notional",
+    "resized_notional",
+    "projected_symbol_notional",
+    "projected_directional_notional",
+    "current_symbol_notional",
+    "current_directional_notional",
+    "open_order_reserved_notional",
+)
 
 AUDIT_APPROVAL_CONTROL_EVENT_TYPES = {
     "settings_updated",
@@ -83,10 +138,13 @@ AUDIT_PROTECTION_EVENT_TYPES = {
     "emergency_exit_failed",
 }
 AUDIT_EXECUTION_EVENT_TYPES = {
+    "live_execution_attempted",
     "live_execution",
     "live_execution_rejected",
     "live_execution_error",
     "live_execution_skipped",
+    "live_order_submission_unknown",
+    "live_order_submission_recovered",
     "live_test_order",
 }
 AUDIT_AI_EVENT_TYPES = {
@@ -171,6 +229,41 @@ def _as_string_list(value: object) -> list[str]:
     return [str(item) for item in value if item not in {None, ""}]
 
 
+def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingEntryPlanSnapshot:
+    if row is None:
+        return PendingEntryPlanSnapshot()
+    metadata = dict(row.metadata_json) if isinstance(row.metadata_json, dict) else {}
+    trigger_details = metadata.get("trigger_details")
+    return PendingEntryPlanSnapshot(
+        plan_id=row.id,
+        symbol=row.symbol,
+        side=row.side if row.side in {"long", "short"} else None,
+        plan_status=row.plan_status if row.plan_status in {"armed", "triggered", "expired", "canceled"} else None,
+        source_decision_run_id=row.source_decision_run_id,
+        source_timeframe=row.source_timeframe,
+        regime=row.regime,
+        posture=row.posture,
+        rationale_codes=_as_string_list(row.rationale_codes),
+        entry_mode=row.entry_mode if row.entry_mode in {"breakout_confirm", "pullback_confirm", "immediate", "none"} else None,
+        entry_zone_min=row.entry_zone_min,
+        entry_zone_max=row.entry_zone_max,
+        invalidation_price=row.invalidation_price,
+        max_chase_bps=row.max_chase_bps,
+        idea_ttl_minutes=row.idea_ttl_minutes,
+        stop_loss=row.stop_loss,
+        take_profit=row.take_profit,
+        risk_pct_cap=row.risk_pct_cap,
+        leverage_cap=row.leverage_cap,
+        created_at=row.created_at,
+        expires_at=row.expires_at,
+        triggered_at=row.triggered_at,
+        canceled_at=row.canceled_at,
+        canceled_reason=row.canceled_reason,
+        idempotency_key=row.idempotency_key,
+        trigger_details=dict(trigger_details) if isinstance(trigger_details, dict) else {},
+    )
+
+
 def _as_missing_items(value: object) -> dict[str, list[str]]:
     if not isinstance(value, dict):
         return {}
@@ -209,6 +302,72 @@ def _as_float(value: object, default: float = 0.0) -> float:
     return default
 
 
+def _adverse_slippage_pct(*, side: str, requested_price: float, fill_price: float) -> float:
+    if requested_price <= 0 or fill_price <= 0:
+        return 0.0
+    side_key = side.lower()
+    if side_key == "buy":
+        return max((fill_price - requested_price) / requested_price, 0.0)
+    if side_key == "sell":
+        return max((requested_price - fill_price) / requested_price, 0.0)
+    return abs(fill_price - requested_price) / requested_price
+
+
+def _execution_quality_metrics_for_order(
+    order_row: Order,
+    executions: list[Execution],
+) -> dict[str, float | int]:
+    metadata = order_row.metadata_json if isinstance(order_row.metadata_json, dict) else {}
+    quality = metadata.get("execution_quality") if isinstance(metadata.get("execution_quality"), dict) else {}
+    sorted_executions = sorted(executions, key=lambda item: (item.created_at, item.id))
+
+    arrival_slippage_pct = 0.0
+    if quality.get("arrival_slippage_pct") is not None:
+        arrival_slippage_pct = _as_float(quality.get("arrival_slippage_pct"), default=0.0)
+    elif sorted_executions:
+        first_execution = sorted_executions[0]
+        arrival_slippage_pct = _as_float(first_execution.slippage_pct, default=0.0)
+        if arrival_slippage_pct <= 0:
+            arrival_slippage_pct = _adverse_slippage_pct(
+                side=str(order_row.side or ""),
+                requested_price=_as_float(order_row.requested_price, default=0.0),
+                fill_price=_as_float(first_execution.fill_price, default=0.0),
+            )
+
+    realized_slippage_pct = 0.0
+    if quality.get("realized_slippage_pct") is not None:
+        realized_slippage_pct = _as_float(quality.get("realized_slippage_pct"), default=0.0)
+    elif sorted_executions:
+        weighted_quantity = sum(abs(_as_float(item.fill_quantity, default=0.0)) for item in sorted_executions)
+        if weighted_quantity > 0:
+            realized_slippage_pct = sum(
+                abs(_as_float(item.fill_quantity, default=0.0))
+                * _as_float(item.slippage_pct, default=0.0)
+                for item in sorted_executions
+            ) / weighted_quantity
+        else:
+            realized_slippage_pct = sum(_as_float(item.slippage_pct, default=0.0) for item in sorted_executions) / len(
+                sorted_executions
+            )
+
+    first_fill_latency_seconds = 0.0
+    if quality.get("first_fill_latency_seconds") is not None:
+        first_fill_latency_seconds = max(_as_float(quality.get("first_fill_latency_seconds"), default=0.0), 0.0)
+    elif sorted_executions:
+        first_fill_latency_seconds = max((sorted_executions[0].created_at - order_row.created_at).total_seconds(), 0.0)
+
+    order_status = str(order_row.status or "").lower()
+    cancel_attempt = int(order_status in {"canceled", "cancelled", "expired"})
+    cancel_success = int(order_status in {"canceled", "cancelled"})
+    return {
+        "arrival_slippage_pct": arrival_slippage_pct,
+        "realized_slippage_pct": realized_slippage_pct,
+        "first_fill_latency_seconds": first_fill_latency_seconds,
+        "cancel_attempt": cancel_attempt,
+        "cancel_success": cancel_success,
+    }
+
+
 def _as_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
@@ -224,6 +383,85 @@ def _as_dict(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {str(key): item for key, item in value.items()}
+
+
+def _compact_dict(
+    value: object,
+    *,
+    allowed_keys: Sequence[str] | None = None,
+    max_items: int | None = None,
+) -> dict[str, Any]:
+    source = _as_dict(value)
+    if allowed_keys is not None:
+        keys = [key for key in allowed_keys if key in source]
+    else:
+        keys = list(source.keys())
+    if max_items is not None:
+        keys = keys[:max_items]
+    compact: dict[str, Any] = {}
+    for key in keys:
+        item = source.get(key)
+        if item is None:
+            continue
+        if isinstance(item, str) and item == "":
+            continue
+        if isinstance(item, (list, dict)) and not item:
+            continue
+        compact[str(key)] = item
+    return compact
+
+
+def _compact_market_context_summary(value: object) -> dict[str, Any]:
+    return _compact_dict(value, allowed_keys=MARKET_CONTEXT_SUMMARY_KEYS)
+
+
+def _compact_adaptive_signal_summary(value: object) -> dict[str, Any]:
+    return _compact_dict(value, allowed_keys=ADAPTIVE_SIGNAL_SUMMARY_KEYS)
+
+
+def _compact_execution_policy(value: object) -> dict[str, Any]:
+    return _compact_dict(value, allowed_keys=EXECUTION_POLICY_SUMMARY_KEYS)
+
+
+def _compact_execution_quality(value: object) -> dict[str, Any]:
+    return _compact_dict(value, allowed_keys=EXECUTION_QUALITY_SUMMARY_KEYS)
+
+
+def _compact_risk_debug_payload(value: object) -> dict[str, Any]:
+    source = _as_dict(value)
+    compact: dict[str, Any] = {}
+    for key in RISK_DEBUG_NUMERIC_KEYS:
+        if source.get(key) is not None:
+            compact[key] = _as_float(source.get(key), default=0.0)
+    requested_codes = _as_string_list(source.get("requested_exposure_limit_codes"))
+    if "requested_exposure_limit_codes" in source:
+        compact["requested_exposure_limit_codes"] = requested_codes
+    final_codes = _as_string_list(source.get("final_exposure_limit_codes"))
+    if "final_exposure_limit_codes" in source:
+        compact["final_exposure_limit_codes"] = final_codes
+    headroom = _compact_dict(source.get("headroom"))
+    if headroom:
+        compact["headroom"] = headroom
+    entry_trigger = _compact_dict(source.get("entry_trigger"))
+    if entry_trigger:
+        compact["entry_trigger"] = entry_trigger
+    sync_timestamps = _compact_dict(source.get("sync_timestamps"))
+    if sync_timestamps:
+        compact["sync_timestamps"] = sync_timestamps
+    return compact
+
+
+def _compact_decision_reference(reference: DecisionReferencePayload) -> DecisionReferencePayload:
+    compact_market_freshness = _compact_dict(
+        reference.market_freshness_summary,
+        allowed_keys=("symbol", "timeframe", "status", "snapshot_at", "stale", "incomplete"),
+    )
+    return reference.model_copy(
+        update={
+            "sync_freshness_summary": {},
+            "market_freshness_summary": compact_market_freshness,
+        }
+    )
 
 
 def _sync_summary_blocks_freshness(sync_freshness_summary: dict[str, Any]) -> bool:
@@ -404,6 +642,14 @@ def get_overview(session: Session) -> OverviewResponse:
         select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1)
     )
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
+    active_entry_plans = list(
+        session.scalars(
+            select(PendingEntryPlan)
+            .where(PendingEntryPlan.plan_status == "armed")
+            .order_by(desc(PendingEntryPlan.created_at))
+            .limit(20)
+        )
+    )
     latest_pnl = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
     open_positions = list(session.scalars(select(Position).where(Position.status == "open", Position.mode == "live")))
     protection_summary = [_build_position_protection_state(session, position) for position in open_positions]
@@ -415,7 +661,8 @@ def get_overview(session: Session) -> OverviewResponse:
         if _as_string_list(item["missing_components"])
     }
     missing_protection_symbols = list(missing_protection_items)
-    blocked_reasons = _risk_reason_codes_from_row(latest_risk) if latest_risk is not None and not latest_risk.allowed else []
+    current_cycle_blocked_reasons = _risk_reason_codes_from_row(latest_risk)
+    current_cycle_risk_allowed = latest_risk.allowed if latest_risk is not None else None
     operational_status = build_operational_status_payload(
         settings_row,
         session=session,
@@ -427,8 +674,9 @@ def get_overview(session: Session) -> OverviewResponse:
         ),
         missing_protection_symbols_override=missing_protection_symbols or None,
         missing_protection_items_override=missing_protection_items or None,
-        blocked_reasons=blocked_reasons,
-        latest_blocked_reasons=blocked_reasons,
+        blocked_reasons=current_cycle_blocked_reasons,
+        latest_blocked_reasons=current_cycle_blocked_reasons,
+        risk_allowed=current_cycle_risk_allowed,
         account_sync_summary=_as_dict(settings_payload.get("account_sync_summary", {})),
         sync_freshness_summary=_as_dict(settings_payload.get("sync_freshness_summary", {})),
         market_freshness_summary=_as_dict(settings_payload.get("market_freshness_summary", {})),
@@ -436,9 +684,9 @@ def get_overview(session: Session) -> OverviewResponse:
     pnl_summary = _as_dict(settings_payload.get("pnl_summary", {}))
     exposure_summary = _as_dict(settings_payload.get("exposure_summary", {}))
     execution_policy_summary = _as_dict(settings_payload.get("execution_policy_summary", {}))
-    market_context_summary = _as_dict(settings_payload.get("market_context_summary", {}))
+    market_context_summary = _compact_market_context_summary(settings_payload.get("market_context_summary", {}))
     adaptive_protection_summary = _as_dict(settings_payload.get("adaptive_protection_summary", {}))
-    adaptive_signal_summary = _as_dict(settings_payload.get("adaptive_signal_summary", {}))
+    adaptive_signal_summary = _compact_adaptive_signal_summary(settings_payload.get("adaptive_signal_summary", {}))
     position_management_summary = _as_dict(settings_payload.get("position_management_summary", {}))
     current_market_refresh_at = _latest_market_refresh_at_for_decision(
         session,
@@ -456,8 +704,16 @@ def get_overview(session: Session) -> OverviewResponse:
         tracked_symbols=get_effective_symbols(settings_row),
         timeframe=settings_row.default_timeframe,
         latest_price=latest_market.latest_price if latest_market is not None else 0.0,
-        latest_decision=latest_decision.output_payload if latest_decision is not None else None,
-        latest_risk=latest_risk.payload if latest_risk is not None else None,
+        latest_decision=(
+            _build_decision_snapshot(latest_decision).model_dump(mode="json", exclude={"raw_output"})
+            if latest_decision is not None
+            else None
+        ),
+        latest_risk=_dashboard_risk_payload_from_row(latest_risk) if latest_risk is not None else None,
+        active_entry_plans=[
+            _build_pending_entry_plan_snapshot(row)
+            for row in active_entry_plans
+        ],
         operational_status=operational_status,
         last_market_refresh_at=current_market_refresh_at,
         last_decision_at=latest_decision.created_at if latest_decision is not None else None,
@@ -498,6 +754,9 @@ def get_overview(session: Session) -> OverviewResponse:
         adaptive_protection_summary=adaptive_protection_summary,
         adaptive_signal_summary=adaptive_signal_summary,
         position_management_summary=position_management_summary,
+        user_stream_summary=dict(operational_status.user_stream_summary),
+        reconciliation_summary=dict(operational_status.reconciliation_summary),
+        candidate_selection_summary=dict(operational_status.candidate_selection_summary),
         daily_pnl=latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
         cumulative_pnl=latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
         blocked_reasons=operational_status.blocked_reasons,
@@ -646,6 +905,16 @@ def get_execution_quality_report(session: Session) -> dict[str, object]:
         .where(Order.mode == "live")
         .order_by(desc(Order.created_at))
     ).all()
+    order_ids = [order_row.id for order_row, _ in rows]
+    executions_by_order: dict[int, list[Execution]] = defaultdict(list)
+    if order_ids:
+        for execution_row in session.scalars(
+            select(Execution)
+            .where(Execution.order_id.in_(order_ids))
+            .order_by(Execution.created_at.asc(), Execution.id.asc())
+        ):
+            if execution_row.order_id is not None:
+                executions_by_order[execution_row.order_id].append(execution_row)
     report_windows: list[dict[str, object]] = []
 
     for label, cutoff in windows:
@@ -660,8 +929,14 @@ def get_execution_quality_report(session: Session) -> dict[str, object]:
                 "orders": 0,
                 "partial_fill_orders": 0,
                 "aggressive_fallback_orders": 0,
+                "cancel_attempts": 0,
+                "cancel_successes": 0,
+                "avg_arrival_slippage_pct_sum": 0.0,
+                "avg_arrival_slippage_pct_count": 0,
                 "avg_slippage_pct_sum": 0.0,
                 "avg_slippage_pct_count": 0,
+                "avg_first_fill_latency_seconds_sum": 0.0,
+                "avg_first_fill_latency_seconds_count": 0,
             }
         )
         summary = {
@@ -676,19 +951,33 @@ def get_execution_quality_report(session: Session) -> dict[str, object]:
             "decision_profit_orders": 0,
             "decision_loss_orders": 0,
             "decision_pending_orders": 0,
+            "average_arrival_slippage_pct": 0.0,
             "average_realized_slippage_pct": 0.0,
+            "average_first_fill_latency_seconds": 0.0,
+            "cancel_attempts": 0,
+            "cancel_successes": 0,
+            "cancel_success_rate": 0.0,
             "fee_total": 0.0,
             "realized_pnl_total": 0.0,
             "net_realized_pnl_total": 0.0,
         }
+        arrival_slippage_sum = 0.0
+        arrival_slippage_count = 0
         slippage_sum = 0.0
         slippage_count = 0
+        first_fill_latency_sum = 0.0
+        first_fill_latency_count = 0
 
         for order_row, decision_output in bucket_orders:
             metadata = order_row.metadata_json if isinstance(order_row.metadata_json, dict) else {}
             quality = metadata.get("execution_quality") if isinstance(metadata.get("execution_quality"), dict) else {}
             policy = metadata.get("execution_policy") if isinstance(metadata.get("execution_policy"), dict) else {}
             decision_payload = decision_output if isinstance(decision_output, dict) else {}
+            order_executions = executions_by_order.get(order_row.id, [])
+            order_metrics = _execution_quality_metrics_for_order(
+                order_row,
+                order_executions,
+            )
             profile = str(policy.get("policy_profile") or "unknown")
             profile_bucket = by_profile[profile]
             profile_bucket["policy_profile"] = profile
@@ -724,21 +1013,58 @@ def get_execution_quality_report(session: Session) -> dict[str, object]:
                 summary["decision_loss_orders"] += 1
             else:
                 summary["decision_pending_orders"] += 1
+            summary["cancel_attempts"] += int(order_metrics["cancel_attempt"])
+            summary["cancel_successes"] += int(order_metrics["cancel_success"])
 
             summary["fee_total"] += _as_float(quality.get("fees_total"))
             summary["realized_pnl_total"] += _as_float(quality.get("realized_pnl_total"))
             summary["net_realized_pnl_total"] += _as_float(quality.get("net_realized_pnl_total"))
-            if "realized_slippage_pct" in quality:
-                slippage_sum += realized_slippage_pct
+            has_arrival_metric = quality.get("arrival_slippage_pct") is not None or bool(order_executions)
+            has_realized_metric = quality.get("realized_slippage_pct") is not None or bool(order_executions)
+            has_first_fill_latency_metric = quality.get("first_fill_latency_seconds") is not None or bool(order_executions)
+            if has_arrival_metric:
+                arrival_slippage_sum += _as_float(order_metrics["arrival_slippage_pct"], default=0.0)
+                arrival_slippage_count += 1
+                profile_bucket["avg_arrival_slippage_pct_sum"] = _as_float(
+                    profile_bucket["avg_arrival_slippage_pct_sum"]
+                ) + _as_float(order_metrics["arrival_slippage_pct"], default=0.0)
+                profile_bucket["avg_arrival_slippage_pct_count"] = _as_int(
+                    profile_bucket["avg_arrival_slippage_pct_count"]
+                ) + 1
+            if has_realized_metric:
+                effective_realized_slippage = _as_float(order_metrics["realized_slippage_pct"], default=realized_slippage_pct)
+                slippage_sum += effective_realized_slippage
                 slippage_count += 1
-                profile_bucket["avg_slippage_pct_sum"] = _as_float(profile_bucket["avg_slippage_pct_sum"]) + realized_slippage_pct
+                profile_bucket["avg_slippage_pct_sum"] = _as_float(
+                    profile_bucket["avg_slippage_pct_sum"]
+                ) + effective_realized_slippage
                 profile_bucket["avg_slippage_pct_count"] = _as_int(profile_bucket["avg_slippage_pct_count"]) + 1
+            if has_first_fill_latency_metric:
+                first_fill_latency_sum += _as_float(order_metrics["first_fill_latency_seconds"], default=0.0)
+                first_fill_latency_count += 1
+                profile_bucket["avg_first_fill_latency_seconds_sum"] = _as_float(
+                    profile_bucket["avg_first_fill_latency_seconds_sum"]
+                ) + _as_float(order_metrics["first_fill_latency_seconds"], default=0.0)
+                profile_bucket["avg_first_fill_latency_seconds_count"] = _as_int(
+                    profile_bucket["avg_first_fill_latency_seconds_count"]
+                ) + 1
+            profile_bucket["cancel_attempts"] = _as_int(profile_bucket["cancel_attempts"]) + int(order_metrics["cancel_attempt"])
+            profile_bucket["cancel_successes"] = _as_int(profile_bucket["cancel_successes"]) + int(order_metrics["cancel_success"])
 
             profile_bucket["orders"] = _as_int(profile_bucket["orders"]) + 1
             profile_bucket["symbol"] = order_row.symbol
             profile_bucket["timeframe"] = decision_payload.get("timeframe")
 
+        summary["average_arrival_slippage_pct"] = (
+            arrival_slippage_sum / arrival_slippage_count if arrival_slippage_count else 0.0
+        )
         summary["average_realized_slippage_pct"] = slippage_sum / slippage_count if slippage_count else 0.0
+        summary["average_first_fill_latency_seconds"] = (
+            first_fill_latency_sum / first_fill_latency_count if first_fill_latency_count else 0.0
+        )
+        summary["cancel_success_rate"] = (
+            summary["cancel_successes"] / summary["cancel_attempts"] if summary["cancel_attempts"] else 0.0
+        )
         profiles = sorted(
             [
                 {
@@ -748,9 +1074,27 @@ def get_execution_quality_report(session: Session) -> dict[str, object]:
                     "orders": _as_int(item["orders"]),
                     "partial_fill_orders": _as_int(item["partial_fill_orders"]),
                     "aggressive_fallback_orders": _as_int(item["aggressive_fallback_orders"]),
+                    "cancel_attempts": _as_int(item["cancel_attempts"]),
+                    "cancel_successes": _as_int(item["cancel_successes"]),
+                    "cancel_success_rate": (
+                        _as_int(item["cancel_successes"]) / _as_int(item["cancel_attempts"])
+                        if _as_int(item["cancel_attempts"]) > 0
+                        else 0.0
+                    ),
+                    "average_arrival_slippage_pct": (
+                        _as_float(item["avg_arrival_slippage_pct_sum"]) / _as_int(item["avg_arrival_slippage_pct_count"])
+                        if _as_int(item["avg_arrival_slippage_pct_count"]) > 0
+                        else 0.0
+                    ),
                     "average_realized_slippage_pct": (
                         _as_float(item["avg_slippage_pct_sum"]) / _as_int(item["avg_slippage_pct_count"])
                         if _as_int(item["avg_slippage_pct_count"]) > 0
+                        else 0.0
+                    ),
+                    "average_first_fill_latency_seconds": (
+                        _as_float(item["avg_first_fill_latency_seconds_sum"])
+                        / _as_int(item["avg_first_fill_latency_seconds_count"])
+                        if _as_int(item["avg_first_fill_latency_seconds_count"]) > 0
                         else 0.0
                     ),
                 }
@@ -772,7 +1116,12 @@ def get_execution_quality_report(session: Session) -> dict[str, object]:
                     "partial_fill_orders": summary["partial_fill_orders"],
                     "repriced_orders": summary["repriced_orders"],
                     "aggressive_fallback_orders": summary["aggressive_fallback_orders"],
+                    "average_arrival_slippage_pct": summary["average_arrival_slippage_pct"],
                     "average_realized_slippage_pct": summary["average_realized_slippage_pct"],
+                    "average_first_fill_latency_seconds": summary["average_first_fill_latency_seconds"],
+                    "cancel_attempts": summary["cancel_attempts"],
+                    "cancel_successes": summary["cancel_successes"],
+                    "cancel_success_rate": summary["cancel_success_rate"],
                 },
                 "profiles": profiles,
             }
@@ -834,15 +1183,25 @@ def _top_execution_profiles(window_payload: dict[str, object], *, limit: int = 5
                 orders=_as_int(item.get("orders"), default=0),
                 partial_fill_orders=_as_int(item.get("partial_fill_orders"), default=0),
                 aggressive_fallback_orders=_as_int(item.get("aggressive_fallback_orders"), default=0),
+                cancel_attempts=_as_int(item.get("cancel_attempts"), default=0),
+                cancel_successes=_as_int(item.get("cancel_successes"), default=0),
+                cancel_success_rate=_as_float(item.get("cancel_success_rate"), default=0.0),
+                average_arrival_slippage_pct=_as_float(item.get("average_arrival_slippage_pct"), default=0.0),
                 average_realized_slippage_pct=_as_float(item.get("average_realized_slippage_pct"), default=0.0),
+                average_first_fill_latency_seconds=_as_float(
+                    item.get("average_first_fill_latency_seconds"),
+                    default=0.0,
+                ),
             )
         )
     return sorted(
         profiles,
         key=lambda item: (
+            item.average_realized_slippage_pct,
+            item.average_arrival_slippage_pct,
+            item.average_first_fill_latency_seconds,
             item.partial_fill_orders,
             item.aggressive_fallback_orders,
-            item.average_realized_slippage_pct,
             item.orders,
         ),
         reverse=True,
@@ -931,7 +1290,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     if row is None:
         return OperatorDecisionSnapshot()
     payload = row.output_payload if isinstance(row.output_payload, dict) else {}
-    decision_reference = _build_decision_reference(row)
+    decision_reference = _compact_decision_reference(_build_decision_reference(row))
     return OperatorDecisionSnapshot(
         decision_run_id=row.id,
         created_at=row.created_at,
@@ -946,7 +1305,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         rationale_codes=_as_string_list(payload.get("rationale_codes", [])),
         explanation_short=str(payload.get("explanation_short") or "") or None,
         decision_reference=decision_reference,
-        raw_output=payload,
+        raw_output={},
     )
 
 
@@ -954,27 +1313,92 @@ def _risk_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
     if row is None:
         return []
     payload = row.payload if isinstance(row.payload, dict) else {}
-    payload_reason_codes = _as_string_list(payload.get("reason_codes", []))
-    if payload_reason_codes:
-        return _prioritize_blocked_reasons(payload_reason_codes)
-    return _prioritize_blocked_reasons(_as_string_list(row.reason_codes))
+    if "blocked_reason_codes" in payload and isinstance(payload.get("blocked_reason_codes"), list):
+        return _as_string_list(payload.get("blocked_reason_codes"))
+    if "reason_codes" in payload and isinstance(payload.get("reason_codes"), list):
+        return _as_string_list(payload.get("reason_codes"))
+    return _as_string_list(row.reason_codes)
+
+
+def _risk_adjustment_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
+    if row is None:
+        return []
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    if "adjustment_reason_codes" in payload and isinstance(payload.get("adjustment_reason_codes"), list):
+        return _as_string_list(payload.get("adjustment_reason_codes"))
+    return []
+
+
+def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+    blocked_reason_codes = _risk_reason_codes_from_row(row)
+    adjustment_reason_codes = _risk_adjustment_reason_codes_from_row(row)
+    approved_quantity_source = (
+        payload.get("approved_quantity")
+        if payload.get("approved_quantity") is not None
+        else payload.get("approved_qty")
+    )
+    exposure_headroom_snapshot = {
+        str(key): _as_float(value, default=0.0)
+        for key, value in _as_dict(payload.get("exposure_headroom_snapshot")).items()
+        if value is not None
+    }
+    normalized_payload: dict[str, Any] = {
+        "allowed": payload.get("allowed", row.allowed),
+        "decision": payload.get("decision", row.decision),
+        "reason_codes": blocked_reason_codes,
+        "blocked_reason_codes": blocked_reason_codes,
+        "adjustment_reason_codes": adjustment_reason_codes,
+        "approved_risk_pct": payload.get("approved_risk_pct", row.approved_risk_pct),
+        "approved_leverage": payload.get("approved_leverage", row.approved_leverage),
+        "raw_projected_notional": payload.get("raw_projected_notional"),
+        "approved_projected_notional": payload.get("approved_projected_notional"),
+        "approved_quantity": approved_quantity_source,
+        "auto_resized_entry": bool(payload.get("auto_resized_entry")),
+        "size_adjustment_ratio": payload.get("size_adjustment_ratio"),
+        "auto_resize_reason": payload.get("auto_resize_reason"),
+        "snapshot_id": payload.get("snapshot_id", row.market_snapshot_id),
+        "operating_state": payload.get("operating_state"),
+        "exposure_headroom_snapshot": exposure_headroom_snapshot,
+        "debug_payload": _compact_risk_debug_payload(payload.get("debug_payload", {})),
+    }
+    normalized_payload["cycle_id"] = (
+        str(payload.get("cycle_id"))
+        if payload.get("cycle_id") not in {None, ""}
+        else (str(row.decision_run_id) if row.decision_run_id is not None else None)
+    )
+    normalized_payload["as_of"] = _as_datetime(payload.get("as_of")) or row.created_at
+    return normalized_payload
 
 
 def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     if row is None:
         return OperatorRiskSnapshot()
-    payload = row.payload if isinstance(row.payload, dict) else {}
-    reason_codes = _risk_reason_codes_from_row(row)
+    payload = _dashboard_risk_payload_from_row(row)
+    reason_codes = _as_string_list(payload.get("reason_codes", []))
+    blocked_reason_codes = _as_string_list(payload.get("blocked_reason_codes", []))
+    adjustment_reason_codes = _as_string_list(payload.get("adjustment_reason_codes", []))
     return OperatorRiskSnapshot(
         risk_check_id=row.id,
         decision_run_id=row.decision_run_id,
         created_at=row.created_at,
-        allowed=row.allowed,
-        decision=row.decision,
+        snapshot_id=_as_int(payload.get("snapshot_id")) if payload.get("snapshot_id") is not None else None,
+        cycle_id=str(payload.get("cycle_id") or "") or None,
+        as_of=_as_datetime(payload.get("as_of")),
+        allowed=bool(payload.get("allowed")) if payload.get("allowed") is not None else row.allowed,
+        decision=str(payload.get("decision") or row.decision or "") or None,
         operating_state=str(payload.get("operating_state") or "") or None,
         reason_codes=reason_codes,
-        approved_risk_pct=row.approved_risk_pct,
-        approved_leverage=row.approved_leverage,
+        blocked_reason_codes=blocked_reason_codes,
+        adjustment_reason_codes=adjustment_reason_codes,
+        approved_risk_pct=_as_float(payload.get("approved_risk_pct"), default=0.0)
+        if payload.get("approved_risk_pct") is not None
+        else None,
+        approved_leverage=_as_float(payload.get("approved_leverage"), default=0.0)
+        if payload.get("approved_leverage") is not None
+        else None,
         raw_projected_notional=_as_float(payload.get("raw_projected_notional"), default=0.0)
         if payload.get("raw_projected_notional") is not None
         else None,
@@ -994,7 +1418,8 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
             for key, value in _as_dict(payload.get("exposure_headroom_snapshot")).items()
         },
         debug_payload=_as_dict(payload.get("debug_payload", {})),
-        raw_payload=payload,
+        current_cycle_result=dict(payload),
+        raw_payload={},
     )
 
 
@@ -1017,17 +1442,9 @@ def _extract_symbol_market_context(row: AgentRun | None, market_row: MarketSnaps
         features = _as_dict(row.input_payload.get("features", {}))
         regime = _as_dict(features.get("regime", {}))
         if regime:
-            return {
-                "primary_regime": regime.get("primary_regime"),
-                "trend_alignment": regime.get("trend_alignment"),
-                "volatility_regime": regime.get("volatility_regime"),
-                "volume_regime": regime.get("volume_regime"),
-                "momentum_state": regime.get("momentum_state"),
-                "weak_volume": regime.get("weak_volume"),
-                "momentum_weakening": regime.get("momentum_weakening"),
-            }
+            return _compact_market_context_summary(regime)
     if market_row is not None and isinstance(market_row.payload, dict):
-        return _as_dict(market_row.payload.get("regime_summary", {}))
+        return _compact_market_context_summary(market_row.payload.get("regime_summary", {}))
     return {}
 
 
@@ -1035,11 +1452,14 @@ def _build_execution_snapshot_from_rows(
     order_row: Order | None,
     execution_row: Execution | None,
     decision_row: AgentRun | None,
+    *,
+    recent_fills: Sequence[Execution] = (),
 ) -> OperatorExecutionSnapshot:
     if order_row is None:
         return OperatorExecutionSnapshot(
             decision_run_id=decision_row.id if decision_row is not None else None,
             symbol=_decision_symbol(decision_row),
+            recent_fills=[_build_execution_fill_summary(row) for row in recent_fills[:RECENT_FILL_LIMIT]],
         )
     decision_payload = decision_row.output_payload if decision_row is not None and isinstance(decision_row.output_payload, dict) else {}
     order_metadata = order_row.metadata_json if isinstance(order_row.metadata_json, dict) else {}
@@ -1059,14 +1479,30 @@ def _build_execution_snapshot_from_rows(
         average_fill_price=order_row.average_fill_price,
         fill_price=execution_row.fill_price if execution_row is not None else None,
         reason_codes=_as_string_list(order_row.reason_codes),
-        execution_policy=_as_dict(order_metadata.get("execution_policy", {})),
-        execution_quality=_as_dict(order_metadata.get("execution_quality", {})),
+        execution_policy=_compact_execution_policy(order_metadata.get("execution_policy", {})),
+        execution_quality=_compact_execution_quality(order_metadata.get("execution_quality", {})),
         decision_summary={
             "decision": decision_payload.get("decision"),
             "timeframe": decision_payload.get("timeframe"),
             "confidence": decision_payload.get("confidence"),
             "rationale_codes": decision_payload.get("rationale_codes", []),
         },
+        recent_fills=[_build_execution_fill_summary(row) for row in recent_fills[:RECENT_FILL_LIMIT]],
+    )
+
+
+def _build_execution_fill_summary(row: Execution) -> OperatorExecutionFillSummary:
+    return OperatorExecutionFillSummary(
+        execution_id=row.id,
+        order_id=row.order_id,
+        external_trade_id=row.external_trade_id,
+        created_at=row.created_at,
+        status=row.status,
+        fill_price=row.fill_price,
+        fill_quantity=row.fill_quantity,
+        fee_paid=row.fee_paid,
+        commission_asset=row.commission_asset,
+        realized_pnl=row.realized_pnl,
     )
 
 
@@ -1088,7 +1524,27 @@ def _build_position_snapshot(position: Position | None) -> OperatorPositionSumma
     )
 
 
-def _build_protection_snapshot(protection_state: dict[str, object]) -> OperatorProtectionSummary:
+def _build_protection_snapshot(
+    protection_state: dict[str, object],
+    *,
+    recovery_state: dict[str, object] | None = None,
+    latest_event: AuditTimelineEntry | None = None,
+) -> OperatorProtectionSummary:
+    recovery_payload = recovery_state if isinstance(recovery_state, dict) else {}
+    latest_event_payload = latest_event.payload if latest_event is not None else {}
+    lifecycle_state = str(
+        latest_event_payload.get("to_state")
+        or latest_event_payload.get("state")
+        or latest_event_payload.get("status")
+        or ""
+    ) or None
+    verification_status = None
+    if str(latest_event.event_type if latest_event is not None else "").lower() == "protection_verification_failed":
+        verification_status = "verify_failed"
+    elif lifecycle_state in {"verified", "placed", "requested", "verify_failed"}:
+        verification_status = lifecycle_state
+    elif bool(protection_state.get("protected", False)):
+        verification_status = "verified"
     return OperatorProtectionSummary(
         status=str(protection_state.get("status") or "unknown"),
         protected=bool(protection_state.get("protected", False)),
@@ -1103,6 +1559,17 @@ def _build_protection_snapshot(protection_state: dict[str, object]) -> OperatorP
         ]
         if isinstance(protection_state.get("order_ids"), list)
         else [],
+        recovery_status=str(recovery_payload.get("recovery_status") or "") or None,
+        auto_recovery_active=bool(recovery_payload.get("auto_recovery_active", False)),
+        failure_count=_as_int(recovery_payload.get("failure_count"), default=0),
+        last_error=str(recovery_payload.get("last_error") or "") or None,
+        last_transition_at=_as_datetime(recovery_payload.get("last_transition_at")),
+        trigger_source=str(recovery_payload.get("trigger_source") or "") or None,
+        lifecycle_state=lifecycle_state,
+        verification_status=verification_status,
+        last_event_type=latest_event.event_type if latest_event is not None else None,
+        last_event_message=latest_event.message if latest_event is not None else None,
+        last_event_at=latest_event.created_at if latest_event is not None else None,
     )
 
 
@@ -1170,6 +1637,39 @@ def _build_audit_entry(payload: dict[str, object]) -> AuditTimelineEntry:
     )
 
 
+def _build_operator_audit_entry(payload: dict[str, object]) -> AuditTimelineEntry:
+    entry = _build_audit_entry(payload)
+    compact_payload = compact_audit_payload(
+        entry.payload,
+        event_type=entry.event_type,
+        event_category=entry.event_category,
+    )
+    return entry.model_copy(update={"payload": compact_payload})
+
+
+def _compact_profitability_window(window: DashboardProfitabilityWindow) -> DashboardProfitabilityWindow:
+    return DashboardProfitabilityWindow(
+        window_label=window.window_label,
+        window_hours=window.window_hours,
+        summary=window.summary,
+        rationale_winners=window.rationale_winners[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
+        rationale_losers=window.rationale_losers[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
+        top_regimes=window.top_regimes[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
+        top_symbols=window.top_symbols[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
+        top_timeframes=[],
+        top_hold_conditions=window.top_hold_conditions[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
+    )
+
+
+def _compact_execution_window(window: DashboardExecutionWindowSummary) -> DashboardExecutionWindowSummary:
+    return DashboardExecutionWindowSummary(
+        window=window.window,
+        decision_quality_summary=dict(window.decision_quality_summary),
+        execution_quality_summary=dict(window.execution_quality_summary),
+        worst_profiles=window.worst_profiles[:OPERATOR_EXECUTION_PROFILE_LIMIT],
+    )
+
+
 def _build_operator_symbol_summaries(
     session: Session,
     *,
@@ -1177,6 +1677,13 @@ def _build_operator_symbol_summaries(
     overview: OverviewResponse,
 ) -> list[OperatorSymbolSummary]:
     symbol_keys = [item.upper() for item in tracked_symbols if item]
+    settings_row = get_or_create_settings(session)
+    runtime_summary = summarize_runtime_state(settings_row)
+    protection_recovery_symbols = {
+        str(key).upper(): dict(value)
+        for key, value in (runtime_summary.get("protection_recovery_symbols") or {}).items()
+        if isinstance(value, dict)
+    }
     latest_markets: dict[str, MarketSnapshot] = {}
     for row in session.scalars(
         select(MarketSnapshot)
@@ -1207,6 +1714,15 @@ def _build_operator_symbol_summaries(
         symbol = row.symbol.upper()
         latest_risks.setdefault(symbol, row)
 
+    active_entry_plans: dict[str, PendingEntryPlan] = {}
+    for row in session.scalars(
+        select(PendingEntryPlan)
+        .where(PendingEntryPlan.symbol.in_(symbol_keys), PendingEntryPlan.plan_status == "armed")
+        .order_by(desc(PendingEntryPlan.created_at))
+    ):
+        symbol = row.symbol.upper()
+        active_entry_plans.setdefault(symbol, row)
+
     latest_orders: dict[str, Order] = {}
     for row in session.scalars(
         select(Order)
@@ -1217,6 +1733,7 @@ def _build_operator_symbol_summaries(
         latest_orders.setdefault(symbol, row)
 
     latest_executions_by_order_id: dict[int, Execution] = {}
+    recent_executions_by_symbol: dict[str, list[Execution]] = defaultdict(list)
     order_ids = [row.id for row in latest_orders.values()]
     if order_ids:
         for row in session.scalars(
@@ -1227,6 +1744,9 @@ def _build_operator_symbol_summaries(
             if row.order_id is None:
                 continue
             latest_executions_by_order_id.setdefault(row.order_id, row)
+            symbol_key = str(row.symbol or "").upper()
+            if symbol_key in symbol_keys and len(recent_executions_by_symbol[symbol_key]) < RECENT_FILL_LIMIT:
+                recent_executions_by_symbol[symbol_key].append(row)
 
     open_positions = {
         row.symbol.upper(): row
@@ -1240,18 +1760,27 @@ def _build_operator_symbol_summaries(
         )
     }
 
-    audit_rows = get_audit_timeline(session, limit=max(20, len(symbol_keys) * 6))
+    audit_rows = get_audit_timeline(session, limit=max(12, len(symbol_keys) * SYMBOL_AUDIT_LIMIT))
     audit_entries_by_symbol: dict[str, list[AuditTimelineEntry]] = {symbol: [] for symbol in symbol_keys}
+    latest_protection_event_by_symbol: dict[str, AuditTimelineEntry] = {}
     for row in audit_rows:
         if not isinstance(row, dict):
             continue
         for symbol in symbol_keys:
-            if len(audit_entries_by_symbol[symbol]) >= 4:
+            if not _audit_event_matches_symbol(row, symbol):
                 continue
-            if _audit_event_matches_symbol(row, symbol):
-                audit_entries_by_symbol[symbol].append(_build_audit_entry(row))
+            entry = _build_operator_audit_entry(row)
+            if len(audit_entries_by_symbol[symbol]) < SYMBOL_AUDIT_LIMIT:
+                audit_entries_by_symbol[symbol].append(entry)
+            if entry.event_category == AUDIT_CATEGORY_PROTECTION and symbol not in latest_protection_event_by_symbol:
+                latest_protection_event_by_symbol[symbol] = entry
 
     summaries: list[OperatorSymbolSummary] = []
+    candidate_selection_map = {
+        str(item.get("symbol") or "").upper(): dict(item)
+        for item in overview.candidate_selection_summary.get("rankings", [])
+        if isinstance(item, dict) and item.get("symbol")
+    }
     for symbol in tracked_symbols:
         symbol_key = symbol.upper()
         decision_row = latest_decisions.get(symbol_key)
@@ -1300,11 +1829,22 @@ def _build_operator_symbol_summaries(
                 market_snapshot_time=market_row.snapshot_time if market_row is not None else None,
                 market_context_summary=_extract_symbol_market_context(decision_row, market_row),
                 ai_decision=decision_snapshot,
+                pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),
                 risk_guard=_build_risk_snapshot(risk_row),
-                execution=_build_execution_snapshot_from_rows(order_row, execution_row, decision_row),
+                execution=_build_execution_snapshot_from_rows(
+                    order_row,
+                    execution_row,
+                    decision_row,
+                    recent_fills=recent_executions_by_symbol.get(symbol_key, []),
+                ),
                 open_position=_build_position_snapshot(position_row),
-                protection_status=_build_protection_snapshot(protection_state),
+                protection_status=_build_protection_snapshot(
+                    protection_state,
+                    recovery_state=protection_recovery_symbols.get(symbol_key),
+                    latest_event=latest_protection_event_by_symbol.get(symbol_key),
+                ),
                 blocked_reasons=_risk_reason_codes_from_row(risk_row),
+                candidate_selection=candidate_selection_map.get(symbol_key, {}),
                 live_execution_ready=overview.live_execution_ready and len(stale_flags) == 0,
                 stale_flags=stale_flags,
                 last_updated_at=last_updated_at,
@@ -1323,14 +1863,26 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         tracked_symbols=overview.tracked_symbols,
         overview=overview,
     )
-    audit_rows = get_audit_timeline(session, limit=6)
+    compact_performance_windows = [
+        _compact_profitability_window(window)
+        for window in profitability.windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
+    ]
+    compact_execution_windows = [
+        _compact_execution_window(window)
+        for window in profitability.execution_windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
+    ]
+    audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT)
     return OperatorDashboardResponse(
         generated_at=utcnow_naive(),
         control=OperatorControlState(
             generated_at=utcnow_naive(),
             operational_status=overview.operational_status,
+            control_status_summary=overview.operational_status.control_status_summary,
             can_enter_new_position=overview.operational_status.can_enter_new_position,
             mode=overview.mode,
+            rollout_mode=overview.operational_status.rollout_mode,
+            exchange_submit_allowed=overview.operational_status.exchange_submit_allowed,
+            limited_live_max_notional=overview.operational_status.limited_live_max_notional,
             default_symbol=overview.symbol,
             default_timeframe=overview.timeframe,
             tracked_symbols=overview.tracked_symbols,
@@ -1359,10 +1911,14 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
             protected_positions=overview.protected_positions,
             unprotected_positions=overview.unprotected_positions,
             open_positions=overview.open_positions,
+            pnl_summary=overview.pnl_summary,
             daily_pnl=overview.daily_pnl,
             cumulative_pnl=overview.cumulative_pnl,
             account_sync_summary=overview.operational_status.account_sync_summary,
             exposure_summary=overview.exposure_summary,
+            user_stream_summary=overview.user_stream_summary,
+            reconciliation_summary=overview.reconciliation_summary,
+            candidate_selection_summary=overview.candidate_selection_summary,
             scheduler_status=latest_scheduler.status if latest_scheduler is not None else None,
             scheduler_window=latest_scheduler.schedule_window if latest_scheduler is not None else None,
             scheduler_triggered_by=latest_scheduler.triggered_by if latest_scheduler is not None else None,
@@ -1375,13 +1931,13 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         ),
         symbols=symbol_summaries,
         market_signal=OperatorMarketSignalSummary(
-            market_context_summary=overview.market_context_summary,
-            performance_windows=profitability.windows,
+            market_context_summary=_compact_market_context_summary(overview.market_context_summary),
+            performance_windows=compact_performance_windows,
             hold_blocked_summary=profitability.hold_blocked_summary,
-            adaptive_signal_summary=profitability.adaptive_signal_summary,
+            adaptive_signal_summary=_compact_adaptive_signal_summary(profitability.adaptive_signal_summary),
         ),
-        execution_windows=profitability.execution_windows,
-        audit_events=[_build_audit_entry(item) for item in audit_rows if isinstance(item, dict)],
+        execution_windows=compact_execution_windows,
+        audit_events=[_build_operator_audit_entry(item) for item in audit_rows if isinstance(item, dict)],
     )
 
 

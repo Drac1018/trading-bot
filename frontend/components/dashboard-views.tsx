@@ -117,6 +117,7 @@ function decisionSummary(decision: string | null | undefined) {
 
 function riskSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
   const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+  const hasAdjustmentReasons = symbol.risk_guard.adjustment_reason_codes.length > 0;
   if (symbol.risk_guard.allowed === null) {
     return {
       label: "risk 평가 없음",
@@ -131,6 +132,12 @@ function riskSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
       };
     }
     if (isEntryDecision(decision)) {
+      if (symbol.risk_guard.auto_resized_entry && hasAdjustmentReasons) {
+        return {
+          label: "허용(자동 축소)",
+          detail: translateDecision(decision),
+        };
+      }
       return {
         label: "신규 진입 승인",
         detail: translateDecision(decision),

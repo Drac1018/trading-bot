@@ -13,17 +13,23 @@ from trading_mvp.services.account import (
     get_open_position,
     get_open_positions,
 )
+from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    get_reconciliation_blocking_reason_codes,
+    get_reconciliation_detail,
     get_operating_state,
 )
 from trading_mvp.services.settings import (
     get_exposure_limits,
+    get_limited_live_max_notional,
+    get_rollout_mode,
     get_runtime_credentials,
     is_live_execution_armed,
+    rollout_mode_allows_exchange_submit,
 )
 
 HARD_MAX_GLOBAL_LEVERAGE = 5.0
@@ -36,6 +42,10 @@ SYNC_BLOCKING_REASON_CODES = {
     "positions": "POSITION_STATE_STALE",
     "open_orders": "OPEN_ORDERS_STATE_STALE",
     "protective_orders": "PROTECTION_STATE_UNVERIFIED",
+}
+MARKET_BLOCKING_REASON_CODES = {
+    "stale": "MARKET_STATE_STALE",
+    "incomplete": "MARKET_STATE_INCOMPLETE",
 }
 SURVIVAL_PATH_DECISIONS = {"reduce", "exit"}
 AUTO_RESIZE_REASON_CODE_MAP = {
@@ -50,7 +60,6 @@ AUTO_RESIZE_HEADROOM_REASON_MAP = {
     "single_position_headroom_notional": "CLAMPED_TO_SINGLE_POSITION_HEADROOM",
     "same_tier_headroom_notional": "CLAMPED_TO_SAME_TIER_HEADROOM",
 }
-AUTO_RESIZE_ALLOWED_REASON_CODES = frozenset({"ENTRY_AUTO_RESIZED", *AUTO_RESIZE_REASON_CODE_MAP.values()})
 FINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "cancelled", "rejected", "expired"})
 PROTECTIVE_ORDER_TYPE_PREFIXES = ("stop", "take_profit", "trailing_stop")
 EXPOSURE_LIMIT_REASON_SPECS = (
@@ -67,6 +76,27 @@ def validate_decision_schema(payload: dict[str, Any]) -> TradeDecision:
 def is_survival_path_decision(decision: TradeDecision | str) -> bool:
     value = decision.decision if isinstance(decision, TradeDecision) else str(decision)
     return value in SURVIVAL_PATH_DECISIONS
+
+
+def _market_freshness_reason_codes(market_snapshot: MarketSnapshotPayload) -> list[str]:
+    reason_codes: list[str] = []
+    if market_snapshot.is_stale:
+        reason_codes.append(MARKET_BLOCKING_REASON_CODES["stale"])
+    if not market_snapshot.is_complete:
+        reason_codes.append(MARKET_BLOCKING_REASON_CODES["incomplete"])
+    return reason_codes
+
+
+def _sync_freshness_reason_codes(sync_freshness_summary: dict[str, Any]) -> list[str]:
+    reason_codes: list[str] = []
+    for scope, reason_code in SYNC_BLOCKING_REASON_CODES.items():
+        scope_summary = sync_freshness_summary.get(scope)
+        if not isinstance(scope_summary, dict):
+            reason_codes.append(reason_code)
+            continue
+        if bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
+            reason_codes.append(reason_code)
+    return reason_codes
 
 
 def _entry_price(decision: TradeDecision, market_snapshot: MarketSnapshotPayload) -> float:
@@ -87,6 +117,15 @@ def _round_float(value: float | None) -> float | None:
     if value is None:
         return None
     return round(float(value), 6)
+
+
+def _coerce_float(value: object, default: float = 0.0) -> float:
+    if value in {None, ""}:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _entry_trigger_evaluation(
@@ -257,20 +296,146 @@ def _minimum_actionable_notional(entry_price: float) -> float:
     return round(max(25.0, max(entry_price, 1.0) * 0.0005), 6)
 
 
+def _build_risk_exchange_client(settings_row: Setting) -> BinanceClient:
+    return BinanceClient(
+        testnet_enabled=settings_row.binance_testnet_enabled,
+        futures_enabled=settings_row.binance_futures_enabled,
+    )
+
+
+def _normalize_entry_size_for_risk(
+    settings_row: Setting,
+    *,
+    symbol: str,
+    quantity: float,
+    reference_price: float,
+    approved_notional: float | None = None,
+    exchange_client: Any | None = None,
+    enable_exchange_filters: bool = True,
+) -> dict[str, Any]:
+    safe_reference_price = max(reference_price, 1.0)
+    fallback_min_notional = _minimum_actionable_notional(safe_reference_price)
+    fallback_filters = {
+        "tick_size": 0.0,
+        "step_size": 0.0,
+        "min_qty": 0.0,
+        "min_notional": fallback_min_notional,
+    }
+    filter_source = "heuristic_fallback"
+    filter_lookup_error: str | None = None
+    client = exchange_client
+
+    if client is None and enable_exchange_filters:
+        try:
+            client = _build_risk_exchange_client(settings_row)
+        except Exception as exc:
+            filter_lookup_error = str(exc)
+            client = None
+
+    if client is not None and hasattr(client, "normalize_order_request"):
+        try:
+            normalized = dict(
+                client.normalize_order_request(
+                    symbol=symbol,
+                    quantity=quantity,
+                    reference_price=safe_reference_price,
+                    approved_notional=approved_notional,
+                    enforce_min_notional=True,
+                    close_position=False,
+                )
+            )
+            normalized["filter_source"] = "exchange_filters"
+            if filter_lookup_error:
+                normalized["filter_lookup_error"] = filter_lookup_error
+            return normalized
+        except Exception as exc:
+            filter_lookup_error = str(exc)
+
+    filters = dict(fallback_filters)
+    if client is not None and hasattr(client, "get_symbol_filters"):
+        try:
+            candidate_filters = client.get_symbol_filters(symbol)
+            if isinstance(candidate_filters, dict):
+                filters = {
+                    "tick_size": _coerce_float(candidate_filters.get("tick_size")),
+                    "step_size": _coerce_float(candidate_filters.get("step_size")),
+                    "min_qty": _coerce_float(candidate_filters.get("min_qty")),
+                    "min_notional": _coerce_float(candidate_filters.get("min_notional")),
+                }
+                filter_source = "exchange_filters"
+        except Exception as exc:
+            filter_lookup_error = str(exc)
+
+    step_size = max(_coerce_float(filters.get("step_size")), 0.0)
+    min_qty = max(_coerce_float(filters.get("min_qty")), 0.0)
+    min_notional = max(_coerce_float(filters.get("min_notional")), 0.0)
+    normalized_quantity = max(abs(quantity), 0.0)
+    if step_size > 0:
+        normalized_quantity = BinanceClient._quantize(normalized_quantity, step_size)
+    if approved_notional is not None and approved_notional > 0 and safe_reference_price > 0:
+        max_quantity = approved_notional / safe_reference_price
+        if step_size > 0:
+            max_quantity = BinanceClient._quantize(max_quantity, step_size)
+        normalized_quantity = min(normalized_quantity, max(max_quantity, 0.0))
+    notional = normalized_quantity * safe_reference_price if normalized_quantity > 0 else 0.0
+    reason_code: str | None = None
+    if normalized_quantity <= 0:
+        reason_code = "ORDER_QTY_ZERO_AFTER_STEP_SIZE"
+    elif min_qty > 0 and normalized_quantity < min_qty:
+        reason_code = "ORDER_QTY_BELOW_MIN_QTY"
+    elif min_notional > 0 and notional < min_notional:
+        reason_code = "ORDER_NOTIONAL_BELOW_MIN_NOTIONAL"
+
+    normalized = {
+        "symbol": symbol.upper(),
+        "quantity": round(normalized_quantity, 6),
+        "reference_price": round(safe_reference_price, 6),
+        "notional": round(max(notional, 0.0), 6),
+        "filters": filters,
+        "reason_code": reason_code,
+        "filter_source": filter_source,
+    }
+    if filter_lookup_error:
+        normalized["filter_lookup_error"] = filter_lookup_error
+    return normalized
+
+
+def _minimum_actionable_entry_size(
+    *,
+    entry_price: float,
+    normalization_payload: dict[str, Any],
+) -> dict[str, Any]:
+    safe_entry_price = max(entry_price, 1.0)
+    filters = normalization_payload.get("filters") if isinstance(normalization_payload.get("filters"), dict) else {}
+    step_size = max(_coerce_float(filters.get("step_size")), 0.0)
+    min_qty = max(_coerce_float(filters.get("min_qty")), 0.0)
+    min_notional = max(_coerce_float(filters.get("min_notional")), 0.0)
+    minimum_quantity = min_qty
+    if min_notional > 0:
+        quantity_from_notional = min_notional / safe_entry_price
+        if step_size > 0:
+            quantity_from_notional = BinanceClient._quantize_up(quantity_from_notional, step_size)
+        minimum_quantity = max(minimum_quantity, quantity_from_notional)
+    if minimum_quantity > 0 and step_size > 0:
+        minimum_quantity = BinanceClient._quantize_up(minimum_quantity, step_size)
+    minimum_notional = max(
+        min_notional,
+        minimum_quantity * safe_entry_price,
+        _minimum_actionable_notional(safe_entry_price)
+        if normalization_payload.get("filter_source") == "heuristic_fallback"
+        else 0.0,
+    )
+    return {
+        "quantity": round(max(minimum_quantity, 0.0), 6),
+        "notional": round(max(minimum_notional, 0.0), 6),
+        "filter_source": normalization_payload.get("filter_source"),
+        "filter_lookup_error": normalization_payload.get("filter_lookup_error"),
+        "filters": filters,
+    }
+
+
 def _has_non_resizable_entry_blockers(reason_codes: list[str]) -> bool:
     return any(str(code or "").strip() for code in reason_codes)
-
-
-def _is_pure_auto_resize_approval(
-    *,
-    is_entry_decision: bool,
-    auto_resized_entry: bool,
-    reason_codes: list[str],
-) -> bool:
-    if not is_entry_decision or not auto_resized_entry:
-        return False
-    normalized = [str(code or "").strip() for code in reason_codes if str(code or "").strip()]
-    return bool(normalized) and all(code in AUTO_RESIZE_ALLOWED_REASON_CODES for code in normalized)
 
 
 def _build_exposure_headroom_snapshot(
@@ -603,10 +768,13 @@ def evaluate_risk(
     decision_run_id: int | None = None,
     market_snapshot_id: int | None = None,
     execution_mode: Literal["live", "historical_replay"] = "live",
+    exchange_client: Any | None = None,
 ) -> tuple[RiskCheckResult, RiskCheck]:
-    reason_codes: list[str] = []
+    blocked_reason_codes: list[str] = []
+    adjustment_reason_codes: list[str] = []
     defaults = get_settings()
-    live_requested = settings_row.live_trading_enabled
+    rollout_mode = get_rollout_mode(settings_row)
+    live_requested = rollout_mode != "paper"
     operating_mode: Literal["live", "paused", "hold"] = "live"
     operating_state = get_operating_state(settings_row)
     existing_position = get_open_position(session, decision.symbol)
@@ -644,10 +812,22 @@ def evaluate_risk(
     resized_exposure_metrics = current_exposure_metrics
     exposure_headroom_snapshot: dict[str, float] = {}
     raw_projected_quantity = 0.0
+    requested_exchange_quantity: float | None = None
+    requested_exchange_notional = 0.0
+    requested_exchange_reason_code: str | None = None
+    resized_exchange_reason_code: str | None = None
+    exchange_minimums: dict[str, Any] = {}
     minimum_actionable_notional = 0.0
+    minimum_actionable_quantity = 0.0
+    max_additional_notional = 0.0
     requested_exposure_limit_codes: list[str] = []
     final_exposure_limit_codes: list[str] = []
     entry_trigger_debug: dict[str, Any] = {}
+    reconciliation_summary = (
+        get_reconciliation_detail(settings_row)
+        if execution_mode != "historical_replay"
+        else {}
+    )
     if is_entry_decision:
         raw_size = _estimate_projected_entry_size(
             decision,
@@ -658,63 +838,94 @@ def evaluate_risk(
         )
         raw_projected_notional = raw_size["notional"]
         raw_projected_quantity = raw_size["quantity"]
-        approved_projected_notional = raw_projected_notional
-        approved_quantity = raw_projected_quantity if raw_projected_quantity > 0 else None
-        resized_projected_notional = raw_projected_notional
+        requested_exchange_payload = _normalize_entry_size_for_risk(
+            settings_row,
+            symbol=decision.symbol,
+            quantity=raw_projected_quantity,
+            reference_price=raw_size["entry_price"],
+            approved_notional=raw_projected_notional,
+            exchange_client=exchange_client,
+            enable_exchange_filters=execution_mode == "live" or exchange_client is not None,
+        )
+        requested_exchange_quantity = (
+            _coerce_float(requested_exchange_payload.get("quantity"))
+            if _coerce_float(requested_exchange_payload.get("quantity")) > 0
+            else None
+        )
+        requested_exchange_notional = _coerce_float(requested_exchange_payload.get("notional"))
+        requested_exchange_reason_code = (
+            str(requested_exchange_payload.get("reason_code") or "").strip() or None
+        )
+        approved_projected_notional = requested_exchange_notional
+        approved_quantity = requested_exchange_quantity
+        resized_projected_notional = requested_exchange_notional
         resized_projected_quantity = approved_quantity
+        minimum_actionable = _minimum_actionable_entry_size(
+            entry_price=raw_size["entry_price"],
+            normalization_payload=requested_exchange_payload,
+        )
+        minimum_actionable_notional = _coerce_float(minimum_actionable.get("notional"))
+        minimum_actionable_quantity = _coerce_float(minimum_actionable.get("quantity"))
+        exchange_minimums = {
+            "filter_source": minimum_actionable.get("filter_source"),
+            "filter_lookup_error": minimum_actionable.get("filter_lookup_error"),
+            "tick_size": _round_float(_coerce_float(minimum_actionable.get("filters", {}).get("tick_size"))),
+            "step_size": _round_float(_coerce_float(minimum_actionable.get("filters", {}).get("step_size"))),
+            "min_qty": _round_float(_coerce_float(minimum_actionable.get("filters", {}).get("min_qty"))),
+            "min_notional": _round_float(_coerce_float(minimum_actionable.get("filters", {}).get("min_notional"))),
+            "minimum_actionable_quantity": _round_float(minimum_actionable_quantity),
+            "minimum_actionable_notional": _round_float(minimum_actionable_notional),
+            "requested_reason_code": requested_exchange_reason_code,
+        }
         exposure_headroom_snapshot = _build_exposure_headroom_snapshot(
             exposure_metrics=current_exposure_metrics,
             exposure_limits=exposure_limits,
             equity=latest_pnl.equity,
             decision_side=decision.decision,
         )
-        minimum_actionable_notional = _minimum_actionable_notional(raw_size["entry_price"])
         exposure_headroom_snapshot["minimum_actionable_notional"] = minimum_actionable_notional
+        exposure_headroom_snapshot["minimum_actionable_quantity"] = minimum_actionable_quantity
         requested_exposure_metrics = _build_exposure_metrics(
             session,
             decision.symbol,
             latest_pnl.equity,
             projected_side=decision.decision,
-            projected_notional=raw_projected_notional,
+            projected_notional=requested_exchange_notional if requested_exchange_reason_code is None else 0.0,
         )
         resized_exposure_metrics = requested_exposure_metrics
         exposure_metrics = requested_exposure_metrics
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
 
     if settings_row.trading_paused and is_entry_decision:
-        reason_codes.append("TRADING_PAUSED")
+        blocked_reason_codes.append("TRADING_PAUSED")
         operating_mode = "paused"
     if operating_state == PROTECTION_REQUIRED_STATE and is_entry_decision:
-        reason_codes.append(PROTECTION_REQUIRED_STATE)
+        blocked_reason_codes.append(PROTECTION_REQUIRED_STATE)
     if operating_state == DEGRADED_MANAGE_ONLY_STATE and is_entry_decision:
-        reason_codes.append(DEGRADED_MANAGE_ONLY_STATE)
+        blocked_reason_codes.append(DEGRADED_MANAGE_ONLY_STATE)
     if operating_state == EMERGENCY_EXIT_STATE and is_entry_decision:
-        reason_codes.append(EMERGENCY_EXIT_STATE)
-    if market_snapshot.is_stale and is_entry_decision:
-        reason_codes.append("STALE_MARKET_DATA")
-    if not market_snapshot.is_complete and is_entry_decision:
-        reason_codes.append("INCOMPLETE_MARKET_DATA")
+        blocked_reason_codes.append(EMERGENCY_EXIT_STATE)
+    if is_entry_decision:
+        blocked_reason_codes.extend(_market_freshness_reason_codes(market_snapshot))
     if is_entry_decision and latest_pnl.daily_pnl < 0 and abs(latest_pnl.daily_pnl) / max(latest_pnl.equity, 1.0) >= effective_daily_loss_cap:
-        reason_codes.append("DAILY_LOSS_LIMIT_REACHED")
+        blocked_reason_codes.append("DAILY_LOSS_LIMIT_REACHED")
     if latest_pnl.consecutive_losses >= settings_row.max_consecutive_losses and is_entry_decision:
-        reason_codes.append("MAX_CONSECUTIVE_LOSSES_REACHED")
+        blocked_reason_codes.append("MAX_CONSECUTIVE_LOSSES_REACHED")
     if is_entry_decision and decision.leverage > effective_leverage_cap:
-        reason_codes.append("LEVERAGE_EXCEEDS_LIMIT")
+        blocked_reason_codes.append("LEVERAGE_EXCEEDS_LIMIT")
     if is_entry_decision and decision.risk_pct > effective_risk_cap:
-        reason_codes.append("RISK_PCT_EXCEEDS_LIMIT")
+        blocked_reason_codes.append("RISK_PCT_EXCEEDS_LIMIT")
     if is_entry_decision and (decision.stop_loss is None or decision.take_profit is None):
-        reason_codes.append("MISSING_STOP_OR_TARGET")
+        blocked_reason_codes.append("MISSING_STOP_OR_TARGET")
     if is_entry_decision:
         entry_trigger_reason_codes, entry_trigger_debug = _entry_trigger_evaluation(decision, market_snapshot)
-        reason_codes.extend(entry_trigger_reason_codes)
+        blocked_reason_codes.extend(entry_trigger_reason_codes)
     if is_entry_decision and live_requested:
-        for scope, reason_code in SYNC_BLOCKING_REASON_CODES.items():
-            scope_summary = sync_freshness_summary.get(scope)
-            if not isinstance(scope_summary, dict):
-                reason_codes.append(reason_code)
-                continue
-            if bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
-                reason_codes.append(reason_code)
+        blocked_reason_codes.extend(_sync_freshness_reason_codes(sync_freshness_summary))
+    if is_entry_decision and live_requested:
+        blocked_reason_codes.extend(get_reconciliation_blocking_reason_codes(settings_row))
+    if is_entry_decision and requested_exchange_reason_code is not None:
+        blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
 
     if is_protection_recovery and existing_position is not None:
         entry = existing_position.mark_price if existing_position.mark_price > 0 else existing_position.entry_price
@@ -722,33 +933,33 @@ def evaluate_risk(
         entry = _entry_price(decision, market_snapshot)
     if decision.decision == "long" and decision.stop_loss is not None and decision.take_profit is not None:
         if decision.stop_loss >= entry or decision.take_profit <= entry:
-            reason_codes.append("INVALID_PROTECTION_BRACKETS" if is_protection_recovery else "INVALID_LONG_BRACKETS")
+            blocked_reason_codes.append("INVALID_PROTECTION_BRACKETS" if is_protection_recovery else "INVALID_LONG_BRACKETS")
     if decision.decision == "short" and decision.stop_loss is not None and decision.take_profit is not None:
         if decision.stop_loss <= entry or decision.take_profit >= entry:
-            reason_codes.append("INVALID_PROTECTION_BRACKETS" if is_protection_recovery else "INVALID_SHORT_BRACKETS")
+            blocked_reason_codes.append("INVALID_PROTECTION_BRACKETS" if is_protection_recovery else "INVALID_SHORT_BRACKETS")
 
     slippage = abs(entry - market_snapshot.latest_price) / max(market_snapshot.latest_price, 1.0)
     if slippage > settings_row.slippage_threshold_pct and is_entry_decision:
-        reason_codes.append("SLIPPAGE_THRESHOLD_EXCEEDED")
+        blocked_reason_codes.append("SLIPPAGE_THRESHOLD_EXCEEDED")
     if decision.decision == "hold":
-        reason_codes.append("HOLD_DECISION")
+        blocked_reason_codes.append("HOLD_DECISION")
         operating_mode = "hold" if operating_mode != "paused" else operating_mode
 
     enforce_live_readiness = execution_mode != "historical_replay"
     if enforce_live_readiness and (not credentials.binance_api_key or not credentials.binance_api_secret):
         if decision.decision != "hold":
-            reason_codes.append("LIVE_CREDENTIALS_MISSING")
+            blocked_reason_codes.append("LIVE_CREDENTIALS_MISSING")
     if enforce_live_readiness and is_entry_decision and live_requested:
         if not defaults.live_trading_env_enabled:
-            reason_codes.append("LIVE_ENV_DISABLED")
+            blocked_reason_codes.append("LIVE_ENV_DISABLED")
         if not settings_row.manual_live_approval:
-            reason_codes.append("LIVE_APPROVAL_POLICY_DISABLED")
+            blocked_reason_codes.append("LIVE_APPROVAL_POLICY_DISABLED")
         if not is_live_execution_armed(settings_row):
-            reason_codes.append("LIVE_APPROVAL_REQUIRED")
+            blocked_reason_codes.append("LIVE_APPROVAL_REQUIRED")
     elif enforce_live_readiness and is_entry_decision:
-        reason_codes.append("LIVE_TRADING_DISABLED")
+        blocked_reason_codes.append("LIVE_TRADING_DISABLED")
 
-    non_resizable_entry_blockers_present = _has_non_resizable_entry_blockers(reason_codes)
+    non_resizable_entry_blockers_present = _has_non_resizable_entry_blockers(blocked_reason_codes)
     if is_entry_decision:
         requested_exposure_limit_codes = _evaluate_exposure_limit_codes(
             exposure_metrics=requested_exposure_metrics,
@@ -763,17 +974,32 @@ def evaluate_risk(
 
         if requested_exposure_limit_codes:
             if not non_resizable_entry_blockers_present and max_additional_notional >= minimum_actionable_notional:
-                resized_projected_notional = min(raw_projected_notional, max_additional_notional)
-                resized_projected_quantity = (
-                    round(
-                        min(
-                            raw_projected_quantity,
-                            resized_projected_notional / max(_entry_price(decision, market_snapshot), 1.0),
-                        ),
-                        6,
+                resized_target_notional = min(requested_exchange_notional, max_additional_notional)
+                resized_target_quantity = (
+                    min(
+                        requested_exchange_quantity or raw_projected_quantity,
+                        resized_target_notional / max(_entry_price(decision, market_snapshot), 1.0),
                     )
-                    if raw_projected_quantity > 0
+                    if (requested_exchange_quantity or raw_projected_quantity) > 0
+                    else 0.0
+                )
+                resized_exchange_payload = _normalize_entry_size_for_risk(
+                    settings_row,
+                    symbol=decision.symbol,
+                    quantity=resized_target_quantity,
+                    reference_price=raw_size["entry_price"],
+                    approved_notional=resized_target_notional,
+                    exchange_client=exchange_client,
+                    enable_exchange_filters=execution_mode == "live" or exchange_client is not None,
+                )
+                resized_projected_notional = _coerce_float(resized_exchange_payload.get("notional"))
+                resized_projected_quantity = (
+                    _coerce_float(resized_exchange_payload.get("quantity"))
+                    if _coerce_float(resized_exchange_payload.get("quantity")) > 0
                     else None
+                )
+                resized_exchange_reason_code = (
+                    str(resized_exchange_payload.get("reason_code") or "").strip() or None
                 )
                 resized_exposure_metrics = _build_exposure_metrics(
                     session,
@@ -783,36 +1009,41 @@ def evaluate_risk(
                     projected_notional=resized_projected_notional,
                 )
                 exposure_metrics = resized_exposure_metrics
-                final_exposure_limit_codes = _evaluate_exposure_limit_codes(
-                    exposure_metrics=resized_exposure_metrics,
-                    exposure_limits=exposure_limits,
-                    decision_side=decision.decision,
-                )
-                if final_exposure_limit_codes:
-                    reason_codes.extend(final_exposure_limit_codes)
+                if resized_exchange_reason_code is not None:
+                    blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
                     approved_projected_notional = 0.0
                     approved_quantity = None
                 else:
-                    approved_projected_notional = resized_projected_notional
-                    approved_quantity = (
-                        resized_projected_quantity
-                        if resized_projected_quantity is not None and resized_projected_quantity > 0
-                        else None
+                    final_exposure_limit_codes = _evaluate_exposure_limit_codes(
+                        exposure_metrics=resized_exposure_metrics,
+                        exposure_limits=exposure_limits,
+                        decision_side=decision.decision,
                     )
-                    if approved_projected_notional < raw_projected_notional - 1e-9:
-                        auto_resized_entry = True
-                        size_adjustment_ratio = round(
-                            approved_projected_notional / max(raw_projected_notional, 1e-9),
-                            6,
-                        )
-                        auto_resize_reason = AUTO_RESIZE_HEADROOM_REASON_MAP[limiting_key]
-                        reason_codes.extend(["ENTRY_AUTO_RESIZED", AUTO_RESIZE_REASON_CODE_MAP[limiting_key]])
+                    if final_exposure_limit_codes:
+                        blocked_reason_codes.extend(final_exposure_limit_codes)
+                        approved_projected_notional = 0.0
+                        approved_quantity = None
                     else:
-                        size_adjustment_ratio = 1.0
+                        approved_projected_notional = resized_projected_notional
+                        approved_quantity = (
+                            resized_projected_quantity
+                            if resized_projected_quantity is not None and resized_projected_quantity > 0
+                            else None
+                        )
+                        if approved_projected_notional < requested_exchange_notional - 1e-9:
+                            auto_resized_entry = True
+                            size_adjustment_ratio = round(
+                                approved_projected_notional / max(raw_projected_notional, 1e-9),
+                                6,
+                            )
+                            auto_resize_reason = AUTO_RESIZE_HEADROOM_REASON_MAP[limiting_key]
+                            adjustment_reason_codes.extend(["ENTRY_AUTO_RESIZED", AUTO_RESIZE_REASON_CODE_MAP[limiting_key]])
+                        else:
+                            size_adjustment_ratio = 1.0
             else:
-                reason_codes.extend(requested_exposure_limit_codes)
+                blocked_reason_codes.extend(requested_exposure_limit_codes)
                 if max_additional_notional < minimum_actionable_notional:
-                    reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
+                    blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
                 approved_projected_notional = 0.0
                 approved_quantity = None
                 exposure_metrics = requested_exposure_metrics
@@ -820,12 +1051,16 @@ def evaluate_risk(
             resized_exposure_metrics = requested_exposure_metrics
             exposure_metrics = requested_exposure_metrics
 
-    reason_codes = list(dict.fromkeys(reason_codes))
-    allowed = len(reason_codes) == 0 or _is_pure_auto_resize_approval(
-        is_entry_decision=is_entry_decision,
-        auto_resized_entry=auto_resized_entry,
-        reason_codes=reason_codes,
+    blocked_reason_codes = list(dict.fromkeys(blocked_reason_codes))
+    adjustment_reason_codes = list(dict.fromkeys(adjustment_reason_codes))
+    reason_codes = list(blocked_reason_codes)
+    resizable = bool(
+        is_entry_decision
+        and requested_exposure_limit_codes
+        and not non_resizable_entry_blockers_present
+        and max_additional_notional >= minimum_actionable_notional
     )
+    allowed = len(blocked_reason_codes) == 0
 
     approved_risk_pct = 0.0
     if allowed:
@@ -866,10 +1101,19 @@ def evaluate_risk(
         ),
     }
     debug_payload = {
+        "rollout_mode": rollout_mode,
+        "exchange_submit_allowed": rollout_mode_allows_exchange_submit(settings_row),
+        "limited_live_max_notional": (
+            _round_float(get_limited_live_max_notional(settings_row)) if rollout_mode == "limited_live" else None
+        ),
         "requested_notional": _round_float(raw_projected_notional),
         "requested_quantity": _round_float(raw_projected_quantity),
         "resized_notional": _round_float(resized_projected_notional),
         "resized_quantity": _round_float(resized_projected_quantity),
+        "requested_exchange_notional": _round_float(requested_exchange_notional),
+        "requested_exchange_quantity": _round_float(requested_exchange_quantity),
+        "requested_exchange_reason_code": requested_exchange_reason_code,
+        "resized_exchange_reason_code": resized_exchange_reason_code,
         "projected_symbol_notional": (
             _round_float(exposure_metrics.get("decision_symbol_notional", 0.0))
             if is_entry_decision
@@ -894,20 +1138,39 @@ def evaluate_risk(
         "headroom": dict(exposure_headroom_snapshot),
         "requested_exposure_limit_codes": requested_exposure_limit_codes,
         "final_exposure_limit_codes": final_exposure_limit_codes,
+        "exchange_minimums": exchange_minimums,
         "entry_trigger": entry_trigger_debug,
         "sync_timestamps": sync_timestamp_debug,
+        "reconciliation_state": {
+            "position_mode": reconciliation_summary.get("position_mode"),
+            "mode_guard_active": bool(reconciliation_summary.get("mode_guard_active", False)),
+            "mode_guard_reason_code": reconciliation_summary.get("mode_guard_reason_code"),
+            "guarded_symbols": [
+                str(item)
+                for item in reconciliation_summary.get("guarded_symbols", [])
+                if item not in {None, ""}
+            ]
+            if isinstance(reconciliation_summary, dict)
+            else [],
+        },
     }
     result = RiskCheckResult(
         allowed=allowed,
         decision=decision.decision,
         reason_codes=reason_codes,
+        blocked_reason_codes=blocked_reason_codes,
+        adjustment_reason_codes=adjustment_reason_codes,
         approved_risk_pct=approved_risk_pct if allowed else 0.0,
         approved_leverage=min(decision.leverage, effective_leverage_cap) if allowed else 0.0,
         raw_projected_notional=raw_projected_notional,
+        approved_notional=approved_projected_notional if allowed else 0.0,
         approved_projected_notional=approved_projected_notional if allowed else 0.0,
+        approved_qty=approved_quantity if allowed else None,
         approved_quantity=approved_quantity if allowed else None,
+        resizable=resizable,
         auto_resized_entry=auto_resized_entry if allowed else False,
         size_adjustment_ratio=size_adjustment_ratio if allowed else 0.0,
+        snapshot_id=market_snapshot_id,
         exposure_headroom_snapshot=exposure_headroom_snapshot,
         auto_resize_reason=auto_resize_reason if allowed else None,
         operating_mode=operating_mode if not allowed else "live",
@@ -924,7 +1187,7 @@ def evaluate_risk(
         market_snapshot_id=market_snapshot_id,
         allowed=result.allowed,
         decision=result.decision,
-        reason_codes=result.reason_codes,
+        reason_codes=result.blocked_reason_codes,
         approved_risk_pct=result.approved_risk_pct,
         approved_leverage=result.approved_leverage,
         payload=result.model_dump(mode="json"),

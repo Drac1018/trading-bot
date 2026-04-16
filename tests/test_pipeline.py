@@ -11,6 +11,7 @@ from trading_mvp.models import (
     FeatureSnapshot,
     MarketSnapshot,
     Order,
+    PendingEntryPlan,
     PnLSnapshot,
     RiskCheck,
     SchedulerRun,
@@ -234,50 +235,19 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
         lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
     )
 
-    def fake_execute_live_trade(session, settings_row, decision_run_id, decision, market_snapshot, risk_result, risk_row=None):
-        order = Order(
-            symbol=decision.symbol,
-            decision_run_id=decision_run_id,
-            risk_check_id=risk_row.id if risk_row is not None else None,
-            position_id=None,
-            side=decision.decision,
-            order_type="market",
-            mode="live",
-            status="filled",
-            external_order_id="sim-order-1",
-            client_order_id="sim-client-1",
-            reduce_only=False,
-            close_only=False,
-            parent_order_id=None,
-            exchange_status="FILLED",
-            last_exchange_update_at=utcnow_naive(),
-            requested_quantity=0.01,
-            requested_price=market_snapshot.latest_price,
-            filled_quantity=0.01,
-            average_fill_price=market_snapshot.latest_price,
-            reason_codes=[],
-            metadata_json={},
-        )
-        session.add(order)
-        session.flush()
-        session.add(
-            Execution(
-                order_id=order.id,
-                position_id=None,
-                symbol=decision.symbol,
-                status="filled",
-                external_trade_id="sim-trade-1",
-                fill_price=market_snapshot.latest_price,
-                fill_quantity=0.01,
-                fee_paid=0.1,
-                commission_asset="USDT",
-                slippage_pct=0.0,
-                realized_pnl=0.0,
-                payload={"test": True},
-            )
-        )
-        session.flush()
-        return {"order_id": order.id, "status": "filled"}
+    def fake_execute_live_trade(
+        session,
+        settings_row,
+        decision_run_id,
+        decision,
+        market_snapshot,
+        risk_result,
+        risk_row=None,
+        cycle_id=None,
+        snapshot_id=None,
+        idempotency_key=None,
+    ):
+        raise AssertionError("new entry decision should arm a pending plan instead of executing immediately")
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
 
@@ -287,8 +257,12 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     decision_run = db_session.get(AgentRun, result["decision_run_id"])
 
     assert result["decision"]["decision"] == "long"
-    assert result["risk_result"]["allowed"] is True
-    assert result["execution"] is not None
+    assert result["risk_result"]["allowed"] is False
+    assert "ENTRY_TRIGGER_NOT_MET" in result["risk_result"]["blocked_reason_codes"]
+    assert result["execution"] is None
+    assert result["status"] == "entry_plan_armed"
+    assert result["entry_plan"] is not None
+    assert result["entry_plan"]["plan_status"] == "armed"
     assert result["decision_reference"]["market_snapshot_id"] == result["market_snapshot_id"]
     assert result["decision_reference"]["market_snapshot_source"] == "refreshed"
     assert result["decision_reference"]["market_snapshot_stale"] is False
@@ -298,8 +272,11 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     assert decision_run is not None
     assert decision_run.input_payload["decision_reference"]["market_snapshot_id"] == result["market_snapshot_id"]
     assert decision_run.input_payload["decision_reference"]["sync_freshness_summary"]["account"]["stale"] is False
-    assert db_session.scalar(select(Order).limit(1)) is not None
-    assert db_session.scalar(select(Execution).limit(1)) is not None
+    pending_plan = db_session.scalar(select(PendingEntryPlan).limit(1))
+    assert pending_plan is not None
+    assert pending_plan.plan_status == "armed"
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
     assert db_session.scalar(select(RiskCheck).limit(1)) is not None
     assert db_session.scalar(select(AuditEvent).limit(1)) is not None
 
@@ -335,8 +312,9 @@ def test_historical_replay_never_executes_live(monkeypatch, db_session) -> None:
     result = TradingOrchestrator(db_session).run_decision_cycle(trigger_event="historical_replay", upto_index=140)
 
     assert result["decision"]["decision"] == "long"
-    assert result["risk_result"]["allowed"] is True
+    assert "ENTRY_TRIGGER_NOT_MET" in result["risk_result"]["blocked_reason_codes"]
     assert result["execution"] is None
+    assert result["entry_plan"] is None
 
 
 def test_runtime_market_snapshot_requires_binance_data() -> None:
@@ -674,6 +652,62 @@ def test_run_selected_symbols_cycle_isolates_symbol_failures(monkeypatch, db_ses
     assert result["failed_symbols"] == ["BTCUSDT"]
     assert result["results"][0]["status"] == "failed"
     assert result["results"][1]["status"] == "ok"
+
+
+def test_run_selected_symbols_cycle_uses_candidate_selection_top_n(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+    executed_symbols: list[str] = []
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "correlation_aware_top_n",
+            "max_selected": 2,
+            "selected_symbols": ["BTCUSDT", "ETHUSDT"],
+            "skipped_symbols": ["BNBUSDT"],
+            "rankings": [
+                {
+                    "symbol": "BTCUSDT",
+                    "selected": True,
+                    "selection_reason": "ranked_top_n",
+                    "score": {"total_score": 0.71, "correlation_penalty": 0.0},
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "selected": True,
+                    "selection_reason": "ranked_top_n",
+                    "score": {"total_score": 0.58, "correlation_penalty": 0.14},
+                },
+                {
+                    "symbol": "BNBUSDT",
+                    "selected": False,
+                    "selection_reason": "correlation_limit",
+                    "score": {"total_score": 0.22, "correlation_penalty": 0.36},
+                },
+            ],
+        },
+    )
+
+    def fake_run_decision_cycle(self, symbol=None, **kwargs):
+        executed_symbols.append(str(symbol))
+        return {"symbol": symbol, "status": "ok"}
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = TradingOrchestrator(db_session).run_selected_symbols_cycle(trigger_event="realtime_cycle")
+
+    assert executed_symbols == ["BTCUSDT", "ETHUSDT"]
+    assert result["tracked_symbols"] == ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+    assert result["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert result["candidate_selection"]["mode"] == "correlation_aware_top_n"
+    assert result["candidate_selection"]["selected_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert result["candidate_selection"]["skipped_symbols"] == ["BNBUSDT"]
+    assert result["candidate_selection"]["rankings"][2]["score"]["correlation_penalty"] == 0.36
 
 
 def test_run_exchange_sync_cycle_calls_live_sync_and_records_success(monkeypatch, db_session) -> None:

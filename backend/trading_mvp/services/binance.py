@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import json
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -10,6 +12,7 @@ from typing import Any, cast
 from urllib.parse import urlencode
 
 import httpx
+import websockets
 
 from trading_mvp.schemas import MarketCandle
 
@@ -63,6 +66,7 @@ class BinanceClient:
         *,
         params: Mapping[str, str | int | float | bool] | None = None,
         signed: bool = False,
+        api_key_only: bool = False,
         retryable: bool | None = None,
     ) -> dict[str, object] | list[object]:
         attempts = 3 if (retryable if retryable is not None else method.upper() == "GET") else 1
@@ -76,11 +80,16 @@ class BinanceClient:
             if signed:
                 if not self.api_key or not self.api_secret:
                     raise RuntimeError("Binance signed endpoints require both API key and secret.")
+                headers["X-MBX-APIKEY"] = self.api_key
+            elif api_key_only:
+                if not self.api_key:
+                    raise RuntimeError("Binance API-key endpoints require an API key.")
+                headers["X-MBX-APIKEY"] = self.api_key
+            if signed:
                 query_params["timestamp"] = self._signed_timestamp_ms()
                 query_params["recvWindow"] = self.recv_window_ms
                 query = urlencode(query_params)
                 query_params["signature"] = self._sign(query)
-                headers["X-MBX-APIKEY"] = self.api_key
             try:
                 with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as client:
                     response = client.request(method, path, params=query_params, headers=headers)
@@ -295,6 +304,120 @@ class BinanceClient:
         filters = self.get_symbol_filters(symbol)
         return self._quantize(price, filters["tick_size"])
 
+    def normalize_order_request(
+        self,
+        *,
+        symbol: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        stop_price: float | None = None,
+        reference_price: float | None = None,
+        approved_notional: float | None = None,
+        enforce_min_notional: bool = True,
+        close_position: bool = False,
+    ) -> dict[str, object]:
+        filters = self.get_symbol_filters(symbol)
+        normalized_price = self._quantize(price, filters["tick_size"]) if price is not None else None
+        normalized_stop_price = self._quantize(stop_price, filters["tick_size"]) if stop_price is not None else None
+        effective_reference_price = (
+            normalized_price
+            if normalized_price is not None and normalized_price > 0
+            else normalized_stop_price
+            if normalized_stop_price is not None and normalized_stop_price > 0
+            else reference_price
+        )
+        if effective_reference_price is None or effective_reference_price <= 0:
+            effective_reference_price = reference_price if reference_price and reference_price > 0 else None
+        normalized_quantity: float | None = None
+        reason_code: str | None = None
+        notional: float | None = None
+        min_qty = float(filters.get("min_qty", 0.0))
+        min_notional = float(filters.get("min_notional", 0.0))
+        if quantity is not None:
+            normalized_quantity = self._quantize(abs(quantity), filters["step_size"])
+            if approved_notional is not None and approved_notional > 0 and effective_reference_price and effective_reference_price > 0:
+                max_quantity = approved_notional / effective_reference_price
+                normalized_quantity = min(normalized_quantity, self._quantize(max_quantity, filters["step_size"]))
+            if normalized_quantity <= 0:
+                reason_code = "ORDER_QTY_ZERO_AFTER_STEP_SIZE"
+            elif normalized_quantity < min_qty:
+                reason_code = "ORDER_QTY_BELOW_MIN_QTY"
+            else:
+                notional = normalized_quantity * (effective_reference_price or 0.0)
+                if (
+                    enforce_min_notional
+                    and not close_position
+                    and min_notional > 0
+                    and effective_reference_price is not None
+                    and effective_reference_price > 0
+                    and notional < min_notional
+                ):
+                    reason_code = "ORDER_NOTIONAL_BELOW_MIN_NOTIONAL"
+        return {
+            "symbol": symbol.upper(),
+            "quantity": normalized_quantity,
+            "price": normalized_price,
+            "stop_price": normalized_stop_price,
+            "reference_price": effective_reference_price,
+            "notional": notional,
+            "filters": filters,
+            "reason_code": reason_code,
+        }
+
+    def create_futures_listen_key(self) -> str:
+        payload = self._request("POST", "/fapi/v1/listenKey", api_key_only=True, retryable=False)
+        result = self._as_dict(payload, "Unexpected Binance futures listen key response.")
+        listen_key = str(result.get("listenKey") or "")
+        if not listen_key:
+            raise RuntimeError("Binance futures listen key was not returned.")
+        return listen_key
+
+    def keepalive_futures_listen_key(self, listen_key: str) -> dict[str, object]:
+        payload = self._request(
+            "PUT",
+            "/fapi/v1/listenKey",
+            params={"listenKey": listen_key},
+            api_key_only=True,
+            retryable=False,
+        )
+        return self._as_dict(payload, "Unexpected Binance futures listen key keepalive response.")
+
+    def close_futures_listen_key(self, listen_key: str) -> dict[str, object]:
+        payload = self._request(
+            "DELETE",
+            "/fapi/v1/listenKey",
+            params={"listenKey": listen_key},
+            api_key_only=True,
+            retryable=False,
+        )
+        return self._as_dict(payload, "Unexpected Binance futures listen key close response.")
+
+    def build_futures_user_stream_url(self, listen_key: str) -> str:
+        ws_base = "wss://stream.binancefuture.com" if self.testnet_enabled else "wss://fstream.binance.com"
+        return f"{ws_base}/ws/{listen_key}"
+
+    async def stream_futures_user_events(
+        self,
+        listen_key: str,
+        *,
+        max_events: int | None = None,
+        idle_timeout_seconds: float = 30.0,
+    ):
+        url = self.build_futures_user_stream_url(listen_key)
+        received = 0
+        async with websockets.connect(url, ping_interval=15, ping_timeout=15, close_timeout=5) as websocket:
+            while max_events is None or received < max_events:
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=max(idle_timeout_seconds, 0.01))
+                except TimeoutError:
+                    break
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8")
+                payload = json.loads(message)
+                if isinstance(payload, dict):
+                    yield payload
+                    received += 1
+
     def change_initial_leverage(self, symbol: str, leverage: int) -> dict[str, object]:
         payload = self._request(
             "POST",
@@ -387,6 +510,18 @@ class BinanceClient:
             self._as_dict(payload, "Unexpected Binance algo order response.")
         )
 
+    def fetch_order(
+        self,
+        *,
+        symbol: str,
+        order_type: str | None = None,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, object]:
+        if self.futures_enabled and order_type and self._is_algo_order_type(order_type):
+            return self.get_algo_order(algo_id=order_id, client_algo_id=client_order_id)
+        return self.get_order(symbol=symbol, order_id=order_id, client_order_id=client_order_id)
+
     def get_open_algo_orders(
         self,
         symbol: str | None = None,
@@ -448,6 +583,18 @@ class BinanceClient:
             self._as_dict(payload, "Unexpected Binance cancel algo order response.")
         )
 
+    def cancel_exchange_order(
+        self,
+        *,
+        symbol: str,
+        order_type: str | None = None,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, object]:
+        if self.futures_enabled and order_type and self._is_algo_order_type(order_type):
+            return self.cancel_algo_order(algo_id=order_id, client_algo_id=client_order_id)
+        return self.cancel_order(symbol=symbol, order_id=order_id, client_order_id=client_order_id)
+
     def cancel_all_open_orders(self, symbol: str) -> dict[str, object]:
         payload = self._request(
             "DELETE",
@@ -498,12 +645,56 @@ class BinanceClient:
             raise RuntimeError("Unexpected Binance trades response.")
         return [dict(cast(Mapping[str, object], item)) for item in payload if isinstance(item, Mapping)]
 
+    def get_income_history(
+        self,
+        *,
+        income_type: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int = 100,
+        symbol: str | None = None,
+    ) -> list[dict[str, object]]:
+        params: dict[str, str | int] = {"limit": limit}
+        if income_type:
+            params["incomeType"] = income_type
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        if symbol:
+            params["symbol"] = symbol.upper()
+        payload = self._request("GET", "/fapi/v1/income", params=params, signed=True)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected Binance income history response.")
+        return [dict(cast(Mapping[str, object], item)) for item in payload if isinstance(item, Mapping)]
+
     def get_position_information(self, symbol: str | None = None) -> list[dict[str, object]]:
         params = {"symbol": symbol.upper()} if symbol else None
         payload = self._request("GET", "/fapi/v3/positionRisk", params=params, signed=True)
         if not isinstance(payload, list):
             raise RuntimeError("Unexpected Binance position response.")
         return [dict(cast(Mapping[str, object], item)) for item in payload if isinstance(item, Mapping)]
+
+    def get_position_mode(self) -> dict[str, object]:
+        payload = self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
+        result = self._as_dict(payload, "Unexpected Binance position mode response.")
+        dual_side_position = result.get("dualSidePosition")
+        if isinstance(dual_side_position, bool):
+            dual_side_enabled = dual_side_position
+        elif isinstance(dual_side_position, str):
+            dual_side_enabled = dual_side_position.strip().lower() == "true"
+        else:
+            dual_side_enabled = None
+        mode = "unknown"
+        if dual_side_enabled is True:
+            mode = "hedge"
+        elif dual_side_enabled is False:
+            mode = "one_way"
+        return {
+            "mode": mode,
+            "dual_side_position": dual_side_enabled,
+            "raw_payload": result,
+        }
 
     def test_connection(self, symbol: str, timeframe: str) -> dict[str, object]:
         self.ping()

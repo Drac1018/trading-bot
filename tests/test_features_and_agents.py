@@ -203,7 +203,7 @@ def test_trading_agent_uses_regime_aware_baseline_for_long_and_short() -> None:
     assert bearish_decision.stop_loss is not None and bearish_decision.take_profit is not None
 
 
-def test_trading_agent_includes_structure_rationale_for_breakout_setup() -> None:
+def test_trading_agent_prefers_continuation_pullback_rationale_over_breakout_chasing() -> None:
     bullish_base = _snapshot(
         "15m",
         [100, 100.4, 100.6, 100.8, 100.7, 101.0, 101.2, 101.1, 101.4, 101.6, 101.8, 102.0, 102.2, 102.1, 102.4, 103.1],
@@ -227,7 +227,8 @@ def test_trading_agent_includes_structure_rationale_for_breakout_setup() -> None
     )
 
     assert decision.decision == "long"
-    assert "STRUCTURE_BREAKOUT_UP" in decision.rationale_codes
+    assert "PULLBACK_ENTRY_BIAS" in decision.rationale_codes
+    assert "BULLISH_CONTINUATION_PULLBACK" in decision.rationale_codes
 
 
 def test_trading_agent_prefers_hold_when_long_risk_budget_is_exhausted() -> None:
@@ -464,7 +465,8 @@ def test_trading_agent_applies_adaptive_confidence_and_risk_discount() -> None:
                 "regime": {"weight": 0.86},
                 "rationale_codes": {
                     "TREND_UP": {"weight": 0.85},
-                    "STRUCTURE_BREAKOUT_UP": {"weight": 0.85},
+                    "PULLBACK_ENTRY_BIAS": {"weight": 0.85},
+                    "BULLISH_CONTINUATION_PULLBACK": {"weight": 0.85},
                 },
             },
             "7d": {
@@ -473,7 +475,8 @@ def test_trading_agent_applies_adaptive_confidence_and_risk_discount() -> None:
                 "regime": {"weight": 0.87},
                 "rationale_codes": {
                     "TREND_UP": {"weight": 0.86},
-                    "STRUCTURE_BREAKOUT_UP": {"weight": 0.86},
+                    "PULLBACK_ENTRY_BIAS": {"weight": 0.86},
+                    "BULLISH_CONTINUATION_PULLBACK": {"weight": 0.86},
                 },
             },
         },

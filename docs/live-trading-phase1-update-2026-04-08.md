@@ -26,13 +26,20 @@
 ### Live route selection
 
 - If `live_trading_enabled` is `false`, the system stays on the paper path.
-- If `live_trading_enabled` is `true`, the risk engine only allows live execution when all of these are true:
+- If `live_trading_enabled` is `true`, rollout is now separated into explicit stages:
+  - `shadow`: market / AI / risk / execution intent / audit까지만 수행하고 실제 Binance submit은 금지
+  - `live_dry_run`: 거래소 sync와 pre-trade filter 검증까지 수행하고 실제 submit은 금지
+  - `limited_live`: 실제 submit은 허용하되 주문당 notional을 `limited_live_max_notional` 이하로 제한
+  - `full_live`: 기존 live submit 경로 유지
+- `paper`를 제외한 rollout에서 risk engine only allows live execution readiness when all of these are true:
   - `LIVE_TRADING_ENV_ENABLED` is enabled in environment
   - Binance API key exists
   - Binance API secret exists
   - `manual_live_approval` is enabled
   - live execution has been armed and the approval window is still open
   - trading is not paused
+
+`live_execution_ready` is the readiness signal. Actual exchange submission still depends on rollout stage via `exchange_submit_allowed` and the final `can_enter_new_position` gate.
 
 ### Manual approval window
 
@@ -121,10 +128,6 @@
 - live fee and funding-rate accounting refinement
 - operator approval audit trail in UI timeline
 - richer UI for live protective order states and fill ladder details
-- staged rollout path:
-  - shadow mode
-  - live dry-run monitoring
-  - limited notional live mode
 
 ## Recommendation
 

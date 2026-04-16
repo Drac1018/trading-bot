@@ -98,6 +98,30 @@ def _sample_features() -> FeaturePayload:
     )
 
 
+def _binance_replay_candles(points: int = 220) -> list[MarketCandle]:
+    start = utcnow_naive() - timedelta(minutes=15 * points)
+    candles: list[MarketCandle] = []
+    price = 65000.0
+    for index in range(points):
+        drift = 35.0 if index % 12 < 8 else -18.0
+        open_price = price
+        close_price = open_price + drift
+        high_price = max(open_price, close_price) + 20.0
+        low_price = min(open_price, close_price) - 18.0
+        candles.append(
+            MarketCandle(
+                timestamp=start + timedelta(minutes=15 * index),
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                volume=1500.0 + index,
+            )
+        )
+        price = close_price
+    return candles
+
+
 def test_trading_agent_supports_baseline_old_logic_variant() -> None:
     agent = TradingDecisionAgent(DeterministicMockProvider())
     market_snapshot = _sample_market_snapshot()
@@ -158,9 +182,14 @@ def test_replay_validation_report_compares_variants_without_live_execution(monke
     assert "never submits live orders" in report.live_execution_guarantee
     assert {variant.logic_variant for variant in report.variants} == {"baseline_old", "improved"}
     assert all(variant.summary.decisions > 0 for variant in report.variants)
+    assert all(variant.summary.average_arrival_slippage_pct >= 0.0 for variant in report.variants)
+    assert all(variant.summary.average_realized_slippage_pct >= 0.0 for variant in report.variants)
+    assert all(variant.summary.average_first_fill_latency_seconds >= 0.0 for variant in report.variants)
+    assert all(variant.by_rationale_code for variant in report.variants)
     assert report.symbol_comparison and report.symbol_comparison[0].key == "BTCUSDT"
     assert report.timeframe_comparison and report.timeframe_comparison[0].key == "15m"
     assert report.regime_comparison
+    assert report.rationale_comparison
 
 
 def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) -> None:
@@ -198,7 +227,44 @@ def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) 
         assert payload["execution_basis"] == "next_bar_open_entry_with_intrabar_stop_take_profit_and_synthetic_fees"
         assert len(payload["variants"]) == 2
         assert payload["variants"][0]["summary"]["gross_pnl"] is not None
+        assert "average_arrival_slippage_pct" in payload["variants"][0]["summary"]
+        assert "average_first_fill_latency_seconds" in payload["variants"][0]["summary"]
+        assert payload["variants"][0]["by_rationale_code"]
         assert payload["symbol_comparison"][0]["key"] == "BTCUSDT"
         assert payload["timeframe_comparison"][0]["key"] == "15m"
+        assert payload["rationale_comparison"]
     finally:
         app.dependency_overrides.clear()
+
+
+def test_replay_validation_supports_binance_futures_klines_data_source(monkeypatch, db_session) -> None:
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("historical replay validation must not place live orders")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+    monkeypatch.setattr(
+        "trading_mvp.services.replay_validation.BinanceClient.fetch_klines",
+        lambda self, symbol, interval, limit=500: _binance_replay_candles(limit),
+    )
+
+    report = build_replay_validation_report(
+        db_session,
+        ReplayValidationRequest(
+            cycles=18,
+            start_index=90,
+            timeframe="15m",
+            symbols=["BTCUSDT"],
+            data_source_type="binance_futures_klines",
+        ),
+    )
+
+    assert report.data_source_type == "binance_futures_klines"
+    assert "binance_futures_klines" in report.data_source_basis
+    assert all(variant.data_source_type == "binance_futures_klines" for variant in report.variants)
+    assert all(variant.summary.average_arrival_slippage_pct >= 0.0 for variant in report.variants)
+    assert all(variant.summary.average_realized_slippage_pct >= 0.0 for variant in report.variants)
+    assert all(variant.summary.average_first_fill_latency_seconds >= 0.0 for variant in report.variants)
+    assert all(variant.summary.average_mfe_pct >= 0.0 for variant in report.variants)
+    assert all(variant.summary.worst_mae_pct >= 0.0 for variant in report.variants)
+    assert all(variant.by_rationale_code for variant in report.variants)
+    assert report.live_execution_guarantee.endswith("never submits live orders.")

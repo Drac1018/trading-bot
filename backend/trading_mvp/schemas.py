@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+RolloutMode = Literal["paper", "shadow", "live_dry_run", "limited_live", "full_live"]
 
 
 class StrictBaseModel(BaseModel):
@@ -38,6 +40,7 @@ class TradeDecisionCandidateScore(StrictBaseModel):
     slippage_sensitivity: float = 0.0
     exposure_impact: float = 0.0
     confidence_consistency: float = 0.0
+    correlation_penalty: float = 0.0
     total_score: float = 0.0
 
 
@@ -121,6 +124,12 @@ class SignalPerformanceEntry(StrictBaseModel):
     fee_total: float = 0.0
     net_realized_pnl_total: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
+    average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
     average_holding_minutes: float = Field(ge=0.0)
     holding_over_plan_count: int = Field(ge=0)
     open_positions: int = Field(ge=0)
@@ -145,6 +154,12 @@ class PerformanceAggregateEntry(StrictBaseModel):
     fee_total: float = 0.0
     net_realized_pnl_total: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
+    average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
     average_holding_minutes: float = Field(ge=0.0)
     holding_over_plan_count: int = Field(ge=0)
     open_positions: int = Field(ge=0)
@@ -185,6 +200,12 @@ class DecisionPerformanceEntry(StrictBaseModel):
     fee_total: float = 0.0
     net_realized_pnl_total: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
+    arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
+    realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
     max_holding_minutes_planned: int | None = None
     holding_minutes_observed: float = Field(ge=0.0)
     holding_result_status: str = "unlinked"
@@ -194,8 +215,12 @@ class DecisionPerformanceEntry(StrictBaseModel):
     close_outcome: str = "not_closed"
     position_ids: list[int] = Field(default_factory=list)
     fill_basis: str = "execution_ledger_truth"
-    mfe_mae_tracking_status: str = "hook_ready"
-    mfe_mae_tracking_basis: str = "market_snapshot_replay_required"
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
+    mfe_pnl: float | None = None
+    mae_pnl: float | None = None
+    mfe_mae_tracking_status: str = "calculated"
+    mfe_mae_tracking_basis: str = "position_window_market_path"
 
 
 class PerformanceWindowSummary(StrictBaseModel):
@@ -214,6 +239,12 @@ class PerformanceWindowSummary(StrictBaseModel):
     fee_total: float = 0.0
     net_realized_pnl_total: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
+    average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
     average_holding_minutes: float = Field(ge=0.0)
     holding_over_plan_count: int = Field(ge=0)
     open_positions: int = Field(ge=0)
@@ -227,8 +258,12 @@ class PerformanceWindowSummary(StrictBaseModel):
     snapshot_net_pnl_estimate: float = 0.0
     decision_context_basis: str = "agent_run_input_features_regime"
     stop_take_profit_efficiency_basis: str = "decision_template_vs_close_order_type"
-    mfe_mae_tracking_status: str = "hook_ready"
-    mfe_mae_tracking_note: str = "Replay intratrade highs and lows against linked positions to compute MFE/MAE."
+    average_mfe_pct: float = 0.0
+    average_mae_pct: float = 0.0
+    best_mfe_pct: float = 0.0
+    worst_mae_pct: float = 0.0
+    mfe_mae_tracking_status: str = "calculated"
+    mfe_mae_tracking_note: str = "MFE/MAE is derived from linked position market path highs and lows."
 
 
 class PerformanceWindowReport(StrictBaseModel):
@@ -259,7 +294,7 @@ class ReplayValidationRequest(StrictBaseModel):
     start_index: int = Field(default=90, ge=20, le=2000)
     timeframe: str = Field(default="15m", min_length=1, max_length=20)
     symbols: list[str] = Field(default_factory=list)
-    data_source_type: Literal["synthetic_seed"] = "synthetic_seed"
+    data_source_type: Literal["synthetic_seed", "binance_futures_klines"] = "synthetic_seed"
 
 
 class ReplayMetricSummary(StrictBaseModel):
@@ -273,6 +308,16 @@ class ReplayMetricSummary(StrictBaseModel):
     profit_factor: float = Field(ge=0.0, default=0.0)
     hold_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
     blocked_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    average_mfe_pct: float = 0.0
+    average_mae_pct: float = 0.0
+    best_mfe_pct: float = 0.0
+    worst_mae_pct: float = 0.0
 
 
 class ReplayBreakdownEntry(StrictBaseModel):
@@ -287,16 +332,27 @@ class ReplayBreakdownEntry(StrictBaseModel):
     profit_factor: float = Field(ge=0.0, default=0.0)
     hold_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
     blocked_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    average_mfe_pct: float = 0.0
+    average_mae_pct: float = 0.0
+    best_mfe_pct: float = 0.0
+    worst_mae_pct: float = 0.0
 
 
 class ReplayVariantReport(StrictBaseModel):
     logic_variant: Literal["baseline_old", "improved"]
     title: str
-    data_source_type: Literal["synthetic_seed"]
+    data_source_type: Literal["synthetic_seed", "binance_futures_klines"]
     summary: ReplayMetricSummary
     by_symbol: list[ReplayBreakdownEntry] = Field(default_factory=list)
     by_timeframe: list[ReplayBreakdownEntry] = Field(default_factory=list)
     by_regime: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_rationale_code: list[ReplayBreakdownEntry] = Field(default_factory=list)
 
 
 class ReplayComparisonEntry(StrictBaseModel):
@@ -315,7 +371,7 @@ class ReplayComparisonEntry(StrictBaseModel):
 
 class ReplayValidationResponse(StrictBaseModel):
     generated_at: datetime
-    data_source_type: Literal["synthetic_seed"]
+    data_source_type: Literal["synthetic_seed", "binance_futures_klines"]
     data_source_basis: str
     execution_basis: str
     live_execution_guarantee: str
@@ -328,6 +384,7 @@ class ReplayValidationResponse(StrictBaseModel):
     symbol_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
     timeframe_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
     regime_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    rationale_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
 
 
 class DashboardExecutionProfileSummary(StrictBaseModel):
@@ -337,7 +394,12 @@ class DashboardExecutionProfileSummary(StrictBaseModel):
     orders: int = Field(ge=0)
     partial_fill_orders: int = Field(ge=0)
     aggressive_fallback_orders: int = Field(ge=0)
+    cancel_attempts: int = Field(ge=0, default=0)
+    cancel_successes: int = Field(ge=0, default=0)
+    cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
+    average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
 
 
 class DashboardExecutionWindowSummary(StrictBaseModel):
@@ -380,8 +442,26 @@ class DashboardProfitabilityResponse(StrictBaseModel):
     hold_blocked_summary: DashboardHoldBlockedSummary
 
 
+class ControlStatusSummary(StrictBaseModel):
+    exchange_can_trade: bool | None = None
+    rollout_mode: RolloutMode = "paper"
+    exchange_submit_allowed: bool = False
+    limited_live_max_notional: float | None = None
+    app_live_armed: bool = False
+    approval_window_open: bool = False
+    approval_state: str | None = None
+    approval_detail: dict[str, Any] = Field(default_factory=dict)
+    paused: bool = False
+    degraded: bool = False
+    risk_allowed: bool | None = None
+    blocked_reasons_current_cycle: list[str] = Field(default_factory=list)
+
+
 class OperationalStatusPayload(StrictBaseModel):
     live_trading_enabled: bool = False
+    rollout_mode: RolloutMode = "paper"
+    exchange_submit_allowed: bool = False
+    limited_live_max_notional: float | None = None
     live_trading_env_enabled: bool = False
     live_execution_ready: bool = False
     trading_paused: bool = False
@@ -411,6 +491,10 @@ class OperationalStatusPayload(StrictBaseModel):
     protection_recovery_failure_count: int = 0
     missing_protection_symbols: list[str] = Field(default_factory=list)
     missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
+    control_status_summary: ControlStatusSummary = Field(default_factory=ControlStatusSummary)
+    user_stream_summary: dict[str, Any] = Field(default_factory=dict)
+    reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
+    candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
     can_enter_new_position: bool = False
 
 
@@ -435,8 +519,12 @@ class DecisionReferencePayload(StrictBaseModel):
 class OperatorControlState(StrictBaseModel):
     generated_at: datetime
     operational_status: OperationalStatusPayload
+    control_status_summary: ControlStatusSummary | None = None
     can_enter_new_position: bool = False
     mode: str
+    rollout_mode: RolloutMode = "paper"
+    exchange_submit_allowed: bool = False
+    limited_live_max_notional: float | None = None
     default_symbol: str
     default_timeframe: str
     tracked_symbols: list[str] = Field(default_factory=list)
@@ -465,6 +553,7 @@ class OperatorControlState(StrictBaseModel):
     protected_positions: int = 0
     unprotected_positions: int = 0
     open_positions: int = 0
+    pnl_summary: dict[str, Any] = Field(default_factory=dict)
     daily_pnl: float = 0.0
     cumulative_pnl: float = 0.0
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
@@ -478,6 +567,9 @@ class OperatorControlState(StrictBaseModel):
     last_decision_at: datetime | None = None
     last_decision_snapshot_at: datetime | None = None
     last_decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
+    user_stream_summary: dict[str, Any] = Field(default_factory=dict)
+    reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
+    candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperatorDecisionSnapshot(StrictBaseModel):
@@ -497,14 +589,51 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     raw_output: dict[str, Any] = Field(default_factory=dict)
 
 
+PendingEntryPlanStatus = Literal["armed", "triggered", "expired", "canceled"]
+
+
+class PendingEntryPlanSnapshot(StrictBaseModel):
+    plan_id: int | None = None
+    symbol: str | None = None
+    side: Literal["long", "short"] | None = None
+    plan_status: PendingEntryPlanStatus | None = None
+    source_decision_run_id: int | None = None
+    source_timeframe: str | None = None
+    regime: str | None = None
+    posture: str | None = None
+    rationale_codes: list[str] = Field(default_factory=list)
+    entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    entry_zone_min: float | None = None
+    entry_zone_max: float | None = None
+    invalidation_price: float | None = None
+    max_chase_bps: float | None = None
+    idea_ttl_minutes: int | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    risk_pct_cap: float | None = None
+    leverage_cap: float | None = None
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+    triggered_at: datetime | None = None
+    canceled_at: datetime | None = None
+    canceled_reason: str | None = None
+    idempotency_key: str | None = None
+    trigger_details: dict[str, Any] = Field(default_factory=dict)
+
+
 class OperatorRiskSnapshot(StrictBaseModel):
     risk_check_id: int | None = None
     decision_run_id: int | None = None
     created_at: datetime | None = None
+    snapshot_id: int | None = None
+    cycle_id: str | None = None
+    as_of: datetime | None = None
     allowed: bool | None = None
     decision: str | None = None
     operating_state: str | None = None
     reason_codes: list[str] = Field(default_factory=list)
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    adjustment_reason_codes: list[str] = Field(default_factory=list)
     approved_risk_pct: float | None = None
     approved_leverage: float | None = None
     raw_projected_notional: float | None = None
@@ -515,6 +644,7 @@ class OperatorRiskSnapshot(StrictBaseModel):
     auto_resize_reason: str | None = None
     exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
     debug_payload: dict[str, Any] = Field(default_factory=dict)
+    current_cycle_result: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -537,6 +667,20 @@ class OperatorExecutionSnapshot(StrictBaseModel):
     execution_policy: dict[str, Any] = Field(default_factory=dict)
     execution_quality: dict[str, Any] = Field(default_factory=dict)
     decision_summary: dict[str, Any] = Field(default_factory=dict)
+    recent_fills: list["OperatorExecutionFillSummary"] = Field(default_factory=list)
+
+
+class OperatorExecutionFillSummary(StrictBaseModel):
+    execution_id: int | None = None
+    order_id: int | None = None
+    external_trade_id: str | None = None
+    created_at: datetime | None = None
+    status: str | None = None
+    fill_price: float | None = None
+    fill_quantity: float | None = None
+    fee_paid: float | None = None
+    commission_asset: str | None = None
+    realized_pnl: float | None = None
 
 
 class OperatorPositionSummary(StrictBaseModel):
@@ -561,6 +705,17 @@ class OperatorProtectionSummary(StrictBaseModel):
     has_take_profit: bool = False
     missing_components: list[str] = Field(default_factory=list)
     order_ids: list[int] = Field(default_factory=list)
+    recovery_status: str | None = None
+    auto_recovery_active: bool = False
+    failure_count: int = 0
+    last_error: str | None = None
+    last_transition_at: datetime | None = None
+    trigger_source: str | None = None
+    lifecycle_state: str | None = None
+    verification_status: str | None = None
+    last_event_type: str | None = None
+    last_event_message: str | None = None
+    last_event_at: datetime | None = None
 
 
 class OperatorSymbolSummary(StrictBaseModel):
@@ -570,6 +725,7 @@ class OperatorSymbolSummary(StrictBaseModel):
     market_snapshot_time: datetime | None = None
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     ai_decision: OperatorDecisionSnapshot = Field(default_factory=OperatorDecisionSnapshot)
+    pending_entry_plan: PendingEntryPlanSnapshot = Field(default_factory=PendingEntryPlanSnapshot)
     risk_guard: OperatorRiskSnapshot = Field(default_factory=OperatorRiskSnapshot)
     execution: OperatorExecutionSnapshot = Field(default_factory=OperatorExecutionSnapshot)
     open_position: OperatorPositionSummary = Field(default_factory=OperatorPositionSummary)
@@ -578,6 +734,7 @@ class OperatorSymbolSummary(StrictBaseModel):
     live_execution_ready: bool = False
     stale_flags: list[str] = Field(default_factory=list)
     last_updated_at: datetime | None = None
+    candidate_selection: dict[str, Any] = Field(default_factory=dict)
     audit_events: list[AuditTimelineEntry] = Field(default_factory=list)
 
 
@@ -613,17 +770,43 @@ class StructuredCompetitorNotesResponse(StrictBaseModel):
     items: list[StructuredCompetitorNote] = Field(default_factory=list)
 
 
+class RiskReasonDetail(StrictBaseModel):
+    code: str = Field(min_length=1, max_length=80)
+    blocking: bool = True
+    resizable: bool = False
+    measured_value: float | None = None
+    limit_value: float | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
 class RiskCheckResult(StrictBaseModel):
     allowed: bool
     decision: Literal["hold", "long", "short", "reduce", "exit"]
-    reason_codes: list[str]
+    reason_codes: list[str] = Field(description="Blocker-only alias. Same meaning as blocked_reason_codes.")
+    blocked_reason_codes: list[str] = Field(
+        default_factory=list,
+        description="Actual blocking reasons for the current risk evaluation cycle.",
+    )
+    adjustment_reason_codes: list[str] = Field(
+        default_factory=list,
+        description="Non-blocking adjustment or approval reasons such as successful auto-resize.",
+    )
+    reason_details: list[RiskReasonDetail] = Field(default_factory=list)
     approved_risk_pct: float = Field(ge=0.0, le=1.0)
     approved_leverage: float = Field(ge=0.0, le=10.0)
     raw_projected_notional: float = Field(ge=0.0, default=0.0)
+    approved_notional: float = Field(ge=0.0, default=0.0)
     approved_projected_notional: float = Field(ge=0.0, default=0.0)
+    approved_qty: float | None = Field(default=None, ge=0.0)
     approved_quantity: float | None = Field(default=None, ge=0.0)
+    resizable: bool = False
     auto_resized_entry: bool = False
     size_adjustment_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    measured_value: float | None = None
+    limit_value: float | None = None
+    snapshot_id: int | None = None
+    cycle_id: str | None = None
+    as_of: datetime | None = None
     exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
     auto_resize_reason: str | None = None
     operating_mode: Literal["live", "paused", "hold"]
@@ -633,6 +816,65 @@ class RiskCheckResult(StrictBaseModel):
     exposure_metrics: dict[str, float] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     debug_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _backfill_compatibility_fields(self) -> "RiskCheckResult":
+        if not self.blocked_reason_codes and self.reason_codes:
+            self.blocked_reason_codes = list(self.reason_codes)
+        if not self.reason_codes and self.blocked_reason_codes:
+            self.reason_codes = list(self.blocked_reason_codes)
+        if self.approved_qty is None and self.approved_quantity is not None:
+            self.approved_qty = self.approved_quantity
+        if self.approved_quantity is None and self.approved_qty is not None:
+            self.approved_quantity = self.approved_qty
+        if self.approved_notional <= 0.0 and self.approved_projected_notional > 0.0:
+            self.approved_notional = self.approved_projected_notional
+        if self.approved_projected_notional <= 0.0 and self.approved_notional > 0.0:
+            self.approved_projected_notional = self.approved_notional
+        ordered_reason_codes = list(dict.fromkeys([*self.reason_codes, *self.adjustment_reason_codes]))
+        if not self.reason_details and ordered_reason_codes:
+            self.reason_details = [RiskReasonDetail(code=code) for code in ordered_reason_codes]
+        elif ordered_reason_codes:
+            detail_by_code = {detail.code: detail for detail in self.reason_details}
+            ordered_details: list[RiskReasonDetail] = []
+            for code in ordered_reason_codes:
+                ordered_details.append(detail_by_code.pop(code, RiskReasonDetail(code=code)))
+            ordered_details.extend(detail_by_code.values())
+            self.reason_details = ordered_details
+        if not self.resizable and self.auto_resized_entry:
+            self.resizable = True
+        if self.measured_value is None or self.limit_value is None:
+            for detail in self.reason_details:
+                if self.measured_value is None and detail.measured_value is not None:
+                    self.measured_value = detail.measured_value
+                if self.limit_value is None and detail.limit_value is not None:
+                    self.limit_value = detail.limit_value
+                if self.measured_value is not None and self.limit_value is not None:
+                    break
+        return self
+
+
+ProtectionLifecycleState = Literal["none", "requested", "placed", "verified", "verify_failed"]
+
+
+class ProtectionLifecycleTransition(StrictBaseModel):
+    from_state: ProtectionLifecycleState | None = None
+    to_state: ProtectionLifecycleState
+    transition_reason: str = Field(min_length=1, max_length=80)
+    transitioned_at: datetime
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProtectionLifecycleSnapshot(StrictBaseModel):
+    symbol: str = Field(min_length=1, max_length=30)
+    trigger_source: str = Field(min_length=1, max_length=120)
+    parent_order_id: int | None = None
+    state: ProtectionLifecycleState = "none"
+    requested_components: list[str] = Field(default_factory=list)
+    requested_order_types: list[str] = Field(default_factory=list)
+    created_order_ids: list[int] = Field(default_factory=list)
+    verification_detail: dict[str, Any] = Field(default_factory=dict)
+    transitions: list[ProtectionLifecycleTransition] = Field(default_factory=list)
 
 
 class ExecutionIntent(StrictBaseModel):
@@ -802,6 +1044,7 @@ class OverviewResponse(StrictBaseModel):
     latest_price: float
     latest_decision: dict[str, Any] | None
     latest_risk: dict[str, Any] | None
+    active_entry_plans: list[PendingEntryPlanSnapshot] = Field(default_factory=list)
     operational_status: OperationalStatusPayload
     last_market_refresh_at: datetime | None = None
     last_decision_at: datetime | None = None
@@ -846,6 +1089,9 @@ class OverviewResponse(StrictBaseModel):
     blocked_reasons: list[str]
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    user_stream_summary: dict[str, Any] = Field(default_factory=dict)
+    reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
+    candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
     protected_positions: int = 0
     unprotected_positions: int = 0
     position_protection_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -896,6 +1142,9 @@ class AppSettingsResponse(StrictBaseModel):
     id: int
     operational_status: OperationalStatusPayload
     live_trading_enabled: bool
+    rollout_mode: RolloutMode = "paper"
+    exchange_submit_allowed: bool = False
+    limited_live_max_notional: float | None = None
     live_trading_env_enabled: bool
     manual_live_approval: bool
     live_execution_armed: bool
@@ -938,6 +1187,9 @@ class AppSettingsResponse(StrictBaseModel):
     adaptive_protection_summary: dict[str, Any] = Field(default_factory=dict)
     adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
     position_management_summary: dict[str, Any] = Field(default_factory=dict)
+    user_stream_summary: dict[str, Any] = Field(default_factory=dict)
+    reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
+    candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str
@@ -1009,6 +1261,8 @@ class AppSettingsResponse(StrictBaseModel):
 
 class AppSettingsUpdateRequest(StrictBaseModel):
     live_trading_enabled: bool
+    rollout_mode: RolloutMode | None = None
+    limited_live_max_notional: float = Field(default=500.0, gt=0.0, le=1000000.0)
     manual_live_approval: bool
     live_approval_window_minutes: int = Field(ge=0, le=240)
     default_symbol: str = Field(min_length=1, max_length=30)

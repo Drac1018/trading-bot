@@ -117,10 +117,55 @@ def test_live_snapshot_uses_execution_net_pnl_and_fees(db_session) -> None:
 
     snapshot = create_exchange_pnl_snapshot(db_session, settings_row)
 
+    assert snapshot.gross_realized_pnl == pytest.approx(15.0, rel=1e-9)
+    assert snapshot.fee_total == pytest.approx(1.5, rel=1e-9)
+    assert snapshot.funding_total == pytest.approx(0.0, rel=1e-9)
+    assert snapshot.net_pnl == pytest.approx(13.5, rel=1e-9)
     assert snapshot.realized_pnl == pytest.approx(13.5, rel=1e-9)
     assert snapshot.daily_pnl == pytest.approx(13.5, rel=1e-9)
     assert snapshot.cumulative_pnl == pytest.approx(13.5, rel=1e-9)
     assert snapshot.cash_balance == pytest.approx(settings_row.starting_equity + 13.5, rel=1e-9)
+    assert snapshot.wallet_balance == pytest.approx(settings_row.starting_equity + 13.5, rel=1e-9)
+    assert snapshot.available_balance == pytest.approx(settings_row.starting_equity + 13.5, rel=1e-9)
+
+
+def test_exchange_snapshot_prefers_live_balances_and_applies_funding_ledger(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    _seed_live_close_order(
+        db_session,
+        label="funding-ledger",
+        fills=[(12.0, 0.5, now - timedelta(minutes=4))],
+    )
+
+    snapshot = create_exchange_pnl_snapshot(
+        db_session,
+        settings_row,
+        {
+            "totalWalletBalance": "1250.5",
+            "availableBalance": "930.25",
+            "totalUnrealizedProfit": "12.75",
+            "totalMarginBalance": "1263.25",
+        },
+        funding_entries=[
+            {
+                "tranId": "funding-1",
+                "symbol": "BTCUSDT",
+                "asset": "USDT",
+                "income": "-1.25",
+                "time": int(now.timestamp() * 1000),
+            }
+        ],
+    )
+
+    assert snapshot.wallet_balance == pytest.approx(1250.5, rel=1e-9)
+    assert snapshot.available_balance == pytest.approx(930.25, rel=1e-9)
+    assert snapshot.equity == pytest.approx(1263.25, rel=1e-9)
+    assert snapshot.gross_realized_pnl == pytest.approx(12.0, rel=1e-9)
+    assert snapshot.fee_total == pytest.approx(0.5, rel=1e-9)
+    assert snapshot.funding_total == pytest.approx(-1.25, rel=1e-9)
+    assert snapshot.net_pnl == pytest.approx(10.25, rel=1e-9)
+    assert snapshot.daily_pnl == pytest.approx(10.25, rel=1e-9)
 
 
 def test_live_snapshot_separates_daily_and_cumulative_pnl(db_session) -> None:
@@ -174,7 +219,7 @@ def test_consecutive_losses_group_multiple_fills_per_close_order(db_session) -> 
 def test_get_latest_snapshot_repairs_stale_copied_totals_from_executions(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     stale_row = PnLSnapshot(
-        snapshot_date=date.today(),
+        snapshot_date=utcnow_naive().date(),
         equity=settings_row.starting_equity,
         cash_balance=settings_row.starting_equity,
         realized_pnl=0.0,
@@ -220,7 +265,7 @@ def test_get_latest_snapshot_rolls_daily_pnl_into_new_day(db_session) -> None:
     snapshot = get_latest_pnl_snapshot(db_session, settings_row)
 
     assert snapshot.id != stale_row.id
-    assert snapshot.snapshot_date == date.today()
+    assert snapshot.snapshot_date == utcnow_naive().date()
     assert snapshot.daily_pnl == pytest.approx(0.0, rel=1e-9)
     assert snapshot.cumulative_pnl == pytest.approx(0.0, rel=1e-9)
 

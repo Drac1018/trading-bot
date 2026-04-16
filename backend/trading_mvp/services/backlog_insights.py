@@ -75,6 +75,11 @@ class DecisionPerformanceSnapshot:
     fee_total: float
     net_realized_pnl_total: float
     average_slippage_pct: float
+    arrival_slippage_pct: float
+    realized_slippage_pct: float
+    first_fill_latency_seconds: float
+    cancel_attempts: int
+    cancel_successes: int
     max_holding_minutes_planned: int | None
     holding_minutes_observed: float
     holding_result_status: str
@@ -90,6 +95,14 @@ class DecisionPerformanceSnapshot:
     closed_positions: int
     holding_over_plan_count: int
     position_ids: list[int]
+    mfe_pct: float
+    mae_pct: float
+    mfe_pnl: float
+    mae_pnl: float
+
+
+CANCEL_ATTEMPT_ORDER_STATUSES = {"canceled", "cancelled", "expired"}
+CANCEL_SUCCESS_ORDER_STATUSES = {"canceled", "cancelled"}
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -285,6 +298,119 @@ def _holding_snapshot(
     return observed, status, open_positions, closed_positions, holding_over_plan_count
 
 
+def _position_excursion_snapshot(positions: list[Position]) -> tuple[float, float, float, float]:
+    if not positions:
+        return 0.0, 0.0, 0.0, 0.0
+    mfe_pct_values: list[float] = []
+    mae_pct_values: list[float] = []
+    mfe_pnl_values: list[float] = []
+    mae_pnl_values: list[float] = []
+    for position in positions:
+        metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+        excursion = metadata.get("intratrade") if isinstance(metadata.get("intratrade"), dict) else {}
+        if not excursion:
+            excursion = metadata.get("replay") if isinstance(metadata.get("replay"), dict) else {}
+        mfe_pct_values.append(_safe_float(excursion.get("mfe_pct"), default=0.0))
+        mae_pct_values.append(_safe_float(excursion.get("mae_pct"), default=0.0))
+        mfe_pnl_values.append(_safe_float(excursion.get("mfe_pnl"), default=0.0))
+        mae_pnl_values.append(_safe_float(excursion.get("mae_pnl"), default=0.0))
+    return (
+        max(mfe_pct_values) if mfe_pct_values else 0.0,
+        max(mae_pct_values) if mae_pct_values else 0.0,
+        max(mfe_pnl_values) if mfe_pnl_values else 0.0,
+        max(mae_pnl_values) if mae_pnl_values else 0.0,
+    )
+
+
+def _adverse_slippage_pct(*, side: str, requested_price: float, fill_price: float) -> float:
+    if requested_price <= 0 or fill_price <= 0:
+        return 0.0
+    side_key = side.lower()
+    if side_key == "buy":
+        return max((fill_price - requested_price) / requested_price, 0.0)
+    if side_key == "sell":
+        return max((requested_price - fill_price) / requested_price, 0.0)
+    return abs(fill_price - requested_price) / requested_price
+
+
+def _execution_quality_snapshot(
+    orders: list[Order],
+    executions_by_order: dict[int, list[Execution]],
+) -> tuple[float, float, float, int, int, float]:
+    if not orders:
+        return 0.0, 0.0, 0.0, 0, 0, 0.0
+
+    primary_orders = [order for order in orders if not order.reduce_only and not order.close_only] or orders
+    arrival_slippages: list[float] = []
+    realized_slippages: list[float] = []
+    first_fill_latencies: list[float] = []
+    cancel_attempts = 0
+    cancel_successes = 0
+
+    for order_row in primary_orders:
+        order_status = str(order_row.status or "").lower()
+        if order_status in CANCEL_ATTEMPT_ORDER_STATUSES:
+            cancel_attempts += 1
+            if order_status in CANCEL_SUCCESS_ORDER_STATUSES:
+                cancel_successes += 1
+
+        metadata = order_row.metadata_json if isinstance(order_row.metadata_json, dict) else {}
+        quality = metadata.get("execution_quality") if isinstance(metadata.get("execution_quality"), dict) else {}
+        order_executions = sorted(
+            executions_by_order.get(order_row.id, []),
+            key=lambda item: (item.created_at, item.id),
+        )
+
+        if quality.get("arrival_slippage_pct") is not None:
+            arrival_slippages.append(_safe_float(quality.get("arrival_slippage_pct"), default=0.0))
+        elif order_executions:
+            first_execution = order_executions[0]
+            arrival_slippage = _safe_float(first_execution.slippage_pct, default=0.0)
+            if arrival_slippage <= 0:
+                arrival_slippage = _adverse_slippage_pct(
+                    side=str(order_row.side or ""),
+                    requested_price=_safe_float(order_row.requested_price, default=0.0),
+                    fill_price=_safe_float(first_execution.fill_price, default=0.0),
+                )
+            arrival_slippages.append(arrival_slippage)
+
+        if quality.get("realized_slippage_pct") is not None:
+            realized_slippages.append(_safe_float(quality.get("realized_slippage_pct"), default=0.0))
+        elif order_executions:
+            weighted_quantity = sum(abs(_safe_float(item.fill_quantity, default=0.0)) for item in order_executions)
+            if weighted_quantity > 0:
+                realized_slippages.append(
+                    sum(
+                        abs(_safe_float(item.fill_quantity, default=0.0))
+                        * _safe_float(item.slippage_pct, default=0.0)
+                        for item in order_executions
+                    )
+                    / weighted_quantity
+                )
+            else:
+                realized_slippages.append(
+                    sum(_safe_float(item.slippage_pct, default=0.0) for item in order_executions)
+                    / len(order_executions)
+                )
+
+        if quality.get("first_fill_latency_seconds") is not None:
+            first_fill_latencies.append(max(_safe_float(quality.get("first_fill_latency_seconds"), default=0.0), 0.0))
+        elif order_executions:
+            first_fill_latencies.append(
+                max((order_executions[0].created_at - order_row.created_at).total_seconds(), 0.0)
+            )
+
+    cancel_success_rate = (cancel_successes / cancel_attempts) if cancel_attempts else 0.0
+    return (
+        sum(arrival_slippages) / len(arrival_slippages) if arrival_slippages else 0.0,
+        sum(realized_slippages) / len(realized_slippages) if realized_slippages else 0.0,
+        sum(first_fill_latencies) / len(first_fill_latencies) if first_fill_latencies else 0.0,
+        cancel_attempts,
+        cancel_successes,
+        cancel_success_rate,
+    )
+
+
 def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot]) -> PerformanceAggregateEntry:
     if not snapshots:
         return PerformanceAggregateEntry(
@@ -304,6 +430,12 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
             fee_total=0.0,
             net_realized_pnl_total=0.0,
             average_slippage_pct=0.0,
+            average_arrival_slippage_pct=0.0,
+            average_realized_slippage_pct=0.0,
+            average_first_fill_latency_seconds=0.0,
+            cancel_attempts=0,
+            cancel_successes=0,
+            cancel_success_rate=0.0,
             average_holding_minutes=0.0,
             holding_over_plan_count=0,
             open_positions=0,
@@ -315,7 +447,12 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
             latest_seen_at=utcnow_naive(),
         )
     slippages = [item.average_slippage_pct for item in snapshots if item.fills > 0]
+    arrival_slippages = [item.arrival_slippage_pct for item in snapshots if item.orders > 0]
+    realized_slippages = [item.realized_slippage_pct for item in snapshots if item.orders > 0]
+    first_fill_latencies = [item.first_fill_latency_seconds for item in snapshots if item.first_fill_latency_seconds > 0]
     holdings = [item.holding_minutes_observed for item in snapshots if item.position_ids]
+    cancel_attempts = sum(item.cancel_attempts for item in snapshots)
+    cancel_successes = sum(item.cancel_successes for item in snapshots)
     return PerformanceAggregateEntry(
         key=key,
         decisions=len(snapshots),
@@ -333,6 +470,14 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
         fee_total=sum(item.fee_total for item in snapshots),
         net_realized_pnl_total=sum(item.net_realized_pnl_total for item in snapshots),
         average_slippage_pct=(sum(slippages) / len(slippages) if slippages else 0.0),
+        average_arrival_slippage_pct=(sum(arrival_slippages) / len(arrival_slippages) if arrival_slippages else 0.0),
+        average_realized_slippage_pct=(sum(realized_slippages) / len(realized_slippages) if realized_slippages else 0.0),
+        average_first_fill_latency_seconds=(
+            sum(first_fill_latencies) / len(first_fill_latencies) if first_fill_latencies else 0.0
+        ),
+        cancel_attempts=cancel_attempts,
+        cancel_successes=cancel_successes,
+        cancel_success_rate=(cancel_successes / cancel_attempts if cancel_attempts else 0.0),
         average_holding_minutes=(sum(holdings) / len(holdings) if holdings else 0.0),
         holding_over_plan_count=sum(item.holding_over_plan_count for item in snapshots),
         open_positions=sum(item.open_positions for item in snapshots),
@@ -451,6 +596,11 @@ def _build_window_report(
             }
         )
         linked_positions = [positions_by_id[position_id] for position_id in linked_position_ids]
+        mfe_pct, mae_pct, mfe_pnl, mae_pnl = _position_excursion_snapshot(linked_positions)
+        arrival_slippage_pct, realized_slippage_pct, first_fill_latency_seconds, cancel_attempts, cancel_successes, _cancel_success_rate = _execution_quality_snapshot(
+            linked_orders,
+            executions_by_order,
+        )
         holding_minutes_observed, holding_result_status, open_positions, closed_positions, holding_over_plan_count = _holding_snapshot(
             linked_positions,
             planned_max_holding_minutes=planned_holding_minutes,
@@ -502,6 +652,11 @@ def _build_window_report(
             fee_total=fee_total,
             net_realized_pnl_total=net_realized_total,
             average_slippage_pct=(sum(slippages) / len(slippages) if slippages else 0.0),
+            arrival_slippage_pct=arrival_slippage_pct,
+            realized_slippage_pct=realized_slippage_pct,
+            first_fill_latency_seconds=first_fill_latency_seconds,
+            cancel_attempts=cancel_attempts,
+            cancel_successes=cancel_successes,
             max_holding_minutes_planned=planned_holding_minutes,
             holding_minutes_observed=holding_minutes_observed,
             holding_result_status=holding_result_status,
@@ -530,6 +685,10 @@ def _build_window_report(
             closed_positions=closed_positions,
             holding_over_plan_count=holding_over_plan_count,
             position_ids=linked_position_ids,
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            mfe_pnl=mfe_pnl,
+            mae_pnl=mae_pnl,
         )
         decision_items.append(snapshot)
         for rationale_code in rationale_codes:
@@ -595,7 +754,14 @@ def _build_window_report(
     decision_items.sort(key=lambda item: (item.created_at, item.net_realized_pnl_total), reverse=True)
 
     overall_slippages = [item.average_slippage_pct for item in decision_items if item.fills > 0]
+    overall_arrival_slippages = [item.arrival_slippage_pct for item in decision_items if item.orders > 0]
+    overall_realized_slippages = [item.realized_slippage_pct for item in decision_items if item.orders > 0]
+    overall_first_fill_latencies = [item.first_fill_latency_seconds for item in decision_items if item.first_fill_latency_seconds > 0]
     overall_holdings = [item.holding_minutes_observed for item in decision_items if item.position_ids]
+    overall_mfe = [item.mfe_pct for item in decision_items if item.position_ids]
+    overall_mae = [item.mae_pct for item in decision_items if item.position_ids]
+    overall_cancel_attempts = sum(item.cancel_attempts for item in decision_items)
+    overall_cancel_successes = sum(item.cancel_successes for item in decision_items)
     summary = PerformanceWindowSummary(
         decisions=len(decision_items),
         approvals=sum(1 for item in decision_items if item.approved),
@@ -612,6 +778,22 @@ def _build_window_report(
         fee_total=sum(item.fee_total for item in decision_items),
         net_realized_pnl_total=sum(item.net_realized_pnl_total for item in decision_items),
         average_slippage_pct=(sum(overall_slippages) / len(overall_slippages) if overall_slippages else 0.0),
+        average_arrival_slippage_pct=(
+            sum(overall_arrival_slippages) / len(overall_arrival_slippages) if overall_arrival_slippages else 0.0
+        ),
+        average_realized_slippage_pct=(
+            sum(overall_realized_slippages) / len(overall_realized_slippages) if overall_realized_slippages else 0.0
+        ),
+        average_first_fill_latency_seconds=(
+            sum(overall_first_fill_latencies) / len(overall_first_fill_latencies)
+            if overall_first_fill_latencies
+            else 0.0
+        ),
+        cancel_attempts=overall_cancel_attempts,
+        cancel_successes=overall_cancel_successes,
+        cancel_success_rate=(
+            overall_cancel_successes / overall_cancel_attempts if overall_cancel_attempts else 0.0
+        ),
         average_holding_minutes=(sum(overall_holdings) / len(overall_holdings) if overall_holdings else 0.0),
         holding_over_plan_count=sum(item.holding_over_plan_count for item in decision_items),
         open_positions=sum(item.open_positions for item in decision_items),
@@ -621,6 +803,10 @@ def _build_window_report(
         manual_closes=sum(item.manual_closes for item in decision_items),
         unclassified_closes=sum(item.unclassified_closes for item in decision_items),
         snapshot_net_pnl_estimate=_snapshot_net_pnl_estimate(session, since),
+        average_mfe_pct=(sum(overall_mfe) / len(overall_mfe) if overall_mfe else 0.0),
+        average_mae_pct=(sum(overall_mae) / len(overall_mae) if overall_mae else 0.0),
+        best_mfe_pct=max(overall_mfe) if overall_mfe else 0.0,
+        worst_mae_pct=max(overall_mae) if overall_mae else 0.0,
     )
 
     return PerformanceWindowReport(
@@ -651,6 +837,14 @@ def _build_window_report(
                 fee_total=item.fee_total,
                 net_realized_pnl_total=item.net_realized_pnl_total,
                 average_slippage_pct=item.average_slippage_pct,
+                arrival_slippage_pct=item.arrival_slippage_pct,
+                realized_slippage_pct=item.realized_slippage_pct,
+                first_fill_latency_seconds=item.first_fill_latency_seconds,
+                cancel_attempts=item.cancel_attempts,
+                cancel_successes=item.cancel_successes,
+                cancel_success_rate=(
+                    item.cancel_successes / item.cancel_attempts if item.cancel_attempts else 0.0
+                ),
                 max_holding_minutes_planned=item.max_holding_minutes_planned,
                 holding_minutes_observed=item.holding_minutes_observed,
                 holding_result_status=item.holding_result_status,
@@ -659,6 +853,10 @@ def _build_window_report(
                 planned_risk_reward_ratio=item.planned_risk_reward_ratio,
                 close_outcome=item.close_outcome,
                 position_ids=item.position_ids,
+                mfe_pct=item.mfe_pct,
+                mae_pct=item.mae_pct,
+                mfe_pnl=item.mfe_pnl,
+                mae_pnl=item.mae_pnl,
             )
             for item in decision_items[:decision_limit]
         ],
@@ -704,6 +902,12 @@ def build_signal_performance_report(
             fee_total=item.fee_total,
             net_realized_pnl_total=item.net_realized_pnl_total,
             average_slippage_pct=item.average_slippage_pct,
+            average_arrival_slippage_pct=item.average_arrival_slippage_pct,
+            average_realized_slippage_pct=item.average_realized_slippage_pct,
+            average_first_fill_latency_seconds=item.average_first_fill_latency_seconds,
+            cancel_attempts=item.cancel_attempts,
+            cancel_successes=item.cancel_successes,
+            cancel_success_rate=item.cancel_success_rate,
             average_holding_minutes=item.average_holding_minutes,
             holding_over_plan_count=item.holding_over_plan_count,
             open_positions=item.open_positions,

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import SchedulerRun
+from trading_mvp.models import PendingEntryPlan, SchedulerRun
 from trading_mvp.services.account import get_open_positions
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.orchestrator import TradingOrchestrator
@@ -22,6 +22,7 @@ EXCHANGE_SYNC_WORKFLOW = "exchange_sync_cycle"
 MARKET_REFRESH_WORKFLOW = "market_refresh_cycle"
 POSITION_MANAGEMENT_WORKFLOW = "position_management_cycle"
 INTERVAL_DECISION_WORKFLOW = "interval_decision_cycle"
+ENTRY_PLAN_WATCHER_WORKFLOW = "entry_plan_watcher_cycle"
 
 
 def _next_window_run(window: str, from_time: datetime | None = None) -> datetime:
@@ -369,6 +370,64 @@ def run_position_management_cycle(session: Session, triggered_by: str = "schedul
     return {"workflow": POSITION_MANAGEMENT_WORKFLOW, "results": results}
 
 
+def get_due_entry_plan_symbols(session: Session) -> list[str]:
+    active_symbols = sorted(
+        {
+            row.symbol.upper()
+            for row in session.scalars(
+                select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed")
+            )
+        }
+    )
+    due: list[str] = []
+    for symbol in active_symbols:
+        latest = _latest_symbol_workflow_run(session, ENTRY_PLAN_WATCHER_WORKFLOW, symbol)
+        if _is_due(latest, timedelta(minutes=1)):
+            due.append(symbol)
+    return due
+
+
+def run_entry_plan_watcher_cycle(session: Session, triggered_by: str = "scheduler") -> dict[str, object]:
+    orchestrator = TradingOrchestrator(session)
+    results: list[dict[str, object]] = []
+    for symbol in get_due_entry_plan_symbols(session):
+        row = _start_scheduler_run(
+            session,
+            workflow=ENTRY_PLAN_WATCHER_WORKFLOW,
+            schedule_window="1m",
+            triggered_by=triggered_by,
+            symbol=symbol,
+            next_run_at=utcnow_naive() + timedelta(minutes=1),
+        )
+        try:
+            outcome = orchestrator.run_entry_plan_watcher_cycle(
+                symbols=[symbol],
+                trigger_event="entry_plan_watcher",
+                auto_resume_checked=True,
+            )
+            symbol_outcome = outcome["results"][0] if outcome.get("results") else {"symbol": symbol, "plans": []}
+            results.append(
+                _finish_scheduler_run(
+                    session,
+                    row=row,
+                    success=True,
+                    message="Entry plan watcher cycle completed.",
+                    payload=symbol_outcome,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                _finish_scheduler_run(
+                    session,
+                    row=row,
+                    success=False,
+                    message="Entry plan watcher cycle failed.",
+                    payload={"symbol": symbol, "error": str(exc)},
+                )
+            )
+    return {"workflow": ENTRY_PLAN_WATCHER_WORKFLOW, "results": results}
+
+
 def is_interval_decision_due(session: Session, symbol: str | None = None) -> bool:
     settings_row = get_or_create_settings(session)
     if not settings_row.ai_enabled:
@@ -473,6 +532,12 @@ def run_due_interval_decision_cycle(session: Session) -> dict[str, object] | Non
     return run_interval_decision_cycle(session, triggered_by="scheduler")
 
 
+def run_due_entry_plan_watcher_cycle(session: Session) -> dict[str, object] | None:
+    if not get_due_entry_plan_symbols(session):
+        return None
+    return run_entry_plan_watcher_cycle(session, triggered_by="scheduler")
+
+
 def run_due_operational_cycles(session: Session) -> list[dict[str, object]]:
     outputs: list[dict[str, object]] = []
     exchange = run_due_exchange_sync_cycle(session)
@@ -484,6 +549,9 @@ def run_due_operational_cycles(session: Session) -> list[dict[str, object]]:
     position_management = run_position_management_cycle(session, triggered_by="scheduler")
     if position_management["results"]:
         outputs.append(position_management)
+    entry_plan_watcher = run_due_entry_plan_watcher_cycle(session)
+    if entry_plan_watcher is not None and entry_plan_watcher.get("results"):
+        outputs.append(entry_plan_watcher)
     decisions = run_due_interval_decision_cycle(session)
     if decisions is not None and decisions.get("results"):
         outputs.append(decisions)

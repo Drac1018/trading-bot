@@ -23,7 +23,9 @@ from trading_mvp.models import (
 from trading_mvp.schemas import (
     AppSettingsResponse,
     AppSettingsUpdateRequest,
+    ControlStatusSummary,
     OperationalStatusPayload,
+    RolloutMode,
     SymbolCadenceOverride,
     SymbolEffectiveCadence,
 )
@@ -50,6 +52,7 @@ from trading_mvp.services.runtime_state import (
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    get_sync_state_detail,
     summarize_runtime_state,
 )
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
@@ -84,7 +87,17 @@ DISPLAY_MAX_LARGEST_POSITION_PCT = 1.5
 DISPLAY_MAX_DIRECTIONAL_BIAS_PCT = 2.0
 DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT = 2.5
 AUTO_RESUME_GRACE_MAX_MINUTES = 15
-RUNTIME_STATE_DETAIL_KEYS = {"operating_state", "protection_recovery", "exchange_sync"}
+DEFAULT_LIMITED_LIVE_MAX_NOTIONAL = 500.0
+ROLLOUT_MODE_SUBMIT_ENABLED = {"limited_live", "full_live"}
+ROLLOUT_MODE_LIVE_PATH = {"shadow", "live_dry_run", "limited_live", "full_live"}
+RUNTIME_STATE_DETAIL_KEYS = {
+    "operating_state",
+    "protection_recovery",
+    "exchange_sync",
+    "user_stream",
+    "reconciliation",
+    "candidate_selection",
+}
 """
 ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
@@ -124,7 +137,9 @@ STALE_FIRST_REASON_PRIORITY = {
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE": 8,
     "LIVE_CREDENTIALS_MISSING": 9,
     "STALE_MARKET_DATA": 10,
+    "MARKET_STATE_STALE": 10,
     "INCOMPLETE_MARKET_DATA": 11,
+    "MARKET_STATE_INCOMPLETE": 11,
 }
 GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "TRADING_PAUSED": "거래가 일시 중지되어 가드 모드입니다.",
@@ -139,6 +154,8 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "EMERGENCY_EXIT": "비상 청산 상태가 진행 중이라 가드 모드입니다.",
     "LIVE_ENV_DISABLED": "실거래 환경이 비활성화되어 가드 모드입니다.",
     "LIVE_TRADING_DISABLED": "앱에서 실거래 사용이 꺼져 있어 가드 모드입니다.",
+    "ROLLOUT_MODE_SHADOW": "shadow rollout 모드라 실제 거래소 submit은 금지됩니다.",
+    "ROLLOUT_MODE_LIVE_DRY_RUN": "live dry-run rollout 모드라 실제 거래소 submit은 금지됩니다.",
     "LIVE_APPROVAL_POLICY_DISABLED": "앱의 실거래 승인 정책이 비활성화되어 가드 모드입니다.",
     "LIVE_APPROVAL_REQUIRED": "실거래 승인 창이 닫혀 있어 가드 모드입니다.",
     "LIVE_CREDENTIALS_MISSING": "Binance API 키 또는 시크릿이 없어 가드 모드입니다.",
@@ -152,6 +169,8 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "POSITION_STATE_STALE": "거래소 포지션 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
+    "EXCHANGE_POSITION_MODE_UNCLEAR": "거래소 포지션 모드를 확인하지 못해 신규 진입을 차단합니다.",
+    "EXCHANGE_POSITION_MODE_MISMATCH": "거래소 Hedge mode가 현재 one-way 로컬 해석과 충돌해 신규 진입을 차단합니다.",
 }
 
 
@@ -169,6 +188,37 @@ def _default_symbols(defaults: AppConfig) -> list[str]:
 def normalize_symbols(symbols: list[str]) -> list[str]:
     cleaned = [item.strip().upper() for item in symbols if item and item.strip()]
     return list(dict.fromkeys(cleaned))
+
+
+def normalize_rollout_mode(value: object) -> RolloutMode:
+    raw = str(value or "paper").strip().lower()
+    if raw in {"shadow", "live_dry_run", "limited_live", "full_live"}:
+        return cast(RolloutMode, raw)
+    return "paper"
+
+
+def get_rollout_mode(settings_row: Setting) -> RolloutMode:
+    rollout_mode = normalize_rollout_mode(getattr(settings_row, "rollout_mode", "paper"))
+    if settings_row.live_trading_enabled and rollout_mode == "paper":
+        return "full_live"
+    if not settings_row.live_trading_enabled and rollout_mode != "paper":
+        return "paper"
+    return rollout_mode
+
+
+def rollout_mode_uses_live_path(settings_row: Setting) -> bool:
+    return get_rollout_mode(settings_row) in ROLLOUT_MODE_LIVE_PATH
+
+
+def rollout_mode_allows_exchange_submit(settings_row: Setting) -> bool:
+    return get_rollout_mode(settings_row) in ROLLOUT_MODE_SUBMIT_ENABLED
+
+
+def get_limited_live_max_notional(settings_row: Setting) -> float:
+    limit = float(getattr(settings_row, "limited_live_max_notional", DEFAULT_LIMITED_LIVE_MAX_NOTIONAL) or 0.0)
+    if limit > 0:
+        return limit
+    return DEFAULT_LIMITED_LIVE_MAX_NOTIONAL
 
 
 def normalize_symbol_cadence_overrides(
@@ -284,6 +334,8 @@ def get_or_create_settings(session: Session) -> Setting:
     tracked_symbols = _default_symbols(defaults)
     row = Setting(
         live_trading_enabled=defaults.live_trading_enabled,
+        rollout_mode="full_live" if defaults.live_trading_enabled else "paper",
+        limited_live_max_notional=DEFAULT_LIMITED_LIVE_MAX_NOTIONAL,
         manual_live_approval=defaults.manual_live_approval,
         live_execution_armed=False,
         live_execution_armed_until=None,
@@ -356,13 +408,20 @@ def _account_sync_stale_seconds(settings_row: Setting) -> int:
 
 def _build_pnl_summary(settings_row: Setting, latest_pnl: PnLSnapshot) -> dict[str, object]:
     return {
-        "basis": "execution_ledger_truth",
+        "basis": "live_account_snapshot_preferred",
         "basis_note": (
-            "Net realized, daily, cumulative PnL and consecutive losses are derived from live executions first."
+            "Wallet, available balance and equity prefer the latest Binance account snapshot. "
+            "Realized, fee and funding totals are reconciled from the execution ledger plus funding ledger."
         ),
         "equity": latest_pnl.equity,
+        "wallet_balance": latest_pnl.wallet_balance,
+        "available_balance": latest_pnl.available_balance,
         "cash_balance": latest_pnl.cash_balance,
-        "net_realized_pnl": latest_pnl.realized_pnl,
+        "realized_pnl": latest_pnl.gross_realized_pnl,
+        "fee_total": latest_pnl.fee_total,
+        "funding_total": latest_pnl.funding_total,
+        "net_pnl": latest_pnl.net_pnl,
+        "net_realized_pnl": latest_pnl.net_pnl,
         "unrealized_pnl": latest_pnl.unrealized_pnl,
         "daily_pnl": latest_pnl.daily_pnl,
         "cumulative_pnl": latest_pnl.cumulative_pnl,
@@ -398,18 +457,21 @@ def _build_account_sync_summary(
         )
 
     status = "exchange_synced"
-    note = "Cash/equity is currently aligned with the latest exchange account snapshot."
+    note = "Wallet, available balance and equity are currently aligned with the latest exchange account snapshot."
     reconciliation_mode = "exchange_confirmed"
     if freshness_seconds > stale_after_seconds:
         status = "stale"
         reconciliation_mode = "stale_snapshot"
-        note = "The latest account snapshot is stale. Freshness should be confirmed before relying on cash/equity."
+        note = (
+            "The latest account snapshot is stale. Freshness should be confirmed before relying on wallet, "
+            "available balance or equity."
+        )
     elif latest_warning is not None and latest_warning.created_at >= latest_pnl.created_at:
         status = "fallback_reconciled"
         reconciliation_mode = "deterministic_delta_fallback"
         note = (
-            "Recent account sync degraded. Cash/equity may be temporarily reconciled from the prior snapshot "
-            "plus deterministic realized PnL delta until the next successful exchange sync."
+            "Recent account sync degraded. Wallet, available balance and equity may be temporarily reconciled "
+            "from the prior snapshot plus deterministic PnL and funding deltas until the next successful exchange sync."
         )
 
     return {
@@ -417,6 +479,14 @@ def _build_account_sync_summary(
         "reconciliation_mode": reconciliation_mode,
         "freshness_seconds": freshness_seconds,
         "stale_after_seconds": stale_after_seconds,
+        "equity": latest_pnl.equity,
+        "wallet_balance": latest_pnl.wallet_balance,
+        "available_balance": latest_pnl.available_balance,
+        "realized_pnl": latest_pnl.gross_realized_pnl,
+        "fee_total": latest_pnl.fee_total,
+        "funding_total": latest_pnl.funding_total,
+        "net_pnl": latest_pnl.net_pnl,
+        "unrealized_pnl": latest_pnl.unrealized_pnl,
         "last_synced_at": latest_pnl.created_at,
         "last_warning_reason_code": (
             str(latest_warning.payload.get("reason_code"))
@@ -580,6 +650,18 @@ def get_latest_blocked_reasons(session: Session | None) -> list[str]:
     if latest_risk is None or latest_risk.allowed:
         return []
     return [str(item) for item in latest_risk.reason_codes if item not in {None, ""}]
+
+
+def get_latest_risk_gate_status(session: Session | None) -> tuple[bool | None, list[str]]:
+    if session is None:
+        return None, []
+    latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
+    if latest_risk is None:
+        return None, []
+    payload = latest_risk.payload if isinstance(latest_risk.payload, dict) else {}
+    raw_reason_codes = payload.get("reason_codes", []) if isinstance(payload.get("reason_codes", []), list) else latest_risk.reason_codes
+    reason_codes = [str(item) for item in raw_reason_codes if item not in {None, ""}]
+    return bool(latest_risk.allowed), _prioritize_blocked_reasons(reason_codes)
 
 
 def _scheduler_symbol_timestamps(
@@ -772,12 +854,64 @@ def is_live_execution_armed(settings_row: Setting) -> bool:
     )
 
 
+def _parse_runtime_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_optional_bool(value: object) -> bool | None:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
+def get_live_approval_status(settings_row: Setting) -> tuple[bool, str, dict[str, object]]:
+    if not settings_row.manual_live_approval:
+        return False, "policy_disabled", {}
+    if is_live_execution_armed(settings_row):
+        return True, "armed", {}
+
+    pause_detail = dict(settings_row.pause_reason_detail or {})
+    resume_context = pause_detail.get("resume_context", {})
+    grace_until = _parse_runtime_datetime(
+        resume_context.get("approval_grace_until") if isinstance(resume_context, dict) else None
+    )
+    now = utcnow_naive()
+    if (
+        settings_row.pause_origin == "system"
+        and pause_reason_allows_auto_resume(settings_row.pause_reason_code)
+        and isinstance(resume_context, dict)
+        and bool(resume_context.get("live_execution_ready_before_pause"))
+        and grace_until is not None
+        and grace_until > now
+    ):
+        return True, "grace", {"approval_grace_until": grace_until.isoformat()}
+
+    return False, "required", {}
+
+
 def is_live_execution_ready(settings_row: Setting, defaults: AppConfig | None = None) -> bool:
     app_defaults = defaults or get_settings()
     credentials = get_runtime_credentials(settings_row, defaults=app_defaults)
     return bool(
         app_defaults.live_trading_env_enabled
-        and settings_row.live_trading_enabled
+        and rollout_mode_uses_live_path(settings_row)
         and settings_row.manual_live_approval
         and is_live_execution_armed(settings_row)
         and credentials.binance_api_key
@@ -790,6 +924,10 @@ def _humanize_guard_code(code: str) -> str:
 
 
 def _guard_message_for_code(code: str, fallback_suffix: str = "가드 모드입니다.") -> str:
+    if code == "MARKET_STATE_STALE":
+        code = "STALE_MARKET_DATA"
+    elif code == "MARKET_STATE_INCOMPLETE":
+        code = "INCOMPLETE_MARKET_DATA"
     return GUARD_MODE_REASON_MESSAGES.get(code, f"{_humanize_guard_code(code)} 상태로 {fallback_suffix}")
 
 
@@ -800,9 +938,10 @@ def _derive_live_execution_guard_reason(
 ) -> tuple[str | None, str | None, str | None]:
     app_defaults = defaults or get_settings()
     credentials = get_runtime_credentials(settings_row, defaults=app_defaults)
+    rollout_mode = get_rollout_mode(settings_row)
     if not app_defaults.live_trading_env_enabled:
         code = "LIVE_ENV_DISABLED"
-    elif not settings_row.live_trading_enabled:
+    elif not rollout_mode_uses_live_path(settings_row):
         code = "LIVE_TRADING_DISABLED"
     elif not credentials.binance_api_key or not credentials.binance_api_secret:
         code = "LIVE_CREDENTIALS_MISSING"
@@ -810,6 +949,10 @@ def _derive_live_execution_guard_reason(
         code = "LIVE_APPROVAL_POLICY_DISABLED"
     elif not is_live_execution_armed(settings_row):
         code = "LIVE_APPROVAL_REQUIRED"
+    elif rollout_mode == "shadow":
+        code = "ROLLOUT_MODE_SHADOW"
+    elif rollout_mode == "live_dry_run":
+        code = "ROLLOUT_MODE_LIVE_DRY_RUN"
     else:
         return None, None, None
     return "readiness", code, _guard_message_for_code(code)
@@ -845,10 +988,23 @@ def _derive_market_blocking_reasons(market_freshness_summary: dict[str, object])
     if not market_freshness_summary.get("snapshot_at"):
         return []
     if bool(market_freshness_summary.get("incomplete")):
-        return ["INCOMPLETE_MARKET_DATA"]
+        return ["MARKET_STATE_INCOMPLETE"]
     if bool(market_freshness_summary.get("stale")):
-        return ["STALE_MARKET_DATA"]
+        return ["MARKET_STATE_STALE"]
     return []
+
+
+def _derive_reconciliation_blocking_reasons(reconciliation_summary: dict[str, object]) -> list[str]:
+    if not isinstance(reconciliation_summary, dict):
+        return []
+    if not bool(reconciliation_summary.get("mode_guard_active")):
+        return []
+    reason_code = str(reconciliation_summary.get("mode_guard_reason_code") or "").strip()
+    return [reason_code] if reason_code else []
+
+
+def _reconciliation_blocks_new_entries(reconciliation_summary: dict[str, object]) -> bool:
+    return bool(_derive_reconciliation_blocking_reasons(reconciliation_summary))
 
 
 def _prioritize_blocked_reasons(reason_codes: list[str]) -> list[str]:
@@ -910,8 +1066,14 @@ def derive_guard_mode_reason(
             "guard_mode_reason_code": PROTECTION_REQUIRED_STATE,
             "guard_mode_reason_message": _guard_message_for_code(PROTECTION_REQUIRED_STATE),
         }
+    category, code, message = _derive_live_execution_guard_reason(settings_row, defaults=app_defaults)
+    if code in {"ROLLOUT_MODE_SHADOW", "ROLLOUT_MODE_LIVE_DRY_RUN"}:
+        return {
+            "guard_mode_reason_category": category,
+            "guard_mode_reason_code": code,
+            "guard_mode_reason_message": message,
+        }
     if not is_live_execution_ready(settings_row, defaults=app_defaults):
-        category, code, message = _derive_live_execution_guard_reason(settings_row, defaults=app_defaults)
         return {
             "guard_mode_reason_category": category,
             "guard_mode_reason_code": code,
@@ -1007,6 +1169,42 @@ def _market_blocks_new_entries(market_freshness_summary: dict[str, object]) -> b
     return bool(market_freshness_summary.get("stale")) or bool(market_freshness_summary.get("incomplete"))
 
 
+def _build_control_status_summary(
+    settings_row: Setting,
+    *,
+    operating_state: str,
+    current_cycle_blocked_reasons: list[str],
+    risk_allowed: bool | None,
+) -> ControlStatusSummary:
+    approval_window_open, approval_state, approval_detail = get_live_approval_status(settings_row)
+    account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
+    exchange_can_trade = _coerce_optional_bool(account_sync_detail.get("exchange_can_trade"))
+    rollout_mode = get_rollout_mode(settings_row)
+    resolved_risk_allowed = risk_allowed
+    if resolved_risk_allowed is None and current_cycle_blocked_reasons:
+        resolved_risk_allowed = False
+    return ControlStatusSummary(
+        exchange_can_trade=exchange_can_trade,
+        rollout_mode=rollout_mode,
+        exchange_submit_allowed=rollout_mode_allows_exchange_submit(settings_row),
+        limited_live_max_notional=(
+            get_limited_live_max_notional(settings_row) if rollout_mode == "limited_live" else None
+        ),
+        app_live_armed=is_live_execution_armed(settings_row),
+        approval_window_open=approval_window_open,
+        approval_state=approval_state,
+        approval_detail=dict(approval_detail),
+        paused=settings_row.trading_paused,
+        degraded=operating_state in {
+            PROTECTION_REQUIRED_STATE,
+            DEGRADED_MANAGE_ONLY_STATE,
+            EMERGENCY_EXIT_STATE,
+        },
+        risk_allowed=resolved_risk_allowed,
+        blocked_reasons_current_cycle=_prioritize_blocked_reasons(current_cycle_blocked_reasons),
+    )
+
+
 def build_operational_status_payload(
     settings_row: Setting,
     *,
@@ -1018,6 +1216,7 @@ def build_operational_status_payload(
     missing_protection_items_override: dict[str, list[str]] | None = None,
     blocked_reasons: list[str] | None = None,
     latest_blocked_reasons: list[str] | None = None,
+    risk_allowed: bool | None = None,
     account_sync_summary: dict[str, object] | None = None,
     sync_freshness_summary: dict[str, object] | None = None,
     market_freshness_summary: dict[str, object] | None = None,
@@ -1028,27 +1227,39 @@ def build_operational_status_payload(
     live_execution_ready = is_live_execution_ready(settings_row, defaults=app_defaults)
     auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
     auto_resume_last_blockers = [str(item) for item in auto_resume_state.get("blockers", [])]
-    current_blocked_reasons = [str(item) for item in (blocked_reasons or []) if item not in {None, ""}]
+    current_cycle_blocked_reasons = [str(item) for item in (blocked_reasons or []) if item not in {None, ""}]
+    reconciliation_summary = dict(runtime.get("reconciliation_summary") or {})
+    if risk_allowed is None and current_session is not None:
+        risk_allowed, latest_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
+        if not current_cycle_blocked_reasons:
+            current_cycle_blocked_reasons = latest_cycle_blocked_reasons
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     inject_freshness_blockers = not settings_row.trading_paused
     sync_blocked_reasons = _derive_sync_blocking_reasons(sync_summary) if inject_freshness_blockers else []
     market_blocked_reasons = _derive_market_blocking_reasons(market_summary) if inject_freshness_blockers else []
+    reconciliation_blocked_reasons = (
+        _derive_reconciliation_blocking_reasons(reconciliation_summary) if inject_freshness_blockers else []
+    )
     recent_blocked_reasons = _prioritize_blocked_reasons(
         sync_blocked_reasons
         + market_blocked_reasons
+        + reconciliation_blocked_reasons
         + [
             str(item)
             for item in (
                 latest_blocked_reasons
                 if latest_blocked_reasons is not None
-                else (current_blocked_reasons or get_latest_blocked_reasons(current_session))
+                else (current_cycle_blocked_reasons or get_latest_blocked_reasons(current_session))
             )
             if item not in {None, ""}
         ]
     )
     current_blocked_reasons = _prioritize_blocked_reasons(
-        sync_blocked_reasons + market_blocked_reasons + (current_blocked_reasons or recent_blocked_reasons)
+        sync_blocked_reasons
+        + market_blocked_reasons
+        + reconciliation_blocked_reasons
+        + (current_cycle_blocked_reasons or recent_blocked_reasons)
     )
     latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
     account_summary: dict[str, object]
@@ -1062,6 +1273,14 @@ def build_operational_status_payload(
             "reconciliation_mode": "unknown",
             "freshness_seconds": None,
             "stale_after_seconds": _account_sync_stale_seconds(settings_row),
+            "equity": settings_row.starting_equity,
+            "wallet_balance": settings_row.starting_equity,
+            "available_balance": settings_row.starting_equity,
+            "realized_pnl": 0.0,
+            "fee_total": 0.0,
+            "funding_total": 0.0,
+            "net_pnl": 0.0,
+            "unrealized_pnl": 0.0,
             "last_synced_at": None,
             "last_warning_reason_code": None,
             "last_warning_message": None,
@@ -1094,16 +1313,32 @@ def build_operational_status_payload(
         sync_freshness_summary=sync_summary,
         market_freshness_summary=market_summary,
     )
+    rollout_mode = get_rollout_mode(settings_row)
+    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
     can_enter_new_position = (
+        exchange_submit_allowed
+        and
         live_execution_ready
         and not settings_row.trading_paused
         and operating_state == "TRADABLE"
         and not _sync_blocks_new_entries(sync_summary)
         and not _market_blocks_new_entries(market_summary)
+        and not _reconciliation_blocks_new_entries(reconciliation_summary)
     )
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
+    control_status_summary = _build_control_status_summary(
+        settings_row,
+        operating_state=operating_state,
+        current_cycle_blocked_reasons=current_cycle_blocked_reasons,
+        risk_allowed=risk_allowed,
+    )
     return OperationalStatusPayload(
         live_trading_enabled=settings_row.live_trading_enabled,
+        rollout_mode=rollout_mode,
+        exchange_submit_allowed=exchange_submit_allowed,
+        limited_live_max_notional=(
+            get_limited_live_max_notional(settings_row) if rollout_mode == "limited_live" else None
+        ),
         live_trading_env_enabled=app_defaults.live_trading_env_enabled,
         live_execution_ready=live_execution_ready,
         trading_paused=settings_row.trading_paused,
@@ -1133,6 +1368,10 @@ def build_operational_status_payload(
         protection_recovery_failure_count=int(runtime["protection_recovery_failure_count"]),
         missing_protection_symbols=missing_protection_symbols,
         missing_protection_items=missing_protection_items,
+        control_status_summary=control_status_summary,
+        user_stream_summary=dict(runtime.get("user_stream_summary") or {}),
+        reconciliation_summary=reconciliation_summary,
+        candidate_selection_summary=dict(runtime.get("candidate_selection_summary") or {}),
         can_enter_new_position=can_enter_new_position,
     )
 
@@ -1203,10 +1442,12 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         "observed_monthly_ai_calls_projection_breakdown": {},
     }
 
+    rollout_mode = get_rollout_mode(settings_row)
+    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
     mode = "live_guarded"
     if settings_row.trading_paused:
         mode = "paused"
-    elif is_live_execution_ready(settings_row, defaults=defaults):
+    elif is_live_execution_ready(settings_row, defaults=defaults) and exchange_submit_allowed:
         mode = "live_ready"
 
     effective_max_leverage = min(settings_row.max_leverage, DISPLAY_MAX_LEVERAGE)
@@ -1219,12 +1460,19 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         _build_pnl_summary(settings_row, latest_pnl)
         if latest_pnl is not None
         else {
-            "basis": "execution_ledger_truth",
+            "basis": "live_account_snapshot_preferred",
             "basis_note": (
-                "Net realized, daily, cumulative PnL and consecutive losses are derived from live executions first."
+                "Wallet, available balance and equity prefer the latest Binance account snapshot. "
+                "Realized, fee and funding totals are reconciled from the execution ledger plus funding ledger."
             ),
             "equity": settings_row.starting_equity,
+            "wallet_balance": settings_row.starting_equity,
+            "available_balance": settings_row.starting_equity,
             "cash_balance": settings_row.starting_equity,
+            "realized_pnl": 0.0,
+            "fee_total": 0.0,
+            "funding_total": 0.0,
+            "net_pnl": 0.0,
             "net_realized_pnl": 0.0,
             "unrealized_pnl": 0.0,
             "daily_pnl": 0.0,
@@ -1241,6 +1489,14 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
             "reconciliation_mode": "unknown",
             "freshness_seconds": None,
             "stale_after_seconds": _account_sync_stale_seconds(settings_row),
+            "equity": settings_row.starting_equity,
+            "wallet_balance": settings_row.starting_equity,
+            "available_balance": settings_row.starting_equity,
+            "realized_pnl": 0.0,
+            "fee_total": 0.0,
+            "funding_total": 0.0,
+            "net_pnl": 0.0,
+            "unrealized_pnl": 0.0,
             "last_synced_at": None,
             "last_warning_reason_code": None,
             "last_warning_message": None,
@@ -1294,6 +1550,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
             raw_codes = payload.get("rationale_codes", [])
             if isinstance(raw_codes, list):
                 latest_decision_rationale_codes = [str(item) for item in raw_codes if item not in {None, ""}]
+    current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
     adaptive_signal_summary = summarize_adaptive_signal_state(
         adaptive_signal_context,
         latest_rationale_codes=latest_decision_rationale_codes,
@@ -1306,6 +1563,9 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         session=current_session,
         defaults=defaults,
         runtime_state=runtime_state,
+        blocked_reasons=current_cycle_blocked_reasons,
+        latest_blocked_reasons=current_cycle_blocked_reasons,
+        risk_allowed=current_risk_allowed,
         account_sync_summary=account_sync_summary,
         sync_freshness_summary=sync_freshness_summary,
         market_freshness_summary=market_freshness_summary,
@@ -1319,6 +1579,9 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         id=settings_row.id,
         operational_status=operational_status,
         live_trading_enabled=settings_row.live_trading_enabled,
+        rollout_mode=rollout_mode,
+        exchange_submit_allowed=exchange_submit_allowed,
+        limited_live_max_notional=get_limited_live_max_notional(settings_row),
         live_trading_env_enabled=defaults.live_trading_env_enabled,
         manual_live_approval=settings_row.manual_live_approval,
         live_execution_armed=is_live_execution_armed(settings_row),
@@ -1361,6 +1624,9 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         adaptive_protection_summary=adaptive_protection_summary,
         adaptive_signal_summary=adaptive_signal_summary,
         position_management_summary=position_management_summary,
+        user_stream_summary=operational_status.user_stream_summary,
+        reconciliation_summary=operational_status.reconciliation_summary,
+        candidate_selection_summary=operational_status.candidate_selection_summary,
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
@@ -1449,7 +1715,14 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     if payload.default_symbol.upper() not in tracked_symbols:
         tracked_symbols.insert(0, payload.default_symbol.upper())
 
-    row.live_trading_enabled = payload.live_trading_enabled
+    rollout_mode = (
+        normalize_rollout_mode(payload.rollout_mode)
+        if payload.rollout_mode is not None
+        else ("full_live" if payload.live_trading_enabled else "paper")
+    )
+    row.rollout_mode = rollout_mode
+    row.live_trading_enabled = rollout_mode != "paper"
+    row.limited_live_max_notional = max(float(payload.limited_live_max_notional), 0.01)
     row.manual_live_approval = payload.manual_live_approval
     row.live_approval_window_minutes = payload.live_approval_window_minutes
     row.default_symbol = payload.default_symbol.upper()

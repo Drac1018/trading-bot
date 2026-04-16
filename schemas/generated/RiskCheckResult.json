@@ -1,4 +1,61 @@
 {
+  "$defs": {
+    "RiskReasonDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 80,
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "blocking": {
+          "default": true,
+          "title": "Blocking",
+          "type": "boolean"
+        },
+        "resizable": {
+          "default": false,
+          "title": "Resizable",
+          "type": "boolean"
+        },
+        "measured_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Measured Value"
+        },
+        "limit_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Limit Value"
+        },
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "title": "RiskReasonDetail",
+      "type": "object"
+    }
+  },
   "additionalProperties": false,
   "properties": {
     "allowed": {
@@ -17,10 +74,34 @@
       "type": "string"
     },
     "reason_codes": {
+      "description": "Blocker-only alias. Same meaning as blocked_reason_codes.",
       "items": {
         "type": "string"
       },
       "title": "Reason Codes",
+      "type": "array"
+    },
+    "blocked_reason_codes": {
+      "description": "Actual blocking reasons for the current risk evaluation cycle.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Blocked Reason Codes",
+      "type": "array"
+    },
+    "adjustment_reason_codes": {
+      "description": "Non-blocking adjustment or approval reasons such as successful auto-resize.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Adjustment Reason Codes",
+      "type": "array"
+    },
+    "reason_details": {
+      "items": {
+        "$ref": "#/$defs/RiskReasonDetail"
+      },
+      "title": "Reason Details",
       "type": "array"
     },
     "approved_risk_pct": {
@@ -41,11 +122,30 @@
       "title": "Raw Projected Notional",
       "type": "number"
     },
+    "approved_notional": {
+      "default": 0.0,
+      "minimum": 0.0,
+      "title": "Approved Notional",
+      "type": "number"
+    },
     "approved_projected_notional": {
       "default": 0.0,
       "minimum": 0.0,
       "title": "Approved Projected Notional",
       "type": "number"
+    },
+    "approved_qty": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Approved Qty"
     },
     "approved_quantity": {
       "anyOf": [
@@ -60,6 +160,11 @@
       "default": null,
       "title": "Approved Quantity"
     },
+    "resizable": {
+      "default": false,
+      "title": "Resizable",
+      "type": "boolean"
+    },
     "auto_resized_entry": {
       "default": false,
       "title": "Auto Resized Entry",
@@ -71,6 +176,42 @@
       "minimum": 0.0,
       "title": "Size Adjustment Ratio",
       "type": "number"
+    },
+    "measured_value": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Measured Value"
+    },
+    "limit_value": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Limit Value"
+    },
+    "snapshot_id": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Snapshot Id"
     },
     "exposure_headroom_snapshot": {
       "additionalProperties": {
@@ -130,6 +271,11 @@
     "sync_freshness_summary": {
       "additionalProperties": true,
       "title": "Sync Freshness Summary",
+      "type": "object"
+    },
+    "debug_payload": {
+      "additionalProperties": true,
+      "title": "Debug Payload",
       "type": "object"
     }
   },

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -171,7 +172,7 @@ def _seed_performance_rows(db_session) -> None:
         take_profit=70800.0,
         realized_pnl=12.0,
         unrealized_pnl=0.0,
-        metadata_json={},
+        metadata_json={"replay": {"mfe_pct": 0.018, "mae_pct": 0.006, "mfe_pnl": 12.6, "mae_pnl": 4.2}},
     )
     sol_position = Position(
         symbol="SOLUSDT",
@@ -186,7 +187,7 @@ def _seed_performance_rows(db_session) -> None:
         take_profit=170.0,
         realized_pnl=-5.0,
         unrealized_pnl=0.0,
-        metadata_json={},
+        metadata_json={"replay": {"mfe_pct": 0.022, "mae_pct": 0.031, "mfe_pnl": 3.98, "mae_pnl": 5.61}},
     )
     db_session.add_all([btc_position, sol_position])
     db_session.flush()
@@ -265,6 +266,10 @@ def _seed_performance_rows(db_session) -> None:
     )
     db_session.add_all([btc_entry, btc_take_profit, sol_entry, sol_stop])
     db_session.flush()
+    btc_entry.created_at = now - timedelta(minutes=89)
+    btc_take_profit.created_at = now - timedelta(minutes=16)
+    sol_entry.created_at = now - timedelta(days=3, minutes=129)
+    sol_stop.created_at = now - timedelta(days=3, minutes=21)
 
     db_session.add_all(
         [
@@ -326,6 +331,16 @@ def _seed_performance_rows(db_session) -> None:
             ),
         ]
     )
+    db_session.flush()
+    btc_entry_fill = db_session.query(Execution).filter_by(external_trade_id="btc-entry-fill").one()
+    btc_tp_fill = db_session.query(Execution).filter_by(external_trade_id="btc-tp-fill").one()
+    sol_entry_fill = db_session.query(Execution).filter_by(external_trade_id="sol-entry-fill").one()
+    sol_stop_fill = db_session.query(Execution).filter_by(external_trade_id="sol-stop-fill").one()
+    btc_entry_fill.created_at = now - timedelta(minutes=88, seconds=30)
+    btc_tp_fill.created_at = now - timedelta(minutes=15)
+    sol_entry_fill.created_at = now - timedelta(days=3, minutes=126)
+    sol_stop_fill.created_at = now - timedelta(days=3, minutes=20)
+    db_session.flush()
 
     db_session.add_all(
         [
@@ -378,11 +393,21 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert day.summary.realized_pnl_total == 12.0
     assert day.summary.fee_total == 1.0
     assert day.summary.net_realized_pnl_total == 11.0
+    assert day.summary.average_arrival_slippage_pct == pytest.approx(0.001, abs=1e-9)
+    assert day.summary.average_realized_slippage_pct == pytest.approx(0.001, abs=1e-9)
+    assert day.summary.average_first_fill_latency_seconds == pytest.approx(30.0, abs=1e-9)
+    assert day.summary.cancel_attempts == 0
+    assert day.summary.cancel_successes == 0
+    assert day.summary.cancel_success_rate == 0.0
     assert day.summary.wins == 1
     assert day.summary.losses == 0
     assert day.summary.take_profit_closes == 1
     assert day.summary.stop_loss_closes == 0
     assert day.summary.snapshot_net_pnl_estimate == 20.0
+    assert day.summary.average_mfe_pct == 0.018
+    assert day.summary.average_mae_pct == 0.006
+    assert day.summary.best_mfe_pct == 0.018
+    assert day.summary.worst_mae_pct == 0.006
 
     assert day.decisions[0].symbol == "ETHUSDT"
     assert day.decisions[0].decision == "hold"
@@ -391,6 +416,11 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert day.decisions[1].symbol == "BTCUSDT"
     assert day.decisions[1].close_outcome == "take_profit"
     assert day.decisions[1].planned_risk_reward_ratio == 1.3333333333333333
+    assert day.decisions[1].arrival_slippage_pct == pytest.approx(0.001, abs=1e-9)
+    assert day.decisions[1].realized_slippage_pct == pytest.approx(0.001, abs=1e-9)
+    assert day.decisions[1].first_fill_latency_seconds == pytest.approx(30.0, abs=1e-9)
+    assert day.decisions[1].mfe_pct == 0.018
+    assert day.decisions[1].mae_pct == 0.006
 
     assert {item.key for item in day.regimes} == {"bullish", "range"}
     assert {item.key for item in day.trend_alignments} == {"bullish_aligned", "range"}
@@ -407,6 +437,13 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert week.summary.decisions == 3
     assert week.summary.shorts == 1
     assert week.summary.stop_loss_closes == 1
+    assert week.summary.average_arrival_slippage_pct == pytest.approx(0.001, abs=1e-9)
+    assert week.summary.average_realized_slippage_pct == pytest.approx(0.001, abs=1e-9)
+    assert week.summary.average_first_fill_latency_seconds == pytest.approx(105.0, abs=1e-9)
+    assert week.summary.average_mfe_pct == pytest.approx(0.02, abs=1e-9)
+    assert week.summary.average_mae_pct == pytest.approx(0.0185, abs=1e-9)
+    assert week.summary.best_mfe_pct == pytest.approx(0.022, abs=1e-9)
+    assert week.summary.worst_mae_pct == pytest.approx(0.031, abs=1e-9)
     assert {item.key for item in week.regimes} == {"bullish", "bearish", "range"}
     assert {item.key for item in week.symbols} == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
     assert {item.key for item in week.timeframes} == {"15m", "1h", "5m"}
@@ -442,6 +479,8 @@ def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypa
         assert len(payload["windows"]) == 3
         assert payload["windows"][0]["summary"]["execution_pnl_basis"] == "execution_ledger_truth"
         assert payload["windows"][0]["summary"]["decision_context_basis"] == "agent_run_input_features_regime"
+        assert "average_arrival_slippage_pct" in payload["windows"][0]["summary"]
+        assert "average_first_fill_latency_seconds" in payload["windows"][0]["summary"]
         assert "regimes" in payload["windows"][0]
         assert "directions" in payload["windows"][0]
         assert "feature_flags" in payload["windows"][0]

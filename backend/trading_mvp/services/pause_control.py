@@ -30,8 +30,8 @@ from trading_mvp.services.runtime_state import (
 )
 from trading_mvp.services.settings import (
     get_effective_symbols,
+    get_live_approval_status,
     get_runtime_credentials,
-    is_live_execution_armed,
     set_trading_pause,
 )
 from trading_mvp.time_utils import utcnow_naive
@@ -63,8 +63,23 @@ def _write_runtime_state(
     last_error: str | None = None,
 ) -> None:
     detail = dict(settings_row.pause_reason_detail or {})
+    existing_recovery = dict(detail.get("protection_recovery") or {})
     detail["operating_state"] = operating_state
     detail["protection_recovery"] = {
+        **{
+            key: value
+            for key, value in existing_recovery.items()
+            if key
+            not in {
+                "status",
+                "auto_recovery_active",
+                "last_transition_at",
+                "last_error",
+                "symbol_states",
+                "missing_symbols",
+                "missing_items",
+            }
+        },
         "status": recovery_status,
         "auto_recovery_active": auto_recovery_active,
         "last_transition_at": utcnow_naive().isoformat(),
@@ -254,24 +269,6 @@ def _parse_datetime(value: object) -> datetime | None:
         return None
 
 
-def _approval_state(settings_row: Setting) -> tuple[bool, str, dict[str, object]]:
-    if is_live_execution_armed(settings_row):
-        return True, "armed", {}
-
-    resume_context = _read_resume_context(settings_row)
-    grace_until = _parse_datetime(resume_context.get("approval_grace_until"))
-    now = utcnow_naive()
-    if (
-        settings_row.pause_origin == "system"
-        and pause_reason_allows_auto_resume(settings_row.pause_reason_code)
-        and bool(resume_context.get("live_execution_ready_before_pause"))
-        and grace_until is not None
-        and grace_until > now
-    ):
-        return True, "grace", {"approval_grace_until": grace_until.isoformat()}
-    return False, "required", {}
-
-
 def _has_protective_orders(open_orders: list[dict[str, object]]) -> bool:
     return any(
         _flag_enabled(item.get("closePosition")) or _flag_enabled(item.get("reduceOnly"))
@@ -438,7 +435,7 @@ def evaluate_auto_resume_safety(
         session.add(settings_row)
         session.flush()
 
-    approval_allowed, approval_state, approval_detail = _approval_state(settings_row)
+    approval_allowed, approval_state, approval_detail = get_live_approval_status(settings_row)
     result["approval_state"] = approval_state
     result["approval_detail"] = approval_detail
     if not approval_allowed:
