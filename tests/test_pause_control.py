@@ -3,12 +3,9 @@ from __future__ import annotations
 from datetime import timedelta
 from types import SimpleNamespace
 
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
-from trading_mvp.database import Base, get_db
-from trading_mvp.main import app
-from trading_mvp.models import AuditEvent, ProductBacklog
+from sqlalchemy import select
+
+from trading_mvp.models import AuditEvent
 from trading_mvp.schemas import AppSettingsUpdateRequest
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.settings import (
@@ -54,50 +51,6 @@ def _build_live_settings_payload() -> AppSettingsUpdateRequest:
         clear_binance_api_key=False,
         clear_binance_api_secret=False,
     )
-
-
-def test_backlog_removed_ai_assist_endpoints_return_404(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'backlog_codex.db'}", future=True)
-    testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
-
-    def override_get_db():
-        with testing_session() as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_get_db
-
-    try:
-        with testing_session() as session:
-            backlog = ProductBacklog(
-                title="Token usage optimization follow-up",
-                problem="Open AI calls are failing and retrying too often.",
-                proposal="Reduce duplicate calls and keep a ready-to-paste Codex draft for manual execution.",
-                severity="high",
-                effort="medium",
-                impact="high",
-                priority="high",
-                rationale="A local draft lets the operator use Codex without paying for Codex API automation.",
-                source="product_improvement_agent",
-                status="open",
-            )
-            session.add(backlog)
-            session.commit()
-            backlog_id = backlog.id
-
-        with TestClient(app) as client:
-            detail_response = client.get(f"/api/backlog/{backlog_id}")
-            assert detail_response.status_code == 200
-            detail_payload = detail_response.json()
-            assert "codex_prompt_draft" not in detail_payload
-            assert "auto_apply_supported" not in detail_payload
-            assert "auto_apply_label" not in detail_payload
-            assert client.get(f"/api/backlog/{backlog_id}/codex-draft").status_code == 404
-            assert client.post(f"/api/backlog/{backlog_id}/auto-apply").status_code == 404
-            assert client.post("/api/backlog/auto-apply-supported").status_code == 405
-    finally:
-        app.dependency_overrides.clear()
 
 
 def test_pause_reason_metadata_and_auto_resume_whitelist(db_session, monkeypatch) -> None:
@@ -162,9 +115,15 @@ def test_pause_reason_metadata_and_auto_resume_whitelist(db_session, monkeypatch
     assert result["resumed"] is True
 
     refreshed = get_or_create_settings(db_session)
+    refreshed_serialized = serialize_settings(refreshed)
     assert refreshed.trading_paused is False
     assert refreshed.pause_reason_code is None
     assert refreshed.auto_resume_after is None
+    assert refreshed_serialized["sync_freshness_summary"]["account"]["last_sync_at"] is not None
+    assert refreshed_serialized["sync_freshness_summary"]["open_orders"]["last_sync_at"] is not None
+    assert refreshed_serialized["sync_freshness_summary"]["positions"]["last_sync_at"] is not None
+    assert refreshed_serialized["sync_freshness_summary"]["protective_orders"]["last_sync_at"] is not None
+    assert refreshed_serialized["sync_freshness_summary"]["protective_orders"]["status"] in {"synced", "stale"}
 
     audit_events = list(
         db_session.scalars(

@@ -10,28 +10,6 @@ const scheduleOptions = ["1h", "4h", "12h", "24h"] as const;
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기", "AI 설정", "Binance 연동"] as const;
 
-type AutoResumeResult = {
-  attempted?: boolean;
-  resumed?: boolean;
-  allowed?: boolean;
-  status?: string;
-  reason_code?: string | null;
-  pause_origin?: string | null;
-  pause_severity?: string | null;
-  pause_recovery_class?: string | null;
-  trigger_source?: string;
-  blockers?: string[];
-  symbol_blockers?: Record<string, string[]>;
-  blocker_details?: Array<Record<string, unknown>>;
-  evaluated_symbols?: string[];
-  protective_orders?: Record<string, string>;
-  market_data_status?: Record<string, string>;
-  sync_status?: Record<string, string>;
-  approval_state?: string;
-  approval_detail?: Record<string, unknown>;
-  auto_resume_after?: string | null;
-};
-
 type ProtectionSyncState = {
   status?: string;
   protected?: boolean;
@@ -174,17 +152,11 @@ type LiveSyncResult = {
   synced_orders?: number;
   synced_positions?: number;
   equity?: number;
-  operating_state?: string;
-  protection_recovery_status?: string;
-  protection_recovery_active?: boolean;
   missing_protection_symbols?: string[];
   missing_protection_items?: Record<string, string[]>;
   symbol_protection_state?: Record<string, ProtectionSyncState>;
   unprotected_positions?: string[];
   emergency_actions_taken?: Array<Record<string, unknown>>;
-  auto_resume_precheck?: AutoResumeResult | null;
-  auto_resume_postcheck?: AutoResumeResult | null;
-  auto_resume?: AutoResumeResult | null;
 };
 
 type FormState = Omit<
@@ -478,80 +450,14 @@ function renderMissingProtectionItems(
     .join(" / ");
 }
 
-function AutoResumeStatusCard({ result, title }: { result: AutoResumeResult | null | undefined; title: string }) {
-  if (!result) return null;
-  const blockers = result.blockers ?? [];
-  const symbolBlockers = Object.entries(result.symbol_blockers ?? {});
-  const protectiveOrders = Object.entries(result.protective_orders ?? {});
-  const marketStatus = Object.entries(result.market_data_status ?? {});
-  const syncStatus = Object.entries(result.sync_status ?? {});
-  return (
-    <div className="rounded-2xl border border-amber-200 bg-white p-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <p className="text-sm font-semibold text-slate-900">{title}</p>
-        <StatusPill tone={result.resumed ? "good" : result.allowed ? "good" : result.status === "blocked" ? "danger" : "warn"}>
-          {formatDisplayValue(result.status, "auto_resume_status")}
-        </StatusPill>
-        {result.trigger_source ? <StatusPill>{result.trigger_source}</StatusPill> : null}
-      </div>
-      <div className="mt-3 grid gap-3 md:grid-cols-2">
-        <div className="rounded-2xl bg-canvas px-4 py-3">
-          <p className="text-xs text-slate-500">중지 사유</p>
-          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.reason_code, "pause_reason_code")}</p>
-        </div>
-        <div className="rounded-2xl bg-canvas px-4 py-3">
-          <p className="text-xs text-slate-500">승인 상태</p>
-          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.approval_state, "approval_state")}</p>
-        </div>
-      </div>
-      {blockers.length > 0 ? (
-        <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-          <p className="font-semibold">자동 복구 차단 사유</p>
-          <p className="mt-2">{blockers.map((item) => formatDisplayValue(item)).join(" / ")}</p>
-        </div>
-      ) : null}
-      {symbolBlockers.length > 0 ? (
-        <div className="mt-3 grid gap-3 md:grid-cols-2">
-          {symbolBlockers.map(([symbol, values]) => (
-            <div key={`blocker-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3">
-              <p className="text-xs text-slate-500">{symbol} 차단 상태</p>
-              <p className="mt-2 text-sm font-semibold text-slate-900">
-                {values.length > 0 ? values.map((item) => formatDisplayValue(item)).join(" / ") : "차단 없음"}
-              </p>
-            </div>
-          ))}
-        </div>
-      ) : null}
-      {protectiveOrders.length > 0 || marketStatus.length > 0 || syncStatus.length > 0 ? (
-        <div className="mt-3 grid gap-3 md:grid-cols-3">
-          {protectiveOrders.map(([symbol, status]) => (
-            <div key={`protect-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3">
-              <p className="text-xs text-slate-500">{symbol} 보호 상태</p>
-              <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(status, "status")}</p>
-            </div>
-          ))}
-          {marketStatus.map(([symbol, status]) => (
-            <div key={`market-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3">
-              <p className="text-xs text-slate-500">{symbol} 시장 데이터</p>
-              <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(status, "status")}</p>
-            </div>
-          ))}
-          {syncStatus.map(([symbol, status]) => (
-            <div key={`sync-${symbol}`} className="rounded-2xl bg-canvas px-4 py-3">
-              <p className="text-xs text-slate-500">{symbol} 동기화 상태</p>
-              <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(status, "status")}</p>
-            </div>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
   if (!result) return null;
   const protectionEntries = Object.entries(result.symbol_protection_state ?? {});
   const missingProtectionText = renderMissingProtectionItems(result.missing_protection_items);
+  const hasProtectionIssues =
+    (result.unprotected_positions?.length ?? 0) > 0 ||
+    (result.missing_protection_symbols?.length ?? 0) > 0 ||
+    protectionEntries.some(([, state]) => !state.protected);
   return (
     <div className="mt-3 space-y-3 rounded-2xl border border-amber-200 bg-white p-4">
       <div className="flex flex-wrap gap-2">
@@ -560,27 +466,20 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
         <StatusPill>포지션 {result.synced_positions ?? 0}</StatusPill>
         {typeof result.equity === "number" ? <StatusPill>자산 {formatDisplayValue(result.equity, "equity")}</StatusPill> : null}
       </div>
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <div className="rounded-2xl bg-canvas px-4 py-3">
-          <p className="text-xs text-slate-500">운영 상태</p>
-          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.operating_state, "operating_state")}</p>
-        </div>
-        <div className="rounded-2xl bg-canvas px-4 py-3">
-          <p className="text-xs text-slate-500">보호 복구 상태</p>
-          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.protection_recovery_status, "protection_recovery_status")}</p>
-        </div>
-        <div className="rounded-2xl bg-canvas px-4 py-3">
-          <p className="text-xs text-slate-500">보호 복구 진행 여부</p>
-          <p className="mt-2 text-sm font-semibold text-slate-900">{formatDisplayValue(result.protection_recovery_active, "protection_recovery_active")}</p>
-        </div>
-        <div className="rounded-2xl bg-canvas px-4 py-3">
-          <p className="text-xs text-slate-500">누락 보호 심볼</p>
-          <p className="mt-2 text-sm font-semibold text-slate-900">{formatCodeList(result.missing_protection_symbols, "-")}</p>
-        </div>
+      <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
+        이 결과는 방금 실행한 거래소 동기화와 보호 주문 확인 결과입니다. 실거래 준비 상태, 운영 중지, 가드 모드, 차단 사유 해석은 개요 화면을 기준으로 확인합니다.
       </div>
-      <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
-        <p className="text-xs text-slate-500">누락 보호 항목</p>
-        <p className="mt-2 text-sm font-semibold text-slate-900">{missingProtectionText}</p>
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className={`rounded-2xl px-4 py-3 ${hasProtectionIssues ? "border border-rose-200 bg-rose-50" : "border border-emerald-200 bg-emerald-50"}`}>
+          <p className="text-xs text-slate-500">보호 확인 결과</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">
+            {hasProtectionIssues ? "미보호 항목이 있어 보호 조치 확인이 필요합니다." : "포지션과 보호 주문 기준으로 추가 조치가 필요하지 않습니다."}
+          </p>
+        </div>
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
+          <p className="text-xs text-slate-500">누락 보호 항목</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">{missingProtectionText}</p>
+        </div>
       </div>
       {protectionEntries.length > 0 ? (
         <div className="grid gap-3 md:grid-cols-2">
@@ -618,9 +517,6 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
           <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{JSON.stringify(result.emergency_actions_taken, null, 2)}</pre>
         </div>
       ) : null}
-      <AutoResumeStatusCard result={result.auto_resume_precheck} title="자동 복구 사전 점검" />
-      <AutoResumeStatusCard result={result.auto_resume_postcheck} title="자동 복구 사후 점검" />
-      {!result.auto_resume_precheck && !result.auto_resume_postcheck ? <AutoResumeStatusCard result={result.auto_resume} title="자동 복구 결과" /> : null}
     </div>
   );
 }
@@ -764,7 +660,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">실거래 설정</p>
           <h2 className="mt-2 text-2xl font-semibold text-slate-900 sm:text-3xl">심볼, AI, 거래소 운영 제어</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면은 변경 가능한 설정값과 즉시 제어만 다룹니다. 실거래 가능 여부, pause, guard mode, blocked reason은 개요 화면을 기준으로 확인합니다.</p>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면은 변경 가능한 설정값과 즉시 제어만 다룹니다. 실거래 준비 상태, 운영 중지, 가드 모드, 차단 사유는 개요 화면을 기준으로 확인합니다.</p>
         </div>
         <div className="grid gap-2 sm:grid-cols-2">
           <StatusPill tone={state.openai_api_key_configured ? "good" : "warn"}>OpenAI: {state.openai_api_key_configured ? "설정됨" : "없음"}</StatusPill>
@@ -793,10 +689,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            운영 pause, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어만 모았습니다. 현재 상태 해석은 개요 화면을 기준으로 봅니다.
+            운영 중지, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어만 모았습니다. 현재 상태 해석은 개요 화면을 기준으로 봅니다.
           </p>
           <div className="mt-4 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-600">
-            이 영역은 상태 모니터링이 아니라 제어와 설정 변경용입니다. 차단 사유, auto-resume, guard mode 직접 원인은 개요에서 확인하세요.
+            이 영역은 상태 모니터링이 아니라 제어와 설정 변경용입니다. 자동 복구 상태를 포함한 운영 상태 해석은 개요에서 확인하세요.
           </div>
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <Field label="승인 유지 시간(분)"><input className={inputClass} min={0} max={240} type="number" value={form.live_approval_window_minutes} onChange={(event) => updateField("live_approval_window_minutes", Number(event.target.value))} /></Field>
@@ -807,7 +703,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <Toggle checked={form.live_trading_enabled} label="실거래 경로 사용" onChange={(value) => updateField("live_trading_enabled", value)} />
             <Toggle checked={form.manual_live_approval} label="수동 승인 정책 사용" onChange={(value) => updateField("manual_live_approval", value)} />
           </div>
-          <p className="mt-4 text-sm leading-6 text-slate-600">즉시 중지는 신규 진입만 막는 운영 pause입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.</p>
+          <p className="mt-4 text-sm leading-6 text-slate-600">즉시 중지는 신규 진입만 막는 운영 중지입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/pause", "거래를 일시 중지했습니다.", syncSettings)} type="button">즉시 중지</button>
             <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/resume", "거래 일시 중지를 해제했습니다.", syncSettings)} type="button">중지 해제</button>

@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import { notFound } from "next/navigation";
 
-import { BacklogBoard, type BacklogBoardPayload } from "../../../components/backlog-board";
 import {
   AgentDebugView,
   DecisionView,
@@ -39,18 +38,6 @@ export default async function DashboardPage({
 
   if (!config) {
     notFound();
-  }
-
-  // Backlog is rendered only through the shared [slug] dashboard path.
-  if (slug === "backlog") {
-    const board = await fetchJson<BacklogBoardPayload>("/api/backlog");
-
-    return (
-      <div className="space-y-6">
-        <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} />
-        <BacklogBoard initial={board} />
-      </div>
-    );
   }
 
   // Audit uses the shared explorer component with audit-only data.

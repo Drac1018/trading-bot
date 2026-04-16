@@ -18,15 +18,16 @@ from trading_mvp.models import (
     Order,
     PnLSnapshot,
     Position,
-    ProductBacklog,
     RiskCheck,
     SchedulerRun,
 )
 from trading_mvp.schemas import (
     AuditTimelineEntry,
+    DecisionReferencePayload,
     DashboardExecutionProfileSummary,
     DashboardExecutionWindowSummary,
     DashboardHoldBlockedSummary,
+    OperationalStatusPayload,
     OperatorControlState,
     OperatorDashboardResponse,
     OperatorDecisionSnapshot,
@@ -44,9 +45,10 @@ from trading_mvp.schemas import (
 from trading_mvp.services.backlog_insights import build_signal_performance_report
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
 from trading_mvp.services.settings import (
+    _prioritize_blocked_reasons,
+    build_operational_status_payload,
     get_effective_symbols,
     get_or_create_settings,
-    is_live_execution_ready,
     serialize_settings,
 )
 from trading_mvp.time_utils import utcnow_naive
@@ -99,10 +101,6 @@ AUDIT_HEALTH_SYSTEM_EVENT_TYPES = {
     "live_sync_failed",
     "scheduler_run",
     "scheduler_run_failed",
-    "user_change_request_created",
-    "applied_change_record_created",
-    "backlog_auto_applied",
-    "backlog_auto_apply_batch",
 }
 
 
@@ -211,10 +209,145 @@ def _as_float(value: object, default: float = 0.0) -> float:
     return default
 
 
+def _as_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _as_dict(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {str(key): item for key, item in value.items()}
+
+
+def _sync_summary_blocks_freshness(sync_freshness_summary: dict[str, Any]) -> bool:
+    for scope_payload in sync_freshness_summary.values():
+        if not isinstance(scope_payload, dict):
+            continue
+        if bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete")):
+            return True
+    return False
+
+
+def _build_decision_reference(row: AgentRun | None) -> DecisionReferencePayload:
+    if row is None or not isinstance(row.input_payload, dict):
+        return DecisionReferencePayload()
+    reference_payload = _as_dict(row.input_payload.get("decision_reference", {}))
+    market_snapshot = _as_dict(row.input_payload.get("market_snapshot", {}))
+    sync_freshness_summary = {
+        str(scope): dict(payload)
+        for scope, payload in _as_dict(reference_payload.get("sync_freshness_summary", {})).items()
+        if isinstance(payload, dict)
+    }
+    market_freshness_summary = _as_dict(reference_payload.get("market_freshness_summary", {}))
+    market_snapshot_stale = bool(
+        reference_payload.get(
+            "market_snapshot_stale",
+            market_freshness_summary.get("stale", market_snapshot.get("is_stale", False)),
+        )
+    )
+    market_snapshot_incomplete = bool(
+        reference_payload.get(
+            "market_snapshot_incomplete",
+            market_freshness_summary.get(
+                "incomplete",
+                not bool(market_snapshot.get("is_complete", True)),
+            ),
+        )
+    )
+    freshness_blocking = bool(reference_payload.get("freshness_blocking")) or market_snapshot_stale or market_snapshot_incomplete or _sync_summary_blocks_freshness(sync_freshness_summary)
+    market_snapshot_id = reference_payload.get("market_snapshot_id")
+    return DecisionReferencePayload(
+        market_snapshot_id=_as_int(market_snapshot_id) if market_snapshot_id is not None else None,
+        market_snapshot_at=_as_datetime(reference_payload.get("market_snapshot_at") or market_snapshot.get("snapshot_time")),
+        market_snapshot_source=str(reference_payload.get("market_snapshot_source") or "unknown") or None,
+        market_snapshot_stale=market_snapshot_stale,
+        market_snapshot_incomplete=market_snapshot_incomplete,
+        account_sync_at=_as_datetime(reference_payload.get("account_sync_at")),
+        positions_sync_at=_as_datetime(reference_payload.get("positions_sync_at")),
+        open_orders_sync_at=_as_datetime(reference_payload.get("open_orders_sync_at")),
+        protective_orders_sync_at=_as_datetime(reference_payload.get("protective_orders_sync_at")),
+        account_sync_status=str(reference_payload.get("account_sync_status") or "") or None,
+        sync_freshness_summary=sync_freshness_summary,
+        market_freshness_summary=market_freshness_summary,
+        freshness_blocking=freshness_blocking,
+        display_gap=bool(reference_payload.get("display_gap", False)),
+        display_gap_reason=str(reference_payload.get("display_gap_reason") or "") or None,
+    )
+
+
+def _latest_market_refresh_at_for_decision(
+    session: Session,
+    decision_row: AgentRun | None,
+    *,
+    fallback_summary: dict[str, Any] | None = None,
+) -> datetime | None:
+    if decision_row is not None and isinstance(decision_row.output_payload, dict):
+        symbol = str(decision_row.output_payload.get("symbol") or "").upper()
+        timeframe = str(decision_row.output_payload.get("timeframe") or "")
+        if symbol and timeframe:
+            market_row = session.scalar(
+                select(MarketSnapshot)
+                .where(MarketSnapshot.symbol == symbol, MarketSnapshot.timeframe == timeframe)
+                .order_by(desc(MarketSnapshot.snapshot_time))
+                .limit(1)
+            )
+            if market_row is not None:
+                return market_row.snapshot_time
+    if isinstance(fallback_summary, dict):
+        return _as_datetime(fallback_summary.get("snapshot_at"))
+    return None
+
+
+def _annotate_decision_reference(
+    reference: DecisionReferencePayload,
+    *,
+    current_market_refresh_at: datetime | None,
+    current_sync_freshness_summary: dict[str, Any],
+) -> DecisionReferencePayload:
+    if (
+        reference.market_snapshot_at is None
+        and reference.market_snapshot_id is None
+        and not reference.sync_freshness_summary
+        and not reference.market_freshness_summary
+    ):
+        return reference
+    if reference.market_snapshot_at is not None and current_market_refresh_at is not None:
+        if current_market_refresh_at > reference.market_snapshot_at:
+            return reference.model_copy(
+                update={
+                    "display_gap": True,
+                    "display_gap_reason": "The dashboard is showing a newer market refresh than the last AI decision snapshot.",
+                }
+            )
+        if current_market_refresh_at < reference.market_snapshot_at:
+            return reference.model_copy(
+                update={
+                    "display_gap": True,
+                    "display_gap_reason": "The current overview payload is older than the snapshot used for the last AI decision.",
+                }
+            )
+    if reference.freshness_blocking:
+        return reference.model_copy(
+            update={
+                "display_gap": True,
+                "display_gap_reason": "The last AI decision used stale or incomplete market/account/order state, so new entry should remain blocked.",
+            }
+        )
+    if _sync_summary_blocks_freshness(current_sync_freshness_summary):
+        return reference.model_copy(
+            update={
+                "display_gap": True,
+                "display_gap_reason": "Current account or order sync is now stale even though the last AI decision used fresher sync data.",
+            }
+        )
+    return reference
 
 
 def classify_audit_event(
@@ -267,7 +400,9 @@ def get_overview(session: Session) -> OverviewResponse:
     settings_payload = serialize_settings(settings_row)
     runtime_state = summarize_runtime_state(settings_row)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
-    latest_decision = session.scalar(select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1))
+    latest_decision = session.scalar(
+        select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1)
+    )
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
     latest_pnl = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
     open_positions = list(session.scalars(select(Position).where(Position.status == "open", Position.mode == "live")))
@@ -280,28 +415,41 @@ def get_overview(session: Session) -> OverviewResponse:
         if _as_string_list(item["missing_components"])
     }
     missing_protection_symbols = list(missing_protection_items)
-    operating_state = str(settings_payload.get("operating_state") or runtime_state["operating_state"])
-    if not settings_row.trading_paused and unprotected_positions > 0:
-        operating_state = PROTECTION_REQUIRED_STATE
     blocked_reasons = latest_risk.reason_codes if latest_risk is not None and not latest_risk.allowed else []
-    auto_resume_last_blockers = _as_string_list(settings_payload.get("auto_resume_last_blockers", []))
-    latest_blocked_reasons = _as_string_list(settings_payload.get("latest_blocked_reasons", []))
-    guard_mode_reason_category = str(settings_payload.get("guard_mode_reason_category") or "") or None
-    guard_mode_reason_code = str(settings_payload.get("guard_mode_reason_code") or "") or None
-    guard_mode_reason_message = str(settings_payload.get("guard_mode_reason_message") or "") or None
-    serialized_missing_symbols = _as_string_list(settings_payload.get("missing_protection_symbols", []))
-    runtime_missing_items = _as_missing_items(runtime_state["missing_protection_items"])
-    pnl_summary = _as_dict(settings_payload.get("pnl_summary", {}))
-    account_sync_summary = _as_dict(settings_payload.get("account_sync_summary", {}))
-    sync_freshness_summary = _as_dict(
-        settings_payload.get("sync_freshness_summary", runtime_state.get("sync_freshness_summary", {}))
+    operational_status = build_operational_status_payload(
+        settings_row,
+        session=session,
+        runtime_state=runtime_state,
+        operating_state_override=(
+            PROTECTION_REQUIRED_STATE
+            if not settings_row.trading_paused and unprotected_positions > 0
+            else None
+        ),
+        missing_protection_symbols_override=missing_protection_symbols or None,
+        missing_protection_items_override=missing_protection_items or None,
+        blocked_reasons=blocked_reasons,
+        latest_blocked_reasons=blocked_reasons,
+        account_sync_summary=_as_dict(settings_payload.get("account_sync_summary", {})),
+        sync_freshness_summary=_as_dict(settings_payload.get("sync_freshness_summary", {})),
+        market_freshness_summary=_as_dict(settings_payload.get("market_freshness_summary", {})),
     )
+    pnl_summary = _as_dict(settings_payload.get("pnl_summary", {}))
     exposure_summary = _as_dict(settings_payload.get("exposure_summary", {}))
     execution_policy_summary = _as_dict(settings_payload.get("execution_policy_summary", {}))
     market_context_summary = _as_dict(settings_payload.get("market_context_summary", {}))
     adaptive_protection_summary = _as_dict(settings_payload.get("adaptive_protection_summary", {}))
     adaptive_signal_summary = _as_dict(settings_payload.get("adaptive_signal_summary", {}))
     position_management_summary = _as_dict(settings_payload.get("position_management_summary", {}))
+    current_market_refresh_at = _latest_market_refresh_at_for_decision(
+        session,
+        latest_decision,
+        fallback_summary=operational_status.market_freshness_summary,
+    )
+    last_decision_reference = _annotate_decision_reference(
+        _build_decision_reference(latest_decision),
+        current_market_refresh_at=current_market_refresh_at,
+        current_sync_freshness_summary=operational_status.sync_freshness_summary,
+    )
     return OverviewResponse(
         mode=str(settings_payload["mode"]),
         symbol=settings_row.default_symbol,
@@ -310,39 +458,40 @@ def get_overview(session: Session) -> OverviewResponse:
         latest_price=latest_market.latest_price if latest_market is not None else 0.0,
         latest_decision=latest_decision.output_payload if latest_decision is not None else None,
         latest_risk=latest_risk.payload if latest_risk is not None else None,
+        operational_status=operational_status,
+        last_market_refresh_at=current_market_refresh_at,
+        last_decision_at=latest_decision.created_at if latest_decision is not None else None,
+        last_decision_snapshot_at=last_decision_reference.market_snapshot_at,
+        last_decision_reference=last_decision_reference,
         open_positions=len(open_positions),
-        live_trading_enabled=settings_row.live_trading_enabled,
-        live_execution_ready=is_live_execution_ready(settings_row),
-        trading_paused=settings_row.trading_paused,
-        guard_mode_reason_category=guard_mode_reason_category,
-        guard_mode_reason_code=guard_mode_reason_code,
-        guard_mode_reason_message=guard_mode_reason_message,
-        pause_reason_code=str(settings_payload.get("pause_reason_code") or "") or None,
-        pause_origin=str(settings_payload.get("pause_origin") or "") or None,
-        pause_triggered_at=settings_row.pause_triggered_at,
-        auto_resume_after=settings_row.auto_resume_after,
-        auto_resume_status=str(settings_payload.get("auto_resume_status") or "not_paused"),
-        auto_resume_eligible=bool(settings_payload.get("auto_resume_eligible", False)),
-        auto_resume_last_blockers=auto_resume_last_blockers,
-        pause_severity=str(settings_payload.get("pause_severity") or "") or None,
-        pause_recovery_class=str(settings_payload.get("pause_recovery_class") or "") or None,
-        operating_state=operating_state,
-        protection_recovery_status=str(settings_payload.get("protection_recovery_status") or runtime_state["protection_recovery_status"]),
-        protection_recovery_active=bool(settings_payload.get("protection_recovery_active", runtime_state["protection_recovery_active"])),
-        protection_recovery_failure_count=_as_int(
-            settings_payload.get(
-                "protection_recovery_failure_count",
-                runtime_state["protection_recovery_failure_count"],
-            ),
-            default=0,
-        ),
-        missing_protection_symbols=missing_protection_symbols
-        or serialized_missing_symbols,
-        missing_protection_items=missing_protection_items
-        or runtime_missing_items,
+        live_trading_enabled=operational_status.live_trading_enabled,
+        live_execution_ready=operational_status.live_execution_ready,
+        trading_paused=operational_status.trading_paused,
+        approval_armed=operational_status.approval_armed,
+        approval_expires_at=operational_status.approval_expires_at,
+        can_enter_new_position=operational_status.can_enter_new_position,
+        guard_mode_reason_category=operational_status.guard_mode_reason_category,
+        guard_mode_reason_code=operational_status.guard_mode_reason_code,
+        guard_mode_reason_message=operational_status.guard_mode_reason_message,
+        pause_reason_code=operational_status.pause_reason_code,
+        pause_origin=operational_status.pause_origin,
+        pause_triggered_at=operational_status.pause_triggered_at,
+        auto_resume_after=operational_status.auto_resume_after,
+        auto_resume_status=operational_status.auto_resume_status,
+        auto_resume_eligible=operational_status.auto_resume_eligible,
+        auto_resume_last_blockers=operational_status.auto_resume_last_blockers,
+        pause_severity=operational_status.pause_severity,
+        pause_recovery_class=operational_status.pause_recovery_class,
+        operating_state=operational_status.operating_state,
+        protection_recovery_status=operational_status.protection_recovery_status,
+        protection_recovery_active=operational_status.protection_recovery_active,
+        protection_recovery_failure_count=operational_status.protection_recovery_failure_count,
+        missing_protection_symbols=operational_status.missing_protection_symbols,
+        missing_protection_items=operational_status.missing_protection_items,
         pnl_summary=pnl_summary,
-        account_sync_summary=account_sync_summary,
-        sync_freshness_summary=sync_freshness_summary,
+        account_sync_summary=operational_status.account_sync_summary,
+        sync_freshness_summary=operational_status.sync_freshness_summary,
+        market_freshness_summary=operational_status.market_freshness_summary,
         exposure_summary=exposure_summary,
         execution_policy_summary=execution_policy_summary,
         market_context_summary=market_context_summary,
@@ -351,8 +500,8 @@ def get_overview(session: Session) -> OverviewResponse:
         position_management_summary=position_management_summary,
         daily_pnl=latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
         cumulative_pnl=latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
-        blocked_reasons=blocked_reasons,
-        latest_blocked_reasons=latest_blocked_reasons or blocked_reasons,
+        blocked_reasons=operational_status.blocked_reasons,
+        latest_blocked_reasons=operational_status.latest_blocked_reasons,
         protected_positions=protected_positions,
         unprotected_positions=unprotected_positions,
         position_protection_summary=protection_summary,
@@ -782,6 +931,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     if row is None:
         return OperatorDecisionSnapshot()
     payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    decision_reference = _build_decision_reference(row)
     return OperatorDecisionSnapshot(
         decision_run_id=row.id,
         created_at=row.created_at,
@@ -795,6 +945,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         confidence=_as_float(payload.get("confidence"), default=0.0) if payload.get("confidence") is not None else None,
         rationale_codes=_as_string_list(payload.get("rationale_codes", [])),
         explanation_short=str(payload.get("explanation_short") or "") or None,
+        decision_reference=decision_reference,
         raw_output=payload,
     )
 
@@ -803,6 +954,7 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     if row is None:
         return OperatorRiskSnapshot()
     payload = row.payload if isinstance(row.payload, dict) else {}
+    reason_codes = _prioritize_blocked_reasons(_as_string_list(row.reason_codes))
     return OperatorRiskSnapshot(
         risk_check_id=row.id,
         decision_run_id=row.decision_run_id,
@@ -810,7 +962,7 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
         allowed=row.allowed,
         decision=row.decision,
         operating_state=str(payload.get("operating_state") or "") or None,
-        reason_codes=_as_string_list(row.reason_codes),
+        reason_codes=reason_codes,
         approved_risk_pct=row.approved_risk_pct,
         approved_leverage=row.approved_leverage,
         raw_projected_notional=_as_float(payload.get("raw_projected_notional"), default=0.0)
@@ -1119,6 +1271,16 @@ def _build_operator_symbol_summaries(
             execution_row.created_at if execution_row is not None else None,
             position_row.created_at if position_row is not None else None,
         )
+        decision_snapshot = _build_decision_snapshot(decision_row)
+        decision_snapshot = decision_snapshot.model_copy(
+            update={
+                "decision_reference": _annotate_decision_reference(
+                    decision_snapshot.decision_reference,
+                    current_market_refresh_at=market_row.snapshot_time if market_row is not None else None,
+                    current_sync_freshness_summary=overview.sync_freshness_summary,
+                )
+            }
+        )
         summaries.append(
             OperatorSymbolSummary(
                 symbol=symbol_key,
@@ -1126,12 +1288,14 @@ def _build_operator_symbol_summaries(
                 latest_price=market_row.latest_price if market_row is not None else None,
                 market_snapshot_time=market_row.snapshot_time if market_row is not None else None,
                 market_context_summary=_extract_symbol_market_context(decision_row, market_row),
-                ai_decision=_build_decision_snapshot(decision_row),
+                ai_decision=decision_snapshot,
                 risk_guard=_build_risk_snapshot(risk_row),
                 execution=_build_execution_snapshot_from_rows(order_row, execution_row, decision_row),
                 open_position=_build_position_snapshot(position_row),
                 protection_status=_build_protection_snapshot(protection_state),
-                blocked_reasons=_as_string_list(risk_row.reason_codes if risk_row is not None else []),
+                blocked_reasons=_prioritize_blocked_reasons(
+                    _as_string_list(risk_row.reason_codes if risk_row is not None else [])
+                ),
                 live_execution_ready=overview.live_execution_ready and len(stale_flags) == 0,
                 stale_flags=stale_flags,
                 last_updated_at=last_updated_at,
@@ -1144,7 +1308,6 @@ def _build_operator_symbol_summaries(
 def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
     overview = get_overview(session)
     profitability = get_profitability_dashboard(session)
-    settings_row = get_or_create_settings(session)
     latest_scheduler = session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
     symbol_summaries = _build_operator_symbol_summaries(
         session,
@@ -1152,57 +1315,54 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         overview=overview,
     )
     audit_rows = get_audit_timeline(session, limit=6)
-    sync_blocks_entry = any(
-        isinstance(scope_payload, dict) and (bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete")))
-        for scope_payload in overview.sync_freshness_summary.values()
-        if isinstance(scope_payload, dict)
-    )
     return OperatorDashboardResponse(
         generated_at=utcnow_naive(),
         control=OperatorControlState(
             generated_at=utcnow_naive(),
-            can_enter_new_position=(
-                overview.live_execution_ready
-                and not overview.trading_paused
-                and overview.operating_state == "TRADABLE"
-                and not sync_blocks_entry
-            ),
+            operational_status=overview.operational_status,
+            can_enter_new_position=overview.operational_status.can_enter_new_position,
             mode=overview.mode,
             default_symbol=overview.symbol,
             default_timeframe=overview.timeframe,
             tracked_symbols=overview.tracked_symbols,
             tracked_symbol_count=len(overview.tracked_symbols),
-            live_trading_enabled=overview.live_trading_enabled,
-            live_execution_ready=overview.live_execution_ready,
-            approval_armed=settings_row.live_execution_armed,
-            approval_expires_at=settings_row.live_execution_armed_until,
-            trading_paused=overview.trading_paused,
-            operating_state=overview.operating_state,
-            guard_mode_reason_category=overview.guard_mode_reason_category,
-            guard_mode_reason_code=overview.guard_mode_reason_code,
-            guard_mode_reason_message=overview.guard_mode_reason_message,
-            pause_reason_code=overview.pause_reason_code,
-            pause_origin=overview.pause_origin,
-            pause_triggered_at=overview.pause_triggered_at,
-            auto_resume_status=overview.auto_resume_status,
-            auto_resume_eligible=overview.auto_resume_eligible,
-            auto_resume_after=overview.auto_resume_after,
-            auto_resume_last_blockers=overview.auto_resume_last_blockers,
-            latest_blocked_reasons=overview.latest_blocked_reasons,
-            sync_freshness_summary=overview.sync_freshness_summary,
-            protection_recovery_status=overview.protection_recovery_status,
+            live_trading_enabled=overview.operational_status.live_trading_enabled,
+            live_execution_ready=overview.operational_status.live_execution_ready,
+            approval_armed=overview.operational_status.approval_armed,
+            approval_expires_at=overview.operational_status.approval_expires_at,
+            trading_paused=overview.operational_status.trading_paused,
+            operating_state=overview.operational_status.operating_state,
+            guard_mode_reason_category=overview.operational_status.guard_mode_reason_category,
+            guard_mode_reason_code=overview.operational_status.guard_mode_reason_code,
+            guard_mode_reason_message=overview.operational_status.guard_mode_reason_message,
+            pause_reason_code=overview.operational_status.pause_reason_code,
+            pause_origin=overview.operational_status.pause_origin,
+            pause_triggered_at=overview.operational_status.pause_triggered_at,
+            auto_resume_status=overview.operational_status.auto_resume_status,
+            auto_resume_eligible=overview.operational_status.auto_resume_eligible,
+            auto_resume_after=overview.operational_status.auto_resume_after,
+            blocked_reasons=overview.operational_status.blocked_reasons,
+            auto_resume_last_blockers=overview.operational_status.auto_resume_last_blockers,
+            latest_blocked_reasons=overview.operational_status.latest_blocked_reasons,
+            market_freshness_summary=overview.operational_status.market_freshness_summary,
+            sync_freshness_summary=overview.operational_status.sync_freshness_summary,
+            protection_recovery_status=overview.operational_status.protection_recovery_status,
             protected_positions=overview.protected_positions,
             unprotected_positions=overview.unprotected_positions,
             open_positions=overview.open_positions,
             daily_pnl=overview.daily_pnl,
             cumulative_pnl=overview.cumulative_pnl,
-            account_sync_summary=overview.account_sync_summary,
+            account_sync_summary=overview.operational_status.account_sync_summary,
             exposure_summary=overview.exposure_summary,
             scheduler_status=latest_scheduler.status if latest_scheduler is not None else None,
             scheduler_window=latest_scheduler.schedule_window if latest_scheduler is not None else None,
             scheduler_triggered_by=latest_scheduler.triggered_by if latest_scheduler is not None else None,
             scheduler_last_run_at=latest_scheduler.created_at if latest_scheduler is not None else None,
             scheduler_next_run_at=latest_scheduler.next_run_at if latest_scheduler is not None else None,
+            last_market_refresh_at=overview.last_market_refresh_at,
+            last_decision_at=overview.last_decision_at,
+            last_decision_snapshot_at=overview.last_decision_snapshot_at,
+            last_decision_reference=overview.last_decision_reference,
         ),
         symbols=symbol_summaries,
         market_signal=OperatorMarketSignalSummary(
@@ -1261,10 +1421,6 @@ def get_audit_timeline(
                 payload=_as_dict(row.get("payload", {})),
             )
     return rows
-
-
-def get_backlog(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(ProductBacklog).order_by(desc(ProductBacklog.created_at)).limit(limit))))
 
 
 def get_alerts(session: Session, limit: int = 50) -> list[dict[str, object]]:

@@ -43,6 +43,7 @@ AUTO_RESIZE_REASON_CODE_MAP = {
     "single_position_headroom_notional": "ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT",
     "same_tier_headroom_notional": "ENTRY_CLAMPED_TO_SAME_TIER_LIMIT",
 }
+AUTO_RESIZE_ALLOWED_REASON_CODES = frozenset({"ENTRY_AUTO_RESIZED", *AUTO_RESIZE_REASON_CODE_MAP.values()})
 
 
 def validate_decision_schema(payload: dict[str, Any]) -> TradeDecision:
@@ -202,6 +203,22 @@ def _estimate_projected_entry_size(
 
 def _minimum_actionable_notional(entry_price: float) -> float:
     return round(max(25.0, max(entry_price, 1.0) * 0.0005), 6)
+
+
+def _has_non_resizable_entry_blockers(reason_codes: list[str]) -> bool:
+    return any(str(code or "").strip() for code in reason_codes)
+
+
+def _is_pure_auto_resize_approval(
+    *,
+    is_entry_decision: bool,
+    auto_resized_entry: bool,
+    reason_codes: list[str],
+) -> bool:
+    if not is_entry_decision or not auto_resized_entry:
+        return False
+    normalized = [str(code or "").strip() for code in reason_codes if str(code or "").strip()]
+    return bool(normalized) and all(code in AUTO_RESIZE_ALLOWED_REASON_CODES for code in normalized)
 
 
 def _build_exposure_headroom_snapshot(
@@ -543,7 +560,7 @@ def evaluate_risk(
     elif enforce_live_readiness and is_entry_decision:
         reason_codes.append("LIVE_TRADING_DISABLED")
 
-    hard_blockers_present = len(reason_codes) > 0
+    non_resizable_entry_blockers_present = _has_non_resizable_entry_blockers(reason_codes)
     exposure_limit_codes: list[str] = []
     if is_entry_decision:
         gross_headroom = exposure_headroom_snapshot.get("gross_exposure_headroom_notional", 0.0)
@@ -568,7 +585,7 @@ def evaluate_risk(
             exposure_limit_codes.append("SAME_TIER_CONCENTRATION_LIMIT_REACHED")
 
         if exposure_limit_codes:
-            if not hard_blockers_present and max_additional_notional >= minimum_actionable_notional:
+            if not non_resizable_entry_blockers_present and max_additional_notional >= minimum_actionable_notional:
                 approved_projected_notional = min(raw_projected_notional, max_additional_notional)
                 if approved_projected_notional < raw_projected_notional:
                     auto_resized_entry = True
@@ -612,13 +629,10 @@ def evaluate_risk(
                 )
 
     reason_codes = list(dict.fromkeys(reason_codes))
-    allowed = len(reason_codes) == 0 or (
-        is_entry_decision
-        and auto_resized_entry
-        and all(
-            code in {"ENTRY_AUTO_RESIZED", *AUTO_RESIZE_REASON_CODE_MAP.values()}
-            for code in reason_codes
-        )
+    allowed = len(reason_codes) == 0 or _is_pure_auto_resize_approval(
+        is_entry_decision=is_entry_decision,
+        auto_resized_entry=auto_resized_entry,
+        reason_codes=reason_codes,
     )
 
     approved_risk_pct = 0.0

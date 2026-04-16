@@ -17,6 +17,14 @@
 
 ### `GET /api/settings`
 
+- `operational_status`
+  - overview / account / settings가 공통으로 재사용할 표준 운영 상태 payload
+  - `live_execution_ready`, `trading_paused`, `approval_armed`, `approval_expires_at`
+  - `operating_state`, `guard_mode_reason_*`, `blocked_reasons`, `latest_blocked_reasons`
+  - `auto_resume_status`, `auto_resume_last_blockers`
+  - `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
+  - `can_enter_new_position`
+
 운영 설정 화면에서 즉시 확인해야 하는 핵심 상태를 반환합니다.
 
 - `live_execution_ready`
@@ -104,6 +112,19 @@
 
 기존 overview 화면과 운영 요약 카드가 사용하는 기본 상태 응답입니다.
 
+- `operational_status`
+  - overview / account / settings가 공통으로 소비할 표준 운영 상태 payload
+  - `trading_paused`, `live_execution_ready`, `approval_armed`, `approval_expires_at`
+  - `operating_state`, `guard_mode_reason_*`, `blocked_reasons`, `latest_blocked_reasons`
+  - `auto_resume_status`, `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
+  - `can_enter_new_position`
+- `last_market_refresh_at`
+- `last_decision_at`
+- `last_decision_snapshot_at`
+- `last_decision_reference`
+  - 마지막 AI 판단이 참조한 market/account/order freshness 기준
+  - `market_snapshot_id`, `market_snapshot_at`, `account_sync_at`, `positions_sync_at`
+  - `sync_freshness_summary`, `market_freshness_summary`, `freshness_blocking`, `display_gap_reason`
 - `mode`
 - `symbol`
 - `timeframe`
@@ -133,6 +154,16 @@
 2026-04 멀티 심볼 개편 기준:
 
 - `control`에는 계좌/시스템 전역 상태만 남습니다.
+- `control.operational_status`
+  - overview / account / settings와 같은 표준 운영 상태 payload
+  - `trading_paused`, `live_execution_ready`, `approval_armed`, `guard_mode_reason_*`, `blocked_reasons`
+  - `auto_resume_status`, `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
+  - `can_enter_new_position`
+- `control.last_market_refresh_at`
+- `control.last_decision_at`
+- `control.last_decision_snapshot_at`
+- `control.last_decision_reference`
+  - 마지막 AI 판단이 실제로 사용한 snapshot/freshness 기준과 현재 표시 중인 상태의 gap 설명
 - `default_symbol`, `default_timeframe`, `tracked_symbols`, `tracked_symbol_count`
 - `can_enter_new_position`, `live_execution_ready`, `approval_armed`, `trading_paused`
 - `operating_state`, `guard_mode_reason_message`, `pause_reason_code`
@@ -214,7 +245,7 @@
 - `TradeDecision` payload에는 신규 진입 아이디어를 제한하기 위한 optional 필드 `entry_mode`, `invalidation_price`, `max_chase_bps`, `idea_ttl_minutes`가 포함될 수 있습니다.
 - `risk_guard`는 신규 `long / short`에 대해 결정론적 entry trigger를 다시 검사합니다.
 - 신규 진입 차단 사유는 `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `INVALID_INVALIDATION_PRICE`를 `reason_codes`로 남깁니다.
-- 익스포저 초과가 유일한 문제이면 `risk_guard`는 신규 진입을 전면 차단하지 않고 `approved_projected_notional`과 `approved_quantity`로 자동 축소 승인할 수 있습니다.
+- 익스포저 초과가 유일한 문제이고 `market/account/positions/open_orders/protective_orders` freshness, protection 검증, pause, approval, leverage/risk 하드 게이트가 모두 정상일 때만 `risk_guard`는 신규 진입을 전면 차단하지 않고 `approved_projected_notional`과 `approved_quantity`로 자동 축소 승인할 수 있습니다.
 - 이 경우 payload에는 아래 필드가 추가됩니다.
   - `raw_projected_notional`
   - `approved_projected_notional`
@@ -275,7 +306,9 @@
   - `positions`
   - `open_orders`
   - `protective_orders`
-  - each scope includes `last_sync_at`, `freshness_seconds`, `stale_after_seconds`, `stale`, `incomplete`, `last_failure_reason`
+  - each scope includes `status`, `raw_status`, `last_sync_at`, `last_attempt_at`, `last_attempt_status`
+  - each scope includes `last_failure_at`, `last_failure_reason`, `last_skip_at`, `last_skip_reason`
+  - each scope includes `freshness_seconds`, `stale_after_seconds`, `stale`, `incomplete`
 
 거래소 주문, 포지션, 계좌, 보호 주문 상태를 동기화하고 운영 상태를 다시 계산합니다.
 
@@ -305,16 +338,6 @@ Scheduler workflow names:
 - `position_management_cycle`
 - `interval_decision_cycle`
 - `scheduled_review`
-
-## Backlog
-
-- `GET /api/backlog`
-- `GET /api/backlog/{backlog_id}`
-- `POST /api/backlog/requests`
-- `POST /api/backlog/applied`
-
-`/api/backlog` 응답은 backlog 항목, 연결된 사용자 요청, 적용 이력, 시그널 성과 리포트, 구조화된 경쟁사 메모만 포함한다.
-기존 backlog 전용 AI 보조 기능이던 `codex-draft`, `auto-apply` 관련 endpoint와 응답 필드는 제거되었다.
 
 ## CLI
 

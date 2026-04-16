@@ -9,7 +9,6 @@ from trading_mvp.enums import AgentRole, OperatingMode, PriorityLevel
 from trading_mvp.models import (
     AgentRun,
     Alert,
-    CompetitorNote,
     Position,
     SystemHealthEvent,
     UIFeedback,
@@ -22,8 +21,6 @@ from trading_mvp.schemas import (
     IntegrationSuggestion,
     IntegrationSuggestionBatch,
     MarketSnapshotPayload,
-    ProductBacklogBatch,
-    ProductBacklogItem,
     RiskCheckResult,
     TradeDecision,
     UXSuggestion,
@@ -115,6 +112,26 @@ def _provider_metadata(result: ProviderResult | None, *, source: str) -> dict[st
     if result.request_id:
         metadata["request_id"] = result.request_id
     return metadata
+
+
+def build_trading_decision_input_payload(
+    *,
+    market_snapshot: MarketSnapshotPayload,
+    higher_timeframe_context: dict[str, MarketSnapshotPayload],
+    feature_payload: FeaturePayload,
+    risk_context: dict[str, Any],
+    decision_reference: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "market_snapshot": market_snapshot.model_dump(mode="json"),
+        "market_context": {
+            context_timeframe: snapshot.model_dump(mode="json")
+            for context_timeframe, snapshot in higher_timeframe_context.items()
+        },
+        "features": feature_payload.model_dump(mode="json"),
+        "risk_context": risk_context,
+        "decision_reference": decision_reference,
+    }
 
 
 class TradingDecisionAgent:
@@ -1207,85 +1224,6 @@ class UIUXAgent:
                 instructions="Return concise UI/UX suggestions for an internal trading dashboard. No deployment actions.",
             )
             result = UXSuggestionBatch.model_validate(provider_result.output)
-            return result, provider_result.provider, _provider_metadata(provider_result, source="llm")
-        except Exception as exc:
-            return baseline, "deterministic-mock", {"source": "llm_fallback", "error": str(exc)}
-
-
-class ProductImprovementAgent:
-    def __init__(self, provider: StructuredModelProvider) -> None:
-        self.provider = provider
-
-    def _deterministic_output(
-        self,
-        competitor_notes: list[CompetitorNote],
-        existing_backlog_titles: list[str],
-    ) -> ProductBacklogBatch:
-        items = [
-            ProductBacklogItem(
-                title="시그널 성과 분해 리포트 추가",
-                problem="어떤 신호 조합이 성과를 만들었는지 즉시 파악하기 어렵습니다.",
-                proposal="rationale code 기준 성과 분해 리포트를 24시간 리뷰에 포함합니다.",
-                severity="medium",
-                effort="medium",
-                impact="high",
-                priority="high",
-                rationale="운영자가 어떤 신호를 신뢰해야 하는지 더 빨리 판단할 수 있습니다.",
-            ),
-            ProductBacklogItem(
-                title="경쟁사 메모 구조화",
-                problem="경쟁사 메모가 자유 형식이라 반복 분석과 비교가 어렵습니다.",
-                proposal="기능 카테고리와 차별점 기준으로 메모 구조를 통일합니다.",
-                severity="low",
-                effort="small",
-                impact="medium",
-                priority="medium",
-                rationale="제품 개선 근거를 더 안정적으로 축적할 수 있습니다.",
-            ),
-        ]
-        if competitor_notes and "실행 슬리피지 리포트" not in existing_backlog_titles:
-            items.append(
-                ProductBacklogItem(
-                    title="실행 슬리피지 리포트",
-                    problem="체결 슬리피지 변화를 운영 화면에서 연속적으로 보기 어렵습니다.",
-                    proposal="주간 슬리피지 요약 리포트와 임계치 경보를 추가합니다.",
-                    severity="medium",
-                    effort="medium",
-                    impact="high",
-                    priority="high",
-                    rationale="실거래 전환 이전에 실행 품질 리스크를 더 빨리 확인할 수 있습니다.",
-                )
-            )
-        return ProductBacklogBatch(items=items)
-
-    def run(
-        self,
-        kpi_summary: dict[str, Any],
-        competitor_notes: list[CompetitorNote],
-        signal_performance_report: dict[str, Any],
-        structured_competitor_notes: dict[str, Any],
-        existing_backlog_titles: list[str],
-        *,
-        use_ai: bool,
-    ) -> tuple[ProductBacklogBatch, str, dict[str, Any]]:
-        baseline = self._deterministic_output(competitor_notes, existing_backlog_titles)
-        if not use_ai:
-            return baseline, "deterministic-mock", {"source": "deterministic"}
-        try:
-            provider_result = self.provider.generate(
-                AgentRole.PRODUCT_IMPROVEMENT.value,
-                {
-                    "kpi_summary": kpi_summary,
-                    "competitor_notes": [note.note for note in competitor_notes[:10]],
-                    "signal_performance_report": signal_performance_report,
-                    "structured_competitor_notes": structured_competitor_notes,
-                    "existing_backlog_titles": existing_backlog_titles[:20],
-                    "deterministic_baseline": baseline.model_dump(mode="json"),
-                },
-                response_model=ProductBacklogBatch,
-                instructions="Return product improvement backlog items for a trading operations MVP. Do not change trading policy automatically.",
-            )
-            result = ProductBacklogBatch.model_validate(provider_result.output)
             return result, provider_result.provider, _provider_metadata(provider_result, source="llm")
         except Exception as exc:
             return baseline, "deterministic-mock", {"source": "llm_fallback", "error": str(exc)}

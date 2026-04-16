@@ -85,7 +85,7 @@ export default async function BinanceAccountPage() {
       <PageShell
         eyebrow="Exchange Account"
         title="거래소 계정 / 자산 현황"
-        description="이 페이지는 Binance 원본 계정, 자산, 포지션, 주문 정보만 보여줍니다. 실거래 가능 여부, pause, guard mode, blocked reason은 개요 화면에서 확인합니다."
+        description="이 페이지는 Binance 원본 계정, 자산, 포지션, 주문 정보만 보여줍니다. 실거래 준비 상태, 운영 중지, 가드 모드, 차단 사유는 개요 화면에서 확인합니다."
       />
 
       <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">

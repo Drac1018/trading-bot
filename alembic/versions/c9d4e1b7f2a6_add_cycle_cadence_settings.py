@@ -36,10 +36,12 @@ def upgrade() -> None:
         sa.Column("symbol_cadence_overrides", sa.JSON(), nullable=False, server_default="[]"),
     )
 
-    op.alter_column("settings", "exchange_sync_interval_seconds", server_default=None)
-    op.alter_column("settings", "market_refresh_interval_minutes", server_default=None)
-    op.alter_column("settings", "position_management_interval_seconds", server_default=None)
-    op.alter_column("settings", "symbol_cadence_overrides", server_default=None)
+    bind = op.get_bind()
+    if bind.dialect.name != "sqlite":
+        op.alter_column("settings", "exchange_sync_interval_seconds", server_default=None)
+        op.alter_column("settings", "market_refresh_interval_minutes", server_default=None)
+        op.alter_column("settings", "position_management_interval_seconds", server_default=None)
+        op.alter_column("settings", "symbol_cadence_overrides", server_default=None)
 
 
 def downgrade() -> None:

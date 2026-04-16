@@ -20,7 +20,6 @@ APP_TABLES = {
     "pnl_snapshots",
     "alerts",
     "scheduler_runs",
-    "product_backlog",
     "competitor_notes",
     "ui_feedback",
     "system_health_events",

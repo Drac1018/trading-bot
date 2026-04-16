@@ -23,6 +23,9 @@ from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
     TRADABLE_STATE,
     get_protection_recovery_detail,
+    mark_sync_issue,
+    mark_sync_skipped,
+    mark_sync_success,
     summarize_runtime_state,
 )
 from trading_mvp.services.settings import (
@@ -423,6 +426,17 @@ def evaluate_auto_resume_safety(
         add_blocker("LIVE_APPROVAL_POLICY_DISABLED", source="settings")
     if not credentials.binance_api_key or not credentials.binance_api_secret:
         add_blocker("LIVE_CREDENTIALS_MISSING", source="credentials")
+        skipped_at = utcnow_naive()
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_skipped(
+                settings_row,
+                scope=scope,
+                reason_code="LIVE_CREDENTIALS_MISSING",
+                observed_at=skipped_at,
+                detail={"trigger_source": trigger_source, "source": "auto_resume"},
+            )
+        session.add(settings_row)
+        session.flush()
 
     approval_allowed, approval_state, approval_detail = _approval_state(settings_row)
     result["approval_state"] = approval_state
@@ -463,12 +477,33 @@ def evaluate_auto_resume_safety(
         if client is not None:
             try:
                 client.get_account_info()
+                mark_sync_success(
+                    settings_row,
+                    scope="account",
+                    synced_at=utcnow_naive(),
+                    detail={
+                        "source": "auto_resume",
+                        "trigger_source": trigger_source,
+                    },
+                )
+                session.add(settings_row)
+                session.flush()
             except Exception as exc:
                 add_blocker(
                     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
                     detail=str(exc),
                     source="account",
                 )
+                mark_sync_issue(
+                    settings_row,
+                    scope="account",
+                    status="failed",
+                    reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+                    observed_at=utcnow_naive(),
+                    detail={"source": "auto_resume", "trigger_source": trigger_source},
+                )
+                session.add(settings_row)
+                session.flush()
                 result["health_error"] = str(exc)
 
             for symbol in evaluated_symbols:
@@ -501,6 +536,19 @@ def evaluate_auto_resume_safety(
 
                 try:
                     open_orders = client.get_open_orders(symbol)
+                    mark_sync_success(
+                        settings_row,
+                        scope="open_orders",
+                        synced_at=utcnow_naive(),
+                        detail={
+                            "symbol": symbol,
+                            "source": "auto_resume",
+                            "trigger_source": trigger_source,
+                            "open_order_count": len(open_orders),
+                        },
+                    )
+                    session.add(settings_row)
+                    session.flush()
                 except Exception as exc:
                     add_blocker(
                         "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
@@ -508,6 +556,16 @@ def evaluate_auto_resume_safety(
                         detail=str(exc),
                         source="open_orders",
                     )
+                    mark_sync_issue(
+                        settings_row,
+                        scope="open_orders",
+                        status="failed",
+                        reason_code="EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+                        observed_at=utcnow_naive(),
+                        detail={"symbol": symbol, "source": "auto_resume", "trigger_source": trigger_source},
+                    )
+                    session.add(settings_row)
+                    session.flush()
                     sync_status[symbol] = "open_orders_failed"
                     result["sync_errors"][f"{symbol}:open_orders"] = str(exc)
                     protective_summary.setdefault(symbol, "open_orders_unavailable")
@@ -515,6 +573,7 @@ def evaluate_auto_resume_safety(
 
                 try:
                     remote_positions = client.get_position_information(symbol)
+                    has_open_position = any(abs(_to_float(item.get("positionAmt"))) > 0 for item in remote_positions)
                 except Exception as exc:
                     add_blocker(
                         "EXCHANGE_POSITION_SYNC_FAILED",
@@ -522,6 +581,16 @@ def evaluate_auto_resume_safety(
                         detail=str(exc),
                         source="positions",
                     )
+                    mark_sync_issue(
+                        settings_row,
+                        scope="positions",
+                        status="failed",
+                        reason_code="EXCHANGE_POSITION_SYNC_FAILED",
+                        observed_at=utcnow_naive(),
+                        detail={"symbol": symbol, "source": "auto_resume", "trigger_source": trigger_source},
+                    )
+                    session.add(settings_row)
+                    session.flush()
                     sync_status[symbol] = "positions_failed"
                     result["sync_errors"][f"{symbol}:positions"] = str(exc)
                     protective_summary.setdefault(symbol, "positions_unavailable")
@@ -535,11 +604,33 @@ def evaluate_auto_resume_safety(
                         detail="Local and exchange position state do not match.",
                         source="reconciliation",
                     )
+                    mark_sync_issue(
+                        settings_row,
+                        scope="positions",
+                        status="failed",
+                        reason_code=consistency_blocker,
+                        observed_at=utcnow_naive(),
+                        detail={"symbol": symbol, "source": "auto_resume", "trigger_source": trigger_source},
+                    )
+                    session.add(settings_row)
+                    session.flush()
                     sync_status[symbol] = "state_inconsistent"
                     protective_summary.setdefault(symbol, "state_inconsistent")
                     continue
+                mark_sync_success(
+                    settings_row,
+                    scope="positions",
+                    synced_at=utcnow_naive(),
+                    detail={
+                        "symbol": symbol,
+                        "source": "auto_resume",
+                        "trigger_source": trigger_source,
+                        "position_status": "open" if has_open_position else "flat",
+                    },
+                )
+                session.add(settings_row)
+                session.flush()
 
-                has_open_position = any(abs(_to_float(item.get("positionAmt"))) > 0 for item in remote_positions)
                 if has_open_position and not _has_protective_orders(open_orders):
                     add_blocker(
                         "MISSING_PROTECTIVE_ORDERS",
@@ -547,12 +638,53 @@ def evaluate_auto_resume_safety(
                         detail="Open position exists without reduceOnly/closePosition protective orders.",
                         source="protective_orders",
                     )
+                    mark_sync_issue(
+                        settings_row,
+                        scope="protective_orders",
+                        status="incomplete",
+                        reason_code="PROTECTION_STATE_UNVERIFIED",
+                        observed_at=utcnow_naive(),
+                        detail={
+                            "symbol": symbol,
+                            "source": "auto_resume",
+                            "trigger_source": trigger_source,
+                            "missing_components": ["stop_loss", "take_profit"],
+                        },
+                    )
+                    session.add(settings_row)
+                    session.flush()
                     sync_status[symbol] = "protective_orders_missing"
                     protective_summary[symbol] = "missing"
                 elif has_open_position:
+                    mark_sync_success(
+                        settings_row,
+                        scope="protective_orders",
+                        synced_at=utcnow_naive(),
+                        detail={
+                            "symbol": symbol,
+                            "source": "auto_resume",
+                            "trigger_source": trigger_source,
+                            "status": "ready",
+                        },
+                    )
+                    session.add(settings_row)
+                    session.flush()
                     sync_status[symbol] = "position_ready"
                     protective_summary[symbol] = "ready"
                 else:
+                    mark_sync_success(
+                        settings_row,
+                        scope="protective_orders",
+                        synced_at=utcnow_naive(),
+                        detail={
+                            "symbol": symbol,
+                            "source": "auto_resume",
+                            "trigger_source": trigger_source,
+                            "status": "flat",
+                        },
+                    )
+                    session.add(settings_row)
+                    session.flush()
                     sync_status[symbol] = "flat"
                     protective_summary[symbol] = "flat"
 

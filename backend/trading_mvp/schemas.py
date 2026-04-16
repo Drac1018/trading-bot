@@ -104,86 +104,6 @@ class UXSuggestionBatch(StrictBaseModel):
     items: list[UXSuggestion]
 
 
-class ProductBacklogItem(StrictBaseModel):
-    title: str
-    problem: str
-    proposal: str
-    severity: Literal["low", "medium", "high", "critical"]
-    effort: Literal["small", "medium", "large"]
-    impact: Literal["low", "medium", "high"]
-    priority: Literal["low", "medium", "high", "critical"]
-    rationale: str
-
-
-class ProductBacklogBatch(StrictBaseModel):
-    items: list[ProductBacklogItem]
-
-
-class ProductBacklogResponse(StrictBaseModel):
-    id: int
-    title: str
-    problem: str
-    proposal: str
-    severity: Literal["low", "medium", "high", "critical"]
-    effort: Literal["small", "medium", "large"]
-    impact: Literal["low", "medium", "high"]
-    priority: Literal["low", "medium", "high", "critical"]
-    rationale: str
-    source: str
-    status: str
-    created_at: datetime
-    updated_at: datetime
-
-
-class UserChangeRequestCreate(StrictBaseModel):
-    title: str = Field(min_length=3, max_length=200)
-    detail: str = Field(min_length=5)
-    status: Literal["requested", "accepted", "applied", "verified"] = "requested"
-    linked_backlog_id: int | None = None
-
-
-class UserChangeRequestResponse(StrictBaseModel):
-    id: int
-    title: str
-    detail: str
-    status: Literal["requested", "accepted", "applied", "verified"]
-    linked_backlog_id: int | None = None
-    linked_backlog_title: str | None = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class AppliedChangeRecordCreate(StrictBaseModel):
-    title: str = Field(min_length=3, max_length=200)
-    summary: str = Field(min_length=5, max_length=500)
-    detail: str = Field(min_length=5)
-    related_backlog_id: int | None = None
-    source_type: Literal["ai", "user", "manual"]
-    files_changed: list[str] = Field(default_factory=list)
-    verification_summary: str = Field(min_length=3)
-    applied_at: datetime | None = None
-
-
-class AppliedChangeRecordResponse(StrictBaseModel):
-    id: int
-    title: str
-    summary: str
-    detail: str
-    related_backlog_id: int | None = None
-    related_backlog_title: str | None = None
-    source_type: Literal["ai", "user", "manual"]
-    files_changed: list[str]
-    verification_summary: str
-    applied_at: datetime
-    created_at: datetime
-    updated_at: datetime
-
-
-class ProductBacklogDetailResponse(ProductBacklogResponse):
-    user_requests: list[UserChangeRequestResponse] = Field(default_factory=list)
-    applied_records: list[AppliedChangeRecordResponse] = Field(default_factory=list)
-
-
 class SignalPerformanceEntry(StrictBaseModel):
     rationale_code: str
     decisions: int = Field(ge=0)
@@ -460,8 +380,61 @@ class DashboardProfitabilityResponse(StrictBaseModel):
     hold_blocked_summary: DashboardHoldBlockedSummary
 
 
+class OperationalStatusPayload(StrictBaseModel):
+    live_trading_enabled: bool = False
+    live_trading_env_enabled: bool = False
+    live_execution_ready: bool = False
+    trading_paused: bool = False
+    approval_armed: bool = False
+    approval_expires_at: datetime | None = None
+    approval_window_minutes: int = 0
+    operating_state: str = "TRADABLE"
+    guard_mode_reason_category: str | None = None
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
+    pause_reason_code: str | None = None
+    pause_origin: str | None = None
+    pause_triggered_at: datetime | None = None
+    auto_resume_after: datetime | None = None
+    auto_resume_status: str = "not_paused"
+    auto_resume_eligible: bool = False
+    auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    pause_severity: str | None = None
+    pause_recovery_class: str | None = None
+    blocked_reasons: list[str] = Field(default_factory=list)
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
+    account_sync_summary: dict[str, Any] = Field(default_factory=dict)
+    sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    protection_recovery_status: str = "idle"
+    protection_recovery_active: bool = False
+    protection_recovery_failure_count: int = 0
+    missing_protection_symbols: list[str] = Field(default_factory=list)
+    missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
+    can_enter_new_position: bool = False
+
+
+class DecisionReferencePayload(StrictBaseModel):
+    market_snapshot_id: int | None = None
+    market_snapshot_at: datetime | None = None
+    market_snapshot_source: str | None = None
+    market_snapshot_stale: bool = False
+    market_snapshot_incomplete: bool = False
+    account_sync_at: datetime | None = None
+    positions_sync_at: datetime | None = None
+    open_orders_sync_at: datetime | None = None
+    protective_orders_sync_at: datetime | None = None
+    account_sync_status: str | None = None
+    sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    freshness_blocking: bool = False
+    display_gap: bool = False
+    display_gap_reason: str | None = None
+
+
 class OperatorControlState(StrictBaseModel):
     generated_at: datetime
+    operational_status: OperationalStatusPayload
     can_enter_new_position: bool = False
     mode: str
     default_symbol: str
@@ -483,8 +456,10 @@ class OperatorControlState(StrictBaseModel):
     auto_resume_status: str = "not_paused"
     auto_resume_eligible: bool = False
     auto_resume_after: datetime | None = None
+    blocked_reasons: list[str] = Field(default_factory=list)
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
     latest_blocked_reasons: list[str] = Field(default_factory=list)
+    market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     protection_recovery_status: str = "idle"
     protected_positions: int = 0
@@ -499,6 +474,10 @@ class OperatorControlState(StrictBaseModel):
     scheduler_triggered_by: str | None = None
     scheduler_last_run_at: datetime | None = None
     scheduler_next_run_at: datetime | None = None
+    last_market_refresh_at: datetime | None = None
+    last_decision_at: datetime | None = None
+    last_decision_snapshot_at: datetime | None = None
+    last_decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
 
 
 class OperatorDecisionSnapshot(StrictBaseModel):
@@ -514,6 +493,7 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     confidence: float | None = None
     rationale_codes: list[str] = Field(default_factory=list)
     explanation_short: str | None = None
+    decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
     raw_output: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -630,14 +610,6 @@ class StructuredCompetitorNotesResponse(StrictBaseModel):
     generated_at: datetime
     category_breakdown: dict[str, int] = Field(default_factory=dict)
     items: list[StructuredCompetitorNote] = Field(default_factory=list)
-
-
-class BacklogBoardResponse(StrictBaseModel):
-    ai_backlog: list[ProductBacklogDetailResponse] = Field(default_factory=list)
-    unlinked_user_requests: list[UserChangeRequestResponse] = Field(default_factory=list)
-    unlinked_applied_records: list[AppliedChangeRecordResponse] = Field(default_factory=list)
-    signal_performance_report: SignalPerformanceReportResponse | None = None
-    structured_competitor_notes: StructuredCompetitorNotesResponse | None = None
 
 
 class RiskCheckResult(StrictBaseModel):
@@ -828,10 +800,18 @@ class OverviewResponse(StrictBaseModel):
     latest_price: float
     latest_decision: dict[str, Any] | None
     latest_risk: dict[str, Any] | None
+    operational_status: OperationalStatusPayload
+    last_market_refresh_at: datetime | None = None
+    last_decision_at: datetime | None = None
+    last_decision_snapshot_at: datetime | None = None
+    last_decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
     open_positions: int
     live_trading_enabled: bool
     live_execution_ready: bool
     trading_paused: bool
+    approval_armed: bool = False
+    approval_expires_at: datetime | None = None
+    can_enter_new_position: bool = False
     guard_mode_reason_category: str | None = None
     guard_mode_reason_code: str | None = None
     guard_mode_reason_message: str | None = None
@@ -863,6 +843,7 @@ class OverviewResponse(StrictBaseModel):
     cumulative_pnl: float
     blocked_reasons: list[str]
     latest_blocked_reasons: list[str] = Field(default_factory=list)
+    market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     protected_positions: int = 0
     unprotected_positions: int = 0
     position_protection_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -911,6 +892,7 @@ class SymbolEffectiveCadence(StrictBaseModel):
 
 class AppSettingsResponse(StrictBaseModel):
     id: int
+    operational_status: OperationalStatusPayload
     live_trading_enabled: bool
     live_trading_env_enabled: bool
     manual_live_approval: bool
@@ -919,6 +901,9 @@ class AppSettingsResponse(StrictBaseModel):
     live_approval_window_minutes: int
     live_execution_ready: bool
     trading_paused: bool
+    approval_armed: bool = False
+    approval_expires_at: datetime | None = None
+    can_enter_new_position: bool = False
     guard_mode_reason_category: str | None = None
     guard_mode_reason_code: str | None = None
     guard_mode_reason_message: str | None = None
@@ -930,6 +915,7 @@ class AppSettingsResponse(StrictBaseModel):
     auto_resume_whitelisted: bool = False
     auto_resume_eligible: bool = False
     auto_resume_status: str = "not_paused"
+    blocked_reasons: list[str] = Field(default_factory=list)
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     pause_severity: str | None = None
@@ -943,6 +929,7 @@ class AppSettingsResponse(StrictBaseModel):
     pnl_summary: dict[str, Any] = Field(default_factory=dict)
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     exposure_summary: dict[str, Any] = Field(default_factory=dict)
     execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
     market_context_summary: dict[str, Any] = Field(default_factory=dict)

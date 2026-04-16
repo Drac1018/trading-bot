@@ -41,6 +41,7 @@ SYNC_SCOPES: tuple[str, ...] = (
     "open_orders",
     "protective_orders",
 )
+SYNC_SCOPE_STATUSES = {"unknown", "synced", "failed", "incomplete", "skipped"}
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -131,9 +132,13 @@ def mark_sync_success(
     scope_detail = {
         **sync_detail.get(scope, {}),
         "status": status,
+        "last_attempt_at": now.isoformat(),
+        "last_attempt_status": "success",
         "last_sync_at": now.isoformat(),
         "last_failure_at": None,
         "last_failure_reason": None,
+        "last_skip_at": None,
+        "last_skip_reason": None,
         "consecutive_failures": 0,
         "stale_after_seconds": stale_after_seconds
         if stale_after_seconds is not None
@@ -164,8 +169,12 @@ def mark_sync_issue(
     scope_detail = {
         **sync_detail.get(scope, {}),
         "status": status,
+        "last_attempt_at": now.isoformat(),
+        "last_attempt_status": status,
         "last_failure_at": now.isoformat(),
         "last_failure_reason": reason_code,
+        "last_skip_at": None,
+        "last_skip_reason": None,
         "consecutive_failures": _coerce_int(sync_detail.get(scope, {}).get("consecutive_failures"), 0) + 1,
         "stale_after_seconds": stale_after_seconds
         if stale_after_seconds is not None
@@ -176,6 +185,48 @@ def mark_sync_issue(
     sync_detail[scope] = scope_detail
     runtime_detail[SYNC_STATE_DETAIL_KEY] = sync_detail
     settings_row.pause_reason_detail = runtime_detail
+
+
+def mark_sync_skipped(
+    settings_row: Setting,
+    *,
+    scope: str,
+    reason_code: str,
+    observed_at: datetime | None = None,
+    detail: dict[str, Any] | None = None,
+    stale_after_seconds: int | None = None,
+) -> None:
+    if scope not in SYNC_SCOPES:
+        raise ValueError(f"Unsupported sync scope: {scope}")
+    runtime_detail = get_runtime_detail(settings_row)
+    sync_detail = get_sync_state_detail(settings_row)
+    now = observed_at or utcnow_naive()
+    scope_detail = {
+        **sync_detail.get(scope, {}),
+        "status": "skipped",
+        "last_attempt_at": now.isoformat(),
+        "last_attempt_status": "skipped",
+        "last_skip_at": now.isoformat(),
+        "last_skip_reason": reason_code,
+        "stale_after_seconds": stale_after_seconds
+        if stale_after_seconds is not None
+        else _default_sync_stale_after_seconds(settings_row, scope),
+    }
+    if detail:
+        scope_detail.update(detail)
+    sync_detail[scope] = scope_detail
+    runtime_detail[SYNC_STATE_DETAIL_KEY] = sync_detail
+    settings_row.pause_reason_detail = runtime_detail
+
+
+def _display_sync_status(raw_status: str, *, stale: bool) -> str:
+    if raw_status == "unknown":
+        return "unknown"
+    if raw_status in {"failed", "incomplete", "skipped"}:
+        return raw_status
+    if stale:
+        return "stale"
+    return raw_status
 
 
 def get_sync_scope_status(
@@ -190,6 +241,8 @@ def get_sync_scope_status(
     current_time = now or utcnow_naive()
     last_sync_at = _coerce_datetime(scope_detail.get("last_sync_at"))
     last_failure_at = _coerce_datetime(scope_detail.get("last_failure_at"))
+    last_attempt_at = _coerce_datetime(scope_detail.get("last_attempt_at"))
+    last_skip_at = _coerce_datetime(scope_detail.get("last_skip_at"))
     stale_after_seconds = max(
         _coerce_int(scope_detail.get("stale_after_seconds"), _default_sync_stale_after_seconds(settings_row, scope)),
         1,
@@ -199,19 +252,35 @@ def get_sync_scope_status(
         if last_sync_at is not None
         else None
     )
-    status = str(scope_detail.get("status") or ("unknown" if last_sync_at is None else "synced"))
+    raw_status_value = str(scope_detail.get("status") or ("unknown" if last_sync_at is None else "synced"))
+    raw_status = raw_status_value if raw_status_value in SYNC_SCOPE_STATUSES else ("unknown" if last_sync_at is None else "synced")
     stale = last_sync_at is None or (
         freshness_seconds is not None and freshness_seconds > stale_after_seconds
     )
-    incomplete = status == "incomplete"
+    incomplete = raw_status == "incomplete"
+    status = _display_sync_status(raw_status, stale=stale)
     return {
         "scope": scope,
         "status": status,
+        "raw_status": raw_status,
+        "sync_detail_status": raw_status_value if raw_status_value not in SYNC_SCOPE_STATUSES else None,
         "last_sync_at": _serialize_datetime(last_sync_at),
+        "last_attempt_at": _serialize_datetime(last_attempt_at),
+        "last_attempt_status": (
+            str(scope_detail.get("last_attempt_status"))
+            if scope_detail.get("last_attempt_status") not in {None, ""}
+            else None
+        ),
         "last_failure_at": _serialize_datetime(last_failure_at),
         "last_failure_reason": (
             str(scope_detail.get("last_failure_reason"))
             if scope_detail.get("last_failure_reason") not in {None, ""}
+            else None
+        ),
+        "last_skip_at": _serialize_datetime(last_skip_at),
+        "last_skip_reason": (
+            str(scope_detail.get("last_skip_reason"))
+            if scope_detail.get("last_skip_reason") not in {None, ""}
             else None
         ),
         "consecutive_failures": _coerce_int(scope_detail.get("consecutive_failures"), 0),

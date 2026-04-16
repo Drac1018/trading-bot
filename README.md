@@ -5,11 +5,13 @@
 
 ## 현재 초점
 
+- 시장 / 계좌 / 포지션 / 주문 상태 수집과 동기화
 - Binance 계정/시장 상태를 기반으로 한 실거래 경로
 - AI 판단과 결정론적 `risk_guard` 분리
+- 실행 통제와 보호 주문 경로 유지
+- 감사 로그와 운영 대시보드를 통한 추적 가능성 확보
 - pause / resume / live arm / manual approval / audit trail 유지
 - 실패 시 자동 중지와 제한적 auto resume 정책
-- 운영 대시보드와 백로그를 통한 추적 가능성 확보
 
 ## 핵심 문서
 

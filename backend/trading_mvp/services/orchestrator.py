@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
@@ -7,10 +9,8 @@ from trading_mvp.enums import AgentRole, TriggerEvent
 from trading_mvp.models import (
     AgentRun,
     Alert,
-    CompetitorNote,
     MarketSnapshot,
     PnLSnapshot,
-    ProductBacklog,
     RiskCheck,
     SchedulerRun,
     SystemHealthEvent,
@@ -26,18 +26,14 @@ from trading_mvp.services.account import (
 from trading_mvp.services.agents import (
     ChiefReviewAgent,
     IntegrationPlannerAgent,
-    ProductImprovementAgent,
     TradingDecisionAgent,
     UIUXAgent,
+    build_trading_decision_input_payload,
     persist_agent_run,
 )
 from trading_mvp.services.ai_usage import get_openai_call_gate
 from trading_mvp.services.adaptive_signal import build_adaptive_signal_context
 from trading_mvp.services.audit import create_alert, record_audit_event, record_health_event
-from trading_mvp.services.backlog_insights import (
-    build_signal_performance_report,
-    build_structured_competitor_notes,
-)
 from trading_mvp.services.execution import apply_position_management, execute_live_trade, sync_live_state
 from trading_mvp.services.features import compute_features, persist_feature_snapshot
 from trading_mvp.services.market_data import (
@@ -55,8 +51,9 @@ from trading_mvp.services.risk import (
     get_symbol_leverage_cap,
     get_symbol_risk_tier,
 )
-from trading_mvp.services.runtime_state import summarize_runtime_state
+from trading_mvp.services.runtime_state import build_sync_freshness_summary, mark_sync_skipped, summarize_runtime_state
 from trading_mvp.services.settings import (
+    build_operational_status_payload,
     get_effective_symbols,
     get_effective_symbol_schedule,
     get_effective_symbol_settings,
@@ -99,7 +96,6 @@ class TradingOrchestrator:
         self.chief_review_agent = ChiefReviewAgent()
         self.integration_agent = IntegrationPlannerAgent(provider)
         self.ui_agent = UIUXAgent(provider)
-        self.product_agent = ProductImprovementAgent(provider)
 
     @staticmethod
     def _should_execute_live(trigger_event: str) -> bool:
@@ -176,10 +172,23 @@ class TradingOrchestrator:
         trigger_event: str = "background_poll",
     ) -> dict[str, object]:
         if not self.credentials.binance_api_key or not self.credentials.binance_api_secret:
+            skipped_at = utcnow_naive()
+            effective_symbol = symbol or self.settings_row.default_symbol
+            for scope in ("account", "positions", "open_orders", "protective_orders"):
+                mark_sync_skipped(
+                    self.settings_row,
+                    scope=scope,
+                    reason_code="LIVE_CREDENTIALS_MISSING",
+                    observed_at=skipped_at,
+                    detail={"symbol": effective_symbol, "trigger_event": trigger_event},
+                )
+            self.session.add(self.settings_row)
+            self.session.flush()
             return {
                 "status": "skipped",
                 "reason": "LIVE_CREDENTIALS_MISSING",
-                "symbol": symbol or self.settings_row.default_symbol,
+                "symbol": effective_symbol,
+                "sync_freshness_summary": build_sync_freshness_summary(self.settings_row),
             }
         try:
             result = sync_live_state(self.session, self.settings_row, symbol=symbol)
@@ -205,6 +214,7 @@ class TradingOrchestrator:
                 "symbol": symbol or self.settings_row.default_symbol,
                 "trigger_event": trigger_event,
                 "error": str(exc),
+                "sync_freshness_summary": build_sync_freshness_summary(self.settings_row),
             }
         record_audit_event(
             self.session,
@@ -249,6 +259,93 @@ class TradingOrchestrator:
             self.settings_row,
             trigger_source=trigger_event,
         )
+
+    @staticmethod
+    def _decision_reference_sync_at(sync_freshness_summary: dict[str, object], scope: str) -> str | None:
+        scope_payload = sync_freshness_summary.get(scope)
+        if not isinstance(scope_payload, dict):
+            return None
+        last_sync_at = scope_payload.get("last_sync_at")
+        if isinstance(last_sync_at, datetime):
+            return last_sync_at.isoformat()
+        if isinstance(last_sync_at, str) and last_sync_at:
+            return last_sync_at
+        return None
+
+    @staticmethod
+    def _decision_reference_has_blocking_freshness(
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        sync_freshness_summary: dict[str, object],
+    ) -> bool:
+        if market_snapshot.is_stale or not market_snapshot.is_complete:
+            return True
+        for scope_payload in sync_freshness_summary.values():
+            if not isinstance(scope_payload, dict):
+                continue
+            if bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete")):
+                return True
+        return False
+
+    def _build_decision_reference_payload(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        market_snapshot: MarketSnapshotPayload,
+        market_row: MarketSnapshot,
+        runtime_state: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        operational_status = build_operational_status_payload(
+            self.settings_row,
+            session=self.session,
+            runtime_state=runtime_state,
+        )
+        market_freshness_summary = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": "decision_cycle",
+            "status": "fresh"
+            if not market_snapshot.is_stale and market_snapshot.is_complete
+            else ("stale" if market_snapshot.is_stale else "incomplete"),
+            "snapshot_at": market_snapshot.snapshot_time.isoformat(),
+            "stale": market_snapshot.is_stale,
+            "incomplete": not market_snapshot.is_complete,
+            "latest_price": market_snapshot.latest_price,
+            "snapshot_id": market_row.id,
+        }
+        sync_freshness_summary = {
+            str(scope): dict(payload)
+            for scope, payload in operational_status.sync_freshness_summary.items()
+            if isinstance(payload, dict)
+        }
+        freshness_blocking = self._decision_reference_has_blocking_freshness(
+            market_snapshot=market_snapshot,
+            sync_freshness_summary=sync_freshness_summary,
+        )
+        return {
+            "market_snapshot_id": market_row.id,
+            "market_snapshot_at": market_snapshot.snapshot_time.isoformat(),
+            "market_snapshot_source": "refreshed",
+            "market_snapshot_stale": market_snapshot.is_stale,
+            "market_snapshot_incomplete": not market_snapshot.is_complete,
+            "account_sync_at": (
+                str(operational_status.account_sync_summary.get("last_synced_at") or "") or None
+            ),
+            "positions_sync_at": self._decision_reference_sync_at(sync_freshness_summary, "positions"),
+            "open_orders_sync_at": self._decision_reference_sync_at(sync_freshness_summary, "open_orders"),
+            "protective_orders_sync_at": self._decision_reference_sync_at(sync_freshness_summary, "protective_orders"),
+            "account_sync_status": str(operational_status.account_sync_summary.get("status") or "") or None,
+            "sync_freshness_summary": sync_freshness_summary,
+            "market_freshness_summary": market_freshness_summary,
+            "freshness_blocking": freshness_blocking,
+            "display_gap": False,
+            "display_gap_reason": (
+                "The decision used stale or incomplete market/account/order state, so new entry should remain blocked."
+                if freshness_blocking
+                else None
+            ),
+        }
 
     def _collect_market_snapshot(
         self,
@@ -469,6 +566,13 @@ class TradingOrchestrator:
             )
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
         runtime_state = summarize_runtime_state(self.settings_row)
+        decision_reference = self._build_decision_reference_payload(
+            symbol=symbol,
+            timeframe=timeframe,
+            market_snapshot=market_snapshot,
+            market_row=market_row,
+            runtime_state=runtime_state,
+        )
         if self._should_skip_same_candle_entry(
             symbol=symbol,
             timeframe=timeframe,
@@ -486,6 +590,7 @@ class TradingOrchestrator:
                 "risk_result": None,
                 "execution": None,
                 "status": "same_candle_skipped",
+                "decision_reference": decision_reference,
                 "account": account_snapshot_to_dict(latest_pnl),
                 "settings": serialize_settings(self.settings_row),
                 "auto_resume": auto_resume_result,
@@ -557,15 +662,13 @@ class TradingOrchestrator:
             self.session,
             AgentRole.TRADING_DECISION,
             trigger_event,
-            {
-                "market_snapshot": market_snapshot.model_dump(mode="json"),
-                "market_context": {
-                    context_timeframe: snapshot.model_dump(mode="json")
-                    for context_timeframe, snapshot in higher_timeframe_context.items()
-                },
-                "features": feature_payload.model_dump(mode="json"),
-                "risk_context": risk_context,
-            },
+            build_trading_decision_input_payload(
+                market_snapshot=market_snapshot,
+                higher_timeframe_context=higher_timeframe_context,
+                feature_payload=feature_payload,
+                risk_context=risk_context,
+                decision_reference=decision_reference,
+            ),
             decision,
             provider_name=provider_name,
             metadata_json=decision_metadata,
@@ -632,6 +735,7 @@ class TradingOrchestrator:
             "decision": decision.model_dump(mode="json"),
             "risk_result": risk_result.model_dump(mode="json"),
             "execution": execution_result,
+            "decision_reference": decision_reference,
             "logic_variant": logic_variant,
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
             "settings": serialize_settings(self.settings_row),
@@ -775,55 +879,9 @@ class TradingOrchestrator:
         return {"agent_run_id": run.id, "items": output.model_dump(mode="json")}
 
 
-    def run_product_review(self, triggered_by: str = TriggerEvent.SCHEDULED.value) -> dict[str, object]:
-        if not self.settings_row.ai_enabled:
-            return {"status": "skipped", "reason": "AI_DISABLED"}
-        openai_gate = get_openai_call_gate(
-            self.session,
-            self.settings_row,
-            AgentRole.PRODUCT_IMPROVEMENT.value,
-            triggered_by,
-            has_openai_key=bool(self.credentials.openai_api_key),
-        )
-        competitor_notes = list(self.session.scalars(select(CompetitorNote).order_by(desc(CompetitorNote.created_at)).limit(20)))
-        structured_competitor_notes = build_structured_competitor_notes(self.session)
-        signal_report = build_signal_performance_report(self.session)
-        existing_titles = [title for title in self.session.scalars(select(ProductBacklog.title))]
-        latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
-        kpi_summary = {
-            "equity": latest_pnl.equity,
-            "daily_pnl": latest_pnl.daily_pnl,
-            "cumulative_pnl": latest_pnl.cumulative_pnl,
-            "consecutive_losses": latest_pnl.consecutive_losses,
-            "tracked_symbols": get_effective_symbols(self.settings_row),
+    def run_daily_review_window(self, triggered_by: str = TriggerEvent.SCHEDULED.value) -> dict[str, object]:
+        return {
+            "status": "skipped",
+            "reason": "DAILY_REVIEW_NO_ACTIVE_WORKFLOW",
+            "triggered_by": triggered_by,
         }
-        output, provider_name, metadata = self.product_agent.run(
-            kpi_summary,
-            competitor_notes,
-            signal_report.model_dump(mode="json"),
-            structured_competitor_notes.model_dump(mode="json"),
-            existing_titles,
-            use_ai=openai_gate.allowed,
-        )
-        metadata = {**metadata, "gate": openai_gate.as_metadata()}
-        run = persist_agent_run(
-            self.session,
-            AgentRole.PRODUCT_IMPROVEMENT,
-            triggered_by,
-            {
-                "kpi_summary": kpi_summary,
-                "competitor_note_count": len(competitor_notes),
-                "signal_performance_report": signal_report.model_dump(mode="json"),
-                "structured_competitor_notes": structured_competitor_notes.model_dump(mode="json"),
-            },
-            output,
-            provider_name=provider_name,
-            metadata_json=metadata,
-        )
-        created_titles: list[str] = []
-        for item in output.items:
-            if item.title in existing_titles:
-                continue
-            self.session.add(ProductBacklog(title=item.title, problem=item.problem, proposal=item.proposal, severity=item.severity, effort=item.effort, impact=item.impact, priority=item.priority, rationale=item.rationale, source="product_improvement_agent", status="open"))
-            created_titles.append(item.title)
-        return {"agent_run_id": run.id, "created_titles": created_titles, "items": output.model_dump(mode="json")}

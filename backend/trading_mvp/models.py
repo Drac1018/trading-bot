@@ -258,46 +258,6 @@ class SchedulerRun(TimestampMixin, Base):
     outcome: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
-class ProductBacklog(TimestampMixin, Base):
-    __tablename__ = "product_backlog"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    title: Mapped[str] = mapped_column(String(200))
-    problem: Mapped[str] = mapped_column(Text)
-    proposal: Mapped[str] = mapped_column(Text)
-    severity: Mapped[str] = mapped_column(String(20))
-    effort: Mapped[str] = mapped_column(String(20))
-    impact: Mapped[str] = mapped_column(String(20))
-    priority: Mapped[str] = mapped_column(String(20))
-    rationale: Mapped[str] = mapped_column(Text)
-    source: Mapped[str] = mapped_column(String(50), default="seed")
-    status: Mapped[str] = mapped_column(String(30), default="open")
-
-
-class UserChangeRequest(TimestampMixin, Base):
-    __tablename__ = "user_change_requests"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    title: Mapped[str] = mapped_column(String(200))
-    detail: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(30), default="requested", index=True)
-    linked_backlog_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-
-
-class AppliedChangeRecord(TimestampMixin, Base):
-    __tablename__ = "applied_change_records"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    title: Mapped[str] = mapped_column(String(200))
-    summary: Mapped[str] = mapped_column(Text)
-    detail: Mapped[str] = mapped_column(Text)
-    related_backlog_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    source_type: Mapped[str] = mapped_column(String(20), default="manual", index=True)
-    files_changed: Mapped[list[str]] = mapped_column(JSON, default=list)
-    verification_summary: Mapped[str] = mapped_column(Text, default="")
-    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=utcnow_naive, index=True)
-
-
 class CompetitorNote(TimestampMixin, Base):
     __tablename__ = "competitor_notes"
 

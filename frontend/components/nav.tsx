@@ -19,7 +19,6 @@ const operatorItems: NavItem[] = [
   { href: "/dashboard/scheduler", label: "스케줄러 상태" },
   { href: "/dashboard/audit", label: "감사 로그" },
   { href: "/dashboard/settings", label: "설정" },
-  { href: "/dashboard/backlog", label: "개선 백로그" },
 ];
 
 const debugItems: NavItem[] = [{ href: "/dashboard/agents", label: "에이전트 디버그" }];

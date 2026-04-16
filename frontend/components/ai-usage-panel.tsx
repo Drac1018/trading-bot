@@ -27,7 +27,6 @@ const roleLabels: Record<string, string> = {
   trading_decision: "거래 의사결정",
   integration_planner: "통합 기획",
   ui_ux: "UI/UX",
-  product_improvement: "제품 개선",
 };
 
 function formatNumber(value: number) {

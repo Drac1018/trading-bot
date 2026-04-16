@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import select
 from trading_mvp.models import AuditEvent, Order, Position
 from trading_mvp.schemas import (
@@ -691,6 +692,23 @@ class EntrySuccessClient:
         return {"status": "CANCELED"}
 
 
+class AutoResizeCaptureClient(EntrySuccessClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.normalized_requests: list[float] = []
+        self.entry_submitted_quantities: list[float] = []
+
+    def normalize_order_quantity(self, symbol: str, quantity: float, *, reference_price: float | None = None, enforce_min_notional: bool = True):
+        normalized = quantity + 0.01
+        self.normalized_requests.append(normalized)
+        return normalized
+
+    def new_order(self, **kwargs):
+        if kwargs.get("order_type") not in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            self.entry_submitted_quantities.append(float(kwargs.get("quantity") or 0.0))
+        return super().new_order(**kwargs)
+
+
 class ReduceSuccessClient:
     def __init__(self) -> None:
         self.reduced = False
@@ -938,6 +956,51 @@ def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_sess
     assert client.account_info_calls >= 3
     assert client.open_orders_calls >= 3
     assert client.position_information_calls >= 3
+
+
+def test_execute_live_trade_keeps_risk_approved_quantity_cap_for_auto_resized_entry(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = AutoResizeCaptureClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    risk_result = RiskCheckResult(
+        allowed=True,
+        decision="long",
+        reason_codes=["ENTRY_AUTO_RESIZED", "ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT"],
+        approved_risk_pct=0.0075,
+        approved_leverage=2.0,
+        raw_projected_notional=158000.0,
+        approved_projected_notional=150000.0,
+        approved_quantity=2.142857,
+        auto_resized_entry=True,
+        size_adjustment_ratio=0.949367,
+        exposure_headroom_snapshot={"limiting_headroom_notional": 150000.0},
+        auto_resize_reason="CLAMPED_TO_SINGLE_POSITION_HEADROOM",
+        operating_mode="live",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
+    )
+
+    result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=777,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=risk_result,
+        risk_row=None,
+    )
+    db_session.flush()
+
+    order = db_session.scalar(select(Order).where(Order.decision_run_id == 777))
+
+    assert result["status"] in {"filled", "partially_filled"}
+    assert client.normalized_requests[-1] > 2.142857
+    assert client.entry_submitted_quantities[-1] == pytest.approx(2.142857, abs=1e-6)
+    assert order is not None
+    assert order.requested_quantity == pytest.approx(2.142857, abs=1e-6)
+    assert order.requested_quantity * order.requested_price <= 150000.0 + 1e-6
 
 
 def test_post_order_resync_updates_sync_freshness_summary(monkeypatch, db_session) -> None:

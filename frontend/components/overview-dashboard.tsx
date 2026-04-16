@@ -307,6 +307,129 @@ function translateDecision(value: string | null | undefined) {
   return decisionLabelMap[value] ?? value;
 }
 
+function isEntryDecision(value: string | null | undefined) {
+  return value === "long" || value === "short";
+}
+
+function isSurvivalDecision(value: string | null | undefined) {
+  return value === "reduce" || value === "exit";
+}
+
+function recommendationSummary(decision: string | null | undefined) {
+  if (isEntryDecision(decision)) {
+    return {
+      label: "신규 진입 제안",
+      detail: translateDecision(decision),
+    };
+  }
+  if (isSurvivalDecision(decision)) {
+    return {
+      label: "생존 경로 제안",
+      detail: translateDecision(decision),
+    };
+  }
+  if (decision === "hold") {
+    return {
+      label: "보류 제안",
+      detail: "신규 진입 없음",
+    };
+  }
+  return {
+    label: "추천 없음",
+    detail: "-",
+  };
+}
+
+function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
+  const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+  if (symbol.risk_guard.allowed === null) {
+    return {
+      label: "risk 평가 없음",
+      detail: "-",
+      kind: "neutral" as const,
+    };
+  }
+  if (symbol.risk_guard.allowed) {
+    if (isSurvivalDecision(decision)) {
+      return {
+        label: "생존 경로 허용",
+        detail: translateDecision(decision),
+        kind: "good" as const,
+      };
+    }
+    if (isEntryDecision(decision)) {
+      return {
+        label: "신규 진입 승인",
+        detail: translateDecision(decision),
+        kind: "good" as const,
+      };
+    }
+    return {
+      label: "보류 유지",
+      detail: translateDecision(decision),
+      kind: "neutral" as const,
+    };
+  }
+  if (isSurvivalDecision(decision)) {
+    return {
+      label: "생존 경로 차단",
+      detail: translateDecision(decision),
+      kind: "danger" as const,
+    };
+  }
+  return {
+    label: "신규 진입 차단",
+    detail: translateDecision(decision),
+    kind: "danger" as const,
+  };
+}
+
+function executionOutcomeSummary(symbol: OperatorSymbolSummary) {
+  const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+  const executionStatus = symbol.execution.execution_status ?? symbol.execution.order_status;
+  const flowLabel = isSurvivalDecision(decision)
+    ? "생존 경로"
+    : isEntryDecision(decision)
+      ? "신규 진입"
+      : "주문";
+
+  if (!symbol.execution.order_id) {
+    if (symbol.risk_guard.allowed === false) {
+      return {
+        label: "실행 없음",
+        detail: "risk 차단으로 주문 없음",
+        kind: "danger" as const,
+      };
+    }
+    if (symbol.ai_decision.decision === "hold") {
+      return {
+        label: "실행 없음",
+        detail: "AI 보류 제안",
+        kind: "neutral" as const,
+      };
+    }
+    return {
+      label: "주문 없음",
+      detail: "아직 실행 기록 없음",
+      kind: "neutral" as const,
+    };
+  }
+
+  if (symbol.execution.order_status === "filled" || symbol.execution.execution_status === "filled") {
+    return {
+      label: `${flowLabel} 실행됨`,
+      detail: executionStatus ?? "filled",
+      kind: "good" as const,
+    };
+  }
+
+  return {
+    label: `${flowLabel} 주문 제출`,
+    detail: executionStatus ?? "pending",
+    kind: "warn" as const,
+  };
+}
+
 function translateOperatingState(value: string | null | undefined) {
   if (!value) {
     return "-";
@@ -778,19 +901,22 @@ function SymbolStatusBoard({
             <tr className="text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
               <th className="px-3 py-2">심볼</th>
               <th className="px-3 py-2">현재가</th>
-              <th className="px-3 py-2">AI 판단</th>
+              <th className="px-3 py-2">AI 추천</th>
               <th className="px-3 py-2">신뢰도</th>
-              <th className="px-3 py-2">risk_guard</th>
-              <th className="px-3 py-2">차단 사유</th>
+              <th className="px-3 py-2">risk 결과</th>
+              <th className="px-3 py-2">risk 차단 사유</th>
               <th className="px-3 py-2">포지션</th>
               <th className="px-3 py-2">보호 상태</th>
-              <th className="px-3 py-2">실행 상태</th>
+              <th className="px-3 py-2">실제 실행</th>
               <th className="px-3 py-2">마지막 갱신</th>
             </tr>
           </thead>
           <tbody>
             {visibleSymbols.map((item) => {
               const blockedReasons = filteredBlockedReasons(item);
+              const recommendation = recommendationSummary(item.ai_decision.decision);
+              const riskOutcome = riskOutcomeSummary(item);
+              const executionOutcome = executionOutcomeSummary(item);
               const rowSelected = selectedSymbol !== ALL_SYMBOLS && item.symbol === selectedSymbol;
               return (
                 <tr
@@ -804,12 +930,20 @@ function SymbolStatusBoard({
                   <td className="px-3 py-3 text-sm text-slate-700">
                     {item.latest_price !== null ? formatNumber(item.latest_price, 2) : "-"}
                   </td>
-                  <td className="px-3 py-3 text-sm text-slate-700">{translateDecision(item.ai_decision.decision)}</td>
+                  <td className="px-3 py-3 text-sm text-slate-700">
+                    <div className="space-y-1">
+                      <div className="font-medium text-slate-900">{recommendation.label}</div>
+                      <div className="text-xs text-slate-500">{recommendation.detail}</div>
+                    </div>
+                  </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
                     {item.ai_decision.confidence !== null ? formatRatio(item.ai_decision.confidence) : "-"}
                   </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
-                    {item.risk_guard.allowed === null ? "-" : item.risk_guard.allowed ? "허용" : "차단"}
+                    <div className="space-y-1">
+                      <div className="font-medium text-slate-900">{riskOutcome.label}</div>
+                      <div className="text-xs text-slate-500">{riskOutcome.detail}</div>
+                    </div>
                   </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
                     {blockedReasons.length > 0 ? blockedReasons.map(translateReasonCode).join(", ") : "-"}
@@ -826,7 +960,10 @@ function SymbolStatusBoard({
                       : ""}
                   </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
-                    {item.execution.order_status ?? item.execution.execution_status ?? "없음"}
+                    <div className="space-y-1">
+                      <div className="font-medium text-slate-900">{executionOutcome.label}</div>
+                      <div className="text-xs text-slate-500">{executionOutcome.detail}</div>
+                    </div>
                   </td>
                   <td className="rounded-r-2xl px-3 py-3 text-sm text-slate-700">
                     {formatDateTime(item.last_updated_at)}
@@ -919,6 +1056,9 @@ function SymbolDetailPanel({
 
   const blockedReasons = filteredBlockedReasons(symbol);
   const autoResized = symbol.risk_guard.auto_resized_entry;
+  const recommendation = recommendationSummary(symbol.ai_decision.decision);
+  const riskOutcome = riskOutcomeSummary(symbol);
+  const executionOutcome = executionOutcomeSummary(symbol);
 
   return (
     <section className="space-y-6 rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
@@ -928,8 +1068,8 @@ function SymbolDetailPanel({
         </p>
         <h2 className="mt-2 text-xl font-semibold text-slate-950">{symbol.symbol} 상세 운영 흐름</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          아래 정보는 선택한 심볼의 최신 AI 판단, risk_guard 결과, 실행 상태, 감사 이벤트만
-          보여줍니다.
+          아래 정보는 선택한 심볼의 최신 AI 추천, risk_guard 결과, 실제 실행 상태, 감사 이벤트만
+          보여줍니다. 차단 사유는 AI 설명이 아니라 risk 결과 블록에서만 해석합니다.
         </p>
       </div>
 
@@ -963,6 +1103,11 @@ function SymbolDetailPanel({
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1.15fr,0.85fr]">
+        <div className="grid gap-4 lg:grid-cols-3 xl:col-span-2">
+          {valueCard("AI 추천", recommendation.label, recommendation.detail)}
+          {valueCard("risk 결과", riskOutcome.label, riskOutcome.detail)}
+          {valueCard("실제 실행", executionOutcome.label, executionOutcome.detail)}
+        </div>
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center gap-2">
             <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass("neutral")}`}>
@@ -1003,12 +1148,8 @@ function SymbolDetailPanel({
       <div className="grid gap-4 xl:grid-cols-[1.1fr,0.9fr]">
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center gap-2">
-            <span
-              className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
-                symbol.risk_guard.allowed ? "good" : "danger",
-              )}`}
-            >
-              {symbol.risk_guard.allowed ? "risk 허용" : "risk 차단"}
+            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(riskOutcome.kind)}`}>
+              {riskOutcome.label}
             </span>
             <span className="text-xs text-slate-500">{formatDateTime(symbol.risk_guard.created_at)}</span>
           </div>
@@ -1019,7 +1160,7 @@ function SymbolDetailPanel({
           <div className="mt-4 space-y-2">
             {blockedReasons.length === 0 ? (
               <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
-                최신 risk 차단 사유는 없습니다.
+                최신 risk 차단 사유는 없습니다. 허용 또는 보류 상태입니다.
               </div>
             ) : (
               blockedReasons.map((code) => (
@@ -1106,7 +1247,7 @@ function SymbolDetailPanel({
                     : "neutral",
               )}`}
             >
-              {symbol.execution.order_id ? "실제 실행" : "주문 없음"}
+              {symbol.execution.order_id ? "실제 실행 상태" : "실행 기록 없음"}
             </span>
             <span className="text-xs text-slate-500">{formatDateTime(symbol.execution.created_at)}</span>
           </div>
@@ -1139,8 +1280,7 @@ function SymbolDetailPanel({
             </div>
           ) : (
             <div className="mt-4 rounded-2xl bg-slate-50 px-4 py-4 text-sm text-slate-600">
-              선택 심볼의 최신 주문 또는 체결 결과가 없습니다. hold 판단이었거나 risk 차단으로 실행되지
-              않았을 수 있습니다.
+              {executionOutcome.detail}
             </div>
           )}
         </div>

@@ -6,7 +6,6 @@ class AgentRole(StrEnum):
     INTEGRATION_PLANNER = "integration_planner"
     TRADING_DECISION = "trading_decision"
     UI_UX = "ui_ux"
-    PRODUCT_IMPROVEMENT = "product_improvement"
 
 
 class DecisionType(StrEnum):
@@ -63,4 +62,3 @@ class TriggerEvent(StrEnum):
     SCHEDULED = "scheduled_review"
     REPLAY = "historical_replay"
     MANUAL = "manual"
-

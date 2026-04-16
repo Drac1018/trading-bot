@@ -38,7 +38,7 @@ AI가 매매 신호를 분석하지만, 실제 실행은 결정론적 리스크 
 시장 데이터가 들어오면 feature layer가 추세, 변동성, 거래량, RSI, ATR 같은 특징을 계산하고, Trading Decision AI가 구조화된 결정을 냅니다.  
 그 다음 결정론적 리스크 엔진이 stop loss / take profit 유효성, risk per trade, leverage, stale data, slippage, daily loss, consecutive loss 같은 규칙을 검사합니다.  
 허용되면 paper execution engine이 주문과 체결, 포지션, PnL을 기록하고, Chief Review AI가 운영 요약을 제공합니다.  
-별도로 Integration Planner AI, UI/UX AI, Product Improvement AI는 배치 리뷰로 제품과 운영의 개선 포인트를 제안합니다.  
+별도로 Integration Planner AI와 UI/UX AI는 배치 리뷰로 제품과 운영의 개선 포인트를 제안합니다.
 즉, 이 제품은 “수익 보장형 투자 엔진”이 아니라, **설명 가능하고 통제 가능한 자동매매 운영 기반**을 제공하는 MVP입니다.
 
 ### 10분 설명 뼈대
@@ -95,10 +95,8 @@ AI가 매매 신호를 분석하지만, 실제 실행은 결정론적 리스크 
 - 중요한 고객: 운영자, PM
 - 과장 금지: 화면을 자동 배포한다고 설명하면 안 됨
 
-### Product Improvement AI
 
 - 쉬운 설명: 경쟁사 메모와 KPI를 보고 다음 개선 아이템을 제안하는 AI
-- 정확한 설명: backlog recommendation 생성 계층
 - 중요한 고객: 제품팀, 기업 고객
 - 과장 금지: 매매 정책을 자동으로 바꾼다고 설명하면 안 됨
 

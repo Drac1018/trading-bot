@@ -23,6 +23,7 @@ from trading_mvp.models import (
 from trading_mvp.schemas import (
     AppSettingsResponse,
     AppSettingsUpdateRequest,
+    OperationalStatusPayload,
     SymbolCadenceOverride,
     SymbolEffectiveCadence,
 )
@@ -104,6 +105,26 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_POSITION_SYNC_FAILED",
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+}
+SYNC_SCOPE_GUARD_REASON_CODES = {
+    "account": "ACCOUNT_STATE_STALE",
+    "positions": "POSITION_STATE_STALE",
+    "open_orders": "OPEN_ORDERS_STATE_STALE",
+    "protective_orders": "PROTECTION_STATE_UNVERIFIED",
+}
+STALE_FIRST_REASON_PRIORITY = {
+    "ACCOUNT_STATE_STALE": 0,
+    "POSITION_STATE_STALE": 1,
+    "OPEN_ORDERS_STATE_STALE": 2,
+    "PROTECTION_STATE_UNVERIFIED": 3,
+    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE": 4,
+    "EXCHANGE_POSITION_SYNC_FAILED": 5,
+    "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": 6,
+    "TEMPORARY_SYNC_FAILURE": 7,
+    "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE": 8,
+    "LIVE_CREDENTIALS_MISSING": 9,
+    "STALE_MARKET_DATA": 10,
+    "INCOMPLETE_MARKET_DATA": 11,
 }
 GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "TRADING_PAUSED": "거래가 일시 중지되어 가드 모드입니다.",
@@ -794,6 +815,54 @@ def _derive_live_execution_guard_reason(
     return "readiness", code, _guard_message_for_code(code)
 
 
+def _derive_sync_blocking_reasons(sync_freshness_summary: dict[str, object]) -> list[str]:
+    reason_codes: list[str] = []
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        scope_payload = sync_freshness_summary.get(scope)
+        if not isinstance(scope_payload, dict):
+            continue
+        status = str(scope_payload.get("status") or scope_payload.get("raw_status") or "")
+        has_observation = any(
+            scope_payload.get(key) not in {None, ""}
+            for key in ("last_sync_at", "last_attempt_at", "last_failure_at", "last_skip_at")
+        )
+        if status == "unknown" and not has_observation:
+            continue
+        if status in {"failed", "incomplete"}:
+            code = str(scope_payload.get("last_failure_reason") or SYNC_SCOPE_GUARD_REASON_CODES[scope])
+        elif status == "skipped":
+            code = str(scope_payload.get("last_skip_reason") or SYNC_SCOPE_GUARD_REASON_CODES[scope])
+        elif bool(scope_payload.get("stale")):
+            code = SYNC_SCOPE_GUARD_REASON_CODES[scope]
+        else:
+            continue
+        if code and code not in reason_codes:
+            reason_codes.append(code)
+    return reason_codes
+
+
+def _derive_market_blocking_reasons(market_freshness_summary: dict[str, object]) -> list[str]:
+    if not market_freshness_summary.get("snapshot_at"):
+        return []
+    if bool(market_freshness_summary.get("incomplete")):
+        return ["INCOMPLETE_MARKET_DATA"]
+    if bool(market_freshness_summary.get("stale")):
+        return ["STALE_MARKET_DATA"]
+    return []
+
+
+def _prioritize_blocked_reasons(reason_codes: list[str]) -> list[str]:
+    unique: list[str] = []
+    for code in reason_codes:
+        normalized = str(code or "").strip()
+        if normalized and normalized not in unique:
+            unique.append(normalized)
+    return sorted(
+        unique,
+        key=lambda code: (STALE_FIRST_REASON_PRIORITY.get(code, 100), unique.index(code)),
+    )
+
+
 def derive_guard_mode_reason(
     settings_row: Setting,
     *,
@@ -801,10 +870,18 @@ def derive_guard_mode_reason(
     runtime_state: dict[str, object] | None = None,
     latest_blocked_reasons: list[str] | None = None,
     auto_resume_last_blockers: list[str] | None = None,
+    sync_freshness_summary: dict[str, object] | None = None,
+    market_freshness_summary: dict[str, object] | None = None,
 ) -> dict[str, str | None]:
     app_defaults = defaults or get_settings()
     runtime = runtime_state or summarize_runtime_state(settings_row)
-    blocked_reasons = [str(item) for item in (latest_blocked_reasons or []) if item]
+    sync_blocked_reasons = _derive_sync_blocking_reasons(sync_freshness_summary or {})
+    market_blocked_reasons = _derive_market_blocking_reasons(market_freshness_summary or {})
+    blocked_reasons = _prioritize_blocked_reasons(
+        sync_blocked_reasons
+        + market_blocked_reasons
+        + [str(item) for item in (latest_blocked_reasons or []) if item]
+    )
     auto_resume_blockers = [str(item) for item in (auto_resume_last_blockers or []) if item]
     operating_state = str(runtime.get("operating_state", "TRADABLE"))
 
@@ -861,6 +938,205 @@ def derive_guard_mode_reason(
     }
 
 
+def _build_market_freshness_summary(
+    session: Session | None,
+    settings_row: Setting,
+) -> dict[str, object]:
+    symbol = settings_row.default_symbol.upper()
+    timeframe = settings_row.default_timeframe
+    if session is None:
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": "snapshot",
+            "status": "unknown",
+            "snapshot_at": None,
+            "stale": True,
+            "incomplete": True,
+            "latest_price": None,
+        }
+
+    latest_market = session.scalar(
+        select(MarketSnapshot)
+        .where(
+            MarketSnapshot.symbol == symbol,
+            MarketSnapshot.timeframe == timeframe,
+        )
+        .order_by(desc(MarketSnapshot.snapshot_time))
+        .limit(1)
+    )
+    if latest_market is None:
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": "snapshot",
+            "status": "missing",
+            "snapshot_at": None,
+            "stale": True,
+            "incomplete": True,
+            "latest_price": None,
+        }
+
+    is_incomplete = not latest_market.is_complete
+    is_stale = bool(latest_market.is_stale)
+    status = "fresh"
+    if is_incomplete:
+        status = "incomplete"
+    elif is_stale:
+        status = "stale"
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "source": "snapshot",
+        "status": status,
+        "snapshot_at": latest_market.snapshot_time,
+        "stale": is_stale,
+        "incomplete": is_incomplete,
+        "latest_price": latest_market.latest_price,
+    }
+
+
+def _sync_blocks_new_entries(sync_freshness_summary: dict[str, object]) -> bool:
+    return any(
+        isinstance(scope_payload, dict) and (bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete")))
+        for scope_payload in sync_freshness_summary.values()
+    )
+
+
+def _market_blocks_new_entries(market_freshness_summary: dict[str, object]) -> bool:
+    return bool(market_freshness_summary.get("stale")) or bool(market_freshness_summary.get("incomplete"))
+
+
+def build_operational_status_payload(
+    settings_row: Setting,
+    *,
+    session: Session | None = None,
+    defaults: AppConfig | None = None,
+    runtime_state: dict[str, object] | None = None,
+    operating_state_override: str | None = None,
+    missing_protection_symbols_override: list[str] | None = None,
+    missing_protection_items_override: dict[str, list[str]] | None = None,
+    blocked_reasons: list[str] | None = None,
+    latest_blocked_reasons: list[str] | None = None,
+    account_sync_summary: dict[str, object] | None = None,
+    sync_freshness_summary: dict[str, object] | None = None,
+    market_freshness_summary: dict[str, object] | None = None,
+) -> OperationalStatusPayload:
+    app_defaults = defaults or get_settings()
+    current_session = session or object_session(settings_row)
+    runtime = runtime_state or summarize_runtime_state(settings_row)
+    live_execution_ready = is_live_execution_ready(settings_row, defaults=app_defaults)
+    auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
+    auto_resume_last_blockers = [str(item) for item in auto_resume_state.get("blockers", [])]
+    current_blocked_reasons = [str(item) for item in (blocked_reasons or []) if item not in {None, ""}]
+    sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
+    market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
+    inject_freshness_blockers = not settings_row.trading_paused
+    sync_blocked_reasons = _derive_sync_blocking_reasons(sync_summary) if inject_freshness_blockers else []
+    market_blocked_reasons = _derive_market_blocking_reasons(market_summary) if inject_freshness_blockers else []
+    recent_blocked_reasons = _prioritize_blocked_reasons(
+        sync_blocked_reasons
+        + market_blocked_reasons
+        + [
+            str(item)
+            for item in (
+                latest_blocked_reasons
+                if latest_blocked_reasons is not None
+                else (current_blocked_reasons or get_latest_blocked_reasons(current_session))
+            )
+            if item not in {None, ""}
+        ]
+    )
+    current_blocked_reasons = _prioritize_blocked_reasons(
+        sync_blocked_reasons + market_blocked_reasons + (current_blocked_reasons or recent_blocked_reasons)
+    )
+    latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
+    account_summary: dict[str, object]
+    if account_sync_summary is not None:
+        account_summary = dict(account_sync_summary)
+    elif latest_pnl is not None:
+        account_summary = _build_account_sync_summary(current_session, settings_row, latest_pnl)
+    else:
+        account_summary = {
+            "status": "unknown",
+            "reconciliation_mode": "unknown",
+            "freshness_seconds": None,
+            "stale_after_seconds": _account_sync_stale_seconds(settings_row),
+            "last_synced_at": None,
+            "last_warning_reason_code": None,
+            "last_warning_message": None,
+            "note": "Account sync status is not available until the first live snapshot is created.",
+        }
+    missing_protection_symbols = (
+        [str(item) for item in (missing_protection_symbols_override or []) if item not in {None, ""}]
+        if missing_protection_symbols_override is not None
+        else [str(item) for item in runtime["missing_protection_symbols"]]
+    )
+    missing_protection_items = (
+        {
+            str(key): [str(item) for item in value if item not in {None, ""}]
+            for key, value in (missing_protection_items_override or {}).items()
+        }
+        if missing_protection_items_override is not None
+        else {
+            str(key): [str(item) for item in value]
+            for key, value in runtime["missing_protection_items"].items()
+        }
+    )
+    operating_state = operating_state_override or str(runtime.get("operating_state", "TRADABLE"))
+    guard_runtime = {**runtime, "operating_state": operating_state}
+    guard_mode_reason = derive_guard_mode_reason(
+        settings_row,
+        defaults=app_defaults,
+        runtime_state=guard_runtime,
+        latest_blocked_reasons=recent_blocked_reasons,
+        auto_resume_last_blockers=auto_resume_last_blockers,
+        sync_freshness_summary=sync_summary,
+        market_freshness_summary=market_summary,
+    )
+    can_enter_new_position = (
+        live_execution_ready
+        and not settings_row.trading_paused
+        and operating_state == "TRADABLE"
+        and not _sync_blocks_new_entries(sync_summary)
+        and not _market_blocks_new_entries(market_summary)
+    )
+    pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
+    return OperationalStatusPayload(
+        live_trading_enabled=settings_row.live_trading_enabled,
+        live_trading_env_enabled=app_defaults.live_trading_env_enabled,
+        live_execution_ready=live_execution_ready,
+        trading_paused=settings_row.trading_paused,
+        approval_armed=is_live_execution_armed(settings_row),
+        approval_expires_at=settings_row.live_execution_armed_until,
+        approval_window_minutes=settings_row.live_approval_window_minutes,
+        operating_state=operating_state,
+        guard_mode_reason_category=guard_mode_reason["guard_mode_reason_category"],
+        guard_mode_reason_code=guard_mode_reason["guard_mode_reason_code"],
+        guard_mode_reason_message=guard_mode_reason["guard_mode_reason_message"],
+        pause_reason_code=settings_row.pause_reason_code,
+        pause_origin=settings_row.pause_origin,
+        pause_triggered_at=settings_row.pause_triggered_at,
+        auto_resume_after=settings_row.auto_resume_after,
+        auto_resume_status=str(auto_resume_state.get("status", "not_paused" if not settings_row.trading_paused else "idle")),
+        auto_resume_eligible=pause_policy.auto_resume_eligible if settings_row.trading_paused else False,
+        auto_resume_last_blockers=auto_resume_last_blockers,
+        pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
+        pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
+        blocked_reasons=current_blocked_reasons,
+        latest_blocked_reasons=recent_blocked_reasons,
+        account_sync_summary=account_summary,
+        sync_freshness_summary=sync_summary,
+        market_freshness_summary=market_summary,
+        protection_recovery_status=str(runtime["protection_recovery_status"]),
+        protection_recovery_active=bool(runtime["protection_recovery_active"]),
+        protection_recovery_failure_count=int(runtime["protection_recovery_failure_count"]),
+        missing_protection_symbols=missing_protection_symbols,
+        missing_protection_items=missing_protection_items,
+        can_enter_new_position=can_enter_new_position,
+    )
+
+
 def arm_live_execution(session: Session, minutes: int | None = None) -> Setting:
     row = get_or_create_settings(session)
     row.live_execution_armed = True
@@ -884,7 +1160,6 @@ def estimate_monthly_ai_calls(settings_row: Setting, *, assume_enabled: bool = F
         "trading_decision": 0,
         "integration_planner": 0,
         "ui_ux": 0,
-        "product_improvement": 0,
     }
     if settings_row.ai_provider != "openai" or not (assume_enabled or settings_row.ai_enabled):
         return 0, breakdown
@@ -901,8 +1176,6 @@ def estimate_monthly_ai_calls(settings_row: Setting, *, assume_enabled: bool = F
         breakdown["integration_planner"] = 30 * 6
     if "12h" in settings_row.schedule_windows:
         breakdown["ui_ux"] = 30 * 2
-    if "24h" in settings_row.schedule_windows:
-        breakdown["product_improvement"] = 30
     return sum(breakdown.values()), breakdown
 
 
@@ -940,18 +1213,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     effective_max_risk_per_trade = min(settings_row.max_risk_per_trade, DISPLAY_MAX_RISK_PER_TRADE)
     effective_max_daily_loss = min(settings_row.max_daily_loss, DISPLAY_MAX_DAILY_LOSS)
     exposure_limits = get_exposure_limits(settings_row)
-    pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
-    auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
     runtime_state = summarize_runtime_state(settings_row)
-    latest_blocked_reasons = get_latest_blocked_reasons(current_session)
-    auto_resume_last_blockers = [str(item) for item in auto_resume_state.get("blockers", [])]
-    guard_mode_reason = derive_guard_mode_reason(
-        settings_row,
-        defaults=defaults,
-        runtime_state=runtime_state,
-        latest_blocked_reasons=latest_blocked_reasons,
-        auto_resume_last_blockers=auto_resume_last_blockers,
-    )
     latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
     pnl_summary = (
         _build_pnl_summary(settings_row, latest_pnl)
@@ -986,6 +1248,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         }
     )
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
+    market_freshness_summary = _build_market_freshness_summary(current_session, settings_row)
     if current_session is not None:
         from trading_mvp.services.risk import build_current_exposure_summary
 
@@ -1038,6 +1301,15 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)
+    operational_status = build_operational_status_payload(
+        settings_row,
+        session=current_session,
+        defaults=defaults,
+        runtime_state=runtime_state,
+        account_sync_summary=account_sync_summary,
+        sync_freshness_summary=sync_freshness_summary,
+        market_freshness_summary=market_freshness_summary,
+    )
     symbol_cadence_overrides = [
         SymbolCadenceOverride(**item) for item in get_symbol_cadence_overrides(settings_row)
     ]
@@ -1045,41 +1317,44 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
 
     payload = AppSettingsResponse(
         id=settings_row.id,
+        operational_status=operational_status,
         live_trading_enabled=settings_row.live_trading_enabled,
         live_trading_env_enabled=defaults.live_trading_env_enabled,
         manual_live_approval=settings_row.manual_live_approval,
         live_execution_armed=is_live_execution_armed(settings_row),
         live_execution_armed_until=settings_row.live_execution_armed_until,
         live_approval_window_minutes=settings_row.live_approval_window_minutes,
-        live_execution_ready=is_live_execution_ready(settings_row, defaults=defaults),
-        trading_paused=settings_row.trading_paused,
-        guard_mode_reason_category=guard_mode_reason["guard_mode_reason_category"],
-        guard_mode_reason_code=guard_mode_reason["guard_mode_reason_code"],
-        guard_mode_reason_message=guard_mode_reason["guard_mode_reason_message"],
-        pause_reason_code=settings_row.pause_reason_code,
-        pause_origin=settings_row.pause_origin,
+        live_execution_ready=operational_status.live_execution_ready,
+        trading_paused=operational_status.trading_paused,
+        approval_armed=operational_status.approval_armed,
+        approval_expires_at=operational_status.approval_expires_at,
+        can_enter_new_position=operational_status.can_enter_new_position,
+        guard_mode_reason_category=operational_status.guard_mode_reason_category,
+        guard_mode_reason_code=operational_status.guard_mode_reason_code,
+        guard_mode_reason_message=operational_status.guard_mode_reason_message,
+        pause_reason_code=operational_status.pause_reason_code,
+        pause_origin=operational_status.pause_origin,
         pause_reason_detail=settings_row.pause_reason_detail,
-        pause_triggered_at=settings_row.pause_triggered_at,
-        auto_resume_after=settings_row.auto_resume_after,
+        pause_triggered_at=operational_status.pause_triggered_at,
+        auto_resume_after=operational_status.auto_resume_after,
         auto_resume_whitelisted=pause_reason_allows_auto_resume(settings_row.pause_reason_code),
-        auto_resume_eligible=pause_policy.auto_resume_eligible if settings_row.trading_paused else False,
-        auto_resume_status=str(auto_resume_state.get("status", "not_paused" if not settings_row.trading_paused else "idle")),
-        auto_resume_last_blockers=auto_resume_last_blockers,
-        latest_blocked_reasons=latest_blocked_reasons,
-        pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
-        pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
-        operating_state=str(runtime_state["operating_state"]),
-        protection_recovery_status=str(runtime_state["protection_recovery_status"]),
-        protection_recovery_active=bool(runtime_state["protection_recovery_active"]),
-        protection_recovery_failure_count=int(runtime_state["protection_recovery_failure_count"]),
-        missing_protection_symbols=[str(item) for item in runtime_state["missing_protection_symbols"]],
-        missing_protection_items={
-            str(key): [str(item) for item in value]
-            for key, value in runtime_state["missing_protection_items"].items()
-        },
+        auto_resume_eligible=operational_status.auto_resume_eligible,
+        auto_resume_status=operational_status.auto_resume_status,
+        blocked_reasons=operational_status.blocked_reasons,
+        auto_resume_last_blockers=operational_status.auto_resume_last_blockers,
+        latest_blocked_reasons=operational_status.latest_blocked_reasons,
+        pause_severity=operational_status.pause_severity,
+        pause_recovery_class=operational_status.pause_recovery_class,
+        operating_state=operational_status.operating_state,
+        protection_recovery_status=operational_status.protection_recovery_status,
+        protection_recovery_active=operational_status.protection_recovery_active,
+        protection_recovery_failure_count=operational_status.protection_recovery_failure_count,
+        missing_protection_symbols=operational_status.missing_protection_symbols,
+        missing_protection_items=operational_status.missing_protection_items,
         pnl_summary=pnl_summary,
-        account_sync_summary=account_sync_summary,
-        sync_freshness_summary=sync_freshness_summary,
+        account_sync_summary=operational_status.account_sync_summary,
+        sync_freshness_summary=operational_status.sync_freshness_summary,
+        market_freshness_summary=operational_status.market_freshness_summary,
         exposure_summary=exposure_summary,
         execution_policy_summary=execution_policy_summary,
         market_context_summary=market_context_summary,

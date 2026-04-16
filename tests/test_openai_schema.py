@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from trading_mvp.providers import OpenAIProvider
-from trading_mvp.schemas import ProductBacklogBatch, TradeDecision
+from trading_mvp.schemas import IntegrationSuggestionBatch, TradeDecision
 
 
 def test_openai_trade_decision_schema_marks_all_properties_required() -> None:
@@ -15,9 +15,9 @@ def test_openai_trade_decision_schema_marks_all_properties_required() -> None:
 
 
 def test_openai_batch_schema_normalizes_nested_object_requirements() -> None:
-    schema = OpenAIProvider._build_strict_json_schema(ProductBacklogBatch)
+    schema = OpenAIProvider._build_strict_json_schema(IntegrationSuggestionBatch)
 
-    item_schema = schema["$defs"]["ProductBacklogItem"]
+    item_schema = schema["$defs"]["IntegrationSuggestion"]
     assert "$defs" in schema
     assert set(item_schema["required"]) == set(item_schema["properties"].keys())
     assert item_schema["additionalProperties"] is False

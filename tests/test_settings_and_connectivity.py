@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -21,6 +21,7 @@ from trading_mvp.schemas import (
     OpenAIConnectionTestRequest,
 )
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
+from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.settings import (
     get_or_create_settings,
     serialize_settings,
@@ -119,6 +120,8 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["time_stop_profit_floor"] == 0.2
     assert serialized["holding_edge_decay_enabled"] is True
     assert serialized["reduce_on_regime_shift_enabled"] is True
+    assert serialized["operational_status"]["live_execution_ready"] == serialized["live_execution_ready"]
+    assert serialized["operational_status"]["approval_armed"] == serialized["approval_armed"]
     assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 5760
     assert serialized["symbol_effective_cadences"][0]["symbol"] == "BTCUSDT"
     assert serialized["symbol_effective_cadences"][0]["estimated_monthly_ai_calls"] == 4320
@@ -174,6 +177,23 @@ def test_should_call_openai_applies_failure_backoff(db_session) -> None:
 
     assert should_call_openai(db_session, row, "trading_decision", "realtime_cycle") is False
     assert should_call_openai(db_session, row, "trading_decision", "manual") is False
+
+
+def test_serialize_settings_marks_stale_sync_scope_instead_of_leaving_synced(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    stale_at = utcnow_naive() - timedelta(hours=2)
+    mark_sync_success(row, scope="positions", synced_at=stale_at, detail={"symbol": "BTCUSDT"})
+    db_session.add(row)
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+    positions = serialized["sync_freshness_summary"]["positions"]
+
+    assert positions["raw_status"] == "synced"
+    assert positions["status"] == "stale"
+    assert positions["last_sync_at"] == stale_at.isoformat()
+    assert positions["last_attempt_at"] == stale_at.isoformat()
+    assert positions["last_skip_reason"] is None
 
 
 def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
@@ -391,7 +411,10 @@ def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> 
     assert serialized["pause_origin"] == "system"
     assert serialized["auto_resume_status"] == "blocked"
     assert serialized["auto_resume_last_blockers"] == ["MISSING_PROTECTIVE_ORDERS"]
+    assert serialized["blocked_reasons"] == ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]
     assert serialized["latest_blocked_reasons"] == ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]
+    assert serialized["operational_status"]["blocked_reasons"] == serialized["blocked_reasons"]
+    assert serialized["operational_status"]["auto_resume_status"] == serialized["auto_resume_status"]
     assert serialized["pause_severity"] == "warning"
     assert serialized["pause_recovery_class"] == "recoverable_system"
     assert serialized["operating_state"] == "PAUSED"
@@ -408,7 +431,7 @@ def test_serialize_settings_includes_operational_summary_sections(db_session) ->
     now = utcnow_naive()
     db_session.add(
         PnLSnapshot(
-            snapshot_date=(now - timedelta(minutes=5)).date(),
+            snapshot_date=date.today(),
             cash_balance=100250.0,
             equity=100125.0,
             unrealized_pnl=-125.0,
@@ -479,6 +502,9 @@ def test_serialize_settings_includes_operational_summary_sections(db_session) ->
 
     assert serialized["pnl_summary"]["basis"] == "execution_ledger_truth"
     assert serialized["account_sync_summary"]["status"] == "fallback_reconciled"
+    assert serialized["operational_status"]["account_sync_summary"]["status"] == "fallback_reconciled"
+    assert serialized["operational_status"]["market_freshness_summary"]["symbol"] == "BTCUSDT"
+    assert serialized["operational_status"]["market_freshness_summary"]["stale"] is False
     assert serialized["exposure_summary"]["reference_symbol"] == "BTCUSDT"
     assert "entry" in serialized["execution_policy_summary"]
     assert serialized["market_context_summary"]["context_timeframes"] == ["1h", "4h"]

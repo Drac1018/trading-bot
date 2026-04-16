@@ -1,32 +1,26 @@
 # Agent Design
 
-## Trading Decision AI
+현재 제품 범위는 **실거래 코어 운영**에 필요한 AI 역할만 유지한다.
+기획·개선·UI 제안 성격의 보조 워크플로우는 현재 운영 범위 밖이다.
+
+## 현재 유지 대상
+
+### Trading Decision AI
 
 - 입력: market snapshot, feature snapshot, open positions, risk context
 - 출력: `TradeDecision`
-- 특징: 완전 결정론적 휴리스틱 기반 mock provider를 기본 사용
+- 역할: 방향과 아이디어를 제안하지만 실행 권한은 없다.
 
-## Chief Review AI
+### Chief Review AI
 
 - 입력: 최근 trade decision, risk result, system health, alerts
 - 출력: `ChiefReviewSummary`
-- 특징: 실행 여부가 아니라 운영 모드와 우선 대응을 제안
+- 역할: 운영 모드, 우선 대응, 주의 상태를 요약한다.
 
-## Integration Planner AI
+## 현재 범위 밖
 
-- 입력: 로그/리스크/스케줄 요약, 헬스 이벤트
-- 출력: `IntegrationSuggestionBatch`
-- 특징: 4시간 주기 배치 리뷰
+아래 역할은 장기 확장 아이디어로만 남기며, 현재 제품의 활성 범위나 기본 운영 워크플로우로 보지 않는다.
 
-## UI/UX AI
-
-- 입력: UI feedback
-- 출력: `UXSuggestionBatch`
-- 특징: 12시간 주기 리뷰, 자동 배포 없음
-
-## Product Improvement AI
-
-- 입력: KPI, competitor notes, prior backlog
-- 출력: `ProductBacklogBatch`
-- 특징: 24시간 주기 리뷰, 정책 자동 변경 없음
-
+- Integration Planner AI
+- UI/UX AI
+- 추가 개선 기획 AI

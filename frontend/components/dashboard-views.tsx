@@ -63,6 +63,96 @@ function metricCard(title: string, value: string, hint: string) {
   );
 }
 
+function isEntryDecision(value: string | null | undefined) {
+  return value === "long" || value === "short";
+}
+
+function isSurvivalDecision(value: string | null | undefined) {
+  return value === "reduce" || value === "exit";
+}
+
+function translateDecision(value: string | null | undefined) {
+  if (value === "long") {
+    return "롱";
+  }
+  if (value === "short") {
+    return "숏";
+  }
+  if (value === "reduce") {
+    return "축소";
+  }
+  if (value === "exit") {
+    return "청산";
+  }
+  if (value === "hold") {
+    return "보류";
+  }
+  return value ?? "-";
+}
+
+function decisionSummary(decision: string | null | undefined) {
+  if (isEntryDecision(decision)) {
+    return {
+      label: "신규 진입 제안",
+      detail: translateDecision(decision),
+    };
+  }
+  if (isSurvivalDecision(decision)) {
+    return {
+      label: "생존 경로 제안",
+      detail: translateDecision(decision),
+    };
+  }
+  if (decision === "hold") {
+    return {
+      label: "보류 제안",
+      detail: "신규 진입 없음",
+    };
+  }
+  return {
+    label: "추천 없음",
+    detail: "-",
+  };
+}
+
+function riskSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
+  const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+  if (symbol.risk_guard.allowed === null) {
+    return {
+      label: "risk 평가 없음",
+      detail: "-",
+    };
+  }
+  if (symbol.risk_guard.allowed) {
+    if (isSurvivalDecision(decision)) {
+      return {
+        label: "생존 경로 허용",
+        detail: translateDecision(decision),
+      };
+    }
+    if (isEntryDecision(decision)) {
+      return {
+        label: "신규 진입 승인",
+        detail: translateDecision(decision),
+      };
+    }
+    return {
+      label: "보류 유지",
+      detail: translateDecision(decision),
+    };
+  }
+  if (isSurvivalDecision(decision)) {
+    return {
+      label: "생존 경로 차단",
+      detail: translateDecision(decision),
+    };
+  }
+  return {
+    label: "신규 진입 차단",
+    detail: translateDecision(decision),
+  };
+}
+
 function SymbolTabs({
   slug,
   symbols,
@@ -218,6 +308,8 @@ export function DecisionView({
   const filteredDecisionRows = decisionRows.filter(
     (row) => String(row.symbol ?? "").toUpperCase() === (symbol?.symbol ?? ""),
   );
+  const recommendation = symbol ? decisionSummary(symbol.ai_decision.decision) : null;
+  const riskOutcome = symbol ? riskSummary(symbol) : null;
 
   if (symbol === null) {
     return (
@@ -238,7 +330,7 @@ export function DecisionView({
         <h2 className="mt-2 text-xl font-semibold text-slate-950">평가와 판단을 한 화면에서 확인</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
           이 탭은 현재 입력을 바탕으로 AI가 무엇을 제안했고, risk_guard가 왜 허용 또는 차단했는지
-          보여줍니다. 스케줄 상태와 실행 결과는 다른 탭으로 분리했습니다.
+          보여줍니다. 실제 주문/체결 상태는 overview 또는 orders 화면에서 별도로 확인합니다.
         </p>
         <div className="mt-4">
           <SymbolTabs
@@ -250,21 +342,22 @@ export function DecisionView({
         <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           {getSelectedSymbolPolicyHint("single")}
         </div>
-        <div className="mt-5 grid gap-4 lg:grid-cols-4">
+        <div className="mt-5 grid gap-4 lg:grid-cols-5">
           {metricCard("마지막 평가", formatDateTime(symbol.ai_decision.created_at), "선택 심볼 기준 최신 평가 시각")}
           {metricCard("다음 평가 예정", formatDateTime(operator.control.scheduler_next_run_at), "전역 스케줄 기준")}
           {metricCard("시장 요약", String(symbol.market_context_summary.primary_regime ?? "-"), `정렬 ${String(symbol.market_context_summary.trend_alignment ?? "-")}`)}
-          {metricCard("판단 상태", symbol.ai_decision.decision ?? "-", symbol.risk_guard.allowed ? "risk_guard 허용" : "risk_guard 차단")}
+          {metricCard("AI 추천", recommendation?.label ?? "-", recommendation?.detail ?? "-")}
+          {metricCard("risk 결과", riskOutcome?.label ?? "-", riskOutcome?.detail ?? "-")}
         </div>
         <div className="mt-4 grid gap-4 xl:grid-cols-[1.1fr,0.9fr]">
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
               <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass("neutral")}`}>
-                AI 추천 / 결정
+                AI 추천
               </span>
               <span className="text-xs text-slate-500">{formatDateTime(symbol.ai_decision.created_at)}</span>
             </div>
-            <p className="mt-4 text-2xl font-semibold text-slate-950">{symbol.ai_decision.decision ?? "-"}</p>
+            <p className="mt-4 text-2xl font-semibold text-slate-950">{translateDecision(symbol.ai_decision.decision)}</p>
             <p className="mt-2 text-sm text-slate-600">confidence {formatRatio(symbol.ai_decision.confidence)}</p>
             <p className="mt-3 text-sm leading-6 text-slate-700">
               {symbol.ai_decision.explanation_short ?? "최신 판단 설명이 없습니다."}
@@ -285,15 +378,19 @@ export function DecisionView({
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
-                  symbol.risk_guard.allowed ? "good" : "danger",
+                  symbol.risk_guard.allowed === null ? "neutral" : symbol.risk_guard.allowed ? "good" : "danger",
                 )}`}
               >
-                {symbol.risk_guard.allowed ? "허용" : "차단"}
+                {riskOutcome?.label ?? "risk 평가 없음"}
               </span>
               <span className="text-xs text-slate-500">{formatDateTime(symbol.risk_guard.created_at)}</span>
             </div>
             <div className="mt-4 space-y-3">
-              {metricCard("blocked reason 요약", symbol.blocked_reasons.join(", ") || "-", "최신 risk 결과 기준")}
+              {metricCard(
+                "risk 차단 사유",
+                symbol.blocked_reasons.join(", ") || "-",
+                "AI 추천 설명이 아니라 최신 risk 판정 기준입니다.",
+              )}
               {metricCard("판단 출처", symbol.ai_decision.provider_name ?? "-", `trigger ${symbol.ai_decision.trigger_event ?? "-"}`)}
               {metricCard(
                 "승인 프로파일",

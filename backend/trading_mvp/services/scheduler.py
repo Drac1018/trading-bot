@@ -189,7 +189,7 @@ def run_window(session: Session, window: str, triggered_by: str = "manual") -> d
         elif window == "12h":
             outcome = orchestrator.run_ui_review()
         elif window == "24h":
-            outcome = orchestrator.run_product_review()
+            outcome = orchestrator.run_daily_review_window()
         else:
             raise RuntimeError(f"Unsupported window {window}")
     except Exception as exc:

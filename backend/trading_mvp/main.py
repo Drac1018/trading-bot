@@ -10,25 +10,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from trading_mvp.database import Base, engine, get_db
 from trading_mvp.schemas import (
-    AppliedChangeRecordCreate,
     AppSettingsUpdateRequest,
-    BacklogBoardResponse,
     BinanceAccountResponse,
     BinanceConnectionTestRequest,
     BinanceLiveTestOrderRequest,
     ManualLiveApprovalRequest,
     OpenAIConnectionTestRequest,
-    ProductBacklogDetailResponse,
     ReplayValidationRequest,
-    UserChangeRequestCreate,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
-from trading_mvp.services.backlog import (
-    create_applied_change_record,
-    create_user_change_request,
-    get_backlog_board,
-    get_backlog_detail,
-)
 from trading_mvp.services.backlog_insights import build_signal_performance_report
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
@@ -503,65 +493,7 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
     return payload
 
 
-@app.get("/api/backlog")
-def backlog(db: Session = Depends(get_db)) -> dict[str, object]:
-    payload: BacklogBoardResponse = get_backlog_board(db)
-    return payload.model_dump(mode="json")
-
-
 @app.get("/api/performance")
 def performance_report(db: Session = Depends(get_db)) -> dict[str, object]:
     payload = build_signal_performance_report(db)
-    return payload.model_dump(mode="json")
-
-
-@app.post("/api/backlog/requests")
-def create_backlog_request(
-    payload: UserChangeRequestCreate,
-    db: Session = Depends(get_db),
-) -> dict[str, object]:
-    try:
-        result = create_user_change_request(db, payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    record_audit_event(
-        db,
-        event_type="user_change_request_created",
-        entity_type="user_change_request",
-        entity_id=str(result.id),
-        severity="info",
-        message="User change request created.",
-        payload=result.model_dump(mode="json"),
-    )
-    db.commit()
-    return result.model_dump(mode="json")
-
-
-@app.post("/api/backlog/applied")
-def create_backlog_applied_record(
-    payload: AppliedChangeRecordCreate,
-    db: Session = Depends(get_db),
-) -> dict[str, object]:
-    try:
-        result = create_applied_change_record(db, payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    record_audit_event(
-        db,
-        event_type="applied_change_record_created",
-        entity_type="applied_change_record",
-        entity_id=str(result.id),
-        severity="info",
-        message="Applied change record created.",
-        payload=result.model_dump(mode="json"),
-    )
-    db.commit()
-    return result.model_dump(mode="json")
-
-
-@app.get("/api/backlog/{backlog_id}")
-def backlog_detail(backlog_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
-    payload: ProductBacklogDetailResponse | None = get_backlog_detail(db, backlog_id)
-    if payload is None:
-        raise HTTPException(status_code=404, detail=f"Backlog item {backlog_id} not found.")
     return payload.model_dump(mode="json")

@@ -192,6 +192,25 @@ def test_ai_enabled_hourly_window_only_refreshes_market_data(monkeypatch, db_ses
     assert db_session.scalar(select(RiskCheck).limit(1)) is None
 
 
+def test_daily_review_window_runs_without_backlog_workflow(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    db_session.add(settings_row)
+    db_session.flush()
+
+    result = run_window(db_session, "24h", triggered_by="scheduler")
+    db_session.commit()
+
+    scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
+    assert scheduler_run is not None
+    assert scheduler_run.workflow == "scheduled_review"
+    assert result["workflow"] == "scheduled_review"
+    assert result["status"] == "success"
+    assert result["outcome"]["window"] == "24h"
+    assert result["outcome"]["status"] == "skipped"
+    assert result["outcome"]["reason"] == "DAILY_REVIEW_NO_ACTIVE_WORKFLOW"
+
+
 def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
@@ -265,10 +284,20 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     orchestrator = TradingOrchestrator(db_session)
     result = orchestrator.run_decision_cycle(trigger_event="manual", upto_index=140)
     db_session.commit()
+    decision_run = db_session.get(AgentRun, result["decision_run_id"])
 
     assert result["decision"]["decision"] == "long"
     assert result["risk_result"]["allowed"] is True
     assert result["execution"] is not None
+    assert result["decision_reference"]["market_snapshot_id"] == result["market_snapshot_id"]
+    assert result["decision_reference"]["market_snapshot_source"] == "refreshed"
+    assert result["decision_reference"]["market_snapshot_stale"] is False
+    assert result["decision_reference"]["freshness_blocking"] is False
+    assert result["decision_reference"]["account_sync_at"] is not None
+    assert result["decision_reference"]["positions_sync_at"] is not None
+    assert decision_run is not None
+    assert decision_run.input_payload["decision_reference"]["market_snapshot_id"] == result["market_snapshot_id"]
+    assert decision_run.input_payload["decision_reference"]["sync_freshness_summary"]["account"]["stale"] is False
     assert db_session.scalar(select(Order).limit(1)) is not None
     assert db_session.scalar(select(Execution).limit(1)) is not None
     assert db_session.scalar(select(RiskCheck).limit(1)) is not None
@@ -682,6 +711,22 @@ def test_run_exchange_sync_cycle_records_failure_without_raising(monkeypatch, db
     assert result["status"] == "error"
     assert result["symbol"] == "BTCUSDT"
     assert "interval failure" in result["error"]
+
+
+def test_run_exchange_sync_cycle_marks_scopes_skipped_when_credentials_missing(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+
+    result = TradingOrchestrator(db_session).run_exchange_sync_cycle(symbol="BTCUSDT", trigger_event="background_poll")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "LIVE_CREDENTIALS_MISSING"
+    sync_summary = result["sync_freshness_summary"]
+    assert sync_summary["account"]["status"] == "skipped"
+    assert sync_summary["positions"]["status"] == "skipped"
+    assert sync_summary["open_orders"]["status"] == "skipped"
+    assert sync_summary["protective_orders"]["status"] == "skipped"
+    assert sync_summary["account"]["last_skip_reason"] == "LIVE_CREDENTIALS_MISSING"
+    assert settings_row.pause_reason_detail["exchange_sync"]["account"]["last_skip_reason"] == "LIVE_CREDENTIALS_MISSING"
 
 
 def test_scheduler_exchange_sync_cycle_records_workflow(monkeypatch, db_session) -> None:

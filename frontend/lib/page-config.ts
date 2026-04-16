@@ -136,16 +136,4 @@ export const dashboardPages: Record<
       },
     ],
   },
-  backlog: {
-    title: "개선 백로그",
-    eyebrow: "제품 개선",
-    description: "개선 항목, 사용자 요청, 적용 이력, 검증 결과를 한 화면에서 추적합니다.",
-    sections: [
-      {
-        title: "백로그",
-        endpoint: "/api/backlog",
-        description: "개선 과제와 연결된 요청, 적용, 검증 이력입니다.",
-      },
-    ],
-  },
 };

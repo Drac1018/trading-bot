@@ -572,6 +572,13 @@ def test_risk_blocks_same_tier_concentration_limit_for_new_entry(db_session) -> 
 def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_limit(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.max_largest_position_pct = 1.5
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
     db_session.flush()
 
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
@@ -590,13 +597,7 @@ def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_li
         }
     )
 
-    result, _ = evaluate_risk(
-        db_session,
-        settings_row,
-        decision,
-        snapshot,
-        execution_mode="historical_replay",
-    )
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
 
     assert result.allowed is True
     assert result.auto_resized_entry is True
@@ -605,6 +606,50 @@ def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_li
     assert result.raw_projected_notional > result.approved_projected_notional
     assert result.approved_projected_notional <= 150000.0
     assert result.approved_quantity is not None and result.approved_quantity > 0
+
+
+def test_stale_sync_keeps_entry_blocked_without_auto_resize(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_largest_position_pct = 1.5
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    mark_sync_success(
+        settings_row,
+        scope="account",
+        synced_at=utcnow_naive() - timedelta(hours=2),
+        stale_after_seconds=60,
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=entry_price - 25.0,
+        entry_zone_max=entry_price + 25.0,
+        stop_loss=entry_price - 10.0,
+        take_profit=entry_price + 250.0,
+        max_chase_bps=20.0,
+    ).model_copy(
+        update={
+            "leverage": 1.58,
+            "risk_pct": 0.01,
+        }
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert result.auto_resized_entry is False
+    assert "ACCOUNT_STATE_STALE" in result.reason_codes
+    assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
+    assert result.approved_projected_notional == 0.0
+    assert result.approved_quantity is None
 
 
 def test_entry_is_clamped_to_directional_headroom_when_that_is_smallest(db_session) -> None:
@@ -734,6 +779,107 @@ def test_hard_blockers_keep_entry_blocked_even_when_exposure_could_be_resized(db
     assert "LIVE_APPROVAL_POLICY_DISABLED" in result.reason_codes
     assert "PROTECTION_REQUIRED" in result.reason_codes
     assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
+
+
+def test_protection_unverified_keeps_entry_blocked_without_auto_resize(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_largest_position_pct = 1.5
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    mark_sync_issue(
+        settings_row,
+        scope="protective_orders",
+        status="incomplete",
+        reason_code="PROTECTION_STATE_UNVERIFIED",
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=snapshot.latest_price - 25.0,
+        entry_zone_max=snapshot.latest_price + 25.0,
+        stop_loss=snapshot.latest_price - 10.0,
+        take_profit=snapshot.latest_price + 250.0,
+        max_chase_bps=20.0,
+    ).model_copy(update={"leverage": 1.58, "risk_pct": 0.01})
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert result.auto_resized_entry is False
+    assert "PROTECTION_STATE_UNVERIFIED" in result.reason_codes
+    assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
+    assert result.approved_quantity is None
+
+
+def test_approval_closed_keeps_entry_blocked_without_auto_resize(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_largest_position_pct = 1.5
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = False
+    settings_row.live_execution_armed_until = utcnow_naive() - timedelta(minutes=1)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=snapshot.latest_price - 25.0,
+        entry_zone_max=snapshot.latest_price + 25.0,
+        stop_loss=snapshot.latest_price - 10.0,
+        take_profit=snapshot.latest_price + 250.0,
+        max_chase_bps=20.0,
+    ).model_copy(update={"leverage": 1.58, "risk_pct": 0.01})
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert result.auto_resized_entry is False
+    assert "LIVE_APPROVAL_REQUIRED" in result.reason_codes
+    assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
+    assert result.approved_quantity is None
+
+
+def test_trading_pause_keeps_entry_blocked_without_auto_resize(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_largest_position_pct = 1.5
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.trading_paused = True
+    settings_row.pause_reason_code = "MANUAL_USER_REQUEST"
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=snapshot.latest_price - 25.0,
+        entry_zone_max=snapshot.latest_price + 25.0,
+        stop_loss=snapshot.latest_price - 10.0,
+        take_profit=snapshot.latest_price + 250.0,
+        max_chase_bps=20.0,
+    ).model_copy(update={"leverage": 1.58, "risk_pct": 0.01})
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert result.auto_resized_entry is False
+    assert "TRADING_PAUSED" in result.reason_codes
+    assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
+    assert result.approved_quantity is None
 
 
 def test_reduce_and_exit_remain_allowed_under_exposure_limits(db_session) -> None:
