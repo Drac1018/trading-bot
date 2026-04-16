@@ -415,7 +415,7 @@ def get_overview(session: Session) -> OverviewResponse:
         if _as_string_list(item["missing_components"])
     }
     missing_protection_symbols = list(missing_protection_items)
-    blocked_reasons = latest_risk.reason_codes if latest_risk is not None and not latest_risk.allowed else []
+    blocked_reasons = _risk_reason_codes_from_row(latest_risk) if latest_risk is not None and not latest_risk.allowed else []
     operational_status = build_operational_status_payload(
         settings_row,
         session=session,
@@ -950,11 +950,21 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     )
 
 
+def _risk_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
+    if row is None:
+        return []
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    payload_reason_codes = _as_string_list(payload.get("reason_codes", []))
+    if payload_reason_codes:
+        return _prioritize_blocked_reasons(payload_reason_codes)
+    return _prioritize_blocked_reasons(_as_string_list(row.reason_codes))
+
+
 def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     if row is None:
         return OperatorRiskSnapshot()
     payload = row.payload if isinstance(row.payload, dict) else {}
-    reason_codes = _prioritize_blocked_reasons(_as_string_list(row.reason_codes))
+    reason_codes = _risk_reason_codes_from_row(row)
     return OperatorRiskSnapshot(
         risk_check_id=row.id,
         decision_run_id=row.decision_run_id,
@@ -983,6 +993,7 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
             str(key): _as_float(value, default=0.0)
             for key, value in _as_dict(payload.get("exposure_headroom_snapshot")).items()
         },
+        debug_payload=_as_dict(payload.get("debug_payload", {})),
         raw_payload=payload,
     )
 
@@ -1293,9 +1304,7 @@ def _build_operator_symbol_summaries(
                 execution=_build_execution_snapshot_from_rows(order_row, execution_row, decision_row),
                 open_position=_build_position_snapshot(position_row),
                 protection_status=_build_protection_snapshot(protection_state),
-                blocked_reasons=_prioritize_blocked_reasons(
-                    _as_string_list(risk_row.reason_codes if risk_row is not None else [])
-                ),
+                blocked_reasons=_risk_reason_codes_from_row(risk_row),
                 live_execution_ready=overview.live_execution_ready and len(stale_flags) == 0,
                 stale_flags=stale_flags,
                 last_updated_at=last_updated_at,

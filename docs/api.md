@@ -216,6 +216,15 @@
   - `approved_risk_pct`
   - `approved_leverage`
   - `operating_state`
+  - `debug_payload`
+    - `requested_notional`, `requested_quantity`
+    - `resized_notional`, `resized_quantity`
+    - `current_symbol_notional`, `current_directional_notional`
+    - `projected_symbol_notional`, `projected_directional_notional`
+    - `open_order_reserved_notional`
+    - `headroom`
+    - `entry_trigger`
+    - `sync_timestamps`
 - `execution`
   - 최신 판단과 연결된 주문/체결 결과
   - `order_status`
@@ -254,8 +263,20 @@
   - `size_adjustment_ratio`
   - `exposure_headroom_snapshot`
   - `auto_resize_reason`
+- `reason_codes`는 현재 평가 사이클 기준으로만 계산됩니다. pre-resize exposure blocker나 이전 cycle blocker를 누적해서 재사용하지 않습니다.
+- auto-resize가 발생하면 directional / single-position / gross / same-tier 한도는 resized size 기준으로 다시 평가합니다.
+- `debug_payload.requested_exposure_limit_codes`는 resize 전 한도 초과 사유를, `debug_payload.final_exposure_limit_codes`는 resize 후 최종 한도 초과 사유를 담습니다.
+- `debug_payload.entry_trigger`는 `ENTRY_TRIGGER_NOT_MET`가 발생한 경우 현재가, entry zone, breakout / pullback confirmation, invalidation, chase 판정값을 같이 남깁니다.
+- 신규 진입 노출 계산에서 `reduce_only`, `close_only`, `STOP*`, `TAKE_PROFIT*`, `TRAILING_STOP*` open order는 reserved exposure에 포함하지 않습니다.
+- `debug_payload.sync_timestamps`는 `account`, `positions`, `open_orders`, `protective_orders` 마지막 sync 시각을 같이 내려 stale state 확인에 사용합니다.
 - 자동 축소 승인 정보 코드는 `ENTRY_AUTO_RESIZED`, `ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT`, `ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT`, `ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT`, `ENTRY_CLAMPED_TO_SAME_TIER_LIMIT`입니다.
 - `reduce / exit / protection / emergency` 계열은 trigger와 auto-resize 정책 때문에 막히지 않습니다.
+
+#### Dashboard risk source-of-truth
+
+- dashboard / overview blocked reasons는 최신 `risk_check.payload.reason_codes`를 우선 사용합니다.
+- operator `risk_guard` snapshot은 최신 `debug_payload`를 그대로 노출합니다.
+- row-level `reason_codes`와 payload `reason_codes`가 다르면 payload 값을 현재 사이클의 source-of-truth로 취급합니다.
 
 ### `GET /api/dashboard/profitability`
 

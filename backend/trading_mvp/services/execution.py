@@ -90,6 +90,52 @@ def _to_float(value: object, default: float = 0.0) -> float:
     return float(str(value))
 
 
+def _to_bool(value: object, default: bool = False) -> bool:
+    if value in {None, ""}:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _exchange_order_requested_price(exchange_order: dict[str, object], fallback: float) -> float:
+    price = _to_float(exchange_order.get("price"))
+    if price > 0:
+        return price
+    stop_price = _to_float(exchange_order.get("stopPrice"))
+    if stop_price > 0:
+        return stop_price
+    return fallback
+
+
+def _apply_exchange_order_state(
+    row: Order,
+    exchange_order: dict[str, object],
+    *,
+    requested_quantity_fallback: float,
+    requested_price_fallback: float,
+    reduce_only_fallback: bool,
+    close_only_fallback: bool,
+) -> None:
+    row.status = _map_exchange_status(str(exchange_order.get("status", "NEW")))
+    row.exchange_status = str(exchange_order.get("status", "")) or None
+    row.last_exchange_update_at = utcnow_naive()
+    row.filled_quantity = abs(_to_float(exchange_order.get("executedQty"), row.filled_quantity))
+    requested_quantity = abs(_to_float(exchange_order.get("origQty"), requested_quantity_fallback))
+    if requested_quantity > 0:
+        row.requested_quantity = requested_quantity
+    requested_price = _exchange_order_requested_price(exchange_order, requested_price_fallback)
+    if requested_price > 0:
+        row.requested_price = requested_price
+    avg_price = _to_float(exchange_order.get("avgPrice") or exchange_order.get("price"), row.average_fill_price)
+    if avg_price > 0:
+        row.average_fill_price = avg_price
+    row.reduce_only = _to_bool(exchange_order.get("reduceOnly"), default=reduce_only_fallback)
+    row.close_only = _to_bool(exchange_order.get("closePosition"), default=close_only_fallback)
+
+
 def _build_client(settings_row: Setting) -> BinanceClient:
     credentials = get_runtime_credentials(settings_row)
     defaults = get_settings()
@@ -1038,13 +1084,14 @@ def _upsert_exchange_order_row(
     row.parent_order_id = parent_order_id
     row.requested_quantity = requested_quantity
     row.requested_price = requested_price
-    row.status = _map_exchange_status(str(exchange_order.get("status", "NEW")))
-    row.exchange_status = str(exchange_order.get("status", "")) or None
-    row.last_exchange_update_at = utcnow_naive()
-    row.filled_quantity = abs(_to_float(exchange_order.get("executedQty"), row.filled_quantity))
-    avg_price = _to_float(exchange_order.get("avgPrice") or exchange_order.get("price"), row.average_fill_price)
-    if avg_price > 0:
-        row.average_fill_price = avg_price
+    _apply_exchange_order_state(
+        row,
+        exchange_order,
+        requested_quantity_fallback=requested_quantity,
+        requested_price_fallback=requested_price,
+        reduce_only_fallback=reduce_only,
+        close_only_fallback=close_only,
+    )
     existing_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     row.metadata_json = {
         **existing_metadata,
@@ -2330,13 +2377,14 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                     alert_message="거래소 주문 상태를 동기화하지 못해 거래를 일시 중지했습니다.",
                 )
                 raise RuntimeError(f"{reason_code}: {exc}") from exc
-            order.status = _map_exchange_status(str(exchange_order.get("status", "NEW")))
-            order.exchange_status = str(exchange_order.get("status", "")) or None
-            order.last_exchange_update_at = utcnow_naive()
-            order.filled_quantity = abs(_to_float(exchange_order.get("executedQty"), order.filled_quantity))
-            avg_price = _to_float(exchange_order.get("avgPrice") or exchange_order.get("price"), order.average_fill_price)
-            if avg_price > 0:
-                order.average_fill_price = avg_price
+            _apply_exchange_order_state(
+                order,
+                exchange_order,
+                requested_quantity_fallback=order.requested_quantity,
+                requested_price_fallback=order.requested_price,
+                reduce_only_fallback=order.reduce_only,
+                close_only_fallback=order.close_only,
+            )
             session.add(order)
             if _is_protective_order_type_name(order.order_type):
                 synced_orders += 1
@@ -2735,6 +2783,8 @@ def execute_live_trade(
                 "symbol": decision.symbol,
                 "decision": decision.model_dump(mode="json"),
                 "reason_codes": list(risk_result.reason_codes),
+                "risk_check_id": risk_row.id if risk_row is not None else None,
+                "risk_debug_payload": dict(risk_result.debug_payload),
             },
         )
         session.flush()
@@ -2951,6 +3001,8 @@ def execute_live_trade(
                     "reason_code": min_notional_failure,
                     "approved_projected_notional": risk_result.approved_projected_notional,
                     "approved_quantity": risk_result.approved_quantity,
+                    "risk_check_id": risk_row.id if risk_row is not None else None,
+                    "risk_debug_payload": dict(risk_result.debug_payload),
                 },
             )
             session.flush()

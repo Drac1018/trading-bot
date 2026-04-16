@@ -514,6 +514,7 @@ class OperatorRiskSnapshot(StrictBaseModel):
     size_adjustment_ratio: float | None = None
     auto_resize_reason: str | None = None
     exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
+    debug_payload: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -631,6 +632,7 @@ class RiskCheckResult(StrictBaseModel):
     symbol_risk_tier: Literal["btc", "major_alt", "alt"]
     exposure_metrics: dict[str, float] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    debug_payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecutionIntent(StrictBaseModel):
