@@ -155,6 +155,65 @@ def _connected_user_stream_payload() -> dict[str, object]:
     }
 
 
+def _rest_polling_fallback_stream_payload(*, stream_event_count: int = 0) -> dict[str, object]:
+    return {
+        "user_stream_summary": {
+            "status": "unavailable",
+            "stream_source": "rest_polling_fallback",
+            "heartbeat_ok": False,
+            "last_event_at": None,
+            "last_error": "USER_STREAM_UNAVAILABLE",
+        },
+        "stream_health": "unavailable",
+        "stream_source": "rest_polling_fallback",
+        "last_stream_event_time": None,
+        "stream_event_count": stream_event_count,
+        "stream_events": [],
+        "stream_issues": [
+            {
+                "severity": "warning",
+                "reason_code": "USER_STREAM_UNAVAILABLE",
+                "message": "User stream unavailable during live sync.",
+            }
+        ],
+    }
+
+
+def _add_pending_live_order(
+    db_session,
+    *,
+    external_order_id: str,
+    client_order_id: str,
+    requested_quantity: float = 0.02,
+    requested_price: float = 70000.0,
+) -> None:
+    db_session.add(
+        Order(
+            symbol="BTCUSDT",
+            decision_run_id=None,
+            risk_check_id=None,
+            position_id=None,
+            side="buy",
+            order_type="limit",
+            mode="live",
+            status="pending",
+            external_order_id=external_order_id,
+            client_order_id=client_order_id,
+            reduce_only=False,
+            close_only=False,
+            parent_order_id=None,
+            exchange_status="NEW",
+            requested_quantity=requested_quantity,
+            requested_price=requested_price,
+            filled_quantity=0.0,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+
 def test_execute_live_trade_returns_blocked_without_touching_exchange_when_risk_disallows(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     called = False
@@ -1981,31 +2040,11 @@ def test_sync_live_state_dedupes_stream_and_rest_fallback_trade_by_external_trad
             ]
 
     client = StreamAndFallbackSameTradeClient()
-    db_session.add(
-        Order(
-            symbol="BTCUSDT",
-            decision_run_id=None,
-            risk_check_id=None,
-            position_id=None,
-            side="buy",
-            order_type="limit",
-            mode="live",
-            status="pending",
-            external_order_id="fallback-order-dup-1",
-            client_order_id="fallback-client-dup-1",
-            reduce_only=False,
-            close_only=False,
-            parent_order_id=None,
-            exchange_status="NEW",
-            requested_quantity=0.02,
-            requested_price=70000.0,
-            filled_quantity=0.0,
-            average_fill_price=0.0,
-            reason_codes=[],
-            metadata_json={},
-        )
+    _add_pending_live_order(
+        db_session,
+        external_order_id="fallback-order-dup-1",
+        client_order_id="fallback-client-dup-1",
     )
-    db_session.flush()
 
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
 
@@ -2042,27 +2081,7 @@ def test_sync_live_state_dedupes_stream_and_rest_fallback_trade_by_external_trad
             normalized_events=[normalize_user_stream_event(stream_event)],
         )
         db_session.flush()
-        return {
-            "user_stream_summary": {
-                "status": "unavailable",
-                "stream_source": "rest_polling_fallback",
-                "heartbeat_ok": False,
-                "last_event_at": None,
-                "last_error": "USER_STREAM_UNAVAILABLE",
-            },
-            "stream_health": "unavailable",
-            "stream_source": "rest_polling_fallback",
-            "last_stream_event_time": None,
-            "stream_event_count": 1,
-            "stream_events": [],
-            "stream_issues": [
-                {
-                    "severity": "warning",
-                    "reason_code": "USER_STREAM_UNAVAILABLE",
-                    "message": "User stream unavailable during live sync.",
-                }
-            ],
-        }
+        return _rest_polling_fallback_stream_payload(stream_event_count=1)
 
     monkeypatch.setattr("trading_mvp.services.execution.poll_live_user_stream", _poll_and_mark_fallback)
 
@@ -2229,31 +2248,11 @@ def test_sync_live_state_rest_fallback_dedupes_user_stream_trade_id(monkeypatch,
     _prime_live_settings(db_session)
     settings_row = get_or_create_settings(db_session)
     client = DuplicateTradeRestFallbackSyncClient()
-    db_session.add(
-        Order(
-            symbol="BTCUSDT",
-            decision_run_id=None,
-            risk_check_id=None,
-            position_id=None,
-            side="buy",
-            order_type="limit",
-            mode="live",
-            status="pending",
-            external_order_id="fallback-order-dup-1",
-            client_order_id="fallback-client-dup-1",
-            reduce_only=False,
-            close_only=False,
-            parent_order_id=None,
-            exchange_status="NEW",
-            requested_quantity=0.02,
-            requested_price=70000.0,
-            filled_quantity=0.0,
-            average_fill_price=0.0,
-            reason_codes=[],
-            metadata_json={},
-        )
+    _add_pending_live_order(
+        db_session,
+        external_order_id="fallback-order-dup-1",
+        client_order_id="fallback-client-dup-1",
     )
-    db_session.flush()
 
     stream_event = {
         "e": "ORDER_TRADE_UPDATE",
@@ -2304,27 +2303,7 @@ def test_sync_live_state_rest_fallback_dedupes_user_stream_trade_id(monkeypatch,
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
     monkeypatch.setattr(
         "trading_mvp.services.execution.poll_live_user_stream",
-        lambda *args, **kwargs: {
-            "user_stream_summary": {
-                "status": "unavailable",
-                "stream_source": "rest_polling_fallback",
-                "heartbeat_ok": False,
-                "last_event_at": None,
-                "last_error": "USER_STREAM_UNAVAILABLE",
-            },
-            "stream_health": "unavailable",
-            "stream_source": "rest_polling_fallback",
-            "last_stream_event_time": None,
-            "stream_event_count": 0,
-            "stream_events": [],
-            "stream_issues": [
-                {
-                    "severity": "warning",
-                    "reason_code": "USER_STREAM_UNAVAILABLE",
-                    "message": "User stream unavailable during live sync.",
-                }
-            ],
-        },
+        lambda *args, **kwargs: _rest_polling_fallback_stream_payload(),
     )
 
     result = sync_live_state(db_session, settings_row, symbol="BTCUSDT")
