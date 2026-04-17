@@ -41,7 +41,6 @@ class CapturingProvider:
                 "leverage": 1.0,
                 "rationale_codes": ["TEST"],
                 "explanation_short": "조건이 약해 보류합니다.",
-                "explanation_detailed": "조건이 약해 보류합니다. 다음 캔들까지 대기합니다.",
             },
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         )
@@ -134,7 +133,9 @@ def test_trading_decision_payload_is_compacted_for_llm_calls() -> None:
     payload = provider.calls[0]["payload"]
     assert provider_name == "openai"
     assert metadata["source"] == "llm"
+    assert metadata["input_token_estimate"] > 0
     assert decision.decision == "hold"
+    assert decision.explanation_detailed
     assert len(payload["market_snapshot"]["candles"]) == 16
     assert set(payload["market_snapshot"]["candles"][0].keys()) == {"t", "o", "h", "l", "c", "v"}
     assert "explanation_detailed" not in payload["deterministic_baseline"]
@@ -172,3 +173,37 @@ def test_trading_decision_payload_is_compacted_for_llm_calls() -> None:
     instructions = provider.calls[0]["instructions"]
     assert "Never propose size or leverage beyond the provided risk budget." in instructions
     assert "If the remaining budget is small or zero, prefer hold." in instructions
+
+
+def test_trading_decision_short_circuit_skips_llm_when_hold_and_budget_exhausted() -> None:
+    provider = CapturingProvider()
+    agent = TradingDecisionAgent(provider)
+    snapshot = _snapshot("BTCUSDT", "15m", [70000.0 for _ in range(16)], [800.0 for _ in range(16)])
+    features = compute_features(snapshot, {})
+
+    decision, provider_name, metadata = agent.run(
+        snapshot,
+        features,
+        open_positions=[],
+        risk_context={
+            "max_risk_per_trade": 0.01,
+            "max_leverage": 3.0,
+            "daily_pnl": 0.0,
+            "consecutive_losses": 0,
+            "operating_state": "TRADABLE",
+            "risk_budget": {
+                "max_additional_long_notional": 0.0,
+                "max_additional_short_notional": 0.0,
+                "max_new_position_notional_for_symbol": 0.0,
+                "max_leverage_for_symbol": 0.0,
+            },
+        },
+        use_ai=True,
+        max_input_candles=16,
+    )
+
+    assert provider.calls == []
+    assert provider_name == "deterministic-mock"
+    assert metadata["source"] == "deterministic_short_circuit"
+    assert decision.decision == "hold"
+    assert "DETERMINISTIC_HOLD_SHORT_CIRCUIT" in decision.rationale_codes

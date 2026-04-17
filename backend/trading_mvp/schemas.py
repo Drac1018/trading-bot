@@ -33,6 +33,26 @@ class TradeDecision(StrictBaseModel):
     explanation_detailed: str = Field(min_length=10, max_length=600)
 
 
+class TradeDecisionLite(StrictBaseModel):
+    decision: Literal["hold", "long", "short", "reduce", "exit"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    symbol: str = Field(min_length=1, max_length=30)
+    timeframe: str = Field(min_length=1, max_length=20)
+    entry_zone_min: float | None = None
+    entry_zone_max: float | None = None
+    entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    invalidation_price: float | None = Field(default=None, gt=0.0)
+    max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
+    idea_ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    max_holding_minutes: int = Field(ge=1, le=10080)
+    risk_pct: float = Field(gt=0.0, le=1.0)
+    leverage: float = Field(gt=0.0, le=10.0)
+    rationale_codes: list[str] = Field(default_factory=list, max_length=6)
+    explanation_short: str = Field(min_length=3, max_length=240)
+
+
 class TradeDecisionCandidateScore(StrictBaseModel):
     regime_fit: float = 0.0
     expected_rr: float = 0.0

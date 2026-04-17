@@ -15,6 +15,7 @@ class ProviderResult:
     output: dict[str, Any]
     usage: dict[str, int] | None = None
     request_id: str | None = None
+    input_token_estimate: int | None = None
 
 
 class StructuredModelProvider(Protocol):
@@ -147,6 +148,7 @@ class OpenAIProvider:
                 },
             },
         }
+        input_token_estimate = max(1, int(round(len(json.dumps(request_body, ensure_ascii=False)) / 4)))
 
         with httpx.Client(base_url=self.base_url, timeout=30.0) as client:
             response = client.post("/chat/completions", headers=self._headers(), json=request_body)
@@ -183,6 +185,7 @@ class OpenAIProvider:
             output=parsed,
             usage=usage,
             request_id=payload_json.get("id"),
+            input_token_estimate=input_token_estimate,
         )
 
     def test_connection(self) -> dict[str, Any]:

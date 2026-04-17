@@ -15,6 +15,7 @@ AI_ATTEMPT_SOURCES = {"llm", "llm_fallback"}
 
 
 class TokenUsage(TypedDict):
+    estimated_prompt_tokens: int
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
@@ -118,9 +119,17 @@ def _metadata_error(row: AgentRun) -> str:
 
 def _metadata_usage(row: AgentRun) -> TokenUsage:
     raw = row.metadata_json.get("usage")
+    estimate_raw = row.metadata_json.get("input_token_estimate")
+    estimated_prompt_tokens = int(estimate_raw) if isinstance(estimate_raw, (int, float)) else 0
     if not isinstance(raw, dict):
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
     return {
+        "estimated_prompt_tokens": estimated_prompt_tokens,
         "prompt_tokens": int(raw.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(raw.get("completion_tokens", 0) or 0),
         "total_tokens": int(raw.get("total_tokens", 0) or 0),
@@ -246,7 +255,14 @@ def _summarize_attempt_rows(rows: list[AgentRun]) -> AIWindowSummary:
     attempts = [row for row in rows if is_ai_attempt(row)]
     successes = [row for row in attempts if is_ai_success(row)]
     failures = [row for row in attempts if is_ai_failure(row)]
-    tokens = Counter({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    tokens = Counter(
+        {
+            "estimated_prompt_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+    )
     role_calls: Counter[str] = Counter()
     role_failures: Counter[str] = Counter()
     failure_reasons: Counter[str] = Counter()
@@ -264,6 +280,7 @@ def _summarize_attempt_rows(rows: list[AgentRun]) -> AIWindowSummary:
         "successes": len(successes),
         "failures": len(failures),
         "tokens": {
+            "estimated_prompt_tokens": int(tokens["estimated_prompt_tokens"]),
             "prompt_tokens": int(tokens["prompt_tokens"]),
             "completion_tokens": int(tokens["completion_tokens"]),
             "total_tokens": int(tokens["total_tokens"]),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ from trading_mvp.schemas import (
     MarketSnapshotPayload,
     RiskCheckResult,
     TradeDecision,
+    TradeDecisionLite,
     UXSuggestion,
     UXSuggestionBatch,
 )
@@ -111,7 +113,15 @@ def _provider_metadata(result: ProviderResult | None, *, source: str) -> dict[st
         metadata["usage"] = result.usage
     if result.request_id:
         metadata["request_id"] = result.request_id
+    if isinstance(result.input_token_estimate, int) and result.input_token_estimate > 0:
+        metadata["input_token_estimate"] = result.input_token_estimate
     return metadata
+
+
+def _estimated_input_tokens(*, instructions: str, payload: dict[str, Any]) -> int:
+    compact_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # Rough estimate for GPT-family tokenization from character length.
+    return max(1, int(round((len(instructions) + len(compact_payload)) / 4)))
 
 
 def build_trading_decision_input_payload(
@@ -135,6 +145,8 @@ def build_trading_decision_input_payload(
 
 
 class TradingDecisionAgent:
+    HOLD_SHORT_CIRCUIT_CONFIDENCE_THRESHOLD = 0.46
+
     def __init__(self, provider: StructuredModelProvider) -> None:
         self.provider = provider
 
@@ -971,6 +983,36 @@ class TradingDecisionAgent:
                     "adaptive_signal_adjustment": adaptive_adjustment,
                 },
             )
+        if (
+            baseline.decision == "hold"
+            and baseline.confidence <= self.HOLD_SHORT_CIRCUIT_CONFIDENCE_THRESHOLD
+            and not open_positions
+            and not self._entry_budget_allows(risk_context, side="long", price=market_snapshot.latest_price)
+            and not self._entry_budget_allows(risk_context, side="short", price=market_snapshot.latest_price)
+        ):
+            decision, adaptive_adjustment = self._apply_adaptive_adjustment(
+                baseline.model_copy(
+                    update={
+                        "rationale_codes": list(
+                            dict.fromkeys(
+                                baseline.rationale_codes
+                                + ["DETERMINISTIC_HOLD_SHORT_CIRCUIT", "RISK_BUDGET_EXHAUSTED"]
+                            )
+                        ),
+                    }
+                ),
+                risk_context=risk_context,
+                provider_code="PROVIDER_DETERMINISTIC_SHORT_CIRCUIT",
+            )
+            return (
+                decision,
+                "deterministic-mock",
+                {
+                    "source": "deterministic_short_circuit",
+                    "logic_variant": logic_variant,
+                    "adaptive_signal_adjustment": adaptive_adjustment,
+                },
+            )
 
         provider_result: ProviderResult | None = None
         try:
@@ -1047,33 +1089,42 @@ class TradingDecisionAgent:
                 },
                 "logic_variant": logic_variant,
             }
+            llm_instructions = (
+                "You are the trading decision role inside a risk-controlled live trading system. "
+                "Return one structured decision. Stay conservative and concise. "
+                "Do not exceed the provided leverage, notional headroom, or risk context. "
+                "Never propose size or leverage beyond the provided risk budget. "
+                "If the remaining budget is small or zero, prefer hold. "
+                "If an open position already exists, prefer reduce, protect, or exit before proposing a new entry. "
+                "If confidence is weak, return hold. "
+                "For new long or short ideas, treat your output as a directional idea, not direct execution authority. "
+                "Prefer pullback or rebound entries inside aligned trends over breakout chasing. "
+                "Use breakout_confirm only as a rare exception when trend, momentum, and volume are strongly aligned. "
+                "Keep immediate new entries disabled unless the market snapshot is unusually clean and urgent. "
+                "Set entry_mode to breakout_confirm, pullback_confirm, immediate, or none. "
+                "For long entries, entry_zone should usually sit below the current price as a pullback zone. "
+                "For short entries, entry_zone should usually sit above the current price as a rebound zone. "
+                "Provide a valid invalidation_price on the wrong side of the trade, plus a conservative max_chase_bps. "
+                "Use entry_mode=none for hold, reduce, or exit. "
+                "Do not use immediate unless the current snapshot already supports immediate execution and pullback waiting is clearly worse. "
+                "Keep explanation_short brief."
+            )
+            input_token_estimate = _estimated_input_tokens(instructions=llm_instructions, payload=compact_payload)
             provider_result = self.provider.generate(
                 AgentRole.TRADING_DECISION.value,
                 compact_payload,
-                response_model=TradeDecision,
-                instructions=(
-                    "You are the trading decision role inside a risk-controlled live trading system. "
-                    "Return one structured decision. Stay conservative and concise. "
-                    "Do not exceed the provided leverage, notional headroom, or risk context. "
-                    "Never propose size or leverage beyond the provided risk budget. "
-                    "If the remaining budget is small or zero, prefer hold. "
-                    "If an open position already exists, prefer reduce, protect, or exit before proposing a new entry. "
-                    "If confidence is weak, return hold. "
-                    "For new long or short ideas, treat your output as a directional idea, not direct execution authority. "
-                    "Prefer pullback or rebound entries inside aligned trends over breakout chasing. "
-                    "Use breakout_confirm only as a rare exception when trend, momentum, and volume are strongly aligned. "
-                    "Keep immediate new entries disabled unless the market snapshot is unusually clean and urgent. "
-                    "Set entry_mode to breakout_confirm, pullback_confirm, immediate, or none. "
-                    "For long entries, entry_zone should usually sit below the current price as a pullback zone. "
-                    "For short entries, entry_zone should usually sit above the current price as a rebound zone. "
-                    "Provide a valid invalidation_price on the wrong side of the trade, plus a conservative max_chase_bps. "
-                    "Use entry_mode=none for hold, reduce, or exit. "
-                    "Do not use immediate unless the current snapshot already supports immediate execution and pullback waiting is clearly worse. "
-                    "Keep explanation_short brief and explanation_detailed under 3 sentences."
-                ),
+                response_model=TradeDecisionLite,
+                instructions=llm_instructions,
             )
+            lite_decision = TradeDecisionLite.model_validate(provider_result.output)
             decision = self._normalize_entry_trigger_fields(
-                TradeDecision.model_validate(provider_result.output),
+                TradeDecision(
+                    **lite_decision.model_dump(mode="python"),
+                    explanation_detailed=(
+                        "Runtime path uses TradeDecisionLite to minimize token usage while keeping "
+                        "dashboard/audit compatibility with the full TradeDecision schema."
+                    ),
+                ),
                 market_snapshot=market_snapshot,
                 features=features,
             )
@@ -1083,6 +1134,7 @@ class TradingDecisionAgent:
                 provider_code=f"PROVIDER_{provider_result.provider.upper()}",
             )
             metadata = _provider_metadata(provider_result, source="llm")
+            metadata.setdefault("input_token_estimate", input_token_estimate)
             metadata["logic_variant"] = logic_variant
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
             return decision, provider_result.provider, metadata
