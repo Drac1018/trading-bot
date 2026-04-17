@@ -63,9 +63,21 @@ type ControlStatusSummary = {
   degraded: boolean;
   risk_allowed: boolean | null;
   blocked_reasons_current_cycle: string[];
+  approval_control_blocked_reasons?: string[];
+  live_arm_disabled?: boolean;
+  live_arm_disable_reason_code?: string | null;
+  live_arm_disable_reason?: string | null;
+};
+
+type ReconciliationSummary = {
+  position_mode?: string;
+  position_mode_checked_at?: string | null;
+  guarded_symbols_count?: number;
 };
 
 export type SettingsPayload = {
+  can_enter_new_position: boolean;
+  blocked_reasons: string[];
   id: number;
   mode: string;
   operating_state: string;
@@ -107,6 +119,8 @@ export type SettingsPayload = {
   auto_resume_last_blockers: string[];
   latest_blocked_reasons: string[];
   control_status_summary?: ControlStatusSummary | null;
+  reconciliation_summary: ReconciliationSummary;
+  operator_alert?: Record<string, unknown>;
   pause_severity: string | null;
   pause_recovery_class: string | null;
   default_symbol: string;
@@ -185,6 +199,7 @@ type FormState = Omit<
   | "protection_recovery_failure_count" | "missing_protection_symbols" | "missing_protection_items"
   | "pnl_summary" | "account_sync_summary" | "exposure_summary" | "execution_policy_summary" | "market_context_summary" | "adaptive_protection_summary" | "adaptive_signal_summary"
   | "position_management_summary" | "symbol_effective_cadences"
+  | "can_enter_new_position" | "blocked_reasons" | "reconciliation_summary" | "operator_alert"
   | "exchange_submit_allowed"
   | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
@@ -337,6 +352,12 @@ function rolloutModeLabel(mode: RolloutMode) {
 
 function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSummary {
   const summary = state.control_status_summary;
+  const reconciliation = state.reconciliation_summary ?? {};
+  const mode = String(reconciliation.position_mode ?? "").toLowerCase();
+  const liveArmDisabledByPositionMode = mode === "hedge" || mode === "unknown";
+  const liveArmDisableReason = liveArmDisabledByPositionMode
+    ? "one-way required for current local position model"
+    : null;
   return {
     exchange_can_trade: summary?.exchange_can_trade ?? null,
     rollout_mode: summary?.rollout_mode ?? state.rollout_mode,
@@ -350,12 +371,19 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     blocked_reasons_current_cycle: dedupeReasons(
       summary?.blocked_reasons_current_cycle ?? state.latest_blocked_reasons,
     ),
+    approval_control_blocked_reasons: dedupeReasons(
+      summary?.approval_control_blocked_reasons ?? state.blocked_reasons,
+    ),
+    live_arm_disabled: summary?.live_arm_disabled ?? liveArmDisabledByPositionMode,
+    live_arm_disable_reason_code: summary?.live_arm_disable_reason_code ?? null,
+    live_arm_disable_reason: summary?.live_arm_disable_reason ?? liveArmDisableReason,
   };
 }
 
 function ControlStatusPanel({ state }: { state: SettingsPayload }) {
   const summary = resolveControlStatusSummary(state);
   const currentCycleBlockedReasons = summary.blocked_reasons_current_cycle;
+  const approvalBlockedReasons = dedupeReasons(summary.approval_control_blocked_reasons ?? []);
   const primaryBlocker = currentCycleBlockedReasons[0];
   const cards = [
     {
@@ -506,6 +534,33 @@ function ControlStatusPanel({ state }: { state: SettingsPayload }) {
               .join(", ")}
           </div>
         ) : null}
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-slate-900">approval control summary</p>
+            <p className="mt-1 text-sm leading-6 text-slate-600">
+              can_enter_new_position 외에도 승인/운영 제어 관점에서 현재 차단 사유를 분리해 보여줍니다.
+            </p>
+          </div>
+          <StatusPill tone={approvalBlockedReasons.length > 0 ? "danger" : "good"}>
+            {approvalBlockedReasons.length > 0 ? `${approvalBlockedReasons.length}건` : "정상"}
+          </StatusPill>
+        </div>
+        <div className="mt-4 space-y-2">
+          {approvalBlockedReasons.length === 0 ? (
+            <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
+              승인/운영 제어 관점에서 즉시 차단 사유가 없습니다.
+            </div>
+          ) : (
+            approvalBlockedReasons.map((reason) => (
+              <div key={reason} className="rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-900">
+                {formatDisplayValue(reason, "blocked_reason_codes")}
+              </div>
+            ))
+          )}
+        </div>
       </div>
     </div>
   );
@@ -773,6 +828,14 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   );
   const adaptiveSignalSummary = state.adaptive_signal_summary ?? {};
   const positionManagementSummary = state.position_management_summary ?? {};
+  const reconciliationSummary = state.reconciliation_summary ?? {};
+  const controlSummary = resolveControlStatusSummary(state);
+  const liveArmBlocked = Boolean(controlSummary.live_arm_disabled);
+  const liveArmDisableReason = controlSummary.live_arm_disable_reason;
+  const operatorAlertMessage =
+    typeof state.operator_alert?.message === "string" ? state.operator_alert.message : null;
+  const showOneWayRequiredBanner =
+    liveArmBlocked && (operatorAlertMessage === "one-way required for current local position model" || liveArmDisableReason === "one-way required for current local position model");
 
   const requestJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const response = await fetch(`${apiBaseUrl}${path}`, init);
@@ -907,6 +970,18 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <MetricCard label="AI 활성화 예상" value={`${state.projected_monthly_ai_calls_if_enabled.toLocaleString("ko-KR")}회`} />
       </div>
 
+      {showOneWayRequiredBanner ? (
+        <div className="rounded-2xl border border-rose-300 bg-rose-50 px-4 py-4 text-sm text-rose-900">
+          <p className="font-semibold">실거래 승인 제한</p>
+          <p className="mt-2">{operatorAlertMessage ?? liveArmDisableReason}</p>
+          <p className="mt-2">
+            position_mode={formatDisplayValue(reconciliationSummary.position_mode ?? "unknown")} / guarded_symbols=
+            {formatDisplayValue(reconciliationSummary.guarded_symbols_count ?? 0)} / checked_at=
+            {formatDisplayValue(reconciliationSummary.position_mode_checked_at ?? null)}
+          </p>
+        </div>
+      ) : null}
+
       <section className="grid gap-5 xl:grid-cols-2">
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
@@ -952,7 +1027,14 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/pause", "거래를 일시 중지했습니다.", syncSettings)} type="button">즉시 중지</button>
             <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/resume", "거래 일시 중지를 해제했습니다.", syncSettings)} type="button">중지 해제</button>
-            <button className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", syncSettings, { minutes: form.live_approval_window_minutes })} type="button">실거래 승인</button>
+            <button
+              className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+              disabled={liveArmBlocked}
+              onClick={() => runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", syncSettings, { minutes: form.live_approval_window_minutes })}
+              type="button"
+            >
+              실거래 승인
+            </button>
             <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/live/disarm", "실거래 승인 창을 닫았습니다.", syncSettings)} type="button">승인 해제</button>
             <button
               className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700"
@@ -975,6 +1057,11 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               거래소 동기화
             </button>
           </div>
+          {liveArmBlocked && liveArmDisableReason ? (
+            <p className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+              실거래 승인 버튼 비활성화 사유: {liveArmDisableReason}
+            </p>
+          ) : null}
           <LiveSyncPanel result={liveSyncResult} />
         </div>
 

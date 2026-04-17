@@ -455,6 +455,10 @@ class ControlStatusSummary(StrictBaseModel):
     degraded: bool = False
     risk_allowed: bool | None = None
     blocked_reasons_current_cycle: list[str] = Field(default_factory=list)
+    approval_control_blocked_reasons: list[str] = Field(default_factory=list)
+    live_arm_disabled: bool = False
+    live_arm_disable_reason_code: str | None = None
+    live_arm_disable_reason: str | None = None
 
 
 class OperationalStatusPayload(StrictBaseModel):
@@ -495,6 +499,7 @@ class OperationalStatusPayload(StrictBaseModel):
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
+    operator_alert: dict[str, Any] = Field(default_factory=dict)
     can_enter_new_position: bool = False
 
 
@@ -570,6 +575,7 @@ class OperatorControlState(StrictBaseModel):
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
+    operator_alert: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperatorDecisionSnapshot(StrictBaseModel):
@@ -1092,6 +1098,7 @@ class OverviewResponse(StrictBaseModel):
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
+    operator_alert: dict[str, Any] = Field(default_factory=dict)
     protected_positions: int = 0
     unprotected_positions: int = 0
     position_protection_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -1190,6 +1197,7 @@ class AppSettingsResponse(StrictBaseModel):
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
+    operator_alert: dict[str, Any] = Field(default_factory=dict)
     default_symbol: str
     tracked_symbols: list[str]
     default_timeframe: str

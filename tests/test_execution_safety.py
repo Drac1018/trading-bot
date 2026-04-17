@@ -2054,6 +2054,16 @@ def test_sync_live_state_marks_hedge_mode_guard_and_exposes_runtime_summary(monk
     assert result["symbol_reconciliation"]["BTCUSDT"]["exchange_position_side"] == "LONG"
     assert serialized["can_enter_new_position"] is False
     assert serialized["reconciliation_summary"]["mode_guard_active"] is True
+    assert serialized["reconciliation_summary"]["guarded_symbols_count"] == 1
+    assert serialized["reconciliation_summary"]["position_mode_checked_at"]
+    assert (
+        serialized["control_status_summary"]["live_arm_disable_reason"]
+        == "one-way required for current local position model"
+    )
+    assert serialized["control_status_summary"]["live_arm_disabled"] is True
+    assert "EXCHANGE_POSITION_MODE_MISMATCH" in serialized["control_status_summary"]["approval_control_blocked_reasons"]
+    assert serialized["operator_alert"]["message"] == "one-way required for current local position model"
+    assert serialized["operator_alert"]["guarded_symbols_count"] == 1
     assert serialized["reconciliation_summary"]["symbol_states"]["BTCUSDT"]["guard_active"] is True
     assert serialized["sync_freshness_summary"]["protective_orders"]["status"] == "incomplete"
     assert audit_events
@@ -2080,6 +2090,15 @@ def test_sync_live_state_marks_unknown_position_mode_guard_when_lookup_fails(mon
     assert "lookup failed" in str(result["reconciliation_summary"]["last_error"])
     assert serialized["can_enter_new_position"] is False
     assert serialized["reconciliation_summary"]["mode_guard_message"]
+    assert serialized["reconciliation_summary"]["guarded_symbols_count"] == 1
+    assert serialized["reconciliation_summary"]["position_mode_checked_at"]
+    assert (
+        serialized["control_status_summary"]["live_arm_disable_reason"]
+        == "one-way required for current local position model"
+    )
+    assert serialized["control_status_summary"]["live_arm_disabled"] is True
+    assert "EXCHANGE_POSITION_MODE_UNCLEAR" in serialized["control_status_summary"]["approval_control_blocked_reasons"]
+    assert serialized["operator_alert"]["reason_code"] == "EXCHANGE_POSITION_MODE_UNCLEAR"
 
 
 def test_evaluate_risk_blocks_new_entry_when_reconciliation_mode_guard_is_active(monkeypatch, db_session) -> None:
