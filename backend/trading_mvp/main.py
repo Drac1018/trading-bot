@@ -16,7 +16,6 @@ from trading_mvp.schemas import (
     BinanceLiveTestOrderRequest,
     ManualLiveApprovalRequest,
     OpenAIConnectionTestRequest,
-    ReplayValidationRequest,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.backlog_insights import build_signal_performance_report
@@ -42,9 +41,7 @@ from trading_mvp.services.dashboard import (
 from trading_mvp.services.execution import poll_live_user_stream, run_live_test_order, sync_live_state
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
-from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.scheduler import run_due_operational_cycles, run_due_windows, run_window
-from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import (
     arm_live_execution,
     disarm_live_execution,
@@ -156,6 +153,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _raise_non_live_surface_disabled(endpoint: str) -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "NON_LIVE_SURFACE_DISABLED",
+            "message": f"{endpoint} is outside the live trading product scope and has been hard-disabled.",
+        },
+    )
+
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)) -> dict[str, object]:
     settings_row = get_or_create_settings(db)
@@ -163,8 +171,8 @@ def health(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/system/seed")
-def seed_system(db: Session = Depends(get_db)) -> dict[str, object]:
-    return seed_demo_data(db)
+def seed_system() -> None:
+    _raise_non_live_surface_disabled("/api/system/seed")
 
 
 @app.get("/api/dashboard/overview")
@@ -450,22 +458,13 @@ def run_review(window: str, db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/replay/run")
-def run_replay(cycles: int = 5, start_index: int = 120, db: Session = Depends(get_db)) -> dict[str, object]:
-    orchestrator = TradingOrchestrator(db)
-    results: list[dict[str, object]] = []
-    for offset in range(cycles):
-        results.append(orchestrator.run_selected_symbols_cycle(trigger_event="historical_replay", upto_index=start_index + offset))
-    db.commit()
-    return {"cycles": cycles, "results": results}
+def run_replay() -> None:
+    _raise_non_live_surface_disabled("/api/replay/run")
 
 
 @app.post("/api/replay/validation")
-def replay_validation(
-    payload: ReplayValidationRequest,
-    db: Session = Depends(get_db),
-) -> dict[str, object]:
-    report = build_replay_validation_report(db, payload)
-    return report.model_dump(mode="json")
+def replay_validation() -> None:
+    _raise_non_live_surface_disabled("/api/replay/validation")
 
 
 @app.post("/api/live/sync")
