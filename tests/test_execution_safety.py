@@ -1143,6 +1143,31 @@ class RestFallbackSyncClient(StreamPrimarySyncClient):
         ]
 
 
+class DuplicateTradeRestFallbackSyncClient(RestFallbackSyncClient):
+    def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        order = super().get_order(symbol=symbol, order_id=order_id, client_order_id=client_order_id)
+        return {
+            **order,
+            "status": "PARTIALLY_FILLED",
+            "executedQty": "0.01",
+            "avgPrice": "70010",
+        }
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        del symbol, order_id, limit
+        self.trade_lookup_calls += 1
+        return [
+            {
+                "id": "trade-stream-rest-dup-1",
+                "price": "70010",
+                "qty": "0.01",
+                "commission": "0.02",
+                "commissionAsset": "USDT",
+                "realizedPnl": "0.01",
+            }
+        ]
+
+
 class MultiSymbolSyncClient(StreamPrimarySyncClient):
     def get_position_mode(self):
         return {"mode": "one_way", "dual_side_position": False}
@@ -1991,6 +2016,130 @@ def test_sync_live_state_uses_rest_order_fallback_when_user_stream_is_unavailabl
     assert result["reconciliation_summary"]["stream_fallback_active"] is True
     assert any(event.entity_id == "BTCUSDT" for event in audit_events)
     assert any(event.status == "degraded" for event in health_events)
+
+
+def test_sync_live_state_rest_fallback_dedupes_user_stream_trade_id(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    client = DuplicateTradeRestFallbackSyncClient()
+    db_session.add(
+        Order(
+            symbol="BTCUSDT",
+            decision_run_id=None,
+            risk_check_id=None,
+            position_id=None,
+            side="buy",
+            order_type="limit",
+            mode="live",
+            status="pending",
+            external_order_id="fallback-order-dup-1",
+            client_order_id="fallback-client-dup-1",
+            reduce_only=False,
+            close_only=False,
+            parent_order_id=None,
+            exchange_status="NEW",
+            requested_quantity=0.02,
+            requested_price=70000.0,
+            filled_quantity=0.0,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    stream_event = {
+        "e": "ORDER_TRADE_UPDATE",
+        "E": 1_713_313_000_000,
+        "o": {
+            "s": "BTCUSDT",
+            "i": "fallback-order-dup-1",
+            "c": "fallback-client-dup-1",
+            "X": "PARTIALLY_FILLED",
+            "q": "0.02",
+            "z": "0.01",
+            "ap": "70010",
+            "p": "70000",
+            "sp": "0",
+            "R": False,
+            "cp": False,
+            "o": "LIMIT",
+            "S": "BUY",
+            "t": "trade-stream-rest-dup-1",
+            "l": "0.01",
+            "L": "70010",
+            "n": "0.02",
+            "N": "USDT",
+            "rp": "0.01",
+        },
+    }
+    _applied, issues = apply_normalized_user_stream_events(
+        db_session,
+        settings_row,
+        normalized_events=[normalize_user_stream_event(stream_event)],
+    )
+    db_session.flush()
+    assert issues == []
+
+    before_order = db_session.scalar(select(Order).where(Order.external_order_id == "fallback-order-dup-1"))
+    before_execution = db_session.scalar(select(Execution).where(Execution.external_trade_id == "trade-stream-rest-dup-1"))
+    assert before_order is not None
+    assert before_execution is not None
+    before_fees = sum(
+        execution.fee_paid
+        for execution in db_session.scalars(select(Execution).where(Execution.order_id == before_order.id))
+    )
+    before_realized = sum(
+        execution.realized_pnl
+        for execution in db_session.scalars(select(Execution).where(Execution.order_id == before_order.id))
+    )
+
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: {
+            "user_stream_summary": {
+                "status": "unavailable",
+                "stream_source": "rest_polling_fallback",
+                "heartbeat_ok": False,
+                "last_event_at": None,
+                "last_error": "USER_STREAM_UNAVAILABLE",
+            },
+            "stream_health": "unavailable",
+            "stream_source": "rest_polling_fallback",
+            "last_stream_event_time": None,
+            "stream_event_count": 0,
+            "stream_events": [],
+            "stream_issues": [
+                {
+                    "severity": "warning",
+                    "reason_code": "USER_STREAM_UNAVAILABLE",
+                    "message": "User stream unavailable during live sync.",
+                }
+            ],
+        },
+    )
+
+    result = sync_live_state(db_session, settings_row, symbol="BTCUSDT")
+    db_session.flush()
+
+    order = db_session.scalar(select(Order).where(Order.external_order_id == "fallback-order-dup-1"))
+    executions = list(
+        db_session.scalars(select(Execution).where(Execution.order_id == order.id).order_by(Execution.id))  # type: ignore[union-attr]
+    )
+    fee_total = sum(execution.fee_paid for execution in executions)
+    realized_total = sum(execution.realized_pnl for execution in executions)
+
+    assert client.order_lookup_calls == 1
+    assert client.trade_lookup_calls == 1
+    assert result["reconcile_source"] == "rest_polling_fallback"
+    assert order is not None
+    assert order.filled_quantity == pytest.approx(0.01)
+    assert order.average_fill_price == pytest.approx(70010.0)
+    assert len(executions) == 1
+    assert executions[0].external_trade_id == "trade-stream-rest-dup-1"
+    assert fee_total == pytest.approx(before_fees)
+    assert realized_total == pytest.approx(before_realized)
 
 
 def test_sync_live_state_reconciles_enabled_symbols_only_and_records_one_way_mapping(monkeypatch, db_session) -> None:
