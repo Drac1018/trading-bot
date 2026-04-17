@@ -126,6 +126,7 @@ staged rollout semantics:
 - `GET /api/dashboard/overview`
 - `GET /api/dashboard/operator`
 - `GET /api/dashboard/profitability`
+- `GET /api/performance`
 - `GET /api/market/snapshots`
 - `GET /api/market/features`
 - `GET /api/decisions`
@@ -138,6 +139,18 @@ staged rollout semantics:
 - `GET /api/scheduler`
 - `GET /api/audit`
 - `GET /api/alerts`
+
+
+### `GET /api/performance`
+
+신호/결정 성과를 24h·7d·30d 윈도우로 집계해 반환합니다.
+
+- 공개 API path는 유지되며(`GET /api/performance`), 내부 구현은 성과 리포팅 서비스로 정리되어 backlog 의미를 사용하지 않습니다.
+- 응답 핵심 필드
+  - `generated_at`
+  - `window_hours`
+  - `items` (기본 24h 기준 rationale code별 성과)
+  - `windows` (`24h`, `7d`, `30d` 상세 breakdown)
 
 ### `GET /api/dashboard/overview`
 

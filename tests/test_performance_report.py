@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import AgentRun, Execution, Order, PnLSnapshot, Position, RiskCheck
-from trading_mvp.services.backlog_insights import build_signal_performance_report
+from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.time_utils import utcnow_naive
 
 
