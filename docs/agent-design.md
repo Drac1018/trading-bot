@@ -24,3 +24,8 @@
 - Integration Planner AI
 - UI/UX AI
 - 추가 개선 기획 AI
+
+운영 보장:
+
+- 스케줄러 `run_due_windows()`는 현재 범위 밖 review workflow를 실행하지 않는다.
+- 수동 review API(`/api/reviews/{window}`)는 `1h`만 허용한다.

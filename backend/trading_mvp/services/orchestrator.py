@@ -16,9 +16,7 @@ from trading_mvp.models import (
     PendingEntryPlan,
     PnLSnapshot,
     RiskCheck,
-    SchedulerRun,
     SystemHealthEvent,
-    UIFeedback,
 )
 from trading_mvp.providers import build_model_provider
 from trading_mvp.schemas import (
@@ -35,9 +33,7 @@ from trading_mvp.services.account import (
 )
 from trading_mvp.services.agents import (
     ChiefReviewAgent,
-    IntegrationPlannerAgent,
     TradingDecisionAgent,
-    UIUXAgent,
     build_trading_decision_input_payload,
     persist_agent_run,
 )
@@ -156,8 +152,6 @@ class TradingOrchestrator:
         )
         self.trading_agent = TradingDecisionAgent(provider)
         self.chief_review_agent = ChiefReviewAgent()
-        self.integration_agent = IntegrationPlannerAgent(provider)
-        self.ui_agent = UIUXAgent(provider)
 
     @staticmethod
     def _should_execute_live(trigger_event: str) -> bool:
@@ -2011,71 +2005,4 @@ class TradingOrchestrator:
             "settings": serialize_settings(self.settings_row),
             "auto_resume": auto_resume_result,
             "exchange_sync": None,
-        }
-
-
-    def run_integration_review(self, triggered_by: str = TriggerEvent.SCHEDULED.value) -> dict[str, object]:
-        if not self.settings_row.ai_enabled:
-            return {"status": "skipped", "reason": "AI_DISABLED"}
-        openai_gate = get_openai_call_gate(
-            self.session,
-            self.settings_row,
-            AgentRole.INTEGRATION_PLANNER.value,
-            triggered_by,
-            has_openai_key=bool(self.credentials.openai_api_key),
-        )
-        metrics_summary = {
-            "agent_runs": int(self.session.scalar(select(func.count()).select_from(AgentRun)) or 0),
-            "risk_rejects": int(self.session.scalar(select(func.count()).select_from(RiskCheck).where(RiskCheck.allowed.is_(False))) or 0),
-            "scheduler_runs": int(self.session.scalar(select(func.count()).select_from(SchedulerRun)) or 0),
-            "tracked_symbols": get_effective_symbols(self.settings_row),
-        }
-        output, provider_name, metadata = self.integration_agent.run(
-            metrics_summary=metrics_summary,
-            health_events=self._latest_health_events(),
-            use_ai=openai_gate.allowed,
-        )
-        metadata = {**metadata, "gate": openai_gate.as_metadata()}
-        run = persist_agent_run(
-            self.session,
-            AgentRole.INTEGRATION_PLANNER,
-            triggered_by,
-            {"metrics_summary": metrics_summary},
-            output,
-            provider_name=provider_name,
-            metadata_json=metadata,
-        )
-        return {"agent_run_id": run.id, "items": output.model_dump(mode="json")}
-
-
-    def run_ui_review(self, triggered_by: str = TriggerEvent.SCHEDULED.value) -> dict[str, object]:
-        if not self.settings_row.ai_enabled:
-            return {"status": "skipped", "reason": "AI_DISABLED"}
-        feedback_rows = list(self.session.scalars(select(UIFeedback).order_by(desc(UIFeedback.created_at)).limit(20)))
-        openai_gate = get_openai_call_gate(
-            self.session,
-            self.settings_row,
-            AgentRole.UI_UX.value,
-            triggered_by,
-            has_openai_key=bool(self.credentials.openai_api_key),
-        )
-        output, provider_name, metadata = self.ui_agent.run(feedback_rows, use_ai=openai_gate.allowed)
-        metadata = {**metadata, "gate": openai_gate.as_metadata()}
-        run = persist_agent_run(
-            self.session,
-            AgentRole.UI_UX,
-            triggered_by,
-            {"feedback_count": len(feedback_rows)},
-            output,
-            provider_name=provider_name,
-            metadata_json=metadata,
-        )
-        return {"agent_run_id": run.id, "items": output.model_dump(mode="json")}
-
-
-    def run_daily_review_window(self, triggered_by: str = TriggerEvent.SCHEDULED.value) -> dict[str, object]:
-        return {
-            "status": "skipped",
-            "reason": "DAILY_REVIEW_NO_ACTIVE_WORKFLOW",
-            "triggered_by": triggered_by,
         }

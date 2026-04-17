@@ -26,6 +26,7 @@ from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.scheduler import (
     is_interval_decision_due,
     run_exchange_sync_cycle,
+    run_due_windows,
     run_interval_decision_cycle,
     run_market_refresh_cycle,
     run_position_management_cycle,
@@ -193,7 +194,7 @@ def test_ai_enabled_hourly_window_only_refreshes_market_data(monkeypatch, db_ses
     assert db_session.scalar(select(RiskCheck).limit(1)) is None
 
 
-def test_daily_review_window_runs_without_backlog_workflow(db_session) -> None:
+def test_out_of_scope_review_windows_are_disabled(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     db_session.add(settings_row)
@@ -203,13 +204,23 @@ def test_daily_review_window_runs_without_backlog_workflow(db_session) -> None:
     db_session.commit()
 
     scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
-    assert scheduler_run is not None
-    assert scheduler_run.workflow == "scheduled_review"
-    assert result["workflow"] == "scheduled_review"
-    assert result["status"] == "success"
-    assert result["outcome"]["window"] == "24h"
-    assert result["outcome"]["status"] == "skipped"
-    assert result["outcome"]["reason"] == "DAILY_REVIEW_NO_ACTIVE_WORKFLOW"
+    assert scheduler_run is None
+    assert result["window"] == "24h"
+    assert result["status"] == "disabled"
+    assert result["reason"] == "REVIEW_WINDOW_DISABLED_OUT_OF_SCOPE"
+
+
+def test_run_due_windows_noops_for_disabled_aux_workflows(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.schedule_windows = ["1h", "4h", "12h", "24h"]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    result = run_due_windows(db_session)
+
+    assert result == []
+    assert db_session.scalar(select(SchedulerRun).limit(1)) is None
 
 
 def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) -> None:

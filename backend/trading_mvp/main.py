@@ -444,6 +444,8 @@ def run_cycle(db: Session = Depends(get_db)) -> dict[str, object]:
 
 @app.post("/api/reviews/{window}")
 def run_review(window: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    if window != "1h":
+        raise HTTPException(status_code=400, detail="Only 1h review window is enabled in current live-core scope.")
     output = run_window(db, window, triggered_by="manual")
     db.commit()
     return output
