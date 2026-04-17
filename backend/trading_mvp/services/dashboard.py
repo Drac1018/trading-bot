@@ -46,7 +46,7 @@ from trading_mvp.schemas import (
     PerformanceAggregateEntry,
 )
 from trading_mvp.services.audit import compact_audit_payload
-from trading_mvp.services.backlog_insights import build_signal_performance_report
+from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
 from trading_mvp.services.settings import (
     build_operational_status_payload,

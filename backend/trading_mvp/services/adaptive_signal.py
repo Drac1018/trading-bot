@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from trading_mvp.schemas import PerformanceAggregateEntry, SignalPerformanceReportResponse
-from trading_mvp.services.backlog_insights import build_signal_performance_report
+from trading_mvp.services.performance_reporting import build_signal_performance_report
 
 ADAPTIVE_WINDOW_WEIGHTS: dict[str, float] = {"24h": 0.6, "7d": 0.4}
 ADAPTIVE_MIN_SAMPLE_SIZE = 3

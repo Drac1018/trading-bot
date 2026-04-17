@@ -19,7 +19,7 @@ from trading_mvp.schemas import (
     ReplayValidationRequest,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
-from trading_mvp.services.backlog_insights import build_signal_performance_report
+from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
 from trading_mvp.services.dashboard import (
