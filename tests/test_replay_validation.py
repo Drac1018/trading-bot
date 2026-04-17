@@ -192,7 +192,7 @@ def test_replay_validation_report_compares_variants_without_live_execution(monke
     assert report.rationale_comparison
 
 
-def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) -> None:
+def test_replay_validation_api_is_hard_disabled(tmp_path, monkeypatch) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'replay_validation_api.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(bind=test_engine)
@@ -221,18 +221,10 @@ def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) 
                 },
             )
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["data_source_type"] == "synthetic_seed"
-        assert payload["execution_basis"] == "next_bar_open_entry_with_intrabar_stop_take_profit_and_synthetic_fees"
-        assert len(payload["variants"]) == 2
-        assert payload["variants"][0]["summary"]["gross_pnl"] is not None
-        assert "average_arrival_slippage_pct" in payload["variants"][0]["summary"]
-        assert "average_first_fill_latency_seconds" in payload["variants"][0]["summary"]
-        assert payload["variants"][0]["by_rationale_code"]
-        assert payload["symbol_comparison"][0]["key"] == "BTCUSDT"
-        assert payload["timeframe_comparison"][0]["key"] == "15m"
-        assert payload["rationale_comparison"]
+        assert response.status_code == 410
+        payload = response.json()["detail"]
+        assert payload["code"] == "NON_LIVE_SURFACE_DISABLED"
+        assert "/api/replay/validation" in payload["message"]
     finally:
         app.dependency_overrides.clear()
 
