@@ -197,9 +197,11 @@ staged rollout semantics:
   - overview / account / settings와 같은 표준 운영 상태 payload
   - `rollout_mode`, `exchange_submit_allowed`, `limited_live_max_notional`
   - `trading_paused`, `live_execution_ready`, `approval_armed`, `guard_mode_reason_*`, `blocked_reasons`
-  - `control_status_summary`: `exchange_can_trade`, `rollout_mode`, `exchange_submit_allowed`, `limited_live_max_notional`, `app_live_armed`, `approval_window_open`, `approval_state`, `approval_detail`, `paused`, `degraded`, `risk_allowed`, `blocked_reasons_current_cycle`
+  - `control_status_summary`: `exchange_can_trade`, `rollout_mode`, `exchange_submit_allowed`, `limited_live_max_notional`, `app_live_armed`, `approval_window_open`, `approval_state`, `approval_detail`, `paused`, `degraded`, `risk_allowed`, `blocked_reasons_current_cycle`, `approval_control_blocked_reasons`, `live_arm_disabled`, `live_arm_disable_reason_code`, `live_arm_disable_reason`
   - `auto_resume_status`, `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
     - `account_sync_summary`에는 `wallet_balance`, `available_balance`, `realized_pnl`, `fee_total`, `funding_total`, `net_pnl`가 additive로 포함됩니다.
+  - `operator_alert` (critical banner용 additive payload)
+    - one-way position mode requirement 위반 시 `level=critical`, `source=reconciliation_position_mode`, `message=one-way required for current local position model`, `position_mode`, `position_mode_checked_at`, `guarded_symbols_count`
   - `can_enter_new_position`
 - `control.last_market_refresh_at`
 - `control.last_decision_at`
@@ -523,6 +525,7 @@ now expose additive stream/reconciliation fields.
   - `mode_guard_message`
   - `enabled_symbols`
   - `guarded_symbols`
+  - `guarded_symbols_count`
   - `symbol_states`
     - per-symbol `position_status`, `exchange_position_side`, `remote_position_sides`, `open_order_position_sides`, `protection_status`, `guard_active`, `guard_reason_code`
 - flat summary fields on live sync:
@@ -543,6 +546,7 @@ Interpretation:
 - `reconcile_source=rest_polling_fallback` means active order reconciliation had to fall back to REST and a matching user stream warning should exist in audit/health.
 - `position_mode=one_way` is the only non-guarded live entry shape in the current backend model.
 - `mode_guard_active=true` means exchange position mode is unclear or conflicts with current one-way local semantics, so `can_enter_new_position=false` and live `risk_guard` includes `EXCHANGE_POSITION_MODE_UNCLEAR` or `EXCHANGE_POSITION_MODE_MISMATCH`.
+- operator/settings approval control summary additionally surfaces this as `live_arm_disabled=true` and `live_arm_disable_reason="one-way required for current local position model"` so operators can see direct policy context even when blocker reasons overlap with risk_guard.
 
 ### Live order submit unknown / reconcile flow
 

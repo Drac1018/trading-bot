@@ -1007,6 +1007,22 @@ def _reconciliation_blocks_new_entries(reconciliation_summary: dict[str, object]
     return bool(_derive_reconciliation_blocking_reasons(reconciliation_summary))
 
 
+def _is_one_way_requirement_block(reconciliation_summary: dict[str, object]) -> bool:
+    if not isinstance(reconciliation_summary, dict):
+        return False
+    position_mode = str(reconciliation_summary.get("position_mode") or "").strip().lower()
+    return position_mode in {"hedge", "unknown"}
+
+
+def _one_way_requirement_reason_payload(
+    reconciliation_summary: dict[str, object],
+) -> tuple[str | None, str | None]:
+    if not _is_one_way_requirement_block(reconciliation_summary):
+        return None, None
+    reason_code = str(reconciliation_summary.get("mode_guard_reason_code") or "").strip() or None
+    return reason_code, "one-way required for current local position model"
+
+
 def _prioritize_blocked_reasons(reason_codes: list[str]) -> list[str]:
     unique: list[str] = []
     for code in reason_codes:
@@ -1175,6 +1191,7 @@ def _build_control_status_summary(
     operating_state: str,
     current_cycle_blocked_reasons: list[str],
     risk_allowed: bool | None,
+    reconciliation_summary: dict[str, object],
 ) -> ControlStatusSummary:
     approval_window_open, approval_state, approval_detail = get_live_approval_status(settings_row)
     account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
@@ -1183,6 +1200,10 @@ def _build_control_status_summary(
     resolved_risk_allowed = risk_allowed
     if resolved_risk_allowed is None and current_cycle_blocked_reasons:
         resolved_risk_allowed = False
+    one_way_reason_code, one_way_reason_message = _one_way_requirement_reason_payload(reconciliation_summary)
+    approval_control_blocked_reasons = _prioritize_blocked_reasons(
+        list(current_cycle_blocked_reasons) + ([one_way_reason_code] if one_way_reason_code else [])
+    )
     return ControlStatusSummary(
         exchange_can_trade=exchange_can_trade,
         rollout_mode=rollout_mode,
@@ -1202,6 +1223,10 @@ def _build_control_status_summary(
         },
         risk_allowed=resolved_risk_allowed,
         blocked_reasons_current_cycle=_prioritize_blocked_reasons(current_cycle_blocked_reasons),
+        approval_control_blocked_reasons=approval_control_blocked_reasons,
+        live_arm_disabled=bool(one_way_reason_message),
+        live_arm_disable_reason_code=one_way_reason_code,
+        live_arm_disable_reason=one_way_reason_message,
     )
 
 
@@ -1326,12 +1351,25 @@ def build_operational_status_payload(
         and not _reconciliation_blocks_new_entries(reconciliation_summary)
     )
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
+    one_way_reason_code, one_way_reason_message = _one_way_requirement_reason_payload(reconciliation_summary)
     control_status_summary = _build_control_status_summary(
         settings_row,
         operating_state=operating_state,
         current_cycle_blocked_reasons=current_cycle_blocked_reasons,
         risk_allowed=risk_allowed,
+        reconciliation_summary=reconciliation_summary,
     )
+    operator_alert: dict[str, object] = {}
+    if one_way_reason_message:
+        operator_alert = {
+            "level": "critical",
+            "source": "reconciliation_position_mode",
+            "reason_code": one_way_reason_code,
+            "message": one_way_reason_message,
+            "position_mode": str(reconciliation_summary.get("position_mode") or "unknown"),
+            "position_mode_checked_at": reconciliation_summary.get("position_mode_checked_at"),
+            "guarded_symbols_count": int(reconciliation_summary.get("guarded_symbols_count") or 0),
+        }
     return OperationalStatusPayload(
         live_trading_enabled=settings_row.live_trading_enabled,
         rollout_mode=rollout_mode,
@@ -1372,6 +1410,7 @@ def build_operational_status_payload(
         user_stream_summary=dict(runtime.get("user_stream_summary") or {}),
         reconciliation_summary=reconciliation_summary,
         candidate_selection_summary=dict(runtime.get("candidate_selection_summary") or {}),
+        operator_alert=operator_alert,
         can_enter_new_position=can_enter_new_position,
     )
 
@@ -1627,6 +1666,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         user_stream_summary=operational_status.user_stream_summary,
         reconciliation_summary=operational_status.reconciliation_summary,
         candidate_selection_summary=operational_status.candidate_selection_summary,
+        operator_alert=operational_status.operator_alert,
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,

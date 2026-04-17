@@ -288,6 +288,7 @@ def should_use_rest_order_reconciliation(
 def get_reconciliation_detail(settings_row: Setting) -> dict[str, Any]:
     detail = get_runtime_detail(settings_row)
     payload = _as_dict(detail.get(RECONCILIATION_DETAIL_KEY))
+    guarded_symbols = [str(item).upper() for item in payload.get("guarded_symbols", []) if item]
     return {
         "status": str(payload.get("status") or "idle"),
         "source": str(payload.get("source") or "rest_polling"),
@@ -304,7 +305,8 @@ def get_reconciliation_detail(settings_row: Setting) -> dict[str, Any]:
         "mode_guard_reason_code": str(payload.get("mode_guard_reason_code") or "") or None,
         "mode_guard_message": str(payload.get("mode_guard_message") or "") or None,
         "enabled_symbols": [str(item).upper() for item in payload.get("enabled_symbols", []) if item],
-        "guarded_symbols": [str(item).upper() for item in payload.get("guarded_symbols", []) if item],
+        "guarded_symbols": guarded_symbols,
+        "guarded_symbols_count": len(guarded_symbols),
         "symbol_states": _as_symbol_map(payload.get("symbol_states")),
     }
 
