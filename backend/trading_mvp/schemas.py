@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-RolloutMode = Literal["paper", "shadow", "live_dry_run", "limited_live", "full_live"]
+RolloutMode = Literal["shadow", "live_dry_run", "limited_live", "full_live"]
 
 
 class StrictBaseModel(BaseModel):
@@ -444,7 +444,7 @@ class DashboardProfitabilityResponse(StrictBaseModel):
 
 class ControlStatusSummary(StrictBaseModel):
     exchange_can_trade: bool | None = None
-    rollout_mode: RolloutMode = "paper"
+    rollout_mode: RolloutMode = "shadow"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
     app_live_armed: bool = False
@@ -459,7 +459,7 @@ class ControlStatusSummary(StrictBaseModel):
 
 class OperationalStatusPayload(StrictBaseModel):
     live_trading_enabled: bool = False
-    rollout_mode: RolloutMode = "paper"
+    rollout_mode: RolloutMode = "shadow"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
     live_trading_env_enabled: bool = False
@@ -522,7 +522,7 @@ class OperatorControlState(StrictBaseModel):
     control_status_summary: ControlStatusSummary | None = None
     can_enter_new_position: bool = False
     mode: str
-    rollout_mode: RolloutMode = "paper"
+    rollout_mode: RolloutMode = "shadow"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
     default_symbol: str
@@ -1142,7 +1142,7 @@ class AppSettingsResponse(StrictBaseModel):
     id: int
     operational_status: OperationalStatusPayload
     live_trading_enabled: bool
-    rollout_mode: RolloutMode = "paper"
+    rollout_mode: RolloutMode = "shadow"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
     live_trading_env_enabled: bool

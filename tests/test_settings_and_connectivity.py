@@ -162,6 +162,42 @@ def test_serialize_settings_exposes_rollout_mode_and_submit_gate(db_session) -> 
     assert serialized["operational_status"]["control_status_summary"]["rollout_mode"] == "shadow"
 
 
+def test_serialize_settings_never_exposes_legacy_paper_rollout_mode(db_session) -> None:
+    row = get_or_create_settings(db_session)
+    row.rollout_mode = "paper"
+    row.live_trading_enabled = False
+    db_session.add(row)
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["rollout_mode"] == "shadow"
+    assert serialized["operational_status"]["rollout_mode"] == "shadow"
+    assert serialized["operational_status"]["control_status_summary"]["rollout_mode"] == "shadow"
+    assert serialized["exchange_submit_allowed"] is False
+
+
+def test_update_settings_keeps_rollout_mode_when_live_trading_disabled(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(
+            update={
+                "rollout_mode": "limited_live",
+                "live_trading_enabled": False,
+            }
+        ),
+    )
+    db_session.add(row)
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["live_trading_enabled"] is False
+    assert serialized["rollout_mode"] == "limited_live"
+    assert serialized["exchange_submit_allowed"] is False
+    assert serialized["operational_status"]["guard_mode_reason_code"] == "LIVE_TRADING_DISABLED"
+
+
 def test_should_call_openai_respects_manual_and_replay(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
 

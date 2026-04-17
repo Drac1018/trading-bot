@@ -191,27 +191,24 @@ def normalize_symbols(symbols: list[str]) -> list[str]:
 
 
 def normalize_rollout_mode(value: object) -> RolloutMode:
-    raw = str(value or "paper").strip().lower()
+    raw = str(value or "shadow").strip().lower()
+    if raw == "paper":
+        return "shadow"
     if raw in {"shadow", "live_dry_run", "limited_live", "full_live"}:
         return cast(RolloutMode, raw)
-    return "paper"
+    return "shadow"
 
 
 def get_rollout_mode(settings_row: Setting) -> RolloutMode:
-    rollout_mode = normalize_rollout_mode(getattr(settings_row, "rollout_mode", "paper"))
-    if settings_row.live_trading_enabled and rollout_mode == "paper":
-        return "full_live"
-    if not settings_row.live_trading_enabled and rollout_mode != "paper":
-        return "paper"
-    return rollout_mode
+    return normalize_rollout_mode(getattr(settings_row, "rollout_mode", "shadow"))
 
 
 def rollout_mode_uses_live_path(settings_row: Setting) -> bool:
-    return get_rollout_mode(settings_row) in ROLLOUT_MODE_LIVE_PATH
+    return settings_row.live_trading_enabled and get_rollout_mode(settings_row) in ROLLOUT_MODE_LIVE_PATH
 
 
 def rollout_mode_allows_exchange_submit(settings_row: Setting) -> bool:
-    return get_rollout_mode(settings_row) in ROLLOUT_MODE_SUBMIT_ENABLED
+    return settings_row.live_trading_enabled and get_rollout_mode(settings_row) in ROLLOUT_MODE_SUBMIT_ENABLED
 
 
 def get_limited_live_max_notional(settings_row: Setting) -> float:
@@ -334,7 +331,7 @@ def get_or_create_settings(session: Session) -> Setting:
     tracked_symbols = _default_symbols(defaults)
     row = Setting(
         live_trading_enabled=defaults.live_trading_enabled,
-        rollout_mode="full_live" if defaults.live_trading_enabled else "paper",
+        rollout_mode="full_live" if defaults.live_trading_enabled else "shadow",
         limited_live_max_notional=DEFAULT_LIMITED_LIVE_MAX_NOTIONAL,
         manual_live_approval=defaults.manual_live_approval,
         live_execution_armed=False,
@@ -1718,10 +1715,10 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     rollout_mode = (
         normalize_rollout_mode(payload.rollout_mode)
         if payload.rollout_mode is not None
-        else ("full_live" if payload.live_trading_enabled else "paper")
+        else normalize_rollout_mode(getattr(row, "rollout_mode", "shadow"))
     )
     row.rollout_mode = rollout_mode
-    row.live_trading_enabled = rollout_mode != "paper"
+    row.live_trading_enabled = payload.live_trading_enabled
     row.limited_live_max_notional = max(float(payload.limited_live_max_notional), 0.01)
     row.manual_live_approval = payload.manual_live_approval
     row.live_approval_window_minutes = payload.live_approval_window_minutes

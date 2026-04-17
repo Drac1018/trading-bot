@@ -774,7 +774,7 @@ def evaluate_risk(
     adjustment_reason_codes: list[str] = []
     defaults = get_settings()
     rollout_mode = get_rollout_mode(settings_row)
-    live_requested = rollout_mode != "paper"
+    live_requested = bool(settings_row.live_trading_enabled)
     operating_mode: Literal["live", "paused", "hold"] = "live"
     operating_state = get_operating_state(settings_row)
     existing_position = get_open_position(session, decision.symbol)

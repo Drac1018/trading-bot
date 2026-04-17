@@ -9,7 +9,7 @@ const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:800
 const scheduleOptions = ["1h", "4h", "12h", "24h"] as const;
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기", "AI 설정", "Binance 연동"] as const;
-const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
+const rolloutModeOptions = ["shadow", "live_dry_run", "limited_live", "full_live"] as const;
 
 type RolloutMode = (typeof rolloutModeOptions)[number];
 
@@ -320,8 +320,6 @@ function dedupeReasons(values: string[]) {
 
 function rolloutModeLabel(mode: RolloutMode) {
   switch (mode) {
-    case "paper":
-      return "paper";
     case "shadow":
       return "shadow";
     case "live_dry_run":
@@ -362,15 +360,13 @@ function ControlStatusPanel({ state }: { state: SettingsPayload }) {
       label: "rollout mode",
       value: rolloutModeLabel(summary.rollout_mode),
       detail:
-        summary.rollout_mode === "paper"
-          ? "paper 경로만 사용하고 거래소 submit은 비활성화됩니다."
-          : summary.rollout_mode === "shadow"
-            ? "AI/risk/execution intent와 audit까지만 수행하고 실제 submit은 금지됩니다."
-            : summary.rollout_mode === "live_dry_run"
-              ? "거래소 sync와 preflight까지 수행하고 실제 submit은 금지됩니다."
-              : summary.rollout_mode === "limited_live"
-                ? `실제 submit은 허용되지만 주문당 notional이 ${formatDisplayValue(summary.limited_live_max_notional, "limited_live_max_notional")}로 제한됩니다.`
-                : "기존 full live submit 경로를 사용합니다.",
+        summary.rollout_mode === "shadow"
+          ? "AI/risk/execution intent와 audit까지만 수행하고 실제 submit은 금지됩니다."
+          : summary.rollout_mode === "live_dry_run"
+            ? "거래소 sync와 preflight까지 수행하고 실제 submit은 금지됩니다."
+            : summary.rollout_mode === "limited_live"
+              ? `실제 submit은 허용되지만 주문당 notional이 ${formatDisplayValue(summary.limited_live_max_notional, "limited_live_max_notional")}로 제한됩니다.`
+              : "기존 full live submit 경로를 사용합니다.",
       tone:
         summary.rollout_mode === "full_live"
           ? ("good" as const)
@@ -813,7 +809,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   };
 
   const payload = {
-    live_trading_enabled: form.rollout_mode !== "paper",
+    live_trading_enabled: form.live_trading_enabled,
     rollout_mode: form.rollout_mode,
     limited_live_max_notional: form.limited_live_max_notional,
     manual_live_approval: form.manual_live_approval,
@@ -923,7 +919,6 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
                   onChange={(event) => {
                     const nextMode = event.target.value as RolloutMode;
                     updateField("rollout_mode", nextMode);
-                    updateField("live_trading_enabled", nextMode !== "paper");
                   }}
                 >
                   {rolloutModeOptions.map((option) => (

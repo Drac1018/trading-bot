@@ -19,7 +19,7 @@
 
 - `operational_status`
   - overview / account / settings가 공통으로 재사용할 표준 운영 상태 payload
-  - `rollout_mode`: `paper | shadow | live_dry_run | limited_live | full_live`
+  - `rollout_mode`: `shadow | live_dry_run | limited_live | full_live`
   - `exchange_submit_allowed`
   - `limited_live_max_notional`
   - `live_execution_ready`, `trading_paused`, `approval_armed`, `approval_expires_at`
@@ -108,8 +108,6 @@
 
 staged rollout semantics:
 
-- `paper`
-  - 기존 paper 경로만 사용합니다.
 - `shadow`
   - 시장/AI/risk/execution intent/audit까지 수행하지만 실제 Binance submit은 하지 않습니다.
 - `live_dry_run`
@@ -118,6 +116,8 @@ staged rollout semantics:
   - 실제 submit은 허용되지만 주문당 notional이 `limited_live_max_notional` 이하로 추가 제한됩니다.
 - `full_live`
   - 기존 live submit 경로를 사용합니다.
+
+`live_trading_enabled=false`인 경우에도 `rollout_mode`는 마지막 선택값을 유지할 수 있습니다. 다만 실제 submit 허용(`exchange_submit_allowed`)과 신규 진입 가능 상태(`can_enter_new_position`)는 `live_trading_enabled`, approval, pause, sync freshness, risk guard 조건을 함께 충족해야만 true가 됩니다.
 
 `live_execution_ready`는 approval / credentials / pause 기준 준비 상태이고, 실제 신규 진입 가능 여부는 `exchange_submit_allowed`와 `can_enter_new_position`를 같이 봐야 합니다.
 

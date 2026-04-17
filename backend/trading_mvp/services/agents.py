@@ -1127,7 +1127,7 @@ class ChiefReviewAgent:
         else:
             mode = OperatingMode.ACT
             priority = PriorityLevel.MEDIUM
-            summary = "리스크 검증을 통과해 종이매매 기준 실행 가능한 상태입니다."
+            summary = "리스크 검증을 통과해 가드된 실거래 실행 경로에서 진행 가능한 상태입니다."
             must_do = ["실행 결과 모니터링", "후속 알림 확인"]
 
         return ChiefReviewSummary(
@@ -1197,7 +1197,7 @@ class IntegrationPlannerAgent:
             IntegrationSuggestion(
                 title="실행 슬리피지 추적 카드 강화",
                 integration_point="executions -> dashboard overview",
-                description="종이매매 체결 품질을 실거래 전환 전에 더 빠르게 확인합니다.",
+                description="실거래 체결 품질을 운영 중에도 더 빠르게 확인합니다.",
                 automation_opportunity="슬리피지 상한 초과 시 즉시 경고 생성",
                 tech_debt_item="실행 지표의 상단 요약 카드 부족",
                 priority="medium",
