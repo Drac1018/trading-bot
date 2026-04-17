@@ -186,6 +186,12 @@ def get_user_stream_detail(settings_row: Setting) -> dict[str, Any]:
         "stream_source": str(payload.get("stream_source") or "user_stream"),
         "next_retry_at": _serialize_datetime(_coerce_datetime(payload.get("next_retry_at"))),
         "backoff_seconds": _coerce_float(payload.get("backoff_seconds"), 0.0),
+        "listen_key_expiry_reason": str(payload.get("listen_key_expiry_reason") or "") or None,
+        "last_listen_key_expired_at": _serialize_datetime(_coerce_datetime(payload.get("last_listen_key_expired_at"))),
+        "listen_key_rotate_attempted_at": _serialize_datetime(_coerce_datetime(payload.get("listen_key_rotate_attempted_at"))),
+        "listen_key_rotate_completed_at": _serialize_datetime(_coerce_datetime(payload.get("listen_key_rotate_completed_at"))),
+        "listen_key_rotate_status": str(payload.get("listen_key_rotate_status") or "idle"),
+        "listen_key_rotate_error": str(payload.get("listen_key_rotate_error") or "") or None,
     }
 
 
@@ -209,6 +215,12 @@ def set_user_stream_detail(
     stream_source: str | None = None,
     next_retry_at: datetime | None = None,
     backoff_seconds: float | None = None,
+    listen_key_expiry_reason: str | None = None,
+    last_listen_key_expired_at: datetime | None = None,
+    listen_key_rotate_attempted_at: datetime | None = None,
+    listen_key_rotate_completed_at: datetime | None = None,
+    listen_key_rotate_status: str | None = None,
+    listen_key_rotate_error: str | None = None,
 ) -> None:
     runtime_detail = get_runtime_detail(settings_row)
     payload = get_user_stream_detail(settings_row)
@@ -246,6 +258,18 @@ def set_user_stream_detail(
         payload["next_retry_at"] = next_retry_at.isoformat()
     if backoff_seconds is not None:
         payload["backoff_seconds"] = backoff_seconds
+    if listen_key_expiry_reason is not None:
+        payload["listen_key_expiry_reason"] = listen_key_expiry_reason
+    if last_listen_key_expired_at is not None:
+        payload["last_listen_key_expired_at"] = last_listen_key_expired_at.isoformat()
+    if listen_key_rotate_attempted_at is not None:
+        payload["listen_key_rotate_attempted_at"] = listen_key_rotate_attempted_at.isoformat()
+    if listen_key_rotate_completed_at is not None:
+        payload["listen_key_rotate_completed_at"] = listen_key_rotate_completed_at.isoformat()
+    if listen_key_rotate_status is not None:
+        payload["listen_key_rotate_status"] = listen_key_rotate_status
+    if listen_key_rotate_error is not None:
+        payload["listen_key_rotate_error"] = listen_key_rotate_error
     runtime_detail[USER_STREAM_DETAIL_KEY] = payload
     settings_row.pause_reason_detail = runtime_detail
 

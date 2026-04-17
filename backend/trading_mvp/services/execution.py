@@ -552,13 +552,13 @@ def _ensure_user_stream_registration(
     settings_row: Setting,
     *,
     client: BinanceClient,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     listener = BinanceUserStreamListener(client)
-    state, _issues = listener.ensure_registration(get_user_stream_detail(settings_row))
+    state, issues = listener.ensure_registration(get_user_stream_detail(settings_row))
     replace_user_stream_detail(settings_row, state)
     session.add(settings_row)
     session.flush()
-    return get_user_stream_detail(settings_row)
+    return get_user_stream_detail(settings_row), [dict(item) for item in issues if isinstance(item, dict)]
 
 
 def _persist_user_stream_state(settings_row: Setting, state: dict[str, Any]) -> None:
@@ -940,18 +940,18 @@ def poll_live_user_stream(
                 "stream_events": [],
             }
         stream_client = _build_client(settings_row)
-    user_stream_summary = _ensure_user_stream_registration(session, settings_row, client=stream_client)
+    user_stream_summary, stream_issues = _ensure_user_stream_registration(session, settings_row, client=stream_client)
     stream_events: list[dict[str, Any]] = []
-    stream_issues: list[dict[str, Any]] = []
     if str(user_stream_summary.get("status") or "") != "degraded":
         try:
-            stream_events, stream_issues, user_stream_summary = _drain_user_stream_events(
+            stream_events, drain_issues, user_stream_summary = _drain_user_stream_events(
                 session,
                 settings_row,
                 client=stream_client,
                 max_events=max_events,
                 idle_timeout_seconds=idle_timeout_seconds,
             )
+            stream_issues.extend(drain_issues)
         except Exception as exc:
             reconnect_count = int(user_stream_summary.get("reconnect_count") or 0)
             set_user_stream_detail(
