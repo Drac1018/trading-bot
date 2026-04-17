@@ -997,10 +997,14 @@ def _derive_market_blocking_reasons(market_freshness_summary: dict[str, object])
 def _derive_reconciliation_blocking_reasons(reconciliation_summary: dict[str, object]) -> list[str]:
     if not isinstance(reconciliation_summary, dict):
         return []
-    if not bool(reconciliation_summary.get("mode_guard_active")):
-        return []
-    reason_code = str(reconciliation_summary.get("mode_guard_reason_code") or "").strip()
-    return [reason_code] if reason_code else []
+    reason_codes: list[str] = []
+    if bool(reconciliation_summary.get("mode_guard_active")):
+        reason_code = str(reconciliation_summary.get("mode_guard_reason_code") or "").strip()
+        if reason_code:
+            reason_codes.append(reason_code)
+    if bool(reconciliation_summary.get("unresolved_submission_badge")):
+        reason_codes.append("UNRESOLVED_SUBMISSION_GUARD_ACTIVE")
+    return reason_codes
 
 
 def _reconciliation_blocks_new_entries(reconciliation_summary: dict[str, object]) -> bool:
