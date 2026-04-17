@@ -92,6 +92,12 @@ def build_user_stream_state(payload: Mapping[str, Any] | None = None) -> dict[st
         "stream_source": str(data.get("stream_source") or USER_STREAM_PRIMARY_SOURCE),
         "next_retry_at": _serialize_datetime(_coerce_datetime(data.get("next_retry_at"))),
         "backoff_seconds": round(_coerce_float(data.get("backoff_seconds"), 0.0), 4),
+        "listen_key_expiry_reason": str(data.get("listen_key_expiry_reason") or "") or None,
+        "last_listen_key_expired_at": _serialize_datetime(_coerce_datetime(data.get("last_listen_key_expired_at"))),
+        "listen_key_rotate_attempted_at": _serialize_datetime(_coerce_datetime(data.get("listen_key_rotate_attempted_at"))),
+        "listen_key_rotate_completed_at": _serialize_datetime(_coerce_datetime(data.get("listen_key_rotate_completed_at"))),
+        "listen_key_rotate_status": str(data.get("listen_key_rotate_status") or "idle"),
+        "listen_key_rotate_error": str(data.get("listen_key_rotate_error") or "") or None,
     }
 
 
@@ -116,6 +122,7 @@ def normalize_user_stream_event(
     raw_payload = dict(payload)
     resolved_at = received_at or utcnow_naive()
     event_type = str(raw_payload.get("e") or raw_payload.get("eventType") or "unknown")
+    listen_key_expiry_reason = str(raw_payload.get("reason") or raw_payload.get("m") or event_type)
     event_time = _coerce_datetime(
         raw_payload.get("E")
         or raw_payload.get("eventTime")
@@ -198,6 +205,7 @@ def normalize_user_stream_event(
         "execution_type": execution_type,
         "order_status": order_status,
         "listen_key_expired": event_type == "listenKeyExpired",
+        "listen_key_expiry_reason": listen_key_expiry_reason if event_type == "listenKeyExpired" else None,
         "raw_payload": raw_payload,
     }
 
@@ -259,6 +267,10 @@ class BinanceUserStreamListener:
             current["last_error"] = None
             current["next_retry_at"] = None
             current["backoff_seconds"] = 0.0
+            if str(current.get("listen_key_rotate_status") or "") in {"pending", "failed"}:
+                current["listen_key_rotate_status"] = "succeeded"
+                current["listen_key_rotate_completed_at"] = now.isoformat()
+                current["listen_key_rotate_error"] = None
         except Exception as exc:
             reconnect_count = int(current.get("reconnect_count") or 0) + 1
             backoff_seconds = next_reconnect_backoff_seconds(
@@ -290,6 +302,95 @@ class BinanceUserStreamListener:
                 }
             )
         return current, issues
+
+    def _rotate_listen_key_after_expiry(
+        self,
+        current: dict[str, Any],
+        *,
+        expired_event: dict[str, Any],
+        previous_listen_key: str | None,
+    ) -> list[dict[str, Any]]:
+        now = self._now()
+        reason = str(expired_event.get("listen_key_expiry_reason") or "listenKeyExpired")
+        issues: list[dict[str, Any]] = []
+        current["status"] = USER_STREAM_STATUS_DEGRADED
+        current["heartbeat_ok"] = False
+        current["stream_source"] = USER_STREAM_FALLBACK_SOURCE
+        current["last_disconnected_at"] = now.isoformat()
+        current["last_error"] = "LISTEN_KEY_EXPIRED"
+        current["listen_key_expiry_reason"] = reason
+        current["last_listen_key_expired_at"] = now.isoformat()
+        current["listen_key_rotate_attempted_at"] = now.isoformat()
+        current["listen_key_rotate_status"] = "pending"
+        current["listen_key_rotate_error"] = None
+        current["listen_key_rotate_completed_at"] = None
+        current["listen_key"] = None
+
+        if previous_listen_key:
+            try:
+                self._client.close_futures_listen_key(previous_listen_key)
+            except Exception as exc:
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "reason_code": "USER_STREAM_EXPIRED_LISTEN_KEY_CLOSE_FAILED",
+                        "message": "Failed to close expired Binance futures listen key.",
+                        "payload": {"error": str(exc), "listen_key": previous_listen_key},
+                    }
+                )
+
+        try:
+            rotated_key = self._client.create_futures_listen_key()
+            rotated_at = self._now()
+            current["listen_key"] = rotated_key
+            current["listen_key_created_at"] = rotated_at.isoformat()
+            current["listen_key_refreshed_at"] = rotated_at.isoformat()
+            current["last_keepalive_at"] = rotated_at.isoformat()
+            current["next_retry_at"] = None
+            current["backoff_seconds"] = 0.0
+            current["listen_key_rotate_status"] = "succeeded"
+            current["listen_key_rotate_completed_at"] = rotated_at.isoformat()
+            issues.append(
+                {
+                    "severity": "warning",
+                    "reason_code": "USER_STREAM_LISTEN_KEY_ROTATED",
+                    "message": "Expired Binance futures listen key was rotated. Waiting for stream reconnect.",
+                    "payload": {
+                        "expired_reason": reason,
+                        "rotated_at": rotated_at.isoformat(),
+                        "stream_source": USER_STREAM_FALLBACK_SOURCE,
+                    },
+                }
+            )
+        except Exception as exc:
+            reconnect_count = int(current.get("reconnect_count") or 0) + 1
+            backoff_seconds = next_reconnect_backoff_seconds(
+                reconnect_count,
+                base_seconds=self._backoff_base_seconds,
+                max_seconds=self._backoff_max_seconds,
+            )
+            failed_at = self._now()
+            current["reconnect_count"] = reconnect_count
+            current["last_error"] = str(exc)
+            current["next_retry_at"] = (failed_at + timedelta(seconds=backoff_seconds)).isoformat()
+            current["backoff_seconds"] = backoff_seconds
+            current["listen_key_rotate_status"] = "failed"
+            current["listen_key_rotate_error"] = str(exc)
+            current["listen_key_rotate_completed_at"] = failed_at.isoformat()
+            issues.append(
+                {
+                    "severity": "warning",
+                    "reason_code": "USER_STREAM_LISTEN_KEY_ROTATE_FAILED",
+                    "message": "Failed to rotate Binance futures listen key after expiration.",
+                    "payload": {
+                        "error": str(exc),
+                        "expired_reason": reason,
+                        "reconnect_count": reconnect_count,
+                        "next_retry_at": current["next_retry_at"],
+                    },
+                }
+            )
+        return issues
 
     def close_registration(self, state: Mapping[str, Any] | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         current = build_user_stream_state(state)
@@ -359,20 +460,12 @@ class BinanceUserStreamListener:
                 current["next_retry_at"] = None
                 current["backoff_seconds"] = 0.0
                 if normalized["listen_key_expired"]:
-                    expired_at = self._now()
-                    current["status"] = USER_STREAM_STATUS_DEGRADED
-                    current["listen_key"] = None
-                    current["last_disconnected_at"] = expired_at.isoformat()
-                    current["heartbeat_ok"] = False
-                    current["stream_source"] = USER_STREAM_FALLBACK_SOURCE
-                    current["last_error"] = "LISTEN_KEY_EXPIRED"
-                    issues.append(
-                        {
-                            "severity": "warning",
-                            "reason_code": "USER_STREAM_LISTEN_KEY_EXPIRED",
-                            "message": "Binance futures listen key expired.",
-                            "payload": {"event_time": normalized["event_time"]},
-                        }
+                    issues.extend(
+                        self._rotate_listen_key_after_expiry(
+                            current,
+                            expired_event=normalized,
+                            previous_listen_key=listen_key,
+                        )
                     )
                     break
         except Exception as exc:

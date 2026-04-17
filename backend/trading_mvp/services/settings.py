@@ -126,6 +126,7 @@ SYNC_SCOPE_GUARD_REASON_CODES = {
     "protective_orders": "PROTECTION_STATE_UNVERIFIED",
 }
 STALE_FIRST_REASON_PRIORITY = {
+    "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": -1,
     "ACCOUNT_STATE_STALE": 0,
     "POSITION_STATE_STALE": 1,
     "OPEN_ORDERS_STATE_STALE": 2,
@@ -169,6 +170,7 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "POSITION_STATE_STALE": "거래소 포지션 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
+    "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": "listen key 재등록이 완료되지 않아 신규 진입을 차단하고 REST fallback으로 운용 중입니다.",
     "EXCHANGE_POSITION_MODE_UNCLEAR": "거래소 포지션 모드를 확인하지 못해 신규 진입을 차단합니다.",
     "EXCHANGE_POSITION_MODE_MISMATCH": "거래소 Hedge mode가 현재 one-way 로컬 해석과 충돌해 신규 진입을 차단합니다.",
 }
@@ -1007,6 +1009,25 @@ def _derive_reconciliation_blocking_reasons(reconciliation_summary: dict[str, ob
     return reason_codes
 
 
+def _derive_user_stream_blocking_reasons(user_stream_summary: dict[str, object]) -> list[str]:
+    if not isinstance(user_stream_summary, dict):
+        return []
+    stream_source = str(user_stream_summary.get("stream_source") or "")
+    rotate_status = str(user_stream_summary.get("listen_key_rotate_status") or "")
+    last_error = str(user_stream_summary.get("last_error") or "")
+    if stream_source != "rest_polling_fallback":
+        return []
+    if rotate_status in {"pending", "failed"}:
+        return ["USER_STREAM_LISTEN_KEY_ROTATION_PENDING"]
+    if last_error in {"LISTEN_KEY_EXPIRED", "USER_STREAM_LISTEN_KEY_ROTATE_FAILED"}:
+        return ["USER_STREAM_LISTEN_KEY_ROTATION_PENDING"]
+    return []
+
+
+def _user_stream_blocks_new_entries(user_stream_summary: dict[str, object]) -> bool:
+    return bool(_derive_user_stream_blocking_reasons(user_stream_summary))
+
+
 def _reconciliation_blocks_new_entries(reconciliation_summary: dict[str, object]) -> bool:
     return bool(_derive_reconciliation_blocking_reasons(reconciliation_summary))
 
@@ -1053,9 +1074,11 @@ def derive_guard_mode_reason(
     runtime = runtime_state or summarize_runtime_state(settings_row)
     sync_blocked_reasons = _derive_sync_blocking_reasons(sync_freshness_summary or {})
     market_blocked_reasons = _derive_market_blocking_reasons(market_freshness_summary or {})
+    user_stream_blocked_reasons = _derive_user_stream_blocking_reasons(dict(runtime.get("user_stream_summary") or {}))
     blocked_reasons = _prioritize_blocked_reasons(
         sync_blocked_reasons
         + market_blocked_reasons
+        + user_stream_blocked_reasons
         + [str(item) for item in (latest_blocked_reasons or []) if item]
     )
     auto_resume_blockers = [str(item) for item in (auto_resume_last_blockers or []) if item]
@@ -1264,15 +1287,18 @@ def build_operational_status_payload(
             current_cycle_blocked_reasons = latest_cycle_blocked_reasons
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
+    user_stream_summary = dict(runtime.get("user_stream_summary") or {})
     inject_freshness_blockers = not settings_row.trading_paused
     sync_blocked_reasons = _derive_sync_blocking_reasons(sync_summary) if inject_freshness_blockers else []
     market_blocked_reasons = _derive_market_blocking_reasons(market_summary) if inject_freshness_blockers else []
+    user_stream_blocked_reasons = _derive_user_stream_blocking_reasons(user_stream_summary) if inject_freshness_blockers else []
     reconciliation_blocked_reasons = (
         _derive_reconciliation_blocking_reasons(reconciliation_summary) if inject_freshness_blockers else []
     )
     recent_blocked_reasons = _prioritize_blocked_reasons(
         sync_blocked_reasons
         + market_blocked_reasons
+        + user_stream_blocked_reasons
         + reconciliation_blocked_reasons
         + [
             str(item)
@@ -1287,6 +1313,7 @@ def build_operational_status_payload(
     current_blocked_reasons = _prioritize_blocked_reasons(
         sync_blocked_reasons
         + market_blocked_reasons
+        + user_stream_blocked_reasons
         + reconciliation_blocked_reasons
         + (current_cycle_blocked_reasons or recent_blocked_reasons)
     )
@@ -1352,6 +1379,7 @@ def build_operational_status_payload(
         and operating_state == "TRADABLE"
         and not _sync_blocks_new_entries(sync_summary)
         and not _market_blocks_new_entries(market_summary)
+        and not _user_stream_blocks_new_entries(user_stream_summary)
         and not _reconciliation_blocks_new_entries(reconciliation_summary)
     )
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
@@ -1411,7 +1439,7 @@ def build_operational_status_payload(
         missing_protection_symbols=missing_protection_symbols,
         missing_protection_items=missing_protection_items,
         control_status_summary=control_status_summary,
-        user_stream_summary=dict(runtime.get("user_stream_summary") or {}),
+        user_stream_summary=user_stream_summary,
         reconciliation_summary=reconciliation_summary,
         candidate_selection_summary=dict(runtime.get("candidate_selection_summary") or {}),
         operator_alert=operator_alert,

@@ -34,6 +34,7 @@ from trading_mvp.services.settings import (
     serialize_settings,
     set_trading_pause,
 )
+from trading_mvp.services.runtime_state import set_user_stream_detail
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -2168,6 +2169,34 @@ def test_sync_live_state_marks_unknown_position_mode_guard_when_lookup_fails(mon
     assert serialized["control_status_summary"]["live_arm_disabled"] is True
     assert "EXCHANGE_POSITION_MODE_UNCLEAR" in serialized["control_status_summary"]["approval_control_blocked_reasons"]
     assert serialized["operator_alert"]["reason_code"] == "EXCHANGE_POSITION_MODE_UNCLEAR"
+
+
+def test_serialize_settings_blocks_new_entries_while_listen_key_rotation_pending(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    set_user_stream_detail(
+        settings_row,
+        status="degraded",
+        stream_source="rest_polling_fallback",
+        heartbeat_ok=False,
+        last_error="LISTEN_KEY_EXPIRED",
+        last_disconnected_at=now,
+        listen_key_expiry_reason="listenKeyExpired",
+        last_listen_key_expired_at=now,
+        listen_key_rotate_attempted_at=now,
+        listen_key_rotate_status="pending",
+    )
+    db_session.add(settings_row)
+    db_session.flush()
+
+    serialized = serialize_settings(settings_row)
+
+    assert serialized["can_enter_new_position"] is False
+    assert "USER_STREAM_LISTEN_KEY_ROTATION_PENDING" in serialized["blocked_reasons"]
+    assert serialized["guard_mode_reason_code"] == "USER_STREAM_LISTEN_KEY_ROTATION_PENDING"
+    assert serialized["user_stream_summary"]["stream_source"] == "rest_polling_fallback"
+    assert serialized["user_stream_summary"]["listen_key_rotate_status"] == "pending"
 
 
 def test_evaluate_risk_blocks_new_entry_when_reconciliation_mode_guard_is_active(monkeypatch, db_session) -> None:

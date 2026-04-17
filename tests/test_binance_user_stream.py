@@ -36,6 +36,9 @@ class _KeepaliveClient:
         self.keepalives.append(listen_key)
         return {"listenKey": listen_key}
 
+    def close_futures_listen_key(self, listen_key: str) -> dict[str, Any]:
+        return {"listenKey": listen_key}
+
     async def stream_futures_user_events(self, listen_key: str, *, max_events: int | None = None, idle_timeout_seconds: float = 30.0):
         if False:
             yield listen_key
@@ -58,6 +61,40 @@ class _DisconnectOnceClient(_KeepaliveClient):
                 "P": [{"s": "BTCUSDT", "pa": "0.010", "ep": "64000", "up": "5.0"}],
             },
         }
+
+
+class _RotateSuccessClient(_KeepaliveClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.listen_keys = ["listen-key-old", "listen-key-new"]
+        self.closed: list[str] = []
+
+    def create_futures_listen_key(self) -> str:
+        self.created += 1
+        if self.created <= len(self.listen_keys):
+            return self.listen_keys[self.created - 1]
+        return self.listen_keys[-1]
+
+    def close_futures_listen_key(self, listen_key: str) -> dict[str, Any]:
+        self.closed.append(listen_key)
+        return {"listenKey": listen_key}
+
+    async def stream_futures_user_events(self, listen_key: str, *, max_events: int | None = None, idle_timeout_seconds: float = 30.0):
+        del max_events, idle_timeout_seconds
+        assert listen_key == "listen-key-old"
+        yield {
+            "e": "listenKeyExpired",
+            "E": 1_713_312_200_000,
+            "reason": "listenKeyExpired",
+        }
+
+
+class _RotateFailClient(_RotateSuccessClient):
+    def create_futures_listen_key(self) -> str:
+        self.created += 1
+        if self.created == 1:
+            return "listen-key-old"
+        raise RuntimeError("rotate failed")
 
 
 def test_normalize_user_stream_event_distinguishes_order_and_execution() -> None:
@@ -185,3 +222,82 @@ def test_user_stream_listener_loop_retries_after_backoff_and_normalizes_event() 
     assert len(results[1]["events"]) == 1
     assert results[1]["events"][0]["event_category"] == "account"
     assert "position" in results[1]["events"][0]["related_categories"]
+
+
+def test_user_stream_listener_rotates_listen_key_when_expired_event_received() -> None:
+    base = datetime(2026, 4, 17, 12, 0, 0)
+    clock = _Clock(base)
+    client = _RotateSuccessClient()
+    listener = BinanceUserStreamListener(client, now_fn=clock.now, sleep_fn=clock.sleep)
+
+    initial_state = {
+        "status": "connected",
+        "listen_key": "listen-key-old",
+        "listen_key_refreshed_at": base.isoformat(),
+        "stream_source": "user_stream",
+    }
+    result = asyncio.run(listener.collect_once(initial_state, max_events=1, idle_timeout_seconds=0.01))
+
+    state = result["state"]
+    issue_codes = [str(item.get("reason_code")) for item in result["issues"]]
+    assert state["status"] == "degraded"
+    assert state["stream_source"] == "rest_polling_fallback"
+    assert state["listen_key"] == "listen-key-new"
+    assert state["listen_key_expiry_reason"] == "listenKeyExpired"
+    assert state["listen_key_rotate_status"] == "succeeded"
+    assert state["listen_key_rotate_attempted_at"] is not None
+    assert state["listen_key_rotate_completed_at"] is not None
+    assert "USER_STREAM_LISTEN_KEY_ROTATED" in issue_codes
+    assert client.closed == ["listen-key-old"]
+
+
+def test_user_stream_listener_rotation_failure_keeps_fallback_and_entry_guard_state() -> None:
+    base = datetime(2026, 4, 17, 12, 0, 0)
+    clock = _Clock(base)
+    client = _RotateFailClient()
+    listener = BinanceUserStreamListener(client, now_fn=clock.now, sleep_fn=clock.sleep)
+
+    initial_state = {
+        "status": "connected",
+        "listen_key": "listen-key-old",
+        "listen_key_refreshed_at": base.isoformat(),
+        "stream_source": "user_stream",
+    }
+    result = asyncio.run(listener.collect_once(initial_state, max_events=1, idle_timeout_seconds=0.01))
+
+    state = result["state"]
+    issue_codes = [str(item.get("reason_code")) for item in result["issues"]]
+    assert state["status"] == "degraded"
+    assert state["stream_source"] == "rest_polling_fallback"
+    assert state["listen_key"] is None
+    assert state["listen_key_rotate_status"] == "failed"
+    assert state["listen_key_rotate_error"] == "rotate failed"
+    assert state["next_retry_at"] is not None
+    assert state["backoff_seconds"] > 0
+    assert "USER_STREAM_LISTEN_KEY_ROTATE_FAILED" in issue_codes
+
+
+def test_user_stream_listener_registration_recovers_connected_after_rotation_failure() -> None:
+    base = datetime(2026, 4, 17, 12, 0, 0)
+    times = iter([base, base + timedelta(seconds=2)])
+    client = _KeepaliveClient()
+    listener = BinanceUserStreamListener(client, now_fn=lambda: next(times))
+
+    failed_state = {
+        "status": "degraded",
+        "stream_source": "rest_polling_fallback",
+        "listen_key": None,
+        "next_retry_at": (base - timedelta(seconds=1)).isoformat(),
+        "backoff_seconds": 1.0,
+        "listen_key_rotate_status": "failed",
+        "listen_key_rotate_error": "rotate failed",
+    }
+    state, issues = listener.ensure_registration(failed_state)
+
+    assert issues == []
+    assert state["status"] == "connected"
+    assert state["stream_source"] == "user_stream"
+    assert state["listen_key"] == "listen-key-1"
+    assert state["listen_key_rotate_status"] == "succeeded"
+    assert state["listen_key_rotate_completed_at"] is not None
+    assert state["listen_key_rotate_error"] is None
