@@ -69,6 +69,7 @@ from trading_mvp.services.risk import (
 from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    get_unresolved_submission_guard,
     mark_sync_skipped,
     set_candidate_selection_detail,
     summarize_runtime_state,
@@ -1801,6 +1802,90 @@ class TradingOrchestrator:
             payload={"provider": provider_name, "decision": decision.model_dump(mode="json")},
             correlation_ids=decision_correlation_ids,
         )
+        if decision.decision in {"long", "short"}:
+            unresolved_guard = get_unresolved_submission_guard(
+                self.settings_row,
+                symbol=symbol,
+                action=decision.decision,
+            )
+            if unresolved_guard is not None and bool(unresolved_guard.get("guard_active", True)):
+                reason_code = str(unresolved_guard.get("guard_reason_code") or "UNRESOLVED_SUBMISSION_GUARD_ACTIVE")
+                blocked_risk_result = RiskCheckResult(
+                    allowed=False,
+                    decision=decision.decision,
+                    reason_codes=[reason_code],
+                    blocked_reason_codes=[reason_code],
+                    approved_risk_pct=0.0,
+                    approved_leverage=0.0,
+                    operating_mode="hold",
+                    effective_leverage_cap=get_symbol_leverage_cap(symbol),
+                    symbol_risk_tier=get_symbol_risk_tier(symbol),
+                    exposure_metrics={},
+                    cycle_id=cycle_id,
+                    snapshot_id=market_row.id,
+                )
+                record_audit_event(
+                    self.session,
+                    event_type="risk_check_skipped",
+                    entity_type="decision_run",
+                    entity_id=str(decision_run.id),
+                    severity="warning",
+                    message="Risk and execution were skipped because unresolved submission guard is active.",
+                    payload={
+                        "symbol": symbol,
+                        "decision": decision.decision,
+                        "reason_code": reason_code,
+                        "unresolved_submission_guard": unresolved_guard,
+                    },
+                    correlation_ids=decision_correlation_ids,
+                )
+                execution_result = {
+                    "status": "blocked",
+                    "reason_codes": [reason_code],
+                    "decision": decision.decision,
+                    "unresolved_submission_guard": unresolved_guard,
+                }
+                chief_review, chief_provider_name, chief_metadata = self.chief_review_agent.run(
+                    decision=decision,
+                    risk_result=blocked_risk_result,
+                    health_events=self._latest_health_events(),
+                    alerts=self._latest_alerts(),
+                    use_ai=False,
+                )
+                chief_run = persist_agent_run(
+                    self.session,
+                    AgentRole.CHIEF_REVIEW,
+                    TriggerEvent.POST_DECISION.value,
+                    {
+                        "decision": decision.model_dump(mode="json"),
+                        "risk_result": blocked_risk_result.model_dump(mode="json"),
+                        "alerts": [alert.payload for alert in self._latest_alerts()],
+                    },
+                    chief_review,
+                    provider_name=chief_provider_name,
+                    metadata_json=chief_metadata,
+                )
+                return {
+                    "symbol": symbol,
+                    "cycle_id": cycle_id,
+                    "market_snapshot_id": market_row.id,
+                    "feature_snapshot_id": feature_row.id,
+                    "decision_run_id": decision_run.id,
+                    "risk_check_id": None,
+                    "chief_review_run_id": chief_run.id,
+                    "decision": decision.model_dump(mode="json"),
+                    "risk_result": blocked_risk_result.model_dump(mode="json"),
+                    "execution": execution_result,
+                    "entry_plan": None,
+                    "canceled_entry_plans": [],
+                    "status": "blocked_pre_risk",
+                    "decision_reference": decision_reference,
+                    "logic_variant": logic_variant,
+                    "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
+                    "settings": serialize_settings(self.settings_row),
+                    "auto_resume": auto_resume_result,
+                    "exchange_sync": exchange_sync_result,
+                }
         risk_result, risk_row = evaluate_risk(
             self.session,
             self.settings_row,

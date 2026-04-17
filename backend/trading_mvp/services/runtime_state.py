@@ -162,6 +162,7 @@ def get_execution_guard_detail(settings_row: Setting) -> dict[str, dict[str, dic
     return {
         "symbol_locks": _as_symbol_map(guard.get("symbol_locks")),
         "dedupe_records": _as_record_map(guard.get("dedupe_records")),
+        "unresolved_submission_guards": _as_record_map(guard.get("unresolved_submission_guards")),
     }
 
 
@@ -306,6 +307,18 @@ def get_reconciliation_detail(settings_row: Setting) -> dict[str, Any]:
         "enabled_symbols": [str(item).upper() for item in payload.get("enabled_symbols", []) if item],
         "guarded_symbols": [str(item).upper() for item in payload.get("guarded_symbols", []) if item],
         "symbol_states": _as_symbol_map(payload.get("symbol_states")),
+        "unresolved_submission_badge": bool(payload.get("unresolved_submission_badge", False)),
+        "unresolved_submission_count": _coerce_int(payload.get("unresolved_submission_count"), 0),
+        "unresolved_submission_symbols": [
+            str(item).upper()
+            for item in payload.get("unresolved_submission_symbols", [])
+            if item
+        ],
+        "unresolved_submissions": [
+            dict(item)
+            for item in payload.get("unresolved_submissions", [])
+            if isinstance(item, dict)
+        ],
     }
 
 
@@ -329,6 +342,10 @@ def set_reconciliation_detail(
     enabled_symbols: list[str] | None = None,
     guarded_symbols: list[str] | None = None,
     symbol_states: dict[str, dict[str, Any]] | None = None,
+    unresolved_submission_badge: bool | None = None,
+    unresolved_submission_count: int | None = None,
+    unresolved_submission_symbols: list[str] | None = None,
+    unresolved_submissions: list[dict[str, Any]] | None = None,
 ) -> None:
     runtime_detail = get_runtime_detail(settings_row)
     payload = get_reconciliation_detail(settings_row)
@@ -370,16 +387,28 @@ def set_reconciliation_detail(
             for key, value in symbol_states.items()
             if isinstance(value, dict)
         }
+    if unresolved_submission_badge is not None:
+        payload["unresolved_submission_badge"] = unresolved_submission_badge
+    if unresolved_submission_count is not None:
+        payload["unresolved_submission_count"] = max(int(unresolved_submission_count), 0)
+    if unresolved_submission_symbols is not None:
+        payload["unresolved_submission_symbols"] = [str(item).upper() for item in unresolved_submission_symbols if item]
+    if unresolved_submissions is not None:
+        payload["unresolved_submissions"] = [dict(item) for item in unresolved_submissions if isinstance(item, dict)]
     runtime_detail[RECONCILIATION_DETAIL_KEY] = payload
     settings_row.pause_reason_detail = runtime_detail
 
 
 def get_reconciliation_blocking_reason_codes(settings_row: Setting) -> list[str]:
     summary = get_reconciliation_detail(settings_row)
-    if not bool(summary.get("mode_guard_active")):
-        return []
-    code = str(summary.get("mode_guard_reason_code") or "").strip()
-    return [code] if code else []
+    reason_codes: list[str] = []
+    if bool(summary.get("mode_guard_active")):
+        code = str(summary.get("mode_guard_reason_code") or "").strip()
+        if code:
+            reason_codes.append(code)
+    if bool(summary.get("unresolved_submission_badge")):
+        reason_codes.append("UNRESOLVED_SUBMISSION_GUARD_ACTIVE")
+    return reason_codes
 
 
 def get_candidate_selection_detail(settings_row: Setting) -> dict[str, Any]:
@@ -428,11 +457,13 @@ def _write_execution_guard_detail(
     *,
     symbol_locks: dict[str, dict[str, Any]],
     dedupe_records: dict[str, dict[str, Any]],
+    unresolved_submission_guards: dict[str, dict[str, Any]],
 ) -> None:
     runtime_detail = get_runtime_detail(settings_row)
     runtime_detail[EXECUTION_GUARD_DETAIL_KEY] = {
         "symbol_locks": symbol_locks,
         "dedupe_records": _prune_execution_dedupe_records(dedupe_records),
+        "unresolved_submission_guards": unresolved_submission_guards,
     }
     settings_row.pause_reason_detail = runtime_detail
 
@@ -476,6 +507,7 @@ def mark_execution_lock(
         settings_row,
         symbol_locks=symbol_locks,
         dedupe_records=detail["dedupe_records"],
+        unresolved_submission_guards=detail["unresolved_submission_guards"],
     )
 
 
@@ -497,6 +529,7 @@ def clear_execution_lock(
         settings_row,
         symbol_locks=symbol_locks,
         dedupe_records=detail["dedupe_records"],
+        unresolved_submission_guards=detail["unresolved_submission_guards"],
     )
 
 
@@ -528,6 +561,88 @@ def store_execution_dedupe_record(
         settings_row,
         symbol_locks=detail["symbol_locks"],
         dedupe_records=dedupe_records,
+        unresolved_submission_guards=detail["unresolved_submission_guards"],
+    )
+
+
+def _build_unresolved_submission_guard_key(*, symbol: str, action: str) -> str:
+    return f"{symbol.upper()}:{action.lower()}"
+
+
+def get_unresolved_submission_guard(
+    settings_row: Setting,
+    *,
+    symbol: str,
+    action: str,
+) -> dict[str, Any] | None:
+    detail = get_execution_guard_detail(settings_row)
+    key = _build_unresolved_submission_guard_key(symbol=symbol, action=action)
+    guard = detail["unresolved_submission_guards"].get(key)
+    if not isinstance(guard, dict):
+        return None
+    return dict(guard)
+
+
+def list_unresolved_submission_guards(
+    settings_row: Setting,
+    *,
+    symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    detail = get_execution_guard_detail(settings_row)
+    rows = list(detail["unresolved_submission_guards"].values())
+    if symbol is not None:
+        symbol_upper = symbol.upper()
+        rows = [item for item in rows if str(item.get("symbol") or "").upper() == symbol_upper]
+    return [dict(item) for item in rows if isinstance(item, dict)]
+
+
+def set_unresolved_submission_guard(
+    settings_row: Setting,
+    *,
+    symbol: str,
+    action: str,
+    payload: dict[str, Any],
+) -> None:
+    detail = get_execution_guard_detail(settings_row)
+    guards = dict(detail["unresolved_submission_guards"])
+    key = _build_unresolved_submission_guard_key(symbol=symbol, action=action)
+    guards[key] = {
+        **dict(payload),
+        "symbol": symbol.upper(),
+        "action": action.lower(),
+    }
+    _write_execution_guard_detail(
+        settings_row,
+        symbol_locks=detail["symbol_locks"],
+        dedupe_records=detail["dedupe_records"],
+        unresolved_submission_guards=guards,
+    )
+
+
+def clear_unresolved_submission_guard(
+    settings_row: Setting,
+    *,
+    symbol: str,
+    action: str | None = None,
+) -> None:
+    detail = get_execution_guard_detail(settings_row)
+    guards = dict(detail["unresolved_submission_guards"])
+    symbol_upper = symbol.upper()
+    if action is None:
+        keys_to_delete = [
+            key
+            for key, value in guards.items()
+            if isinstance(value, dict) and str(value.get("symbol") or "").upper() == symbol_upper
+        ]
+        for key in keys_to_delete:
+            guards.pop(key, None)
+    else:
+        guards.pop(_build_unresolved_submission_guard_key(symbol=symbol_upper, action=action), None)
+    _write_execution_guard_detail(
+        settings_row,
+        symbol_locks=detail["symbol_locks"],
+        dedupe_records=detail["dedupe_records"],
+        unresolved_submission_guards=guards,
     )
 
 

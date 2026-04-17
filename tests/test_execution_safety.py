@@ -29,6 +29,7 @@ from trading_mvp.services.binance import BinanceAPIError
 from trading_mvp.services.risk import evaluate_risk
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import (
+    build_operational_status_payload,
     get_or_create_settings,
     serialize_settings,
     set_trading_pause,
@@ -737,6 +738,74 @@ class TimeoutUnknownExitClient(ExitWhilePausedClient):
     def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
         self.lookup_calls += 1
         raise BinanceAPIError(-2013, "Order does not exist.")
+
+
+class TimeoutUnknownEntryClient:
+    def __init__(self) -> None:
+        self.submit_calls = 0
+        self.lookup_calls = 0
+        self.recover_on_lookup = False
+        self.submitted_client_order_ids: list[str | None] = []
+
+    def get_account_info(self):
+        return {
+            "availableBalance": "1000.0",
+            "totalWalletBalance": "1000.0",
+            "totalUnrealizedProfit": "0.0",
+            "totalMarginBalance": "1000.0",
+        }
+
+    def get_open_orders(self, symbol: str):
+        del symbol
+        return []
+
+    def get_position_information(self, symbol: str):
+        del symbol
+        return []
+
+    def change_initial_leverage(self, symbol: str, leverage: int):
+        del symbol
+        return {"leverage": leverage}
+
+    def normalize_order_quantity(self, symbol: str, quantity: float, *, reference_price: float | None = None, enforce_min_notional: bool = True):
+        del symbol, reference_price, enforce_min_notional
+        return quantity
+
+    def normalize_price(self, symbol: str, price: float):
+        del symbol
+        return price
+
+    def get_symbol_filters(self, symbol: str):
+        del symbol
+        return {"step_size": 0.001, "min_qty": 0.001, "min_notional": 5.0}
+
+    def new_order(self, **kwargs):
+        self.submit_calls += 1
+        self.submitted_client_order_ids.append(kwargs.get("client_order_id"))
+        raise httpx.ReadTimeout("submit timed out")
+
+    def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        del symbol, order_id
+        self.lookup_calls += 1
+        if not self.recover_on_lookup:
+            raise BinanceAPIError(-2013, "Order does not exist.")
+        return {
+            "orderId": "entry-reconciled-1",
+            "clientOrderId": client_order_id or "entry-reconciled-client-1",
+            "status": "FILLED",
+            "type": "MARKET",
+            "origQty": "0.01",
+            "executedQty": "0.01",
+            "avgPrice": "70000",
+            "reduceOnly": "false",
+            "closePosition": "false",
+        }
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        del symbol, limit
+        if order_id == "entry-reconciled-1":
+            return [{"id": "entry-reconciled-trade-1", "price": "70000", "qty": "0.01", "commission": "0.05", "commissionAsset": "USDT", "realizedPnl": "0.0"}]
+        return []
 
 
 class ProtectionFailureManageOnlyClient(ProtectionFailureClient):
@@ -2399,6 +2468,101 @@ def test_execute_live_trade_marks_timeout_submission_unknown_and_emits_audit(mon
     assert order.metadata_json["submission_tracking"]["safe_retry_used"] is True
     assert any(event.entity_id == str(order.id) for event in audit_events)
     assert any(event.status == "warning" for event in health_events)
+
+
+def test_background_reconcile_restores_submission_unknown_order(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = TimeoutUnknownEntryClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    unknown_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=156,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    assert unknown_result["status"] == "submission_unknown"
+    client.recover_on_lookup = True
+
+    sync_result = sync_live_state(db_session, get_or_create_settings(db_session), symbol="BTCUSDT")
+    order = db_session.scalar(select(Order).where(Order.client_order_id == unknown_result["client_order_id"]))
+
+    assert order is not None
+    assert order.metadata_json["submission_tracking"]["submission_state"] == "reconciled"
+    assert order.metadata_json["submission_tracking"]["recovered_via"] == "bounded_reconcile_loop"
+    assert sync_result["reconciliation_summary"]["unresolved_submission_badge"] is False
+
+
+def test_submission_unknown_deadline_exceeded_blocks_symbol_entry(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = TimeoutUnknownEntryClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    unknown_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=157,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    assert unknown_result["status"] == "submission_unknown"
+
+    row = db_session.scalar(select(Order).where(Order.client_order_id == unknown_result["client_order_id"]))
+    assert row is not None
+    metadata = dict(row.metadata_json or {})
+    tracking = dict(metadata.get("submission_tracking") or {})
+    tracking["next_reconcile_at"] = (utcnow_naive() - timedelta(seconds=120)).isoformat()
+    tracking["final_resolution_deadline"] = (utcnow_naive() - timedelta(seconds=30)).isoformat()
+    metadata["submission_tracking"] = tracking
+    row.metadata_json = metadata
+    db_session.add(row)
+    db_session.flush()
+
+    sync_result = sync_live_state(db_session, get_or_create_settings(db_session), symbol="BTCUSDT")
+    operational = build_operational_status_payload(
+        get_or_create_settings(db_session),
+        session=db_session,
+    )
+
+    assert sync_result["reconciliation_summary"]["unresolved_submission_badge"] is True
+    assert "BTCUSDT" in sync_result["reconciliation_summary"]["unresolved_submission_symbols"]
+    assert operational.can_enter_new_position is False
+    assert "UNRESOLVED_SUBMISSION_GUARD_ACTIVE" in operational.blocked_reasons
+
+
+def test_unresolved_submission_blocks_same_symbol_entry_before_exchange_call(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = TimeoutUnknownEntryClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    first = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=158,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    assert first["status"] == "submission_unknown"
+
+    def _unexpected_client(*args, **kwargs):
+        raise AssertionError("blocked path must not build exchange client")
+
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", _unexpected_client)
+    blocked = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=159,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert blocked["status"] == "blocked"
+    assert blocked["reason_codes"][0] in {"UNRESOLVED_SUBMISSION_GUARD_ACTIVE", "UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED"}
 
 
 def test_reduce_execution_uses_partial_take_profit_fraction_and_marks_metadata(monkeypatch, db_session) -> None:

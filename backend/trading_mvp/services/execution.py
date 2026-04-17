@@ -76,6 +76,7 @@ from trading_mvp.services.runtime_state import (
     TRADABLE_STATE,
     build_execution_dedupe_key,
     build_sync_freshness_summary,
+    clear_unresolved_submission_guard,
     clear_execution_lock,
     get_reconciliation_detail,
     get_user_stream_detail,
@@ -86,6 +87,7 @@ from trading_mvp.services.runtime_state import (
     mark_sync_issue,
     mark_sync_success,
     replace_user_stream_detail,
+    set_unresolved_submission_guard,
     set_reconciliation_detail,
     set_user_stream_detail,
     should_use_rest_order_reconciliation,
@@ -111,6 +113,11 @@ PROTECTION_VERIFY_BLOCKING_INTENT_TYPES = {"entry", "scale_in"}
 INACTIVE_PROTECTIVE_ORDER_STATUSES = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
 DUPLICATE_EXECUTION_SUPPRESSED_REASON_CODE = "DUPLICATE_EXECUTION_SUPPRESSED"
 UNKNOWN_SUBMISSION_REASON_CODE = "LIVE_ORDER_SUBMISSION_UNKNOWN"
+UNRESOLVED_SUBMISSION_GUARD_REASON_CODE = "UNRESOLVED_SUBMISSION_GUARD_ACTIVE"
+UNRESOLVED_SUBMISSION_DEADLINE_REASON_CODE = "UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED"
+UNRESOLVED_SUBMISSION_MAX_RECONCILE_ATTEMPTS = 6
+UNRESOLVED_SUBMISSION_RECONCILE_INTERVAL_SECONDS = 20
+UNRESOLVED_SUBMISSION_RESOLUTION_DEADLINE_SECONDS = 300
 POSITION_MODE_ONE_WAY = "one_way"
 POSITION_MODE_HEDGE = "hedge"
 POSITION_MODE_UNKNOWN = "unknown"
@@ -344,6 +351,10 @@ def _build_submission_tracking(
     last_submit_error: str | None = None,
     safe_retry_used: bool = False,
     recovered_via: str | None = None,
+    reconcile_attempt_count: int | None = None,
+    next_reconcile_at: datetime | None = None,
+    final_resolution_deadline: datetime | None = None,
+    unresolved_guard_active: bool | None = None,
 ) -> dict[str, Any]:
     tracking: dict[str, Any] = {
         "submission_state": submission_state,
@@ -356,8 +367,35 @@ def _build_submission_tracking(
         tracking["safe_retry_used"] = True
     if recovered_via:
         tracking["recovered_via"] = recovered_via
+    if reconcile_attempt_count is not None:
+        tracking["reconcile_attempt_count"] = max(int(reconcile_attempt_count), 0)
+    if next_reconcile_at is not None:
+        tracking["next_reconcile_at"] = next_reconcile_at.isoformat()
+    if final_resolution_deadline is not None:
+        tracking["final_resolution_deadline"] = final_resolution_deadline.isoformat()
+    if unresolved_guard_active is not None:
+        tracking["unresolved_guard_active"] = bool(unresolved_guard_active)
     tracking["updated_at"] = utcnow_naive().isoformat()
     return tracking
+
+
+def _entry_action_for_decision(decision: TradeDecision) -> str | None:
+    if decision.decision == "long":
+        return "long"
+    if decision.decision == "short":
+        return "short"
+    return None
+
+
+def _coerce_tracking_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 class OrderSubmissionUnknownError(RuntimeError):
@@ -2596,6 +2634,207 @@ def _create_submission_unknown_order_row(
     return row
 
 
+def _bounded_reconcile_submission_unknown_orders(
+    session: Session,
+    settings_row: Setting,
+    *,
+    client: BinanceClient,
+    symbol: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    observed_at = now or utcnow_naive()
+    query = select(Order).where(
+        Order.mode == "live",
+        Order.status == "pending",
+    )
+    if symbol:
+        query = query.where(Order.symbol == symbol.upper())
+    pending_rows = list(session.scalars(query))
+    unresolved_payloads: list[dict[str, Any]] = []
+    for row in pending_rows:
+        metadata = _as_object_dict(row.metadata_json)
+        tracking = _as_object_dict(metadata.get("submission_tracking"))
+        if str(tracking.get("submission_state") or "").lower() != "submit_unknown":
+            continue
+        action = "long" if row.side.lower() == "buy" else "short" if row.side.lower() == "sell" else row.side.lower()
+        if action not in {"long", "short"}:
+            action = "long"
+        attempts = int(tracking.get("reconcile_attempt_count") or 0)
+        next_reconcile_at = _coerce_tracking_datetime(tracking.get("next_reconcile_at"))
+        final_resolution_deadline = _coerce_tracking_datetime(tracking.get("final_resolution_deadline"))
+        if final_resolution_deadline is None:
+            final_resolution_deadline = observed_at + timedelta(seconds=UNRESOLVED_SUBMISSION_RESOLUTION_DEADLINE_SECONDS)
+        deadline_exceeded = observed_at >= final_resolution_deadline
+        attempt_budget_exhausted = attempts >= UNRESOLVED_SUBMISSION_MAX_RECONCILE_ATTEMPTS
+        should_attempt_lookup = (
+            not deadline_exceeded
+            and not attempt_budget_exhausted
+            and (next_reconcile_at is None or observed_at >= next_reconcile_at)
+        )
+
+        if should_attempt_lookup:
+            attempts += 1
+            exchange_order: dict[str, object] | None = None
+            reconcile_lookup_error: str | None = None
+            try:
+                exchange_order = _reconcile_unknown_submission(
+                    client,
+                    symbol=row.symbol,
+                    order_type=row.order_type,
+                    client_order_id=row.client_order_id or "",
+                )
+            except Exception as exc:
+                reconcile_lookup_error = _stringify_submit_error(exc)
+            if exchange_order is not None:
+                _upsert_exchange_order_row(
+                    session,
+                    symbol=row.symbol,
+                    requested_price=row.requested_price,
+                    requested_quantity=row.requested_quantity,
+                    order_type=row.order_type,
+                    side=row.side,
+                    exchange_order=exchange_order,
+                    decision_run_id=row.decision_run_id,
+                    risk_row=session.get(RiskCheck, row.risk_check_id) if row.risk_check_id is not None else None,
+                    reduce_only=row.reduce_only,
+                    close_only=row.close_only,
+                    parent_order_id=row.parent_order_id,
+                    updated_at=observed_at,
+                )
+                updated_tracking = _build_submission_tracking(
+                    submission_state="reconciled",
+                    client_order_id=row.client_order_id,
+                    submit_attempt_count=int(tracking.get("submit_attempt_count") or 0),
+                    last_submit_error=str(tracking.get("last_submit_error") or "") or None,
+                    safe_retry_used=bool(tracking.get("safe_retry_used", False)),
+                    recovered_via="bounded_reconcile_loop",
+                    reconcile_attempt_count=attempts,
+                    unresolved_guard_active=False,
+                )
+                metadata["submission_tracking"] = updated_tracking
+                row.metadata_json = metadata
+                row.reason_codes = [code for code in row.reason_codes if code not in {UNKNOWN_SUBMISSION_REASON_CODE, UNRESOLVED_SUBMISSION_DEADLINE_REASON_CODE}]
+                clear_unresolved_submission_guard(settings_row, symbol=row.symbol, action=action)
+                record_audit_event(
+                    session,
+                    event_type="live_order_submission_recovered",
+                    entity_type="order",
+                    entity_id=str(row.id),
+                    severity="info",
+                    message="Submission-unknown order was recovered by bounded reconcile loop.",
+                    payload={
+                        "symbol": row.symbol,
+                        "client_order_id": row.client_order_id,
+                        "reconcile_attempt_count": attempts,
+                        "recovered_via": "bounded_reconcile_loop",
+                    },
+                )
+                continue
+            next_reconcile_at = observed_at + timedelta(seconds=UNRESOLVED_SUBMISSION_RECONCILE_INTERVAL_SECONDS)
+            if reconcile_lookup_error:
+                tracking["last_submit_error"] = reconcile_lookup_error
+        else:
+            next_reconcile_at = next_reconcile_at or (observed_at + timedelta(seconds=UNRESOLVED_SUBMISSION_RECONCILE_INTERVAL_SECONDS))
+
+        deadline_exceeded = observed_at >= final_resolution_deadline
+        attempt_budget_exhausted = attempts >= UNRESOLVED_SUBMISSION_MAX_RECONCILE_ATTEMPTS
+        guard_payload = {
+            "guard_active": True,
+            "guard_reason_code": (
+                UNRESOLVED_SUBMISSION_DEADLINE_REASON_CODE
+                if (deadline_exceeded or attempt_budget_exhausted)
+                else UNRESOLVED_SUBMISSION_GUARD_REASON_CODE
+            ),
+            "order_id": row.id,
+            "client_order_id": row.client_order_id,
+            "final_resolution_deadline": final_resolution_deadline.isoformat(),
+            "next_reconcile_at": next_reconcile_at.isoformat() if next_reconcile_at is not None else None,
+            "reconcile_attempt_count": attempts,
+            "updated_at": observed_at.isoformat(),
+        }
+        set_unresolved_submission_guard(
+            settings_row,
+            symbol=row.symbol,
+            action=action,
+            payload=guard_payload,
+        )
+        tracking.update(
+            {
+                "submission_state": "submit_unknown",
+                "reconcile_attempt_count": attempts,
+                "next_reconcile_at": next_reconcile_at.isoformat() if next_reconcile_at is not None else None,
+                "final_resolution_deadline": final_resolution_deadline.isoformat(),
+                "unresolved_guard_active": True,
+                "updated_at": observed_at.isoformat(),
+            }
+        )
+        metadata["submission_tracking"] = tracking
+        row.metadata_json = metadata
+        if UNKNOWN_SUBMISSION_REASON_CODE not in row.reason_codes:
+            row.reason_codes = [*row.reason_codes, UNKNOWN_SUBMISSION_REASON_CODE]
+        if deadline_exceeded or attempt_budget_exhausted:
+            if UNRESOLVED_SUBMISSION_DEADLINE_REASON_CODE not in row.reason_codes:
+                row.reason_codes = [*row.reason_codes, UNRESOLVED_SUBMISSION_DEADLINE_REASON_CODE]
+            if not tracking.get("deadline_notified_at"):
+                tracking["deadline_notified_at"] = observed_at.isoformat()
+                record_audit_event(
+                    session,
+                    event_type="live_order_submission_unresolved_guarded",
+                    entity_type="order",
+                    entity_id=str(row.id),
+                    severity="warning",
+                    message="Submission-unknown order exceeded bounded reconcile window and entry guard remains active.",
+                    payload={
+                        "symbol": row.symbol,
+                        "client_order_id": row.client_order_id,
+                        "reconcile_attempt_count": attempts,
+                        "final_resolution_deadline": final_resolution_deadline.isoformat(),
+                    },
+                )
+                record_health_event(
+                    session,
+                    component="live_sync",
+                    status="degraded",
+                    message="Submission-unknown order remained unresolved after bounded reconcile attempts.",
+                    payload={
+                        "symbol": row.symbol,
+                        "order_id": row.id,
+                        "client_order_id": row.client_order_id,
+                        "reconcile_attempt_count": attempts,
+                    },
+                )
+
+        unresolved_payloads.append(
+            {
+                "order_id": row.id,
+                "symbol": row.symbol,
+                "action": action,
+                "client_order_id": row.client_order_id,
+                "reconcile_attempt_count": attempts,
+                "next_reconcile_at": next_reconcile_at.isoformat() if next_reconcile_at is not None else None,
+                "final_resolution_deadline": final_resolution_deadline.isoformat(),
+                "deadline_exceeded": deadline_exceeded or attempt_budget_exhausted,
+                "guard_reason_code": guard_payload["guard_reason_code"],
+            }
+        )
+        session.add(row)
+
+    guards = list_unresolved_submission_guards(settings_row, symbol=symbol)
+    active_symbols = sorted(
+        {
+            str(item.get("symbol") or "").upper()
+            for item in guards
+            if bool(item.get("guard_active"))
+        }
+    )
+    return {
+        "unresolved_submission_badge": bool(guards),
+        "unresolved_submission_count": len(guards),
+        "unresolved_submission_symbols": active_symbols,
+        "unresolved_submissions": unresolved_payloads or [dict(item) for item in guards],
+    }
+
+
 def _build_deterministic_client_order_id(
     *,
     seed: str | None,
@@ -4560,6 +4799,13 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
     mode_guard_reason_code = _position_mode_guard_reason_code(position_mode)
     stream_fallback_active = str(user_stream_summary.get("status") or "") != "connected"
     reconcile_source = "rest_polling_fallback" if stream_fallback_active else "user_stream_primary"
+    unresolved_submission_summary = _bounded_reconcile_submission_unknown_orders(
+        session,
+        settings_row,
+        client=client,
+        symbol=symbol,
+        now=reconcile_started_at,
+    )
     set_reconciliation_detail(
         settings_row,
         status="running",
@@ -4572,6 +4818,18 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         position_mode_source=position_mode_source,
         position_mode_checked_at=reconcile_started_at,
         enabled_symbols=symbols,
+        unresolved_submission_badge=bool(unresolved_submission_summary.get("unresolved_submission_badge", False)),
+        unresolved_submission_count=int(unresolved_submission_summary.get("unresolved_submission_count") or 0),
+        unresolved_submission_symbols=[
+            str(item)
+            for item in unresolved_submission_summary.get("unresolved_submission_symbols", [])
+            if item
+        ],
+        unresolved_submissions=[
+            dict(item)
+            for item in unresolved_submission_summary.get("unresolved_submissions", [])
+            if isinstance(item, dict)
+        ],
     )
     session.add(settings_row)
     session.flush()
@@ -4945,6 +5203,18 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
         enabled_symbols=symbols,
         guarded_symbols=list(dict.fromkeys(guarded_symbols)),
         symbol_states=symbol_states,
+        unresolved_submission_badge=bool(unresolved_submission_summary.get("unresolved_submission_badge", False)),
+        unresolved_submission_count=int(unresolved_submission_summary.get("unresolved_submission_count") or 0),
+        unresolved_submission_symbols=[
+            str(item)
+            for item in unresolved_submission_summary.get("unresolved_submission_symbols", [])
+            if item
+        ],
+        unresolved_submissions=[
+            dict(item)
+            for item in unresolved_submission_summary.get("unresolved_submissions", [])
+            if isinstance(item, dict)
+        ],
     )
     session.add(settings_row)
     session.flush()
@@ -5402,6 +5672,38 @@ def _execute_live_trade_body(
 
     if decision.decision == "hold":
         return {"status": "skipped", "reason_codes": ["HOLD_DECISION"], "rollout_mode": rollout_mode}
+
+    entry_action = _entry_action_for_decision(decision)
+    if entry_action is not None:
+        unresolved_guard = get_unresolved_submission_guard(
+            settings_row,
+            symbol=decision.symbol,
+            action=entry_action,
+        )
+        if unresolved_guard is not None and bool(unresolved_guard.get("guard_active", True)):
+            reason_code = str(unresolved_guard.get("guard_reason_code") or UNRESOLVED_SUBMISSION_GUARD_REASON_CODE)
+            record_audit_event(
+                session,
+                event_type="live_execution_blocked",
+                entity_type="decision_run",
+                entity_id=str(decision_run_id or decision.symbol),
+                severity="warning",
+                message="Live execution skipped because unresolved submission guard is active for this symbol/action.",
+                payload={
+                    "symbol": decision.symbol,
+                    "decision": decision.decision,
+                    "reason_code": reason_code,
+                    "unresolved_submission_guard": unresolved_guard,
+                },
+                correlation_ids=execution_correlation_ids,
+            )
+            session.flush()
+            return {
+                "status": "blocked",
+                "reason_codes": [reason_code],
+                "decision": decision.decision,
+                "unresolved_submission_guard": unresolved_guard,
+            }
 
     if rollout_mode == "shadow":
         latest_pnl = get_latest_pnl_snapshot(session, settings_row)
@@ -5884,6 +6186,17 @@ def _execute_live_trade_body(
             "exchange_filter_detail": exc.detail,
         }
     except OrderSubmissionUnknownError as exc:
+        submission_tracking = dict(exc.submission_tracking)
+        now = utcnow_naive()
+        submission_tracking["reconcile_attempt_count"] = 0
+        submission_tracking["next_reconcile_at"] = (
+            now + timedelta(seconds=UNRESOLVED_SUBMISSION_RECONCILE_INTERVAL_SECONDS)
+        ).isoformat()
+        submission_tracking["final_resolution_deadline"] = (
+            now + timedelta(seconds=UNRESOLVED_SUBMISSION_RESOLUTION_DEADLINE_SECONDS)
+        ).isoformat()
+        submission_tracking["unresolved_guard_active"] = True
+        submission_tracking["updated_at"] = now.isoformat()
         order = _create_submission_unknown_order_row(
             session,
             symbol=decision.symbol,
@@ -5897,7 +6210,7 @@ def _execute_live_trade_body(
             close_only=decision.decision == "exit",
             client_order_id=exc.client_order_id,
             submit_request=exc.submit_request,
-            submission_tracking=exc.submission_tracking,
+            submission_tracking=submission_tracking,
             metadata_json={
                 "error": str(exc),
                 "intent_type": intent_type,
@@ -5909,12 +6222,29 @@ def _execute_live_trade_body(
         payload = {
             "symbol": decision.symbol,
             "client_order_id": exc.client_order_id,
-            "submission_tracking": exc.submission_tracking,
+            "submission_tracking": submission_tracking,
             "intent_type": intent_type,
             "requested_quantity": normalized_quantity,
             "requested_price": execution_price,
             "execution_policy": execution_plan.to_payload(),
         }
+        guard_action = _entry_action_for_decision(decision)
+        if guard_action is not None:
+            set_unresolved_submission_guard(
+                settings_row,
+                symbol=decision.symbol,
+                action=guard_action,
+                payload={
+                    "guard_active": True,
+                    "guard_reason_code": UNRESOLVED_SUBMISSION_GUARD_REASON_CODE,
+                    "order_id": order.id,
+                    "client_order_id": exc.client_order_id,
+                    "reconcile_attempt_count": 0,
+                    "next_reconcile_at": submission_tracking.get("next_reconcile_at"),
+                    "final_resolution_deadline": submission_tracking.get("final_resolution_deadline"),
+                    "updated_at": submission_tracking.get("updated_at"),
+                },
+            )
         create_alert(
             session,
             category="execution",
@@ -5947,9 +6277,9 @@ def _execute_live_trade_body(
             "status": "submission_unknown",
             "reason_codes": [UNKNOWN_SUBMISSION_REASON_CODE],
             "client_order_id": exc.client_order_id,
-            "submission_state": exc.submission_tracking.get("submission_state"),
-            "submit_attempt_count": exc.submission_tracking.get("submit_attempt_count"),
-            "last_submit_error": exc.submission_tracking.get("last_submit_error"),
+            "submission_state": submission_tracking.get("submission_state"),
+            "submit_attempt_count": submission_tracking.get("submit_attempt_count"),
+            "last_submit_error": submission_tracking.get("last_submit_error"),
             "intent_type": intent_type,
             "execution_policy": execution_plan.to_payload(),
         }
@@ -6367,3 +6697,5 @@ def _execute_live_trade_body(
             "metadata": position_management_payload,
         },
     }
+    get_unresolved_submission_guard,
+    list_unresolved_submission_guards,
