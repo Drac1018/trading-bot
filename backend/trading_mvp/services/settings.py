@@ -1397,8 +1397,7 @@ def disarm_live_execution(session: Session) -> Setting:
 def estimate_monthly_ai_calls(settings_row: Setting, *, assume_enabled: bool = False) -> tuple[int, dict[str, int]]:
     breakdown = {
         "trading_decision": 0,
-        "integration_planner": 0,
-        "ui_ux": 0,
+        "chief_review": 0,
     }
     if settings_row.ai_provider != "openai" or not (assume_enabled or settings_row.ai_enabled):
         return 0, breakdown
@@ -1411,10 +1410,7 @@ def estimate_monthly_ai_calls(settings_row: Setting, *, assume_enabled: bool = F
             int(effective.ai_call_interval_minutes),
         )
         breakdown["trading_decision"] += MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1)
-    if "4h" in settings_row.schedule_windows:
-        breakdown["integration_planner"] = 30 * 6
-    if "12h" in settings_row.schedule_windows:
-        breakdown["ui_ux"] = 30 * 2
+        breakdown["chief_review"] += MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1)
     return sum(breakdown.values()), breakdown
 
 

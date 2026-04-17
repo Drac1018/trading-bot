@@ -11,20 +11,15 @@ from trading_mvp.models import (
     Alert,
     Position,
     SystemHealthEvent,
-    UIFeedback,
 )
 from trading_mvp.providers import ProviderResult, StructuredModelProvider
 from trading_mvp.schemas import (
     AgentRunRecord,
     ChiefReviewSummary,
     FeaturePayload,
-    IntegrationSuggestion,
-    IntegrationSuggestionBatch,
     MarketSnapshotPayload,
     RiskCheckResult,
     TradeDecision,
-    UXSuggestion,
-    UXSuggestionBatch,
 )
 from trading_mvp.services.adaptive_signal import compute_adaptive_adjustment
 from trading_mvp.time_utils import utcnow_naive
@@ -1174,134 +1169,3 @@ class ChiefReviewAgent:
         except Exception as exc:
             return baseline, "deterministic-mock", {"source": "llm_fallback", "error": str(exc)}
 
-
-class IntegrationPlannerAgent:
-    def __init__(self, provider: StructuredModelProvider) -> None:
-        self.provider = provider
-
-    def _deterministic_output(
-        self,
-        metrics_summary: dict[str, Any],
-        health_events: list[SystemHealthEvent],
-    ) -> IntegrationSuggestionBatch:
-        issues = [event.message for event in health_events if event.status not in {"ok", "healthy"}]
-        items = [
-            IntegrationSuggestion(
-                title="리스크 차단 사유 집계 자동화",
-                integration_point="scheduler -> risk_checks -> alerts",
-                description="차단 사유 상위 패턴을 정리해 운영 병목을 빠르게 찾습니다.",
-                automation_opportunity="4시간마다 차단 사유 상위 3개 요약 생성",
-                tech_debt_item="차단 및 실행 흐름의 집계 지표 보강",
-                priority="high",
-            ),
-            IntegrationSuggestion(
-                title="실행 슬리피지 추적 카드 강화",
-                integration_point="executions -> dashboard overview",
-                description="종이매매 체결 품질을 실거래 전환 전에 더 빠르게 확인합니다.",
-                automation_opportunity="슬리피지 상한 초과 시 즉시 경고 생성",
-                tech_debt_item="실행 지표의 상단 요약 카드 부족",
-                priority="medium",
-            ),
-        ]
-        if issues:
-            items.append(
-                IntegrationSuggestion(
-                    title="시스템 상태 이벤트 기반 복구 가이드 연결",
-                    integration_point="system_health_events -> agents",
-                    description="문제 이벤트가 발생하면 관련 운영 점검 항목을 바로 보여줍니다.",
-                    automation_opportunity="이상 이벤트별 점검 체크리스트 자동 첨부",
-                    tech_debt_item="장애 대응 문맥 링크 부족",
-                    priority="high",
-                )
-            )
-        return IntegrationSuggestionBatch(items=items)
-
-    def run(
-        self,
-        metrics_summary: dict[str, Any],
-        health_events: list[SystemHealthEvent],
-        *,
-        use_ai: bool,
-    ) -> tuple[IntegrationSuggestionBatch, str, dict[str, Any]]:
-        baseline = self._deterministic_output(metrics_summary, health_events)
-        if not use_ai:
-            return baseline, "deterministic-mock", {"source": "deterministic"}
-        try:
-            provider_result = self.provider.generate(
-                AgentRole.INTEGRATION_PLANNER.value,
-                {
-                    "metrics_summary": metrics_summary,
-                    "health_events": [
-                        {"component": event.component, "status": event.status, "message": event.message}
-                        for event in health_events[:10]
-                    ],
-                    "deterministic_baseline": baseline.model_dump(mode="json"),
-                },
-                response_model=IntegrationSuggestionBatch,
-                instructions="Return 2 to 4 actionable integration suggestions. Prioritize observability and automation.",
-            )
-            result = IntegrationSuggestionBatch.model_validate(provider_result.output)
-            return result, provider_result.provider, _provider_metadata(provider_result, source="llm")
-        except Exception as exc:
-            return baseline, "deterministic-mock", {"source": "llm_fallback", "error": str(exc)}
-
-
-class UIUXAgent:
-    def __init__(self, provider: StructuredModelProvider) -> None:
-        self.provider = provider
-
-    def _deterministic_output(self, feedback_rows: list[UIFeedback]) -> UXSuggestionBatch:
-        pages = {row.page for row in feedback_rows}
-        items = [
-            UXSuggestion(
-                page="overview",
-                title="추천과 승인 실행의 시각적 분리 강화",
-                suggestion="AI 추천과 리스크 승인 결과를 더 명확히 분리해 오판을 줄입니다.",
-                severity="high",
-                improved_copy="AI 추천은 참고 정보이며 실제 실행은 리스크 엔진 승인 후에만 반영됩니다.",
-            ),
-            UXSuggestion(
-                page="risk",
-                title="HOLD 사유 상단 요약 카드 추가",
-                suggestion="차단 사유를 페이지 상단에서 바로 읽을 수 있게 요약합니다.",
-                severity="medium",
-                improved_copy="현재 HOLD 상태입니다. 차단 사유를 먼저 해소한 뒤 다음 평가를 기다려 주세요.",
-            ),
-        ]
-        if "settings" in pages:
-            items.append(
-                UXSuggestion(
-                    page="settings",
-                    title="연결 테스트 결과 요약 문구 보강",
-                    suggestion="API 키 저장 여부와 마지막 연결 결과를 한눈에 보여줍니다.",
-                    severity="medium",
-                    improved_copy="저장된 키는 마스킹 처리되며, 연결 테스트는 현재 입력값 또는 저장값 기준으로 실행됩니다.",
-                )
-            )
-        return UXSuggestionBatch(items=items)
-
-    def run(self, feedback_rows: list[UIFeedback], *, use_ai: bool) -> tuple[UXSuggestionBatch, str, dict[str, Any]]:
-        baseline = self._deterministic_output(feedback_rows)
-        if not use_ai:
-            return baseline, "deterministic-mock", {"source": "deterministic"}
-        try:
-            provider_result = self.provider.generate(
-                AgentRole.UI_UX.value,
-                {
-                    "feedback_rows": [
-                        {
-                            "page": row.page,
-                            "sentiment": row.sentiment,
-                            "feedback": row.feedback,
-                        }
-                        for row in feedback_rows[:12]
-                    ],
-                    "deterministic_baseline": baseline.model_dump(mode="json"),
-                },
-                response_model=UXSuggestionBatch,
-                instructions="Return concise UI/UX suggestions for an internal trading dashboard. No deployment actions.",
-            )
-            result = UXSuggestionBatch.model_validate(provider_result.output)
-            return result, provider_result.provider, _provider_metadata(provider_result, source="llm")
-        except Exception as exc:
-            return baseline, "deterministic-mock", {"source": "llm_fallback", "error": str(exc)}

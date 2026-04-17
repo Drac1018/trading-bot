@@ -6,7 +6,7 @@ import { AIUsagePanel } from "./ai-usage-panel";
 import { formatDisplayValue } from "../lib/ui-copy";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const scheduleOptions = ["1h", "4h", "12h", "24h"] as const;
+const scheduleOptions = ["1h"] as const;
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기", "AI 설정", "Binance 연동"] as const;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;

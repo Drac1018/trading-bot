@@ -16,7 +16,7 @@ from trading_mvp.services.settings import (
 )
 from trading_mvp.time_utils import utcnow_naive
 
-WINDOW_HOURS = {"1h": 1, "4h": 4, "12h": 12, "24h": 24}
+WINDOW_HOURS = {"1h": 1}
 
 EXCHANGE_SYNC_WORKFLOW = "exchange_sync_cycle"
 MARKET_REFRESH_WORKFLOW = "market_refresh_cycle"
@@ -142,6 +142,13 @@ def run_window(session: Session, window: str, triggered_by: str = "manual") -> d
         orchestrator.settings_row,
         trigger_source=f"{triggered_by}:{window}",
     )
+    if window not in WINDOW_HOURS:
+        return {
+            "window": window,
+            "status": "disabled",
+            "reason": "REVIEW_WINDOW_DISABLED_OUT_OF_SCOPE",
+            "auto_resume": auto_resume_result,
+        }
     if window == "1h":
         outcome = orchestrator.run_market_refresh_cycle(
             trigger_event=triggered_by,
@@ -177,37 +184,12 @@ def run_window(session: Session, window: str, triggered_by: str = "manual") -> d
             "auto_resume": auto_resume_result,
         }
 
-    row = _start_scheduler_run(
-        session,
-        workflow="scheduled_review",
-        schedule_window=window,
-        triggered_by=triggered_by,
-        next_run_at=_next_window_run(window),
-    )
-    try:
-        if window == "4h":
-            outcome = orchestrator.run_integration_review()
-        elif window == "12h":
-            outcome = orchestrator.run_ui_review()
-        elif window == "24h":
-            outcome = orchestrator.run_daily_review_window()
-        else:
-            raise RuntimeError(f"Unsupported window {window}")
-    except Exception as exc:
-        return _finish_scheduler_run(
-            session,
-            row=row,
-            success=False,
-            message=f"{window} scheduled workflow failed.",
-            payload={"window": window, "error": str(exc)},
-        )
-    return _finish_scheduler_run(
-        session,
-        row=row,
-        success=True,
-        message=f"{window} scheduled workflow completed.",
-        payload={**outcome, "window": window, "auto_resume": auto_resume_result},
-    )
+    return {
+        "window": window,
+        "status": "skipped",
+        "reason": "AI_DISABLED",
+        "auto_resume": auto_resume_result,
+    }
 
 
 def is_exchange_sync_due(session: Session) -> bool:
@@ -559,22 +541,5 @@ def run_due_operational_cycles(session: Session) -> list[dict[str, object]]:
 
 
 def run_due_windows(session: Session) -> list[dict[str, object]]:
-    settings_row = get_or_create_settings(session)
-    outputs: list[dict[str, object]] = []
-    if not settings_row.ai_enabled:
-        return outputs
-    for window in settings_row.schedule_windows:
-        if window == "1h":
-            continue
-        latest = session.scalar(
-            select(SchedulerRun)
-            .where(
-                SchedulerRun.schedule_window == window,
-                SchedulerRun.workflow == "scheduled_review",
-            )
-            .order_by(desc(SchedulerRun.created_at))
-            .limit(1)
-        )
-        if latest is None or latest.next_run_at is None or latest.next_run_at <= utcnow_naive():
-            outputs.append(run_window(session, window, triggered_by="scheduler"))
-    return outputs
+    # Out-of-scope auxiliary review workflows are disabled for current live-core scope.
+    return []

@@ -269,12 +269,12 @@ def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
                 created_at=now - timedelta(hours=1),
             ),
             AgentRun(
-                role="integration_planner",
-                trigger_event="scheduled_review",
-                schema_name="IntegrationSuggestionBatch",
+                role="chief_review",
+                trigger_event="realtime_cycle",
+                schema_name="ChiefReviewSummary",
                 status="completed",
                 provider_name="openai",
-                summary="planner success",
+                summary="chief success",
                 input_payload={},
                 output_payload={},
                 metadata_json={
@@ -294,7 +294,10 @@ def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
     assert serialized["recent_ai_successes_24h"] == 1
     assert serialized["recent_ai_failures_24h"] == 1
     assert serialized["recent_ai_tokens_24h"]["total_tokens"] == 120
-    assert serialized["recent_ai_role_calls_7d"]["integration_planner"] == 1
+    assert serialized["recent_ai_role_calls_7d"]["chief_review"] == 1
+    assert "integration_planner" not in serialized["estimated_monthly_ai_calls_breakdown"]
+    assert "ui_ux" not in serialized["estimated_monthly_ai_calls_breakdown"]
+    assert serialized["estimated_monthly_ai_calls_breakdown"]["chief_review"] > 0
     assert "BAD_REQUEST x1" in serialized["recent_ai_failure_reasons"]
     assert serialized["observed_monthly_ai_calls_projection"] == 60
 
@@ -705,5 +708,26 @@ def test_health_endpoint_uses_lifespan_startup(tmp_path, monkeypatch) -> None:
             payload = response.json()
             assert payload["status"] == "ok"
             assert payload["database"] == "ready"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_review_api_rejects_out_of_scope_windows(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'review_api.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/reviews/24h")
+            assert response.status_code == 400
+            assert "Only 1h review window is enabled" in response.json()["detail"]
     finally:
         app.dependency_overrides.clear()
