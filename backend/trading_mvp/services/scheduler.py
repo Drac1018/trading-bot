@@ -670,6 +670,16 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         trigger_payload = plan.get("trigger") if isinstance(plan.get("trigger"), dict) else None
         next_ai_review_due_at = plan.get("next_ai_review_due_at")
         last_ai_invoked_at = plan.get("last_ai_invoked_at")
+        last_material_review_at = plan.get("last_material_review_at")
+        dedupe_reason = str(plan.get("dedupe_reason") or "") or None
+        forced_review_reason = str(plan.get("forced_review_reason") or "") or None
+        fingerprint_changed_fields = (
+            list(plan.get("fingerprint_changed_fields"))
+            if isinstance(plan.get("fingerprint_changed_fields"), list)
+            else list(trigger_payload.get("fingerprint_changed_fields") or [])
+            if isinstance(trigger_payload, dict)
+            else []
+        )
         last_ai_skip_reason = str(plan.get("last_ai_skip_reason") or "") or None
         try:
             if trigger_payload is None:
@@ -684,6 +694,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "symbol": effective.symbol,
                         "cadence": cadence_profile,
                         "next_ai_review_due_at": next_ai_review_due_at,
+                        "last_material_review_at": last_material_review_at,
                     },
                 )
                 results.append(
@@ -702,6 +713,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "next_ai_review_due_at": next_ai_review_due_at,
                             "trigger_deduped": False,
                             "trigger_fingerprint": None,
+                            "fingerprint_changed_fields": [],
+                            "dedupe_reason": None,
+                            "last_material_review_at": last_material_review_at,
+                            "forced_review_reason": None,
                             "last_ai_skip_reason": last_ai_skip_reason or "NO_EVENT",
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
@@ -721,6 +736,8 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "symbol": effective.symbol,
                         "trigger": trigger_payload,
                         "next_ai_review_due_at": next_ai_review_due_at,
+                        "dedupe_reason": dedupe_reason,
+                        "last_material_review_at": last_material_review_at,
                     },
                 )
                 results.append(
@@ -739,6 +756,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "next_ai_review_due_at": next_ai_review_due_at,
                             "trigger_deduped": True,
                             "trigger_fingerprint": trigger_payload.get("trigger_fingerprint"),
+                            "fingerprint_changed_fields": fingerprint_changed_fields,
+                            "dedupe_reason": dedupe_reason or "TRIGGER_FINGERPRINT_UNCHANGED",
+                            "last_material_review_at": last_material_review_at,
+                            "forced_review_reason": forced_review_reason,
                             "last_ai_skip_reason": last_ai_skip_reason or "TRIGGER_DEDUPED",
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
@@ -758,6 +779,8 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "symbol": effective.symbol,
                         "trigger": trigger_payload,
                         "next_ai_review_due_at": next_ai_review_due_at,
+                        "forced_review_reason": forced_review_reason,
+                        "last_material_review_at": last_material_review_at,
                     },
                 )
             outcome = orchestrator.run_decision_cycle(

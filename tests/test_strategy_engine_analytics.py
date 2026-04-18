@@ -317,6 +317,8 @@ def test_ai_prior_context_builder_consumes_engine_bucket_analytics(db_session) -
         ),
         strategy_engine="trend_pullback_engine",
     )
+    uncached_debug: dict[str, object] = {}
+    cached_debug: dict[str, object] = {}
     prior_context = build_ai_prior_context(
         db_session,
         ai_context=ai_context,
@@ -335,9 +337,35 @@ def test_ai_prior_context_builder_consumes_engine_bucket_analytics(db_session) -
                 }
             },
         },
+        use_cache=False,
+        debug_collector=uncached_debug,
+    )
+    cached_prior_context = build_ai_prior_context(
+        db_session,
+        ai_context=ai_context,
+        selection_context={
+            "scenario": "pullback_entry",
+            "entry_mode": "pullback_confirm",
+            "execution_policy_profile": "entry_btc_fast_calm",
+            "regime_summary": {
+                "primary_regime": "bullish",
+                "trend_alignment": "bullish_aligned",
+            },
+            "strategy_engine_context": {
+                "session_context": {
+                    "session_label": "asia",
+                    "time_of_day_bucket": "utc_00_05",
+                }
+            },
+        },
+        use_cache=True,
+        debug_collector=cached_debug,
     )
 
     assert prior_context.engine_prior_available is True
     assert prior_context.engine_prior_classification == "strong"
     assert prior_context.engine_prior_sample_count == 3
     assert prior_context.engine_expectancy_hint is not None
+    assert prior_context.model_dump(mode="json") == cached_prior_context.model_dump(mode="json")
+    assert uncached_debug["prior_read_path"] == "full_report"
+    assert cached_debug["prior_read_path"] == "cache_miss"

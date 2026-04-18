@@ -231,6 +231,7 @@ def _seed_engine_trade(
     )
     db_session.add(execution)
     db_session.flush()
+    return decision_row
 
 
 def _seed_efficiency_trade(
@@ -458,6 +459,252 @@ def test_strong_engine_prior_surfaces_in_context(db_session) -> None:
     assert prior_context.engine_prior_sample_count == 3
     assert prior_context.engine_expectancy_hint is not None
     assert prior_context.expected_payoff_efficiency_hint_summary["engine_time_to_profit_hint_minutes"] is not None
+
+
+def test_prior_cache_equivalence_and_paths(db_session) -> None:
+    now = utcnow_naive() - timedelta(hours=10)
+    for offset_hours, pnl in ((0, 14.0), (2, 9.0), (4, 11.0)):
+        _seed_engine_trade(
+            db_session,
+            created_at=now + timedelta(hours=offset_hours),
+            strategy_engine="trend_pullback_engine",
+            session_label="asia",
+            time_of_day_bucket="utc_00_05",
+            net_pnl_after_fees=pnl,
+            signed_slippage_bps=4.0,
+            time_to_profit_minutes=16.0 + offset_hours,
+            drawdown_impact=0.22,
+        )
+        _seed_efficiency_trade(
+            db_session,
+            created_at=now + timedelta(hours=offset_hours, minutes=30),
+            gross_pnl=pnl + 1.0,
+            fee_total=1.0,
+            time_to_0_25r_minutes=18.0,
+            time_to_0_5r_minutes=32.0,
+            time_to_fail_minutes=None,
+            reached_0_25r=True,
+            reached_0_5r=True,
+            failed_before_0_25r=False,
+        )
+
+    selection_context = {
+        "scenario": "pullback_entry",
+        "entry_mode": "pullback_confirm",
+        "execution_policy_profile": "entry_btc_fast_calm",
+        "regime_summary": {
+            "primary_regime": "bullish",
+            "trend_alignment": "bullish_aligned",
+        },
+        "strategy_engine_context": {
+            "session_context": {
+                "session_label": "asia",
+                "time_of_day_bucket": "utc_00_05",
+            }
+        },
+    }
+    uncached_debug: dict[str, object] = {}
+    cached_debug_first: dict[str, object] = {}
+    cached_debug_second: dict[str, object] = {}
+
+    uncached = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=False,
+        debug_collector=uncached_debug,
+    )
+    cached_first = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=True,
+        debug_collector=cached_debug_first,
+    )
+    cached_second = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=True,
+        debug_collector=cached_debug_second,
+    )
+
+    assert uncached.model_dump(mode="json") == cached_first.model_dump(mode="json")
+    assert cached_first.model_dump(mode="json") == cached_second.model_dump(mode="json")
+    assert uncached_debug["prior_read_path"] == "full_report"
+    assert uncached_debug["cache_applied"] is False
+    assert uncached_debug["cache_fallback_used"] is False
+    assert cached_debug_first["prior_read_path"] == "cache_miss"
+    assert cached_debug_first["cache_applied"] is True
+    assert cached_debug_first["cache_fallback_used"] is False
+    assert cached_debug_second["prior_read_path"] == "cache_hit"
+    assert cached_debug_second["cache_applied"] is True
+    assert cached_debug_second["cache_fallback_used"] is False
+
+
+def test_prior_cache_fallback_full_read_keeps_output(db_session) -> None:
+    now = utcnow_naive() - timedelta(hours=10)
+    for offset_hours, pnl in ((0, 14.0), (2, 9.0), (4, 11.0)):
+        _seed_engine_trade(
+            db_session,
+            created_at=now + timedelta(hours=offset_hours),
+            strategy_engine="trend_pullback_engine",
+            session_label="asia",
+            time_of_day_bucket="utc_00_05",
+            net_pnl_after_fees=pnl,
+            signed_slippage_bps=4.0,
+            time_to_profit_minutes=16.0 + offset_hours,
+            drawdown_impact=0.22,
+        )
+
+    selection_context = {
+        "scenario": "pullback_entry",
+        "entry_mode": "pullback_confirm",
+        "execution_policy_profile": "entry_btc_fast_calm",
+        "regime_summary": {
+            "primary_regime": "bullish",
+            "trend_alignment": "bullish_aligned",
+        },
+        "strategy_engine_context": {
+            "session_context": {
+                "session_label": "asia",
+                "time_of_day_bucket": "utc_00_05",
+            }
+        },
+    }
+    uncached_debug: dict[str, object] = {}
+    fallback_debug: dict[str, object] = {}
+
+    uncached = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=False,
+        debug_collector=uncached_debug,
+    )
+    db_session.info["ai_prior_context_report_cache_v1"] = "corrupted"
+    fallback = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=True,
+        debug_collector=fallback_debug,
+    )
+
+    assert uncached.model_dump(mode="json") == fallback.model_dump(mode="json")
+    assert fallback_debug["prior_read_path"] == "fallback_full_read"
+    assert fallback_debug["cache_applied"] is False
+    assert fallback_debug["cache_fallback_used"] is True
+
+
+def test_prior_cache_preserves_non_entry_exclusion(db_session) -> None:
+    now = utcnow_naive() - timedelta(hours=10)
+    for offset_hours, pnl in ((0, 14.0), (2, 9.0), (4, 11.0)):
+        _seed_engine_trade(
+            db_session,
+            created_at=now + timedelta(hours=offset_hours),
+            strategy_engine="trend_pullback_engine",
+            session_label="asia",
+            time_of_day_bucket="utc_00_05",
+            net_pnl_after_fees=pnl,
+            signed_slippage_bps=4.0,
+            time_to_profit_minutes=16.0 + offset_hours,
+            drawdown_impact=0.22,
+        )
+    management_row = _seed_engine_trade(
+        db_session,
+        created_at=now + timedelta(hours=6),
+        strategy_engine="protection_reduce_engine",
+        session_label="asia",
+        time_of_day_bucket="utc_00_05",
+        net_pnl_after_fees=6.0,
+        signed_slippage_bps=2.0,
+        time_to_profit_minutes=12.0,
+        drawdown_impact=0.1,
+    )
+    management_row.output_payload = {
+        **management_row.output_payload,
+        "decision": "long",
+        "entry_mode": "immediate",
+        "rationale_codes": ["PROTECTION_RESTORE"],
+    }
+    management_row.metadata_json = {
+        **management_row.metadata_json,
+        "strategy_engine": {
+            "selected_engine": {
+                "engine_name": "protection_reduce_engine",
+                "scenario": "protection_restore",
+                "decision_hint": "long",
+                "entry_mode": "immediate",
+                "eligible": True,
+            },
+            "session_context": {
+                "session_label": "asia",
+                "time_of_day_bucket": "utc_00_05",
+            },
+        },
+    }
+    db_session.add(management_row)
+    db_session.flush()
+
+    selection_context = {
+        "scenario": "pullback_entry",
+        "entry_mode": "pullback_confirm",
+        "execution_policy_profile": "entry_btc_fast_calm",
+        "regime_summary": {
+            "primary_regime": "bullish",
+            "trend_alignment": "bullish_aligned",
+        },
+        "strategy_engine_context": {
+            "session_context": {
+                "session_label": "asia",
+                "time_of_day_bucket": "utc_00_05",
+            }
+        },
+    }
+    uncached = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=False,
+    )
+    cached = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context=selection_context,
+        use_cache=True,
+    )
+
+    assert uncached.model_dump(mode="json") == cached.model_dump(mode="json")
+    assert uncached.engine_prior_sample_count == 3
+    assert uncached.engine_prior_classification == "strong"
+
+
+def test_prior_context_incomplete_lookup_keeps_partial_none_behavior(db_session) -> None:
+    uncached_debug: dict[str, object] = {}
+    cached_debug: dict[str, object] = {}
+
+    uncached = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context={},
+        use_cache=False,
+        debug_collector=uncached_debug,
+    )
+    cached = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context={},
+        use_cache=True,
+        debug_collector=cached_debug,
+    )
+
+    assert uncached.model_dump(mode="json") == cached.model_dump(mode="json")
+    assert uncached.prior_reason_codes == ["PRIOR_CONTEXT_INCOMPLETE"]
+    assert uncached.engine_prior_available is False
+    assert uncached.capital_efficiency_available is False
+    assert uncached_debug["cache_applied"] is False
+    assert cached_debug["cache_applied"] is False
 
 
 def test_inefficient_capital_efficiency_penalizes_long_holding_bias() -> None:

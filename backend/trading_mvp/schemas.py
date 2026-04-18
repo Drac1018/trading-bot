@@ -183,7 +183,12 @@ class AIReviewTriggerPayload(StrictBaseModel):
     candidate_weight: float | None = None
     reason_codes: list[str] = Field(default_factory=list)
     trigger_fingerprint: str = Field(min_length=8, max_length=128)
+    fingerprint_basis: dict[str, Any] = Field(default_factory=dict)
+    fingerprint_changed_fields: list[str] = Field(default_factory=list)
+    dedupe_reason: str | None = None
     last_decision_at: datetime | None = None
+    last_material_review_at: datetime | None = None
+    forced_review_reason: str | None = None
     triggered_at: datetime
 
 

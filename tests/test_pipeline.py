@@ -212,6 +212,9 @@ def _interval_review_plan(
     trigger_reason: str | None,
     trigger_deduped: bool = False,
     selection_context: dict[str, object] | None = None,
+    dedupe_reason: str | None = None,
+    fingerprint_changed_fields: list[str] | None = None,
+    forced_review_reason: str | None = None,
 ) -> dict[str, object]:
     now = utcnow_naive()
     trigger = (
@@ -225,7 +228,11 @@ def _interval_review_plan(
             "candidate_weight": 0.64,
             "reason_codes": ["TEST_SELECTION"],
             "trigger_fingerprint": "fingerprint-1234",
+            "fingerprint_basis": {"position_state_bucket": "flat"},
+            "fingerprint_changed_fields": list(fingerprint_changed_fields or []),
             "last_decision_at": None,
+            "last_material_review_at": now.isoformat(),
+            "forced_review_reason": forced_review_reason,
             "triggered_at": now.isoformat(),
         }
         if trigger_reason is not None
@@ -250,7 +257,11 @@ def _interval_review_plan(
                 "trigger_deduped": trigger_deduped,
                 "last_decision_at": None,
                 "last_ai_invoked_at": None,
+                "last_material_review_at": now.isoformat(),
                 "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                "fingerprint_changed_fields": list(fingerprint_changed_fields or []),
+                "dedupe_reason": dedupe_reason,
+                "forced_review_reason": forced_review_reason,
                 "last_ai_skip_reason": "TRIGGER_DEDUPED" if trigger_deduped else "NO_EVENT" if trigger is None else None,
             }
         ],
@@ -2682,9 +2693,17 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
             return {"allowed": True, "reason": "allowed"}
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: DummyGate())
-    monkeypatch.setattr(
-        "trading_mvp.services.orchestrator.build_ai_prior_context",
-        lambda *args, **kwargs: AIPriorContextPacket(
+    def fake_build_ai_prior_context(*args, **kwargs):  # noqa: ANN002, ANN003
+        debug_collector = kwargs.get("debug_collector")
+        if isinstance(debug_collector, dict):
+            debug_collector.update(
+                {
+                    "prior_read_path": "cache_hit",
+                    "cache_applied": True,
+                    "cache_fallback_used": False,
+                }
+            )
+        return AIPriorContextPacket(
             engine_prior_available=True,
             engine_prior_sample_count=3,
             engine_sample_threshold_satisfied=True,
@@ -2696,7 +2715,11 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
             prior_reason_codes=["ENGINE_PRIOR_STRONG"],
             prior_penalty_level="none",
             expected_payoff_efficiency_hint_summary={"time_to_0_25r_hint_minutes": 18.0},
-        ),
+        )
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_ai_prior_context",
+        fake_build_ai_prior_context,
     )
 
     captured_selection_context: dict[str, object] = {}
@@ -2744,6 +2767,23 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
             "15m": snapshot,
             "1h": snapshot.model_copy(update={"timeframe": "1h"}),
         },
+        review_trigger={
+            "trigger_reason": "manual_review_event",
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "strategy_engine": "trend_pullback_engine",
+            "holding_profile": "scalp",
+            "assigned_slot": "slot_1",
+            "candidate_weight": 0.64,
+            "reason_codes": ["TEST_SELECTION"],
+            "trigger_fingerprint": "manual-trigger-1234",
+            "fingerprint_basis": {"position_state_bucket": "flat"},
+            "fingerprint_changed_fields": ["position_state_bucket"],
+            "last_decision_at": snapshot_time.isoformat(),
+            "last_material_review_at": snapshot_time.isoformat(),
+            "forced_review_reason": "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED",
+            "triggered_at": snapshot_time.isoformat(),
+        },
     )
     decision_row = db_session.get(AgentRun, result["decision_run_id"])
 
@@ -2760,9 +2800,18 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
     assert decision_row.input_payload["ai_context"]["assigned_slot"] == "slot_1"
     assert decision_row.input_payload["ai_context"]["strategy_engine"] == "trend_pullback_engine"
     assert decision_row.input_payload["ai_context"]["prior_context"]["engine_prior_classification"] == "strong"
+    assert decision_row.input_payload["ai_trigger"]["fingerprint_changed_fields"] == ["position_state_bucket"]
     assert decision_row.metadata_json["slot_allocation"]["assigned_slot"] == "slot_1"
     assert decision_row.metadata_json["ai_context"]["holding_profile"] == "scalp"
+    assert decision_row.metadata_json["fingerprint_changed_fields"] == ["position_state_bucket"]
+    assert decision_row.metadata_json["forced_review_reason"] == "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
+    assert decision_row.metadata_json["last_material_review_at"] is not None
+    assert decision_row.metadata_json["prior_read_path"] == "cache_hit"
+    assert decision_row.metadata_json["cache_applied"] is True
+    assert decision_row.metadata_json["cache_fallback_used"] is False
     assert result["last_ai_trigger_reason"] == "manual_review_event"
+    assert result["fingerprint_changed_fields"] == ["position_state_bucket"]
+    assert result["forced_review_reason"] == "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
 
 
 def test_pipeline_persists_management_intent_semantics_for_protection_restore(monkeypatch, db_session) -> None:

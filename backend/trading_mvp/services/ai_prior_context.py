@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from trading_mvp.models import AgentRun, Execution, Order, Position
 from trading_mvp.schemas import (
     AIDecisionContextPacket,
     AIPriorContextPacket,
@@ -15,6 +18,7 @@ from trading_mvp.schemas import (
 from trading_mvp.services.capital_efficiency import build_capital_efficiency_report
 from trading_mvp.services.holding_profile import HOLDING_PROFILE_POSITION, HOLDING_PROFILE_SWING
 from trading_mvp.services.strategy_engine_analytics import build_strategy_engine_bucket_report
+from trading_mvp.time_utils import utcnow_naive
 
 PRIOR_LOOKBACK_DAYS = 21
 PRIOR_REPORT_LIMIT = 256
@@ -22,6 +26,8 @@ ENGINE_PRIOR_MIN_SAMPLES = 3
 CAPITAL_EFFICIENCY_PRIOR_MIN_SAMPLES = 3
 SESSION_PRIOR_MIN_SAMPLES = 5
 TIME_OF_DAY_PRIOR_MIN_SAMPLES = 6
+PRIOR_REPORT_CACHE_TTL_SECONDS = 15
+_PRIOR_REPORT_CACHE_SESSION_KEY = "ai_prior_context_report_cache_v1"
 
 _ENGINE_CLASSIFICATION_SCORE = {
     "strong": 1.0,
@@ -429,6 +435,167 @@ def _penalty_level(
     return _PRIOR_PENALTY_LEVELS[min(max(penalty_score, 0), 3)]
 
 
+def _full_report_cache_key(
+    session: Session,
+    *,
+    lookback_days: int,
+    limit: int,
+) -> tuple[str, int, int]:
+    bind = session.get_bind()
+    bind_key = str(getattr(bind, "url", "")) or repr(bind)
+    return (bind_key, lookback_days, limit)
+
+
+def _revision_component(
+    session: Session,
+    *,
+    model,
+    since: datetime,
+    created_field: str | None = None,
+) -> tuple[int, str | None]:
+    updated_at_column = model.updated_at
+    id_column = model.id
+    if created_field is None:
+        where_clause = updated_at_column >= since
+    else:
+        where_clause = getattr(model, created_field) >= since
+    max_id, max_updated_at = session.execute(
+        select(
+            func.max(id_column),
+            func.max(updated_at_column),
+        ).where(where_clause)
+    ).one()
+    updated_iso = max_updated_at.isoformat() if isinstance(max_updated_at, datetime) else None
+    return (int(max_id or 0), updated_iso)
+
+
+def _prior_report_revision_signature(
+    session: Session,
+    *,
+    lookback_days: int,
+) -> tuple[tuple[int, str | None], ...]:
+    since = utcnow_naive() - timedelta(days=lookback_days)
+    return (
+        _revision_component(session, model=AgentRun, since=since, created_field="created_at"),
+        _revision_component(session, model=Order, since=since),
+        _revision_component(session, model=Execution, since=since),
+        _revision_component(session, model=Position, since=since),
+    )
+
+
+def _session_report_cache(session: Session) -> dict[tuple[str, int, int], dict[str, Any]]:
+    cache = session.info.get(_PRIOR_REPORT_CACHE_SESSION_KEY)
+    if cache is None:
+        cache = {}
+        session.info[_PRIOR_REPORT_CACHE_SESSION_KEY] = cache
+    if not isinstance(cache, dict):
+        raise TypeError("prior report cache must be a dict")
+    return cache
+
+
+def _build_full_prior_reports(
+    session: Session,
+    *,
+    lookback_days: int,
+    limit: int,
+):
+    engine_report = build_strategy_engine_bucket_report(
+        session,
+        lookback_days=lookback_days,
+        limit=limit,
+    )
+    capital_efficiency_report = build_capital_efficiency_report(
+        session,
+        lookback_days=lookback_days,
+        limit=limit,
+    )
+    return engine_report, capital_efficiency_report
+
+
+def _load_prior_reports(
+    session: Session,
+    *,
+    lookback_days: int,
+    limit: int,
+    use_cache: bool,
+) -> tuple[object, object, dict[str, Any]]:
+    if not use_cache:
+        engine_report, capital_efficiency_report = _build_full_prior_reports(
+            session,
+            lookback_days=lookback_days,
+            limit=limit,
+        )
+        return (
+            engine_report,
+            capital_efficiency_report,
+            {
+                "prior_read_path": "full_report",
+                "cache_applied": False,
+                "cache_fallback_used": False,
+            },
+        )
+    try:
+        now = utcnow_naive()
+        cache_key = _full_report_cache_key(session, lookback_days=lookback_days, limit=limit)
+        revision_signature = _prior_report_revision_signature(session, lookback_days=lookback_days)
+        cache = _session_report_cache(session)
+        cache_entry = cache.get(cache_key)
+        if isinstance(cache_entry, dict):
+            cached_at = cache_entry.get("cached_at")
+            cached_signature = cache_entry.get("revision_signature")
+            if (
+                isinstance(cached_at, datetime)
+                and (now - cached_at).total_seconds() <= PRIOR_REPORT_CACHE_TTL_SECONDS
+                and cached_signature == revision_signature
+                and cache_entry.get("engine_report") is not None
+                and cache_entry.get("capital_efficiency_report") is not None
+            ):
+                return (
+                    cache_entry["engine_report"],
+                    cache_entry["capital_efficiency_report"],
+                    {
+                        "prior_read_path": "cache_hit",
+                        "cache_applied": True,
+                        "cache_fallback_used": False,
+                    },
+                )
+        engine_report, capital_efficiency_report = _build_full_prior_reports(
+            session,
+            lookback_days=lookback_days,
+            limit=limit,
+        )
+        cache[cache_key] = {
+            "cached_at": now,
+            "revision_signature": revision_signature,
+            "engine_report": engine_report,
+            "capital_efficiency_report": capital_efficiency_report,
+        }
+        return (
+            engine_report,
+            capital_efficiency_report,
+            {
+                "prior_read_path": "cache_miss",
+                "cache_applied": True,
+                "cache_fallback_used": False,
+            },
+        )
+    except Exception:
+        engine_report, capital_efficiency_report = _build_full_prior_reports(
+            session,
+            lookback_days=lookback_days,
+            limit=limit,
+        )
+        return (
+            engine_report,
+            capital_efficiency_report,
+            {
+                "prior_read_path": "fallback_full_read",
+                "cache_applied": False,
+                "cache_fallback_used": True,
+            },
+        )
+
+
 def build_ai_prior_context(
     session: Session,
     *,
@@ -437,6 +604,8 @@ def build_ai_prior_context(
     feature_payload: FeaturePayload | None = None,
     lookback_days: int = PRIOR_LOOKBACK_DAYS,
     limit: int = PRIOR_REPORT_LIMIT,
+    use_cache: bool = True,
+    debug_collector: dict[str, Any] | None = None,
 ) -> AIPriorContextPacket:
     lookup = _prior_lookup_context(
         ai_context=ai_context,
@@ -452,13 +621,27 @@ def build_ai_prior_context(
         "execution_policy_profile",
     )
     if any(not lookup.get(field) for field in required_lookup_fields):
+        if debug_collector is not None:
+            debug_collector.update(
+                {
+                    "prior_read_path": "full_report",
+                    "cache_applied": False,
+                    "cache_fallback_used": False,
+                }
+            )
         return AIPriorContextPacket(
             prior_reason_codes=["PRIOR_CONTEXT_INCOMPLETE"],
             expected_payoff_efficiency_hint_summary={},
         )
 
-    engine_report = build_strategy_engine_bucket_report(session, lookback_days=lookback_days, limit=limit)
-    capital_efficiency_report = build_capital_efficiency_report(session, lookback_days=lookback_days, limit=limit)
+    engine_report, capital_efficiency_report, read_debug = _load_prior_reports(
+        session,
+        lookback_days=lookback_days,
+        limit=limit,
+        use_cache=use_cache,
+    )
+    if debug_collector is not None:
+        debug_collector.update(read_debug)
 
     matching_engine_rows = [
         bucket

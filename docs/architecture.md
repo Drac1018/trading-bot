@@ -18,6 +18,8 @@
   - strategy-engine bucket analytics
   - capital-efficiency report buckets
   - session / time-of-day bucket history
+- Read path is now conservatively memoized per SQLAlchemy session with a short-lived read-through cache keyed by `(bind, lookback, limit)` plus source-table revision state.
+- The cache does not change prior semantics. If the cache is unavailable or corrupted, the builder falls back to the original full-report read path.
 - Conservative sample thresholds apply before any live influence:
   - insufficient samples => `unavailable`
   - unavailable prior => no confidence boost/penalty
@@ -89,7 +91,18 @@
   - `trigger_fingerprint`
   - `last_decision_at`
   - `triggered_at`
+- Open-position review triggers also persist:
+  - `fingerprint_basis`
+  - `fingerprint_changed_fields`
+  - `dedupe_reason`
+  - `last_material_review_at`
+  - `forced_review_reason`
 - `trigger_fingerprint` is used for debounce/dedupe. If the same symbol repeats with the same materially equivalent trigger fingerprint, the scheduler records a deduped skip instead of reinvoking AI.
+- `open_position_recheck_due` uses a dedicated bucketed fingerprint basis: `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
+- The open-position fingerprint intentionally avoids raw noisy values. Material bucket changes reopen AI review; same-basis repeats are deduped.
+- A stable fingerprint is not allowed to suppress review forever. Once the max review age is exceeded, the scheduler sets `forced_review_reason=OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED` and allows the review to proceed even if the fingerprint is unchanged.
+- The forced-review ceiling is conservative and bounded by cadence: `min(backstop interval, 3x position review cadence)`.
+- `protection_review_event` is dedupe-exempt so protection/emergency style survival paths are not delayed by unchanged fingerprints.
 - `periodic_backstop_due` is the explicit escape hatch for stale-thesis refresh and missed-event recovery. It is a safety backstop, not an entry-frequency booster.
 
 ### Safety boundary

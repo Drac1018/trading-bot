@@ -252,12 +252,27 @@
   - no event
   - deduped trigger
   - periodic backstop due
+- `open_position_recheck_due` outcomes now also carry:
+  - `fingerprint_changed_fields`
+  - `dedupe_reason`
+  - `last_material_review_at`
+  - `forced_review_reason`
 - Expected audit events include:
   - `decision_ai_invoked`
   - `decision_ai_skipped`
   - `decision_ai_no_event`
   - `decision_ai_deduped`
   - `decision_ai_backstop_due`
+- `ai_trigger` payload now includes:
+  - `fingerprint_basis`
+  - `fingerprint_changed_fields`
+  - `dedupe_reason`
+  - `last_material_review_at`
+  - `forced_review_reason`
+- `open_position_recheck_due` dedupe is bucketed on stable review context rather than raw noise values. The basis includes `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
+- Same open-position fingerprint is deduped only when the trigger remains materially unchanged. A material bucket change reopens review immediately.
+- Even when the fingerprint is unchanged, open-position review can be forced once the max review age is exceeded. The default forced-review ceiling is conservative: `min(backstop interval, 3x position review cadence)`.
+- `protection_review_event` remains dedupe-exempt so protection recovery is not delayed by unchanged AI review fingerprints.
 
 ### Execution boundary reminder
 

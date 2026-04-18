@@ -6,7 +6,10 @@ import pytest
 from trading_mvp.models import AgentRun, Position, SchedulerRun
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_success
-from trading_mvp.services.scheduler import get_due_position_management_symbols
+from trading_mvp.services.scheduler import (
+    get_due_position_management_symbols,
+    run_interval_decision_cycle,
+)
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
 
@@ -214,3 +217,74 @@ def test_protection_path_not_delayed_by_cadence(db_session) -> None:
     db_session.flush()
 
     assert get_due_position_management_symbols(db_session) == ["BTCUSDT"]
+
+
+def test_open_position_dedupe_surfaces_reason_fields(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: {
+            "generated_at": now.isoformat(),
+            "candidate_selection": {"rankings": []},
+            "plans": [
+                {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "cadence": {
+                        "mode": "active_position",
+                        "effective_cadence": {
+                            "decision_cycle_interval_minutes": 1,
+                            "ai_call_interval_minutes": 15,
+                        },
+                    },
+                    "selection_context": None,
+                    "trigger": {
+                        "trigger_reason": "open_position_recheck_due",
+                        "symbol": "BTCUSDT",
+                        "timeframe": "15m",
+                        "strategy_engine": "trend_pullback_engine",
+                        "holding_profile": "scalp",
+                        "reason_codes": ["OPEN_POSITION_RECHECK_DUE"],
+                        "trigger_fingerprint": "same-fingerprint",
+                        "fingerprint_basis": {"position_state_bucket": "flat"},
+                        "fingerprint_changed_fields": [],
+                        "last_decision_at": None,
+                        "last_material_review_at": (now - timedelta(minutes=15)).isoformat(),
+                        "forced_review_reason": None,
+                        "triggered_at": now.isoformat(),
+                    },
+                    "trigger_deduped": True,
+                    "last_decision_at": None,
+                    "last_ai_invoked_at": (now - timedelta(minutes=15)).isoformat(),
+                    "last_material_review_at": (now - timedelta(minutes=15)).isoformat(),
+                    "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                    "fingerprint_changed_fields": [],
+                    "dedupe_reason": "OPEN_POSITION_FINGERPRINT_UNCHANGED",
+                    "forced_review_reason": None,
+                    "last_ai_skip_reason": "TRIGGER_DEDUPED",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_decision_cycle",
+        lambda self, **kwargs: pytest.fail("deduped open-position trigger must not invoke decision cycle"),
+    )
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcome = result["results"][0]["outcome"]
+
+    assert outcome["ai_review_status"] == "deduped"
+    assert outcome["dedupe_reason"] == "OPEN_POSITION_FINGERPRINT_UNCHANGED"
+    assert outcome["fingerprint_changed_fields"] == []
+    assert outcome["last_material_review_at"] == (now - timedelta(minutes=15)).isoformat()
+    assert outcome["forced_review_reason"] is None
