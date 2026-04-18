@@ -24,25 +24,24 @@ from trading_mvp.models import (
 )
 from trading_mvp.schemas import (
     AuditTimelineEntry,
-    DecisionReferencePayload,
     DashboardExecutionProfileSummary,
     DashboardExecutionWindowSummary,
     DashboardHoldBlockedSummary,
-    OperationalStatusPayload,
+    DashboardProfitabilityResponse,
+    DashboardProfitabilityWindow,
+    DecisionReferencePayload,
     OperatorControlState,
     OperatorDashboardResponse,
     OperatorDecisionSnapshot,
     OperatorExecutionFillSummary,
     OperatorExecutionSnapshot,
     OperatorMarketSignalSummary,
-    PendingEntryPlanSnapshot,
     OperatorPositionSummary,
     OperatorProtectionSummary,
     OperatorRiskSnapshot,
     OperatorSymbolSummary,
-    DashboardProfitabilityResponse,
-    DashboardProfitabilityWindow,
     OverviewResponse,
+    PendingEntryPlanSnapshot,
     PerformanceAggregateEntry,
 )
 from trading_mvp.services.audit import compact_audit_payload
@@ -52,7 +51,7 @@ from trading_mvp.services.settings import (
     build_operational_status_payload,
     get_effective_symbols,
     get_or_create_settings,
-    serialize_settings,
+    serialize_settings_runtime_summary,
 )
 from trading_mvp.time_utils import utcnow_naive
 
@@ -635,7 +634,7 @@ def classify_audit_event(
 
 def get_overview(session: Session) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
-    settings_payload = serialize_settings(settings_row)
+    settings_payload = serialize_settings_runtime_summary(settings_row)
     runtime_state = summarize_runtime_state(settings_row)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
     latest_decision = session.scalar(
@@ -1510,6 +1509,8 @@ def _build_execution_fill_summary(row: Execution) -> OperatorExecutionFillSummar
 def _build_position_snapshot(position: Position | None) -> OperatorPositionSummary:
     if position is None:
         return OperatorPositionSummary()
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
+    management = dict(metadata.get("position_management") or {}) if isinstance(metadata.get("position_management"), dict) else {}
     return OperatorPositionSummary(
         is_open=position.status == "open" and position.quantity > 0,
         position_id=position.id,
@@ -1522,6 +1523,20 @@ def _build_position_snapshot(position: Position | None) -> OperatorPositionSumma
         realized_pnl=position.realized_pnl,
         leverage=position.leverage,
         opened_at=position.opened_at,
+        holding_profile=str(management.get("holding_profile") or "scalp"),
+        holding_profile_reason=str(management.get("holding_profile_reason") or "") or None,
+        initial_stop_type=str(management.get("initial_stop_type") or "") or None,
+        ai_stop_management_allowed=(
+            bool(management.get("ai_stop_management_allowed"))
+            if "ai_stop_management_allowed" in management
+            else None
+        ),
+        hard_stop_active=bool(management.get("hard_stop_active")) if "hard_stop_active" in management else None,
+        stop_widening_allowed=(
+            bool(management.get("stop_widening_allowed"))
+            if "stop_widening_allowed" in management
+            else None
+        ),
     )
 
 
@@ -1609,9 +1624,7 @@ def _audit_event_matches_symbol(row: dict[str, object], symbol: str) -> bool:
         if str(payload.get(key) or "").upper() == symbol_key:
             return True
     symbols = payload.get("symbols")
-    if isinstance(symbols, list) and symbol_key in {str(item).upper() for item in symbols}:
-        return True
-    return False
+    return isinstance(symbols, list) and symbol_key in {str(item).upper() for item in symbols}
 
 
 def _build_audit_entry(payload: dict[str, object]) -> AuditTimelineEntry:

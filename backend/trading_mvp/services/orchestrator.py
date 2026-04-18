@@ -67,7 +67,10 @@ from trading_mvp.services.features import (
     persist_feature_snapshot,
     summarize_universe_breadth,
 )
-from trading_mvp.services.holding_profile import evaluate_holding_profile
+from trading_mvp.services.holding_profile import (
+    evaluate_holding_profile,
+    resolve_holding_profile_cadence_hint,
+)
 from trading_mvp.services.market_data import (
     build_lead_market_contexts,
     build_market_context,
@@ -1505,6 +1508,41 @@ class TradingOrchestrator:
             return max(base * 2, decision_cadence_minutes)
         return max(base, 1)
 
+    @staticmethod
+    def _cadence_holding_profile_context(
+        *,
+        open_positions: list[object],
+        armed_plans: list[PendingEntryPlan],
+    ) -> dict[str, object]:
+        for position in open_positions:
+            metadata = getattr(position, "metadata_json", None)
+            metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
+            management = metadata_dict.get("position_management")
+            management_dict = dict(management) if isinstance(management, dict) else {}
+            profile = str(management_dict.get("holding_profile") or "scalp").strip().lower() or "scalp"
+            return {
+                "active_holding_profile": profile,
+                "active_holding_profile_reason": str(management_dict.get("holding_profile_reason") or "") or None,
+                "holding_profile_cadence_source": "open_position",
+                "holding_profile_cadence_hint": resolve_holding_profile_cadence_hint(profile),
+            }
+        for plan in armed_plans:
+            metadata = getattr(plan, "metadata_json", None)
+            metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
+            profile = str(metadata_dict.get("holding_profile") or "scalp").strip().lower() or "scalp"
+            return {
+                "active_holding_profile": profile,
+                "active_holding_profile_reason": str(metadata_dict.get("holding_profile_reason") or "") or None,
+                "holding_profile_cadence_source": "armed_entry_plan",
+                "holding_profile_cadence_hint": resolve_holding_profile_cadence_hint(profile),
+            }
+        return {
+            "active_holding_profile": None,
+            "active_holding_profile_reason": None,
+            "holding_profile_cadence_source": None,
+            "holding_profile_cadence_hint": {},
+        }
+
     def get_symbol_cadence_profile(
         self,
         *,
@@ -1532,6 +1570,10 @@ class TradingOrchestrator:
         else:
             feature_source = "current_feature_payload"
         feature_flags = self._cadence_feature_flags(feature_payload)
+        holding_profile_context = self._cadence_holding_profile_context(
+            open_positions=open_positions,
+            armed_plans=armed_plans,
+        )
         missing_protection_symbols = {
             str(item).upper()
             for item in runtime_state.get("missing_protection_symbols", [])
@@ -1627,11 +1669,31 @@ class TradingOrchestrator:
             effective_settings.decision_cycle_interval_minutes,
             mode=mode,
         )
+        position_management_cadence = self._position_management_cadence_seconds(
+            effective_settings.position_management_interval_seconds,
+            mode=mode,
+        )
+        watcher_cadence = 1 if armed_plans else None
+        cadence_hint = holding_profile_context.get("holding_profile_cadence_hint")
+        if isinstance(cadence_hint, dict):
+            hint_decision = cadence_hint.get("decision_interval_minutes")
+            hint_position_management = cadence_hint.get("position_management_interval_seconds")
+            hint_watcher = cadence_hint.get("entry_plan_watcher_interval_minutes")
+            if mode == CADENCE_ACTIVE_POSITION_MODE:
+                if isinstance(hint_decision, int) and hint_decision > 0:
+                    decision_cadence = max(decision_cadence, hint_decision)
+                if isinstance(hint_position_management, int) and hint_position_management > 0:
+                    position_management_cadence = max(position_management_cadence, hint_position_management)
+            elif mode == CADENCE_ARMED_ENTRY_PLAN_MODE and isinstance(hint_decision, int) and hint_decision > 0:
+                decision_cadence = max(decision_cadence, hint_decision)
+            if armed_plans and isinstance(hint_watcher, int) and hint_watcher > 0:
+                watcher_cadence = max(watcher_cadence or hint_watcher, hint_watcher)
         ai_cadence = self._ai_cadence_minutes(
             effective_settings.ai_call_interval_minutes,
             mode=mode,
             decision_cadence_minutes=decision_cadence,
         )
+        ai_cadence = max(ai_cadence, decision_cadence)
         return {
             "mode": mode,
             "reasons": reasons,
@@ -1646,18 +1708,19 @@ class TradingOrchestrator:
             "setup_disable_reasons": setup_disable_reasons,
             "setup_cluster_active": setup_cluster_active,
             "setup_cluster_reasons": setup_cluster_reasons,
+            "active_holding_profile": holding_profile_context.get("active_holding_profile"),
+            "active_holding_profile_reason": holding_profile_context.get("active_holding_profile_reason"),
+            "holding_profile_cadence_source": holding_profile_context.get("holding_profile_cadence_source"),
+            "holding_profile_cadence_hint": dict(holding_profile_context.get("holding_profile_cadence_hint") or {}),
             "effective_cadence": {
                 "market_refresh_interval_minutes": self._market_refresh_cadence_minutes(
                     effective_settings.market_refresh_interval_minutes,
                     mode=mode,
                 ),
-                "position_management_interval_seconds": self._position_management_cadence_seconds(
-                    effective_settings.position_management_interval_seconds,
-                    mode=mode,
-                ),
+                "position_management_interval_seconds": position_management_cadence,
                 "decision_cycle_interval_minutes": decision_cadence,
                 "ai_call_interval_minutes": ai_cadence,
-                "entry_plan_watcher_interval_minutes": 1 if armed_plans else None,
+                "entry_plan_watcher_interval_minutes": watcher_cadence,
             },
         }
 

@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
-from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.binance import BinanceAPIError, BinanceClient
 from trading_mvp.time_utils import utcnow_naive
 
 USER_STREAM_STATUS_IDLE = "idle"
@@ -18,6 +18,7 @@ USER_STREAM_FALLBACK_SOURCE = "rest_polling_fallback"
 DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 25 * 60
 DEFAULT_BACKOFF_BASE_SECONDS = 1.0
 DEFAULT_BACKOFF_MAX_SECONDS = 30.0
+INVALID_LISTEN_KEY_ERROR_CODE = -1125
 
 
 def _coerce_datetime(value: object) -> datetime | None:
@@ -107,11 +108,21 @@ def next_reconnect_backoff_seconds(
     base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS,
     max_seconds: float = DEFAULT_BACKOFF_MAX_SECONDS,
 ) -> float:
-    if reconnect_count <= 0:
+    if reconnect_count <= 0 or base_seconds <= 0 or max_seconds <= 0:
         return 0.0
-    exponent = max(reconnect_count - 1, 0)
-    backoff = min(max_seconds, base_seconds * (2 ** exponent))
+    backoff = min(float(base_seconds), float(max_seconds))
+    # Saturate once the configured ceiling is reached instead of evaluating
+    # unbounded powers for persisted reconnect counters.
+    while reconnect_count > 1 and backoff < max_seconds:
+        backoff = min(float(max_seconds), backoff * 2.0)
+        reconnect_count -= 1
     return float(round(backoff, 4))
+
+
+def _is_invalid_listen_key_error(exc: Exception) -> bool:
+    if isinstance(exc, BinanceAPIError) and exc.code == INVALID_LISTEN_KEY_ERROR_CODE:
+        return True
+    return "listenkey does not exist" in str(exc).lower()
 
 
 def normalize_user_stream_event(
@@ -228,6 +239,84 @@ class BinanceUserStreamListener:
         self._backoff_base_seconds = backoff_base_seconds
         self._backoff_max_seconds = backoff_max_seconds
 
+    def _recover_invalid_listen_key(
+        self,
+        current: dict[str, Any],
+        *,
+        previous_listen_key: str | None,
+        original_error: Exception,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        now = self._now()
+        issues: list[dict[str, Any]] = []
+        current["listen_key_expiry_reason"] = "listenKeyInvalid"
+        current["last_listen_key_expired_at"] = now.isoformat()
+        current["listen_key_rotate_attempted_at"] = now.isoformat()
+        current["listen_key_rotate_status"] = "pending"
+        current["listen_key_rotate_error"] = None
+        current["listen_key_rotate_completed_at"] = None
+        current["listen_key"] = None
+
+        if previous_listen_key:
+            try:
+                self._client.close_futures_listen_key(previous_listen_key)
+            except Exception as close_exc:
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "reason_code": "USER_STREAM_INVALID_LISTEN_KEY_CLOSE_FAILED",
+                        "message": "Failed to close invalid Binance futures listen key.",
+                        "payload": {"error": str(close_exc), "listen_key": previous_listen_key},
+                    }
+                )
+
+        try:
+            rotated_key = self._client.create_futures_listen_key()
+            rotated_at = self._now()
+            current["listen_key"] = rotated_key
+            current["listen_key_created_at"] = rotated_at.isoformat()
+            current["listen_key_refreshed_at"] = rotated_at.isoformat()
+            current["last_keepalive_at"] = rotated_at.isoformat()
+            current["status"] = USER_STREAM_STATUS_CONNECTED
+            current["source"] = USER_STREAM_SOURCE
+            current["heartbeat_ok"] = True
+            current["stream_source"] = USER_STREAM_PRIMARY_SOURCE
+            current["last_error"] = None
+            current["reconnect_count"] = 0
+            current["next_retry_at"] = None
+            current["backoff_seconds"] = 0.0
+            current["listen_key_rotate_status"] = "succeeded"
+            current["listen_key_rotate_completed_at"] = rotated_at.isoformat()
+            current["listen_key_rotate_error"] = None
+            issues.append(
+                {
+                    "severity": "warning",
+                    "reason_code": "USER_STREAM_LISTEN_KEY_RECREATED",
+                    "message": "Invalid Binance futures listen key was recreated.",
+                    "payload": {
+                        "error": str(original_error),
+                        "rotated_at": rotated_at.isoformat(),
+                    },
+                }
+            )
+            return True, issues
+        except Exception as recovery_exc:
+            failed_at = self._now()
+            current["listen_key_rotate_status"] = "failed"
+            current["listen_key_rotate_error"] = str(recovery_exc)
+            current["listen_key_rotate_completed_at"] = failed_at.isoformat()
+            issues.append(
+                {
+                    "severity": "warning",
+                    "reason_code": "USER_STREAM_LISTEN_KEY_RECOVERY_FAILED",
+                    "message": "Failed to recreate invalid Binance futures listen key.",
+                    "payload": {
+                        "error": str(recovery_exc),
+                        "original_error": str(original_error),
+                    },
+                }
+            )
+            return False, issues
+
     def ensure_registration(self, state: Mapping[str, Any] | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         current = build_user_stream_state(state)
         now = self._now()
@@ -265,6 +354,7 @@ class BinanceUserStreamListener:
             current["heartbeat_ok"] = True
             current["stream_source"] = USER_STREAM_PRIMARY_SOURCE
             current["last_error"] = None
+            current["reconnect_count"] = 0
             current["next_retry_at"] = None
             current["backoff_seconds"] = 0.0
             if str(current.get("listen_key_rotate_status") or "") in {"pending", "failed"}:
@@ -272,6 +362,15 @@ class BinanceUserStreamListener:
                 current["listen_key_rotate_completed_at"] = now.isoformat()
                 current["listen_key_rotate_error"] = None
         except Exception as exc:
+            if _is_invalid_listen_key_error(exc):
+                recovered, recovery_issues = self._recover_invalid_listen_key(
+                    current,
+                    previous_listen_key=listen_key,
+                    original_error=exc,
+                )
+                issues.extend(recovery_issues)
+                if recovered:
+                    return current, issues
             reconnect_count = int(current.get("reconnect_count") or 0) + 1
             backoff_seconds = next_reconnect_backoff_seconds(
                 reconnect_count,
@@ -346,6 +445,7 @@ class BinanceUserStreamListener:
             current["listen_key_created_at"] = rotated_at.isoformat()
             current["listen_key_refreshed_at"] = rotated_at.isoformat()
             current["last_keepalive_at"] = rotated_at.isoformat()
+            current["reconnect_count"] = 0
             current["next_retry_at"] = None
             current["backoff_seconds"] = 0.0
             current["listen_key_rotate_status"] = "succeeded"
@@ -457,6 +557,7 @@ class BinanceUserStreamListener:
                 current["status"] = USER_STREAM_STATUS_CONNECTED
                 current["stream_source"] = USER_STREAM_PRIMARY_SOURCE
                 current["last_error"] = None
+                current["reconnect_count"] = 0
                 current["next_retry_at"] = None
                 current["backoff_seconds"] = 0.0
                 if normalized["listen_key_expired"]:

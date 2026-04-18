@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from time import perf_counter, sleep
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -12,6 +13,7 @@ from trading_mvp.models import (
     FeatureSnapshot,
     MarketSnapshot,
     PnLSnapshot,
+    Position,
     RiskCheck,
     SystemHealthEvent,
 )
@@ -403,6 +405,43 @@ def test_serialize_settings_includes_position_management_summary(db_session) -> 
     assert serialized["position_management_summary"]["data_fallback_rule"]
 
 
+def test_serialize_settings_includes_holding_profile_and_hard_stop_position_summary(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.02,
+            entry_price=70000.0,
+            mark_price=70450.0,
+            leverage=2.0,
+            stop_loss=69200.0,
+            take_profit=71500.0,
+            metadata_json={
+                "position_management": {
+                    "holding_profile": "position",
+                    "holding_profile_reason": "strong_structural_regime_position_allowed",
+                    "initial_stop_type": "deterministic_hard_stop",
+                    "hard_stop_active": True,
+                    "stop_widening_allowed": False,
+                }
+            },
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["position_management_summary"]["active_positions"] == 1
+    assert serialized["position_management_summary"]["managed_positions_with_baseline"] == 1
+    assert serialized["position_management_summary"]["active_holding_profiles"]["position"] == 1
+    assert serialized["position_management_summary"]["hard_stop_active_positions"] == 1
+    assert serialized["position_management_summary"]["deterministic_hard_stop_positions"] == 1
+    assert serialized["position_management_summary"]["stop_widening_forbidden_positions"] == 1
+
+
 def test_serialize_settings_merges_global_and_symbol_cadence_overrides(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
 
@@ -739,6 +778,41 @@ def test_health_endpoint_uses_lifespan_startup(tmp_path, monkeypatch) -> None:
             payload = response.json()
             assert payload["status"] == "ok"
             assert payload["database"] == "ready"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_health_endpoint_is_not_blocked_by_slow_background_ticks(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'lifespan_background_ticks.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    def slow_scheduler_tick() -> int:
+        sleep(2.0)
+        return 15
+
+    def slow_user_stream_tick() -> int:
+        sleep(2.0)
+        return 5
+
+    monkeypatch.setattr("trading_mvp.main._run_background_scheduler_tick", slow_scheduler_tick)
+    monkeypatch.setattr("trading_mvp.main._run_background_user_stream_tick", slow_user_stream_tick)
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        started_at = perf_counter()
+        with TestClient(app) as client:
+            response = client.get("/health")
+        elapsed = perf_counter() - started_at
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        # Startup should not wait for both 2s background ticks to finish serially.
+        assert elapsed < 3.2
     finally:
         app.dependency_overrides.clear()
 

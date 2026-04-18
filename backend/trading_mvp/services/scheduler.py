@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from trading_mvp.services.account import get_open_positions
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
+from trading_mvp.services.runtime_state import build_sync_freshness_summary
 from trading_mvp.services.settings import (
     get_effective_symbol_schedule,
     get_or_create_settings,
@@ -23,6 +25,7 @@ MARKET_REFRESH_WORKFLOW = "market_refresh_cycle"
 POSITION_MANAGEMENT_WORKFLOW = "position_management_cycle"
 INTERVAL_DECISION_WORKFLOW = "interval_decision_cycle"
 ENTRY_PLAN_WATCHER_WORKFLOW = "entry_plan_watcher_cycle"
+READ_REFRESH_SYNC_DEBOUNCE_SECONDS = 30
 
 
 def _next_window_run(window: str, from_time: datetime | None = None) -> datetime:
@@ -71,6 +74,39 @@ def _is_due(latest: SchedulerRun | None, delta: timedelta) -> bool:
     if latest.next_run_at is None:
         return computed_due_at <= utcnow_naive()
     return min(latest.next_run_at, computed_due_at) <= utcnow_naive()
+
+
+def _coerce_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _sync_summary_needs_refresh(sync_freshness_summary: dict[str, object]) -> bool:
+    for payload in sync_freshness_summary.values():
+        if not isinstance(payload, dict):
+            continue
+        if bool(payload.get("stale")) or bool(payload.get("incomplete")):
+            return True
+    return False
+
+
+def _latest_sync_attempt_at(sync_freshness_summary: dict[str, object]) -> datetime | None:
+    latest: datetime | None = None
+    for payload in sync_freshness_summary.values():
+        if not isinstance(payload, dict):
+            continue
+        attempted_at = _coerce_datetime(payload.get("last_attempt_at"))
+        if attempted_at is None:
+            continue
+        if latest is None or attempted_at > latest:
+            latest = attempted_at
+    return latest
 
 
 def _symbol_cadence_profile(
@@ -233,8 +269,8 @@ def run_exchange_sync_cycle(session: Session, triggered_by: str = "scheduler") -
         triggered_by=triggered_by,
         next_run_at=utcnow_naive() + timedelta(seconds=interval_seconds),
     )
-    orchestrator = TradingOrchestrator(session)
     try:
+        orchestrator = TradingOrchestrator(session)
         outcome = orchestrator.run_exchange_sync_cycle(trigger_event=triggered_by)
     except Exception as exc:
         return _finish_scheduler_run(
@@ -252,6 +288,24 @@ def run_exchange_sync_cycle(session: Session, triggered_by: str = "scheduler") -
         message="Exchange sync cycle completed." if success else "Exchange sync cycle failed.",
         payload=outcome,
     )
+
+
+def maybe_refresh_exchange_sync_freshness(
+    session: Session,
+    *,
+    triggered_by: str = "api_read",
+) -> dict[str, Any] | None:
+    settings_row = get_or_create_settings(session)
+    if not settings_row.binance_api_key_encrypted or not settings_row.binance_api_secret_encrypted:
+        return None
+    sync_freshness_summary = build_sync_freshness_summary(settings_row)
+    if not _sync_summary_needs_refresh(sync_freshness_summary):
+        return None
+    latest_attempt_at = _latest_sync_attempt_at(sync_freshness_summary)
+    now = utcnow_naive()
+    if latest_attempt_at is not None and (now - latest_attempt_at).total_seconds() < READ_REFRESH_SYNC_DEBOUNCE_SECONDS:
+        return None
+    return run_exchange_sync_cycle(session, triggered_by=triggered_by)
 
 
 def get_due_market_refresh_symbols(session: Session) -> list[str]:

@@ -98,6 +98,10 @@
     - `metrics`
     - `recovery_condition`
 - `position_management_summary`
+  - `active_holding_profiles`: 현재 open live position의 `scalp / swing / position` 분포
+  - `hard_stop_active_positions`: deterministic hard stop이 active인 position 수
+  - `deterministic_hard_stop_positions`: `initial_stop_type=deterministic_hard_stop` 기준 position 수
+  - `stop_widening_forbidden_positions`: `stop_widening_allowed=false` position 수
 - `exchange_sync_interval_seconds`
 - `market_refresh_interval_minutes`
 - `position_management_interval_seconds`
@@ -277,6 +281,7 @@ staged rollout semantics:
   - 현재 symbol에 `armed` plan이 있으면 `symbol`, `side`, `plan_status`, `entry_mode`, `entry_zone_min`, `entry_zone_max`, `expires_at`, `idempotency_key`, `metadata`가 내려갑니다.
 - `symbols`는 tracked symbol별 최신 snapshot 배열입니다.
 - 각 symbol row는 `symbol`, `timeframe`, `latest_price`, `market_snapshot_time`, `ai_decision`, `risk_guard`, `execution`, `open_position`, `protection_status`, `blocked_reasons`, `live_execution_ready`, `stale_flags`, `last_updated_at`, `audit_events`를 포함합니다.
+  - `open_position`: 기존 포지션 snapshot 외에 `holding_profile`, `holding_profile_reason`, `initial_stop_type`, `ai_stop_management_allowed`, `hard_stop_active`, `stop_widening_allowed`가 additive로 포함될 수 있습니다.
   - `execution.recent_fills`: 최근 fill ladder 요약. `execution_id`, `external_trade_id`, `fill_price`, `fill_quantity`, `fee_paid`, `commission_asset`, `realized_pnl`, `created_at`
   - `protection_status`: 기본 protected/missing 상태 외에 `recovery_status`, `auto_recovery_active`, `failure_count`, `last_error`, `last_transition_at`, `trigger_source`, `lifecycle_state`, `verification_status`, `last_event_type`, `last_event_message`, `last_event_at`
   - `audit_events`: operator dashboard에서는 raw payload 전체 대신 approval / protection / execution 설명에 필요한 compact payload만 유지합니다.

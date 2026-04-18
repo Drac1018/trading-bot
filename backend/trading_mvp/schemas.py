@@ -933,6 +933,12 @@ class OperatorPositionSummary(StrictBaseModel):
     realized_pnl: float | None = None
     leverage: float | None = None
     opened_at: datetime | None = None
+    holding_profile: HoldingProfile | None = None
+    holding_profile_reason: str | None = None
+    initial_stop_type: str | None = None
+    ai_stop_management_allowed: bool | None = None
+    hard_stop_active: bool | None = None
+    stop_widening_allowed: bool | None = None
 
 
 class OperatorProtectionSummary(StrictBaseModel):

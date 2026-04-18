@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from threading import Event
+from time import sleep
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import AuditEvent, Execution, Order, Position, RiskCheck, SchedulerRun
@@ -19,14 +20,14 @@ from trading_mvp.services.dashboard import (
     get_positions,
     get_profitability_dashboard,
 )
-from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.runtime_state import (
+    mark_sync_success,
     set_candidate_selection_detail,
     set_reconciliation_detail,
     set_user_stream_detail,
 )
-from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.services.secret_store import encrypt_secret
+from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -567,7 +568,16 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
         take_profit=71500.0,
         realized_pnl=0.0,
         unrealized_pnl=10.0,
-        metadata_json={},
+        metadata_json={
+            "position_management": {
+                "holding_profile": "swing",
+                "holding_profile_reason": "swing_intraday_trend_extension_allowed",
+                "initial_stop_type": "deterministic_hard_stop",
+                "ai_stop_management_allowed": True,
+                "hard_stop_active": True,
+                "stop_widening_allowed": False,
+            }
+        },
     )
     db_session.add(btc_position)
     db_session.flush()
@@ -1083,6 +1093,12 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.risk_guard.raw_payload == {}
     assert btc.blocked_reasons == ["POSITION_STATE_STALE"]
     assert btc.open_position.is_open is True
+    assert btc.open_position.holding_profile == "swing"
+    assert btc.open_position.holding_profile_reason == "swing_intraday_trend_extension_allowed"
+    assert btc.open_position.initial_stop_type == "deterministic_hard_stop"
+    assert btc.open_position.hard_stop_active is True
+    assert btc.open_position.ai_stop_management_allowed is True
+    assert btc.open_position.stop_widening_allowed is False
     assert btc.protection_status.status == "missing"
     assert btc.protection_status.recovery_status == "recovery_pending"
     assert btc.protection_status.auto_recovery_active is True
@@ -1257,6 +1273,63 @@ def test_operator_dashboard_api_returns_operator_flow(tmp_path, monkeypatch) -> 
         assert eth["risk_guard"]["auto_resize_reason"] == "CLAMPED_TO_SINGLE_POSITION_HEADROOM"
         assert eth["execution"]["symbol"] == "ETHUSDT"
         assert len(payload["audit_events"]) >= 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_api_refreshes_stale_exchange_sync_on_read(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'overview_sync_refresh.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestingSessionLocal() as session:
+            settings = get_or_create_settings(session)
+            settings.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+            settings.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+            stale_at = utcnow_naive() - timedelta(hours=2)
+            for scope in ("account", "positions", "open_orders", "protective_orders"):
+                mark_sync_success(settings, scope=scope, synced_at=stale_at)
+            session.commit()
+
+        refresh_completed = Event()
+
+        def fake_refresh_exchange_sync(session, *, triggered_by: str):
+            sleep(0.6)
+            refreshed_at = utcnow_naive()
+            settings = get_or_create_settings(session)
+            for scope in ("account", "positions", "open_orders", "protective_orders"):
+                mark_sync_success(settings, scope=scope, synced_at=refreshed_at)
+            session.flush()
+            refresh_completed.set()
+            return {"workflow": "exchange_sync_cycle", "status": "success", "triggered_by": triggered_by}
+
+        monkeypatch.setattr(
+            "trading_mvp.main.maybe_refresh_exchange_sync_freshness",
+            fake_refresh_exchange_sync,
+        )
+        monkeypatch.setattr("trading_mvp.main.READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS", 0.0)
+        monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_inflight", False)
+        monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_last_started", 0.0)
+
+        with TestClient(app) as client:
+            response = client.get("/api/dashboard/overview")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["sync_freshness_summary"]["account"]["stale"] is True
+        assert refresh_completed.wait(timeout=2.0) is True
+
+        with TestingSessionLocal() as session:
+            refreshed = get_overview(session)
+            assert refreshed.sync_freshness_summary["account"]["stale"] is False
+            assert refreshed.sync_freshness_summary["protective_orders"]["stale"] is False
     finally:
         app.dependency_overrides.clear()
 

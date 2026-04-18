@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from time import monotonic
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +21,6 @@ from trading_mvp.schemas import (
     ReplayValidationRequest,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
-from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
 from trading_mvp.services.dashboard import (
@@ -27,23 +28,33 @@ from trading_mvp.services.dashboard import (
     get_alerts,
     get_audit_timeline,
     get_decisions,
-    get_operator_dashboard,
-    get_profitability_dashboard,
     get_execution_quality_report,
     get_executions,
     get_feature_snapshots,
     get_market_snapshots,
+    get_operator_dashboard,
     get_orders,
     get_overview,
     get_positions,
+    get_profitability_dashboard,
     get_risk_checks,
     get_scheduler_runs,
 )
-from trading_mvp.services.execution import poll_live_user_stream, run_live_test_order, sync_live_state
+from trading_mvp.services.execution import (
+    poll_live_user_stream,
+    run_live_test_order,
+    sync_live_state,
+)
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
+from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.replay_validation import build_replay_validation_report
-from trading_mvp.services.scheduler import run_due_operational_cycles, run_due_windows, run_window
+from trading_mvp.services.scheduler import (
+    maybe_refresh_exchange_sync_freshness,
+    run_due_operational_cycles,
+    run_due_windows,
+    run_window,
+)
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import (
     arm_live_execution,
@@ -54,80 +65,91 @@ from trading_mvp.services.settings import (
     update_settings,
 )
 
+READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS = 20.0
+_exchange_sync_read_refresh_guard = threading.Lock()
+_exchange_sync_read_refresh_inflight = False
+_exchange_sync_read_refresh_last_started = 0.0
+
 
 async def _background_scheduler_loop() -> None:
     while True:
-        polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
-        with polling_session_factory() as session:
-            settings_row = get_or_create_settings(session)
-            try:
-                run_due_operational_cycles(session)
-                run_due_windows(session)
-                session.commit()
-            except Exception as exc:
-                record_audit_event(
-                    session,
-                    event_type="background_scheduler_failed",
-                    entity_type="scheduler",
-                    entity_id="background",
-                    severity="error",
-                    message="Background scheduler loop failed.",
-                    payload={"error": str(exc)},
-                )
-                record_health_event(
-                    session,
-                    component="scheduler",
-                    status="error",
-                    message="Background scheduler loop failed.",
-                    payload={"error": str(exc)},
-                )
-                session.commit()
-            interval_seconds = max(15, min(int(settings_row.exchange_sync_interval_seconds), 30))
+        interval_seconds = await asyncio.to_thread(_run_background_scheduler_tick)
         await asyncio.sleep(interval_seconds)
 
 
 async def _background_user_stream_loop() -> None:
     while True:
-        sleep_seconds = 5
-        polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
-        with polling_session_factory() as session:
-            settings_row = get_or_create_settings(session)
-            tracked_symbols = settings_row.tracked_symbols or [settings_row.default_symbol]
-            try:
-                stream_result = poll_live_user_stream(
-                    session,
-                    settings_row,
-                    max_events=max(8, len(tracked_symbols) * 4),
-                    idle_timeout_seconds=2.0,
-                )
-                session.commit()
-                stream_health = str(stream_result.get("stream_health") or "idle")
-                if stream_health == "connected":
-                    sleep_seconds = 1
-                elif stream_health == "unavailable":
-                    sleep_seconds = 10
-                else:
-                    sleep_seconds = 5
-            except Exception as exc:
-                record_audit_event(
-                    session,
-                    event_type="background_user_stream_failed",
-                    entity_type="binance",
-                    entity_id=settings_row.default_symbol,
-                    severity="warning",
-                    message="Background Binance futures user stream loop failed.",
-                    payload={"error": str(exc)},
-                )
-                record_health_event(
-                    session,
-                    component="user_stream",
-                    status="error",
-                    message="Background Binance futures user stream loop failed.",
-                    payload={"error": str(exc)},
-                )
-                session.commit()
-                sleep_seconds = 5
+        sleep_seconds = await asyncio.to_thread(_run_background_user_stream_tick)
         await asyncio.sleep(sleep_seconds)
+
+
+def _run_background_scheduler_tick() -> int:
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    with polling_session_factory() as session:
+        settings_row = get_or_create_settings(session)
+        try:
+            run_due_operational_cycles(session)
+            run_due_windows(session)
+            session.commit()
+        except Exception as exc:
+            record_audit_event(
+                session,
+                event_type="background_scheduler_failed",
+                entity_type="scheduler",
+                entity_id="background",
+                severity="error",
+                message="Background scheduler loop failed.",
+                payload={"error": str(exc)},
+            )
+            record_health_event(
+                session,
+                component="scheduler",
+                status="error",
+                message="Background scheduler loop failed.",
+                payload={"error": str(exc)},
+            )
+            session.commit()
+        return max(15, min(int(settings_row.exchange_sync_interval_seconds), 30))
+
+
+def _run_background_user_stream_tick() -> int:
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    with polling_session_factory() as session:
+        settings_row = get_or_create_settings(session)
+        tracked_symbols = settings_row.tracked_symbols or [settings_row.default_symbol]
+        try:
+            stream_result = poll_live_user_stream(
+                session,
+                settings_row,
+                max_events=max(8, len(tracked_symbols) * 4),
+                idle_timeout_seconds=2.0,
+            )
+            session.commit()
+            stream_health = str(stream_result.get("stream_health") or "idle")
+            if stream_health == "connected":
+                return 1
+            if stream_health == "unavailable":
+                return 10
+            return 5
+        except Exception as exc:
+            record_audit_event(
+                session,
+                event_type="background_user_stream_failed",
+                entity_type="binance",
+                entity_id=settings_row.default_symbol,
+                severity="warning",
+                message="Background Binance futures user stream loop failed.",
+                payload={"error": str(exc)},
+            )
+            record_health_event(
+                session,
+                component="user_stream",
+                status="error",
+                message="Background Binance futures user stream loop failed.",
+                payload={"error": str(exc)},
+            )
+            session.commit()
+            return 5
 
 
 @asynccontextmanager
@@ -141,10 +163,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         for task in (poll_task, user_stream_task):
             task.cancel()
         for task in (poll_task, user_stream_task):
-            try:
+            with suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
 
 app = FastAPI(title="Trading MVP API", version="0.2.0", lifespan=lifespan)
@@ -156,10 +176,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _run_exchange_sync_read_refresh(triggered_by: str) -> None:
+    global _exchange_sync_read_refresh_inflight
+
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    try:
+        with polling_session_factory() as session:
+            refresh_result = maybe_refresh_exchange_sync_freshness(session, triggered_by=triggered_by)
+            if refresh_result is not None:
+                session.commit()
+    except Exception as exc:
+        with polling_session_factory() as session:
+            record_audit_event(
+                session,
+                event_type="exchange_sync_read_refresh_failed",
+                entity_type="scheduler",
+                entity_id="exchange_sync_cycle",
+                severity="warning",
+                message="Read-triggered exchange sync refresh failed.",
+                payload={"error": str(exc), "triggered_by": triggered_by},
+            )
+            record_health_event(
+                session,
+                component="exchange_sync",
+                status="error",
+                message="Read-triggered exchange sync refresh failed.",
+                payload={"error": str(exc), "triggered_by": triggered_by},
+            )
+            session.commit()
+    finally:
+        with _exchange_sync_read_refresh_guard:
+            _exchange_sync_read_refresh_inflight = False
+
+
+def _refresh_exchange_sync_for_read(*, triggered_by: str) -> bool:
+    global _exchange_sync_read_refresh_inflight, _exchange_sync_read_refresh_last_started
+
+    started_at = monotonic()
+    with _exchange_sync_read_refresh_guard:
+        if _exchange_sync_read_refresh_inflight:
+            return False
+        if started_at - _exchange_sync_read_refresh_last_started < READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS:
+            return False
+        _exchange_sync_read_refresh_inflight = True
+        _exchange_sync_read_refresh_last_started = started_at
+    threading.Thread(
+        target=_run_exchange_sync_read_refresh,
+        args=(triggered_by,),
+        daemon=True,
+        name="exchange-sync-read-refresh",
+    ).start()
+    return True
+
 @app.get("/health")
-def health(db: Session = Depends(get_db)) -> dict[str, object]:
-    settings_row = get_or_create_settings(db)
-    return {"status": "ok", "mode": serialize_settings(settings_row)["mode"], "database": "ready"}
+def health() -> dict[str, object]:
+    return {"status": "ok", "mode": "service_ready", "database": "ready"}
 
 
 @app.post("/api/system/seed")
@@ -169,11 +241,13 @@ def seed_system(db: Session = Depends(get_db)) -> dict[str, object]:
 
 @app.get("/api/dashboard/overview")
 def dashboard_overview(db: Session = Depends(get_db)) -> dict[str, object]:
+    _refresh_exchange_sync_for_read(triggered_by="api_dashboard_overview")
     return get_overview(db).model_dump(mode="json")
 
 
 @app.get("/api/dashboard/operator")
 def dashboard_operator(db: Session = Depends(get_db)) -> dict[str, object]:
+    _refresh_exchange_sync_for_read(triggered_by="api_dashboard_operator")
     return get_operator_dashboard(db).model_dump(mode="json")
 
 
@@ -264,6 +338,7 @@ def alerts(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 
 @app.get("/api/settings")
 def settings_view(db: Session = Depends(get_db)) -> dict[str, object]:
+    _refresh_exchange_sync_for_read(triggered_by="api_settings_view")
     return serialize_settings(get_or_create_settings(db))
 
 

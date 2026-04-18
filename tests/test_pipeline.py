@@ -38,6 +38,7 @@ from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.scheduler import (
     is_interval_decision_due,
+    maybe_refresh_exchange_sync_freshness,
     run_due_windows,
     run_exchange_sync_cycle,
     run_interval_decision_cycle,
@@ -2264,6 +2265,29 @@ def test_scheduler_exchange_sync_cycle_records_workflow(monkeypatch, db_session)
     assert scheduler_run.status == "success"
 
 
+def test_maybe_refresh_exchange_sync_freshness_runs_when_sync_is_stale(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    stale_at = utcnow_naive() - timedelta(hours=2)
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings_row, scope=scope, synced_at=stale_at)
+    db_session.flush()
+
+    calls: list[str] = []
+
+    def fake_run_exchange_sync_cycle(session, triggered_by="scheduler"):
+        calls.append(triggered_by)
+        return {"workflow": "exchange_sync_cycle", "status": "success"}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_exchange_sync_cycle", fake_run_exchange_sync_cycle)
+
+    result = maybe_refresh_exchange_sync_freshness(db_session, triggered_by="api_dashboard_overview")
+
+    assert result == {"workflow": "exchange_sync_cycle", "status": "success"}
+    assert calls == ["api_dashboard_overview"]
+
+
 def test_run_interval_decision_cycle_marks_failure_instead_of_raising(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
@@ -2832,6 +2856,74 @@ def test_cadence_profile_keeps_active_position_priority_over_idle_skip_reasons(d
     assert profile["skip_reason"] == "ACTIVE_POSITION_PRIORITY"
     assert profile["ai_skipped_reason"] is None
     assert profile["setup_disable_active"] is False
+
+
+def test_cadence_profile_uses_holding_profile_overlay_for_open_position(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    settings_row.symbol_cadence_overrides = [
+        {
+            "symbol": "BTCUSDT",
+            "decision_cycle_interval_minutes_override": 5,
+            "ai_call_interval_minutes_override": 5,
+            "position_management_interval_seconds_override": 15,
+        }
+    ]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=70250.0,
+        leverage=2.0,
+        stop_loss=69400.0,
+        take_profit=71200.0,
+        unrealized_pnl=2.5,
+        metadata_json={
+            "position_management": {
+                "holding_profile": "position",
+                "holding_profile_reason": "strong_structural_regime_position_allowed",
+                "hard_stop_active": True,
+                "stop_widening_allowed": False,
+            }
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    feature_payload = {
+        "symbol": "BTCUSDT",
+        "timeframe": "15m",
+        "regime": {
+            "primary_regime": "bullish",
+            "trend_alignment": "bullish_aligned",
+            "volatility_regime": "normal",
+            "volume_regime": "normal",
+            "momentum_state": "strengthening",
+        },
+    }
+
+    profile = TradingOrchestrator(db_session).get_symbol_cadence_profile(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        feature_payload=feature_payload,
+        open_positions=[position],
+        armed_plans=[],
+    )
+
+    assert profile["mode"] == "active_position"
+    assert profile["active_holding_profile"] == "position"
+    assert profile["active_holding_profile_reason"] == "strong_structural_regime_position_allowed"
+    assert profile["holding_profile_cadence_source"] == "open_position"
+    assert profile["effective_cadence"]["position_management_interval_seconds"] == 60
+    assert profile["effective_cadence"]["decision_cycle_interval_minutes"] == 30
+    assert profile["effective_cadence"]["ai_call_interval_minutes"] == 30
 
 
 def test_cadence_profile_keeps_armed_entry_plan_priority_over_idle_skip_reasons(db_session) -> None:

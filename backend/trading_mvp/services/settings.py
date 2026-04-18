@@ -588,6 +588,10 @@ def _build_position_management_summary(
     active_positions = 0
     managed_positions = 0
     partial_take_profit_taken = 0
+    active_holding_profiles = {"scalp": 0, "swing": 0, "position": 0}
+    hard_stop_active_positions = 0
+    deterministic_hard_stop_positions = 0
+    stop_widening_forbidden_positions = 0
     if session is not None:
         positions = list(
             session.scalars(
@@ -605,8 +609,18 @@ def _build_position_management_summary(
             if not isinstance(management, dict):
                 continue
             managed_positions += 1
+            holding_profile = str(management.get("holding_profile") or "scalp").strip().lower() or "scalp"
+            if holding_profile not in active_holding_profiles:
+                holding_profile = "scalp"
+            active_holding_profiles[holding_profile] += 1
             if bool(management.get("partial_take_profit_taken")):
                 partial_take_profit_taken += 1
+            if bool(management.get("hard_stop_active")):
+                hard_stop_active_positions += 1
+            if str(management.get("initial_stop_type") or "") == "deterministic_hard_stop":
+                deterministic_hard_stop_positions += 1
+            if management.get("stop_widening_allowed") is False:
+                stop_widening_forbidden_positions += 1
 
     return {
         "mode": "conservative_dynamic_profit_protection",
@@ -636,6 +650,10 @@ def _build_position_management_summary(
         "active_positions": active_positions,
         "managed_positions_with_baseline": managed_positions,
         "partial_take_profit_taken_positions": partial_take_profit_taken,
+        "active_holding_profiles": active_holding_profiles,
+        "hard_stop_active_positions": hard_stop_active_positions,
+        "deterministic_hard_stop_positions": deterministic_hard_stop_positions,
+        "stop_widening_forbidden_positions": stop_widening_forbidden_positions,
         "data_fallback_rule": (
             "If initial stop or holding-plan metadata is missing, the layer keeps the current stop and skips "
             "time stop or partial-take-profit automation."
@@ -1803,6 +1821,160 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         manual_ai_guard_minutes=manual_ai_guard_minutes(settings_row),
     )
     return payload.model_dump(mode="json")
+
+
+def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, object]:
+    defaults = get_settings()
+    current_session = object_session(settings_row)
+
+    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
+    mode = "live_guarded"
+    if settings_row.trading_paused:
+        mode = "paused"
+    elif is_live_execution_ready(settings_row, defaults=defaults) and exchange_submit_allowed:
+        mode = "live_ready"
+
+    exposure_limits = get_exposure_limits(settings_row)
+    runtime_state = summarize_runtime_state(settings_row)
+    latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
+    pnl_summary = (
+        _build_pnl_summary(settings_row, latest_pnl)
+        if latest_pnl is not None
+        else {
+            "basis": "live_account_snapshot_preferred",
+            "basis_note": (
+                "Wallet, available balance and equity prefer the latest Binance account snapshot. "
+                "Realized, fee and funding totals are reconciled from the execution ledger plus funding ledger."
+            ),
+            "equity": settings_row.starting_equity,
+            "wallet_balance": settings_row.starting_equity,
+            "available_balance": settings_row.starting_equity,
+            "cash_balance": settings_row.starting_equity,
+            "realized_pnl": 0.0,
+            "fee_total": 0.0,
+            "funding_total": 0.0,
+            "net_pnl": 0.0,
+            "net_realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "daily_pnl": 0.0,
+            "cumulative_pnl": 0.0,
+            "consecutive_losses": 0,
+            "snapshot_time": None,
+        }
+    )
+    account_sync_summary = (
+        _build_account_sync_summary(current_session, settings_row, latest_pnl)
+        if latest_pnl is not None
+        else {
+            "status": "unknown",
+            "reconciliation_mode": "unknown",
+            "freshness_seconds": None,
+            "stale_after_seconds": _account_sync_stale_seconds(settings_row),
+            "equity": settings_row.starting_equity,
+            "wallet_balance": settings_row.starting_equity,
+            "available_balance": settings_row.starting_equity,
+            "realized_pnl": 0.0,
+            "fee_total": 0.0,
+            "funding_total": 0.0,
+            "net_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "last_synced_at": None,
+            "last_warning_reason_code": None,
+            "last_warning_message": None,
+            "note": "Account sync status is not available until the first live snapshot is created.",
+        }
+    )
+    sync_freshness_summary = build_sync_freshness_summary(settings_row)
+    market_freshness_summary = _build_market_freshness_summary(current_session, settings_row)
+    if current_session is not None:
+        from trading_mvp.services.risk import build_current_exposure_summary
+
+        exposure_summary = build_current_exposure_summary(
+            current_session,
+            settings_row,
+            equity=_coerce_float(pnl_summary.get("equity"), settings_row.starting_equity),
+            reference_symbol=settings_row.default_symbol,
+        )
+    else:
+        exposure_summary = {
+            "reference_symbol": settings_row.default_symbol.upper(),
+            "reference_tier": "unknown",
+            "metrics": {},
+            "limits": exposure_limits,
+            "headroom": {},
+            "status": "unknown",
+        }
+    market_context_summary = _build_market_context_summary(current_session, settings_row)
+    adaptive_protection_summary = _build_adaptive_protection_summary(
+        runtime_state,
+        market_context_summary,
+    )
+    adaptive_signal_context = build_adaptive_signal_context(
+        current_session,
+        enabled=settings_row.adaptive_signal_enabled,
+        symbol=settings_row.default_symbol.upper(),
+        timeframe=settings_row.default_timeframe,
+        regime=str(market_context_summary.get("primary_regime", "unknown")),
+        settings_row=settings_row,
+    )
+    latest_decision_rationale_codes: list[str] = []
+    latest_decision_code: str | None = None
+    latest_trading_run: AgentRun | None = None
+    if current_session is not None:
+        latest_trading_run = current_session.scalar(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(1)
+        )
+        if latest_trading_run is not None:
+            payload = latest_trading_run.output_payload or {}
+            latest_decision_code = str(payload.get("decision") or "") or None
+            raw_codes = payload.get("rationale_codes", [])
+            if isinstance(raw_codes, list):
+                latest_decision_rationale_codes = [str(item) for item in raw_codes if item not in {None, ""}]
+    current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
+    adaptive_signal_summary = summarize_adaptive_signal_state(
+        adaptive_signal_context,
+        latest_rationale_codes=latest_decision_rationale_codes,
+        latest_decision=latest_decision_code,
+        latest_entry_mode=(
+            str(latest_trading_run.output_payload.get("entry_mode"))
+            if current_session is not None
+            and latest_trading_run is not None
+            and isinstance(latest_trading_run.output_payload, dict)
+            and latest_trading_run.output_payload.get("entry_mode") not in {None, ""}
+            else None
+        ),
+    )
+    execution_policy_summary = summarize_execution_policy(settings_row)
+    position_management_summary = _build_position_management_summary(current_session, settings_row)
+    operational_status = build_operational_status_payload(
+        settings_row,
+        session=current_session,
+        defaults=defaults,
+        runtime_state=runtime_state,
+        blocked_reasons=current_cycle_blocked_reasons,
+        latest_blocked_reasons=current_cycle_blocked_reasons,
+        risk_allowed=current_risk_allowed,
+        account_sync_summary=account_sync_summary,
+        sync_freshness_summary=sync_freshness_summary,
+        market_freshness_summary=market_freshness_summary,
+    )
+    return {
+        "mode": mode,
+        "pnl_summary": pnl_summary,
+        "account_sync_summary": account_sync_summary,
+        "sync_freshness_summary": sync_freshness_summary,
+        "market_freshness_summary": market_freshness_summary,
+        "exposure_summary": exposure_summary,
+        "execution_policy_summary": execution_policy_summary,
+        "market_context_summary": market_context_summary,
+        "adaptive_protection_summary": adaptive_protection_summary,
+        "adaptive_signal_summary": adaptive_signal_summary,
+        "position_management_summary": position_management_summary,
+        "operational_status": operational_status.model_dump(mode="json"),
+    }
 
 
 def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Setting:
