@@ -39,6 +39,7 @@ EXECUTION_GUARD_DETAIL_KEY = "execution_guard"
 USER_STREAM_DETAIL_KEY = "user_stream"
 RECONCILIATION_DETAIL_KEY = "reconciliation"
 CANDIDATE_SELECTION_DETAIL_KEY = "candidate_selection"
+DRAWDOWN_STATE_DETAIL_KEY = "drawdown_state"
 MAX_EXECUTION_DEDUPE_RECORDS = 128
 SYNC_SCOPES: tuple[str, ...] = (
     "account",
@@ -444,6 +445,16 @@ def get_candidate_selection_detail(settings_row: Setting) -> dict[str, Any]:
         "generated_at": _serialize_datetime(_coerce_datetime(payload.get("generated_at"))),
         "mode": str(payload.get("mode") or "unavailable"),
         "max_selected": _coerce_int(payload.get("max_selected"), 0),
+        "breadth_regime": str(payload.get("breadth_regime") or "unavailable"),
+        "breadth_summary": _as_dict(payload.get("breadth_summary")),
+        "capacity_reason": str(payload.get("capacity_reason") or "") or None,
+        "entry_score_threshold": _coerce_float(payload.get("entry_score_threshold"), 0.0),
+        "portfolio_allocator": _as_dict(payload.get("portfolio_allocator")),
+        "current_drawdown_state": str(payload.get("current_drawdown_state") or "normal"),
+        "drawdown_entered_at": _serialize_datetime(_coerce_datetime(payload.get("drawdown_entered_at"))),
+        "drawdown_transition_reason": str(payload.get("drawdown_transition_reason") or "") or None,
+        "drawdown_policy_adjustments": _as_dict(payload.get("drawdown_policy_adjustments")),
+        "drawdown_capacity_reason": str(payload.get("drawdown_capacity_reason") or "") or None,
         "selected_symbols": [str(item) for item in payload.get("selected_symbols", []) if item],
         "skipped_symbols": [str(item) for item in payload.get("skipped_symbols", []) if item],
         "rankings": [dict(item) for item in payload.get("rankings", []) if isinstance(item, dict)],
@@ -456,6 +467,16 @@ def set_candidate_selection_detail(
     generated_at: datetime | None = None,
     mode: str | None = None,
     max_selected: int | None = None,
+    breadth_regime: str | None = None,
+    breadth_summary: dict[str, Any] | None = None,
+    capacity_reason: str | None = None,
+    entry_score_threshold: float | None = None,
+    portfolio_allocator: dict[str, Any] | None = None,
+    current_drawdown_state: str | None = None,
+    drawdown_entered_at: datetime | None = None,
+    drawdown_transition_reason: str | None = None,
+    drawdown_policy_adjustments: dict[str, Any] | None = None,
+    drawdown_capacity_reason: str | None = None,
     selected_symbols: list[str] | None = None,
     skipped_symbols: list[str] | None = None,
     rankings: list[dict[str, Any]] | None = None,
@@ -468,6 +489,26 @@ def set_candidate_selection_detail(
         payload["mode"] = mode
     if max_selected is not None:
         payload["max_selected"] = max_selected
+    if breadth_regime is not None:
+        payload["breadth_regime"] = breadth_regime
+    if breadth_summary is not None:
+        payload["breadth_summary"] = dict(breadth_summary)
+    if capacity_reason is not None:
+        payload["capacity_reason"] = capacity_reason
+    if entry_score_threshold is not None:
+        payload["entry_score_threshold"] = float(entry_score_threshold)
+    if portfolio_allocator is not None:
+        payload["portfolio_allocator"] = dict(portfolio_allocator)
+    if current_drawdown_state is not None:
+        payload["current_drawdown_state"] = str(current_drawdown_state)
+    if drawdown_entered_at is not None:
+        payload["drawdown_entered_at"] = drawdown_entered_at.isoformat()
+    if drawdown_transition_reason is not None:
+        payload["drawdown_transition_reason"] = drawdown_transition_reason
+    if drawdown_policy_adjustments is not None:
+        payload["drawdown_policy_adjustments"] = dict(drawdown_policy_adjustments)
+    if drawdown_capacity_reason is not None:
+        payload["drawdown_capacity_reason"] = drawdown_capacity_reason
     if selected_symbols is not None:
         payload["selected_symbols"] = [str(item).upper() for item in selected_symbols if item]
     if skipped_symbols is not None:
@@ -475,6 +516,33 @@ def set_candidate_selection_detail(
     if rankings is not None:
         payload["rankings"] = [dict(item) for item in rankings if isinstance(item, dict)]
     runtime_detail[CANDIDATE_SELECTION_DETAIL_KEY] = payload
+    settings_row.pause_reason_detail = runtime_detail
+
+
+def get_drawdown_state_detail(settings_row: Setting) -> dict[str, Any]:
+    detail = get_runtime_detail(settings_row)
+    payload = _as_dict(detail.get(DRAWDOWN_STATE_DETAIL_KEY))
+    return {
+        "current_drawdown_state": str(payload.get("current_drawdown_state") or "normal"),
+        "entered_at": _serialize_datetime(_coerce_datetime(payload.get("entered_at"))),
+        "transition_reason": str(payload.get("transition_reason") or "stable_normal"),
+        "policy_adjustments": _as_dict(payload.get("policy_adjustments")),
+        "peak_equity": _coerce_float(payload.get("peak_equity"), 0.0),
+        "trough_equity": _coerce_float(payload.get("trough_equity"), 0.0),
+        "drawdown_depth_pct": _coerce_float(payload.get("drawdown_depth_pct"), 0.0),
+        "recent_net_pnl": _coerce_float(payload.get("recent_net_pnl"), 0.0),
+        "recent_net_pnl_pct": _coerce_float(payload.get("recent_net_pnl_pct"), 0.0),
+        "consecutive_losses": _coerce_int(payload.get("consecutive_losses"), 0),
+        "recovery_progress": _coerce_float(payload.get("recovery_progress"), 0.0),
+        "current_equity": _coerce_float(payload.get("current_equity"), 0.0),
+        "lookback_snapshots": _coerce_int(payload.get("lookback_snapshots"), 0),
+        "latest_pnl_snapshot_at": _serialize_datetime(_coerce_datetime(payload.get("latest_pnl_snapshot_at"))),
+    }
+
+
+def set_drawdown_state_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
+    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail[DRAWDOWN_STATE_DETAIL_KEY] = dict(payload)
     settings_row.pause_reason_detail = runtime_detail
 
 
@@ -900,6 +968,7 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
     user_stream_summary = get_user_stream_detail(settings_row)
     reconciliation_summary = get_reconciliation_detail(settings_row)
     candidate_selection_summary = get_candidate_selection_detail(settings_row)
+    drawdown_state_summary = get_drawdown_state_detail(settings_row)
     symbol_states = _as_symbol_map(recovery.get("symbol_states"))
     failure_count = 0
     for item in symbol_states.values():
@@ -933,6 +1002,7 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
         "user_stream_summary": user_stream_summary,
         "reconciliation_summary": reconciliation_summary,
         "candidate_selection_summary": candidate_selection_summary,
+        "drawdown_state_summary": drawdown_state_summary,
         "last_account_sync_at": sync_freshness_summary["account"]["last_sync_at"],
         "last_positions_sync_at": sync_freshness_summary["positions"]["last_sync_at"],
         "last_open_orders_sync_at": sync_freshness_summary["open_orders"]["last_sync_at"],

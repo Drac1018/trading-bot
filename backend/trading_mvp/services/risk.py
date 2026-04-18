@@ -7,21 +7,41 @@ from sqlalchemy.orm import Session
 
 from trading_mvp.config import get_settings
 from trading_mvp.models import Order, RiskCheck, Setting
-from trading_mvp.schemas import MarketSnapshotPayload, RiskCheckResult, TradeDecision
+from trading_mvp.schemas import (
+    MarketSnapshotPayload,
+    MetaGateResult,
+    RiskCheckResult,
+    TradeDecision,
+)
 from trading_mvp.services.account import (
     get_latest_pnl_snapshot,
     get_open_position,
     get_open_positions,
 )
+from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
 from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.drawdown_state import (
+    STATE_ADJUSTMENT_REASON_CODES,
+    build_drawdown_state_snapshot,
+)
+from trading_mvp.services.holding_profile import (
+    HOLDING_PROFILE_POSITION,
+    HOLDING_PROFILE_SCALP,
+    HOLDING_PROFILE_SWING,
+    deterministic_stop_management_payload,
+    resolve_holding_profile_cadence_hint,
+    resolve_holding_profile_management_policy,
+    resolve_holding_profile_risk_policy,
+)
 from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    get_drawdown_state_detail,
+    get_operating_state,
     get_reconciliation_blocking_reason_codes,
     get_reconciliation_detail,
-    get_operating_state,
 )
 from trading_mvp.services.settings import (
     get_exposure_limits,
@@ -48,6 +68,7 @@ MARKET_BLOCKING_REASON_CODES = {
     "incomplete": "MARKET_STATE_INCOMPLETE",
 }
 SURVIVAL_PATH_DECISIONS = {"reduce", "exit"}
+IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES = frozenset({"PENDING_ENTRY_PLAN_TRIGGERED"})
 AUTO_RESIZE_REASON_CODE_MAP = {
     "gross_exposure_headroom_notional": "ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT",
     "directional_headroom_notional": "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT",
@@ -60,6 +81,64 @@ AUTO_RESIZE_HEADROOM_REASON_MAP = {
     "single_position_headroom_notional": "CLAMPED_TO_SINGLE_POSITION_HEADROOM",
     "same_tier_headroom_notional": "CLAMPED_TO_SAME_TIER_HEADROOM",
 }
+DECISION_AGREEMENT_DISAGREEMENT_REASON_CODE = "DETERMINISTIC_BASELINE_DISAGREEMENT"
+SETUP_CLUSTER_DISABLED_REASON_CODE = "SETUP_CLUSTER_DISABLED"
+META_GATE_SOFT_PASS_REASON_CODE = "META_GATE_SOFT_PASS"
+DECISION_AGREEMENT_MULTIPLIERS = {
+    "full_agreement": {
+        "risk_pct_multiplier": 1.0,
+        "leverage_multiplier": 1.0,
+        "notional_multiplier": 1.0,
+    },
+    "partial_agreement": {
+        "risk_pct_multiplier": 0.75,
+        "leverage_multiplier": 0.85,
+        "notional_multiplier": 0.7,
+    },
+    "disagreement": {
+        "risk_pct_multiplier": 0.0,
+        "leverage_multiplier": 0.0,
+        "notional_multiplier": 0.0,
+    },
+}
+META_GATE_REJECT_REASON_CODES = {
+    "META_GATE_LOW_HIT_PROBABILITY",
+    "META_GATE_NEGATIVE_EXPECTANCY",
+    "META_GATE_ADVERSE_SIGNED_SLIPPAGE",
+    "META_GATE_LEAD_LAG_DIVERGENCE",
+    "META_GATE_DERIVATIVES_HEADWIND",
+    "META_GATE_WEAK_BREADTH",
+    "META_GATE_TRANSITIONAL_BREADTH",
+    "META_GATE_BREADTH_COUNTER_BIAS",
+}
+DRAWDOWN_BREAKOUT_DISABLED_REASON_CODE = "DRAWDOWN_STATE_BREAKOUT_RESTRICTED"
+DRAWDOWN_PYRAMIDING_REQUIRES_WINNER_REASON_CODE = "DRAWDOWN_STATE_PYRAMIDING_REQUIRES_WINNER"
+ADD_ON_REQUIRES_WINNING_POSITION_REASON_CODE = "ADD_ON_REQUIRES_WINNING_POSITION"
+ADD_ON_PROTECTIVE_STOP_REQUIRED_REASON_CODE = "ADD_ON_PROTECTIVE_STOP_REQUIRED"
+ADD_ON_TREND_ALIGNMENT_REQUIRED_REASON_CODE = "ADD_ON_TREND_ALIGNMENT_REQUIRED"
+ADD_ON_BREADTH_VETO_REASON_CODE = "ADD_ON_BREADTH_VETO"
+ADD_ON_LEAD_LAG_VETO_REASON_CODE = "ADD_ON_LEAD_LAG_VETO"
+ADD_ON_DERIVATIVES_VETO_REASON_CODE = "ADD_ON_DERIVATIVES_VETO"
+ADD_ON_SPREAD_HEADWIND_REASON_CODE = "ADD_ON_SPREAD_HEADWIND"
+ADD_ON_RISK_DOWNSIZED_REASON_CODE = "ADD_ON_RISK_DOWNSIZED"
+ADD_ON_SPREAD_HEADWIND_BPS = 7.0
+ADD_ON_RISK_MULTIPLIER = 0.7
+ADD_ON_LEVERAGE_MULTIPLIER = 0.9
+ADD_ON_NOTIONAL_MULTIPLIER = 0.6
+ADD_ON_HIGH_R_MULTIPLIER = 0.78
+ADD_ON_HIGH_R_THRESHOLD = 1.0
+PORTFOLIO_SLOT_SOFT_CAP_REASON_CODE = "PORTFOLIO_SLOT_SOFT_CAP"
+HOLDING_PROFILE_SWING_SOFT_CAP_REASON_CODE = "HOLDING_PROFILE_SWING_SOFT_CAP"
+HOLDING_PROFILE_POSITION_SOFT_CAP_REASON_CODE = "HOLDING_PROFILE_POSITION_SOFT_CAP"
+HOLDING_PROFILE_REQUIRES_META_GATE_PASS_REASON_CODE = "HOLDING_PROFILE_REQUIRES_META_GATE_PASS"
+HOLDING_PROFILE_SWING_REQUIRES_INTRADAY_ALIGNMENT_REASON_CODE = "HOLDING_PROFILE_SWING_REQUIRES_INTRADAY_ALIGNMENT"
+HOLDING_PROFILE_SWING_DERIVATIVES_HEADWIND_REASON_CODE = "HOLDING_PROFILE_SWING_DERIVATIVES_HEADWIND"
+HOLDING_PROFILE_POSITION_REQUIRES_STRONG_REGIME_REASON_CODE = "HOLDING_PROFILE_POSITION_REQUIRES_STRONG_REGIME"
+HOLDING_PROFILE_POSITION_BREADTH_WEAK_REASON_CODE = "HOLDING_PROFILE_POSITION_BREADTH_WEAK"
+HOLDING_PROFILE_POSITION_LEAD_LAG_MISMATCH_REASON_CODE = "HOLDING_PROFILE_POSITION_LEAD_LAG_MISMATCH"
+HOLDING_PROFILE_POSITION_RELATIVE_STRENGTH_WEAK_REASON_CODE = "HOLDING_PROFILE_POSITION_RELATIVE_STRENGTH_WEAK"
+HOLDING_PROFILE_POSITION_DERIVATIVES_HEADWIND_REASON_CODE = "HOLDING_PROFILE_POSITION_DERIVATIVES_HEADWIND"
+HOLDING_PROFILE_BREAKOUT_SCALP_ONLY_REASON_CODE = "HOLDING_PROFILE_BREAKOUT_SCALP_ONLY"
 FINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "cancelled", "rejected", "expired"})
 PROTECTIVE_ORDER_TYPE_PREFIXES = ("stop", "take_profit", "trailing_stop")
 EXPOSURE_LIMIT_REASON_SPECS = (
@@ -128,6 +207,362 @@ def _coerce_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _optional_float(value: object) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decision_agreement_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = (
+        decision_context.get("decision_agreement")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("decision_agreement"), dict)
+        else {}
+    )
+    level = str(payload.get("level") or "full_agreement")
+    if level not in DECISION_AGREEMENT_MULTIPLIERS:
+        level = "full_agreement"
+    ai_used = bool(payload.get("ai_used", False))
+    multiplier_profile = DECISION_AGREEMENT_MULTIPLIERS[level]
+    if not ai_used:
+        multiplier_profile = DECISION_AGREEMENT_MULTIPLIERS["full_agreement"]
+    return {
+        "ai_used": ai_used,
+        "comparison_source": str(payload.get("comparison_source") or "unknown"),
+        "level": level,
+        "direction_match": bool(payload.get("direction_match", False)),
+        "entry_mode_match": bool(payload.get("entry_mode_match", False)),
+        "baseline_decision": payload.get("baseline_decision"),
+        "baseline_entry_mode": payload.get("baseline_entry_mode"),
+        "final_decision": payload.get("final_decision"),
+        "final_entry_mode": payload.get("final_entry_mode"),
+        "risk_pct_multiplier": float(multiplier_profile["risk_pct_multiplier"]),
+        "leverage_multiplier": float(multiplier_profile["leverage_multiplier"]),
+        "notional_multiplier": float(multiplier_profile["notional_multiplier"]),
+        "applies_soft_limit": ai_used and level != "full_agreement",
+    }
+
+
+def _setup_cluster_state_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = (
+        decision_context.get("setup_cluster_state")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("setup_cluster_state"), dict)
+        else {}
+    )
+    active = bool(payload.get("active", False))
+    cooldown_active = bool(payload.get("cooldown_active", active))
+    return {
+        "matched": bool(payload.get("matched", False)),
+        "active": active,
+        "cooldown_active": cooldown_active,
+        "status": payload.get("status") or ("active_disabled" if cooldown_active else "monitoring"),
+        "recovery_trigger": payload.get("recovery_trigger"),
+        "cluster_key": payload.get("cluster_key"),
+        "disable_reason_codes": list(payload.get("disable_reason_codes", []))
+        if isinstance(payload.get("disable_reason_codes"), list)
+        else [],
+        "disabled_at": payload.get("disabled_at"),
+        "cooldown_expires_at": payload.get("cooldown_expires_at"),
+        "recovery_condition": payload.get("recovery_condition")
+        if isinstance(payload.get("recovery_condition"), dict)
+        else {},
+        "metrics": payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {},
+        "thresholds": payload.get("thresholds") if isinstance(payload.get("thresholds"), dict) else {},
+        "regime": payload.get("regime"),
+        "trend_alignment": payload.get("trend_alignment"),
+        "scenario": payload.get("scenario"),
+        "entry_mode": payload.get("entry_mode"),
+    }
+
+
+def _meta_gate_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = (
+        decision_context.get("meta_gate")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("meta_gate"), dict)
+        else {}
+    )
+    try:
+        meta_gate = MetaGateResult.model_validate(payload)
+    except Exception:
+        meta_gate = MetaGateResult()
+    gate_decision = str(meta_gate.gate_decision or "pass")
+    if gate_decision not in {"pass", "soft_pass", "reject"}:
+        gate_decision = "pass"
+    reject_reason_codes = [
+        str(code)
+        for code in meta_gate.reject_reason_codes
+        if str(code or "") in META_GATE_REJECT_REASON_CODES
+    ]
+    if gate_decision == "pass":
+        reject_reason_codes = []
+    return {
+        "gate_decision": gate_decision,
+        "expected_hit_probability": float(meta_gate.expected_hit_probability),
+        "expected_time_to_profit_minutes": meta_gate.expected_time_to_profit_minutes,
+        "reject_reason_codes": reject_reason_codes,
+        "confidence_adjustment": float(meta_gate.confidence_adjustment),
+        "risk_multiplier": float(meta_gate.risk_multiplier),
+        "leverage_multiplier": float(meta_gate.leverage_multiplier),
+        "notional_multiplier": float(meta_gate.notional_multiplier),
+        "components": dict(meta_gate.components),
+        "applies_soft_limit": gate_decision == "soft_pass",
+        "applies_block": gate_decision == "reject" and bool(reject_reason_codes),
+    }
+
+
+def _slot_allocation_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = (
+        decision_context.get("slot_allocation")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("slot_allocation"), dict)
+        else {}
+    )
+    assigned_slot = str(payload.get("assigned_slot") or "")
+    if assigned_slot not in {"slot_1", "slot_2", "slot_3"}:
+        assigned_slot = ""
+    slot_label = str(payload.get("slot_label") or "") or None
+    candidate_weight = _optional_float(payload.get("candidate_weight"))
+    if candidate_weight is None:
+        candidate_weight = _optional_float(payload.get("portfolio_weight"))
+    risk_pct_multiplier = _optional_float(payload.get("risk_pct_multiplier"))
+    leverage_multiplier = _optional_float(payload.get("leverage_multiplier"))
+    notional_multiplier = _optional_float(payload.get("notional_multiplier"))
+    if not assigned_slot:
+        risk_pct_multiplier = 1.0
+        leverage_multiplier = 1.0
+        notional_multiplier = 1.0
+    return {
+        "assigned_slot": assigned_slot or None,
+        "slot_label": slot_label,
+        "candidate_weight": candidate_weight if candidate_weight is not None else 0.0,
+        "slot_conviction_score": _optional_float(payload.get("slot_conviction_score")),
+        "meta_gate_probability": _optional_float(payload.get("meta_gate_probability")),
+        "agreement_alignment_score": _optional_float(payload.get("agreement_alignment_score")),
+        "agreement_level_hint": str(payload.get("agreement_level_hint") or "") or None,
+        "execution_quality_score": _optional_float(payload.get("execution_quality_score")),
+        "capacity_reason": str(payload.get("capacity_reason") or "") or None,
+        "selected_reason": str(payload.get("selected_reason") or "") or None,
+        "risk_pct_multiplier": max(risk_pct_multiplier if risk_pct_multiplier is not None else 1.0, 0.0),
+        "leverage_multiplier": max(leverage_multiplier if leverage_multiplier is not None else 1.0, 0.0),
+        "notional_multiplier": max(notional_multiplier if notional_multiplier is not None else 1.0, 0.0),
+        "applies_soft_limit": bool(assigned_slot),
+    }
+
+
+def _holding_profile_context(
+    decision: TradeDecision,
+    decision_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = (
+        decision_context.get("holding_profile_context")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("holding_profile_context"), dict)
+        else {}
+    )
+    profile = str(payload.get("holding_profile") or decision.holding_profile or HOLDING_PROFILE_SCALP).strip().lower()
+    if profile not in {HOLDING_PROFILE_SCALP, HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}:
+        profile = HOLDING_PROFILE_SCALP
+    hard_stop_active = bool(payload.get("hard_stop_active", decision.stop_loss is not None))
+    stop_management = deterministic_stop_management_payload(hard_stop_active=hard_stop_active)
+    risk_policy = resolve_holding_profile_risk_policy(profile)
+    cadence_hint = payload.get("cadence_hint") if isinstance(payload.get("cadence_hint"), dict) else resolve_holding_profile_cadence_hint(profile)
+    management_policy = payload.get("management_policy") if isinstance(payload.get("management_policy"), dict) else resolve_holding_profile_management_policy(profile)
+    return {
+        "holding_profile": profile,
+        "holding_profile_reason": str(
+            payload.get("holding_profile_reason")
+            or decision.holding_profile_reason
+            or "scalp_default_intraday_bias"
+        ),
+        "structural_alignment_strong": bool(payload.get("structural_alignment_strong", False)),
+        "intraday_alignment_ok": bool(payload.get("intraday_alignment_ok", profile == HOLDING_PROFILE_SCALP)),
+        "breadth_not_weak": bool(payload.get("breadth_not_weak", profile == HOLDING_PROFILE_SCALP)),
+        "lead_lag_positive": bool(payload.get("lead_lag_positive", profile == HOLDING_PROFILE_SCALP)),
+        "relative_strength_positive": bool(payload.get("relative_strength_positive", profile == HOLDING_PROFILE_SCALP)),
+        "derivatives_headwind_severe": bool(payload.get("derivatives_headwind_severe", False)),
+        "position_profile_eligible": bool(payload.get("position_profile_eligible", profile == HOLDING_PROFILE_POSITION)),
+        "swing_profile_eligible": bool(payload.get("swing_profile_eligible", profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION})),
+        "breadth_regime": str(payload.get("breadth_regime") or ""),
+        "strategy_engine": str(payload.get("strategy_engine") or ""),
+        "risk_policy": risk_policy,
+        "cadence_hint": dict(cadence_hint),
+        "management_policy": dict(management_policy),
+        **stop_management,
+    }
+
+
+def _position_management_metadata(position: Any) -> dict[str, Any]:
+    metadata = position.metadata_json if position is not None and isinstance(position.metadata_json, dict) else {}
+    management = metadata.get("position_management")
+    if isinstance(management, dict):
+        return dict(management)
+    return {}
+
+
+def _position_initial_risk_per_unit(position: Any) -> float | None:
+    management = _position_management_metadata(position)
+    initial_risk = _optional_float(management.get("initial_risk_per_unit"))
+    if initial_risk is not None and initial_risk > 0:
+        return initial_risk
+    entry_price = _optional_float(getattr(position, "entry_price", None))
+    initial_stop = _optional_float(management.get("initial_stop_loss"))
+    if entry_price is None or initial_stop is None:
+        initial_stop = _optional_float(getattr(position, "stop_loss", None))
+    if entry_price is None or initial_stop is None:
+        return None
+    initial_risk = abs(entry_price - initial_stop)
+    return initial_risk if initial_risk > 0 else None
+
+
+def _position_current_r_multiple(position: Any) -> float | None:
+    management = _position_management_metadata(position)
+    current_r_multiple = _optional_float(management.get("current_r_multiple"))
+    if current_r_multiple is not None:
+        return current_r_multiple
+    initial_risk_per_unit = _position_initial_risk_per_unit(position)
+    entry_price = _optional_float(getattr(position, "entry_price", None))
+    mark_price = _optional_float(getattr(position, "mark_price", None))
+    side = str(getattr(position, "side", "") or "").lower()
+    if (
+        initial_risk_per_unit is None
+        or initial_risk_per_unit <= 0
+        or entry_price is None
+        or mark_price is None
+        or side not in {"long", "short"}
+    ):
+        return None
+    move = mark_price - entry_price if side == "long" else entry_price - mark_price
+    return move / initial_risk_per_unit
+
+
+def _protective_stop_progress_r(position: Any) -> float | None:
+    initial_risk_per_unit = _position_initial_risk_per_unit(position)
+    entry_price = _optional_float(getattr(position, "entry_price", None))
+    stop_loss = _optional_float(getattr(position, "stop_loss", None))
+    side = str(getattr(position, "side", "") or "").lower()
+    if (
+        initial_risk_per_unit is None
+        or initial_risk_per_unit <= 0
+        or entry_price is None
+        or stop_loss is None
+        or side not in {"long", "short"}
+    ):
+        return None
+    if side == "long":
+        return (stop_loss - entry_price) / initial_risk_per_unit
+    return (entry_price - stop_loss) / initial_risk_per_unit
+
+
+def _add_on_context(
+    *,
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    existing_position: Any,
+    decision_context: dict[str, Any] | None,
+    meta_gate: dict[str, Any],
+) -> dict[str, Any]:
+    payload = (
+        decision_context.get("add_on_context")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("add_on_context"), dict)
+        else {}
+    )
+    current_r_multiple = _optional_float(payload.get("current_r_multiple"))
+    if current_r_multiple is None:
+        current_r_multiple = _position_current_r_multiple(existing_position)
+    existing_unrealized_pnl = _optional_float(getattr(existing_position, "unrealized_pnl", None))
+    protected_r_multiple = _optional_float(payload.get("protected_r_multiple"))
+    if protected_r_multiple is None:
+        protected_r_multiple = _protective_stop_progress_r(existing_position)
+    protective_stop_ready = bool(payload.get("protective_stop_ready", False))
+    if not protective_stop_ready:
+        protective_stop_ready = bool(
+            protected_r_multiple is not None
+            and (
+                protected_r_multiple >= 0.0
+                or (
+                    current_r_multiple is not None
+                    and current_r_multiple >= ADD_ON_HIGH_R_THRESHOLD
+                    and protected_r_multiple >= -0.25
+                )
+            )
+        )
+    spread_bps = _optional_float(payload.get("spread_bps"))
+    if spread_bps is None:
+        spread_bps = _optional_float(getattr(market_snapshot.derivatives_context, "spread_bps", None))
+    spread_headwind = bool(payload.get("spread_headwind", False))
+    if not spread_headwind:
+        spread_headwind = spread_bps is not None and spread_bps >= ADD_ON_SPREAD_HEADWIND_BPS
+    breadth_veto = bool(payload.get("breadth_veto", False))
+    lead_lag_veto = bool(payload.get("lead_lag_veto", False))
+    derivatives_veto = bool(payload.get("derivatives_veto", False))
+    meta_gate_reason_codes = {
+        str(code)
+        for code in meta_gate.get("reject_reason_codes", [])
+        if code not in {None, ""}
+    }
+    if not breadth_veto:
+        breadth_veto = any(
+            code in {"META_GATE_WEAK_BREADTH", "META_GATE_TRANSITIONAL_BREADTH", "META_GATE_BREADTH_COUNTER_BIAS"}
+            for code in meta_gate_reason_codes
+        )
+    if not lead_lag_veto:
+        lead_lag_veto = "LEAD_MARKET_DIVERGENCE" in decision.rationale_codes or "META_GATE_LEAD_LAG_DIVERGENCE" in meta_gate_reason_codes
+    if not derivatives_veto:
+        derivatives_veto = bool(
+            "DERIVATIVES_ALIGNMENT_HEADWIND" in decision.rationale_codes
+            or "BREAKOUT_OI_SPREAD_FILTER" in decision.rationale_codes
+            or "META_GATE_DERIVATIVES_HEADWIND" in meta_gate_reason_codes
+        )
+    trend_alignment_ok_payload = payload.get("trend_alignment_ok")
+    if isinstance(trend_alignment_ok_payload, bool):
+        trend_alignment_ok = trend_alignment_ok_payload
+    elif decision.decision == "long":
+        trend_alignment_ok = bool(
+            {"TREND_UP", "ALIGNED_PULLBACK", "BULLISH_CONTINUATION_PULLBACK", "STRUCTURE_BREAKOUT_UP_EXCEPTION"}
+            & set(decision.rationale_codes)
+        ) or meta_gate.get("gate_decision") == "pass"
+    else:
+        trend_alignment_ok = bool(
+            {"TREND_DOWN", "ALIGNED_PULLBACK", "BEARISH_CONTINUATION_REBOUND", "STRUCTURE_BREAKOUT_DOWN_EXCEPTION"}
+            & set(decision.rationale_codes)
+        ) or meta_gate.get("gate_decision") == "pass"
+    current_position_notional = None
+    if existing_position is not None:
+        quantity = _optional_float(getattr(existing_position, "quantity", None))
+        reference_price = _optional_float(getattr(existing_position, "mark_price", None)) or _optional_float(
+            getattr(existing_position, "entry_price", None)
+        )
+        if quantity is not None and reference_price is not None and quantity > 0 and reference_price > 0:
+            current_position_notional = quantity * reference_price
+    strong_winner = bool(
+        existing_unrealized_pnl is not None
+        and existing_unrealized_pnl > 0
+        and current_r_multiple is not None
+        and current_r_multiple >= ADD_ON_HIGH_R_THRESHOLD
+    )
+    add_on_reason = "winner_only_add_on"
+    if strong_winner and protective_stop_ready:
+        add_on_reason = "winner_only_add_on_protected_runner"
+    return {
+        "current_r_multiple": current_r_multiple,
+        "existing_unrealized_pnl": existing_unrealized_pnl,
+        "protected_r_multiple": protected_r_multiple,
+        "protective_stop_ready": protective_stop_ready,
+        "trend_alignment_ok": trend_alignment_ok,
+        "spread_bps": spread_bps,
+        "spread_headwind": spread_headwind,
+        "breadth_veto": breadth_veto,
+        "lead_lag_veto": lead_lag_veto,
+        "derivatives_veto": derivatives_veto,
+        "current_position_notional": current_position_notional,
+        "add_on_reason": add_on_reason,
+        "risk_pct_multiplier": ADD_ON_HIGH_R_MULTIPLIER if strong_winner else ADD_ON_RISK_MULTIPLIER,
+        "leverage_multiplier": ADD_ON_LEVERAGE_MULTIPLIER,
+        "notional_multiplier": ADD_ON_HIGH_R_MULTIPLIER if strong_winner else ADD_ON_NOTIONAL_MULTIPLIER,
+    }
+
+
 def _entry_trigger_evaluation(
     decision: TradeDecision,
     market_snapshot: MarketSnapshotPayload,
@@ -147,6 +582,7 @@ def _entry_trigger_evaluation(
     chase_limit_exceeded = False
     breakout_confirmed: bool | None = None
     pullback_confirmed: bool | None = None
+    immediate_allowed: bool | None = None
 
     if invalidation_price is None or invalidation_price <= 0:
         invalidation_valid = False
@@ -172,7 +608,10 @@ def _entry_trigger_evaluation(
 
     trigger_met = True
     if mode == "immediate":
-        trigger_met = True
+        immediate_allowed = bool(set(decision.rationale_codes) & IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES)
+        trigger_met = immediate_allowed
+        if not trigger_met:
+            reason_codes.append("ENTRY_TRIGGER_NOT_MET")
     elif mode == "breakout_confirm":
         if decision.decision == "long":
             breakout_confirmed = latest_price >= entry_max or (last_candle is not None and last_candle.high >= entry_max)
@@ -204,6 +643,7 @@ def _entry_trigger_evaluation(
         "chase_limit_exceeded": chase_limit_exceeded,
         "breakout_confirmed": breakout_confirmed,
         "pullback_confirmed": pullback_confirmed,
+        "immediate_allowed": immediate_allowed,
         "trigger_met": trigger_met,
         "last_candle_high": _round_float(last_candle.high if last_candle is not None else None),
         "last_candle_low": _round_float(last_candle.low if last_candle is not None else None),
@@ -769,6 +1209,7 @@ def evaluate_risk(
     market_snapshot_id: int | None = None,
     execution_mode: Literal["live", "historical_replay"] = "live",
     exchange_client: Any | None = None,
+    decision_context: dict[str, Any] | None = None,
 ) -> tuple[RiskCheckResult, RiskCheck]:
     blocked_reason_codes: list[str] = []
     adjustment_reason_codes: list[str] = []
@@ -788,6 +1229,11 @@ def evaluate_risk(
     )
     is_entry_decision = decision.decision in {"long", "short"} and not is_protection_recovery
     latest_pnl = get_latest_pnl_snapshot(session, settings_row)
+    drawdown_state = build_drawdown_state_snapshot(
+        session,
+        settings_row,
+        current_detail=get_drawdown_state_detail(settings_row),
+    )
     credentials = get_runtime_credentials(settings_row)
     symbol_risk_tier = get_symbol_risk_tier(decision.symbol)
     effective_leverage_cap = _effective_leverage_cap(settings_row, decision.symbol)
@@ -823,6 +1269,38 @@ def evaluate_risk(
     requested_exposure_limit_codes: list[str] = []
     final_exposure_limit_codes: list[str] = []
     entry_trigger_debug: dict[str, Any] = {}
+    decision_agreement = _decision_agreement_context(decision_context)
+    setup_cluster_state = _setup_cluster_state_context(decision_context)
+    meta_gate = _meta_gate_context(decision_context)
+    holding_profile = _holding_profile_context(decision, decision_context)
+    holding_profile_name = str(holding_profile["holding_profile"])
+    holding_profile_policy = (
+        dict(holding_profile.get("risk_policy"))
+        if isinstance(holding_profile.get("risk_policy"), dict)
+        else resolve_holding_profile_risk_policy(holding_profile_name)
+    )
+    slot_allocation = _slot_allocation_context(decision_context)
+    drawdown_policy = (
+        dict(drawdown_state.get("policy_adjustments") or {})
+        if isinstance(drawdown_state.get("policy_adjustments"), dict)
+        else {}
+    )
+    drawdown_state_code = str(drawdown_state.get("current_drawdown_state") or "normal")
+    same_side_pyramiding = bool(
+        is_entry_decision
+        and existing_position is not None
+        and _decision_matches_position_side(existing_position.side, decision.decision)
+    )
+    add_on = _add_on_context(
+        decision=decision,
+        market_snapshot=market_snapshot,
+        existing_position=existing_position,
+        decision_context=decision_context,
+        meta_gate=meta_gate,
+    )
+    agreement_adjusted_notional = 0.0
+    agreement_adjusted_quantity: float | None = None
+    agreement_block_reason_code: str | None = None
     reconciliation_summary = (
         get_reconciliation_detail(settings_row)
         if execution_mode != "historical_replay"
@@ -920,6 +1398,76 @@ def evaluate_risk(
     if is_entry_decision:
         entry_trigger_reason_codes, entry_trigger_debug = _entry_trigger_evaluation(decision, market_snapshot)
         blocked_reason_codes.extend(entry_trigger_reason_codes)
+    if is_entry_decision and not is_protection_recovery and ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes:
+        blocked_reason_codes.append(ADAPTIVE_SETUP_DISABLE_REASON_CODE)
+    if (
+        is_entry_decision
+        and decision_agreement["ai_used"]
+        and decision_agreement["level"] == "disagreement"
+    ):
+        agreement_block_reason_code = DECISION_AGREEMENT_DISAGREEMENT_REASON_CODE
+        blocked_reason_codes.append(agreement_block_reason_code)
+    if is_entry_decision and setup_cluster_state["active"]:
+        blocked_reason_codes.append(SETUP_CLUSTER_DISABLED_REASON_CODE)
+    if is_entry_decision and meta_gate["applies_block"]:
+        blocked_reason_codes.extend(list(meta_gate["reject_reason_codes"]))
+    if is_entry_decision and holding_profile_name in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}:
+        if bool(holding_profile_policy.get("require_meta_gate_pass", False)) and meta_gate["gate_decision"] != "pass":
+            blocked_reason_codes.append(HOLDING_PROFILE_REQUIRES_META_GATE_PASS_REASON_CODE)
+        if (
+            not bool(holding_profile_policy.get("breakout_exception_allowed", True))
+            and str(decision.entry_mode or "").lower() == "breakout_confirm"
+        ):
+            blocked_reason_codes.append(HOLDING_PROFILE_BREAKOUT_SCALP_ONLY_REASON_CODE)
+        if holding_profile_name == HOLDING_PROFILE_SWING:
+            if not bool(holding_profile.get("intraday_alignment_ok", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_SWING_REQUIRES_INTRADAY_ALIGNMENT_REASON_CODE)
+            if bool(holding_profile.get("derivatives_headwind_severe", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_SWING_DERIVATIVES_HEADWIND_REASON_CODE)
+        if holding_profile_name == HOLDING_PROFILE_POSITION:
+            if not bool(holding_profile.get("structural_alignment_strong", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_POSITION_REQUIRES_STRONG_REGIME_REASON_CODE)
+            if not bool(holding_profile.get("breadth_not_weak", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_POSITION_BREADTH_WEAK_REASON_CODE)
+            if not bool(holding_profile.get("lead_lag_positive", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_POSITION_LEAD_LAG_MISMATCH_REASON_CODE)
+            if not bool(holding_profile.get("relative_strength_positive", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_POSITION_RELATIVE_STRENGTH_WEAK_REASON_CODE)
+            if bool(holding_profile.get("derivatives_headwind_severe", False)):
+                blocked_reason_codes.append(HOLDING_PROFILE_POSITION_DERIVATIVES_HEADWIND_REASON_CODE)
+    if (
+        is_entry_decision
+        and not bool(drawdown_policy.get("breakout_exception_allowed", True))
+        and str(decision.entry_mode or "").lower() == "breakout_confirm"
+    ):
+        blocked_reason_codes.append(DRAWDOWN_BREAKOUT_DISABLED_REASON_CODE)
+    if (
+        is_entry_decision
+        and same_side_pyramiding
+        and bool(drawdown_policy.get("winner_only_pyramiding", False))
+        and (existing_position.unrealized_pnl or 0.0) <= 0.0
+    ):
+        blocked_reason_codes.append(DRAWDOWN_PYRAMIDING_REQUIRES_WINNER_REASON_CODE)
+    if is_entry_decision and same_side_pyramiding:
+        if (
+            add_on["existing_unrealized_pnl"] is None
+            or add_on["existing_unrealized_pnl"] <= 0.0
+            or add_on["current_r_multiple"] is None
+            or add_on["current_r_multiple"] <= 0.0
+        ):
+            blocked_reason_codes.append(ADD_ON_REQUIRES_WINNING_POSITION_REASON_CODE)
+        if not add_on["protective_stop_ready"]:
+            blocked_reason_codes.append(ADD_ON_PROTECTIVE_STOP_REQUIRED_REASON_CODE)
+        if not add_on["trend_alignment_ok"]:
+            blocked_reason_codes.append(ADD_ON_TREND_ALIGNMENT_REQUIRED_REASON_CODE)
+        if add_on["breadth_veto"]:
+            blocked_reason_codes.append(ADD_ON_BREADTH_VETO_REASON_CODE)
+        if add_on["lead_lag_veto"]:
+            blocked_reason_codes.append(ADD_ON_LEAD_LAG_VETO_REASON_CODE)
+        if add_on["derivatives_veto"]:
+            blocked_reason_codes.append(ADD_ON_DERIVATIVES_VETO_REASON_CODE)
+        if add_on["spread_headwind"]:
+            blocked_reason_codes.append(ADD_ON_SPREAD_HEADWIND_REASON_CODE)
     if is_entry_decision and live_requested:
         blocked_reason_codes.extend(_sync_freshness_reason_codes(sync_freshness_summary))
     if is_entry_decision and live_requested:
@@ -1051,6 +1599,76 @@ def evaluate_risk(
             resized_exposure_metrics = requested_exposure_metrics
             exposure_metrics = requested_exposure_metrics
 
+    combined_notional_multiplier = (
+        float(decision_agreement["notional_multiplier"])
+        * float(meta_gate["notional_multiplier"])
+        * float(holding_profile_policy.get("notional_multiplier", 1.0))
+        * float(drawdown_policy.get("notional_multiplier", 1.0))
+        * (float(add_on["notional_multiplier"]) if same_side_pyramiding else 1.0)
+        * (float(slot_allocation["notional_multiplier"]) if is_entry_decision else 1.0)
+    )
+    if (
+        is_entry_decision
+        and len(blocked_reason_codes) == 0
+        and approved_projected_notional > 0
+        and combined_notional_multiplier < 0.999999
+    ):
+        agreement_target_notional = approved_projected_notional * combined_notional_multiplier
+        current_position_notional = _optional_float(add_on.get("current_position_notional"))
+        if same_side_pyramiding and current_position_notional is not None and current_position_notional > 0:
+            agreement_target_notional = min(agreement_target_notional, current_position_notional)
+        agreement_target_quantity = (
+            min(
+                approved_quantity or raw_projected_quantity,
+                agreement_target_notional / max(raw_size["entry_price"], 1.0),
+            )
+            if (approved_quantity or raw_projected_quantity) > 0
+            else 0.0
+        )
+        agreement_payload = _normalize_entry_size_for_risk(
+            settings_row,
+            symbol=decision.symbol,
+            quantity=agreement_target_quantity,
+            reference_price=raw_size["entry_price"],
+            approved_notional=agreement_target_notional,
+            exchange_client=exchange_client,
+            enable_exchange_filters=execution_mode == "live" or exchange_client is not None,
+        )
+        agreement_adjusted_notional = _coerce_float(agreement_payload.get("notional"))
+        agreement_adjusted_quantity = (
+            _coerce_float(agreement_payload.get("quantity"))
+            if _coerce_float(agreement_payload.get("quantity")) > 0
+            else None
+        )
+        agreement_reason_code = str(agreement_payload.get("reason_code") or "").strip() or None
+        if agreement_reason_code is not None:
+            blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
+            approved_projected_notional = 0.0
+            approved_quantity = None
+        else:
+            approved_projected_notional = agreement_adjusted_notional
+            approved_quantity = agreement_adjusted_quantity
+            exposure_metrics = _build_exposure_metrics(
+                session,
+                decision.symbol,
+                latest_pnl.equity,
+                projected_side=decision.decision,
+                projected_notional=approved_projected_notional,
+            )
+            if meta_gate["applies_soft_limit"]:
+                adjustment_reason_codes.append(META_GATE_SOFT_PASS_REASON_CODE)
+            if holding_profile_name == HOLDING_PROFILE_SWING:
+                adjustment_reason_codes.append(HOLDING_PROFILE_SWING_SOFT_CAP_REASON_CODE)
+            elif holding_profile_name == HOLDING_PROFILE_POSITION:
+                adjustment_reason_codes.append(HOLDING_PROFILE_POSITION_SOFT_CAP_REASON_CODE)
+            if same_side_pyramiding:
+                adjustment_reason_codes.append(ADD_ON_RISK_DOWNSIZED_REASON_CODE)
+            if bool(slot_allocation.get("applies_soft_limit", False)):
+                adjustment_reason_codes.append(PORTFOLIO_SLOT_SOFT_CAP_REASON_CODE)
+            drawdown_adjustment_reason_code = STATE_ADJUSTMENT_REASON_CODES.get(drawdown_state_code)
+            if drawdown_adjustment_reason_code is not None:
+                adjustment_reason_codes.append(drawdown_adjustment_reason_code)
+
     blocked_reason_codes = list(dict.fromkeys(blocked_reason_codes))
     adjustment_reason_codes = list(dict.fromkeys(adjustment_reason_codes))
     reason_codes = list(blocked_reason_codes)
@@ -1063,17 +1681,46 @@ def evaluate_risk(
     allowed = len(blocked_reason_codes) == 0
 
     approved_risk_pct = 0.0
+    approved_leverage = 0.0
     if allowed:
         if is_entry_decision and raw_projected_notional > 0:
+            combined_risk_multiplier = (
+                float(decision_agreement["risk_pct_multiplier"])
+                * float(meta_gate["risk_multiplier"])
+                * float(holding_profile_policy.get("risk_pct_multiplier", 1.0))
+                * float(drawdown_policy.get("risk_pct_multiplier", 1.0))
+                * (float(add_on["risk_pct_multiplier"]) if same_side_pyramiding else 1.0)
+                * (float(slot_allocation["risk_pct_multiplier"]) if is_entry_decision else 1.0)
+            )
+            combined_leverage_multiplier = (
+                float(decision_agreement["leverage_multiplier"])
+                * float(meta_gate["leverage_multiplier"])
+                * float(holding_profile_policy.get("leverage_multiplier", 1.0))
+                * float(drawdown_policy.get("leverage_multiplier", 1.0))
+                * (float(add_on["leverage_multiplier"]) if same_side_pyramiding else 1.0)
+                * (float(slot_allocation["leverage_multiplier"]) if is_entry_decision else 1.0)
+            )
             approved_risk_pct = round(
                 min(
-                    decision.risk_pct * (approved_projected_notional / max(raw_projected_notional, 1e-9)),
+                    decision.risk_pct
+                    * (approved_projected_notional / max(raw_projected_notional, 1e-9))
+                    * combined_risk_multiplier,
                     effective_risk_cap,
                 ),
                 6,
             )
+            approved_leverage = round(
+                min(
+                    decision.leverage * combined_leverage_multiplier,
+                    effective_leverage_cap,
+                ),
+                6,
+            )
+            if same_side_pyramiding and existing_position is not None and existing_position.leverage > 0:
+                approved_leverage = round(min(approved_leverage, float(existing_position.leverage)), 6)
         else:
             approved_risk_pct = decision.risk_pct
+            approved_leverage = min(decision.leverage, effective_leverage_cap)
     sync_timestamp_debug = {
         "account_sync_at": (
             str(sync_freshness_summary.get("account", {}).get("last_sync_at"))
@@ -1140,7 +1787,67 @@ def evaluate_risk(
         "final_exposure_limit_codes": final_exposure_limit_codes,
         "exchange_minimums": exchange_minimums,
         "entry_trigger": entry_trigger_debug,
+        "decision_agreement": {
+            **decision_agreement,
+            "agreement_adjusted_notional": _round_float(
+                agreement_adjusted_notional if agreement_adjusted_notional > 0 else None
+            ),
+            "agreement_adjusted_quantity": _round_float(agreement_adjusted_quantity),
+            "blocked_reason_code": agreement_block_reason_code,
+        },
+        "meta_gate": {
+            **meta_gate,
+            "soft_adjusted_notional": _round_float(
+                agreement_adjusted_notional if meta_gate["applies_soft_limit"] and agreement_adjusted_notional > 0 else None
+            ),
+            "soft_adjusted_quantity": _round_float(
+                agreement_adjusted_quantity if meta_gate["applies_soft_limit"] else None
+            ),
+        },
+        "drawdown_state": {
+            **drawdown_state,
+            "same_side_pyramiding": same_side_pyramiding,
+            "winner_only_pyramiding": bool(drawdown_policy.get("winner_only_pyramiding", False)),
+            "breakout_exception_allowed": bool(drawdown_policy.get("breakout_exception_allowed", True)),
+        },
+        "holding_profile": {
+            **holding_profile,
+            "risk_policy": holding_profile_policy,
+            "same_side_pyramiding": same_side_pyramiding,
+            "meta_gate_decision": meta_gate["gate_decision"],
+            "blocked_reason_codes": [
+                code
+                for code in blocked_reason_codes
+                if code.startswith("HOLDING_PROFILE_")
+            ],
+        },
+        "add_on": {
+            **add_on,
+            "same_side_pyramiding": same_side_pyramiding,
+            "winner_only_required": same_side_pyramiding,
+            "decision_agreement_level": decision_agreement["level"],
+            "meta_gate_decision": meta_gate["gate_decision"],
+            "drawdown_state": drawdown_state_code,
+            "blocked_reason_codes": [
+                code
+                for code in blocked_reason_codes
+                if code.startswith("ADD_ON_") or code == DRAWDOWN_PYRAMIDING_REQUIRES_WINNER_REASON_CODE
+            ],
+        },
+        "slot_allocation": {
+            **slot_allocation,
+            "decision_agreement_level": decision_agreement["level"],
+            "meta_gate_decision": meta_gate["gate_decision"],
+            "drawdown_state": drawdown_state_code,
+            "same_side_pyramiding": same_side_pyramiding,
+        },
+        "setup_cluster_state": setup_cluster_state,
+        "adaptive_setup_disable": {
+            "active": ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes,
+            "reason_code": ADAPTIVE_SETUP_DISABLE_REASON_CODE if ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes else None,
+        },
         "sync_timestamps": sync_timestamp_debug,
+        "market_derivatives_context": market_snapshot.derivatives_context.model_dump(mode="json"),
         "reconciliation_state": {
             "position_mode": reconciliation_summary.get("position_mode"),
             "mode_guard_active": bool(reconciliation_summary.get("mode_guard_active", False)),
@@ -1161,7 +1868,7 @@ def evaluate_risk(
         blocked_reason_codes=blocked_reason_codes,
         adjustment_reason_codes=adjustment_reason_codes,
         approved_risk_pct=approved_risk_pct if allowed else 0.0,
-        approved_leverage=min(decision.leverage, effective_leverage_cap) if allowed else 0.0,
+        approved_leverage=approved_leverage if allowed else 0.0,
         raw_projected_notional=raw_projected_notional,
         approved_notional=approved_projected_notional if allowed else 0.0,
         approved_projected_notional=approved_projected_notional if allowed else 0.0,

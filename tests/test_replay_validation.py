@@ -3,15 +3,28 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.providers import DeterministicMockProvider
-from trading_mvp.schemas import FeaturePayload, MarketCandle, MarketSnapshotPayload, ReplayValidationRequest
+from trading_mvp.schemas import (
+    FeaturePayload,
+    MarketCandle,
+    MarketSnapshotPayload,
+    ReplayBreakdownEntry,
+    ReplayMetricSummary,
+    ReplayValidationRequest,
+)
 from trading_mvp.services.agents import TradingDecisionAgent
-from trading_mvp.services.replay_validation import build_replay_validation_report
+from trading_mvp.services.replay_validation import (
+    ReplayAccumulator,
+    _build_parameter_recommendation,
+    _summarize_metrics,
+    build_replay_validation_report,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -185,10 +198,28 @@ def test_replay_validation_report_compares_variants_without_live_execution(monke
     assert all(variant.summary.average_arrival_slippage_pct >= 0.0 for variant in report.variants)
     assert all(variant.summary.average_realized_slippage_pct >= 0.0 for variant in report.variants)
     assert all(variant.summary.average_first_fill_latency_seconds >= 0.0 for variant in report.variants)
+    assert all(
+        variant.summary.closed_trades == 0
+        or variant.summary.expectancy
+        == pytest.approx(variant.summary.net_pnl_after_fees / variant.summary.closed_trades, abs=1e-8)
+        for variant in report.variants
+    )
+    assert all(variant.recent_window_summary.closed_trades >= 0 for variant in report.variants)
+    assert all(variant.by_scenario for variant in report.variants)
+    assert all(variant.by_trend_alignment for variant in report.variants)
+    assert all(variant.by_execution_policy_profile for variant in report.variants)
+    assert all(variant.by_entry_mode for variant in report.variants)
+    assert all(variant.walk_forward_recommendation is not None for variant in report.variants)
+    assert report.recent_walk_forward_recommendation is not None
+    assert report.recent_walk_forward_recommendation.risk_context_patch
     assert all(variant.by_rationale_code for variant in report.variants)
     assert report.symbol_comparison and report.symbol_comparison[0].key == "BTCUSDT"
     assert report.timeframe_comparison and report.timeframe_comparison[0].key == "15m"
+    assert report.scenario_comparison
     assert report.regime_comparison
+    assert report.trend_alignment_comparison
+    assert report.execution_policy_profile_comparison
+    assert report.entry_mode_comparison
     assert report.rationale_comparison
 
 
@@ -229,9 +260,15 @@ def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) 
         assert payload["variants"][0]["summary"]["gross_pnl"] is not None
         assert "average_arrival_slippage_pct" in payload["variants"][0]["summary"]
         assert "average_first_fill_latency_seconds" in payload["variants"][0]["summary"]
+        assert "expectancy" in payload["variants"][0]["summary"]
+        assert "recent_window_summary" in payload["variants"][0]
+        assert "walk_forward_recommendation" in payload["variants"][0]
+        assert "underperforming_buckets" in payload["variants"][0]
+        assert "recent_walk_forward_recommendation" in payload
         assert payload["variants"][0]["by_rationale_code"]
         assert payload["symbol_comparison"][0]["key"] == "BTCUSDT"
         assert payload["timeframe_comparison"][0]["key"] == "15m"
+        assert payload["scenario_comparison"]
         assert payload["rationale_comparison"]
     finally:
         app.dependency_overrides.clear()
@@ -266,5 +303,60 @@ def test_replay_validation_supports_binance_futures_klines_data_source(monkeypat
     assert all(variant.summary.average_first_fill_latency_seconds >= 0.0 for variant in report.variants)
     assert all(variant.summary.average_mfe_pct >= 0.0 for variant in report.variants)
     assert all(variant.summary.worst_mae_pct >= 0.0 for variant in report.variants)
+    assert all(variant.summary.average_hold_time_minutes >= 0.0 for variant in report.variants)
+    assert all(variant.summary.partial_tp_contribution >= 0.0 for variant in report.variants)
+    assert all(variant.summary.runner_contribution >= 0.0 for variant in report.variants)
     assert all(variant.by_rationale_code for variant in report.variants)
     assert report.live_execution_guarantee.endswith("never submits live orders.")
+
+
+def test_replay_metric_summary_calculates_expectancy_and_mfe_mae() -> None:
+    accumulator = ReplayAccumulator(
+        decisions=4,
+        closed_trades=3,
+        gross_pnl=21.0,
+        net_pnl=18.0,
+        fees=3.0,
+        trade_nets=[12.0, -4.0, 10.0],
+        holding_minutes_values=[30.0, 45.0, 75.0],
+        stop_hits=1,
+        tp_hits=1,
+        partial_tp_contribution_total=5.0,
+        runner_contribution_total=7.0,
+        mfe_pct_values=[0.03, 0.05, 0.02],
+        mae_pct_values=[0.01, 0.015, 0.025],
+    )
+
+    summary = _summarize_metrics(accumulator)
+
+    assert summary.net_pnl_after_fees == 18.0
+    assert summary.avg_win == 11.0
+    assert summary.avg_loss == 4.0
+    assert summary.expectancy == 6.0
+    assert summary.average_hold_time_minutes == 50.0
+    assert summary.stop_hit_rate == pytest.approx(1 / 3, abs=1e-8)
+    assert summary.tp_hit_rate == pytest.approx(1 / 3, abs=1e-8)
+    assert summary.partial_tp_contribution == 5.0
+    assert summary.runner_contribution == 7.0
+    assert summary.average_mfe_pct == pytest.approx(0.03333333, abs=1e-8)
+    assert summary.average_mae_pct == pytest.approx(0.01666667, abs=1e-8)
+    assert summary.best_mfe_pct == 0.05
+    assert summary.worst_mae_pct == 0.025
+
+
+def test_replay_parameter_recommendation_returns_fallback_when_data_is_insufficient() -> None:
+    recommendation = _build_parameter_recommendation(
+        logic_variant="improved",
+        recent_summary=ReplayMetricSummary(decisions=5, closed_trades=1),
+        by_entry_mode=[ReplayBreakdownEntry(key="pullback_confirm", decisions=1, closed_trades=1)],
+        by_scenario=[ReplayBreakdownEntry(key="pullback_entry", decisions=1, closed_trades=1)],
+        by_execution_policy_profile=[ReplayBreakdownEntry(key="entry_btc_fast_calm", decisions=1, closed_trades=1)],
+    )
+
+    assert recommendation.status == "insufficient_data"
+    assert recommendation.sample_size == 1
+    assert recommendation.risk_pct_multiplier == 1.0
+    assert recommendation.leverage_multiplier == 1.0
+    assert recommendation.rationale == ["INSUFFICIENT_SAMPLE_SIZE"]
+    assert recommendation.adaptive_signal_context_patch
+    assert recommendation.risk_context_patch

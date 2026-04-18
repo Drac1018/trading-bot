@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RolloutMode = Literal["paper", "shadow", "live_dry_run", "limited_live", "full_live"]
+HoldingProfile = Literal["scalp", "swing", "position"]
 
 
 class StrictBaseModel(BaseModel):
@@ -20,6 +21,8 @@ class TradeDecision(StrictBaseModel):
     entry_zone_min: float | None = None
     entry_zone_max: float | None = None
     entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    holding_profile: HoldingProfile = "scalp"
+    holding_profile_reason: str | None = None
     invalidation_price: float | None = Field(default=None, gt=0.0)
     max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
     idea_ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
@@ -37,6 +40,12 @@ class TradeDecisionCandidateScore(StrictBaseModel):
     regime_fit: float = 0.0
     expected_rr: float = 0.0
     recent_signal_performance: float = 0.0
+    derivatives_alignment: float = 0.0
+    lead_lag_alignment: float = 0.0
+    meta_gate_probability: float = 0.0
+    agreement_alignment: float = 0.0
+    execution_quality: float = 0.0
+    slot_conviction: float = 0.0
     slippage_sensitivity: float = 0.0
     exposure_impact: float = 0.0
     confidence_consistency: float = 0.0
@@ -66,6 +75,12 @@ class TradeDecisionCandidate(StrictBaseModel):
     risk_pct: float = Field(ge=0.0, le=1.0)
     leverage: float = Field(ge=0.0, le=10.0)
     rationale_codes: list[str] = Field(default_factory=list)
+    holding_profile: HoldingProfile = "scalp"
+    holding_profile_reason: str | None = None
+    strategy_engine: str = "unspecified"
+    strategy_engine_context: dict[str, Any] = Field(default_factory=dict)
+    derivatives_summary: dict[str, Any] = Field(default_factory=dict)
+    lead_lag_summary: dict[str, Any] = Field(default_factory=dict)
     explanation_short: str = Field(min_length=3, max_length=240)
     explanation_detailed: str = Field(min_length=10, max_length=600)
 
@@ -302,18 +317,27 @@ class ReplayMetricSummary(StrictBaseModel):
     closed_trades: int = Field(ge=0)
     gross_pnl: float = 0.0
     net_pnl: float = 0.0
+    net_pnl_after_fees: float = 0.0
     fees: float = 0.0
     max_drawdown: float = Field(ge=0.0, default=0.0)
     win_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    avg_win: float = 0.0
+    avg_loss: float = Field(ge=0.0, default=0.0)
+    expectancy: float = 0.0
     profit_factor: float = Field(ge=0.0, default=0.0)
     hold_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
     blocked_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
     average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    average_hold_time_minutes: float = Field(ge=0.0, default=0.0)
     cancel_attempts: int = Field(ge=0, default=0)
     cancel_successes: int = Field(ge=0, default=0)
     cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    stop_hit_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    tp_hit_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    partial_tp_contribution: float = 0.0
+    runner_contribution: float = 0.0
     average_mfe_pct: float = 0.0
     average_mae_pct: float = 0.0
     best_mfe_pct: float = 0.0
@@ -326,22 +350,63 @@ class ReplayBreakdownEntry(StrictBaseModel):
     closed_trades: int = Field(ge=0)
     gross_pnl: float = 0.0
     net_pnl: float = 0.0
+    net_pnl_after_fees: float = 0.0
     fees: float = 0.0
     max_drawdown: float = Field(ge=0.0, default=0.0)
     win_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    avg_win: float = 0.0
+    avg_loss: float = Field(ge=0.0, default=0.0)
+    expectancy: float = 0.0
     profit_factor: float = Field(ge=0.0, default=0.0)
     hold_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
     blocked_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
     average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
+    average_hold_time_minutes: float = Field(ge=0.0, default=0.0)
     cancel_attempts: int = Field(ge=0, default=0)
     cancel_successes: int = Field(ge=0, default=0)
     cancel_success_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    stop_hit_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    tp_hit_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    partial_tp_contribution: float = 0.0
+    runner_contribution: float = 0.0
     average_mfe_pct: float = 0.0
     average_mae_pct: float = 0.0
     best_mfe_pct: float = 0.0
     worst_mae_pct: float = 0.0
+
+
+class ReplayUnderperformingBucket(StrictBaseModel):
+    bucket_type: str
+    key: str
+    sample_size: int = Field(ge=0)
+    expectancy: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    average_hold_time_minutes: float = Field(ge=0.0, default=0.0)
+    average_mfe_pct: float = 0.0
+    average_mae_pct: float = 0.0
+    disable_candidate: bool = True
+    reasons: list[str] = Field(default_factory=list)
+
+
+class ReplayParameterRecommendation(StrictBaseModel):
+    status: Literal["ready", "fallback_neutral", "insufficient_data"] = "fallback_neutral"
+    logic_variant: Literal["baseline_old", "improved"] | None = None
+    sample_size: int = Field(ge=0, default=0)
+    recommendation_basis: dict[str, str] = Field(default_factory=dict)
+    risk_pct_multiplier: float = Field(default=1.0, ge=0.1, le=2.0)
+    leverage_multiplier: float = Field(default=1.0, ge=0.1, le=2.0)
+    max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
+    entry_mode_preference: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    partial_tp_rr: float | None = Field(default=None, ge=0.1, le=10.0)
+    partial_tp_size_pct: float | None = Field(default=None, gt=0.0, le=1.0)
+    time_stop_minutes: int | None = Field(default=None, ge=1, le=1440)
+    trailing_aggressiveness: Literal["defensive", "balanced", "patient"] = "balanced"
+    disable_candidate: bool = False
+    rationale: list[str] = Field(default_factory=list)
+    adaptive_signal_context_patch: dict[str, Any] = Field(default_factory=dict)
+    risk_context_patch: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReplayVariantReport(StrictBaseModel):
@@ -349,10 +414,17 @@ class ReplayVariantReport(StrictBaseModel):
     title: str
     data_source_type: Literal["synthetic_seed", "binance_futures_klines"]
     summary: ReplayMetricSummary
+    recent_window_summary: ReplayMetricSummary
     by_symbol: list[ReplayBreakdownEntry] = Field(default_factory=list)
     by_timeframe: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_scenario: list[ReplayBreakdownEntry] = Field(default_factory=list)
     by_regime: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_trend_alignment: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_execution_policy_profile: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    by_entry_mode: list[ReplayBreakdownEntry] = Field(default_factory=list)
     by_rationale_code: list[ReplayBreakdownEntry] = Field(default_factory=list)
+    walk_forward_recommendation: ReplayParameterRecommendation | None = None
+    underperforming_buckets: list[ReplayUnderperformingBucket] = Field(default_factory=list)
 
 
 class ReplayComparisonEntry(StrictBaseModel):
@@ -383,8 +455,158 @@ class ReplayValidationResponse(StrictBaseModel):
     variants: list[ReplayVariantReport] = Field(default_factory=list)
     symbol_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
     timeframe_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    scenario_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
     regime_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    trend_alignment_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    execution_policy_profile_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    entry_mode_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
     rationale_comparison: list[ReplayComparisonEntry] = Field(default_factory=list)
+    recent_walk_forward_recommendation: ReplayParameterRecommendation | None = None
+    underperforming_buckets: list[ReplayUnderperformingBucket] = Field(default_factory=list)
+
+
+class RulePruningBucketEntry(StrictBaseModel):
+    bucket_key: str
+    symbol: str
+    timeframe: str
+    scenario: str
+    regime: str
+    entry_mode: str
+    execution_policy_profile: str
+    decisions: int = Field(ge=0)
+    traded_decisions: int = Field(ge=0)
+    expectancy: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    avg_signed_slippage_bps: float = 0.0
+    hold_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    late_trigger_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    failure_cluster_hit_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    classification: Literal["keep", "kill", "simplify"] = "simplify"
+    reasons: list[str] = Field(default_factory=list)
+
+
+class RulePruningCandidate(StrictBaseModel):
+    rule_key: str
+    sample_size: int = Field(ge=0)
+    traded_decisions: int = Field(ge=0)
+    expectancy: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    avg_signed_slippage_bps: float = 0.0
+    hold_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    late_trigger_ratio: float = Field(ge=0.0, le=1.0, default=0.0)
+    failure_cluster_hit_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    classification: Literal["keep", "kill", "simplify"] = "simplify"
+    reasons: list[str] = Field(default_factory=list)
+    recommendation: str = ""
+
+
+class RulePruningReportResponse(StrictBaseModel):
+    generated_at: datetime
+    lookback_days: int = Field(ge=1, le=365)
+    decisions_analyzed: int = Field(ge=0)
+    bucket_reports: list[RulePruningBucketEntry] = Field(default_factory=list)
+    keep_list: list[RulePruningCandidate] = Field(default_factory=list)
+    kill_list: list[RulePruningCandidate] = Field(default_factory=list)
+    simplify_list: list[RulePruningCandidate] = Field(default_factory=list)
+    next_cycle_candidates: list[RulePruningCandidate] = Field(default_factory=list)
+
+
+class SkipQualityReasonEntry(StrictBaseModel):
+    skip_reason: str
+    events: int = Field(ge=0)
+    evaluated_events: int = Field(ge=0)
+    pending_events: int = Field(ge=0)
+    avg_followup_return: float = 0.0
+    would_have_hit_tp_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    would_have_hit_sl_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    would_have_reached_0_5r_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    avg_skip_quality_score: float = Field(ge=0.0, le=1.0, default=0.0)
+    good_skip_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    overconservative_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+
+
+class SkipQualityReportResponse(StrictBaseModel):
+    generated_at: datetime
+    lookback_days: int = Field(ge=1, le=365)
+    total_events: int = Field(ge=0)
+    evaluated_events: int = Field(ge=0)
+    pending_events: int = Field(ge=0)
+    reason_reports: list[SkipQualityReasonEntry] = Field(default_factory=list)
+    no_trade_zone_summary: SkipQualityReasonEntry | None = None
+    meta_gate_summary: SkipQualityReasonEntry | None = None
+    breadth_veto_summary: SkipQualityReasonEntry | None = None
+    disable_bucket_summary: SkipQualityReasonEntry | None = None
+
+
+class CapitalEfficiencyBucketEntry(StrictBaseModel):
+    bucket_key: str
+    symbol: str
+    timeframe: str
+    scenario: str
+    regime: str
+    entry_mode: str
+    execution_policy_profile: str
+    decisions: int = Field(ge=0)
+    traded_decisions: int = Field(ge=0)
+    total_exposure_hours: float = Field(ge=0.0, default=0.0)
+    gross_pnl: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    pnl_per_exposure_hour: float = 0.0
+    net_pnl_after_fees_per_hour: float = 0.0
+    average_time_to_0_25r_minutes: float | None = None
+    average_time_to_0_5r_minutes: float | None = None
+    average_time_to_fail_minutes: float | None = None
+    reached_0_25r_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    reached_0_5r_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    fail_before_0_25r_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    capital_slot_occupancy_efficiency: float = Field(ge=0.0, default=0.0)
+    efficiency_classification: Literal["efficient", "neutral", "inefficient"] = "neutral"
+    reasons: list[str] = Field(default_factory=list)
+
+
+class CapitalEfficiencyReportResponse(StrictBaseModel):
+    generated_at: datetime
+    lookback_days: int = Field(ge=1, le=365)
+    decisions_analyzed: int = Field(ge=0)
+    traded_decisions: int = Field(ge=0)
+    total_exposure_hours: float = Field(ge=0.0, default=0.0)
+    bucket_reports: list[CapitalEfficiencyBucketEntry] = Field(default_factory=list)
+    efficient_bucket_keys: list[str] = Field(default_factory=list)
+    inefficient_bucket_keys: list[str] = Field(default_factory=list)
+
+
+class StrategyEngineBucketEntry(StrictBaseModel):
+    bucket_key: str
+    strategy_engine: str
+    symbol: str
+    timeframe: str
+    scenario: str
+    regime: str
+    trend_alignment: str
+    entry_mode: str
+    execution_policy_profile: str
+    session_label: str
+    time_of_day_bucket: str
+    decisions: int = Field(ge=0)
+    traded_decisions: int = Field(ge=0)
+    expectancy: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    avg_signed_slippage_bps: float = 0.0
+    average_time_to_profit_minutes: float | None = None
+    average_drawdown_impact: float = 0.0
+    efficiency_score: float = 0.0
+    classification: Literal["strong", "mixed", "weak"] = "mixed"
+    reasons: list[str] = Field(default_factory=list)
+
+
+class StrategyEngineReportResponse(StrictBaseModel):
+    generated_at: datetime
+    lookback_days: int = Field(ge=1, le=365)
+    decisions_analyzed: int = Field(ge=0)
+    traded_decisions: int = Field(ge=0)
+    bucket_reports: list[StrategyEngineBucketEntry] = Field(default_factory=list)
+    strong_engine_bucket_keys: list[str] = Field(default_factory=list)
+    weak_engine_bucket_keys: list[str] = Field(default_factory=list)
 
 
 class DashboardExecutionProfileSummary(StrictBaseModel):
@@ -459,6 +681,10 @@ class ControlStatusSummary(StrictBaseModel):
     live_arm_disabled: bool = False
     live_arm_disable_reason_code: str | None = None
     live_arm_disable_reason: str | None = None
+    current_drawdown_state: str = "normal"
+    drawdown_state_entered_at: datetime | None = None
+    drawdown_transition_reason: str | None = None
+    drawdown_policy_adjustments: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperationalStatusPayload(StrictBaseModel):
@@ -495,6 +721,10 @@ class OperationalStatusPayload(StrictBaseModel):
     protection_recovery_failure_count: int = 0
     missing_protection_symbols: list[str] = Field(default_factory=list)
     missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
+    current_drawdown_state: str = "normal"
+    drawdown_state_entered_at: datetime | None = None
+    drawdown_transition_reason: str | None = None
+    drawdown_policy_adjustments: dict[str, Any] = Field(default_factory=dict)
     control_status_summary: ControlStatusSummary = Field(default_factory=ControlStatusSummary)
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
@@ -609,6 +839,8 @@ class PendingEntryPlanSnapshot(StrictBaseModel):
     posture: str | None = None
     rationale_codes: list[str] = Field(default_factory=list)
     entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    holding_profile: HoldingProfile = "scalp"
+    holding_profile_reason: str | None = None
     entry_zone_min: float | None = None
     entry_zone_max: float | None = None
     invalidation_price: float | None = None
@@ -673,7 +905,7 @@ class OperatorExecutionSnapshot(StrictBaseModel):
     execution_policy: dict[str, Any] = Field(default_factory=dict)
     execution_quality: dict[str, Any] = Field(default_factory=dict)
     decision_summary: dict[str, Any] = Field(default_factory=dict)
-    recent_fills: list["OperatorExecutionFillSummary"] = Field(default_factory=list)
+    recent_fills: list[OperatorExecutionFillSummary] = Field(default_factory=list)
 
 
 class OperatorExecutionFillSummary(StrictBaseModel):
@@ -785,6 +1017,18 @@ class RiskReasonDetail(StrictBaseModel):
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
+class MetaGateResult(StrictBaseModel):
+    gate_decision: Literal["pass", "soft_pass", "reject"] = "pass"
+    expected_hit_probability: float = Field(ge=0.0, le=1.0, default=0.5)
+    expected_time_to_profit_minutes: int | None = Field(default=None, ge=1, le=1440)
+    reject_reason_codes: list[str] = Field(default_factory=list)
+    confidence_adjustment: float = 0.0
+    risk_multiplier: float = Field(default=1.0, ge=0.0, le=1.0)
+    leverage_multiplier: float = Field(default=1.0, ge=0.0, le=1.0)
+    notional_multiplier: float = Field(default=1.0, ge=0.0, le=1.0)
+    components: dict[str, Any] = Field(default_factory=dict)
+
+
 class RiskCheckResult(StrictBaseModel):
     allowed: bool
     decision: Literal["hold", "long", "short", "reduce", "exit"]
@@ -824,7 +1068,7 @@ class RiskCheckResult(StrictBaseModel):
     debug_payload: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _backfill_compatibility_fields(self) -> "RiskCheckResult":
+    def _backfill_compatibility_fields(self) -> RiskCheckResult:
         if not self.blocked_reason_codes and self.reason_codes:
             self.blocked_reason_codes = list(self.reason_codes)
         if not self.reason_codes and self.blocked_reason_codes:
@@ -890,6 +1134,8 @@ class ExecutionIntent(StrictBaseModel):
     quantity: float = Field(gt=0.0)
     requested_price: float = Field(gt=0.0)
     entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    holding_profile: HoldingProfile = "scalp"
+    holding_profile_reason: str | None = None
     invalidation_price: float | None = Field(default=None, gt=0.0)
     max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
     idea_ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
@@ -934,6 +1180,23 @@ class MarketCandle(StrictBaseModel):
     volume: float = Field(ge=0.0)
 
 
+class DerivativesContextPayload(StrictBaseModel):
+    source: Literal["binance_public", "seed_fallback", "unavailable"] = "unavailable"
+    fallback_used: bool = False
+    fetch_failed: bool = False
+    open_interest: float | None = Field(default=None, ge=0.0)
+    open_interest_change_pct: float | None = None
+    funding_rate: float | None = None
+    taker_buy_sell_imbalance: float | None = None
+    perp_basis_bps: float | None = None
+    crowding_bias: float | None = None
+    top_trader_long_short_ratio: float | None = Field(default=None, ge=0.0)
+    best_bid: float | None = Field(default=None, gt=0.0)
+    best_ask: float | None = Field(default=None, gt=0.0)
+    spread_bps: float | None = Field(default=None, ge=0.0)
+    spread_stress_score: float | None = Field(default=None, ge=0.0)
+
+
 class MarketSnapshotPayload(StrictBaseModel):
     symbol: str
     timeframe: str
@@ -944,6 +1207,7 @@ class MarketSnapshotPayload(StrictBaseModel):
     is_stale: bool
     is_complete: bool
     candles: list[MarketCandle]
+    derivatives_context: DerivativesContextPayload = Field(default_factory=DerivativesContextPayload)
 
 
 class TimeframeFeatureContext(StrictBaseModel):
@@ -1021,6 +1285,85 @@ class RegimeFeatureContext(StrictBaseModel):
     momentum_weakening: bool = False
 
 
+class DerivativesFeatureContext(StrictBaseModel):
+    available: bool = False
+    source: Literal["binance_public", "seed_fallback", "unavailable"] = "unavailable"
+    fallback_used: bool = False
+    fetch_failed: bool = False
+    open_interest: float | None = Field(default=None, ge=0.0)
+    open_interest_change_pct: float | None = None
+    funding_rate: float | None = None
+    taker_buy_sell_imbalance: float | None = None
+    perp_basis_bps: float | None = None
+    crowding_bias: float | None = None
+    top_trader_long_short_ratio: float | None = Field(default=None, ge=0.0)
+    top_trader_crowding_bias: float | None = Field(default=None, ge=-1.0, le=1.0)
+    best_bid: float | None = Field(default=None, gt=0.0)
+    best_ask: float | None = Field(default=None, gt=0.0)
+    spread_bps: float | None = Field(default=None, ge=0.0)
+    spread_stress_score: float | None = Field(default=None, ge=0.0)
+    oi_expanding_with_price: bool = False
+    oi_falling_on_breakout: bool = False
+    crowded_long_risk: bool = False
+    crowded_short_risk: bool = False
+    spread_headwind: bool = False
+    breakout_spread_headwind: bool = False
+    spread_stress: bool = False
+    top_trader_long_crowded: bool = False
+    top_trader_short_crowded: bool = False
+    taker_flow_alignment: Literal["bullish", "bearish", "neutral", "unknown"] = "unknown"
+    funding_bias: Literal["long_headwind", "short_headwind", "neutral", "unknown"] = "unknown"
+    basis_bias: Literal["bullish", "bearish", "neutral", "unknown"] = "unknown"
+    entry_veto_reason_codes: list[str] = Field(default_factory=list)
+    breakout_veto_reason_codes: list[str] = Field(default_factory=list)
+    long_discount_magnitude: float = Field(ge=0.0, le=1.0, default=0.0)
+    short_discount_magnitude: float = Field(ge=0.0, le=1.0, default=0.0)
+    long_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    short_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+
+
+class LeadMarketReferencePayload(StrictBaseModel):
+    symbol: str
+    timeframe: str
+    trend_score: float = 0.0
+    momentum_score: float = 0.0
+    breakout_direction: Literal["up", "down", "none"] = "none"
+    pullback_state: Literal[
+        "bullish_continuation",
+        "bearish_continuation",
+        "bullish_pullback",
+        "bearish_pullback",
+        "countertrend",
+        "range",
+        "unclear",
+    ] = "unclear"
+    primary_regime: Literal["bullish", "bearish", "range", "transition"] = "transition"
+    trend_alignment: Literal["bullish_aligned", "bearish_aligned", "mixed", "range"] = "mixed"
+    weak_volume: bool = False
+    momentum_state: Literal["strengthening", "stable", "weakening", "overextended"] = "stable"
+    volume_ratio: float = Field(ge=0.0, default=0.0)
+
+
+class LeadLagFeatureContext(StrictBaseModel):
+    available: bool = False
+    leader_bias: Literal["bullish", "bearish", "mixed", "neutral", "unknown"] = "unknown"
+    reference_symbols: list[str] = Field(default_factory=list)
+    missing_reference_symbols: list[str] = Field(default_factory=list)
+    bullish_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    bearish_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    bullish_breakout_confirmed: bool = False
+    bearish_breakout_confirmed: bool = False
+    bullish_breakout_ahead: bool = False
+    bearish_breakout_ahead: bool = False
+    bullish_pullback_supported: bool = False
+    bearish_pullback_supported: bool = False
+    bullish_continuation_supported: bool = False
+    bearish_continuation_supported: bool = False
+    strong_reference_confirmation: bool = False
+    weak_reference_confirmation: bool = False
+    references: dict[str, LeadMarketReferencePayload] = Field(default_factory=dict)
+
+
 class FeaturePayload(StrictBaseModel):
     symbol: str
     timeframe: str
@@ -1039,6 +1382,8 @@ class FeaturePayload(StrictBaseModel):
     location: LocationFeatureContext = Field(default_factory=LocationFeatureContext)
     volume_persistence: VolumePersistenceFeatureContext = Field(default_factory=VolumePersistenceFeatureContext)
     pullback_context: PullbackContinuationFeatureContext = Field(default_factory=PullbackContinuationFeatureContext)
+    derivatives: DerivativesFeatureContext = Field(default_factory=DerivativesFeatureContext)
+    lead_lag: LeadLagFeatureContext = Field(default_factory=LeadLagFeatureContext)
     data_quality_flags: list[str] = Field(default_factory=list)
 
 

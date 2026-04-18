@@ -91,6 +91,9 @@ stale / incomplete / protection 검증 실패 관련 reason code:
 - `POSITION_STATE_STALE`
 - `OPEN_ORDERS_STATE_STALE`
 - `PROTECTION_STATE_UNVERIFIED`
+- `UNDERPERFORMING_SETUP_DISABLED`
+  - 최근 실거래 bucket 성과가 충분히 나빠 adaptive setup disable가 active일 때 신규 진입만 차단합니다.
+  - `reduce`, `exit`, `reduce_only`, `protection recovery`, `emergency_exit`는 이 code 때문에 막지 않습니다.
 
 ## 허용되는 생존 경로
 
@@ -101,6 +104,21 @@ stale / incomplete / protection 검증 실패 관련 reason code:
 - `reduce_only`
 - 보호주문 복구
 - `emergency_exit`
+
+## Holding Profile Risk Overlay
+
+- `scalp`는 기본 신규 진입 프로필입니다.
+- `swing`은 `meta_gate=pass`가 필요하고, intraday 정렬이 유지되어야 하며 leverage / notional / risk budget을 더 보수적으로 줄입니다.
+- `position`은 `meta_gate=pass`가 필요하고, strong higher timeframe alignment, breadth not weak, positive lead-lag, positive relative strength, severe derivatives headwind 없음이 모두 필요합니다.
+- `breakout_confirm` 신규 진입은 기본적으로 scalp 전용으로 유지하며, 장기 holding profile에서는 별도 예외를 열지 않습니다.
+- holding profile soft cap은 하드 리스크 한도 위에만 추가 적용되며, stale sync / protection / approval / daily loss 같은 하드 차단을 우회하지 않습니다.
+
+## Hard Stop Policy
+
+- 최초 손절은 항상 deterministic hard stop입니다.
+- AI는 break-even 이동, trailing tighten, partial reduce, stop profile 재조정 제안만 할 수 있습니다.
+- AI는 hard stop 제거, stop widening, 무손절 유지, protection 없는 신규 진입 허용을 할 수 없습니다.
+- `reduce`, `exit`, `reduce_only`, `protection recovery`, `emergency_exit`는 holding profile 차단과 구분되는 survival path로 유지합니다.
 
 ## Exchange Minimum Actionable Size
 

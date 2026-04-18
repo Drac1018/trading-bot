@@ -1,5 +1,17 @@
 # API
 
+## Holding Profile Fields
+
+- `TradeDecision`, decision metadata, candidate ranking, pending entry plan snapshot, `ExecutionIntent`, execution result, and `position_management` metadata can now carry:
+  - `holding_profile`: `scalp | swing | position`
+  - `holding_profile_reason`
+  - `initial_stop_type`
+  - `ai_stop_management_allowed`
+  - `hard_stop_active`
+- 기본값은 `holding_profile=scalp`입니다.
+- `risk_guard.debug_payload.holding_profile` is the source-of-truth for holding-profile operating overlays and blocker codes.
+- `position_management` metadata also stores `stop_widening_allowed=false`; stop widening is not a supported management action.
+
 ## Health
 
 - `GET /health`
@@ -25,11 +37,24 @@
   - `live_execution_ready`, `trading_paused`, `approval_armed`, `approval_expires_at`
   - `operating_state`, `guard_mode_reason_*`, `blocked_reasons`, `latest_blocked_reasons`
   - `control_status_summary`: `exchange_can_trade`, `rollout_mode`, `exchange_submit_allowed`, `limited_live_max_notional`, `app_live_armed`, `approval_window_open`, `approval_state`, `approval_detail`, `paused`, `degraded`, `risk_allowed`, `blocked_reasons_current_cycle`
+    - additive drawdown operating layer:
+      - `current_drawdown_state`: `normal | caution | drawdown_containment | recovery`
+      - `drawdown_state_entered_at`
+      - `drawdown_transition_reason`
+      - `drawdown_policy_adjustments`
   - `auto_resume_status`, `auto_resume_last_blockers`
   - `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
     - `equity`, `wallet_balance`, `available_balance`
     - `realized_pnl`, `fee_total`, `funding_total`, `net_pnl`
-  - `can_enter_new_position`
+- `can_enter_new_position`
+- `current_drawdown_state`
+- `drawdown_state_entered_at`
+- `drawdown_transition_reason`
+- `drawdown_policy_adjustments`
+  - hard risk policy 위의 adaptive operating layer 요약입니다.
+  - `risk_pct_multiplier`, `leverage_multiplier`, `notional_multiplier`
+  - `max_non_priority_selected`, `entry_capacity_multiplier`, `entry_score_threshold_uplift`
+  - `winner_only_pyramiding`, `breakout_exception_allowed`
 
 운영 설정 화면에서 즉시 확인해야 하는 핵심 상태를 반환합니다.
 
@@ -61,6 +86,17 @@
 - `execution_policy_summary`
 - `market_context_summary`
 - `adaptive_signal_summary`
+  - adaptive multiplier 요약 외에 setup auto-disable 상태를 함께 내립니다.
+  - `setup_disable_active`
+  - `active_setup_disable_buckets`
+  - `setup_disable`
+    - `bucket_key`
+    - `symbol`, `timeframe`, `scenario`, `regime`, `entry_mode`
+    - `disable_reason_codes`
+    - `disabled_at`
+    - `cooldown_expires_at`
+    - `metrics`
+    - `recovery_condition`
 - `position_management_summary`
 - `exchange_sync_interval_seconds`
 - `market_refresh_interval_minutes`
@@ -161,6 +197,11 @@ staged rollout semantics:
   - `trading_paused`, `live_execution_ready`, `approval_armed`, `approval_expires_at`
   - `operating_state`, `guard_mode_reason_*`, `blocked_reasons`, `latest_blocked_reasons`
   - `control_status_summary`: `exchange_can_trade`, `app_live_armed`, `approval_window_open`, `approval_state`, `approval_detail`, `paused`, `degraded`, `risk_allowed`, `blocked_reasons_current_cycle`
+    - additive drawdown state:
+      - `current_drawdown_state`
+      - `drawdown_state_entered_at`
+      - `drawdown_transition_reason`
+      - `drawdown_policy_adjustments`
   - `auto_resume_status`, `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
     - `account_sync_summary`는 `wallet_balance`, `available_balance`, `realized_pnl`, `fee_total`, `funding_total`, `net_pnl`를 함께 포함합니다.
   - `can_enter_new_position`
@@ -211,6 +252,11 @@ staged rollout semantics:
   - `rollout_mode`, `exchange_submit_allowed`, `limited_live_max_notional`
   - `trading_paused`, `live_execution_ready`, `approval_armed`, `guard_mode_reason_*`, `blocked_reasons`
   - `control_status_summary`: `exchange_can_trade`, `rollout_mode`, `exchange_submit_allowed`, `limited_live_max_notional`, `app_live_armed`, `approval_window_open`, `approval_state`, `approval_detail`, `paused`, `degraded`, `risk_allowed`, `blocked_reasons_current_cycle`, `approval_control_blocked_reasons`, `live_arm_disabled`, `live_arm_disable_reason_code`, `live_arm_disable_reason`
+    - additive drawdown state:
+      - `current_drawdown_state`
+      - `drawdown_state_entered_at`
+      - `drawdown_transition_reason`
+      - `drawdown_policy_adjustments`
   - `auto_resume_status`, `account_sync_summary`, `sync_freshness_summary`, `market_freshness_summary`
     - `account_sync_summary`에는 `wallet_balance`, `available_balance`, `realized_pnl`, `fee_total`, `funding_total`, `net_pnl`가 additive로 포함됩니다.
   - `operator_alert` (critical banner용 additive payload)
@@ -242,6 +288,7 @@ staged rollout semantics:
   - 지금 신규 진입 가능한지 판단하는 제어 상태
   - `control_status_summary`
     - `operational_status.control_status_summary`의 same-value passthrough
+    - drawdown operating layer도 same-value passthrough로 포함됩니다.
   - `can_enter_new_position`
   - `live_execution_ready`
   - `approval_armed`
@@ -296,6 +343,57 @@ staged rollout semantics:
     - `headroom`
     - `exchange_minimums`
     - `entry_trigger`
+    - `adaptive_setup_disable`
+      - `active`
+      - `reason_code`
+    - `decision_agreement`
+      - `level`
+      - `ai_used`
+      - `risk_pct_multiplier`, `leverage_multiplier`, `notional_multiplier`
+      - `agreement_adjusted_notional`, `agreement_adjusted_quantity`
+      - `blocked_reason_code`
+    - `strategy_engine`
+      - `selected_engine`
+        - `engine_name`
+        - `scenario`
+        - `decision_hint`
+        - `entry_mode`
+        - `eligible`
+        - `priority`
+        - `reasons`
+      - `candidates`
+      - `session_context`
+        - `utc_hour`
+        - `session_label`
+        - `time_of_day_bucket`
+    - `meta_gate`
+      - `gate_decision`
+      - `expected_hit_probability`
+      - `expected_time_to_profit_minutes`
+      - `reject_reason_codes`
+      - `confidence_adjustment`
+      - `risk_multiplier`, `leverage_multiplier`, `notional_multiplier`
+      - `soft_adjusted_notional`, `soft_adjusted_quantity`
+      - `components`
+    - `setup_cluster_state`
+      - `matched`, `active`
+      - `cluster_key`
+      - `disable_reason_codes`
+      - `disabled_at`, `cooldown_expires_at`
+      - `metrics`, `recovery_condition`
+    - `drawdown_state`
+      - `current_drawdown_state`
+      - `previous_drawdown_state`
+      - `entered_at`
+      - `transition_reason`
+      - `drawdown_depth_pct`
+      - `recent_net_pnl`, `recent_net_pnl_pct`
+      - `consecutive_losses`
+      - `recovery_progress`
+      - `policy_adjustments`
+      - `same_side_pyramiding`
+      - `winner_only_pyramiding`
+      - `breakout_exception_allowed`
     - `sync_timestamps`
 - `execution`
   - 최신 판단과 연결된 주문/체결 결과
@@ -324,8 +422,10 @@ staged rollout semantics:
 ### Decision / Risk trigger note
 
 - `TradeDecision` payload는 신규 진입 아이디어에 대해 optional `entry_mode`, `invalidation_price`, `max_chase_bps`, `idea_ttl_minutes`를 포함할 수 있습니다.
+- 일반 신규 진입 아이디어의 `entry_mode`는 `pullback_confirm` 또는 드문 `breakout_confirm` 위주로 정규화되며, `immediate`는 plan watcher가 confirm 후 넘긴 실행 직전 decision 같은 제한된 예외에서만 사용됩니다.
 - `risk_guard`는 신규 `long / short`에 한해 결정론적 entry trigger를 다시 검사합니다.
 - 신규 차단 사유는 `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `INVALID_INVALIDATION_PRICE`를 `reason_codes`와 `blocked_reason_codes`로 남깁니다.
+- adaptive setup disable bucket 이 active인 신규 진입은 `UNDERPERFORMING_SETUP_DISABLED`를 추가 blocker로 남깁니다.
 - `reduce / exit / protection / emergency` 계열은 이 trigger 때문에 막지 않습니다.
 
 ### Pending entry plan lifecycle
@@ -335,13 +435,39 @@ staged rollout semantics:
 - plan에는 `entry_mode`, `entry_zone_min`, `entry_zone_max`, `invalidation_price`, `max_chase_bps`, `idea_ttl_minutes`, `stop_loss`, `take_profit`, `risk_pct_cap`, `leverage_cap`가 함께 저장됩니다.
 - `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `SLIPPAGE_THRESHOLD_EXCEEDED`처럼 현재가 기준으로만 미충족인 entry blocker만 남아 있으면 plan을 `armed`로 유지할 수 있습니다.
 - 반대로 `hold`, 반대 방향 신규 계획, TTL 만료, invalidation 붕괴, stale sync, protection 불일치가 발생하면 기존 armed plan은 `canceled` 또는 `expired`로 종료됩니다.
-- 1분 watcher cycle은 최신 시장/계좌/포지션/오픈오더/보호주문 snapshot을 다시 모은 뒤 plan zone 진입 여부를 보고, 1분 confirm까지 충족한 경우에만 `risk_guard`를 재실행합니다.
+- 1분 watcher cycle은 최신 시장/계좌/포지션/오픈오더/보호주문 snapshot을 다시 모은 뒤 plan zone 진입 여부를 보고, 1분 confirm의 `quality_score`가 threshold를 넘는 경우에만 `risk_guard`를 재실행합니다.
 - watcher 실행에서도 순서는 항상 `decision(plan) -> risk_guard -> execution`이며, `risk_guard.allowed=true`가 아니면 live order를 제출하지 않습니다.
 - watcher가 주문을 성공적으로 제출하거나 동일 `idempotency_key` 실행이 이미 완료된 것을 확인하면 plan은 `triggered`로 종료됩니다.
+- `trigger_details`에는 additive confirm quality fields가 함께 남습니다.
+  - `quality_score`
+  - `quality_threshold`
+  - `quality_state`: `trigger | waiting | cancel`
+  - `quality_components.reclaim_signal_strength`
+  - `quality_components.candle_body_quality`
+  - `quality_components.wick_imbalance_quality`
+  - `quality_components.late_chase_quality`
+  - `quality_components.expected_rr_quality`
+  - `candle_body_ratio`
+  - `wick_imbalance`
+  - `late_chase`, `late_chase_ratio`
+  - `baseline_expected_rr`, `current_expected_rr`, `expected_rr_deterioration_pct`
+- `quality_state=waiting`이면 plan은 그대로 `armed_waiting_confirmation`으로 유지됩니다.
+- `quality_state=cancel`이면 severe late chase 또는 reward-to-risk 붕괴로 `PLAN_CONFIRM_QUALITY_REJECTED`가 기록되고 plan은 취소됩니다.
+- decision/watcher payloads now include additive cadence fields:
+  - `cadence.mode`: `idle | watch | active_position | armed_entry_plan | high_priority_recovery`
+  - `cadence.reasons`
+  - `cadence.skip_reason`
+  - `cadence.effective_cadence.market_refresh_interval_minutes`
+  - `cadence.effective_cadence.position_management_interval_seconds`
+  - `cadence.effective_cadence.decision_cycle_interval_minutes`
+  - `cadence.effective_cadence.ai_call_interval_minutes`
+  - `cadence.effective_cadence.entry_plan_watcher_interval_minutes`
+  - `ai_skipped_reason`: deterministic-only decision path reason when AI inference was intentionally skipped
 
 #### Entry trigger and auto-resize
 
 - `TradeDecision` payload에는 신규 진입 아이디어를 제한하기 위한 optional 필드 `entry_mode`, `invalidation_price`, `max_chase_bps`, `idea_ttl_minutes`가 포함될 수 있습니다.
+- 일반 agent/AI 신규 진입 아이디어는 `immediate`로 바로 실행되지 않으며, `immediate`는 confirm을 마친 armed plan trigger 같은 제한된 실행 컨텍스트에만 남습니다.
 - `risk_guard`는 신규 `long / short`에 대해 결정론적 entry trigger를 다시 검사합니다.
 - 신규 진입 차단 사유는 `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `INVALID_INVALIDATION_PRICE`를 `reason_codes`와 `blocked_reason_codes`로 남깁니다.
 - 익스포저 초과가 유일한 문제이고 `market/account/positions/open_orders/protective_orders` freshness, protection 검증, pause, approval, leverage/risk 하드 게이트가 모두 정상일 때만 `risk_guard`는 신규 진입을 전면 차단하지 않고 `approved_projected_notional`과 `approved_quantity`로 자동 축소 승인할 수 있습니다.
@@ -362,10 +488,143 @@ staged rollout semantics:
 - `debug_payload.requested_exposure_limit_codes`는 resize 전 한도 초과 사유를, `debug_payload.final_exposure_limit_codes`는 resize 후 최종 한도 초과 사유를 담습니다.
 - `debug_payload.exchange_minimums`는 `filter_source`, `tick_size`, `step_size`, `min_qty`, `min_notional`, `minimum_actionable_quantity`, `minimum_actionable_notional`을 함께 내려줍니다.
 - `debug_payload.entry_trigger`는 `ENTRY_TRIGGER_NOT_MET`가 발생한 경우 현재가, entry zone, breakout / pullback confirmation, invalidation, chase 판정값을 같이 남깁니다.
+- `debug_payload.decision_agreement`는 deterministic baseline 대비 최종 AI decision 합의도를 함께 남깁니다.
+  - `full_agreement`: 방향 + `entry_mode` 일치
+  - `partial_agreement`: 방향만 일치
+  - `disagreement`: 방향 불일치 또는 한쪽만 `hold`
+  - `partial_agreement`는 entry 전용 soft multiplier를 적용하고, `disagreement`는 신규 진입 blocker `DETERMINISTIC_BASELINE_DISAGREEMENT`를 남깁니다.
+- `debug_payload.setup_cluster_state`는 `symbol + timeframe + scenario + entry_mode + regime.primary_regime + regime.trend_alignment` 기준 setup cluster 상태를 남깁니다.
+  - disable 조건:
+    - `expectancy < 0`
+    - `net_pnl_after_fees < 0`
+    - 그리고 `loss_streak >= 3` 또는 `avg_signed_slippage_bps >= 12`
+    - 최소 sample size `4`, lookback `8`
+  - 상태 필드:
+    - `status`: `active_disabled`, `cooldown_elapsed`, `metrics_recovered`, `monitoring`, `insufficient_data`
+    - `cooldown_active`
+    - `recovery_trigger`: `cooldown_elapsed`, `positive_recent_metrics`, 또는 `null`
+    - `thresholds`
+  - recovery 조건:
+    - cooldown `180분` 경과
+    - 또는 최근 cluster 지표가 `expectancy >= 0` and `net_pnl_after_fees >= 0`로 회복
+  - 최근 같은 cluster에서 연속 손실, negative expectancy, signed slippage 악화가 반복되면 신규 진입 blocker `SETUP_CLUSTER_DISABLED`가 추가될 수 있습니다.
+  - `reduce`, `exit`, `reduce_only`, `protection recovery`는 이 code 때문에 막지 않습니다.
 - 신규 진입 노출 계산에서 `reduce_only`, `close_only`, `STOP*`, `TAKE_PROFIT*`, `TRAILING_STOP*` open order는 reserved exposure에 포함하지 않습니다.
 - `debug_payload.sync_timestamps`는 `account`, `positions`, `open_orders`, `protective_orders` 마지막 sync 시각을 같이 내려 stale state 확인에 사용합니다.
+- `debug_payload.market_derivatives_context`는 현재 risk 평가에 사용된 파생시장 공개 데이터 요약입니다.
+  - `open_interest`, `open_interest_change_pct`, `funding_rate`, `taker_buy_sell_imbalance`, `perp_basis_bps`, `crowding_bias`
+  - `top_trader_long_short_ratio`, `best_bid`, `best_ask`, `spread_bps`, `spread_stress_score`
+  - 값이 없으면 `None`으로 남고, source/fallback 정보는 market snapshot payload의 `derivatives_context`에서 확인합니다.
+- drawdown state reason / blocker codes:
+  - adjustment-only:
+    - `DRAWDOWN_STATE_CAUTION`
+    - `DRAWDOWN_STATE_CONTAINMENT`
+    - `DRAWDOWN_STATE_RECOVERY`
+  - entry blocker:
+    - `DRAWDOWN_STATE_BREAKOUT_RESTRICTED`
+    - `DRAWDOWN_STATE_PYRAMIDING_REQUIRES_WINNER`
+  - survival path (`reduce`, `exit`, `reduce_only`, `protection recovery`, `emergency`)는 이 drawdown operating layer 때문에 막히지 않습니다.
 - 자동 축소 승인 정보 코드는 `ENTRY_AUTO_RESIZED`, `ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT`, `ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT`, `ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT`, `ENTRY_CLAMPED_TO_SAME_TIER_LIMIT`이며 모두 `adjustment_reason_codes`에 기록됩니다.
 - `reduce / exit / protection / emergency` 계열은 trigger와 auto-resize 정책 때문에 막히지 않습니다.
+
+#### Meta gate
+
+- `decision metadata.meta_gate` is an additive secondary approval layer computed after the decision is generated and before `risk_guard` makes the final allow/block decision.
+- Input sources:
+  - `selection_context.score`
+  - `selection_context.performance_summary`
+  - `selection_context.universe_breadth`
+  - `features.derivatives`
+  - `features.lead_lag`
+  - `decision_agreement`
+- Output fields:
+  - `gate_decision`: `pass | soft_pass | reject`
+  - `expected_hit_probability`
+  - `expected_time_to_profit_minutes`
+  - `reject_reason_codes`
+  - `confidence_adjustment`
+  - `risk_multiplier`, `leverage_multiplier`, `notional_multiplier`
+- `risk_guard.debug_payload.meta_gate` mirrors the same structure and is the source-of-truth used when the secondary gate down-sizes or rejects a new entry.
+- `gate_decision=soft_pass` is non-blocking and adds `META_GATE_SOFT_PASS` to `adjustment_reason_codes` while down-sizing `approved_risk_pct`, `approved_leverage`, and `approved_projected_notional`.
+- `gate_decision=reject` only applies to new entry paths and adds blocker codes such as `META_GATE_LOW_HIT_PROBABILITY`, `META_GATE_NEGATIVE_EXPECTANCY`, `META_GATE_ADVERSE_SIGNED_SLIPPAGE`, `META_GATE_LEAD_LAG_DIVERGENCE`, or `META_GATE_DERIVATIVES_HEADWIND`.
+- `risk_guard.debug_payload.slot_allocation` is an additive portfolio allocator layer used only for new entry soft caps.
+  - `assigned_slot`
+  - `candidate_weight`
+  - `slot_conviction_score`
+  - `meta_gate_probability`
+  - `agreement_alignment_score`
+  - `execution_quality_score`
+  - `risk_pct_multiplier`
+  - `leverage_multiplier`
+  - `notional_multiplier`
+- When a non-priority entry is down-sized by slot policy, `adjustment_reason_codes` includes `PORTFOLIO_SLOT_SOFT_CAP`.
+- Survival paths remain exempt:
+  - `reduce`
+  - `exit`
+  - `reduce_only`
+  - `protection recovery`
+  - `emergency`
+- Final `execution` payloads may include additive `meta_gate` detail so operators can see the secondary gate state alongside execution quality and risk debug data.
+
+#### Holding profile / hard stop
+
+- `decision metadata.holding_profile_context` carries the selected operating profile and the structural reasons behind it.
+- `risk_guard.debug_payload.holding_profile` includes:
+  - `holding_profile`
+  - `holding_profile_reason`
+  - `risk_policy`
+  - `cadence_hint`
+  - `management_policy`
+  - `initial_stop_type`
+  - `ai_stop_management_allowed`
+  - `hard_stop_active`
+  - holding-profile blocker codes such as:
+    - `HOLDING_PROFILE_REQUIRES_META_GATE_PASS`
+    - `HOLDING_PROFILE_SWING_REQUIRES_INTRADAY_ALIGNMENT`
+    - `HOLDING_PROFILE_POSITION_REQUIRES_STRONG_REGIME`
+    - `HOLDING_PROFILE_POSITION_BREADTH_WEAK`
+    - `HOLDING_PROFILE_POSITION_LEAD_LAG_MISMATCH`
+    - `HOLDING_PROFILE_POSITION_RELATIVE_STRENGTH_WEAK`
+    - `HOLDING_PROFILE_POSITION_DERIVATIVES_HEADWIND`
+    - `HOLDING_PROFILE_BREAKOUT_SCALP_ONLY`
+- execution payloads and `position_management.metadata` mirror:
+  - `holding_profile`
+  - `holding_profile_reason`
+  - `initial_stop_type=deterministic_hard_stop`
+  - `ai_stop_management_allowed`
+  - `hard_stop_active`
+  - `stop_widening_allowed=false`
+
+#### Winner-only pyramiding / add-on
+
+- same-side open position이 있는 신규 `long / short`는 execution 직전 `intent_type=scale_in`으로 해석될 수 있으며, `risk_guard`는 이 경로를 winner-only add-on으로 다시 검증합니다.
+- `risk_guard.debug_payload.add_on` is the source-of-truth for add-on gating and sizing:
+  - `same_side_pyramiding`
+  - `current_r_multiple`
+  - `existing_unrealized_pnl`
+  - `protective_stop_ready`
+  - `protected_r_multiple`
+  - `trend_alignment_ok`
+  - `breadth_veto`
+  - `lead_lag_veto`
+  - `derivatives_veto`
+  - `spread_bps`
+  - `spread_headwind`
+  - `current_position_notional`
+  - `risk_pct_multiplier`
+  - `leverage_multiplier`
+  - `notional_multiplier`
+  - `add_on_reason`
+- 신규 add-on blocker reason codes:
+  - `ADD_ON_REQUIRES_WINNING_POSITION`
+  - `ADD_ON_PROTECTIVE_STOP_REQUIRED`
+  - `ADD_ON_TREND_ALIGNMENT_REQUIRED`
+  - `ADD_ON_BREADTH_VETO`
+  - `ADD_ON_LEAD_LAG_VETO`
+  - `ADD_ON_DERIVATIVES_VETO`
+  - `ADD_ON_SPREAD_HEADWIND`
+- add-on이 허용되면 non-blocking adjustment reason `ADD_ON_RISK_DOWNSIZED`가 남고, `approved_risk_pct`, `approved_leverage`, `approved_projected_notional`은 add-on 전용 soft multiplier와 현재 보유 포지션 notional cap 기준으로 더 보수적으로 축소됩니다.
+- `reduce`, `exit`, `reduce_only`, `protection recovery`, `emergency`는 add-on blocker 때문에 막지 않습니다.
 
 #### Dashboard risk source-of-truth
 
@@ -445,6 +704,20 @@ staged rollout semantics:
 - `payload`
 - `created_at`
 
+drawdown state transition audit:
+
+- `event_type=drawdown_state_transition`
+- `event_category=health_system`
+- payload may include:
+  - `previous_drawdown_state`
+  - `current_drawdown_state`
+  - `entered_at`
+  - `transition_reason`
+  - `policy_adjustments`
+  - `drawdown_depth_pct`
+  - `recent_net_pnl`
+  - `consecutive_losses`
+
 ## Live Sync
 
 - `POST /api/live/sync`
@@ -488,6 +761,27 @@ Scheduler workflow names:
 - `position_management_cycle`
 - `entry_plan_watcher_cycle`
 - `interval_decision_cycle`
+
+State-based cadence notes:
+
+- scheduler keeps the configured symbol schedule as the baseline and applies a runtime cadence overlay per symbol
+- `idle` slows market refresh / decision / AI cadence in low-edge conditions
+- `idle` is also used when there is no open position and no armed entry plan, and the current symbol is inside an active setup-disable cooldown or setup-cluster cooldown
+- `armed_entry_plan` keeps the 1m watcher active while an armed plan exists
+- `active_position` prioritizes position management cadence and slows fresh decision cadence
+- `high_priority_recovery` prioritizes recovery/management cadence when protection or degraded state needs urgent attention
+- scheduler run outcomes and decision cycle payloads surface the current cadence mode instead of silently reinterpreting timing in the frontend
+- additional idle reasons may include:
+  - `SETUP_DISABLE_COOLDOWN_ACTIVE`
+  - `SETUP_CLUSTER_COOLDOWN_ACTIVE`
+- additive cadence flags may include:
+  - `setup_disable_active`
+  - `setup_disable_reasons`
+  - `setup_cluster_active`
+  - `setup_cluster_reasons`
+- additive `ai_skipped_reason` values may include:
+  - `CADENCE_IDLE_SETUP_DISABLE_ACTIVE`
+  - `CADENCE_IDLE_SETUP_CLUSTER_ACTIVE`
 
 ## CLI
 
@@ -612,21 +906,59 @@ Audit / health expectations:
   - `average_arrival_slippage_pct`
   - `average_realized_slippage_pct`
   - `average_first_fill_latency_seconds`
+  - `net_pnl_after_fees`
+  - `avg_win`
+  - `avg_loss`
+  - `expectancy`
+  - `average_hold_time_minutes`
   - `cancel_attempts`
   - `cancel_successes`
   - `cancel_success_rate`
+  - `stop_hit_rate`
+  - `tp_hit_rate`
+  - `partial_tp_contribution`
+  - `runner_contribution`
   - `average_mfe_pct`
   - `average_mae_pct`
 - variant breakdowns:
   - `by_symbol`
   - `by_timeframe`
+  - `by_scenario`
   - `by_regime`
+  - `by_trend_alignment`
+  - `by_execution_policy_profile`
+  - `by_entry_mode`
   - `by_rationale_code`
+- variant recent walk-forward fields:
+  - `recent_window_summary`
+  - `walk_forward_recommendation`
+  - `underperforming_buckets`
 - comparison blocks:
   - `symbol_comparison`
   - `timeframe_comparison`
+  - `scenario_comparison`
   - `regime_comparison`
+  - `trend_alignment_comparison`
+  - `execution_policy_profile_comparison`
+  - `entry_mode_comparison`
   - `rationale_comparison`
+- top-level recommendation fields:
+  - `recent_walk_forward_recommendation`
+  - `underperforming_buckets`
+
+`walk_forward_recommendation` is additive only. It does not auto-apply live settings, but it is shaped so it can
+be wired into future `adaptive_signal_context` / `risk_context` usage:
+
+- `risk_pct_multiplier`
+- `leverage_multiplier`
+- `max_chase_bps`
+- `entry_mode_preference`
+- `partial_tp_rr`
+- `partial_tp_size_pct`
+- `time_stop_minutes`
+- `trailing_aggressiveness`
+- `adaptive_signal_context_patch`
+- `risk_context_patch`
 
 Replay guarantee:
 
@@ -670,7 +1002,134 @@ Decision/window breakdowns also include:
 - `feature_flags`
 - `by_rationale_code` and `rationale_comparison` in replay validation responses
 
+### Position management MFE rollback metadata
+
+Live position management context and execution metadata can now carry additive MFE-protection fields:
+
+- `current_r_multiple`
+- `mfe_r`
+- `mae_r`
+- `entry_time_profile`
+  - `breakout_fast`
+  - `continuation_balanced`
+  - `pullback_flexible`
+- `planned_max_holding_minutes`
+- `effective_max_holding_minutes`
+- `early_fail_minutes`
+- `early_fail_r_floor`
+- `hold_extension_minutes`
+- `hold_extension_active`
+- `time_to_fail_basis`
+- `time_to_fail_ready`
+- `time_to_fail_action`
+- `time_to_fail_reason`
+- `mfe_rollback_pct`
+- `mfe_rollback_threshold`
+- `mfe_protection_action`
+  - `monitor`
+  - `tighten_stop`
+  - `reduce`
+  - `exit`
+- `management_stage`
+  - `initial`
+  - `partial_taken`
+  - `trailing_runner`
+  - `defensive_reduce`
+
+When rollback protection is triggered, rationale / audit payloads may include:
+
+- `POSITION_MANAGEMENT_MFE_ROLLBACK`
+- `POSITION_MANAGEMENT_MFE_ROLLBACK_TIGHTEN`
+- `POSITION_MANAGEMENT_MFE_ROLLBACK_REDUCE`
+- `POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT`
+- `POSITION_MANAGEMENT_TIME_TO_FAIL`
+- `POSITION_MANAGEMENT_BREAKOUT_TIME_FAIL_REDUCE`
+- `POSITION_MANAGEMENT_BREAKOUT_TIME_FAIL_EXIT`
+- `POSITION_MANAGEMENT_CONTINUATION_TIME_FAIL_REDUCE`
+- `POSITION_MANAGEMENT_CONTINUATION_TIME_FAIL_EXIT`
+- `POSITION_MANAGEMENT_PULLBACK_TIME_FAIL_REDUCE`
+- `POSITION_MANAGEMENT_PULLBACK_TIME_FAIL_EXIT`
+- `position_management` metadata may also include winner-only pyramiding fields for approved `scale_in` fills:
+  - `add_on_count`
+  - `pyramiding_stage`
+  - `last_add_on_at`
+  - `add_on_reason`
+  - `add_on_r_multiple`
+  - `last_add_on`
+    - `at`
+    - `stage`
+    - `reason`
+    - `r_multiple`
+    - `risk_multiplier`
+    - `leverage_multiplier`
+    - `notional_multiplier`
+
+Agent-side entry decisions now also add setup timing rationale codes:
+
+- `SETUP_TIME_PROFILE_BREAKOUT_FAST`
+- `SETUP_TIME_PROFILE_CONTINUATION_BALANCED`
+- `SETUP_TIME_PROFILE_PULLBACK_FLEXIBLE`
+
 ### Candidate selection / ranking summary
+
+Market and feature payloads can now carry a derivatives context summary:
+
+- `market_snapshot.derivatives_context`
+  - `source`: `binance_public`, `seed_fallback`, `unavailable`
+  - `fallback_used`, `fetch_failed`
+  - `open_interest`, `open_interest_change_pct`, `funding_rate`
+  - `taker_buy_sell_imbalance`, `perp_basis_bps`, `crowding_bias`
+  - `top_trader_long_short_ratio`
+  - `best_bid`, `best_ask`, `spread_bps`, `spread_stress_score`
+- `features.derivatives`
+  - `oi_expanding_with_price`, `oi_falling_on_breakout`
+  - `crowded_long_risk`, `crowded_short_risk`
+  - `taker_flow_alignment`, `funding_bias`, `basis_bias`
+  - `top_trader_long_short_ratio`, `top_trader_crowding_bias`
+  - `top_trader_long_crowded`, `top_trader_short_crowded`
+  - `long_alignment_score`, `short_alignment_score`
+  - `best_bid`, `best_ask`, `spread_bps`
+  - `spread_stress_score`, `spread_headwind`, `spread_stress`, `breakout_spread_headwind`
+  - `entry_veto_reason_codes`, `breakout_veto_reason_codes`
+  - `long_discount_magnitude`, `short_discount_magnitude`
+- `features.lead_lag`
+  - `available`
+  - `leader_bias`: `bullish | bearish | mixed | neutral | unknown`
+  - `reference_symbols`, `missing_reference_symbols`
+  - `bullish_alignment_score`, `bearish_alignment_score`
+  - `bullish_breakout_confirmed`, `bearish_breakout_confirmed`
+  - `bullish_breakout_ahead`, `bearish_breakout_ahead`
+  - `bullish_pullback_supported`, `bearish_pullback_supported`
+  - `bullish_continuation_supported`, `bearish_continuation_supported`
+  - `strong_reference_confirmation`, `weak_reference_confirmation`
+  - `references`
+    - `symbol`, `timeframe`
+    - `trend_score`, `momentum_score`
+    - `breakout_direction`, `pullback_state`
+    - `primary_regime`, `trend_alignment`, `weak_volume`, `momentum_state`
+    - `volume_ratio`
+
+If derivatives public data is missing, the engine keeps the candle-based path and sets fallback flags instead of failing the cycle.
+
+Funding / OI / spread filters are entry-side veto filters first, not entry boosters.
+
+- `SPREAD_HEADWIND`
+  - wide spread relative to current setup quality
+  - used for score discount and deterministic hold bias
+- `SPREAD_STRESS`
+  - wide spread plus shallow top-of-book depth or breakout-specific spread deterioration
+  - used for stronger hold bias / score discount than `SPREAD_HEADWIND`
+- `TOP_TRADER_LONG_CROWDED`
+  - long-side crowding is elevated in top trader positioning
+  - used for long hold bias / score discount only
+- `TOP_TRADER_SHORT_CROWDED`
+  - short-side crowding is elevated in top trader positioning
+  - used for short hold bias / score discount only
+- `BREAKOUT_OI_SPREAD_FILTER`
+  - breakout-like entry with no OI expansion and degraded spread
+  - used to keep breakout exception more conservative
+
+If BTC/ETH lead references are missing, the engine keeps the existing candle path and marks `LEAD_LAG_CONTEXT_UNAVAILABLE` instead of failing the cycle.
 
 Overview, operator control, and settings operational payloads now expose:
 
@@ -678,6 +1137,45 @@ Overview, operator control, and settings operational payloads now expose:
   - `generated_at`
   - `mode`
   - `max_selected`
+  - `current_drawdown_state`
+  - `drawdown_entered_at`
+  - `drawdown_transition_reason`
+  - `drawdown_policy_adjustments`
+  - `drawdown_capacity_reason`
+  - `breadth_regime`
+  - `breadth_summary`
+    - `tracked_symbols`
+    - `bullish_aligned_count`
+    - `bearish_aligned_count`
+    - `weak_volume_count`
+    - `transition_count`
+    - `entry_candidates`
+    - `directional_bias`
+    - `bullish_alignment_ratio`
+    - `bearish_alignment_ratio`
+    - `weak_volume_ratio`
+    - `transition_ratio`
+    - `entry_score_multiplier`
+    - `hold_bias_multiplier`
+  - `capacity_reason`
+  - `entry_score_threshold`
+  - `portfolio_allocator`
+    - `allocator_mode`
+    - `selected_entry_symbols`
+    - `weights`
+    - `slot_mode`
+    - `slot_plan`
+      - `available_slots`
+      - `high_conviction_threshold`
+      - `medium_conviction_threshold`
+      - `low_conviction_action`
+    - `slot_assignments`
+      - `slot_1` / `slot_2` / `slot_3`
+        - `label`
+        - `symbol`
+        - `candidate_weight`
+        - `slot_conviction_score`
+        - `meta_gate_probability`
   - `selected_symbols`
   - `skipped_symbols`
   - `rankings`
@@ -685,19 +1183,99 @@ Overview, operator control, and settings operational payloads now expose:
 Ranking payloads include:
 
 - `candidate`
+  - `strategy_engine`
+  - `strategy_engine_context`
+  - `derivatives_summary`
+  - `lead_lag_summary`
+  - `derivatives_summary.discount_magnitude`
+  - `derivatives_summary.veto_reason_codes`
+- `performance_summary`
+  - `avg_time_to_profit_minutes`
+  - `avg_drawdown_impact`
+  - `components.engine`
 - `score`
   - `regime_fit`
   - `expected_rr`
   - `recent_signal_performance`
+    - approval-rate가 아니라 realized `expectancy`, `net_pnl_after_fees`, `avg_signed_slippage_bps`, scenario/regime bucket 성과를 합성한 expectancy 중심 점수
+  - `derivatives_alignment`
+  - `lead_lag_alignment`
+  - `meta_gate_probability`
+  - `agreement_alignment`
+  - `execution_quality`
+  - `slot_conviction`
   - `slippage_sensitivity`
   - `exposure_impact`
   - `confidence_consistency`
   - `correlation_penalty`
   - `total_score`
 - `selection_reason`
+- `selected_reason`
+- `rejected_reason`
+  - 저성과 후보는 correlation penalty 이전에 `underperforming_expectancy_bucket`, `expectancy_below_threshold`, `adverse_signed_slippage`로 탈락할 수 있음
 - `max_abs_correlation`
+- `breadth_regime`
+- `capacity_reason`
+- `entry_score_threshold`
+- `breadth_score_multiplier`
+- `breadth_score_adjustment`
+- `breadth_hold_bias`
+- `breadth_adjustment_reasons`
+- `assigned_slot`
+- `slot_label`
+- `slot_reason`
+- `candidate_weight`
+- `portfolio_weight`
+- `slot_conviction_score`
+- `meta_gate_probability`
+- `agreement_alignment_score`
+- `agreement_level_hint`
+- `execution_quality_score`
+- `slot_risk_pct_multiplier`
+- `slot_leverage_multiplier`
+- `slot_notional_multiplier`
+- `low-conviction` 신규 진입 후보는 correlation rotation 전에 `rejected_reason=low_conviction_slot_excluded`로 제외될 수 있음
+- `performance_summary`
+  - `score`
+  - `sample_size`
+  - `hit_rate`
+  - `expectancy`
+  - `net_pnl_after_fees`
+  - `avg_signed_slippage_bps`
+  - `loss_streak`
+  - `underperforming`
+  - `components`
+    - `symbol`
+    - `scenario`
+    - `regime`
+    - `bucket`
+- `portfolio_weight`
+- `weight_reason`
+
+Decision metadata and audit payloads can also carry breadth context when the symbol is selected through the portfolio rotation cycle:
+
+- `analysis_context.universe_breadth`
+- `analysis_context.lead_lag`
+- `selection_context`
+  - `universe_breadth`
+  - `breadth_regime`
+  - `capacity_reason`
+  - `portfolio_weight`
+  - `strategy_engine`
+  - `strategy_engine_context`
+  - `breadth_score_multiplier`
+  - `breadth_score_adjustment`
+  - `breadth_hold_bias`
+  - `breadth_adjustment_reasons`
+  - `selected_reason`
 
 Operational rule:
 
+- current mode is `portfolio_rotation_top_n`
+- weak breadth / weak-volume-heavy universes reduce non-priority entry capacity first
+- weak breadth also discounts candidate entry score and raises hold bias for structurally weak new-entry candidates
+- strong breadth keeps the top expectancy-aligned candidates concentrated instead of widening the entry universe indiscriminately
+- priority symbols for open position management or protection recovery remain selected even when entry capacity is reduced
+- selected entry symbols receive score-weighted `portfolio_weight` values so operators can see which symbols the rotation layer is concentrating on
 - candidate ranking only narrows which symbols enter the decision cycle
 - `risk_guard` still remains the final allow/block gate before execution

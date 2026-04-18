@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
 from trading_mvp.models import PnLSnapshot, Position
 from trading_mvp.schemas import TradeDecision
+from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import evaluate_risk, validate_decision_schema
 from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
@@ -32,6 +33,7 @@ def _entry_decision(
     entry_mode: str = "immediate",
     invalidation_price: float | None = None,
     max_chase_bps: float | None = 25.0,
+    rationale_codes: list[str] | None = None,
 ) -> TradeDecision:
     return TradeDecision(
         decision=decision,  # type: ignore[arg-type]
@@ -49,9 +51,178 @@ def _entry_decision(
         max_holding_minutes=120,
         risk_pct=0.01,
         leverage=2.0,
-        rationale_codes=["TEST"],
+        rationale_codes=rationale_codes or ["TEST", "PENDING_ENTRY_PLAN_TRIGGERED"],
         explanation_short="entry trigger test",
         explanation_detailed="Deterministic entry trigger regression test.",
+    )
+
+
+def _decision_context(
+    level: str,
+    *,
+    ai_used: bool = True,
+    baseline_decision: str = "long",
+    baseline_entry_mode: str = "immediate",
+    final_decision: str = "long",
+    final_entry_mode: str = "immediate",
+) -> dict[str, object]:
+    return {
+        "decision_agreement": {
+            "ai_used": ai_used,
+            "comparison_source": "deterministic_baseline_vs_ai_final",
+            "level": level,
+            "baseline_decision": baseline_decision,
+            "baseline_entry_mode": baseline_entry_mode,
+            "final_decision": final_decision,
+            "final_entry_mode": final_entry_mode,
+            "direction_match": baseline_decision == final_decision and baseline_decision in {"long", "short"},
+            "entry_mode_match": (
+                baseline_decision == final_decision
+                and baseline_decision in {"long", "short"}
+                and baseline_entry_mode == final_entry_mode
+            ),
+        }
+    }
+
+
+def _meta_gate_context(
+    gate_decision: str,
+    *,
+    expected_hit_probability: float,
+    risk_multiplier: float,
+    leverage_multiplier: float,
+    notional_multiplier: float,
+    reject_reason_codes: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "meta_gate": {
+            "gate_decision": gate_decision,
+            "expected_hit_probability": expected_hit_probability,
+            "expected_time_to_profit_minutes": 36,
+            "reject_reason_codes": list(reject_reason_codes or []),
+            "confidence_adjustment": -0.08 if gate_decision == "soft_pass" else 0.0,
+            "risk_multiplier": risk_multiplier,
+            "leverage_multiplier": leverage_multiplier,
+            "notional_multiplier": notional_multiplier,
+            "components": {
+                "applicable": True,
+                "test": True,
+            },
+        }
+    }
+
+
+def _add_on_context(
+    *,
+    current_r_multiple: float,
+    protective_stop_ready: bool = True,
+    trend_alignment_ok: bool = True,
+    breadth_veto: bool = False,
+    lead_lag_veto: bool = False,
+    derivatives_veto: bool = False,
+    spread_bps: float = 2.5,
+    spread_headwind: bool = False,
+) -> dict[str, object]:
+    return {
+        "add_on_context": {
+            "current_r_multiple": current_r_multiple,
+            "protective_stop_ready": protective_stop_ready,
+            "trend_alignment_ok": trend_alignment_ok,
+            "breadth_veto": breadth_veto,
+            "lead_lag_veto": lead_lag_veto,
+            "derivatives_veto": derivatives_veto,
+            "spread_bps": spread_bps,
+            "spread_headwind": spread_headwind,
+        }
+    }
+
+
+def _slot_allocation_context(
+    *,
+    assigned_slot: str,
+    candidate_weight: float,
+    risk_pct_multiplier: float,
+    leverage_multiplier: float,
+    notional_multiplier: float,
+    slot_conviction_score: float = 0.7,
+    meta_gate_probability: float = 0.62,
+    agreement_alignment_score: float = 0.64,
+    agreement_level_hint: str = "full_agreement_likely",
+    execution_quality_score: float = 0.66,
+) -> dict[str, object]:
+    return {
+        "slot_allocation": {
+            "assigned_slot": assigned_slot,
+            "slot_label": "high_conviction" if assigned_slot == "slot_1" else "medium_conviction",
+            "candidate_weight": candidate_weight,
+            "portfolio_weight": candidate_weight,
+            "slot_conviction_score": slot_conviction_score,
+            "meta_gate_probability": meta_gate_probability,
+            "agreement_alignment_score": agreement_alignment_score,
+            "agreement_level_hint": agreement_level_hint,
+            "execution_quality_score": execution_quality_score,
+            "risk_pct_multiplier": risk_pct_multiplier,
+            "leverage_multiplier": leverage_multiplier,
+            "notional_multiplier": notional_multiplier,
+            "capacity_reason": "trend_expansion_allow_rotation",
+            "selected_reason": "ranked_portfolio_focus",
+        }
+    }
+
+
+def _holding_profile_context(
+    profile: str,
+    *,
+    structural_alignment_strong: bool = True,
+    intraday_alignment_ok: bool = True,
+    breadth_not_weak: bool = True,
+    lead_lag_positive: bool = True,
+    relative_strength_positive: bool = True,
+    derivatives_headwind_severe: bool = False,
+) -> dict[str, object]:
+    return {
+        "holding_profile_context": {
+            "holding_profile": profile,
+            "holding_profile_reason": f"{profile}_test",
+            "structural_alignment_strong": structural_alignment_strong,
+            "intraday_alignment_ok": intraday_alignment_ok,
+            "breadth_not_weak": breadth_not_weak,
+            "lead_lag_positive": lead_lag_positive,
+            "relative_strength_positive": relative_strength_positive,
+            "derivatives_headwind_severe": derivatives_headwind_severe,
+        }
+    }
+
+
+def _seed_drawdown_pnl_snapshot(
+    db_session,
+    *,
+    equity: float,
+    net_pnl: float,
+    daily_pnl: float,
+    consecutive_losses: int,
+    minutes_ago: int,
+) -> None:
+    created_at = utcnow_naive() - timedelta(minutes=minutes_ago)
+    db_session.add(
+        PnLSnapshot(
+            snapshot_date=created_at.date(),
+            equity=equity,
+            cash_balance=equity,
+            wallet_balance=equity,
+            available_balance=equity,
+            gross_realized_pnl=net_pnl,
+            fee_total=0.0,
+            funding_total=0.0,
+            net_pnl=net_pnl,
+            realized_pnl=net_pnl,
+            unrealized_pnl=0.0,
+            daily_pnl=daily_pnl,
+            cumulative_pnl=net_pnl,
+            consecutive_losses=consecutive_losses,
+            created_at=created_at,
+            updated_at=created_at,
+        )
     )
 
 
@@ -969,6 +1140,35 @@ def test_live_entry_keeps_existing_path_when_sync_state_is_fresh(db_session) -> 
     assert "PROTECTION_STATE_UNVERIFIED" not in result.reason_codes
 
 
+def test_risk_blocks_plain_immediate_entry_without_confirmed_trigger_context(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_zone_min=snapshot.latest_price - 50.0,
+        entry_zone_max=snapshot.latest_price + 50.0,
+        stop_loss=snapshot.latest_price - 500.0,
+        take_profit=snapshot.latest_price + 800.0,
+        entry_mode="immediate",
+        rationale_codes=["TEST"],
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert "ENTRY_TRIGGER_NOT_MET" in result.reason_codes
+    assert result.debug_payload["entry_trigger"]["immediate_allowed"] is False
+
+
 def test_risk_blocks_entry_when_breakout_trigger_is_not_met(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.live_trading_enabled = True
@@ -1333,3 +1533,1019 @@ def test_invalid_protection_recovery_output_is_blocked(db_session) -> None:
 
     assert result.allowed is False
     assert "INVALID_PROTECTION_BRACKETS" in result.reason_codes
+
+
+def test_underperforming_setup_disable_blocks_new_entry_but_not_reduce_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_decision = _entry_decision(rationale_codes=[ADAPTIVE_SETUP_DISABLE_REASON_CODE])
+    reduce_decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=[ADAPTIVE_SETUP_DISABLE_REASON_CODE],
+    )
+
+    entry_result, _ = evaluate_risk(db_session, settings_row, entry_decision, snapshot)
+    reduce_result, _ = evaluate_risk(db_session, settings_row, reduce_decision, snapshot)
+
+    assert entry_result.allowed is False
+    assert ADAPTIVE_SETUP_DISABLE_REASON_CODE in entry_result.reason_codes
+    assert ADAPTIVE_SETUP_DISABLE_REASON_CODE in entry_result.blocked_reason_codes
+    assert entry_result.debug_payload["adaptive_setup_disable"]["active"] is True
+    assert ADAPTIVE_SETUP_DISABLE_REASON_CODE not in reduce_result.reason_codes
+    assert ADAPTIVE_SETUP_DISABLE_REASON_CODE not in reduce_result.blocked_reason_codes
+
+
+def test_setup_cluster_disable_blocks_new_entry_but_not_reduce_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+    reduce_decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["TEST"],
+    )
+    cluster_state = {
+        "matched": True,
+        "active": True,
+        "cluster_key": "BTCUSDT|15m|pullback_entry|pullback_confirm|bullish|bullish_aligned",
+        "disable_reason_codes": ["CLUSTER_NEGATIVE_EXPECTANCY", "CLUSTER_LOSS_STREAK"],
+        "disabled_at": utcnow_naive().isoformat(),
+        "cooldown_expires_at": (utcnow_naive() + timedelta(minutes=180)).isoformat(),
+        "metrics": {
+            "expectancy": -12.0,
+            "net_pnl_after_fees": -48.0,
+            "avg_signed_slippage_bps": 15.0,
+            "loss_streak": 4,
+        },
+        "recovery_condition": {
+            "mode": "cooldown_or_positive_recent_metrics",
+            "cooldown_minutes": 180,
+        },
+        "regime": "bullish",
+        "trend_alignment": "bullish_aligned",
+        "scenario": "pullback_entry",
+        "entry_mode": "pullback_confirm",
+    }
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        entry_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={"setup_cluster_state": cluster_state},
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={"setup_cluster_state": cluster_state},
+    )
+
+    assert entry_result.allowed is False
+    assert "SETUP_CLUSTER_DISABLED" in entry_result.reason_codes
+    assert entry_result.debug_payload["setup_cluster_state"]["active"] is True
+    assert entry_result.debug_payload["setup_cluster_state"]["status"] == "active_disabled"
+    assert entry_result.debug_payload["setup_cluster_state"]["cooldown_active"] is True
+    assert reduce_result.allowed is True
+    assert "SETUP_CLUSTER_DISABLED" not in reduce_result.reason_codes
+
+
+def test_full_agreement_keeps_entry_size_and_leverage(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+
+    baseline_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+    full_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_decision_context(
+            "full_agreement",
+            baseline_entry_mode="pullback_confirm",
+            final_entry_mode="pullback_confirm",
+        ),
+    )
+
+    assert baseline_result.allowed is True
+    assert full_result.allowed is True
+    assert full_result.approved_projected_notional == pytest.approx(
+        baseline_result.approved_projected_notional,
+        rel=1e-6,
+    )
+    assert full_result.approved_risk_pct == pytest.approx(baseline_result.approved_risk_pct, rel=1e-6)
+    assert full_result.approved_leverage == pytest.approx(baseline_result.approved_leverage, rel=1e-6)
+    assert full_result.debug_payload["decision_agreement"]["level"] == "full_agreement"
+    assert full_result.debug_payload["decision_agreement"]["applies_soft_limit"] is False
+
+
+def test_partial_agreement_reduces_entry_size_and_risk_budget(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+
+    baseline_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+    partial_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_decision_context(
+            "partial_agreement",
+            baseline_entry_mode="breakout_confirm",
+            final_entry_mode="pullback_confirm",
+        ),
+    )
+
+    assert partial_result.allowed is True
+    assert partial_result.approved_projected_notional < baseline_result.approved_projected_notional
+    assert partial_result.approved_risk_pct < baseline_result.approved_risk_pct
+    assert partial_result.approved_leverage < baseline_result.approved_leverage
+    assert partial_result.debug_payload["decision_agreement"]["level"] == "partial_agreement"
+    assert partial_result.debug_payload["decision_agreement"]["applies_soft_limit"] is True
+    assert partial_result.debug_payload["decision_agreement"]["notional_multiplier"] == pytest.approx(0.7, rel=1e-6)
+
+
+def test_disagreement_blocks_new_entry_but_not_survival_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_decision = _entry_decision()
+    reduce_decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["TEST"],
+    )
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        entry_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_decision_context(
+            "disagreement",
+            baseline_decision="hold",
+            baseline_entry_mode="none",
+            final_decision="long",
+            final_entry_mode="immediate",
+        ),
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_decision_context(
+            "disagreement",
+            baseline_decision="hold",
+            baseline_entry_mode="none",
+            final_decision="reduce",
+            final_entry_mode="none",
+        ),
+    )
+
+    assert entry_result.allowed is False
+    assert "DETERMINISTIC_BASELINE_DISAGREEMENT" in entry_result.reason_codes
+    assert "DETERMINISTIC_BASELINE_DISAGREEMENT" in entry_result.blocked_reason_codes
+    assert entry_result.debug_payload["decision_agreement"]["blocked_reason_code"] == "DETERMINISTIC_BASELINE_DISAGREEMENT"
+    assert reduce_result.allowed is True
+    assert "DETERMINISTIC_BASELINE_DISAGREEMENT" not in reduce_result.reason_codes
+
+
+def test_meta_gate_soft_pass_downsizes_entry_without_blocking(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+
+    baseline_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+    soft_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_meta_gate_context(
+            "soft_pass",
+            expected_hit_probability=0.49,
+            risk_multiplier=0.72,
+            leverage_multiplier=0.85,
+            notional_multiplier=0.65,
+        ),
+    )
+
+    assert soft_result.allowed is True
+    assert soft_result.approved_projected_notional < baseline_result.approved_projected_notional
+    assert soft_result.approved_risk_pct < baseline_result.approved_risk_pct
+    assert soft_result.approved_leverage < baseline_result.approved_leverage
+    assert "META_GATE_SOFT_PASS" in soft_result.adjustment_reason_codes
+    assert soft_result.debug_payload["meta_gate"]["gate_decision"] == "soft_pass"
+    assert soft_result.debug_payload["meta_gate"]["applies_soft_limit"] is True
+
+
+def test_meta_gate_reject_blocks_new_entry_but_not_survival_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_decision = _entry_decision(entry_mode="pullback_confirm")
+    reduce_decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["TEST"],
+    )
+    meta_gate_reject = _meta_gate_context(
+        "reject",
+        expected_hit_probability=0.24,
+        risk_multiplier=0.0,
+        leverage_multiplier=0.0,
+        notional_multiplier=0.0,
+        reject_reason_codes=["META_GATE_LOW_HIT_PROBABILITY", "META_GATE_NEGATIVE_EXPECTANCY"],
+    )
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        entry_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=meta_gate_reject,
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=meta_gate_reject,
+    )
+
+    assert entry_result.allowed is False
+    assert "META_GATE_LOW_HIT_PROBABILITY" in entry_result.reason_codes
+    assert "META_GATE_NEGATIVE_EXPECTANCY" in entry_result.blocked_reason_codes
+    assert entry_result.debug_payload["meta_gate"]["gate_decision"] == "reject"
+    assert reduce_result.allowed is True
+    assert "META_GATE_LOW_HIT_PROBABILITY" not in reduce_result.reason_codes
+
+
+def test_holding_profile_swing_downsizes_entry_when_meta_gate_passes(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reference_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=reference_price * 0.999,
+        entry_zone_max=reference_price * 1.001,
+        stop_loss=reference_price * 0.985,
+        take_profit=reference_price * 1.015,
+        max_chase_bps=100.0,
+    ).model_copy(
+        update={
+            "holding_profile": "swing",
+            "holding_profile_reason": "swing_test",
+        }
+    )
+
+    baseline_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        _entry_decision(
+            entry_mode="pullback_confirm",
+            entry_zone_min=reference_price * 0.999,
+            entry_zone_max=reference_price * 1.001,
+            stop_loss=reference_price * 0.985,
+            take_profit=reference_price * 1.015,
+            max_chase_bps=100.0,
+        ),
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            **_meta_gate_context(
+                "pass",
+                expected_hit_probability=0.72,
+                risk_multiplier=1.0,
+                leverage_multiplier=1.0,
+                notional_multiplier=1.0,
+            ),
+            **_decision_context(
+                "full_agreement",
+                baseline_entry_mode="pullback_confirm",
+                final_entry_mode="pullback_confirm",
+            ),
+        },
+    )
+    swing_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            **_holding_profile_context("swing"),
+            **_meta_gate_context(
+                "pass",
+                expected_hit_probability=0.72,
+                risk_multiplier=1.0,
+                leverage_multiplier=1.0,
+                notional_multiplier=1.0,
+            ),
+            **_decision_context(
+                "full_agreement",
+                baseline_entry_mode="pullback_confirm",
+                final_entry_mode="pullback_confirm",
+            ),
+        },
+    )
+
+    assert baseline_result.allowed is True
+    assert swing_result.allowed is True
+    assert swing_result.approved_projected_notional < baseline_result.approved_projected_notional
+    assert swing_result.approved_risk_pct < baseline_result.approved_risk_pct
+    assert swing_result.approved_leverage < baseline_result.approved_leverage
+    assert "HOLDING_PROFILE_SWING_SOFT_CAP" in swing_result.adjustment_reason_codes
+    assert swing_result.debug_payload["holding_profile"]["holding_profile"] == "swing"
+
+
+def test_holding_profile_position_blocks_when_structural_regime_is_not_strong(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reference_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=reference_price * 0.999,
+        entry_zone_max=reference_price * 1.001,
+        stop_loss=reference_price * 0.985,
+        take_profit=reference_price * 1.018,
+        max_chase_bps=100.0,
+    ).model_copy(
+        update={
+            "holding_profile": "position",
+            "holding_profile_reason": "position_test",
+        }
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            **_holding_profile_context("position", structural_alignment_strong=False),
+            **_meta_gate_context(
+                "pass",
+                expected_hit_probability=0.76,
+                risk_multiplier=1.0,
+                leverage_multiplier=1.0,
+                notional_multiplier=1.0,
+            ),
+            **_decision_context(
+                "full_agreement",
+                baseline_entry_mode="pullback_confirm",
+                final_entry_mode="pullback_confirm",
+            ),
+        },
+    )
+
+    assert result.allowed is False
+    assert "HOLDING_PROFILE_POSITION_REQUIRES_STRONG_REGIME" in result.reason_codes
+    assert result.debug_payload["holding_profile"]["holding_profile"] == "position"
+
+
+def test_holding_profile_swing_requires_meta_gate_pass_for_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reference_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=reference_price * 0.999,
+        entry_zone_max=reference_price * 1.001,
+        stop_loss=reference_price * 0.985,
+        take_profit=reference_price * 1.015,
+        max_chase_bps=100.0,
+    ).model_copy(
+        update={
+            "holding_profile": "swing",
+            "holding_profile_reason": "swing_test",
+        }
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            **_holding_profile_context("swing"),
+            **_meta_gate_context(
+                "soft_pass",
+                expected_hit_probability=0.52,
+                risk_multiplier=0.72,
+                leverage_multiplier=0.85,
+                notional_multiplier=0.65,
+            ),
+            **_decision_context(
+                "full_agreement",
+                baseline_entry_mode="pullback_confirm",
+                final_entry_mode="pullback_confirm",
+            ),
+        },
+    )
+
+    assert result.allowed is False
+    assert "HOLDING_PROFILE_REQUIRES_META_GATE_PASS" in result.reason_codes
+    assert result.debug_payload["holding_profile"]["meta_gate_decision"] == "soft_pass"
+
+
+def test_holding_profile_blocks_do_not_apply_to_survival_paths(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["TEST"],
+    ).model_copy(
+        update={
+            "holding_profile": "position",
+            "holding_profile_reason": "position_test",
+        }
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            **_holding_profile_context(
+                "position",
+                structural_alignment_strong=False,
+                breadth_not_weak=False,
+                lead_lag_positive=False,
+                relative_strength_positive=False,
+                derivatives_headwind_severe=True,
+            ),
+            **_meta_gate_context(
+                "reject",
+                expected_hit_probability=0.22,
+                risk_multiplier=0.0,
+                leverage_multiplier=0.0,
+                notional_multiplier=0.0,
+                reject_reason_codes=["META_GATE_LOW_HIT_PROBABILITY"],
+            ),
+        },
+    )
+
+    assert result.allowed is True
+    assert "HOLDING_PROFILE_REQUIRES_META_GATE_PASS" not in result.reason_codes
+    assert "HOLDING_PROFILE_POSITION_REQUIRES_STRONG_REGIME" not in result.reason_codes
+
+
+def test_portfolio_slot_soft_cap_downsizes_medium_conviction_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reference_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=reference_price * 0.999,
+        entry_zone_max=reference_price * 1.001,
+        stop_loss=reference_price * 0.985,
+        take_profit=reference_price * 1.03,
+        invalidation_price=reference_price * 0.985,
+        max_chase_bps=120.0,
+    )
+
+    baseline_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+    slot_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_slot_allocation_context(
+            assigned_slot="slot_2",
+            candidate_weight=0.38,
+            risk_pct_multiplier=0.82,
+            leverage_multiplier=0.9,
+            notional_multiplier=0.78,
+        ),
+    )
+
+    assert baseline_result.allowed is True
+    assert slot_result.allowed is True
+    assert slot_result.approved_projected_notional < baseline_result.approved_projected_notional
+    assert slot_result.approved_risk_pct < baseline_result.approved_risk_pct
+    assert slot_result.approved_leverage < baseline_result.approved_leverage
+    assert "PORTFOLIO_SLOT_SOFT_CAP" in slot_result.adjustment_reason_codes
+    assert slot_result.debug_payload["slot_allocation"]["assigned_slot"] == "slot_2"
+    assert slot_result.debug_payload["slot_allocation"]["candidate_weight"] == pytest.approx(0.38, rel=1e-6)
+    assert slot_result.debug_payload["slot_allocation"]["applies_soft_limit"] is True
+
+
+def test_portfolio_slot_soft_cap_does_not_override_exposure_hard_block(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    settings_row.max_directional_bias_pct = 0.7
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=1.0,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    decision = TradeDecision(
+        decision="long",
+        confidence=0.7,
+        symbol="ETHUSDT",
+        timeframe="15m",
+        entry_zone_min=3200.0,
+        entry_zone_max=3210.0,
+        stop_loss=3150.0,
+        take_profit=3330.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="slot soft cap must not override exposure hard block",
+        explanation_detailed="Directional exposure blockers stay higher priority than slot-based soft downsize.",
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_slot_allocation_context(
+            assigned_slot="slot_1",
+            candidate_weight=0.64,
+            risk_pct_multiplier=1.0,
+            leverage_multiplier=1.0,
+            notional_multiplier=1.0,
+            slot_conviction_score=0.81,
+            meta_gate_probability=0.74,
+            agreement_alignment_score=0.78,
+            execution_quality_score=0.72,
+        ),
+    )
+
+    assert result.allowed is False
+    assert "DIRECTIONAL_BIAS_LIMIT_REACHED" in result.reason_codes
+    assert result.debug_payload["slot_allocation"]["assigned_slot"] == "slot_1"
+
+
+def test_drawdown_caution_downsizes_entry_without_breaking_hard_gates(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=100000.0,
+        net_pnl=0.0,
+        daily_pnl=0.0,
+        consecutive_losses=0,
+        minutes_ago=40,
+    )
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=98200.0,
+        net_pnl=-1800.0,
+        daily_pnl=-900.0,
+        consecutive_losses=2,
+        minutes_ago=5,
+    )
+    db_session.flush()
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+
+    caution_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert caution_result.allowed is True
+    assert caution_result.approved_projected_notional > 0.0
+    assert caution_result.approved_risk_pct < decision.risk_pct
+    assert caution_result.approved_leverage < decision.leverage
+    assert "DRAWDOWN_STATE_CAUTION" in caution_result.adjustment_reason_codes
+    assert caution_result.debug_payload["drawdown_state"]["current_drawdown_state"] == "caution"
+    assert caution_result.debug_payload["drawdown_state"]["policy_adjustments"]["risk_pct_multiplier"] == 0.75
+
+
+def test_drawdown_containment_blocks_breakout_and_losing_pyramiding_but_not_reduce(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=100000.0,
+        net_pnl=0.0,
+        daily_pnl=0.0,
+        consecutive_losses=0,
+        minutes_ago=40,
+    )
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=95800.0,
+        net_pnl=-4200.0,
+        daily_pnl=-1600.0,
+        consecutive_losses=2,
+        minutes_ago=5,
+    )
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.25,
+            entry_price=65000.0,
+            mark_price=64850.0,
+            leverage=2.0,
+            unrealized_pnl=-37.5,
+            stop_loss=64000.0,
+            take_profit=66500.0,
+        )
+    )
+    db_session.flush()
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    breakout_decision = _entry_decision(
+        entry_mode="breakout_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+    pullback_scale_in = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+    reduce_decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["TEST"],
+    )
+
+    breakout_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        breakout_decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+    scale_in_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        pullback_scale_in,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert breakout_result.allowed is False
+    assert "DRAWDOWN_STATE_BREAKOUT_RESTRICTED" in breakout_result.reason_codes
+    assert scale_in_result.allowed is False
+    assert "DRAWDOWN_STATE_PYRAMIDING_REQUIRES_WINNER" in scale_in_result.reason_codes
+    assert scale_in_result.debug_payload["drawdown_state"]["winner_only_pyramiding"] is True
+    assert reduce_result.allowed is True
+    assert "DRAWDOWN_STATE_BREAKOUT_RESTRICTED" not in reduce_result.reason_codes
+
+
+def test_winner_only_add_on_allows_profitable_protected_scale_in_with_downsized_size(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=100000.0,
+        net_pnl=0.0,
+        daily_pnl=0.0,
+        consecutive_losses=0,
+        minutes_ago=5,
+    )
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=70600.0,
+            leverage=2.0,
+            stop_loss=70100.0,
+            take_profit=72000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=6.0,
+            metadata_json={
+                "position_management": {
+                    "initial_stop_loss": 69000.0,
+                    "initial_risk_per_unit": 1000.0,
+                    "current_r_multiple": 0.6,
+                }
+            },
+        )
+    )
+    db_session.flush()
+
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+        rationale_codes=["TEST", "TREND_UP", "ALIGNED_PULLBACK"],
+    )
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_add_on_context(current_r_multiple=0.6),
+    )
+
+    assert result.allowed is True
+    assert result.debug_payload["add_on"]["same_side_pyramiding"] is True
+    assert result.debug_payload["add_on"]["protective_stop_ready"] is True
+    assert result.approved_projected_notional > 0.0
+    assert result.approved_projected_notional < result.raw_projected_notional
+    assert result.approved_projected_notional <= 706.0 + 1e-6
+    assert result.approved_risk_pct < decision.risk_pct
+    assert result.approved_leverage <= decision.leverage
+    assert "ADD_ON_RISK_DOWNSIZED" in result.adjustment_reason_codes
+
+
+def test_winner_only_add_on_blocks_losing_position_and_unprotected_stop(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=100000.0,
+        net_pnl=0.0,
+        daily_pnl=0.0,
+        consecutive_losses=0,
+        minutes_ago=5,
+    )
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=69750.0,
+            leverage=2.0,
+            stop_loss=69000.0,
+            take_profit=72000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=-2.5,
+            metadata_json={
+                "position_management": {
+                    "initial_stop_loss": 69000.0,
+                    "initial_risk_per_unit": 1000.0,
+                    "current_r_multiple": -0.25,
+                }
+            },
+        )
+    )
+    db_session.flush()
+
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+        rationale_codes=["TEST", "TREND_UP", "ALIGNED_PULLBACK"],
+    )
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_add_on_context(current_r_multiple=-0.25, protective_stop_ready=False),
+    )
+
+    assert result.allowed is False
+    assert "ADD_ON_REQUIRES_WINNING_POSITION" in result.reason_codes
+    assert "ADD_ON_PROTECTIVE_STOP_REQUIRED" in result.reason_codes
+    assert result.debug_payload["add_on"]["same_side_pyramiding"] is True
+
+
+def test_winner_only_add_on_block_does_not_apply_to_reduce_paths(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=100000.0,
+        net_pnl=0.0,
+        daily_pnl=0.0,
+        consecutive_losses=0,
+        minutes_ago=5,
+    )
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=69750.0,
+            leverage=2.0,
+            stop_loss=69000.0,
+            take_profit=72000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=-2.5,
+        )
+    )
+    db_session.flush()
+
+    reduce_decision = _entry_decision(decision="reduce", entry_mode="none", max_chase_bps=None)
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_add_on_context(current_r_multiple=-0.25, protective_stop_ready=False),
+    )
+
+    assert reduce_result.allowed is True
+    assert "ADD_ON_REQUIRES_WINNING_POSITION" not in reduce_result.reason_codes
+    assert "ADD_ON_PROTECTIVE_STOP_REQUIRED" not in reduce_result.reason_codes
+
+
+def test_drawdown_soft_layer_does_not_override_daily_loss_hard_block(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    settings_row.max_daily_loss = 0.02
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=100000.0,
+        net_pnl=0.0,
+        daily_pnl=0.0,
+        consecutive_losses=0,
+        minutes_ago=40,
+    )
+    _seed_drawdown_pnl_snapshot(
+        db_session,
+        equity=94000.0,
+        net_pnl=-6000.0,
+        daily_pnl=-2500.0,
+        consecutive_losses=2,
+        minutes_ago=5,
+    )
+    db_session.flush()
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "DAILY_LOSS_LIMIT_REACHED" in result.reason_codes
+    assert result.debug_payload["drawdown_state"]["current_drawdown_state"] == "drawdown_containment"

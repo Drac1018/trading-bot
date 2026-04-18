@@ -73,6 +73,31 @@ def _is_due(latest: SchedulerRun | None, delta: timedelta) -> bool:
     return min(latest.next_run_at, computed_due_at) <= utcnow_naive()
 
 
+def _symbol_cadence_profile(
+    orchestrator: TradingOrchestrator,
+    *,
+    symbol: str,
+    timeframe: str,
+) -> dict[str, object]:
+    return orchestrator.get_symbol_cadence_profile(symbol=symbol, timeframe=timeframe)
+
+
+def _cadence_minutes(profile: dict[str, object], key: str, fallback: int) -> int:
+    cadence = profile.get("effective_cadence")
+    if not isinstance(cadence, dict):
+        return fallback
+    value = cadence.get(key)
+    return int(value) if isinstance(value, (int, float)) and int(value) > 0 else fallback
+
+
+def _cadence_seconds(profile: dict[str, object], key: str, fallback: int) -> int:
+    cadence = profile.get("effective_cadence")
+    if not isinstance(cadence, dict):
+        return fallback
+    value = cadence.get(key)
+    return int(value) if isinstance(value, (int, float)) and int(value) > 0 else fallback
+
+
 def _start_scheduler_run(
     session: Session,
     *,
@@ -231,12 +256,23 @@ def run_exchange_sync_cycle(session: Session, triggered_by: str = "scheduler") -
 
 def get_due_market_refresh_symbols(session: Session) -> list[str]:
     settings_row = get_or_create_settings(session)
+    orchestrator = TradingOrchestrator(session)
     due: list[str] = []
     for effective in get_effective_symbol_schedule(settings_row):
         if not effective.enabled:
             continue
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_minutes = _cadence_minutes(
+            cadence_profile,
+            "market_refresh_interval_minutes",
+            effective.market_refresh_interval_minutes,
+        )
         latest = _latest_symbol_workflow_run(session, MARKET_REFRESH_WORKFLOW, effective.symbol)
-        if _is_due(latest, timedelta(minutes=effective.market_refresh_interval_minutes)):
+        if _is_due(latest, timedelta(minutes=cadence_minutes)):
             due.append(effective.symbol)
     return due
 
@@ -247,16 +283,26 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
     for effective in get_effective_symbol_schedule(orchestrator.settings_row):
         if not effective.enabled:
             continue
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_minutes = _cadence_minutes(
+            cadence_profile,
+            "market_refresh_interval_minutes",
+            effective.market_refresh_interval_minutes,
+        )
         latest = _latest_symbol_workflow_run(session, MARKET_REFRESH_WORKFLOW, effective.symbol)
-        if not _is_due(latest, timedelta(minutes=effective.market_refresh_interval_minutes)):
+        if not _is_due(latest, timedelta(minutes=cadence_minutes)):
             continue
         row = _start_scheduler_run(
             session,
             workflow=MARKET_REFRESH_WORKFLOW,
-            schedule_window=_symbol_schedule_window(interval_minutes=effective.market_refresh_interval_minutes),
+            schedule_window=_symbol_schedule_window(interval_minutes=cadence_minutes),
             triggered_by=triggered_by,
             symbol=effective.symbol,
-            next_run_at=utcnow_naive() + timedelta(minutes=effective.market_refresh_interval_minutes),
+            next_run_at=utcnow_naive() + timedelta(minutes=cadence_minutes),
         )
         try:
             cycle = orchestrator.run_market_refresh_cycle(
@@ -273,7 +319,7 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
                     row=row,
                     success=True,
                     message="Market refresh cycle completed.",
-                    payload=symbol_outcome,
+                    payload={**symbol_outcome, "cadence": cadence_profile},
                 )
             )
         except Exception as exc:
@@ -291,14 +337,25 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
 
 def get_due_position_management_symbols(session: Session) -> list[str]:
     settings_row = get_or_create_settings(session)
+    orchestrator = TradingOrchestrator(session)
     due: list[str] = []
     for effective in get_effective_symbol_schedule(settings_row):
         if not effective.enabled:
             continue
         if not get_open_positions(session, effective.symbol):
             continue
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_seconds = _cadence_seconds(
+            cadence_profile,
+            "position_management_interval_seconds",
+            effective.position_management_interval_seconds,
+        )
         latest = _latest_symbol_workflow_run(session, POSITION_MANAGEMENT_WORKFLOW, effective.symbol)
-        if _is_due(latest, timedelta(seconds=effective.position_management_interval_seconds)):
+        if _is_due(latest, timedelta(seconds=cadence_seconds)):
             due.append(effective.symbol)
     return due
 
@@ -311,18 +368,28 @@ def run_position_management_cycle(session: Session, triggered_by: str = "schedul
             continue
         if not get_open_positions(session, effective.symbol):
             continue
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_seconds = _cadence_seconds(
+            cadence_profile,
+            "position_management_interval_seconds",
+            effective.position_management_interval_seconds,
+        )
         latest = _latest_symbol_workflow_run(session, POSITION_MANAGEMENT_WORKFLOW, effective.symbol)
-        if not _is_due(latest, timedelta(seconds=effective.position_management_interval_seconds)):
+        if not _is_due(latest, timedelta(seconds=cadence_seconds)):
             continue
         row = _start_scheduler_run(
             session,
             workflow=POSITION_MANAGEMENT_WORKFLOW,
             schedule_window=_symbol_schedule_window(
-                interval_seconds=effective.position_management_interval_seconds
+                interval_seconds=cadence_seconds
             ),
             triggered_by=triggered_by,
             symbol=effective.symbol,
-            next_run_at=utcnow_naive() + timedelta(seconds=effective.position_management_interval_seconds),
+            next_run_at=utcnow_naive() + timedelta(seconds=cadence_seconds),
         )
         try:
             outcome = orchestrator.run_position_management_cycle(
@@ -336,7 +403,7 @@ def run_position_management_cycle(session: Session, triggered_by: str = "schedul
                     row=row,
                     success=True,
                     message="Position management cycle completed.",
-                    payload=outcome,
+                    payload={**outcome, "cadence": cadence_profile},
                 )
             )
         except Exception as exc:
@@ -353,6 +420,7 @@ def run_position_management_cycle(session: Session, triggered_by: str = "schedul
 
 
 def get_due_entry_plan_symbols(session: Session) -> list[str]:
+    orchestrator = TradingOrchestrator(session)
     active_symbols = sorted(
         {
             row.symbol.upper()
@@ -363,8 +431,19 @@ def get_due_entry_plan_symbols(session: Session) -> list[str]:
     )
     due: list[str] = []
     for symbol in active_symbols:
+        effective = orchestrator._effective_symbol_settings(symbol)
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_minutes = _cadence_minutes(
+            cadence_profile,
+            "entry_plan_watcher_interval_minutes",
+            1,
+        )
         latest = _latest_symbol_workflow_run(session, ENTRY_PLAN_WATCHER_WORKFLOW, symbol)
-        if _is_due(latest, timedelta(minutes=1)):
+        if _is_due(latest, timedelta(minutes=cadence_minutes)):
             due.append(symbol)
     return due
 
@@ -373,13 +452,24 @@ def run_entry_plan_watcher_cycle(session: Session, triggered_by: str = "schedule
     orchestrator = TradingOrchestrator(session)
     results: list[dict[str, object]] = []
     for symbol in get_due_entry_plan_symbols(session):
+        effective = orchestrator._effective_symbol_settings(symbol)
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_minutes = _cadence_minutes(
+            cadence_profile,
+            "entry_plan_watcher_interval_minutes",
+            1,
+        )
         row = _start_scheduler_run(
             session,
             workflow=ENTRY_PLAN_WATCHER_WORKFLOW,
-            schedule_window="1m",
+            schedule_window=_symbol_schedule_window(interval_minutes=cadence_minutes),
             triggered_by=triggered_by,
             symbol=symbol,
-            next_run_at=utcnow_naive() + timedelta(minutes=1),
+            next_run_at=utcnow_naive() + timedelta(minutes=cadence_minutes),
         )
         try:
             outcome = orchestrator.run_entry_plan_watcher_cycle(
@@ -394,7 +484,7 @@ def run_entry_plan_watcher_cycle(session: Session, triggered_by: str = "schedule
                     row=row,
                     success=True,
                     message="Entry plan watcher cycle completed.",
-                    payload=symbol_outcome,
+                    payload={**symbol_outcome, "cadence": cadence_profile},
                 )
             )
         except Exception as exc:
@@ -416,24 +506,46 @@ def is_interval_decision_due(session: Session, symbol: str | None = None) -> boo
         return False
     if symbol is None:
         return len(get_due_interval_decision_symbols(session)) > 0
+    orchestrator = TradingOrchestrator(session)
     effective = next(
         (item for item in get_effective_symbol_schedule(settings_row) if item.symbol == symbol.upper()),
         None,
     )
     if effective is None or not effective.enabled:
         return False
+    cadence_profile = _symbol_cadence_profile(
+        orchestrator,
+        symbol=effective.symbol,
+        timeframe=effective.timeframe,
+    )
+    cadence_minutes = _cadence_minutes(
+        cadence_profile,
+        "decision_cycle_interval_minutes",
+        effective.decision_cycle_interval_minutes,
+    )
     latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
-    return _is_due(latest, timedelta(minutes=effective.decision_cycle_interval_minutes))
+    return _is_due(latest, timedelta(minutes=cadence_minutes))
 
 
 def get_due_interval_decision_symbols(session: Session) -> list[str]:
     settings_row = get_or_create_settings(session)
+    orchestrator = TradingOrchestrator(session)
     due: list[str] = []
     for effective in get_effective_symbol_schedule(settings_row):
         if not effective.enabled:
             continue
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_minutes = _cadence_minutes(
+            cadence_profile,
+            "decision_cycle_interval_minutes",
+            effective.decision_cycle_interval_minutes,
+        )
         latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
-        if _is_due(latest, timedelta(minutes=effective.decision_cycle_interval_minutes)):
+        if _is_due(latest, timedelta(minutes=cadence_minutes)):
             due.append(effective.symbol)
     return due
 
@@ -458,18 +570,28 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
     for effective in get_effective_symbol_schedule(settings_row):
         if not effective.enabled:
             continue
+        cadence_profile = _symbol_cadence_profile(
+            orchestrator,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+        )
+        cadence_minutes = _cadence_minutes(
+            cadence_profile,
+            "decision_cycle_interval_minutes",
+            effective.decision_cycle_interval_minutes,
+        )
         latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
-        if not _is_due(latest, timedelta(minutes=effective.decision_cycle_interval_minutes)):
+        if not _is_due(latest, timedelta(minutes=cadence_minutes)):
             continue
         row = _start_scheduler_run(
             session,
             workflow=INTERVAL_DECISION_WORKFLOW,
             schedule_window=_symbol_schedule_window(
-                interval_minutes=effective.decision_cycle_interval_minutes
+                interval_minutes=cadence_minutes
             ),
             triggered_by=triggered_by,
             symbol=effective.symbol,
-            next_run_at=utcnow_naive() + timedelta(minutes=effective.decision_cycle_interval_minutes),
+            next_run_at=utcnow_naive() + timedelta(minutes=cadence_minutes),
         )
         try:
             outcome = orchestrator.run_decision_cycle(

@@ -22,3 +22,17 @@
 * `docs/execution-flow.md`
 * `docs/architecture.md`
 * `docs/codex-drafts-and-auto-resume.md`
+
+## 현재 운영 기본값
+
+* 신규 진입의 기본 운영 편향은 `scalp`다
+* 신규 진입 기본 `entry_mode`는 `pullback_confirm`이다
+* `breakout_confirm`은 드문 예외로만 허용하고 기본 경로로 쓰지 말 것
+* `swing` / `position`은 강한 구조적 레짐, breadth, lead-lag, relative strength, derivatives 상태가 동시에 지지할 때만 예외로 허용할 것
+
+## 손절과 보호주문 원칙
+
+* 최초 손절은 항상 deterministic hard stop 이어야 한다
+* 실주문 경로에서는 exchange-resident protective stop 생성과 검증을 유지할 것
+* AI는 break-even 이동, trailing tighten, partial reduce 같은 관리 제안만 할 수 있다
+* hard stop 제거, stop widening, protection 없는 포지션 유지, 손실 중 포지션의 장기 보유 승격은 금지한다

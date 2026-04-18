@@ -40,6 +40,7 @@ from trading_mvp.services.ai_usage import (
     get_openai_call_gate,
     manual_ai_guard_minutes,
 )
+from trading_mvp.services.drawdown_state import build_drawdown_state_snapshot
 from trading_mvp.services.execution_policy import summarize_execution_policy
 from trading_mvp.services.pause_policy import (
     get_pause_reason_policy,
@@ -52,6 +53,7 @@ from trading_mvp.services.runtime_state import (
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    get_drawdown_state_detail,
     get_sync_state_detail,
     summarize_runtime_state,
 )
@@ -1219,6 +1221,7 @@ def _build_control_status_summary(
     current_cycle_blocked_reasons: list[str],
     risk_allowed: bool | None,
     reconciliation_summary: dict[str, object],
+    drawdown_state_summary: dict[str, object],
 ) -> ControlStatusSummary:
     approval_window_open, approval_state, approval_detail = get_live_approval_status(settings_row)
     account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
@@ -1254,6 +1257,10 @@ def _build_control_status_summary(
         live_arm_disabled=bool(one_way_reason_message),
         live_arm_disable_reason_code=one_way_reason_code,
         live_arm_disable_reason=one_way_reason_message,
+        current_drawdown_state=str(drawdown_state_summary.get("current_drawdown_state") or "normal"),
+        drawdown_state_entered_at=_parse_runtime_datetime(drawdown_state_summary.get("entered_at")),
+        drawdown_transition_reason=str(drawdown_state_summary.get("transition_reason") or "") or None,
+        drawdown_policy_adjustments=dict(drawdown_state_summary.get("policy_adjustments") or {}),
     )
 
 
@@ -1281,6 +1288,13 @@ def build_operational_status_payload(
     auto_resume_last_blockers = [str(item) for item in auto_resume_state.get("blockers", [])]
     current_cycle_blocked_reasons = [str(item) for item in (blocked_reasons or []) if item not in {None, ""}]
     reconciliation_summary = dict(runtime.get("reconciliation_summary") or {})
+    drawdown_state_summary = dict(runtime.get("drawdown_state_summary") or {})
+    if not drawdown_state_summary and current_session is not None:
+        drawdown_state_summary = build_drawdown_state_snapshot(
+            current_session,
+            settings_row,
+            current_detail=get_drawdown_state_detail(settings_row),
+        )
     if risk_allowed is None and current_session is not None:
         risk_allowed, latest_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
         if not current_cycle_blocked_reasons:
@@ -1390,6 +1404,7 @@ def build_operational_status_payload(
         current_cycle_blocked_reasons=current_cycle_blocked_reasons,
         risk_allowed=risk_allowed,
         reconciliation_summary=reconciliation_summary,
+        drawdown_state_summary=drawdown_state_summary,
     )
     operator_alert: dict[str, object] = {}
     if one_way_reason_message:
@@ -1438,6 +1453,10 @@ def build_operational_status_payload(
         protection_recovery_failure_count=int(runtime["protection_recovery_failure_count"]),
         missing_protection_symbols=missing_protection_symbols,
         missing_protection_items=missing_protection_items,
+        current_drawdown_state=str(drawdown_state_summary.get("current_drawdown_state") or "normal"),
+        drawdown_state_entered_at=_parse_runtime_datetime(drawdown_state_summary.get("entered_at")),
+        drawdown_transition_reason=str(drawdown_state_summary.get("transition_reason") or "") or None,
+        drawdown_policy_adjustments=dict(drawdown_state_summary.get("policy_adjustments") or {}),
         control_status_summary=control_status_summary,
         user_stream_summary=user_stream_summary,
         reconciliation_summary=reconciliation_summary,
@@ -1601,9 +1620,11 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         symbol=settings_row.default_symbol.upper(),
         timeframe=settings_row.default_timeframe,
         regime=str(market_context_summary.get("primary_regime", "unknown")),
+        settings_row=settings_row,
     )
     latest_decision_rationale_codes: list[str] = []
     latest_decision_code: str | None = None
+    latest_trading_run: AgentRun | None = None
     if current_session is not None:
         latest_trading_run = current_session.scalar(
             select(AgentRun)
@@ -1622,6 +1643,14 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         adaptive_signal_context,
         latest_rationale_codes=latest_decision_rationale_codes,
         latest_decision=latest_decision_code,
+        latest_entry_mode=(
+            str(latest_trading_run.output_payload.get("entry_mode"))
+            if current_session is not None
+            and latest_trading_run is not None
+            and isinstance(latest_trading_run.output_payload, dict)
+            and latest_trading_run.output_payload.get("entry_mode") not in {None, ""}
+            else None
+        ),
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)

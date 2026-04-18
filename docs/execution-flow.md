@@ -1,5 +1,19 @@
 # Execution Flow
 
+## Holding Profile Overlay
+
+- 신규 진입 기본 프로필은 `holding_profile=scalp`입니다.
+- `holding_profile=swing` 또는 `position`은 강한 higher timeframe 구조 정렬, breadth, lead-lag, derivatives 역풍 부재, meta gate `pass`가 동시에 맞을 때만 사용합니다.
+- `interval_decision_cycle`이 만든 `holding_profile`과 `holding_profile_reason`은 pending entry plan, risk, execution, position management까지 그대로 전달됩니다.
+- `breakout_confirm` 신규 진입은 기본적으로 scalp/intraday 성격으로 다루며, 장기 보유 프로필에서 예외를 넓히지 않습니다.
+
+## Hard Stop Handling
+
+- 최초 손절은 항상 deterministic hard stop 기준으로 생성됩니다.
+- live execution은 exchange-resident protective stop을 계속 유지해야 하며, protection 없는 상태를 정상 상태로 표시하지 않습니다.
+- AI는 stop width 제안, break-even 이동, trailing tighten, partial reduce 같은 보조 관리만 할 수 있습니다.
+- AI는 hard stop 제거, stop widening, 무손절 유지, protection 없는 상태 허용을 할 수 없습니다.
+
 현재 운영 루프는 하나의 interval decision cycle에 모든 책임을 몰아넣지 않고, 아래 4개 cycle로 분리됩니다.
 
 ## 운영 cycle

@@ -15,6 +15,8 @@ from trading_mvp.schemas import (
     ReplayBreakdownEntry,
     ReplayComparisonEntry,
     ReplayMetricSummary,
+    ReplayParameterRecommendation,
+    ReplayUnderperformingBucket,
     ReplayValidationRequest,
     ReplayValidationResponse,
     ReplayVariantReport,
@@ -24,6 +26,7 @@ from trading_mvp.schemas import (
 from trading_mvp.services.account import calculate_unrealized_pnl, create_exchange_pnl_snapshot, get_latest_pnl_snapshot
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.execution import _reduce_fraction_for_decision, build_execution_intent
+from trading_mvp.services.execution_policy import select_execution_plan
 from trading_mvp.services.market_data import generate_seed_candles
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.position_management import mark_partial_take_profit_taken, seed_position_management_metadata
@@ -31,6 +34,8 @@ from trading_mvp.time_utils import utcnow_naive
 
 REPLAY_FEE_RATE = 0.0004
 LOGIC_VARIANTS = ("baseline_old", "improved")
+RECENT_WALK_FORWARD_MIN_CYCLES = 8
+UNDERPERFORMING_BUCKET_MIN_SAMPLE = 3
 
 
 def _load_replay_series(
@@ -91,6 +96,12 @@ class ReplayDecisionRecord:
     symbol: str
     timeframe: str
     regime: str
+    trend_alignment: str
+    scenario: str
+    entry_mode: str
+    execution_policy_profile: str
+    cycle_index: int
+    decision_time: datetime
     blocked: bool
     held: bool
     rationale_codes: list[str] = field(default_factory=list)
@@ -101,6 +112,14 @@ class ReplayTradeRecord:
     symbol: str
     timeframe: str
     regime: str
+    trend_alignment: str
+    scenario: str
+    entry_mode: str
+    execution_policy_profile: str
+    cycle_index: int
+    opened_at: datetime | None
+    closed_at: datetime | None
+    holding_minutes: float
     gross_pnl: float
     net_pnl: float
     fees: float
@@ -115,6 +134,10 @@ class ReplayTradeRecord:
     mae_pct: float = 0.0
     mfe_pnl: float = 0.0
     mae_pnl: float = 0.0
+    stop_hit: bool = False
+    tp_hit: bool = False
+    partial_tp_contribution: float = 0.0
+    runner_contribution: float = 0.0
 
 
 @dataclass(slots=True)
@@ -129,8 +152,13 @@ class ReplayAccumulator:
     arrival_slippage_values: list[float] = field(default_factory=list)
     realized_slippage_values: list[float] = field(default_factory=list)
     first_fill_latency_values: list[float] = field(default_factory=list)
+    holding_minutes_values: list[float] = field(default_factory=list)
     cancel_attempts: int = 0
     cancel_successes: int = 0
+    stop_hits: int = 0
+    tp_hits: int = 0
+    partial_tp_contribution_total: float = 0.0
+    runner_contribution_total: float = 0.0
     trade_nets: list[float] = field(default_factory=list)
     mfe_pct_values: list[float] = field(default_factory=list)
     mae_pct_values: list[float] = field(default_factory=list)
@@ -178,15 +206,38 @@ def _copy_settings(
     session.add(row)
     session.flush()
     return row
-def _extract_regime_from_run(session: Session, decision_run_id: int) -> str:
+def _extract_decision_context(session: Session, decision_run_id: int) -> tuple[str, str]:
     row = session.scalar(select(AgentRun).where(AgentRun.id == decision_run_id))
     if row is None:
-        return "unknown"
+        return "unknown", "unknown"
     input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
     features = input_payload.get("features") if isinstance(input_payload.get("features"), dict) else {}
     regime = features.get("regime") if isinstance(features.get("regime"), dict) else {}
-    value = regime.get("primary_regime")
-    return str(value or "unknown")
+    primary_regime = str(regime.get("primary_regime") or "unknown")
+    trend_alignment = str(regime.get("trend_alignment") or "unknown")
+    return primary_regime, trend_alignment
+
+
+def _decision_scenario(decision: TradeDecision) -> str:
+    if decision.decision == "hold":
+        return "hold"
+    if decision.decision == "reduce":
+        return "reduce"
+    if decision.decision == "exit":
+        return "exit"
+    if any(str(code).startswith("PROTECTION_") for code in decision.rationale_codes):
+        return "protection_restore"
+    if decision.entry_mode == "pullback_confirm":
+        return "pullback_entry"
+    if decision.entry_mode == "breakout_confirm":
+        return "breakout_exception"
+    return "trend_follow"
+
+
+def _normalize_entry_mode(entry_mode: str | None) -> str:
+    if entry_mode in {"breakout_confirm", "pullback_confirm", "immediate", "none"}:
+        return entry_mode
+    return "none"
 
 
 def _extract_decision_row(session: Session, decision_run_id: int) -> AgentRun:
@@ -333,6 +384,8 @@ def _close_position_at_price(
     decision_run_id: int | None,
     risk_check_id: int | None,
     reason_codes: list[str],
+    closed_at: datetime | None = None,
+    cycle_index: int = -1,
 ) -> ReplayTradeRecord:
     replay_metadata = _position_replay_metadata(position)
     fee_paid = abs(quantity * price) * REPLAY_FEE_RATE
@@ -369,11 +422,12 @@ def _close_position_at_price(
         payload={"synthetic_execution": True, "reason_codes": reason_codes},
     )
     remaining_quantity = max(position.quantity - quantity, 0.0)
+    close_time = closed_at or utcnow_naive()
     position.realized_pnl += gross_pnl
     if remaining_quantity <= 1e-9:
         position.quantity = 0.0
         position.status = "closed"
-        position.closed_at = utcnow_naive()
+        position.closed_at = close_time
         position.mark_price = price
         position.unrealized_pnl = 0.0
     else:
@@ -382,10 +436,27 @@ def _close_position_at_price(
         position.unrealized_pnl = calculate_unrealized_pnl(position, price)
     session.add(position)
     session.flush()
+    management = position.metadata_json.get("position_management") if isinstance(position.metadata_json, dict) else {}
+    partial_taken_before = bool(management.get("partial_take_profit_taken")) if isinstance(management, dict) else False
+    is_partial_take_profit = (
+        "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in reason_codes
+        or "POSITION_MANAGEMENT_LOCK_PARTIAL_PROFIT" in reason_codes
+    )
+    holding_minutes = 0.0
+    if position.opened_at is not None:
+        holding_minutes = max((close_time - position.opened_at).total_seconds() / 60.0, 0.0)
     return ReplayTradeRecord(
         symbol=position.symbol,
         timeframe=str(replay_metadata.get("entry_timeframe") or "unknown"),
         regime=str(replay_metadata.get("entry_regime") or "unknown"),
+        trend_alignment=str(replay_metadata.get("entry_trend_alignment") or "unknown"),
+        scenario=str(replay_metadata.get("entry_scenario") or "hold"),
+        entry_mode=str(replay_metadata.get("entry_mode") or "none"),
+        execution_policy_profile=str(replay_metadata.get("execution_policy_profile") or "UNSPECIFIED"),
+        cycle_index=cycle_index,
+        opened_at=position.opened_at,
+        closed_at=close_time,
+        holding_minutes=round(holding_minutes, 8),
         rationale_codes=[
             str(item)
             for item in (replay_metadata.get("entry_rationale_codes") or [])
@@ -408,6 +479,10 @@ def _close_position_at_price(
         mae_pct=round(float(replay_metadata.get("mae_pct") or 0.0), 8),
         mfe_pnl=round(float(replay_metadata.get("mfe_pnl") or 0.0), 8),
         mae_pnl=round(float(replay_metadata.get("mae_pnl") or 0.0), 8),
+        stop_hit=order_type.startswith("STOP"),
+        tp_hit=order_type.startswith("TAKE_PROFIT"),
+        partial_tp_contribution=round(net_pnl, 8) if is_partial_take_profit else 0.0,
+        runner_contribution=round(net_pnl, 8) if partial_taken_before and not is_partial_take_profit else 0.0,
     )
 
 
@@ -416,6 +491,7 @@ def _advance_open_positions(
     *,
     symbol: str,
     candle,
+    cycle_index: int,
     variant_state: ReplayVariantState,
 ) -> None:
     for position in _open_positions(session, symbol):
@@ -452,6 +528,8 @@ def _advance_open_positions(
                     decision_run_id=None,
                     risk_check_id=None,
                     reason_codes=reason_codes,
+                    closed_at=candle.timestamp,
+                    cycle_index=cycle_index,
                 )
             )
             continue
@@ -473,6 +551,7 @@ def _apply_entry(
     risk_check_id: int | None,
     next_candle,
     regime: str,
+    trend_alignment: str,
     logic_variant: str,
 ) -> None:
     latest_pnl = get_latest_pnl_snapshot(session, settings_row)
@@ -485,6 +564,8 @@ def _apply_entry(
         existing_position=None,
         operating_state=risk_result.operating_state,
     )
+    execution_plan = select_execution_plan(intent, market_snapshot, settings_row)
+    scenario = _decision_scenario(decision)
     quantity = intent.quantity
     fill_price = float(next_candle.open)
     side = "buy" if decision.decision == "long" else "sell"
@@ -530,10 +611,15 @@ def _apply_entry(
             "replay": {
                 "synthetic_execution": True,
                 "entry_regime": regime,
+                "entry_trend_alignment": trend_alignment,
+                "entry_scenario": scenario,
                 "entry_timeframe": decision.timeframe,
+                "entry_mode": _normalize_entry_mode(decision.entry_mode),
                 "logic_variant": logic_variant,
                 "entry_decision_run_id": decision_run_id,
                 "entry_rationale_codes": list(decision.rationale_codes),
+                "execution_policy_profile": execution_plan.policy_profile,
+                "execution_policy_name": execution_plan.policy_name,
                 "entry_arrival_slippage_pct": round(entry_arrival_slippage_pct, 8),
                 "entry_realized_slippage_pct": round(entry_arrival_slippage_pct, 8),
                 "entry_first_fill_latency_seconds": round(entry_first_fill_latency_seconds, 8),
@@ -581,6 +667,7 @@ def _apply_reduce_or_exit(
     decision_run_id: int,
     risk_check_id: int | None,
     next_candle,
+    cycle_index: int,
     variant_state: ReplayVariantState,
 ) -> None:
     fraction = 1.0 if decision.decision == "exit" else _reduce_fraction_for_decision(decision)
@@ -597,6 +684,8 @@ def _apply_reduce_or_exit(
             decision_run_id=decision_run_id,
             risk_check_id=risk_check_id,
             reason_codes=list(decision.rationale_codes),
+            closed_at=next_candle.timestamp,
+            cycle_index=cycle_index,
         )
     )
     if decision.decision == "reduce" and "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in decision.rationale_codes:
@@ -615,6 +704,269 @@ def _record_equity_point(session: Session, settings_row: Setting, variant_state:
     variant_state.equity_points.append(round(float(settings_row.starting_equity) + net_realized + unrealized, 8))
 
 
+def _accumulate_decision(bucket: ReplayAccumulator, record: ReplayDecisionRecord) -> None:
+    bucket.decisions += 1
+    bucket.blocked += int(record.blocked)
+    bucket.held += int(record.held)
+
+
+def _accumulate_trade(bucket: ReplayAccumulator, trade: ReplayTradeRecord) -> None:
+    bucket.closed_trades += 1
+    bucket.gross_pnl += trade.gross_pnl
+    bucket.net_pnl += trade.net_pnl
+    bucket.fees += trade.fees
+    bucket.arrival_slippage_values.append(trade.arrival_slippage_pct)
+    bucket.realized_slippage_values.append(trade.realized_slippage_pct)
+    bucket.first_fill_latency_values.append(trade.first_fill_latency_seconds)
+    bucket.holding_minutes_values.append(trade.holding_minutes)
+    bucket.cancel_attempts += int(trade.cancel_attempted)
+    bucket.cancel_successes += int(trade.cancel_succeeded)
+    bucket.stop_hits += int(trade.stop_hit)
+    bucket.tp_hits += int(trade.tp_hit)
+    bucket.partial_tp_contribution_total += trade.partial_tp_contribution
+    bucket.runner_contribution_total += trade.runner_contribution
+    bucket.trade_nets.append(trade.net_pnl)
+    bucket.mfe_pct_values.append(trade.mfe_pct)
+    bucket.mae_pct_values.append(trade.mae_pct)
+
+
+def _accumulator_from_variant_state(variant_state: ReplayVariantState) -> ReplayAccumulator:
+    accumulator = ReplayAccumulator()
+    for decision in variant_state.decisions:
+        _accumulate_decision(accumulator, decision)
+    for trade in variant_state.trades:
+        _accumulate_trade(accumulator, trade)
+    return accumulator
+
+
+def _recent_variant_state(variant_state: ReplayVariantState, *, cycles: int) -> ReplayVariantState:
+    if not variant_state.decisions:
+        return ReplayVariantState()
+    recent_cycles = max(RECENT_WALK_FORWARD_MIN_CYCLES, cycles // 3)
+    latest_cycle_index = max(item.cycle_index for item in variant_state.decisions)
+    cutoff = max(latest_cycle_index - recent_cycles + 1, 0)
+    return ReplayVariantState(
+        decisions=[item for item in variant_state.decisions if item.cycle_index >= cutoff],
+        trades=[item for item in variant_state.trades if item.cycle_index >= cutoff],
+    )
+
+
+def _bucket_sample_size(item: ReplayBreakdownEntry) -> int:
+    return max(item.closed_trades, item.decisions)
+
+
+def _underperforming_bucket_reasons(item: ReplayBreakdownEntry) -> list[str]:
+    if _bucket_sample_size(item) < UNDERPERFORMING_BUCKET_MIN_SAMPLE:
+        return []
+    reasons: list[str] = []
+    if item.expectancy < 0:
+        reasons.append("NEGATIVE_EXPECTANCY")
+    if item.net_pnl_after_fees < 0:
+        reasons.append("NEGATIVE_NET_PNL")
+    if item.average_mae_pct > max(item.average_mfe_pct * 1.1, 0.005):
+        reasons.append("MAE_DOMINATES_MFE")
+    if item.stop_hit_rate > 0.55 and item.tp_hit_rate < 0.35:
+        reasons.append("STOP_DOMINANT")
+    return reasons
+
+
+def _best_bucket(items: list[ReplayBreakdownEntry]) -> ReplayBreakdownEntry | None:
+    eligible = [
+        item
+        for item in items
+        if item.closed_trades >= UNDERPERFORMING_BUCKET_MIN_SAMPLE and item.key not in {"UNSPECIFIED", "hold", "none"}
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda item: (
+            item.expectancy,
+            item.net_pnl_after_fees,
+            item.win_rate,
+            item.average_mfe_pct - item.average_mae_pct,
+            -item.average_hold_time_minutes,
+        ),
+    )
+
+
+def _recommendation_context_patch(recommendation: ReplayParameterRecommendation) -> tuple[dict[str, Any], dict[str, Any]]:
+    adaptive_patch = {
+        "walk_forward_recommendation": {
+            "status": recommendation.status,
+            "entry_mode_preference": recommendation.entry_mode_preference,
+            "trailing_aggressiveness": recommendation.trailing_aggressiveness,
+            "max_chase_bps": recommendation.max_chase_bps,
+            "recommendation_basis": recommendation.recommendation_basis,
+        }
+    }
+    risk_patch = {
+        "walk_forward_recommendation": {
+            "status": recommendation.status,
+            "risk_pct_multiplier": recommendation.risk_pct_multiplier,
+            "leverage_multiplier": recommendation.leverage_multiplier,
+            "max_chase_bps": recommendation.max_chase_bps,
+            "disable_candidate": recommendation.disable_candidate,
+            "recommendation_basis": recommendation.recommendation_basis,
+        }
+    }
+    return adaptive_patch, risk_patch
+
+
+def _build_parameter_recommendation(
+    *,
+    logic_variant: str,
+    recent_summary: ReplayMetricSummary,
+    by_entry_mode: list[ReplayBreakdownEntry],
+    by_scenario: list[ReplayBreakdownEntry],
+    by_execution_policy_profile: list[ReplayBreakdownEntry],
+) -> ReplayParameterRecommendation:
+    sample_size = recent_summary.closed_trades
+    best_entry_mode = _best_bucket(by_entry_mode)
+    best_scenario = _best_bucket(by_scenario)
+    best_policy = _best_bucket(by_execution_policy_profile)
+    recommendation_basis = {
+        "entry_mode": best_entry_mode.key if best_entry_mode is not None else "UNSPECIFIED",
+        "scenario": best_scenario.key if best_scenario is not None else "UNSPECIFIED",
+        "execution_policy_profile": best_policy.key if best_policy is not None else "UNSPECIFIED",
+    }
+    if sample_size < UNDERPERFORMING_BUCKET_MIN_SAMPLE:
+        recommendation = ReplayParameterRecommendation(
+            status="insufficient_data",
+            logic_variant=logic_variant,  # type: ignore[arg-type]
+            sample_size=sample_size,
+            recommendation_basis=recommendation_basis,
+            rationale=["INSUFFICIENT_SAMPLE_SIZE"],
+        )
+        adaptive_patch, risk_patch = _recommendation_context_patch(recommendation)
+        recommendation.adaptive_signal_context_patch = adaptive_patch
+        recommendation.risk_context_patch = risk_patch
+        return recommendation
+
+    entry_mode_preference = best_entry_mode.key if best_entry_mode is not None else None
+    if entry_mode_preference not in {"breakout_confirm", "pullback_confirm", "immediate", "none"}:
+        entry_mode_preference = None
+
+    strength = 0
+    if recent_summary.expectancy > 0:
+        strength += 1
+    if recent_summary.net_pnl_after_fees > 0:
+        strength += 1
+    if recent_summary.average_mfe_pct > max(recent_summary.average_mae_pct * 1.2, 0.0001):
+        strength += 1
+    if recent_summary.tp_hit_rate >= recent_summary.stop_hit_rate:
+        strength += 1
+
+    risk_pct_multiplier = 1.0
+    leverage_multiplier = 1.0
+    max_chase_bps = 4.0
+    partial_tp_rr = 1.5
+    partial_tp_size_pct = 0.25
+    time_stop_minutes = max(int(round(recent_summary.average_hold_time_minutes or 120.0)), 30)
+    trailing_aggressiveness: str = "balanced"
+    rationale: list[str] = []
+    disable_candidate = False
+
+    if recent_summary.expectancy < 0 or recent_summary.net_pnl_after_fees < 0:
+        risk_pct_multiplier = 0.7
+        leverage_multiplier = 0.8
+        max_chase_bps = 2.0
+        partial_tp_rr = 1.2
+        partial_tp_size_pct = 0.35
+        time_stop_minutes = max(int(round((recent_summary.average_hold_time_minutes or 90.0) * 0.8)), 20)
+        trailing_aggressiveness = "defensive"
+        disable_candidate = True
+        rationale.append("NEGATIVE_EXPECTANCY_REDUCTION")
+    elif strength >= 3:
+        risk_pct_multiplier = 1.1
+        leverage_multiplier = 1.05
+        max_chase_bps = 6.0 if entry_mode_preference == "breakout_confirm" else 4.0
+        if recent_summary.runner_contribution > recent_summary.partial_tp_contribution:
+            partial_tp_rr = 1.8
+            partial_tp_size_pct = 0.2
+            trailing_aggressiveness = "patient"
+            rationale.append("RUNNER_CONTRIBUTION_DOMINANT")
+        else:
+            partial_tp_rr = 1.4
+            partial_tp_size_pct = 0.25
+            trailing_aggressiveness = "balanced"
+            rationale.append("POSITIVE_EXPECTANCY")
+        time_stop_minutes = max(int(round((recent_summary.average_hold_time_minutes or 120.0) * 1.15)), 45)
+    else:
+        if recent_summary.partial_tp_contribution >= recent_summary.runner_contribution and recent_summary.closed_trades > 0:
+            partial_tp_rr = 1.3
+            partial_tp_size_pct = 0.3
+            trailing_aggressiveness = "defensive"
+            rationale.append("PARTIAL_TP_DOMINANT")
+        else:
+            rationale.append("NEUTRAL_BALANCED_PROFILE")
+
+    recommendation = ReplayParameterRecommendation(
+        status="ready",
+        logic_variant=logic_variant,  # type: ignore[arg-type]
+        sample_size=sample_size,
+        recommendation_basis=recommendation_basis,
+        risk_pct_multiplier=round(risk_pct_multiplier, 4),
+        leverage_multiplier=round(leverage_multiplier, 4),
+        max_chase_bps=round(max_chase_bps, 4),
+        entry_mode_preference=entry_mode_preference,  # type: ignore[arg-type]
+        partial_tp_rr=round(partial_tp_rr, 4),
+        partial_tp_size_pct=round(partial_tp_size_pct, 4),
+        time_stop_minutes=time_stop_minutes,
+        trailing_aggressiveness=trailing_aggressiveness,  # type: ignore[arg-type]
+        disable_candidate=disable_candidate,
+        rationale=rationale,
+    )
+    adaptive_patch, risk_patch = _recommendation_context_patch(recommendation)
+    recommendation.adaptive_signal_context_patch = adaptive_patch
+    recommendation.risk_context_patch = risk_patch
+    return recommendation
+
+
+def _collect_underperforming_buckets(
+    *,
+    by_symbol: list[ReplayBreakdownEntry],
+    by_timeframe: list[ReplayBreakdownEntry],
+    by_scenario: list[ReplayBreakdownEntry],
+    by_regime: list[ReplayBreakdownEntry],
+    by_trend_alignment: list[ReplayBreakdownEntry],
+    by_execution_policy_profile: list[ReplayBreakdownEntry],
+    by_entry_mode: list[ReplayBreakdownEntry],
+) -> list[ReplayUnderperformingBucket]:
+    items: list[ReplayUnderperformingBucket] = []
+    for bucket_type, entries in (
+        ("symbol", by_symbol),
+        ("timeframe", by_timeframe),
+        ("scenario", by_scenario),
+        ("regime", by_regime),
+        ("trend_alignment", by_trend_alignment),
+        ("execution_policy_profile", by_execution_policy_profile),
+        ("entry_mode", by_entry_mode),
+    ):
+        for entry in entries:
+            reasons = _underperforming_bucket_reasons(entry)
+            if not reasons:
+                continue
+            items.append(
+                ReplayUnderperformingBucket(
+                    bucket_type=bucket_type,
+                    key=entry.key,
+                    sample_size=_bucket_sample_size(entry),
+                    expectancy=entry.expectancy,
+                    net_pnl_after_fees=entry.net_pnl_after_fees,
+                    average_hold_time_minutes=entry.average_hold_time_minutes,
+                    average_mfe_pct=entry.average_mfe_pct,
+                    average_mae_pct=entry.average_mae_pct,
+                    disable_candidate=True,
+                    reasons=reasons,
+                )
+            )
+    return sorted(
+        items,
+        key=lambda item: (len(item.reasons), item.expectancy, item.net_pnl_after_fees),
+    )
+
+
 def _summarize_metrics(
     accumulator: ReplayAccumulator,
     *,
@@ -622,6 +974,11 @@ def _summarize_metrics(
 ) -> ReplayMetricSummary:
     wins = [value for value in accumulator.trade_nets if value > 0]
     losses = [value for value in accumulator.trade_nets if value < 0]
+    avg_win = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+    win_rate = (len(wins) / accumulator.closed_trades) if accumulator.closed_trades else 0.0
+    loss_rate = (len(losses) / accumulator.closed_trades) if accumulator.closed_trades else 0.0
+    expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
     equity_series = equity_points if equity_points else []
     cumulative = 0.0
     peak = equity_series[0] if equity_series else 0.0
@@ -640,9 +997,13 @@ def _summarize_metrics(
         closed_trades=accumulator.closed_trades,
         gross_pnl=round(accumulator.gross_pnl, 8),
         net_pnl=round(accumulator.net_pnl, 8),
+        net_pnl_after_fees=round(accumulator.net_pnl, 8),
         fees=round(accumulator.fees, 8),
         max_drawdown=round(max_drawdown, 8),
-        win_rate=round((len(wins) / accumulator.closed_trades) if accumulator.closed_trades else 0.0, 6),
+        win_rate=round(win_rate, 6),
+        avg_win=round(avg_win, 8),
+        avg_loss=round(avg_loss, 8),
+        expectancy=round(expectancy, 8),
         profit_factor=round((sum(wins) / abs(sum(losses))) if losses else (sum(wins) if wins else 0.0), 6),
         hold_ratio=round((accumulator.held / accumulator.decisions) if accumulator.decisions else 0.0, 6),
         blocked_ratio=round((accumulator.blocked / accumulator.decisions) if accumulator.decisions else 0.0, 6),
@@ -664,6 +1025,12 @@ def _summarize_metrics(
             else 0.0,
             8,
         ),
+        average_hold_time_minutes=round(
+            (sum(accumulator.holding_minutes_values) / len(accumulator.holding_minutes_values))
+            if accumulator.holding_minutes_values
+            else 0.0,
+            8,
+        ),
         cancel_attempts=accumulator.cancel_attempts,
         cancel_successes=accumulator.cancel_successes,
         cancel_success_rate=round(
@@ -672,6 +1039,16 @@ def _summarize_metrics(
             else 0.0,
             8,
         ),
+        stop_hit_rate=round(
+            (accumulator.stop_hits / accumulator.closed_trades) if accumulator.closed_trades else 0.0,
+            8,
+        ),
+        tp_hit_rate=round(
+            (accumulator.tp_hits / accumulator.closed_trades) if accumulator.closed_trades else 0.0,
+            8,
+        ),
+        partial_tp_contribution=round(accumulator.partial_tp_contribution_total, 8),
+        runner_contribution=round(accumulator.runner_contribution_total, 8),
         average_mfe_pct=round(
             (sum(accumulator.mfe_pct_values) / len(accumulator.mfe_pct_values))
             if accumulator.mfe_pct_values
@@ -706,25 +1083,10 @@ def _build_breakdown(
     grouped: dict[str, ReplayAccumulator] = defaultdict(ReplayAccumulator)
     for record in variant_state.decisions:
         for key in _group_keys(key_fn_decision(record)):
-            bucket = grouped[key]
-            bucket.decisions += 1
-            bucket.blocked += int(record.blocked)
-            bucket.held += int(record.held)
+            _accumulate_decision(grouped[key], record)
     for trade in variant_state.trades:
         for key in _group_keys(key_fn_trade(trade)):
-            bucket = grouped[key]
-            bucket.closed_trades += 1
-            bucket.gross_pnl += trade.gross_pnl
-            bucket.net_pnl += trade.net_pnl
-            bucket.fees += trade.fees
-            bucket.arrival_slippage_values.append(trade.arrival_slippage_pct)
-            bucket.realized_slippage_values.append(trade.realized_slippage_pct)
-            bucket.first_fill_latency_values.append(trade.first_fill_latency_seconds)
-            bucket.cancel_attempts += int(trade.cancel_attempted)
-            bucket.cancel_successes += int(trade.cancel_succeeded)
-            bucket.trade_nets.append(trade.net_pnl)
-            bucket.mfe_pct_values.append(trade.mfe_pct)
-            bucket.mae_pct_values.append(trade.mae_pct)
+            _accumulate_trade(grouped[key], trade)
     items: list[ReplayBreakdownEntry] = []
     for key, bucket in grouped.items():
         summary = _summarize_metrics(bucket)
@@ -735,25 +1097,68 @@ def _build_breakdown(
                 closed_trades=summary.closed_trades,
                 gross_pnl=summary.gross_pnl,
                 net_pnl=summary.net_pnl,
+                net_pnl_after_fees=summary.net_pnl_after_fees,
                 fees=summary.fees,
                 max_drawdown=summary.max_drawdown,
                 win_rate=summary.win_rate,
+                avg_win=summary.avg_win,
+                avg_loss=summary.avg_loss,
+                expectancy=summary.expectancy,
                 profit_factor=summary.profit_factor,
                 hold_ratio=summary.hold_ratio,
                 blocked_ratio=summary.blocked_ratio,
                 average_arrival_slippage_pct=summary.average_arrival_slippage_pct,
                 average_realized_slippage_pct=summary.average_realized_slippage_pct,
                 average_first_fill_latency_seconds=summary.average_first_fill_latency_seconds,
+                average_hold_time_minutes=summary.average_hold_time_minutes,
                 cancel_attempts=summary.cancel_attempts,
                 cancel_successes=summary.cancel_successes,
                 cancel_success_rate=summary.cancel_success_rate,
+                stop_hit_rate=summary.stop_hit_rate,
+                tp_hit_rate=summary.tp_hit_rate,
+                partial_tp_contribution=summary.partial_tp_contribution,
+                runner_contribution=summary.runner_contribution,
                 average_mfe_pct=summary.average_mfe_pct,
                 average_mae_pct=summary.average_mae_pct,
                 best_mfe_pct=summary.best_mfe_pct,
                 worst_mae_pct=summary.worst_mae_pct,
             )
-        )
+    )
     return sorted(items, key=lambda item: (item.net_pnl, item.key), reverse=True)
+
+
+def _metric_summary_from_breakdown(item: ReplayBreakdownEntry) -> ReplayMetricSummary:
+    return ReplayMetricSummary(
+        decisions=item.decisions,
+        closed_trades=item.closed_trades,
+        gross_pnl=item.gross_pnl,
+        net_pnl=item.net_pnl,
+        net_pnl_after_fees=item.net_pnl_after_fees,
+        fees=item.fees,
+        max_drawdown=item.max_drawdown,
+        win_rate=item.win_rate,
+        avg_win=item.avg_win,
+        avg_loss=item.avg_loss,
+        expectancy=item.expectancy,
+        profit_factor=item.profit_factor,
+        hold_ratio=item.hold_ratio,
+        blocked_ratio=item.blocked_ratio,
+        average_arrival_slippage_pct=item.average_arrival_slippage_pct,
+        average_realized_slippage_pct=item.average_realized_slippage_pct,
+        average_first_fill_latency_seconds=item.average_first_fill_latency_seconds,
+        average_hold_time_minutes=item.average_hold_time_minutes,
+        cancel_attempts=item.cancel_attempts,
+        cancel_successes=item.cancel_successes,
+        cancel_success_rate=item.cancel_success_rate,
+        stop_hit_rate=item.stop_hit_rate,
+        tp_hit_rate=item.tp_hit_rate,
+        partial_tp_contribution=item.partial_tp_contribution,
+        runner_contribution=item.runner_contribution,
+        average_mfe_pct=item.average_mfe_pct,
+        average_mae_pct=item.average_mae_pct,
+        best_mfe_pct=item.best_mfe_pct,
+        worst_mae_pct=item.worst_mae_pct,
+    )
 
 
 def _comparison_entries(
@@ -768,58 +1173,8 @@ def _comparison_entries(
     for key in keys:
         baseline_item = baseline_map.get(key)
         improved_item = improved_map.get(key)
-        baseline_summary = (
-            ReplayMetricSummary(
-                decisions=baseline_item.decisions,
-                closed_trades=baseline_item.closed_trades,
-                gross_pnl=baseline_item.gross_pnl,
-                net_pnl=baseline_item.net_pnl,
-                fees=baseline_item.fees,
-                max_drawdown=baseline_item.max_drawdown,
-                win_rate=baseline_item.win_rate,
-                profit_factor=baseline_item.profit_factor,
-                hold_ratio=baseline_item.hold_ratio,
-                blocked_ratio=baseline_item.blocked_ratio,
-                average_arrival_slippage_pct=baseline_item.average_arrival_slippage_pct,
-                average_realized_slippage_pct=baseline_item.average_realized_slippage_pct,
-                average_first_fill_latency_seconds=baseline_item.average_first_fill_latency_seconds,
-                cancel_attempts=baseline_item.cancel_attempts,
-                cancel_successes=baseline_item.cancel_successes,
-                cancel_success_rate=baseline_item.cancel_success_rate,
-                average_mfe_pct=baseline_item.average_mfe_pct,
-                average_mae_pct=baseline_item.average_mae_pct,
-                best_mfe_pct=baseline_item.best_mfe_pct,
-                worst_mae_pct=baseline_item.worst_mae_pct,
-            )
-            if baseline_item is not None
-            else zero
-        )
-        improved_summary = (
-            ReplayMetricSummary(
-                decisions=improved_item.decisions,
-                closed_trades=improved_item.closed_trades,
-                gross_pnl=improved_item.gross_pnl,
-                net_pnl=improved_item.net_pnl,
-                fees=improved_item.fees,
-                max_drawdown=improved_item.max_drawdown,
-                win_rate=improved_item.win_rate,
-                profit_factor=improved_item.profit_factor,
-                hold_ratio=improved_item.hold_ratio,
-                blocked_ratio=improved_item.blocked_ratio,
-                average_arrival_slippage_pct=improved_item.average_arrival_slippage_pct,
-                average_realized_slippage_pct=improved_item.average_realized_slippage_pct,
-                average_first_fill_latency_seconds=improved_item.average_first_fill_latency_seconds,
-                cancel_attempts=improved_item.cancel_attempts,
-                cancel_successes=improved_item.cancel_successes,
-                cancel_success_rate=improved_item.cancel_success_rate,
-                average_mfe_pct=improved_item.average_mfe_pct,
-                average_mae_pct=improved_item.average_mae_pct,
-                best_mfe_pct=improved_item.best_mfe_pct,
-                worst_mae_pct=improved_item.worst_mae_pct,
-            )
-            if improved_item is not None
-            else zero
-        )
+        baseline_summary = _metric_summary_from_breakdown(baseline_item) if baseline_item is not None else zero
+        improved_summary = _metric_summary_from_breakdown(improved_item) if improved_item is not None else zero
         comparisons.append(
             ReplayComparisonEntry(
                 key=key,
@@ -877,6 +1232,7 @@ def _run_variant(
                     session,
                     symbol=symbol,
                     candle=series[candle_index],
+                    cycle_index=offset,
                     variant_state=variant_state,
                 )
                 create_exchange_pnl_snapshot(session, settings_row)
@@ -897,12 +1253,34 @@ def _run_variant(
                 )
                 decision = TradeDecision.model_validate(result["decision"])
                 risk_result = RiskCheckResult.model_validate(result["risk_result"])
-                regime = _extract_regime_from_run(session, int(result["decision_run_id"]))
+                regime, trend_alignment = _extract_decision_context(session, int(result["decision_run_id"]))
+                scenario = _decision_scenario(decision)
+                execution_policy_profile = "UNSPECIFIED"
+                if decision.decision in {"long", "short", "reduce", "exit"} and decision.stop_loss is not None:
+                    try:
+                        intent = build_execution_intent(
+                            decision,
+                            replay_snapshot,
+                            risk_result,
+                            settings_row,
+                            get_latest_pnl_snapshot(session, settings_row).equity,
+                            existing_position=_open_position(session, symbol),
+                            operating_state=risk_result.operating_state,
+                        )
+                        execution_policy_profile = select_execution_plan(intent, replay_snapshot, settings_row).policy_profile
+                    except Exception:
+                        execution_policy_profile = "UNSPECIFIED"
                 variant_state.decisions.append(
                     ReplayDecisionRecord(
                         symbol=symbol,
                         timeframe=timeframe,
                         regime=regime,
+                        trend_alignment=trend_alignment,
+                        scenario=scenario,
+                        entry_mode=_normalize_entry_mode(decision.entry_mode),
+                        execution_policy_profile=execution_policy_profile,
+                        cycle_index=offset,
+                        decision_time=replay_snapshot.snapshot_time,
                         rationale_codes=list(decision.rationale_codes),
                         blocked=not risk_result.allowed,
                         held=decision.decision == "hold",
@@ -947,6 +1325,7 @@ def _run_variant(
                             risk_check_id=risk_row.id if risk_row is not None else None,
                             next_candle=next_candle,
                             regime=regime,
+                            trend_alignment=trend_alignment,
                             logic_variant=logic_variant,
                         )
                 elif decision.decision in {"reduce", "exit"} and existing_position is not None:
@@ -957,6 +1336,7 @@ def _run_variant(
                         decision_run_id=int(result["decision_run_id"]),
                         risk_check_id=risk_row.id if risk_row is not None else None,
                         next_candle=next_candle,
+                        cycle_index=offset,
                         variant_state=variant_state,
                     )
                 _record_equity_point(session, settings_row, variant_state)
@@ -978,53 +1358,89 @@ def _run_variant(
                         decision_run_id=None,
                         risk_check_id=None,
                         reason_codes=["REPLAY_WINDOW_END_CLOSE"],
+                        closed_at=last_candle.timestamp,
+                        cycle_index=request.cycles,
                     )
                 )
         _record_equity_point(session, settings_row, variant_state)
         session.commit()
 
-    overall = ReplayAccumulator()
-    overall.decisions = len(variant_state.decisions)
-    overall.closed_trades = len(variant_state.trades)
-    overall.blocked = sum(int(item.blocked) for item in variant_state.decisions)
-    overall.held = sum(int(item.held) for item in variant_state.decisions)
-    overall.gross_pnl = sum(item.gross_pnl for item in variant_state.trades)
-    overall.net_pnl = sum(item.net_pnl for item in variant_state.trades)
-    overall.fees = sum(item.fees for item in variant_state.trades)
-    overall.arrival_slippage_values = [item.arrival_slippage_pct for item in variant_state.trades]
-    overall.realized_slippage_values = [item.realized_slippage_pct for item in variant_state.trades]
-    overall.first_fill_latency_values = [item.first_fill_latency_seconds for item in variant_state.trades]
-    overall.cancel_attempts = sum(int(item.cancel_attempted) for item in variant_state.trades)
-    overall.cancel_successes = sum(int(item.cancel_succeeded) for item in variant_state.trades)
-    overall.trade_nets = [item.net_pnl for item in variant_state.trades]
-    overall.mfe_pct_values = [item.mfe_pct for item in variant_state.trades]
-    overall.mae_pct_values = [item.mae_pct for item in variant_state.trades]
+    overall = _accumulator_from_variant_state(variant_state)
+    recent_state = _recent_variant_state(variant_state, cycles=request.cycles)
+    recent_summary = _summarize_metrics(_accumulator_from_variant_state(recent_state))
+    by_symbol = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.symbol,
+        key_fn_trade=lambda item: item.symbol,
+    )
+    by_timeframe = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.timeframe,
+        key_fn_trade=lambda item: item.timeframe,
+    )
+    by_scenario = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.scenario,
+        key_fn_trade=lambda item: item.scenario,
+    )
+    by_regime = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.regime,
+        key_fn_trade=lambda item: item.regime,
+    )
+    by_trend_alignment = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.trend_alignment,
+        key_fn_trade=lambda item: item.trend_alignment,
+    )
+    by_execution_policy_profile = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.execution_policy_profile,
+        key_fn_trade=lambda item: item.execution_policy_profile,
+    )
+    by_entry_mode = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.entry_mode,
+        key_fn_trade=lambda item: item.entry_mode,
+    )
+    by_rationale_code = _build_breakdown(
+        variant_state,
+        key_fn_decision=lambda item: item.rationale_codes,
+        key_fn_trade=lambda item: item.rationale_codes,
+    )
+    recommendation = _build_parameter_recommendation(
+        logic_variant=logic_variant,
+        recent_summary=recent_summary,
+        by_entry_mode=by_entry_mode,
+        by_scenario=by_scenario,
+        by_execution_policy_profile=by_execution_policy_profile,
+    )
+    underperforming_buckets = _collect_underperforming_buckets(
+        by_symbol=by_symbol,
+        by_timeframe=by_timeframe,
+        by_scenario=by_scenario,
+        by_regime=by_regime,
+        by_trend_alignment=by_trend_alignment,
+        by_execution_policy_profile=by_execution_policy_profile,
+        by_entry_mode=by_entry_mode,
+    )
 
     return ReplayVariantReport(
         logic_variant=logic_variant,  # type: ignore[arg-type]
         title="Baseline Old Logic" if logic_variant == "baseline_old" else "Improved Logic",
         data_source_type=request.data_source_type,
         summary=_summarize_metrics(overall, equity_points=variant_state.equity_points),
-        by_symbol=_build_breakdown(
-            variant_state,
-            key_fn_decision=lambda item: item.symbol,
-            key_fn_trade=lambda item: item.symbol,
-        ),
-        by_timeframe=_build_breakdown(
-            variant_state,
-            key_fn_decision=lambda item: item.timeframe,
-            key_fn_trade=lambda item: item.timeframe,
-        ),
-        by_regime=_build_breakdown(
-            variant_state,
-            key_fn_decision=lambda item: item.regime,
-            key_fn_trade=lambda item: item.regime,
-        ),
-        by_rationale_code=_build_breakdown(
-            variant_state,
-            key_fn_decision=lambda item: item.rationale_codes,
-            key_fn_trade=lambda item: item.rationale_codes,
-        ),
+        recent_window_summary=recent_summary,
+        by_symbol=by_symbol,
+        by_timeframe=by_timeframe,
+        by_scenario=by_scenario,
+        by_regime=by_regime,
+        by_trend_alignment=by_trend_alignment,
+        by_execution_policy_profile=by_execution_policy_profile,
+        by_entry_mode=by_entry_mode,
+        by_rationale_code=by_rationale_code,
+        walk_forward_recommendation=recommendation,
+        underperforming_buckets=underperforming_buckets,
     )
 
 
@@ -1048,6 +1464,14 @@ def build_replay_validation_report(
     baseline = next(item for item in variants if item.logic_variant == "baseline_old")
     improved = next(item for item in variants if item.logic_variant == "improved")
     end_index = request.start_index + request.cycles - 1
+    preferred_variant = max(
+        variants,
+        key=lambda item: (
+            item.recent_window_summary.expectancy,
+            item.recent_window_summary.net_pnl_after_fees,
+            item.recent_window_summary.win_rate,
+        ),
+    )
     return ReplayValidationResponse(
         generated_at=utcnow_naive(),
         data_source_type=request.data_source_type,
@@ -1062,6 +1486,15 @@ def build_replay_validation_report(
         variants=variants,
         symbol_comparison=_comparison_entries(baseline.by_symbol, improved.by_symbol),
         timeframe_comparison=_comparison_entries(baseline.by_timeframe, improved.by_timeframe),
+        scenario_comparison=_comparison_entries(baseline.by_scenario, improved.by_scenario),
         regime_comparison=_comparison_entries(baseline.by_regime, improved.by_regime),
+        trend_alignment_comparison=_comparison_entries(baseline.by_trend_alignment, improved.by_trend_alignment),
+        execution_policy_profile_comparison=_comparison_entries(
+            baseline.by_execution_policy_profile,
+            improved.by_execution_policy_profile,
+        ),
+        entry_mode_comparison=_comparison_entries(baseline.by_entry_mode, improved.by_entry_mode),
         rationale_comparison=_comparison_entries(baseline.by_rationale_code, improved.by_rationale_code),
+        recent_walk_forward_recommendation=preferred_variant.walk_forward_recommendation,
+        underperforming_buckets=preferred_variant.underperforming_buckets,
     )

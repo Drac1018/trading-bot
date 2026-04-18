@@ -14,10 +14,11 @@ from trading_mvp.schemas import (
     RiskCheckResult,
     TradeDecision,
 )
+from trading_mvp.services.binance import BinanceAPIError
 from trading_mvp.services.binance_user_stream import normalize_user_stream_event
 from trading_mvp.services.execution import (
-    _cap_quantity_to_approved_notional,
     _cancel_exit_orders,
+    _cap_quantity_to_approved_notional,
     apply_normalized_user_stream_events,
     apply_position_management,
     build_execution_intent,
@@ -25,8 +26,12 @@ from trading_mvp.services.execution import (
     poll_live_user_stream,
     sync_live_state,
 )
-from trading_mvp.services.binance import BinanceAPIError
+from trading_mvp.services.position_management import (
+    build_position_management_context,
+    store_position_management_context,
+)
 from trading_mvp.services.risk import evaluate_risk
+from trading_mvp.services.runtime_state import set_user_stream_detail
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import (
     build_operational_status_payload,
@@ -34,7 +39,6 @@ from trading_mvp.services.settings import (
     serialize_settings,
     set_trading_pause,
 )
-from trading_mvp.services.runtime_state import set_user_stream_detail
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -117,6 +121,8 @@ def _live_decision(decision: str) -> TradeDecision:
         max_holding_minutes=120,
         risk_pct=0.01,
         leverage=2.0,
+        holding_profile="scalp",
+        holding_profile_reason="scalp_default_intraday_bias",
         rationale_codes=["TEST"],
         explanation_short="safety test",
         explanation_detailed="execution safety regression test path.",
@@ -241,6 +247,13 @@ def test_execute_live_trade_returns_blocked_without_touching_exchange_when_risk_
         effective_leverage_cap=5.0,
         symbol_risk_tier="btc",
         exposure_metrics={},
+        debug_payload={
+            "meta_gate": {
+                "gate_decision": "reject",
+                "expected_hit_probability": 0.24,
+                "reject_reason_codes": ["META_GATE_LOW_HIT_PROBABILITY"],
+            }
+        },
     )
 
     result = execute_live_trade(
@@ -255,6 +268,7 @@ def test_execute_live_trade_returns_blocked_without_touching_exchange_when_risk_
 
     assert result["status"] == "blocked"
     assert result["reason_codes"] == ["ENTRY_TRIGGER_NOT_MET"]
+    assert result["meta_gate"]["gate_decision"] == "reject"
     assert called is False
 
 
@@ -341,6 +355,8 @@ def test_build_execution_intent_uses_approved_quantity_from_risk_result(db_sessi
     assert intent.quantity == 2.142857
     assert intent.requested_price == 70000.0
     assert intent.entry_mode == "immediate"
+    assert intent.holding_profile == "scalp"
+    assert intent.holding_profile_reason == "scalp_default_intraday_bias"
 
 
 def test_capped_quantity_never_overshoots_approved_notional_after_normalize() -> None:
@@ -1202,11 +1218,9 @@ class ScriptedStreamingClient:
         idle_timeout_seconds: float = 30.0,
     ):
         del listen_key, idle_timeout_seconds
-        emitted = 0
-        for event in self.events:
+        for emitted, event in enumerate(self.events):
             if max_events is not None and emitted >= max_events:
                 break
-            emitted += 1
             yield dict(event)
 
 
@@ -1574,6 +1588,388 @@ def test_apply_position_management_never_widens_stop_for_break_even(monkeypatch,
     assert stop_orders == []
 
 
+def test_position_management_tracks_mfe_mae_and_tightens_on_rollback(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = False
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=71600.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=16.0,
+        opened_at=utcnow_naive() - timedelta(minutes=45),
+        metadata_json={"position_management": {"initial_stop_loss": 69000.0, "initial_risk_per_unit": 1000.0, "mfe_r": 3.0, "mae_r": -0.4}},
+    )
+
+    rollback_feature = _feature_payload(atr=0.0).model_copy(
+        update={
+            "regime": RegimeFeatureContext(
+                primary_regime="bullish",
+                trend_alignment="bullish_aligned",
+                volatility_regime="normal",
+                volume_regime="normal",
+                momentum_state="weakening",
+                weak_volume=False,
+                momentum_weakening=True,
+            )
+        }
+    )
+    context = build_position_management_context(position, feature_payload=rollback_feature, settings_row=settings_row)
+    metadata = store_position_management_context(position, context)
+
+    assert context["mfe_r"] == pytest.approx(3.0)
+    assert context["mae_r"] == pytest.approx(-0.4)
+    assert context["mfe_rollback_pct"] == pytest.approx(0.4667, rel=1e-3)
+    assert context["mfe_protection_action"] == "tighten_stop"
+    assert "POSITION_MANAGEMENT_MFE_ROLLBACK" in context["applied_rule_candidates"]
+    assert "POSITION_MANAGEMENT_MFE_ROLLBACK_TIGHTEN" in context["applied_rule_candidates"]
+    assert context["tightened_stop_loss"] is not None
+    assert context["tightened_stop_loss"] > 69000.0
+    assert metadata["mfe_r"] == pytest.approx(3.0)
+    assert metadata["mae_r"] == pytest.approx(-0.4)
+    assert metadata["mfe_protection_action"] == "tighten_stop"
+    assert metadata["management_stage"] == "initial"
+
+
+def test_position_management_runner_rollback_reduces_after_partial_take_profit(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = False
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+
+    weak_feature = _feature_payload(atr=0.0).model_copy(
+        update={
+            "regime": RegimeFeatureContext(
+                primary_regime="transition",
+                trend_alignment="bullish_aligned",
+                volatility_regime="normal",
+                volume_regime="weak",
+                momentum_state="weakening",
+                weak_volume=True,
+                momentum_weakening=True,
+            )
+        }
+    )
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.015,
+        entry_price=70000.0,
+        mark_price=70800.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=12.0,
+        opened_at=utcnow_naive() - timedelta(minutes=75),
+        metadata_json={
+            "position_management": {
+                "initial_stop_loss": 69000.0,
+                "initial_risk_per_unit": 1000.0,
+                "partial_take_profit_taken": True,
+                "mfe_r": 3.0,
+                "mae_r": -0.25,
+            }
+        },
+    )
+
+    context = build_position_management_context(position, feature_payload=weak_feature, settings_row=settings_row)
+
+    assert context["mfe_r"] == pytest.approx(3.0)
+    assert context["mfe_rollback_pct"] == pytest.approx(0.7333, rel=1e-3)
+    assert context["mfe_protection_action"] == "reduce"
+    assert context["management_stage"] == "defensive_reduce"
+    assert "POSITION_MANAGEMENT_MFE_ROLLBACK_REDUCE" in context["reduce_reason_codes"]
+    assert context["tightened_stop_loss"] == 69000.0
+
+
+def test_position_management_strong_trend_runner_does_not_exit_too_early(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = False
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.015,
+        entry_price=70000.0,
+        mark_price=72500.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=73500.0,
+        realized_pnl=0.0,
+        unrealized_pnl=37.5,
+        opened_at=utcnow_naive() - timedelta(minutes=90),
+        metadata_json={
+            "position_management": {
+                "initial_stop_loss": 69000.0,
+                "initial_risk_per_unit": 1000.0,
+                "partial_take_profit_taken": True,
+                "mfe_r": 4.0,
+            }
+        },
+    )
+
+    context = build_position_management_context(position, feature_payload=_feature_payload(atr=0.0), settings_row=settings_row)
+
+    assert context["mfe_rollback_pct"] == pytest.approx(0.375, rel=1e-3)
+    assert context["mfe_protection_action"] == "monitor"
+    assert "POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT" not in context["reduce_reason_codes"]
+    assert "POSITION_MANAGEMENT_MFE_ROLLBACK_REDUCE" not in context["reduce_reason_codes"]
+
+
+def test_position_management_breakout_time_fail_reduces_before_generic_time_stop(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = True
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+
+    feature = _feature_payload(atr=0.0).model_copy(
+        update={
+            "regime": RegimeFeatureContext(
+                primary_regime="bullish",
+                trend_alignment="bullish_aligned",
+                volatility_regime="normal",
+                volume_regime="normal",
+                momentum_state="stable",
+                weak_volume=False,
+                momentum_weakening=False,
+            )
+        }
+    )
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=70040.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=0.4,
+        opened_at=utcnow_naive() - timedelta(minutes=28),
+        metadata_json={
+            "position_management": {
+                "initial_stop_loss": 69000.0,
+                "initial_risk_per_unit": 1000.0,
+                "planned_max_holding_minutes": 90,
+                "entry_time_profile": "breakout_fast",
+                "early_fail_minutes": 20,
+                "early_fail_r_floor": 0.1,
+                "hold_extension_minutes": 15,
+            }
+        },
+    )
+
+    context = build_position_management_context(position, feature_payload=feature, settings_row=settings_row)
+
+    assert context["entry_time_profile"] == "breakout_fast"
+    assert context["time_to_fail_ready"] is True
+    assert context["time_to_fail_action"] == "reduce"
+    assert context["time_to_fail_reason"] == "breakout_follow_through_missing"
+    assert "POSITION_MANAGEMENT_BREAKOUT_TIME_FAIL_REDUCE" in context["reduce_reason_codes"]
+    assert context["time_stop_ready"] is False
+
+
+def test_position_management_pullback_time_fail_waits_longer_than_breakout(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = True
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+
+    weak_feature = _feature_payload(atr=0.0).model_copy(
+        update={
+            "regime": RegimeFeatureContext(
+                primary_regime="bullish",
+                trend_alignment="bullish_aligned",
+                volatility_regime="normal",
+                volume_regime="normal",
+                momentum_state="stable",
+                weak_volume=False,
+                momentum_weakening=False,
+            )
+        }
+    )
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=69920.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=-0.8,
+        opened_at=utcnow_naive() - timedelta(minutes=28),
+        metadata_json={
+            "position_management": {
+                "initial_stop_loss": 69000.0,
+                "initial_risk_per_unit": 1000.0,
+                "planned_max_holding_minutes": 210,
+                "entry_time_profile": "pullback_flexible",
+                "early_fail_minutes": 50,
+                "early_fail_r_floor": -0.15,
+                "hold_extension_minutes": 30,
+            }
+        },
+    )
+
+    context = build_position_management_context(position, feature_payload=weak_feature, settings_row=settings_row)
+
+    assert context["entry_time_profile"] == "pullback_flexible"
+    assert context["time_to_fail_ready"] is False
+    assert context["time_to_fail_action"] is None
+    assert "POSITION_MANAGEMENT_PULLBACK_TIME_FAIL_REDUCE" not in context["reduce_reason_codes"]
+    assert context["time_stop_ready"] is False
+
+
+def test_position_management_extends_holding_window_for_strong_trend_runner(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = True
+    settings_row.holding_edge_decay_enabled = False
+    settings_row.reduce_on_regime_shift_enabled = False
+
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.015,
+        entry_price=70000.0,
+        mark_price=71200.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=73000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=18.0,
+        opened_at=utcnow_naive() - timedelta(minutes=165),
+        metadata_json={
+            "position_management": {
+                "initial_stop_loss": 69000.0,
+                "initial_risk_per_unit": 1000.0,
+                "planned_max_holding_minutes": 150,
+                "entry_time_profile": "continuation_balanced",
+                "early_fail_minutes": 35,
+                "early_fail_r_floor": 0.0,
+                "hold_extension_minutes": 25,
+            }
+        },
+    )
+
+    context = build_position_management_context(position, feature_payload=_feature_payload(atr=0.0), settings_row=settings_row)
+
+    assert context["entry_time_profile"] == "continuation_balanced"
+    assert context["hold_extension_active"] is True
+    assert context["effective_max_holding_minutes"] == 175
+    assert context["time_stop_minutes"] == 175
+    assert context["time_stop_elapsed"] is False
+    assert context["time_stop_ready"] is False
+
+
+def test_apply_position_management_records_mfe_rollback_reduce_event(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70800.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=16.0,
+        opened_at=utcnow_naive() - timedelta(minutes=80),
+        metadata_json={"position_management": {"initial_stop_loss": 69000.0, "initial_risk_per_unit": 1000.0, "partial_take_profit_taken": True}},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    client = ReduceSuccessClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": ["POSITION_MANAGEMENT_MFE_ROLLBACK_REDUCE"],
+            "mfe_r": 3.0,
+            "mae_r": -0.2,
+            "mfe_rollback_pct": 0.72,
+            "mfe_protection_action": "reduce",
+            "management_stage": "defensive_reduce",
+            "applied_rule_candidates": ["POSITION_MANAGEMENT_MFE_ROLLBACK"],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=52,
+        client=client,
+    )
+    db_session.flush()
+
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "executed"
+    assert result["position_management_action"]["status"] == "partially_filled"
+    rollback_events = [event for event in events if event.event_type == "position_management_mfe_rollback_reduce"]
+    assert len(rollback_events) == 1
+    assert rollback_events[0].payload["mfe_rollback_pct"] == pytest.approx(0.72)
+
+
 def test_entry_protection_failure_triggers_emergency_close(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: ProtectionFailureClient())
@@ -1620,13 +2016,65 @@ def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_sess
 
     assert result["status"] == "filled"
     assert position is not None
+    assert result["holding_profile"] == "scalp"
+    assert result["initial_stop_type"] == "deterministic_hard_stop"
+    assert result["hard_stop_active"] is True
     assert result["position_management"]["metadata"]["initial_stop_loss"] == 69000.0
     assert result["position_management"]["metadata"]["initial_take_profit"] == 72000.0
     assert result["position_management"]["metadata"]["planned_max_holding_minutes"] == 120
     assert result["position_management"]["metadata"]["partial_take_profit_taken"] is False
+    assert result["position_management"]["metadata"]["holding_profile"] == "scalp"
+    assert result["position_management"]["metadata"]["holding_profile_reason"] == "scalp_default_intraday_bias"
+    assert result["position_management"]["metadata"]["initial_stop_type"] == "deterministic_hard_stop"
+    assert result["position_management"]["metadata"]["hard_stop_active"] is True
+    assert result["position_management"]["metadata"]["stop_widening_allowed"] is False
     assert client.account_info_calls >= 3
     assert client.open_orders_calls >= 3
     assert client.position_information_calls >= 3
+
+
+def test_position_management_context_uses_position_holding_profile_without_stop_widening(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        opened_at=utcnow_naive() - timedelta(minutes=150),
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=71200.0,
+        leverage=2.0,
+        stop_loss=70200.0,
+        take_profit=75000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=12.0,
+        metadata_json={
+            "position_management": {
+                "holding_profile": "position",
+                "holding_profile_reason": "strong_structural_regime_position_allowed",
+                "initial_stop_loss": 69000.0,
+                "initial_risk_per_unit": 1000.0,
+                "initial_stop_type": "deterministic_hard_stop",
+                "ai_stop_management_allowed": True,
+                "hard_stop_active": True,
+                "stop_widening_allowed": False,
+                "planned_max_holding_minutes": 480,
+            }
+        },
+    )
+
+    context = build_position_management_context(position, feature_payload=_feature_payload(atr=150.0), settings_row=settings_row)
+
+    assert context["holding_profile"] == "position"
+    assert context["initial_stop_type"] == "deterministic_hard_stop"
+    assert context["hard_stop_active"] is True
+    assert context["ai_stop_management_allowed"] is True
+    assert context["stop_widening_allowed"] is False
+    assert context["break_even_trigger_r"] == pytest.approx(1.2)
+    assert context["partial_take_profit_trigger_r"] == pytest.approx(2.2)
+    assert context["trailing_stop_atr_multiplier"] == pytest.approx(1.45)
 
 
 def test_execute_live_trade_keeps_risk_approved_quantity_cap_for_auto_resized_entry(monkeypatch, db_session) -> None:
@@ -3073,6 +3521,20 @@ def test_scale_in_does_not_cancel_existing_protection_before_fill(monkeypatch, d
     cancel_calls: list[str] = []
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: ScaleInClient())
     monkeypatch.setattr("trading_mvp.services.execution._cancel_exit_orders", lambda session, client, symbol: cancel_calls.append(symbol))
+    risk_result = _risk_result("long").model_copy(
+        update={
+            "debug_payload": {
+                "add_on": {
+                    "same_side_pyramiding": True,
+                    "current_r_multiple": 0.8,
+                    "add_on_reason": "winner_only_add_on_protected_runner",
+                    "risk_pct_multiplier": 0.7,
+                    "leverage_multiplier": 0.9,
+                    "notional_multiplier": 0.6,
+                }
+            }
+        }
+    )
 
     result = execute_live_trade(
         db_session,
@@ -3080,12 +3542,15 @@ def test_scale_in_does_not_cancel_existing_protection_before_fill(monkeypatch, d
         decision_run_id=3,
         decision=_live_decision("long"),
         market_snapshot=_market_snapshot(),
-        risk_result=_risk_result("long"),
+        risk_result=risk_result,
     )
 
     assert result["status"] == "filled"
     assert result["intent_type"] == "scale_in"
     assert cancel_calls == []
+    assert result["position_management"]["metadata"]["pyramiding_stage"] == 1
+    assert result["position_management"]["metadata"]["add_on_reason"] == "winner_only_add_on_protected_runner"
+    assert result["position_management"]["metadata"]["add_on_r_multiple"] == pytest.approx(0.8)
 
 
 def test_protection_failure_falls_back_to_manage_only_when_emergency_close_fails(monkeypatch, db_session) -> None:

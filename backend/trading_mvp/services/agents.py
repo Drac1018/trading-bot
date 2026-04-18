@@ -21,8 +21,36 @@ from trading_mvp.schemas import (
     RiskCheckResult,
     TradeDecision,
 )
-from trading_mvp.services.adaptive_signal import compute_adaptive_adjustment
+from trading_mvp.services.adaptive_signal import (
+    ADAPTIVE_SETUP_DISABLE_REASON_CODE,
+    compute_adaptive_adjustment,
+)
+from trading_mvp.services.holding_profile import (
+    HOLDING_PROFILE_POSITION,
+    HOLDING_PROFILE_SCALP,
+    HOLDING_PROFILE_SWING,
+    deterministic_stop_management_payload,
+    evaluate_holding_profile,
+)
+from trading_mvp.services.strategy_engines import select_strategy_engine
 from trading_mvp.time_utils import utcnow_naive
+
+IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES = {"PENDING_ENTRY_PLAN_TRIGGERED"}
+SETUP_CLUSTER_DISABLED_REASON_CODE = "SETUP_CLUSTER_DISABLED"
+WINNER_ONLY_ADD_ON_REASON_CODE = "WINNER_ONLY_ADD_ON"
+ADD_ON_TREND_CONFIRMED_REASON_CODE = "ADD_ON_TREND_CONFIRMED"
+ADD_ON_PROTECTED_STOP_REASON_CODE = "ADD_ON_PROTECTED_STOP"
+ADD_ON_REQUIRES_WINNING_POSITION_REASON_CODE = "ADD_ON_REQUIRES_WINNING_POSITION"
+ADD_ON_PROTECTIVE_STOP_REQUIRED_REASON_CODE = "ADD_ON_PROTECTIVE_STOP_REQUIRED"
+ADD_ON_TREND_ALIGNMENT_REQUIRED_REASON_CODE = "ADD_ON_TREND_ALIGNMENT_REQUIRED"
+ADD_ON_BREADTH_VETO_REASON_CODE = "ADD_ON_BREADTH_VETO"
+ADD_ON_LEAD_LAG_VETO_REASON_CODE = "ADD_ON_LEAD_LAG_VETO"
+ADD_ON_DERIVATIVES_VETO_REASON_CODE = "ADD_ON_DERIVATIVES_VETO"
+SETUP_CLUSTER_EXEMPT_RATIONALE_CODES = {
+    "PROTECTION_REQUIRED",
+    "PROTECTION_RECOVERY",
+    "PROTECTION_RESTORE",
+}
 
 
 def _summary_from_output(output: BaseModel | dict[str, Any]) -> str:
@@ -109,6 +137,30 @@ def _provider_metadata(result: ProviderResult | None, *, source: str) -> dict[st
     return metadata
 
 
+def _setup_cluster_scenario(decision: str, entry_mode: str | None, rationale_codes: list[str]) -> str:
+    decision_code = str(decision or "").lower()
+    if decision_code in {"reduce", "exit", "hold"}:
+        return decision_code
+    rationale_set = {str(code) for code in rationale_codes if code}
+    if rationale_set & SETUP_CLUSTER_EXEMPT_RATIONALE_CODES:
+        return "protection_restore"
+    if str(entry_mode or "").lower() == "pullback_confirm" or any("PULLBACK" in code for code in rationale_set):
+        return "pullback_entry"
+    return "trend_follow"
+
+
+def _setup_cluster_key(
+    *,
+    symbol: str,
+    timeframe: str,
+    scenario: str,
+    entry_mode: str,
+    regime: str,
+    trend_alignment: str,
+) -> str:
+    return f"{symbol.upper()}|{timeframe}|{scenario}|{entry_mode}|{regime}|{trend_alignment}"
+
+
 def build_trading_decision_input_payload(
     *,
     market_snapshot: MarketSnapshotPayload,
@@ -190,9 +242,163 @@ class TradingDecisionAgent:
             confidence -= 0.04
         if features.pullback_context.state == "countertrend":
             confidence -= 0.08
+        if features.lead_lag.available:
+            if features.regime.trend_alignment == "bullish_aligned":
+                if features.lead_lag.bullish_alignment_score >= 0.68:
+                    confidence += 0.05
+                elif features.lead_lag.bullish_alignment_score <= 0.38:
+                    confidence -= 0.08
+            elif features.regime.trend_alignment == "bearish_aligned":
+                if features.lead_lag.bearish_alignment_score >= 0.68:
+                    confidence += 0.05
+                elif features.lead_lag.bearish_alignment_score <= 0.38:
+                    confidence -= 0.08
         if "STALE_MARKET_DATA" in features.data_quality_flags or "INCOMPLETE_MARKET_DATA" in features.data_quality_flags:
             confidence -= 0.2
         return round(min(0.96, max(0.18, confidence)), 4)
+
+    @staticmethod
+    def _derivatives_side_context(features: FeaturePayload, side: Literal["long", "short"]) -> dict[str, object]:
+        derivatives = features.derivatives
+        if not derivatives.available:
+            return {
+                "available": False,
+                "alignment_score": 0.5,
+                "crowding_risk": False,
+                "top_trader_crowded": False,
+                "taker_headwind": False,
+                "funding_headwind": False,
+                "spread_bps": None,
+                "spread_headwind": False,
+                "spread_stress": False,
+                "breakout_filter_blocking": False,
+                "entry_filter_blocking": False,
+                "oi_supportive": True,
+                "breakout_supportive": True,
+                "entry_veto_reason_codes": [],
+                "breakout_veto_reason_codes": [],
+                "discount_magnitude": 0.0,
+            }
+        if side == "long":
+            funding_headwind = derivatives.funding_bias == "long_headwind"
+            crowding_risk = derivatives.crowded_long_risk
+            top_trader_crowded = derivatives.top_trader_long_crowded
+            taker_headwind = derivatives.taker_flow_alignment == "bearish"
+            oi_supportive = derivatives.oi_expanding_with_price and not derivatives.oi_falling_on_breakout
+            spread_headwind = derivatives.spread_headwind
+            spread_stress = derivatives.spread_stress
+            breakout_filter_blocking = (
+                (derivatives.breakout_spread_headwind and not oi_supportive)
+                or top_trader_crowded
+                or spread_stress
+                or derivatives.taker_flow_alignment != "bullish"
+            )
+            entry_filter_blocking = (
+                (funding_headwind and spread_headwind)
+                or (crowding_risk and spread_headwind)
+                or (top_trader_crowded and (spread_stress or taker_headwind))
+                or (funding_headwind and spread_stress)
+            )
+            breakout_supportive = (
+                oi_supportive
+                and derivatives.taker_flow_alignment == "bullish"
+                and not crowding_risk
+                and not top_trader_crowded
+                and not funding_headwind
+                and not spread_stress
+                and not derivatives.breakout_spread_headwind
+            )
+            alignment_score = derivatives.long_alignment_score
+            entry_veto_reason_codes = list(derivatives.entry_veto_reason_codes)
+            breakout_veto_reason_codes = list(derivatives.breakout_veto_reason_codes)
+            discount_magnitude = float(derivatives.long_discount_magnitude)
+        else:
+            funding_headwind = derivatives.funding_bias == "short_headwind"
+            crowding_risk = derivatives.crowded_short_risk
+            top_trader_crowded = derivatives.top_trader_short_crowded
+            taker_headwind = derivatives.taker_flow_alignment == "bullish"
+            oi_supportive = derivatives.oi_expanding_with_price and not derivatives.oi_falling_on_breakout
+            spread_headwind = derivatives.spread_headwind
+            spread_stress = derivatives.spread_stress
+            breakout_filter_blocking = (
+                (derivatives.breakout_spread_headwind and not oi_supportive)
+                or top_trader_crowded
+                or spread_stress
+                or derivatives.taker_flow_alignment != "bearish"
+            )
+            entry_filter_blocking = (
+                (funding_headwind and spread_headwind)
+                or (crowding_risk and spread_headwind)
+                or (top_trader_crowded and (spread_stress or taker_headwind))
+                or (funding_headwind and spread_stress)
+            )
+            breakout_supportive = (
+                oi_supportive
+                and derivatives.taker_flow_alignment == "bearish"
+                and not crowding_risk
+                and not top_trader_crowded
+                and not funding_headwind
+                and not spread_stress
+                and not derivatives.breakout_spread_headwind
+            )
+            alignment_score = derivatives.short_alignment_score
+            entry_veto_reason_codes = list(derivatives.entry_veto_reason_codes)
+            breakout_veto_reason_codes = list(derivatives.breakout_veto_reason_codes)
+            discount_magnitude = float(derivatives.short_discount_magnitude)
+        return {
+            "available": True,
+            "alignment_score": float(alignment_score),
+            "crowding_risk": bool(crowding_risk),
+            "top_trader_crowded": bool(top_trader_crowded),
+            "taker_headwind": bool(taker_headwind),
+            "funding_headwind": bool(funding_headwind),
+            "spread_bps": derivatives.spread_bps,
+            "spread_headwind": bool(spread_headwind),
+            "spread_stress": bool(spread_stress),
+            "breakout_filter_blocking": bool(breakout_filter_blocking),
+            "entry_filter_blocking": bool(entry_filter_blocking),
+            "oi_supportive": bool(oi_supportive),
+            "breakout_supportive": bool(breakout_supportive),
+            "entry_veto_reason_codes": entry_veto_reason_codes,
+            "breakout_veto_reason_codes": breakout_veto_reason_codes,
+            "discount_magnitude": round(discount_magnitude, 4),
+        }
+
+    @staticmethod
+    def _lead_lag_side_context(features: FeaturePayload, side: Literal["long", "short"]) -> dict[str, object]:
+        lead_lag = features.lead_lag
+        if not lead_lag.available:
+            return {
+                "available": False,
+                "alignment_score": 0.5,
+                "leader_bias": "unknown",
+                "breakout_confirmed": True,
+                "breakout_ahead": False,
+                "pullback_supported": True,
+                "continuation_supported": True,
+                "strong_reference_confirmation": False,
+            }
+        if side == "long":
+            return {
+                "available": True,
+                "alignment_score": float(lead_lag.bullish_alignment_score),
+                "leader_bias": lead_lag.leader_bias,
+                "breakout_confirmed": bool(lead_lag.bullish_breakout_confirmed),
+                "breakout_ahead": bool(lead_lag.bullish_breakout_ahead),
+                "pullback_supported": bool(lead_lag.bullish_pullback_supported),
+                "continuation_supported": bool(lead_lag.bullish_continuation_supported),
+                "strong_reference_confirmation": bool(lead_lag.strong_reference_confirmation),
+            }
+        return {
+            "available": True,
+            "alignment_score": float(lead_lag.bearish_alignment_score),
+            "leader_bias": lead_lag.leader_bias,
+            "breakout_confirmed": bool(lead_lag.bearish_breakout_confirmed),
+            "breakout_ahead": bool(lead_lag.bearish_breakout_ahead),
+            "pullback_supported": bool(lead_lag.bearish_pullback_supported),
+            "continuation_supported": bool(lead_lag.bearish_continuation_supported),
+            "strong_reference_confirmation": bool(lead_lag.strong_reference_confirmation),
+        }
 
     @staticmethod
     def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -210,8 +416,158 @@ class TradingDecisionAgent:
         }
 
     @staticmethod
+    def _optional_float(value: object) -> float | None:
+        try:
+            if value in {None, ""}:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _protective_stop_ready_for_add_on(
+        cls,
+        position: Position,
+        position_management_context: dict[str, Any],
+    ) -> bool:
+        if bool(position_management_context.get("break_even_eligible")):
+            return True
+        stop_loss = cls._optional_float(position_management_context.get("tightened_stop_loss"))
+        if stop_loss is None:
+            stop_loss = cls._optional_float(getattr(position, "stop_loss", None))
+        entry_price = cls._optional_float(getattr(position, "entry_price", None))
+        side = str(getattr(position, "side", "") or "").lower()
+        if stop_loss is None or entry_price is None or side not in {"long", "short"}:
+            return False
+        if side == "long":
+            return stop_loss >= entry_price
+        return stop_loss <= entry_price
+
+    def _add_on_candidate_context(
+        self,
+        *,
+        decision_side: Literal["long", "short"],
+        open_position: Position | None,
+        features: FeaturePayload,
+        risk_context: dict[str, Any],
+        position_management_context: dict[str, Any],
+        derivatives_blocking: bool,
+        lead_lag_blocking: bool,
+    ) -> dict[str, Any]:
+        if open_position is None or open_position.side != decision_side:
+            return {"candidate": False, "allowed": False, "blocked_reason_codes": [], "allowed_reason_codes": []}
+        selection_context = (
+            risk_context.get("selection_context")
+            if isinstance(risk_context.get("selection_context"), dict)
+            else {}
+        )
+        breadth_summary = (
+            selection_context.get("universe_breadth")
+            if isinstance(selection_context, dict) and isinstance(selection_context.get("universe_breadth"), dict)
+            else {}
+        )
+        breadth_regime = str(breadth_summary.get("breadth_regime") or "mixed")
+        hold_bias_multiplier = self._optional_float(breadth_summary.get("hold_bias_multiplier")) or 1.0
+        breadth_veto = breadth_regime in {"weak_breadth", "transition_fragile"} and hold_bias_multiplier > 1.05
+        current_r_multiple = self._optional_float(position_management_context.get("current_r_multiple"))
+        unrealized_pnl = self._optional_float(getattr(open_position, "unrealized_pnl", None)) or 0.0
+        protective_stop_ready = self._protective_stop_ready_for_add_on(open_position, position_management_context)
+        target_alignment = "bullish_aligned" if decision_side == "long" else "bearish_aligned"
+        trend_alignment_ok = features.regime.trend_alignment == target_alignment
+        blocked_reason_codes: list[str] = []
+        if unrealized_pnl <= 0 or current_r_multiple is None or current_r_multiple <= 0:
+            blocked_reason_codes.append(ADD_ON_REQUIRES_WINNING_POSITION_REASON_CODE)
+        if not protective_stop_ready:
+            blocked_reason_codes.append(ADD_ON_PROTECTIVE_STOP_REQUIRED_REASON_CODE)
+        if not trend_alignment_ok:
+            blocked_reason_codes.append(ADD_ON_TREND_ALIGNMENT_REQUIRED_REASON_CODE)
+        if breadth_veto:
+            blocked_reason_codes.append(ADD_ON_BREADTH_VETO_REASON_CODE)
+        if lead_lag_blocking:
+            blocked_reason_codes.append(ADD_ON_LEAD_LAG_VETO_REASON_CODE)
+        if derivatives_blocking or bool(features.derivatives.spread_headwind):
+            blocked_reason_codes.append(ADD_ON_DERIVATIVES_VETO_REASON_CODE)
+        return {
+            "candidate": True,
+            "allowed": len(blocked_reason_codes) == 0,
+            "blocked_reason_codes": blocked_reason_codes,
+            "allowed_reason_codes": [
+                WINNER_ONLY_ADD_ON_REASON_CODE,
+                ADD_ON_TREND_CONFIRMED_REASON_CODE,
+                ADD_ON_PROTECTED_STOP_REASON_CODE,
+            ],
+            "current_r_multiple": current_r_multiple,
+            "breadth_regime": breadth_regime,
+        }
+
+    @staticmethod
     def _minimum_actionable_notional(price: float) -> float:
         return max(25.0, price * 0.0005)
+
+    def _breakout_exception_allowed(
+        self,
+        features: FeaturePayload,
+        side: Literal["long", "short"],
+    ) -> bool:
+        breakout_up = features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
+        breakout_down = features.breakout.broke_swing_low or features.breakout.range_breakout_direction == "down"
+        bearish_rejection = (
+            features.candle_structure.upper_wick_ratio > max(features.candle_structure.lower_wick_ratio + 0.08, 0.28)
+            and features.candle_structure.body_ratio < 0.55
+        )
+        bullish_rejection = (
+            features.candle_structure.lower_wick_ratio > max(features.candle_structure.upper_wick_ratio + 0.08, 0.28)
+            and features.candle_structure.body_ratio < 0.55
+        )
+        if side == "long":
+            derivatives = self._derivatives_side_context(features, "long")
+            lead_lag = self._lead_lag_side_context(features, "long")
+            return bool(
+                breakout_up
+                and features.regime.trend_alignment == "bullish_aligned"
+                and features.regime.primary_regime != "range"
+                and features.trend_score >= 0.42
+                and features.momentum_score >= 0.26
+                and not features.regime.weak_volume
+                and not bearish_rejection
+                and features.regime.momentum_state == "strengthening"
+                and features.volume_persistence.persistence_ratio >= 1.05
+                and bool(derivatives.get("breakout_supportive", True))
+                and (
+                    not bool(lead_lag.get("available"))
+                    or (
+                        not bool(lead_lag.get("breakout_ahead"))
+                        and (
+                            bool(lead_lag.get("breakout_confirmed"))
+                            or bool(lead_lag.get("strong_reference_confirmation"))
+                        )
+                    )
+                )
+            )
+        derivatives = self._derivatives_side_context(features, "short")
+        lead_lag = self._lead_lag_side_context(features, "short")
+        return bool(
+            breakout_down
+            and features.regime.trend_alignment == "bearish_aligned"
+            and features.regime.primary_regime != "range"
+            and features.trend_score <= -0.42
+            and features.momentum_score <= -0.26
+            and not features.regime.weak_volume
+            and not bullish_rejection
+            and features.regime.momentum_state == "strengthening"
+            and features.volume_persistence.persistence_ratio >= 1.05
+            and bool(derivatives.get("breakout_supportive", True))
+            and (
+                not bool(lead_lag.get("available"))
+                or (
+                    not bool(lead_lag.get("breakout_ahead"))
+                    and (
+                        bool(lead_lag.get("breakout_confirmed"))
+                        or bool(lead_lag.get("strong_reference_confirmation"))
+                    )
+                )
+            )
+        )
 
     def _entry_budget_allows(
         self,
@@ -241,6 +597,83 @@ class TradingDecisionAgent:
             return max(int(value[:-1]) * 1440, 1)
         return 15
 
+    def _build_entry_timing_profile(
+        self,
+        decision: Literal["hold", "long", "short", "reduce", "exit"],
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        entry_mode: str | None,
+        holding_profile: str = HOLDING_PROFILE_SCALP,
+    ) -> dict[str, Any]:
+        if decision not in {"long", "short"}:
+            return {
+                "profile_name": "non_entry",
+                "profile_rationale_code": None,
+                "idea_ttl_minutes": None,
+                "max_holding_minutes": 240,
+                "early_fail_minutes": None,
+                "early_fail_r_floor": None,
+                "hold_extension_minutes": None,
+            }
+
+        timeframe_minutes = self._timeframe_minutes(market_snapshot.timeframe)
+        pullback_state = str(features.pullback_context.state or "")
+
+        if entry_mode == "breakout_confirm":
+            profile_name = "breakout_fast"
+            profile_rationale_code = "SETUP_TIME_PROFILE_BREAKOUT_FAST"
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 0.8)), 8), 12)
+            max_holding_minutes = min(max(int(round(timeframe_minutes * 6.0)), 90), 120)
+            early_fail_minutes = min(max(int(round(max_holding_minutes * 0.22)), 18), 30)
+            early_fail_r_floor = 0.1
+            hold_extension_minutes = min(max(int(round(timeframe_minutes * 0.75)), 8), 15)
+        elif pullback_state in {"bullish_continuation", "bearish_continuation"}:
+            profile_name = "continuation_balanced"
+            profile_rationale_code = "SETUP_TIME_PROFILE_CONTINUATION_BALANCED"
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 1.0)), 12), 16)
+            max_holding_minutes = min(max(int(round(timeframe_minutes * 10.0)), 150), 180)
+            early_fail_minutes = min(max(int(round(max_holding_minutes * 0.25)), 30), 45)
+            early_fail_r_floor = 0.0
+            hold_extension_minutes = min(max(int(round(timeframe_minutes * 1.25)), 15), 25)
+        else:
+            profile_name = "pullback_flexible"
+            profile_rationale_code = "SETUP_TIME_PROFILE_PULLBACK_FLEXIBLE"
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 1.25)), 15), 20)
+            max_holding_minutes = min(max(int(round(timeframe_minutes * 14.0)), 180), 240)
+            early_fail_minutes = min(max(int(round(max_holding_minutes * 0.25)), 40), 60)
+            early_fail_r_floor = -0.15
+            hold_extension_minutes = min(max(int(round(timeframe_minutes * 1.75)), 20), 35)
+
+        if holding_profile == HOLDING_PROFILE_SCALP:
+            idea_ttl_minutes = max(min(int(round(idea_ttl_minutes * 0.85)), idea_ttl_minutes), 6)
+            max_holding_minutes = max(min(int(round(max_holding_minutes * 0.78)), max_holding_minutes), 60)
+            early_fail_minutes = max(min(int(round(early_fail_minutes * 0.82)), early_fail_minutes), 15)
+            hold_extension_minutes = max(min(int(round(hold_extension_minutes * 0.7)), hold_extension_minutes), 5)
+            profile_name = f"{profile_name}_scalp"
+        elif holding_profile == HOLDING_PROFILE_SWING:
+            idea_ttl_minutes = max(int(round(idea_ttl_minutes * 1.15)), idea_ttl_minutes)
+            max_holding_minutes = max(int(round(max_holding_minutes * 1.6)), max_holding_minutes)
+            early_fail_minutes = max(int(round(early_fail_minutes * 1.2)), early_fail_minutes)
+            hold_extension_minutes = max(int(round(hold_extension_minutes * 1.2)), hold_extension_minutes)
+            profile_name = f"{profile_name}_swing"
+        elif holding_profile == HOLDING_PROFILE_POSITION:
+            idea_ttl_minutes = max(int(round(idea_ttl_minutes * 1.35)), idea_ttl_minutes)
+            max_holding_minutes = max(int(round(max_holding_minutes * 3.2)), max_holding_minutes)
+            early_fail_minutes = max(int(round(early_fail_minutes * 1.6)), early_fail_minutes)
+            hold_extension_minutes = max(int(round(hold_extension_minutes * 1.6)), hold_extension_minutes)
+            profile_name = f"{profile_name}_position"
+
+        return {
+            "profile_name": profile_name,
+            "profile_rationale_code": profile_rationale_code,
+            "idea_ttl_minutes": idea_ttl_minutes,
+            "max_holding_minutes": max_holding_minutes,
+            "early_fail_minutes": early_fail_minutes,
+            "early_fail_r_floor": early_fail_r_floor,
+            "hold_extension_minutes": hold_extension_minutes,
+        }
+
     def _build_entry_trigger_defaults(
         self,
         decision: Literal["hold", "long", "short", "reduce", "exit"],
@@ -257,43 +690,19 @@ class TradingDecisionAgent:
                 "idea_ttl_minutes": None,
             }
 
-        breakout_up = features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
-        breakout_down = features.breakout.broke_swing_low or features.breakout.range_breakout_direction == "down"
-        bullish_pullback = features.pullback_context.state == "bullish_pullback"
-        bullish_continuation = features.pullback_context.state == "bullish_continuation"
-        bearish_pullback = features.pullback_context.state == "bearish_pullback"
-        bearish_continuation = features.pullback_context.state == "bearish_continuation"
-        strong_bullish_breakout_exception = (
-            breakout_up
-            and features.regime.trend_alignment == "bullish_aligned"
-            and not features.regime.weak_volume
-            and features.regime.momentum_state in {"strengthening", "stable"}
-            and features.trend_score >= 0.35
-            and features.momentum_score >= 0.2
+        strategy_engine_selection = self._build_strategy_engine_selection_payload(
+            market_snapshot=market_snapshot,
+            features=features,
+            open_positions=[],
+            risk_context={},
         )
-        strong_bearish_breakout_exception = (
-            breakout_down
-            and features.regime.trend_alignment == "bearish_aligned"
-            and not features.regime.weak_volume
-            and features.regime.momentum_state in {"strengthening", "stable"}
-            and features.trend_score <= -0.35
-            and features.momentum_score <= -0.2
+        selected_engine = (
+            dict(strategy_engine_selection.get("selected_engine"))
+            if isinstance(strategy_engine_selection.get("selected_engine"), dict)
+            else {}
         )
-
-        if decision == "long":
-            if bullish_pullback or bullish_continuation:
-                entry_mode = "pullback_confirm"
-            elif strong_bullish_breakout_exception:
-                entry_mode = "breakout_confirm"
-            else:
-                entry_mode = "pullback_confirm"
-        else:
-            if bearish_pullback or bearish_continuation:
-                entry_mode = "pullback_confirm"
-            elif strong_bearish_breakout_exception:
-                entry_mode = "breakout_confirm"
-            else:
-                entry_mode = "pullback_confirm"
+        selected_engine_name = str(selected_engine.get("engine_name") or "")
+        entry_mode = "breakout_confirm" if selected_engine_name == "breakout_exception_engine" else "pullback_confirm"
 
         if entry_mode == "breakout_confirm":
             max_chase_bps = 6.0
@@ -301,13 +710,39 @@ class TradingDecisionAgent:
             max_chase_bps = 4.0
         else:
             max_chase_bps = 2.0
+        timing_profile = self._build_entry_timing_profile(
+            decision,
+            market_snapshot=market_snapshot,
+            features=features,
+            entry_mode=entry_mode,
+        )
 
         return {
             "entry_mode": entry_mode,
             "invalidation_price": stop_loss,
             "max_chase_bps": max_chase_bps,
-            "idea_ttl_minutes": min(max(self._timeframe_minutes(market_snapshot.timeframe), 10), 20),
+            "idea_ttl_minutes": timing_profile["idea_ttl_minutes"],
+            "max_holding_minutes": timing_profile["max_holding_minutes"],
+            "time_profile_name": timing_profile["profile_name"],
+            "time_profile_rationale_code": timing_profile["profile_rationale_code"],
         }
+
+    def _build_strategy_engine_selection_payload(
+        self,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        open_positions: list[Position],
+        risk_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        return select_strategy_engine(
+            market_snapshot=market_snapshot,
+            features=features,
+            open_positions=open_positions,
+            risk_context=risk_context,
+            long_breakout_allowed=self._breakout_exception_allowed(features, "long"),
+            short_breakout_allowed=self._breakout_exception_allowed(features, "short"),
+        ).to_payload()
 
     def _normalize_entry_trigger_fields(
         self,
@@ -324,26 +759,254 @@ class TradingDecisionAgent:
         )
         if decision.decision not in {"long", "short"}:
             return decision.model_copy(update=defaults)
+        normalized_entry_mode = decision.entry_mode or defaults["entry_mode"]
+        preserve_immediate_entry = bool(
+            normalized_entry_mode == "immediate"
+            and set(decision.rationale_codes) & IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES
+        )
+        if normalized_entry_mode == "immediate" and not preserve_immediate_entry:
+            normalized_entry_mode = defaults["entry_mode"]
+        normalized_timing_profile = self._build_entry_timing_profile(
+            decision.decision,
+            market_snapshot=market_snapshot,
+            features=features,
+            entry_mode=normalized_entry_mode,
+        )
+        normalized_default_max_chase_bps = 6.0 if normalized_entry_mode == "breakout_confirm" else 4.0 if normalized_entry_mode == "pullback_confirm" else 2.0
+        normalized_max_chase_bps = (
+            decision.max_chase_bps
+            if decision.max_chase_bps is not None and preserve_immediate_entry
+            else normalized_default_max_chase_bps if decision.entry_mode == "immediate" and not preserve_immediate_entry
+            else decision.max_chase_bps if decision.max_chase_bps is not None
+            else normalized_default_max_chase_bps
+        )
+        normalized_idea_ttl_minutes = (
+            decision.idea_ttl_minutes
+            if decision.idea_ttl_minutes is not None and preserve_immediate_entry
+            else normalized_timing_profile["idea_ttl_minutes"] if decision.entry_mode == "immediate" and not preserve_immediate_entry
+            else decision.idea_ttl_minutes if decision.idea_ttl_minutes is not None
+            else normalized_timing_profile["idea_ttl_minutes"]
+        )
+        normalized_max_holding_minutes = (
+            decision.max_holding_minutes
+            if preserve_immediate_entry
+            else int(normalized_timing_profile["max_holding_minutes"] or decision.max_holding_minutes)
+        )
+        normalized_rationale_codes = list(
+            dict.fromkeys(decision.rationale_codes + [normalized_timing_profile["profile_rationale_code"]])
+        )
         return decision.model_copy(
             update={
-                "entry_mode": decision.entry_mode or defaults["entry_mode"],
+                "entry_mode": normalized_entry_mode,
                 "invalidation_price": (
                     decision.invalidation_price
                     if decision.invalidation_price is not None
                     else defaults["invalidation_price"]
                 ),
-                "max_chase_bps": (
-                    decision.max_chase_bps
-                    if decision.max_chase_bps is not None
-                    else defaults["max_chase_bps"]
-                ),
-                "idea_ttl_minutes": (
-                    decision.idea_ttl_minutes
-                    if decision.idea_ttl_minutes is not None
-                    else defaults["idea_ttl_minutes"]
-                ),
+                "max_chase_bps": normalized_max_chase_bps,
+                "idea_ttl_minutes": normalized_idea_ttl_minutes,
+                "max_holding_minutes": normalized_max_holding_minutes,
+                "rationale_codes": normalized_rationale_codes,
             }
         )
+
+    def _apply_holding_profile_fields(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        risk_context: dict[str, Any],
+        strategy_engine_selection: dict[str, Any],
+    ) -> tuple[TradeDecision, dict[str, Any]]:
+        selection_context = (
+            dict(risk_context.get("selection_context"))
+            if isinstance(risk_context.get("selection_context"), dict)
+            else {}
+        )
+        selected_engine = (
+            dict(strategy_engine_selection.get("selected_engine"))
+            if isinstance(strategy_engine_selection.get("selected_engine"), dict)
+            else {}
+        )
+        holding_profile_context = evaluate_holding_profile(
+            decision=decision.decision,
+            features=features,
+            selection_context=selection_context,
+            strategy_engine=str(selected_engine.get("engine_name") or ""),
+        )
+        timing_profile = self._build_entry_timing_profile(
+            decision.decision,
+            market_snapshot=market_snapshot,
+            features=features,
+            entry_mode=decision.entry_mode,
+            holding_profile=str(holding_profile_context["holding_profile"]),
+        )
+        normalized_rationale_codes = list(
+            dict.fromkeys(
+                list(decision.rationale_codes)
+                + list(holding_profile_context.get("rationale_codes") or [])
+                + [str(timing_profile["profile_rationale_code"] or "")]
+            )
+        )
+        update_payload: dict[str, Any] = {
+            "holding_profile": holding_profile_context["holding_profile"],
+            "holding_profile_reason": holding_profile_context["holding_profile_reason"],
+            "rationale_codes": [code for code in normalized_rationale_codes if code],
+        }
+        if decision.decision in {"long", "short"}:
+            update_payload["idea_ttl_minutes"] = timing_profile["idea_ttl_minutes"]
+            update_payload["max_holding_minutes"] = int(timing_profile["max_holding_minutes"] or decision.max_holding_minutes)
+        updated_decision = decision.model_copy(update=update_payload)
+        updated_decision = self._apply_deterministic_entry_brackets(
+            updated_decision,
+            market_snapshot=market_snapshot,
+            features=features,
+        )
+        return updated_decision, {
+            **holding_profile_context,
+            **deterministic_stop_management_payload(hard_stop_active=updated_decision.stop_loss is not None),
+        }
+
+    @staticmethod
+    def _deterministic_entry_reference_price(
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+    ) -> float:
+        if decision.entry_zone_min is not None and decision.entry_zone_max is not None:
+            return (decision.entry_zone_min + decision.entry_zone_max) / 2
+        return market_snapshot.latest_price
+
+    def _apply_deterministic_entry_brackets(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+    ) -> TradeDecision:
+        if decision.decision not in {"long", "short"}:
+            return decision
+        reference_price = self._deterministic_entry_reference_price(
+            decision,
+            market_snapshot=market_snapshot,
+        )
+        deterministic_stop_loss, deterministic_take_profit = self._adaptive_brackets(
+            decision.decision,
+            price=reference_price,
+            atr=features.atr,
+            features=features,
+        )
+        take_profit = decision.take_profit
+        if take_profit is None or (
+            decision.decision == "long" and take_profit <= reference_price
+        ) or (
+            decision.decision == "short" and take_profit >= reference_price
+        ):
+            take_profit = deterministic_take_profit
+        normalized_rationale_codes = list(
+            dict.fromkeys(list(decision.rationale_codes) + ["DETERMINISTIC_HARD_STOP_ACTIVE"])
+        )
+        return decision.model_copy(
+            update={
+                "stop_loss": deterministic_stop_loss,
+                "take_profit": take_profit,
+                "rationale_codes": normalized_rationale_codes,
+            }
+        )
+
+    @staticmethod
+    def _build_decision_agreement(
+        baseline: TradeDecision,
+        final_decision: TradeDecision,
+        *,
+        ai_used: bool,
+    ) -> dict[str, Any]:
+        baseline_direction = baseline.decision
+        final_direction = final_decision.decision
+        baseline_entry_mode = baseline.entry_mode or "none"
+        final_entry_mode = final_decision.entry_mode or "none"
+        direction_match = (
+            baseline_direction in {"long", "short"}
+            and final_direction in {"long", "short"}
+            and baseline_direction == final_direction
+        )
+        entry_mode_match = direction_match and baseline_entry_mode == final_entry_mode
+        if entry_mode_match:
+            level = "full_agreement"
+        elif direction_match:
+            level = "partial_agreement"
+        else:
+            level = "disagreement"
+        return {
+            "ai_used": ai_used,
+            "comparison_source": (
+                "deterministic_baseline_vs_ai_final"
+                if ai_used
+                else "deterministic_baseline_vs_deterministic_final"
+            ),
+            "level": level,
+            "baseline_decision": baseline_direction,
+            "baseline_entry_mode": baseline_entry_mode,
+            "final_decision": final_direction,
+            "final_entry_mode": final_entry_mode,
+            "direction_match": direction_match,
+            "entry_mode_match": entry_mode_match,
+            "baseline_is_hold": baseline_direction == "hold",
+            "final_is_hold": final_direction == "hold",
+        }
+
+    @staticmethod
+    def _resolve_setup_cluster_state(
+        risk_context: dict[str, Any],
+        decision: TradeDecision,
+    ) -> dict[str, Any]:
+        context = risk_context.get("setup_cluster_context")
+        if not isinstance(context, dict):
+            return {"matched": False, "active": False, "cooldown_active": False, "status": "unavailable", "recovery_trigger": None, "thresholds": {}}
+        if decision.decision not in {"long", "short"}:
+            return {"matched": False, "active": False, "cooldown_active": False, "status": "not_applicable", "recovery_trigger": None, "thresholds": {}}
+        if set(decision.rationale_codes) & SETUP_CLUSTER_EXEMPT_RATIONALE_CODES:
+            return {"matched": False, "active": False, "cooldown_active": False, "status": "exempt", "recovery_trigger": None, "thresholds": {}}
+        cluster_lookup = context.get("cluster_lookup")
+        if not isinstance(cluster_lookup, dict):
+            return {"matched": False, "active": False, "cooldown_active": False, "status": "unavailable", "recovery_trigger": None, "thresholds": {}}
+        cluster_key = _setup_cluster_key(
+            symbol=decision.symbol,
+            timeframe=decision.timeframe,
+            scenario=_setup_cluster_scenario(
+                decision.decision,
+                decision.entry_mode,
+                decision.rationale_codes,
+            ),
+            entry_mode=str(decision.entry_mode or "none").lower(),
+            regime=str(context.get("regime") or "unknown"),
+            trend_alignment=str(context.get("trend_alignment") or "unknown"),
+        )
+        cluster_state = cluster_lookup.get(cluster_key)
+        if not isinstance(cluster_state, dict):
+            return {
+                "matched": False,
+                "active": False,
+                "cooldown_active": False,
+                "status": "not_matched",
+                "recovery_trigger": None,
+                "thresholds": {},
+                "cluster_key": cluster_key,
+                "regime": context.get("regime"),
+                "trend_alignment": context.get("trend_alignment"),
+            }
+        active = bool(cluster_state.get("active", False))
+        cooldown_active = bool(cluster_state.get("cooldown_active", active))
+        return {
+            **cluster_state,
+            "matched": True,
+            "active": active,
+            "cooldown_active": cooldown_active,
+            "status": cluster_state.get("status") or ("active_disabled" if cooldown_active else "monitoring"),
+            "recovery_trigger": cluster_state.get("recovery_trigger"),
+            "thresholds": cluster_state.get("thresholds") if isinstance(cluster_state.get("thresholds"), dict) else {},
+        }
 
     def _apply_adaptive_adjustment(
         self,
@@ -357,15 +1020,43 @@ class TradingDecisionAgent:
             adaptive_context if isinstance(adaptive_context, dict) else None,
             decision=decision.decision,
             rationale_codes=decision.rationale_codes,
+            entry_mode=decision.entry_mode,
         )
+        setup_cluster_state = self._resolve_setup_cluster_state(risk_context, decision)
         if not adjustment.get("enabled"):
+            if decision.decision in {"long", "short"} and bool(setup_cluster_state.get("active", False)):
+                rationale_codes = list(dict.fromkeys(decision.rationale_codes + [SETUP_CLUSTER_DISABLED_REASON_CODE, provider_code]))
+                return (
+                    decision.model_copy(
+                        update={
+                            "decision": "hold",
+                            "confidence": round(max(0.24, decision.confidence), 4),
+                            "entry_mode": "none",
+                            "invalidation_price": None,
+                            "max_chase_bps": None,
+                            "idea_ttl_minutes": None,
+                            "stop_loss": None,
+                            "take_profit": None,
+                            "risk_pct": 0.001,
+                            "leverage": 1.0,
+                            "rationale_codes": rationale_codes,
+                            "explanation_short": "최근 같은 setup cluster 손실이 반복되어 신규 진입을 보류합니다.",
+                            "explanation_detailed": (
+                                f"Setup cluster {setup_cluster_state.get('cluster_key', 'unknown')} is temporarily disabled "
+                                f"because reasons={setup_cluster_state.get('disable_reason_codes', [])}. "
+                                "같은 구조의 연속 손실을 줄이기 위해 cooldown 또는 최근 지표 회복 전까지 hold를 유지합니다."
+                            ),
+                        }
+                    ),
+                    {**adjustment, "setup_cluster_state": setup_cluster_state},
+                )
             return (
                 decision.model_copy(
                     update={
                         "rationale_codes": list(dict.fromkeys(decision.rationale_codes + [provider_code])),
                     }
                 ),
-                adjustment,
+                {**adjustment, "setup_cluster_state": setup_cluster_state},
             )
 
         updated_decision = decision
@@ -387,8 +1078,57 @@ class TradingDecisionAgent:
         )
         hold_bias = float(adjustment.get("hold_bias", 0.0))
         rationale_codes = list(dict.fromkeys(decision.rationale_codes))
+        setup_disable = adjustment.get("setup_disable") if isinstance(adjustment.get("setup_disable"), dict) else {}
+        setup_disable_active = bool(setup_disable.get("active", False))
+        setup_disable_exempt = bool(set(rationale_codes) & {"PROTECTION_REQUIRED", "PROTECTION_RECOVERY", "PROTECTION_RESTORE"})
 
-        if (
+        if decision.decision in {"long", "short"} and setup_disable_active and not setup_disable_exempt:
+            rationale_codes.append(ADAPTIVE_SETUP_DISABLE_REASON_CODE)
+            updated_decision = decision.model_copy(
+                update={
+                    "decision": "hold",
+                    "confidence": round(max(0.24, adjusted_confidence), 4),
+                    "entry_mode": "none",
+                    "invalidation_price": None,
+                    "max_chase_bps": None,
+                    "idea_ttl_minutes": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "risk_pct": 0.001,
+                    "leverage": 1.0,
+                    "rationale_codes": rationale_codes,
+                    "explanation_short": "최근 실거래 성과가 약한 setup bucket 이라 진입을 보류합니다.",
+                    "explanation_detailed": (
+                        f"Adaptive setup disable matched bucket={setup_disable.get('bucket_key', 'unknown')} "
+                        f"with reasons={setup_disable.get('disable_reason_codes', [])}. "
+                        "신규 진입은 일시 비활성화하고 다음 회복 또는 cooldown 해제 전까지 hold를 유지합니다."
+                    ),
+                }
+            )
+        elif decision.decision in {"long", "short"} and bool(setup_cluster_state.get("active", False)):
+            rationale_codes.append(SETUP_CLUSTER_DISABLED_REASON_CODE)
+            updated_decision = decision.model_copy(
+                update={
+                    "decision": "hold",
+                    "confidence": round(max(0.24, adjusted_confidence), 4),
+                    "entry_mode": "none",
+                    "invalidation_price": None,
+                    "max_chase_bps": None,
+                    "idea_ttl_minutes": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "risk_pct": 0.001,
+                    "leverage": 1.0,
+                    "rationale_codes": rationale_codes,
+                    "explanation_short": "최근 같은 setup cluster 손실이 반복되어 신규 진입을 보류합니다.",
+                    "explanation_detailed": (
+                        f"Setup cluster {setup_cluster_state.get('cluster_key', 'unknown')} is temporarily disabled "
+                        f"because reasons={setup_cluster_state.get('disable_reason_codes', [])}. "
+                        "같은 구조의 연속 손실을 줄이기 위해 cooldown 또는 최근 지표 회복 전까지 hold를 유지합니다."
+                    ),
+                }
+            )
+        elif (
             decision.decision in {"long", "short"}
             and hold_bias >= 0.12
             and adjusted_confidence <= 0.46
@@ -434,6 +1174,7 @@ class TradingDecisionAgent:
                 "rationale_codes": list(dict.fromkeys(updated_decision.rationale_codes + [provider_code])),
             }
         )
+        adjustment["setup_cluster_state"] = setup_cluster_state
         return updated_decision, adjustment
 
     def _deterministic_decision_improved(
@@ -460,12 +1201,14 @@ class TradingDecisionAgent:
         trend_alignment = features.regime.trend_alignment
         weak_volume = features.regime.weak_volume
         momentum_weakening = features.regime.momentum_weakening
-        breakout_up = features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
-        breakout_down = features.breakout.broke_swing_low or features.breakout.range_breakout_direction == "down"
         bullish_pullback = features.pullback_context.state == "bullish_pullback"
         bearish_pullback = features.pullback_context.state == "bearish_pullback"
         bullish_continuation = features.pullback_context.state == "bullish_continuation"
         bearish_continuation = features.pullback_context.state == "bearish_continuation"
+        long_derivatives = self._derivatives_side_context(features, "long")
+        short_derivatives = self._derivatives_side_context(features, "short")
+        long_lead_lag = self._lead_lag_side_context(features, "long")
+        short_lead_lag = self._lead_lag_side_context(features, "short")
         countertrend = features.pullback_context.state == "countertrend"
         bearish_rejection = (
             features.candle_structure.upper_wick_ratio > max(features.candle_structure.lower_wick_ratio + 0.08, 0.28)
@@ -476,28 +1219,8 @@ class TradingDecisionAgent:
             and features.candle_structure.body_ratio < 0.55
         )
         range_like_signal = regime_name == "range"
-        strong_bullish_breakout_exception = (
-            breakout_up
-            and trend_alignment == "bullish_aligned"
-            and regime_name != "range"
-            and features.trend_score >= 0.38
-            and features.momentum_score >= 0.24
-            and not weak_volume
-            and not bearish_rejection
-            and features.regime.momentum_state in {"strengthening", "stable"}
-            and features.volume_persistence.persistence_ratio >= 1.0
-        )
-        strong_bearish_breakout_exception = (
-            breakout_down
-            and trend_alignment == "bearish_aligned"
-            and regime_name != "range"
-            and features.trend_score <= -0.38
-            and features.momentum_score <= -0.24
-            and not weak_volume
-            and not bullish_rejection
-            and features.regime.momentum_state in {"strengthening", "stable"}
-            and features.volume_persistence.persistence_ratio >= 1.0
-        )
+        strong_bullish_breakout_exception = self._breakout_exception_allowed(features, "long")
+        strong_bearish_breakout_exception = self._breakout_exception_allowed(features, "short")
         pullback_long_signal = (
             trend_alignment == "bullish_aligned"
             and regime_name != "range"
@@ -556,6 +1279,66 @@ class TradingDecisionAgent:
         )
         long_signal = pullback_long_signal or continuation_long_signal or strong_bullish_breakout_exception
         short_signal = pullback_short_signal or continuation_short_signal or strong_bearish_breakout_exception
+        long_breakout_like = strong_bullish_breakout_exception or (
+            features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
+        )
+        short_breakout_like = strong_bearish_breakout_exception or (
+            features.breakout.broke_swing_low or features.breakout.range_breakout_direction == "down"
+        )
+        long_lead_lag_blocking = bool(
+            bool(long_lead_lag.get("available"))
+            and (
+                float(long_lead_lag.get("alignment_score", 0.5)) <= 0.32
+                or (
+                    long_breakout_like
+                    and bool(long_lead_lag.get("breakout_ahead"))
+                    and not bool(long_lead_lag.get("breakout_confirmed"))
+                )
+            )
+        )
+        short_lead_lag_blocking = bool(
+            bool(short_lead_lag.get("available"))
+            and (
+                float(short_lead_lag.get("alignment_score", 0.5)) <= 0.32
+                or (
+                    short_breakout_like
+                    and bool(short_lead_lag.get("breakout_ahead"))
+                    and not bool(short_lead_lag.get("breakout_confirmed"))
+                )
+            )
+        )
+        long_derivatives_blocking = bool(
+            bool(long_derivatives.get("entry_filter_blocking"))
+            or (
+                bool(long_derivatives.get("crowding_risk"))
+                and bool(long_derivatives.get("taker_headwind"))
+            )
+            or (
+                bool(long_derivatives.get("funding_headwind"))
+                and bool(long_derivatives.get("taker_headwind"))
+            )
+            or (
+                long_breakout_like
+                and bool(long_derivatives.get("breakout_filter_blocking"))
+            )
+            or float(long_derivatives.get("alignment_score", 0.5)) <= 0.28
+        )
+        short_derivatives_blocking = bool(
+            bool(short_derivatives.get("entry_filter_blocking"))
+            or (
+                bool(short_derivatives.get("crowding_risk"))
+                and bool(short_derivatives.get("taker_headwind"))
+            )
+            or (
+                bool(short_derivatives.get("funding_headwind"))
+                and bool(short_derivatives.get("taker_headwind"))
+            )
+            or (
+                short_breakout_like
+                and bool(short_derivatives.get("breakout_filter_blocking"))
+            )
+            or float(short_derivatives.get("alignment_score", 0.5)) <= 0.28
+        )
         weakening_signal = momentum_weakening or weak_volume or range_like_signal
         operating_state = str(risk_context.get("operating_state", "TRADABLE"))
         position_management_context = (
@@ -572,6 +1355,24 @@ class TradingDecisionAgent:
         current_r_multiple = position_management_context.get("current_r_multiple")
         long_budget_available = self._entry_budget_allows(risk_context, side="long", price=price)
         short_budget_available = self._entry_budget_allows(risk_context, side="short", price=price)
+        long_add_on_context = self._add_on_candidate_context(
+            decision_side="long",
+            open_position=open_position,
+            features=features,
+            risk_context=risk_context,
+            position_management_context=position_management_context,
+            derivatives_blocking=long_derivatives_blocking,
+            lead_lag_blocking=long_lead_lag_blocking,
+        )
+        short_add_on_context = self._add_on_candidate_context(
+            decision_side="short",
+            open_position=open_position,
+            features=features,
+            risk_context=risk_context,
+            position_management_context=position_management_context,
+            derivatives_blocking=short_derivatives_blocking,
+            lead_lag_blocking=short_lead_lag_blocking,
+        )
 
         if open_position is not None and operating_state == "PROTECTION_REQUIRED":
             decision = "long" if open_position.side == "long" else "short"
@@ -621,6 +1422,114 @@ class TradingDecisionAgent:
             rationale = ["WEAKENING_SIGNAL", "PROTECT_OPEN_PNL"]
             short_explanation = "기존 포지션을 일부 축소해 리스크를 낮춥니다."
             detailed_explanation = "추세 강도와 거래량 우위가 약화돼 포지션 규모를 줄이는 편이 안전합니다."
+        elif decision == "hold" and bool(long_add_on_context.get("candidate")) and not bool(long_add_on_context.get("allowed")):
+            rationale = list(long_add_on_context.get("blocked_reason_codes") or [])
+            short_explanation = "winner-only long add-on conditions are not met yet."
+            detailed_explanation = (
+                "The existing long is not protected well enough for a same-side add-on. "
+                "The system keeps the add-on on hold until the position stays profitable and protected."
+            )
+        elif decision == "hold" and bool(short_add_on_context.get("candidate")) and not bool(short_add_on_context.get("allowed")):
+            rationale = list(short_add_on_context.get("blocked_reason_codes") or [])
+            short_explanation = "winner-only short add-on conditions are not met yet."
+            detailed_explanation = (
+                "The existing short is not protected well enough for a same-side add-on. "
+                "The system keeps the add-on on hold until the position stays profitable and protected."
+            )
+        elif decision == "hold" and long_breakout_like and bool(long_derivatives.get("breakout_filter_blocking")):
+            rationale = [
+                "DERIVATIVES_ALIGNMENT_HEADWIND",
+                "BREAKOUT_OI_SPREAD_FILTER",
+                "BREAKOUT_OI_NOT_EXPANDING",
+            ]
+            if bool(long_derivatives.get("spread_headwind")):
+                rationale.append("SPREAD_HEADWIND")
+            if bool(long_derivatives.get("top_trader_crowded")):
+                rationale.append("TOP_TRADER_LONG_CROWDED")
+            if bool(long_derivatives.get("spread_stress")):
+                rationale.append("SPREAD_STRESS")
+            short_explanation = "濡?諛⑺뼢 ?뚯깮?쒖옣 而ㅼ꽌媛 ?섑솕?섏뼱 踰뚮젅?댄겕?꾩썐 ?덈즺瑜??좎낮??蹂대쪟?⑸땲??"
+            detailed_explanation = (
+                "遺덈젅?댄겕?꾩썐 紐⑥뼇? 蹂댁씠吏留??ㅻ컮?대줈 OI ?뺤옣???뺤씤?섏? 紐삵뻽怨??ㅽ봽?덈뱶瑜??뚯븳 議곌굔?덈룄 蹂댁닔?곸엯?덈떎. "
+                "?뚯깮?쒖옣 ?뺥빀?깆씠 媛쒖꽑?섎뒗吏 ?붾㈃??吏꾩엯??蹂대쪟?⑸땲??"
+            )
+        elif decision == "hold" and long_signal and long_derivatives_blocking:
+            rationale = ["DERIVATIVES_ALIGNMENT_HEADWIND"]
+            if bool(long_derivatives.get("crowding_risk")):
+                rationale.append("CROWDED_LONG_RISK")
+            if bool(long_derivatives.get("top_trader_crowded")):
+                rationale.append("TOP_TRADER_LONG_CROWDED")
+            if bool(long_derivatives.get("taker_headwind")):
+                rationale.append("TAKER_FLOW_DIVERGENCE")
+            if bool(long_derivatives.get("funding_headwind")):
+                rationale.append("FUNDING_HEADWIND")
+            if bool(long_derivatives.get("spread_headwind")):
+                rationale.append("SPREAD_HEADWIND")
+            if bool(long_derivatives.get("spread_stress")):
+                rationale.append("SPREAD_STRESS")
+            if bool(long_derivatives.get("breakout_filter_blocking")):
+                rationale.extend(["BREAKOUT_OI_SPREAD_FILTER", "BREAKOUT_OI_NOT_EXPANDING"])
+            short_explanation = "롱 방향 차트 모양은 보이지만 파생시장 역풍이 커서 HOLD가 우선입니다."
+            detailed_explanation = (
+                "현재 롱 후보는 crowding, funding, taker flow 중 하나 이상이 역풍으로 작동하고 있습니다. "
+                "차트만 보고 진입하기보다 파생시장 정합성이 회복될 때까지 대기합니다."
+            )
+        elif decision == "hold" and short_breakout_like and bool(short_derivatives.get("breakout_filter_blocking")):
+            rationale = [
+                "DERIVATIVES_ALIGNMENT_HEADWIND",
+                "BREAKOUT_OI_SPREAD_FILTER",
+                "BREAKOUT_OI_NOT_EXPANDING",
+            ]
+            if bool(short_derivatives.get("spread_headwind")):
+                rationale.append("SPREAD_HEADWIND")
+            if bool(short_derivatives.get("top_trader_crowded")):
+                rationale.append("TOP_TRADER_SHORT_CROWDED")
+            if bool(short_derivatives.get("spread_stress")):
+                rationale.append("SPREAD_STRESS")
+            short_explanation = "??諛⑺뼢 ?뚯깮?쒖옣 而ㅼ꽌媛 ?섑솕?섏뼱 踰뚮젅?댄겕?꾩썐 ?덈즺瑜??좎낮??蹂대쪟?⑸땲??"
+            detailed_explanation = (
+                "遺덈젅?댄겕?꾩썐 紐⑥뼇? 蹂댁씠吏留??ㅻ컮?대줈 OI ?뺤옣???뺤씤?섏? 紐삵뻽怨??ㅽ봽?덈뱶瑜??뚯븳 議곌굔?덈룄 蹂댁닔?곸엯?덈떎. "
+                "?뚯깮?쒖옣 ?뺥빀?깆씠 媛쒖꽑?섎뒗吏 ?붾㈃??吏꾩엯??蹂대쪟?⑸땲??"
+            )
+        elif decision == "hold" and short_signal and short_derivatives_blocking:
+            rationale = ["DERIVATIVES_ALIGNMENT_HEADWIND"]
+            if bool(short_derivatives.get("crowding_risk")):
+                rationale.append("CROWDED_SHORT_RISK")
+            if bool(short_derivatives.get("top_trader_crowded")):
+                rationale.append("TOP_TRADER_SHORT_CROWDED")
+            if bool(short_derivatives.get("taker_headwind")):
+                rationale.append("TAKER_FLOW_DIVERGENCE")
+            if bool(short_derivatives.get("funding_headwind")):
+                rationale.append("FUNDING_HEADWIND")
+            if bool(short_derivatives.get("spread_headwind")):
+                rationale.append("SPREAD_HEADWIND")
+            if bool(short_derivatives.get("spread_stress")):
+                rationale.append("SPREAD_STRESS")
+            if bool(short_derivatives.get("breakout_filter_blocking")):
+                rationale.extend(["BREAKOUT_OI_SPREAD_FILTER", "BREAKOUT_OI_NOT_EXPANDING"])
+            short_explanation = "숏 방향 차트 모양은 보이지만 파생시장 역풍이 커서 HOLD가 우선입니다."
+            detailed_explanation = (
+                "현재 숏 후보는 crowding, funding, taker flow 중 하나 이상이 역풍으로 작동하고 있습니다. "
+                "실제 밀릴 확률이 더 높아질 때까지 신규 진입을 보류합니다."
+            )
+        elif decision == "hold" and long_signal and long_lead_lag_blocking:
+            rationale = ["LEAD_MARKET_DIVERGENCE"]
+            if bool(long_lead_lag.get("breakout_ahead")):
+                rationale.append("ALT_BREAKOUT_AHEAD_OF_LEADS")
+            short_explanation = "BTC/ETH lead structure is not confirmed yet, so the alt long stays on hold."
+            detailed_explanation = (
+                "The alt setup looks constructive on its own, but BTC/ETH are not aligned strongly enough yet. "
+                "The system keeps the long on hold until the lead market confirms the same structure."
+            )
+        elif decision == "hold" and short_signal and short_lead_lag_blocking:
+            rationale = ["LEAD_MARKET_DIVERGENCE"]
+            if bool(short_lead_lag.get("breakout_ahead")):
+                rationale.append("ALT_BREAKOUT_AHEAD_OF_LEADS")
+            short_explanation = "BTC/ETH lead structure is not confirmed yet, so the alt short stays on hold."
+            detailed_explanation = (
+                "The alt short setup is moving ahead of BTC/ETH confirmation. "
+                "The system waits until the lead market aligns before allowing the trade idea."
+            )
         elif decision == "hold" and long_signal and not long_budget_available:
             rationale = ["RISK_BUDGET_EXHAUSTED", "HOLD_ON_LONG_BUDGET_LIMIT"]
             short_explanation = "남은 롱 리스크 예산이 부족해 신규 진입보다 HOLD가 우선입니다."
@@ -663,6 +1572,83 @@ class TradingDecisionAgent:
                 "하락 추세 안에서 반등 매도 구간을 기다리는 편이 추격 숏보다 안전합니다. "
                 "현재는 1분 확인이 붙는 되돌림 진입 시나리오를 우선합니다."
             )
+
+        if decision == "long" and bool(long_add_on_context.get("candidate")):
+            rationale.extend([str(code) for code in long_add_on_context.get("allowed_reason_codes") or []])
+            short_explanation = "winner-only add-on is allowed for the protected long."
+            detailed_explanation = (
+                "The existing long is already profitable and protected, so the system allows a same-side add-on "
+                "instead of averaging down."
+            )
+        elif decision == "short" and bool(short_add_on_context.get("candidate")):
+            rationale.extend([str(code) for code in short_add_on_context.get("allowed_reason_codes") or []])
+            short_explanation = "winner-only add-on is allowed for the protected short."
+            detailed_explanation = (
+                "The existing short is already profitable and protected, so the system allows a same-side add-on "
+                "instead of averaging down."
+            )
+
+        if decision == "long" and bool(long_derivatives.get("available")):
+            derivatives_discount = float(long_derivatives.get("discount_magnitude", 0.0))
+            if bool(long_derivatives.get("crowding_risk")):
+                rationale.append("CROWDED_LONG_RISK")
+            if bool(long_derivatives.get("top_trader_crowded")):
+                rationale.append("TOP_TRADER_LONG_CROWDED")
+            if bool(long_derivatives.get("taker_headwind")):
+                rationale.append("TAKER_FLOW_DIVERGENCE")
+            if bool(long_derivatives.get("funding_headwind")):
+                rationale.append("FUNDING_HEADWIND")
+            if bool(long_derivatives.get("spread_headwind")):
+                rationale.append("SPREAD_HEADWIND")
+            if bool(long_derivatives.get("spread_stress")):
+                rationale.append("SPREAD_STRESS")
+            if derivatives_discount > 0:
+                confidence = self._clamp(confidence - derivatives_discount, 0.18, 0.96)
+                rationale.append("DERIVATIVES_CONFIDENCE_DISCOUNT")
+                short_explanation = "추세는 유효하지만 파생시장 역풍 때문에 보수적으로 롱 진입합니다."
+                detailed_explanation = (
+                    "차트 구조는 진입 조건을 만족했지만 crowding, funding, taker flow 중 일부가 역풍입니다. "
+                    "진입 자체는 유지하되 confidence와 이후 risk sizing은 더 보수적으로 둡니다."
+                )
+        if decision == "long" and bool(long_lead_lag.get("available")):
+            alignment_score = float(long_lead_lag.get("alignment_score", 0.5))
+            if alignment_score >= 0.72:
+                confidence = round(self._clamp(confidence * 1.05, 0.18, 0.99), 4)
+                rationale.append("LEAD_MARKETS_ALIGNED")
+            elif alignment_score <= 0.42:
+                confidence = round(self._clamp(confidence * 0.88, 0.18, 0.99), 4)
+                rationale.append("LEAD_MARKET_CONFIDENCE_DISCOUNT")
+        elif decision == "short" and bool(short_derivatives.get("available")):
+            derivatives_discount = float(short_derivatives.get("discount_magnitude", 0.0))
+            if bool(short_derivatives.get("crowding_risk")):
+                rationale.append("CROWDED_SHORT_RISK")
+            if bool(short_derivatives.get("top_trader_crowded")):
+                rationale.append("TOP_TRADER_SHORT_CROWDED")
+            if bool(short_derivatives.get("taker_headwind")):
+                rationale.append("TAKER_FLOW_DIVERGENCE")
+            if bool(short_derivatives.get("funding_headwind")):
+                rationale.append("FUNDING_HEADWIND")
+            if bool(short_derivatives.get("spread_headwind")):
+                rationale.append("SPREAD_HEADWIND")
+            if bool(short_derivatives.get("spread_stress")):
+                rationale.append("SPREAD_STRESS")
+            if derivatives_discount > 0:
+                confidence = self._clamp(confidence - derivatives_discount, 0.18, 0.96)
+                rationale.append("DERIVATIVES_CONFIDENCE_DISCOUNT")
+                short_explanation = "하락 구조는 유효하지만 파생시장 역풍 때문에 보수적으로 숏 진입합니다."
+                detailed_explanation = (
+                    "차트 구조는 진입 조건을 만족했지만 crowding, funding, taker flow 중 일부가 역풍입니다. "
+                    "진입 자체는 유지하되 confidence와 이후 risk sizing은 더 보수적으로 둡니다."
+                )
+
+        if decision == "short" and bool(short_lead_lag.get("available")):
+            alignment_score = float(short_lead_lag.get("alignment_score", 0.5))
+            if alignment_score >= 0.72:
+                confidence = round(self._clamp(confidence * 1.05, 0.18, 0.99), 4)
+                rationale.append("LEAD_MARKETS_ALIGNED")
+            elif alignment_score <= 0.42:
+                confidence = round(self._clamp(confidence * 0.88, 0.18, 0.99), 4)
+                rationale.append("LEAD_MARKET_CONFIDENCE_DISCOUNT")
 
         risk_pct = max(0.003, round(confidence * 0.008, 4))
         if features.regime.volatility_regime == "expanded":
@@ -713,7 +1699,7 @@ class TradingDecisionAgent:
                 max_holding_minutes=240,
                 risk_pct=float(risk_pct),
                 leverage=float(leverage),
-                rationale_codes=rationale,
+                rationale_codes=list(dict.fromkeys(rationale)),
                 explanation_short=short_explanation,
                 explanation_detailed=detailed_explanation,
             ),
@@ -927,6 +1913,19 @@ class TradingDecisionAgent:
             risk_context,
             logic_variant=logic_variant,
         )
+        strategy_engine_selection = self._build_strategy_engine_selection_payload(
+            market_snapshot=market_snapshot,
+            features=features,
+            open_positions=open_positions,
+            risk_context=risk_context,
+        )
+        baseline, baseline_holding_profile = self._apply_holding_profile_fields(
+            baseline,
+            market_snapshot=market_snapshot,
+            features=features,
+            risk_context=risk_context,
+            strategy_engine_selection=strategy_engine_selection,
+        )
         position_management_context = (
             risk_context.get("position_management_context")
             if isinstance(risk_context.get("position_management_context"), dict)
@@ -939,12 +1938,24 @@ class TradingDecisionAgent:
                     "rationale_codes": list(dict.fromkeys(baseline.rationale_codes + [provider_code])),
                 }
             )
+            decision_agreement = self._build_decision_agreement(
+                baseline,
+                decision,
+                ai_used=False,
+            )
             return (
                 decision,
                 "deterministic-mock",
                 {
                     "source": "deterministic",
                     "logic_variant": logic_variant,
+                    "decision_agreement": decision_agreement,
+                    "strategy_engine": strategy_engine_selection,
+                    "holding_profile": decision.holding_profile,
+                    "holding_profile_reason": decision.holding_profile_reason,
+                    "holding_profile_context": baseline_holding_profile,
+                    **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
+                    "setup_cluster_state": {"matched": False, "active": False},
                     "adaptive_signal_adjustment": {
                         "enabled": False,
                         "status": "disabled_for_baseline_old",
@@ -957,12 +1968,31 @@ class TradingDecisionAgent:
                 risk_context=risk_context,
                 provider_code="PROVIDER_DETERMINISTIC_MOCK",
             )
+            decision, holding_profile_context = self._apply_holding_profile_fields(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+                risk_context=risk_context,
+                strategy_engine_selection=strategy_engine_selection,
+            )
+            decision_agreement = self._build_decision_agreement(
+                baseline,
+                decision,
+                ai_used=False,
+            )
             return (
                 decision,
                 "deterministic-mock",
                 {
                     "source": "deterministic",
                     "logic_variant": logic_variant,
+                    "decision_agreement": decision_agreement,
+                    "strategy_engine": strategy_engine_selection,
+                    "holding_profile": decision.holding_profile,
+                    "holding_profile_reason": decision.holding_profile_reason,
+                    "holding_profile_context": holding_profile_context,
+                    **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
+                    "setup_cluster_state": adaptive_adjustment.get("setup_cluster_state"),
                     "adaptive_signal_adjustment": adaptive_adjustment,
                 },
             )
@@ -989,6 +2019,7 @@ class TradingDecisionAgent:
                     "latest_volume": market_snapshot.latest_volume,
                     "is_stale": market_snapshot.is_stale,
                     "is_complete": market_snapshot.is_complete,
+                    "derivatives_context": market_snapshot.derivatives_context.model_dump(mode="json"),
                     "candles": compact_candles,
                 },
                 "features": {
@@ -1006,6 +2037,7 @@ class TradingDecisionAgent:
                     "location": features.location.model_dump(mode="json"),
                     "volume_persistence": features.volume_persistence.model_dump(mode="json"),
                     "pullback_context": features.pullback_context.model_dump(mode="json"),
+                    "derivatives": features.derivatives.model_dump(mode="json"),
                     "multi_timeframe": {
                         timeframe: context.model_dump(mode="json")
                         for timeframe, context in features.multi_timeframe.items()
@@ -1030,6 +2062,8 @@ class TradingDecisionAgent:
                     "entry_zone_min": baseline.entry_zone_min,
                     "entry_zone_max": baseline.entry_zone_max,
                     "entry_mode": baseline.entry_mode,
+                    "holding_profile": baseline.holding_profile,
+                    "holding_profile_reason": baseline.holding_profile_reason,
                     "invalidation_price": baseline.invalidation_price,
                     "max_chase_bps": baseline.max_chase_bps,
                     "idea_ttl_minutes": baseline.idea_ttl_minutes,
@@ -1040,6 +2074,7 @@ class TradingDecisionAgent:
                     "rationale_codes": baseline.rationale_codes,
                     "explanation_short": baseline.explanation_short,
                 },
+                "strategy_engine_selection": strategy_engine_selection,
                 "logic_variant": logic_variant,
             }
             provider_result = self.provider.generate(
@@ -1057,13 +2092,15 @@ class TradingDecisionAgent:
                     "For new long or short ideas, treat your output as a directional idea, not direct execution authority. "
                     "Prefer pullback or rebound entries inside aligned trends over breakout chasing. "
                     "Use breakout_confirm only as a rare exception when trend, momentum, and volume are strongly aligned. "
-                    "Keep immediate new entries disabled unless the market snapshot is unusually clean and urgent. "
-                    "Set entry_mode to breakout_confirm, pullback_confirm, immediate, or none. "
+                    "Keep immediate new entries disabled inside the agent. "
+                    "Set entry_mode to breakout_confirm, pullback_confirm, or none for new ideas. "
                     "For long entries, entry_zone should usually sit below the current price as a pullback zone. "
                     "For short entries, entry_zone should usually sit above the current price as a rebound zone. "
+                    "Default holding_profile should stay scalp. "
+                    "Use swing or position only when the regime is strongly aligned across higher timeframes, breadth is not weak, and lead-lag plus derivatives context support it. "
                     "Provide a valid invalidation_price on the wrong side of the trade, plus a conservative max_chase_bps. "
                     "Use entry_mode=none for hold, reduce, or exit. "
-                    "Do not use immediate unless the current snapshot already supports immediate execution and pullback waiting is clearly worse. "
+                    "Reserve immediate only for externally triggered plan execution, not for fresh agent ideas. "
                     "Keep explanation_short brief and explanation_detailed under 3 sentences."
                 ),
             )
@@ -1077,8 +2114,27 @@ class TradingDecisionAgent:
                 risk_context=risk_context,
                 provider_code=f"PROVIDER_{provider_result.provider.upper()}",
             )
+            decision, holding_profile_context = self._apply_holding_profile_fields(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+                risk_context=risk_context,
+                strategy_engine_selection=strategy_engine_selection,
+            )
+            decision_agreement = self._build_decision_agreement(
+                baseline,
+                decision,
+                ai_used=True,
+            )
             metadata = _provider_metadata(provider_result, source="llm")
             metadata["logic_variant"] = logic_variant
+            metadata["decision_agreement"] = decision_agreement
+            metadata["strategy_engine"] = strategy_engine_selection
+            metadata["holding_profile"] = decision.holding_profile
+            metadata["holding_profile_reason"] = decision.holding_profile_reason
+            metadata["holding_profile_context"] = holding_profile_context
+            metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
+            metadata["setup_cluster_state"] = adaptive_adjustment.get("setup_cluster_state")
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
             return decision, provider_result.provider, metadata
         except Exception as exc:
@@ -1087,9 +2143,28 @@ class TradingDecisionAgent:
                 risk_context=risk_context,
                 provider_code=f"PROVIDER_{self.provider.name.upper()}",
             )
+            decision, holding_profile_context = self._apply_holding_profile_fields(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+                risk_context=risk_context,
+                strategy_engine_selection=strategy_engine_selection,
+            )
+            decision_agreement = self._build_decision_agreement(
+                baseline,
+                decision,
+                ai_used=False,
+            )
             metadata = _provider_metadata(provider_result, source="llm_fallback")
             metadata["error"] = str(exc)
             metadata["logic_variant"] = logic_variant
+            metadata["decision_agreement"] = decision_agreement
+            metadata["strategy_engine"] = strategy_engine_selection
+            metadata["holding_profile"] = decision.holding_profile
+            metadata["holding_profile_reason"] = decision.holding_profile_reason
+            metadata["holding_profile_context"] = holding_profile_context
+            metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
+            metadata["setup_cluster_state"] = adaptive_adjustment.get("setup_cluster_state")
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
             return decision, "deterministic-mock", metadata
 

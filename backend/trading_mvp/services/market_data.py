@@ -7,11 +7,24 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import MarketSnapshot
-from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload
+from trading_mvp.schemas import DerivativesContextPayload, MarketCandle, MarketSnapshotPayload
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
+LEAD_MARKET_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+
+DERIVATIVES_CONTEXT_FIELDS = (
+    "open_interest",
+    "open_interest_change_pct",
+    "funding_rate",
+    "taker_buy_sell_imbalance",
+    "perp_basis_bps",
+    "crowding_bias",
+    "top_trader_long_short_ratio",
+    "spread_bps",
+    "spread_stress_score",
+)
 
 
 def timeframe_to_minutes(timeframe: str) -> int:
@@ -59,12 +72,113 @@ def generate_seed_candles(symbol: str, timeframe: str, points: int = 160) -> lis
     return candles
 
 
+def _seed_derivatives_context() -> DerivativesContextPayload:
+    return DerivativesContextPayload(source="seed_fallback", fallback_used=True, fetch_failed=False)
+
+
+def _compute_spread_stress_score(
+    *,
+    spread_bps: object,
+    top_bid_size: object,
+    top_ask_size: object,
+) -> float | None:
+    try:
+        normalized_spread_bps = float(spread_bps)
+    except (TypeError, ValueError):
+        return None
+    if normalized_spread_bps < 0:
+        return None
+    stress_score = normalized_spread_bps / 4.0
+    try:
+        bid_size = float(top_bid_size) if top_bid_size not in {None, ""} else None
+        ask_size = float(top_ask_size) if top_ask_size not in {None, ""} else None
+    except (TypeError, ValueError):
+        bid_size = None
+        ask_size = None
+    if bid_size is not None and ask_size is not None and bid_size > 0 and ask_size > 0:
+        smaller = min(bid_size, ask_size)
+        larger = max(bid_size, ask_size)
+        imbalance = (larger - smaller) / larger if larger > 0 else 0.0
+        stress_score *= 1.0 + min(imbalance, 1.0) * 0.25
+        if smaller / larger <= 0.35:
+            stress_score += 0.35
+    return round(max(stress_score, 0.0), 4)
+
+
+def _build_derivatives_context(client: BinanceClient, symbol: str) -> DerivativesContextPayload:
+    payload: dict[str, object] = {
+        "source": "binance_public",
+        "fallback_used": False,
+        "fetch_failed": False,
+        "open_interest": None,
+        "open_interest_change_pct": None,
+        "funding_rate": None,
+        "taker_buy_sell_imbalance": None,
+        "perp_basis_bps": None,
+        "crowding_bias": None,
+        "top_trader_long_short_ratio": None,
+        "best_bid": None,
+        "best_ask": None,
+        "spread_bps": None,
+        "spread_stress_score": None,
+    }
+    fetch_failed = False
+    try:
+        payload["open_interest"] = client.get_open_interest(symbol)
+    except Exception:
+        fetch_failed = True
+    try:
+        payload["open_interest_change_pct"] = client.get_open_interest_change_pct(symbol, period="5m")
+    except Exception:
+        fetch_failed = True
+    try:
+        premium = client.get_premium_index(symbol)
+        payload["funding_rate"] = premium.get("funding_rate")
+        payload["perp_basis_bps"] = premium.get("perp_basis_bps")
+    except Exception:
+        fetch_failed = True
+    try:
+        payload["taker_buy_sell_imbalance"] = client.get_taker_buy_sell_imbalance(symbol, period="5m")
+    except Exception:
+        fetch_failed = True
+    try:
+        payload["crowding_bias"] = client.get_crowding_bias(symbol, period="5m")
+    except Exception:
+        fetch_failed = True
+    try:
+        payload["top_trader_long_short_ratio"] = client.get_top_trader_long_short_ratio(symbol, period="5m")
+    except Exception:
+        fetch_failed = True
+    try:
+        best_bid_ask = client.get_best_bid_ask(symbol, limit=5)
+        payload["best_bid"] = best_bid_ask.get("best_bid")
+        payload["best_ask"] = best_bid_ask.get("best_ask")
+        payload["spread_bps"] = best_bid_ask.get("spread_bps")
+        payload["spread_stress_score"] = _compute_spread_stress_score(
+            spread_bps=best_bid_ask.get("spread_bps"),
+            top_bid_size=best_bid_ask.get("top_bid_size"),
+            top_ask_size=best_bid_ask.get("top_ask_size"),
+        )
+    except Exception:
+        fetch_failed = True
+    payload["fetch_failed"] = fetch_failed
+    if not any(payload[field] is not None for field in DERIVATIVES_CONTEXT_FIELDS):
+        return DerivativesContextPayload(
+            source="unavailable",
+            fallback_used=True,
+            fetch_failed=fetch_failed,
+        )
+    return DerivativesContextPayload(**payload)
+
+
 def _build_seed_snapshot(
     symbol: str,
     timeframe: str,
     lookback: int,
     upto_index: int | None,
     force_stale: bool,
+    *,
+    derivatives_context: DerivativesContextPayload | None = None,
 ) -> MarketSnapshotPayload:
     series = generate_seed_candles(symbol=symbol, timeframe=timeframe)
     if upto_index is None:
@@ -91,6 +205,7 @@ def _build_seed_snapshot(
         is_stale=force_stale,
         is_complete=len(candles) >= min(lookback, 20),
         candles=candles,
+        derivatives_context=derivatives_context or _seed_derivatives_context(),
     )
 
 
@@ -101,12 +216,14 @@ def _build_binance_snapshot(
     *,
     testnet_enabled: bool,
     stale_threshold_seconds: int,
+    derivatives_context: DerivativesContextPayload | None = None,
 ) -> MarketSnapshotPayload:
     client = BinanceClient(testnet_enabled=testnet_enabled, futures_enabled=True)
     candles = client.fetch_klines(symbol=symbol, interval=timeframe, limit=lookback)
     latest = candles[-1]
     snapshot_time = utcnow_naive()
     staleness_seconds = (snapshot_time - latest.timestamp).total_seconds()
+    snapshot_derivatives = derivatives_context or _build_derivatives_context(client, symbol)
     return MarketSnapshotPayload(
         symbol=symbol,
         timeframe=timeframe,
@@ -117,6 +234,7 @@ def _build_binance_snapshot(
         is_stale=staleness_seconds > stale_threshold_seconds,
         is_complete=len(candles) >= min(lookback, 20),
         candles=candles,
+        derivatives_context=snapshot_derivatives,
     )
 
 
@@ -130,9 +248,17 @@ def build_market_snapshot(
     use_binance: bool = False,
     binance_testnet_enabled: bool = False,
     stale_threshold_seconds: int = 1800,
+    derivatives_context_override: DerivativesContextPayload | None = None,
 ) -> MarketSnapshotPayload:
     if upto_index is not None or force_stale:
-        return _build_seed_snapshot(symbol, timeframe, lookback, upto_index, force_stale)
+        return _build_seed_snapshot(
+            symbol,
+            timeframe,
+            lookback,
+            upto_index,
+            force_stale,
+            derivatives_context=derivatives_context_override,
+        )
 
     if not use_binance:
         raise RuntimeError("실거래 모드에서는 Binance 실데이터가 꺼져 있으면 시장 스냅샷을 만들 수 없습니다.")
@@ -143,6 +269,7 @@ def build_market_snapshot(
         lookback=lookback,
         testnet_enabled=binance_testnet_enabled,
         stale_threshold_seconds=stale_threshold_seconds,
+        derivatives_context=derivatives_context_override,
     )
 
 
@@ -160,6 +287,14 @@ def build_market_context(
 ) -> dict[str, MarketSnapshotPayload]:
     timeframes = [base_timeframe, *[item for item in context_timeframes if item != base_timeframe]]
     snapshots: dict[str, MarketSnapshotPayload] = {}
+    derivatives_context: DerivativesContextPayload | None = None
+    if upto_index is not None or force_stale:
+        derivatives_context = _seed_derivatives_context()
+    elif use_binance:
+        derivatives_context = _build_derivatives_context(
+            BinanceClient(testnet_enabled=binance_testnet_enabled, futures_enabled=True),
+            symbol,
+        )
     for timeframe in timeframes:
         snapshots[timeframe] = build_market_snapshot(
             symbol=symbol,
@@ -170,8 +305,43 @@ def build_market_context(
             use_binance=use_binance,
             binance_testnet_enabled=binance_testnet_enabled,
             stale_threshold_seconds=stale_threshold_seconds,
+            derivatives_context_override=derivatives_context,
         )
     return snapshots
+
+
+def build_lead_market_contexts(
+    base_timeframe: str,
+    *,
+    lead_symbols: tuple[str, ...] = LEAD_MARKET_SYMBOLS,
+    context_timeframes: tuple[str, ...] = DEFAULT_CONTEXT_TIMEFRAMES,
+    lookback: int = 60,
+    upto_index: int | None = None,
+    force_stale: bool = False,
+    use_binance: bool = False,
+    binance_testnet_enabled: bool = False,
+    stale_threshold_seconds: int = 1800,
+) -> dict[str, dict[str, MarketSnapshotPayload]]:
+    contexts: dict[str, dict[str, MarketSnapshotPayload]] = {}
+    for symbol in lead_symbols:
+        symbol_key = str(symbol or "").upper()
+        if not symbol_key:
+            continue
+        try:
+            contexts[symbol_key] = build_market_context(
+                symbol=symbol_key,
+                base_timeframe=base_timeframe,
+                context_timeframes=context_timeframes,
+                lookback=lookback,
+                upto_index=upto_index,
+                force_stale=force_stale,
+                use_binance=use_binance,
+                binance_testnet_enabled=binance_testnet_enabled,
+                stale_threshold_seconds=stale_threshold_seconds,
+            )
+        except RuntimeError:
+            continue
+    return contexts
 
 
 def persist_market_snapshot(session: Session, snapshot: MarketSnapshotPayload) -> MarketSnapshot:

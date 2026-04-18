@@ -198,6 +198,148 @@ class BinanceClient:
             )
         return candles
 
+    @staticmethod
+    def _as_numeric(value: object) -> float | None:
+        try:
+            if value in {None, ""}:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _ratio_to_bias(ratio: float | None) -> float | None:
+        if ratio is None or ratio <= 0:
+            return None
+        return max(-1.0, min(1.0, (ratio - 1.0) / (ratio + 1.0)))
+
+    def get_open_interest(self, symbol: str) -> float | None:
+        payload = self._request("GET", "/fapi/v1/openInterest", params={"symbol": symbol.upper()})
+        result = self._as_dict(payload, "Unexpected Binance open interest response.")
+        return self._as_numeric(result.get("openInterest"))
+
+    def get_open_interest_change_pct(self, symbol: str, *, period: str = "5m", limit: int = 2) -> float | None:
+        payload = self._request(
+            "GET",
+            "/futures/data/openInterestHist",
+            params={"symbol": symbol.upper(), "period": period, "limit": max(limit, 2)},
+        )
+        if not isinstance(payload, list) or len(payload) < 2:
+            return None
+        latest = payload[-1] if isinstance(payload[-1], Mapping) else None
+        previous = payload[-2] if isinstance(payload[-2], Mapping) else None
+        if latest is None or previous is None:
+            return None
+        latest_value = self._as_numeric(latest.get("sumOpenInterest") or latest.get("openInterest"))
+        previous_value = self._as_numeric(previous.get("sumOpenInterest") or previous.get("openInterest"))
+        if latest_value is None or previous_value is None or previous_value <= 0:
+            return None
+        return ((latest_value - previous_value) / previous_value) * 100.0
+
+    def get_premium_index(self, symbol: str) -> dict[str, float | None]:
+        payload = self._request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol.upper()})
+        result = self._as_dict(payload, "Unexpected Binance premium index response.")
+        mark_price = self._as_numeric(result.get("markPrice"))
+        index_price = self._as_numeric(result.get("indexPrice"))
+        funding_rate = self._as_numeric(result.get("lastFundingRate"))
+        perp_basis_bps = None
+        if mark_price is not None and index_price is not None and index_price > 0:
+            perp_basis_bps = ((mark_price - index_price) / index_price) * 10000.0
+        return {
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "funding_rate": funding_rate,
+            "perp_basis_bps": perp_basis_bps,
+        }
+
+    def get_taker_buy_sell_imbalance(self, symbol: str, *, period: str = "5m", limit: int = 1) -> float | None:
+        payload = self._request(
+            "GET",
+            "/futures/data/takerlongshortRatio",
+            params={"symbol": symbol.upper(), "period": period, "limit": max(limit, 1)},
+        )
+        if not isinstance(payload, list) or not payload:
+            return None
+        latest = payload[-1]
+        if not isinstance(latest, Mapping):
+            return None
+        ratio = self._as_numeric(latest.get("buySellRatio"))
+        return self._ratio_to_bias(ratio)
+
+    def get_crowding_bias(self, symbol: str, *, period: str = "5m", limit: int = 1) -> float | None:
+        payload = self._request(
+            "GET",
+            "/futures/data/globalLongShortAccountRatio",
+            params={"symbol": symbol.upper(), "period": period, "limit": max(limit, 1)},
+        )
+        if not isinstance(payload, list) or not payload:
+            return None
+        latest = payload[-1]
+        if not isinstance(latest, Mapping):
+            return None
+        ratio = self._as_numeric(latest.get("longShortRatio"))
+        return self._ratio_to_bias(ratio)
+
+    def get_top_trader_long_short_ratio(self, symbol: str, *, period: str = "5m", limit: int = 1) -> float | None:
+        payload = self._request(
+            "GET",
+            "/futures/data/topLongShortPositionRatio",
+            params={"symbol": symbol.upper(), "period": period, "limit": max(limit, 1)},
+        )
+        if not isinstance(payload, list) or not payload:
+            return None
+        latest = payload[-1]
+        if not isinstance(latest, Mapping):
+            return None
+        return self._as_numeric(latest.get("longShortRatio"))
+
+    def get_derivatives_public_context(self, symbol: str, *, period: str = "5m") -> dict[str, float | None]:
+        premium = self.get_premium_index(symbol)
+        return {
+            "open_interest": self.get_open_interest(symbol),
+            "open_interest_change_pct": self.get_open_interest_change_pct(symbol, period=period),
+            "funding_rate": premium.get("funding_rate"),
+            "perp_basis_bps": premium.get("perp_basis_bps"),
+            "taker_buy_sell_imbalance": self.get_taker_buy_sell_imbalance(symbol, period=period),
+            "crowding_bias": self.get_crowding_bias(symbol, period=period),
+            "top_trader_long_short_ratio": self.get_top_trader_long_short_ratio(symbol, period=period),
+        }
+
+    def get_order_book(self, symbol: str, *, limit: int = 5) -> dict[str, object]:
+        payload = self._request(
+            "GET",
+            "/fapi/v1/depth",
+            params={"symbol": symbol.upper(), "limit": max(5, min(int(limit), 20))},
+        )
+        return self._as_dict(payload, "Unexpected Binance order book response.")
+
+    def get_best_bid_ask(self, symbol: str, *, limit: int = 5) -> dict[str, float | None]:
+        payload = self.get_order_book(symbol, limit=limit)
+        bids = payload.get("bids")
+        asks = payload.get("asks")
+        best_bid = None
+        best_ask = None
+        top_bid_size = None
+        top_ask_size = None
+        if isinstance(bids, list) and bids and isinstance(bids[0], list) and len(bids[0]) >= 2:
+            best_bid = self._as_numeric(bids[0][0])
+            top_bid_size = self._as_numeric(bids[0][1])
+        if isinstance(asks, list) and asks and isinstance(asks[0], list) and len(asks[0]) >= 2:
+            best_ask = self._as_numeric(asks[0][0])
+            top_ask_size = self._as_numeric(asks[0][1])
+        spread_bps = None
+        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
+            mid_price = (best_bid + best_ask) / 2.0
+            if mid_price > 0:
+                spread_bps = ((best_ask - best_bid) / mid_price) * 10_000.0
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "top_bid_size": top_bid_size,
+            "top_ask_size": top_ask_size,
+            "spread_bps": spread_bps,
+        }
+
     def get_account_info(self) -> dict[str, object]:
         payload = self._request("GET", "/fapi/v3/account", signed=True)
         return self._as_dict(payload, "Unexpected Binance account response.")

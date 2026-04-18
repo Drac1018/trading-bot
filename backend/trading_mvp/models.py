@@ -285,6 +285,38 @@ class AccountLedgerEntry(TimestampMixin, Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class SkippedTradeEvent(TimestampMixin, Base):
+    __tablename__ = "skipped_trade_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    timeframe: Mapped[str] = mapped_column(String(20), index=True)
+    scenario: Mapped[str] = mapped_column(String(40), default="unspecified", index=True)
+    regime: Mapped[str] = mapped_column(String(40), default="unknown", index=True)
+    trend_alignment: Mapped[str] = mapped_column(String(40), default="unknown", index=True)
+    entry_mode: Mapped[str] = mapped_column(String(30), default="none", index=True)
+    skip_reason: Mapped[str] = mapped_column(String(80), index=True)
+    skip_source: Mapped[str] = mapped_column(String(30), default="decision", index=True)
+    market_snapshot_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    decision_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    risk_check_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    expected_side: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    rejected_side: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    reference_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    horizon_minutes: Mapped[int] = mapped_column(Integer, default=90)
+    status: Mapped[str] = mapped_column(String(30), default="pending_evaluation", index=True)
+    skipped_trade_followup_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    would_have_hit_tp: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    would_have_hit_sl: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    would_have_reached_0_5r: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    skip_quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    skip_quality_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class Alert(TimestampMixin, Base):
     __tablename__ = "alerts"
 

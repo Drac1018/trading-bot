@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -21,7 +21,7 @@ from trading_mvp.schemas import (
     OpenAIConnectionTestRequest,
 )
 from trading_mvp.services.connectivity import check_binance_connection, check_openai_connection
-from trading_mvp.services.runtime_state import mark_sync_success
+from trading_mvp.services.runtime_state import mark_sync_success, set_drawdown_state_detail
 from trading_mvp.services.settings import (
     get_or_create_settings,
     serialize_settings,
@@ -160,6 +160,37 @@ def test_serialize_settings_exposes_rollout_mode_and_submit_gate(db_session) -> 
     assert serialized["operational_status"]["rollout_mode"] == "shadow"
     assert serialized["operational_status"]["exchange_submit_allowed"] is False
     assert serialized["operational_status"]["control_status_summary"]["rollout_mode"] == "shadow"
+
+
+def test_serialize_settings_exposes_drawdown_operating_layer(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    set_drawdown_state_detail(
+        row,
+        {
+            "current_drawdown_state": "caution",
+            "entered_at": utcnow_naive().isoformat(),
+            "transition_reason": "consecutive_losses_warning",
+            "policy_adjustments": {
+                "risk_pct_multiplier": 0.75,
+                "leverage_multiplier": 0.85,
+                "notional_multiplier": 0.8,
+                "max_non_priority_selected": 2,
+                "entry_capacity_multiplier": 0.75,
+                "winner_only_pyramiding": True,
+                "breakout_exception_allowed": False,
+            },
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+
+    assert serialized["operational_status"]["current_drawdown_state"] == "caution"
+    assert serialized["operational_status"]["drawdown_transition_reason"] == "consecutive_losses_warning"
+    assert serialized["operational_status"]["drawdown_policy_adjustments"]["risk_pct_multiplier"] == 0.75
+    assert serialized["operational_status"]["control_status_summary"]["current_drawdown_state"] == "caution"
+    assert serialized["operational_status"]["control_status_summary"]["drawdown_policy_adjustments"]["breakout_exception_allowed"] is False
 
 
 def test_should_call_openai_respects_manual_and_replay(db_session) -> None:

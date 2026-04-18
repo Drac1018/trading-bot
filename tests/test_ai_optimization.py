@@ -137,6 +137,7 @@ def test_trading_decision_payload_is_compacted_for_llm_calls() -> None:
     assert decision.decision == "hold"
     assert len(payload["market_snapshot"]["candles"]) == 16
     assert set(payload["market_snapshot"]["candles"][0].keys()) == {"t", "o", "h", "l", "c", "v"}
+    assert "derivatives_context" in payload["market_snapshot"]
     assert "explanation_detailed" not in payload["deterministic_baseline"]
     assert set(payload["features"].keys()) == {
         "trend_score",
@@ -153,6 +154,7 @@ def test_trading_decision_payload_is_compacted_for_llm_calls() -> None:
         "location",
         "volume_persistence",
         "pullback_context",
+        "derivatives",
         "multi_timeframe",
         "data_quality_flags",
     }
@@ -160,6 +162,7 @@ def test_trading_decision_payload_is_compacted_for_llm_calls() -> None:
     assert "vwap_distance_pct" in payload["features"]["location"]
     assert "persistence_ratio" in payload["features"]["volume_persistence"]
     assert "state" in payload["features"]["pullback_context"]
+    assert "taker_flow_alignment" in payload["features"]["derivatives"]
     assert payload["risk_context"]["risk_budget"] == {
         "max_additional_long_notional": 1250.0,
         "max_additional_short_notional": 980.0,

@@ -54,6 +54,7 @@ from trading_mvp.services.execution_policy import (
     select_execution_plan,
     should_fallback_aggressively,
 )
+from trading_mvp.services.holding_profile import deterministic_stop_management_payload
 from trading_mvp.services.pause_control import (
     clear_symbol_protection_state,
     mark_manage_only_state,
@@ -63,6 +64,7 @@ from trading_mvp.services.position_management import (
     PARTIAL_TAKE_PROFIT_FRACTION,
     build_position_management_context,
     mark_partial_take_profit_taken,
+    record_add_on_metadata,
     mark_time_stop_action,
     seed_position_management_metadata,
     store_position_management_context,
@@ -81,8 +83,10 @@ from trading_mvp.services.runtime_state import (
     get_reconciliation_detail,
     get_user_stream_detail,
     get_execution_dedupe_record,
+    get_unresolved_submission_guard,
     get_operating_state,
     get_protection_recovery_detail,
+    list_unresolved_submission_guards,
     mark_execution_lock,
     mark_sync_issue,
     mark_sync_success,
@@ -143,6 +147,14 @@ def _entry_price(decision: TradeDecision, market_snapshot: MarketSnapshotPayload
     if decision.entry_zone_min is not None and decision.entry_zone_max is not None:
         return (decision.entry_zone_min + decision.entry_zone_max) / 2
     return market_snapshot.latest_price
+
+
+def _holding_profile_execution_payload(decision: TradeDecision) -> dict[str, object]:
+    return {
+        "holding_profile": decision.holding_profile,
+        "holding_profile_reason": decision.holding_profile_reason,
+        **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
+    }
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -1329,13 +1341,24 @@ def _build_position_management_trade_decision(
     if not reason_codes:
         return None
 
-    if "POSITION_MANAGEMENT_TIME_STOP_EXIT" in reason_codes:
+    if "POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT" in reason_codes:
+        decision_type = "exit"
+        explanation_short = "mfe rollback exit"
+        explanation_detailed = (
+            "Position management exited because the trade gave back too much of its maximum favorable excursion."
+        )
+    elif "POSITION_MANAGEMENT_TIME_STOP_EXIT" in reason_codes:
         decision_type = "exit"
         explanation_short = "time stop exit"
         explanation_detailed = "Time stop triggered a deterministic exit because the trade failed to show acceptable progress."
     else:
         decision_type = "reduce"
-        if "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in reason_codes:
+        if "POSITION_MANAGEMENT_MFE_ROLLBACK_REDUCE" in reason_codes:
+            explanation_short = "mfe rollback reduce"
+            explanation_detailed = (
+                "Position management reduced size because the runner gave back too much of its maximum favorable excursion."
+            )
+        elif "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in reason_codes:
             explanation_short = "partial take profit"
             explanation_detailed = (
                 "Partial take profit triggered after the configured R threshold and keeps the position in reduce-only mode."
@@ -2156,6 +2179,24 @@ def apply_position_management(
                     "break_even_trigger_r": context.get("break_even_trigger_r"),
                 },
             )
+        if "POSITION_MANAGEMENT_MFE_ROLLBACK" in set(_get_string_list(context, "applied_rule_candidates")):
+            record_position_management_event(
+                session,
+                event_type="position_management_mfe_rollback_tighten",
+                position_id=position.id,
+                severity="info",
+                message="Position management tightened protection after an MFE rollback trigger.",
+                payload={
+                    "symbol": symbol,
+                    "decision_run_id": decision_run_id,
+                    "tightened_stop_loss": applied["tightened_stop_loss"],
+                    "mfe_r": context.get("mfe_r"),
+                    "mae_r": context.get("mae_r"),
+                    "mfe_rollback_pct": context.get("mfe_rollback_pct"),
+                    "mfe_protection_action": context.get("mfe_protection_action"),
+                    "management_stage": context.get("management_stage"),
+                },
+            )
         refreshed_open_orders = client.get_open_orders(symbol)
         protection_result = _ensure_protected_position(
             session,
@@ -2282,6 +2323,40 @@ def apply_position_management(
         mark_time_stop_action(position, action="reduce")
         session.add(position)
         session.flush()
+    elif fill_quantity > 0 and "POSITION_MANAGEMENT_MFE_ROLLBACK_REDUCE" in set(management_decision.rationale_codes):
+        record_position_management_event(
+            session,
+            event_type="position_management_mfe_rollback_reduce",
+            position_id=position.id,
+            severity="info",
+            message="Position management reduced the runner after a large MFE rollback.",
+            payload={
+                "symbol": symbol,
+                "order_id": execution_result.get("order_id"),
+                "mfe_r": context.get("mfe_r"),
+                "mae_r": context.get("mae_r"),
+                "mfe_rollback_pct": context.get("mfe_rollback_pct"),
+                "mfe_protection_action": context.get("mfe_protection_action"),
+                "management_stage": context.get("management_stage"),
+            },
+        )
+    elif fill_quantity > 0 and "POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT" in set(management_decision.rationale_codes):
+        record_position_management_event(
+            session,
+            event_type="position_management_mfe_rollback_exit",
+            position_id=position.id,
+            severity="info",
+            message="Position management exited after a severe MFE rollback.",
+            payload={
+                "symbol": symbol,
+                "order_id": execution_result.get("order_id"),
+                "mfe_r": context.get("mfe_r"),
+                "mae_r": context.get("mae_r"),
+                "mfe_rollback_pct": context.get("mfe_rollback_pct"),
+                "mfe_protection_action": context.get("mfe_protection_action"),
+                "management_stage": context.get("management_stage"),
+            },
+        )
 
     return {
         "status": "executed",
@@ -2344,6 +2419,8 @@ def build_execution_intent(
         mode="live",
         reduce_only=decision.decision in {"reduce", "exit"},
         close_only=decision.decision == "exit",
+        holding_profile=decision.holding_profile,
+        holding_profile_reason=decision.holding_profile_reason,
     )
 
 
@@ -5640,6 +5717,12 @@ def _execute_live_trade_body(
         decision_id=decision_run_id,
         risk_id=risk_row.id if risk_row is not None else None,
     )
+    meta_gate_payload = (
+        dict(risk_result.debug_payload.get("meta_gate"))
+        if isinstance(risk_result.debug_payload, dict) and isinstance(risk_result.debug_payload.get("meta_gate"), dict)
+        else {}
+    )
+    holding_profile_payload = _holding_profile_execution_payload(decision)
     if not risk_result.allowed:
         record_audit_event(
             session,
@@ -5654,6 +5737,8 @@ def _execute_live_trade_body(
                 "reason_codes": list(risk_result.reason_codes),
                 "risk_check_id": risk_row.id if risk_row is not None else None,
                 "risk_debug_payload": dict(risk_result.debug_payload),
+                "meta_gate": meta_gate_payload,
+                **holding_profile_payload,
             },
             correlation_ids=execution_correlation_ids,
         )
@@ -5662,6 +5747,8 @@ def _execute_live_trade_body(
             "status": "blocked",
             "reason_codes": list(risk_result.reason_codes),
             "decision": decision.decision,
+            "meta_gate": meta_gate_payload,
+            **holding_profile_payload,
         }
 
     rollout_mode = get_rollout_mode(settings_row)
@@ -5671,7 +5758,12 @@ def _execute_live_trade_body(
     )
 
     if decision.decision == "hold":
-        return {"status": "skipped", "reason_codes": ["HOLD_DECISION"], "rollout_mode": rollout_mode}
+        return {
+            "status": "skipped",
+            "reason_codes": ["HOLD_DECISION"],
+            "rollout_mode": rollout_mode,
+            **holding_profile_payload,
+        }
 
     entry_action = _entry_action_for_decision(decision)
     if entry_action is not None:
@@ -5734,6 +5826,7 @@ def _execute_live_trade_body(
                     "reason_code": PROTECTION_VERIFY_FAILED_REASON_CODE,
                     "protection_verify_block": protection_verify_block,
                     "rollout_mode": rollout_mode,
+                    **holding_profile_payload,
                 },
                 correlation_ids=execution_correlation_ids,
             )
@@ -5744,6 +5837,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "protection_verify_block": protection_verify_block,
                 "rollout_mode": rollout_mode,
+                **holding_profile_payload,
             }
         execution_plan = select_execution_plan(
             intent,
@@ -5767,6 +5861,7 @@ def _execute_live_trade_body(
                 "execution_policy": execution_plan.to_payload(),
                 "rollout_mode": rollout_mode,
                 "exchange_submit_allowed": exchange_submit_allowed,
+                **holding_profile_payload,
             },
             correlation_ids=execution_correlation_ids,
         )
@@ -5786,6 +5881,7 @@ def _execute_live_trade_body(
                 "requested_price": intent.requested_price,
                 "execution_policy": execution_plan.to_payload(),
                 "rollout_mode": rollout_mode,
+                **holding_profile_payload,
             },
             correlation_ids=execution_correlation_ids,
         )
@@ -5801,6 +5897,7 @@ def _execute_live_trade_body(
             "execution_policy": execution_plan.to_payload(),
             "submit_blocked": True,
             "_cache_dedupe": False,
+            **holding_profile_payload,
         }
 
     client = _build_client(settings_row)
@@ -6054,6 +6151,7 @@ def _execute_live_trade_body(
                 "approved_quantity": risk_result.approved_quantity,
                 "risk_check_id": risk_row.id if risk_row is not None else None,
                 "risk_debug_payload": dict(risk_result.debug_payload),
+                "meta_gate": meta_gate_payload,
                 "exchange_filter_detail": exc.detail,
             },
             correlation_ids=execution_correlation_ids,
@@ -6065,6 +6163,7 @@ def _execute_live_trade_body(
             "decision": decision.decision,
             "intent_type": intent_type,
             "exchange_filter_detail": exc.detail,
+            "meta_gate": meta_gate_payload,
         }
     normalized_quantity = _to_float(preflight_request.get("quantity"), requested_quantity)
     execution_plan = select_execution_plan(
@@ -6098,6 +6197,7 @@ def _execute_live_trade_body(
                 "limited_live_max_notional": limited_live_max_notional,
                 "rollout_notional_cap_applied": rollout_notional_cap_applied,
                 "approved_notional_cap": approved_notional_cap,
+                "meta_gate": meta_gate_payload,
             },
             correlation_ids=execution_correlation_ids,
         )
@@ -6120,6 +6220,7 @@ def _execute_live_trade_body(
                 "execution_policy": execution_plan.to_payload(),
                 "preflight_request": dict(preflight_request),
                 "rollout_mode": rollout_mode,
+                **holding_profile_payload,
             },
             correlation_ids=execution_correlation_ids,
         )
@@ -6137,6 +6238,7 @@ def _execute_live_trade_body(
             "preflight_request": dict(preflight_request),
             "submit_blocked": True,
             "_cache_dedupe": False,
+            **holding_profile_payload,
         }
     try:
         client.change_initial_leverage(decision.symbol, max(1, int(round(intent.leverage))))
@@ -6499,7 +6601,26 @@ def _execute_live_trade_body(
                 stop_loss=intent.stop_loss or position.stop_loss,
                 take_profit=intent.take_profit or position.take_profit,
                 reset_partial_take_profit=True,
+                holding_profile=decision.holding_profile,
+                holding_profile_reason=decision.holding_profile_reason,
+                initial_stop_type=str(holding_profile_payload.get("initial_stop_type") or "deterministic_hard_stop"),
+                ai_stop_management_allowed=bool(holding_profile_payload.get("ai_stop_management_allowed", True)),
+                hard_stop_active=bool(holding_profile_payload.get("hard_stop_active", True)),
             )
+            if intent_type == "scale_in":
+                add_on_debug = (
+                    risk_result.debug_payload.get("add_on")
+                    if isinstance(risk_result.debug_payload, dict) and isinstance(risk_result.debug_payload.get("add_on"), dict)
+                    else {}
+                )
+                position_management_payload = record_add_on_metadata(
+                    position,
+                    add_on_r_multiple=_to_float(add_on_debug.get("current_r_multiple")) if add_on_debug else None,
+                    add_on_reason=str(add_on_debug.get("add_on_reason") or "winner_only_add_on") if add_on_debug else "winner_only_add_on",
+                    risk_multiplier=_to_float(add_on_debug.get("risk_pct_multiplier")) if add_on_debug else None,
+                    leverage_multiplier=_to_float(add_on_debug.get("leverage_multiplier")) if add_on_debug else None,
+                    notional_multiplier=_to_float(add_on_debug.get("notional_multiplier")) if add_on_debug else None,
+                )
         elif decision.decision in {"reduce", "exit"}:
             position_management_payload = (
                 position.metadata_json.get("position_management")
@@ -6560,6 +6681,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "execution_attempts": execution_result["attempts"],
                 "execution_quality": execution_quality,
+                **holding_profile_payload,
                 "position_management": {
                     "reduce_fraction": reduce_fraction,
                     "rationale_codes": decision.rationale_codes,
@@ -6651,6 +6773,8 @@ def _execute_live_trade_body(
             "execution_policy": execution_plan.to_payload(),
             "execution_attempts": execution_result["attempts"],
             "execution_quality": execution_quality,
+            "meta_gate": meta_gate_payload,
+            **holding_profile_payload,
             "position_management": {
                 "reduce_fraction": reduce_fraction,
                 "rationale_codes": decision.rationale_codes,
@@ -6661,12 +6785,18 @@ def _execute_live_trade_body(
     )
     order.metadata_json = {
         **(order.metadata_json or {}),
+        **holding_profile_payload,
         "protection_lifecycle": final_protection_lifecycle,
         "position_management": {
             "reduce_fraction": reduce_fraction,
             "rationale_codes": decision.rationale_codes,
             "metadata": position_management_payload,
         },
+        "holding_profile": decision.holding_profile,
+        "holding_profile_reason": decision.holding_profile_reason,
+        "initial_stop_type": holding_profile_payload.get("initial_stop_type"),
+        "ai_stop_management_allowed": holding_profile_payload.get("ai_stop_management_allowed"),
+        "hard_stop_active": holding_profile_payload.get("hard_stop_active"),
     }
     session.add(order)
     session.flush()
@@ -6691,11 +6821,11 @@ def _execute_live_trade_body(
         "execution_policy": execution_plan.to_payload(),
         "execution_attempts": execution_result["attempts"],
         "execution_quality": execution_quality,
+        "meta_gate": meta_gate_payload,
+        **holding_profile_payload,
         "position_management": {
             "reduce_fraction": reduce_fraction,
             "rationale_codes": decision.rationale_codes,
             "metadata": position_management_payload,
         },
     }
-    get_unresolved_submission_guard,
-    list_unresolved_submission_guards,

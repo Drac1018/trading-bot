@@ -1,5 +1,19 @@
 # Architecture
 
+## Holding Profile Split
+
+- `agents.py`는 거래 의도와 `holding_profile` (`scalp | swing | position`)만 생성합니다.
+- `orchestrator.py`는 holding profile, rationale, cadence hint를 candidate / decision / pending entry plan / risk context로 전달합니다.
+- `risk.py`는 holding profile별 hard/soft gate를 적용하는 최종 허용/차단 관문으로 유지됩니다.
+- `execution.py`는 승인된 intent만 실행하고, deterministic hard stop + exchange-resident protective stop metadata를 position management seed에 넘깁니다.
+- `position_management.py`는 holding profile별 관리 강도만 다르게 적용하며, stop widening은 허용하지 않습니다.
+
+## Stop Ownership
+
+- 최초 stop은 AI 전권이 아니라 deterministic hard stop이 source-of-truth입니다.
+- AI는 stop width recommendation, break-even, trailing tighten, staged reduce만 보조합니다.
+- hard stop 제거, widening, protection 없는 상태 정상화는 architecture 경계 밖이며 허용하지 않습니다.
+
 현재 저장소는 멀티 에이전트 자동매매 플랫폼 전체를 크게 확장하기보다, **실거래에 안전한 Binance Futures 코어**를 우선 안정화하는 구조로 정리되어 있습니다.
 
 ## 현재 핵심 경계
