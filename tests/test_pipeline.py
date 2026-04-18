@@ -2765,6 +2765,159 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
     assert result["last_ai_trigger_reason"] == "manual_review_event"
 
 
+def test_pipeline_persists_management_intent_semantics_for_protection_restore(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    snapshot_time = utcnow_naive()
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70000.0,
+        latest_volume=1000.0,
+        candle_count=3,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=2), open=69950.0, high=70040.0, low=69920.0, close=70000.0, volume=900.0),
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70000.0, high=70070.0, low=69980.0, close=70030.0, volume=980.0),
+            MarketCandle(timestamp=snapshot_time, open=70030.0, high=70090.0, low=70010.0, close=70060.0, volume=1020.0),
+        ],
+    )
+    feature_payload = FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=0.32,
+        volatility_pct=0.002,
+        volume_ratio=1.08,
+        drawdown_pct=0.001,
+        rsi=58.0,
+        atr=90.0,
+        atr_pct=0.0013,
+        momentum_score=0.18,
+        multi_timeframe={
+            "15m": TimeframeFeatureContext(
+                timeframe="15m",
+                trend_score=0.32,
+                volatility_pct=0.002,
+                volume_ratio=1.08,
+                drawdown_pct=0.001,
+                rsi=58.0,
+                atr=90.0,
+                atr_pct=0.0013,
+                momentum_score=0.18,
+            )
+        },
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime="normal",
+            momentum_state="strengthening",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        data_quality_flags=[],
+    )
+    open_position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=69900.0,
+        mark_price=70060.0,
+        leverage=2.0,
+        stop_loss=69780.0,
+        take_profit=70320.0,
+        realized_pnl=0.0,
+        unrealized_pnl=1.6,
+    )
+    db_session.add(open_position)
+    db_session.flush()
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": ["BTCUSDT"],
+            "skipped_symbols": [],
+            "rankings": [_ranking_candidate_payload(symbol="BTCUSDT", strategy_engine="protection_reduce_engine")],
+        },
+    )
+    monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
+
+    class DummyGate:
+        allowed = True
+        reason = "allowed"
+
+        def as_metadata(self) -> dict[str, object]:
+            return {"allowed": True, "reason": "allowed"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: DummyGate())
+
+    def fake_run(_market_snapshot, _feature_payload, _open_positions, _risk_context, *, use_ai, **kwargs):
+        return (
+            TradeDecision(
+                decision="long",
+                confidence=0.63,
+                symbol="BTCUSDT",
+                timeframe="15m",
+                entry_zone_min=69980.0,
+                entry_zone_max=70020.0,
+                entry_mode="immediate",
+                invalidation_price=69820.0,
+                max_chase_bps=10.0,
+                idea_ttl_minutes=20,
+                stop_loss=69820.0,
+                take_profit=70300.0,
+                max_holding_minutes=120,
+                risk_pct=0.01,
+                leverage=1.0,
+                rationale_codes=["PROTECTION_REQUIRED", "PROTECTION_RESTORE"],
+                explanation_short="protection restore compatibility",
+                explanation_detailed="Legacy long semantics are preserved for execution compatibility but external metadata must classify this as protection restore.",
+            ),
+            "deterministic-mock",
+            {"source": "deterministic"},
+        )
+
+    orchestrator = TradingOrchestrator(db_session)
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_run)
+
+    result = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+    )
+    decision_row = db_session.get(AgentRun, result["decision_run_id"])
+
+    assert decision_row is not None
+    assert decision_row.output_payload["decision"] == "long"
+    assert decision_row.output_payload["intent_family"] == "protection"
+    assert decision_row.output_payload["management_action"] == "restore_protection"
+    assert decision_row.output_payload["legacy_semantics_preserved"] is True
+    assert decision_row.output_payload["analytics_excluded_from_entry_stats"] is True
+    assert decision_row.metadata_json["intent_family"] == "protection"
+    assert decision_row.metadata_json["management_action"] == "restore_protection"
+
+
 def test_pipeline_persists_bounded_breakout_output_metadata(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True

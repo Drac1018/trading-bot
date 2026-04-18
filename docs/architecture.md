@@ -27,6 +27,24 @@
   - it can downgrade aggressive holding-profile recommendations back toward `scalp`
 - It does not create a new hard blocker, and it does not weaken `risk.py` or `execution.py`.
 
+## 2026-04 Management Intent Semantics
+
+- `long` / `short` legacy semantics are still preserved where the execution adapter needs them, but the system now also persists explicit intent classification metadata.
+- The classification layer distinguishes:
+  - directional entry
+  - management-only actions
+  - protection recovery / restore
+  - exit-only actions
+- This classification is used for:
+  - operator/API observability
+  - audit payloads
+  - analytics filtering
+  - historical prior hygiene
+- The execution boundary is unchanged:
+  - `risk.py` still makes the final deterministic allow/block decision
+  - `execution.py` still consumes only approved intents
+  - no new execution action type was introduced in this ticket
+
 ## 2026-04 Prompt Routing And Fail-Closed
 
 - `backend/trading_mvp/services/ai_prompt_routing.py` is the thin adapter between hybrid triggers and the model provider.

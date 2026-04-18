@@ -24,6 +24,7 @@ from trading_mvp.services.adaptive_signal import (
 )
 from trading_mvp.services.agents import TradingDecisionAgent
 from trading_mvp.services.features import compute_features, summarize_universe_breadth
+from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.strategy_engines import select_strategy_engine
 from trading_mvp.time_utils import utcnow_naive
 
@@ -1499,6 +1500,13 @@ def test_trading_agent_prioritizes_protection_recovery_with_open_position() -> N
     assert "PROTECTION_REQUIRED" in decision.rationale_codes
     assert decision.stop_loss is not None
     assert decision.take_profit is not None
+    semantics = infer_intent_semantics(
+        decision.model_dump(mode="json"),
+        {"operating_state": "PROTECTION_REQUIRED"},
+    )
+    assert semantics["intent_family"] == "protection"
+    assert semantics["management_action"] == "restore_protection"
+    assert semantics["legacy_semantics_preserved"] is True
 
 
 def test_trading_agent_allows_winner_only_add_on_for_protected_position() -> None:

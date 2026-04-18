@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from trading_mvp.models import AgentRun, Execution, Order, Position
 from trading_mvp.schemas import StrategyEngineBucketEntry, StrategyEngineReportResponse
+from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.performance_reporting import _extract_analysis_context
 from trading_mvp.time_utils import utcnow_naive
 
@@ -230,6 +231,7 @@ def build_strategy_engine_bucket_report(
         strategy_engine = _selected_engine_name(metadata, output_payload)
         session_label, time_of_day_bucket = _session_context(metadata)
         scenario = _scenario(output_payload)
+        intent_semantics = infer_intent_semantics(output_payload, metadata)
         regime, trend_alignment, *_rest = _extract_analysis_context(decision_row)
         linked_orders = orders_by_decision.get(decision_row.id, [])
         linked_executions = [
@@ -266,7 +268,11 @@ def build_strategy_engine_bucket_report(
             "session_label": session_label,
             "time_of_day_bucket": time_of_day_bucket,
         }
-        if decision_code not in {"long", "short", "reduce", "exit"} or not linked_executions:
+        if (
+            decision_code not in {"long", "short", "reduce", "exit"}
+            or not linked_executions
+            or bool(intent_semantics.get("analytics_excluded_from_entry_stats"))
+        ):
             continue
         traded_decisions += 1
         accumulator.traded_decisions += 1

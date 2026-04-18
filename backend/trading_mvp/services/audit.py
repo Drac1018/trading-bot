@@ -52,6 +52,28 @@ EXECUTION_TIMELINE_KEYS = (
     "realized_pnl",
     "reason_codes",
 )
+AI_DECISION_TIMELINE_KEYS = (
+    "symbol",
+    "provider",
+    "prompt_family",
+    "bounded_output_applied",
+    "fallback_reason_codes",
+    "fail_closed_applied",
+    "engine_prior_classification",
+    "capital_efficiency_classification",
+    "session_prior_classification",
+    "time_of_day_prior_classification",
+    "prior_penalty_level",
+    "prior_reason_codes",
+    "sample_threshold_satisfied",
+    "confidence_adjustment_applied",
+    "abstain_due_to_prior_and_quality",
+    "expected_payoff_efficiency_hint_summary",
+    "intent_family",
+    "management_action",
+    "legacy_semantics_preserved",
+    "analytics_excluded_from_entry_stats",
+)
 
 
 def _compact_payload_dict(
@@ -128,6 +150,32 @@ def compact_audit_payload(
 
     if category_key == "execution" or event_key.startswith("live_execution"):
         return _compact_payload_dict(source, allowed_keys=EXECUTION_TIMELINE_KEYS)
+
+    if category_key == "ai_decision":
+        compact = _compact_payload_dict(source, allowed_keys=AI_DECISION_TIMELINE_KEYS)
+        decision_payload = _compact_payload_dict(
+            source.get("decision"),
+            allowed_keys=(
+                "symbol",
+                "timeframe",
+                "decision",
+                "confidence",
+                "rationale_codes",
+                "intent_family",
+                "management_action",
+                "legacy_semantics_preserved",
+                "analytics_excluded_from_entry_stats",
+            ),
+        )
+        if decision_payload:
+            compact["decision"] = decision_payload
+        trigger_payload = _compact_payload_dict(
+            source.get("trigger"),
+            allowed_keys=("trigger_reason", "symbol", "timeframe", "trigger_fingerprint"),
+        )
+        if trigger_payload:
+            compact["trigger"] = trigger_payload
+        return compact
 
     return {}
 

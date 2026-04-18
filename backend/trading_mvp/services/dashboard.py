@@ -29,8 +29,8 @@ from trading_mvp.schemas import (
     DashboardHoldBlockedSummary,
     DashboardProfitabilityResponse,
     DashboardProfitabilityWindow,
-    OperatorCandidateSelectionSnapshot,
     DecisionReferencePayload,
+    OperatorCandidateSelectionSnapshot,
     OperatorControlState,
     OperatorDashboardResponse,
     OperatorDecisionSnapshot,
@@ -46,6 +46,7 @@ from trading_mvp.schemas import (
     PerformanceAggregateEntry,
 )
 from trading_mvp.services.audit import compact_audit_payload
+from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
 from trading_mvp.services.settings import (
@@ -1336,6 +1337,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     if not holding_profile_context:
         holding_profile_context = _as_dict(selection_context.get("holding_profile_context"))
     decision_reference = _compact_decision_reference(_build_decision_reference(row))
+    intent_semantics = infer_intent_semantics(payload, metadata)
     holding_profile = (
         _as_holding_profile(selection_context.get("holding_profile"))
         or _as_holding_profile(metadata.get("holding_profile"))
@@ -1386,6 +1388,32 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         capacity_reason=capacity_reason,
         portfolio_slot_soft_cap_applied=bool(
             slot_allocation.get("applies_soft_limit") or selection_context.get("slot_applies_soft_cap")
+        ),
+        intent_family=str(
+            payload.get("intent_family")
+            or metadata.get("intent_family")
+            or intent_semantics.get("intent_family")
+            or "unknown"
+        ),
+        management_action=str(
+            payload.get("management_action")
+            or metadata.get("management_action")
+            or intent_semantics.get("management_action")
+            or "none"
+        ),
+        legacy_semantics_preserved=bool(
+            payload.get("legacy_semantics_preserved")
+            if payload.get("legacy_semantics_preserved") is not None
+            else metadata.get("legacy_semantics_preserved")
+            if metadata.get("legacy_semantics_preserved") is not None
+            else intent_semantics.get("legacy_semantics_preserved")
+        ),
+        analytics_excluded_from_entry_stats=bool(
+            payload.get("analytics_excluded_from_entry_stats")
+            if payload.get("analytics_excluded_from_entry_stats") is not None
+            else metadata.get("analytics_excluded_from_entry_stats")
+            if metadata.get("analytics_excluded_from_entry_stats") is not None
+            else intent_semantics.get("analytics_excluded_from_entry_stats")
         ),
         last_ai_trigger_reason=str(
             metadata.get("last_ai_trigger_reason")

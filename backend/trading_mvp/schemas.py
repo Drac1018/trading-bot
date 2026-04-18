@@ -12,6 +12,8 @@ RecommendedHoldingProfile = Literal["scalp", "swing", "position", "hold_current"
 PriorClassification = Literal["strong", "neutral", "weak", "unavailable"]
 CapitalEfficiencyClassification = Literal["efficient", "neutral", "inefficient", "unavailable"]
 PriorPenaltyLevel = Literal["none", "light", "medium", "strong"]
+IntentFamily = Literal["entry", "management", "protection", "exit", "unknown"]
+ManagementAction = Literal["restore_protection", "reduce_only", "exit_only", "tighten_management", "none"]
 RegimeStructure = Literal["trend", "range", "squeeze", "expansion", "transition"]
 RegimeDirection = Literal["bullish", "bearish", "neutral"]
 RegimeVolatility = Literal["calm", "normal", "fast", "shock"]
@@ -81,6 +83,10 @@ class TradeDecision(StrictBaseModel):
     confidence_adjustment_applied: bool = False
     abstain_due_to_prior_and_quality: bool = False
     expected_payoff_efficiency_hint_summary: dict[str, float | None] = Field(default_factory=dict)
+    intent_family: IntentFamily = "unknown"
+    management_action: ManagementAction = "none"
+    legacy_semantics_preserved: bool = False
+    analytics_excluded_from_entry_stats: bool = False
     prompt_family_hint: str | None = None
     ai_context_version: str = AI_CONTEXT_VERSION
     explanation_short: str = Field(min_length=3, max_length=240)
@@ -1018,6 +1024,10 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     candidate_weight: float | None = None
     capacity_reason: str | None = None
     portfolio_slot_soft_cap_applied: bool = False
+    intent_family: IntentFamily = "unknown"
+    management_action: ManagementAction = "none"
+    legacy_semantics_preserved: bool = False
+    analytics_excluded_from_entry_stats: bool = False
     last_ai_trigger_reason: AITriggerReason | None = None
     last_ai_invoked_at: datetime | None = None
     next_ai_review_due_at: datetime | None = None

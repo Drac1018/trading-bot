@@ -16,6 +16,19 @@
   - `execution.py`
 - Provider outputs that omit the new optional fields remain valid. The agent backfills only metadata defaults; it does not create a new execution action type.
 
+## 2026-04 Protection / Management Semantics Split
+
+- The decision object can still be `long` / `short` / `reduce` / `exit` for backward compatibility, but persisted output and decision metadata now also carry:
+  - `intent_family`
+  - `management_action`
+  - `legacy_semantics_preserved`
+  - `analytics_excluded_from_entry_stats`
+- This means protection recovery / restore no longer has to look like a generic new entry to operator, audit, analytics, or prior builders.
+- Execution meaning is unchanged:
+  - if legacy `long` / `short` mapping is required for deterministic protection restore, it remains allowed internally
+  - this ticket does not change `risk.py`
+  - this ticket does not change `execution.py`
+
 ## 2026-04 Prompt Routing And Bounded Output
 
 - `TradingDecisionAgent.run(...)` now resolves a route contract before provider invocation:
@@ -33,6 +46,7 @@
 - On protection/reduce/emergency-style routes, provider failure falls back to deterministic management behavior and does not block survival handling.
 - Historical priors do not block survival handling. `reduce`, `exit`, protection recovery, and other deterministic management paths ignore prior penalties for execution purposes.
 - `risk.py` still receives only the normalized decision. `execution.py` still receives only intents approved by `risk.py`.
+- Historical analytics / prior builders now exclude non-entry intent rows from entry stats so management/protection behavior does not contaminate entry expectancy or payoff timing.
 
 ## 2026-04 Hybrid AI Review Dispatch
 

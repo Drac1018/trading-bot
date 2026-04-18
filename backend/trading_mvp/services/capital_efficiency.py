@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from trading_mvp.models import AgentRun, Execution, Order, Position
 from trading_mvp.schemas import CapitalEfficiencyBucketEntry, CapitalEfficiencyReportResponse
+from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.performance_reporting import _extract_analysis_context
 from trading_mvp.time_utils import utcnow_naive
 
@@ -258,6 +259,7 @@ def build_capital_efficiency_report(
         symbol = str(output_payload.get("symbol") or "UNKNOWN").upper()
         timeframe = str(output_payload.get("timeframe") or "UNKNOWN")
         decision = str(output_payload.get("decision") or "hold").lower()
+        intent_semantics = infer_intent_semantics(output_payload, metadata)
         entry_mode = _normalized_entry_mode(decision=decision, output_payload=output_payload, metadata=metadata)
         scenario = _normalized_scenario(
             decision=decision,
@@ -288,7 +290,7 @@ def build_capital_efficiency_report(
             "entry_mode": entry_mode,
             "execution_policy_profile": execution_policy_profile,
         }
-        if not orders:
+        if not orders or bool(intent_semantics.get("analytics_excluded_from_entry_stats")):
             continue
 
         linked_positions = [

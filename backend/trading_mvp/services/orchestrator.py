@@ -76,6 +76,7 @@ from trading_mvp.services.holding_profile import (
     evaluate_holding_profile,
     resolve_holding_profile_cadence_hint,
 )
+from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.market_data import (
     build_lead_market_contexts,
     build_market_context,
@@ -5218,6 +5219,15 @@ class TradingOrchestrator:
             "cycle_id": cycle_id,
             "snapshot_id": market_row.id,
         }
+        intent_semantics = infer_intent_semantics(
+            decision.model_dump(mode="json"),
+            decision_metadata,
+        )
+        decision = decision.model_copy(update=intent_semantics)
+        decision_metadata = {
+            **decision_metadata,
+            **intent_semantics,
+        }
         decision_run = persist_agent_run(
             self.session,
             AgentRole.TRADING_DECISION,
@@ -5278,6 +5288,10 @@ class TradingOrchestrator:
                 "confidence_adjustment_applied": decision_metadata.get("confidence_adjustment_applied"),
                 "abstain_due_to_prior_and_quality": decision_metadata.get("abstain_due_to_prior_and_quality"),
                 "expected_payoff_efficiency_hint_summary": decision_metadata.get("expected_payoff_efficiency_hint_summary"),
+                "intent_family": decision_metadata.get("intent_family"),
+                "management_action": decision_metadata.get("management_action"),
+                "legacy_semantics_preserved": decision_metadata.get("legacy_semantics_preserved"),
+                "analytics_excluded_from_entry_stats": decision_metadata.get("analytics_excluded_from_entry_stats"),
             },
             correlation_ids=decision_correlation_ids,
         )
@@ -5312,6 +5326,8 @@ class TradingOrchestrator:
                     "ai_skipped_reason": ai_skipped_reason,
                     "gate": openai_gate.as_metadata(),
                     "trigger": decision_metadata.get("ai_trigger"),
+                    "intent_family": decision_metadata.get("intent_family"),
+                    "management_action": decision_metadata.get("management_action"),
                 },
                 correlation_ids=decision_correlation_ids,
             )

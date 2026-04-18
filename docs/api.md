@@ -142,9 +142,28 @@
   - `confidence_adjustment_applied`
   - `abstain_due_to_prior_and_quality`
   - `expected_payoff_efficiency_hint_summary`
+  - `intent_family`: `entry | management | protection | exit | unknown`
+  - `management_action`: `restore_protection | reduce_only | exit_only | tighten_management | none`
+  - `legacy_semantics_preserved`
+  - `analytics_excluded_from_entry_stats`
   - `prompt_family_hint`
   - `ai_context_version`
 - These fields are backward-compatible. Existing provider/mock payloads that only return the legacy minimum shape still validate.
+
+## 2026-04 Management Intent Semantics
+
+- Protection recovery / protective restore / reduce-only / exit-only now carry explicit non-entry semantics in decision metadata and persisted output payloads.
+- `long` / `short` can still be preserved internally for legacy execution compatibility, but external consumers should read:
+  - `intent_family`
+  - `management_action`
+  - `legacy_semantics_preserved`
+  - `analytics_excluded_from_entry_stats`
+- Interpretation:
+  - `intent_family=entry` means directional entry semantics
+  - `intent_family=protection` means protection recovery / restore semantics
+  - `intent_family=management` means reduce-only / tighten-management semantics
+  - `intent_family=exit` means exit-only semantics
+- Historical rows without these fields may be conservatively inferred. If inference is not reliable they remain `intent_family=unknown`.
 
 ## 2026-04 Prompt Routing / Bounded Output / Fail-Closed
 
@@ -214,7 +233,17 @@
   - `trigger_deduped`
   - `trigger_fingerprint`
   - `last_ai_skip_reason`
+  - `intent_family`
+  - `management_action`
+  - `legacy_semantics_preserved`
+  - `analytics_excluded_from_entry_stats`
 - These fields are sourced from the latest decision metadata and may be overlaid by the latest `interval_decision_cycle` scheduler outcome when the latest scheduler state is newer than the latest decision row.
+
+### Analytics / prior filtering
+
+- Strategy-engine analytics and capital-efficiency aggregates now exclude `analytics_excluded_from_entry_stats=true` rows from entry stats.
+- Historical priors are therefore built from entry semantics only.
+- Management / protection rows may still exist in history, but they do not count as entry sample rows for expectancy, payoff timing, or efficiency priors.
 
 ### Interval decision cycle audit states
 

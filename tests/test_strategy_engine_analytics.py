@@ -240,6 +240,45 @@ def test_orchestrator_build_strategy_engine_bucket_report_wrapper(db_session) ->
     assert report.bucket_reports[0].efficiency_score >= report.bucket_reports[-1].efficiency_score
 
 
+def test_strategy_engine_bucket_report_excludes_management_semantics_from_entry_stats(db_session) -> None:
+    now = utcnow_naive() - timedelta(hours=6)
+    _seed_strategy_engine_trade(
+        db_session,
+        symbol="BTCUSDT",
+        created_at=now,
+        strategy_engine="trend_pullback_engine",
+        session_label="asia",
+        time_of_day_bucket="utc_00_05",
+        net_pnl_after_fees=12.0,
+        signed_slippage_bps=4.0,
+        time_to_profit_minutes=18.0,
+        drawdown_impact=0.2,
+    )
+    _seed_strategy_engine_trade(
+        db_session,
+        symbol="BTCUSDT",
+        created_at=now + timedelta(hours=1),
+        strategy_engine="protection_reduce_engine",
+        session_label="asia",
+        time_of_day_bucket="utc_00_05",
+        scenario="protection_restore",
+        decision="long",
+        entry_mode="immediate",
+        net_pnl_after_fees=3.0,
+        signed_slippage_bps=2.0,
+        time_to_profit_minutes=10.0,
+        drawdown_impact=0.1,
+    )
+
+    report = build_strategy_engine_bucket_report(db_session, lookback_days=21, limit=64)
+
+    entry_bucket = next(item for item in report.bucket_reports if item.strategy_engine == "trend_pullback_engine")
+    protection_bucket = next(item for item in report.bucket_reports if item.strategy_engine == "protection_reduce_engine")
+    assert entry_bucket.traded_decisions == 1
+    assert protection_bucket.decisions == 1
+    assert protection_bucket.traded_decisions == 0
+
+
 def test_ai_prior_context_builder_consumes_engine_bucket_analytics(db_session) -> None:
     now = utcnow_naive() - timedelta(hours=10)
     for offset_hours, pnl in ((0, 14.0), (2, 8.0), (4, 10.0)):
