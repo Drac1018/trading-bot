@@ -134,6 +134,15 @@ def _cadence_seconds(profile: dict[str, object], key: str, fallback: int) -> int
     return int(value) if isinstance(value, (int, float)) and int(value) > 0 else fallback
 
 
+def _position_management_scheduler_seconds(profile: dict[str, object], fallback: int) -> int:
+    cadence_seconds = _cadence_seconds(
+        profile,
+        "position_management_interval_seconds",
+        fallback,
+    )
+    return max(15, min(int(cadence_seconds), int(fallback)))
+
+
 def _start_scheduler_run(
     session: Session,
     *,
@@ -403,9 +412,8 @@ def get_due_position_management_symbols(session: Session) -> list[str]:
             symbol=effective.symbol,
             timeframe=effective.timeframe,
         )
-        cadence_seconds = _cadence_seconds(
+        cadence_seconds = _position_management_scheduler_seconds(
             cadence_profile,
-            "position_management_interval_seconds",
             effective.position_management_interval_seconds,
         )
         latest = _latest_symbol_workflow_run(session, POSITION_MANAGEMENT_WORKFLOW, effective.symbol)
@@ -427,9 +435,8 @@ def run_position_management_cycle(session: Session, triggered_by: str = "schedul
             symbol=effective.symbol,
             timeframe=effective.timeframe,
         )
-        cadence_seconds = _cadence_seconds(
+        cadence_seconds = _position_management_scheduler_seconds(
             cadence_profile,
-            "position_management_interval_seconds",
             effective.position_management_interval_seconds,
         )
         latest = _latest_symbol_workflow_run(session, POSITION_MANAGEMENT_WORKFLOW, effective.symbol)
@@ -621,6 +628,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         }
     orchestrator = TradingOrchestrator(session)
     results: list[dict[str, object]] = []
+    due_effective = []
     for effective in get_effective_symbol_schedule(settings_row):
         if not effective.enabled:
             continue
@@ -637,6 +645,17 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
         if not _is_due(latest, timedelta(minutes=cadence_minutes)):
             continue
+        due_effective.append((effective, cadence_profile, cadence_minutes))
+    decision_plan = orchestrator.build_interval_decision_plan(
+        symbols=[effective.symbol for effective, _cadence, _minutes in due_effective],
+        triggered_at=utcnow_naive(),
+    )
+    plan_lookup = {
+        str(item.get("symbol") or "").upper(): dict(item)
+        for item in decision_plan.get("plans", [])
+        if isinstance(item, dict) and item.get("symbol")
+    }
+    for effective, cadence_profile, cadence_minutes in due_effective:
         row = _start_scheduler_run(
             session,
             workflow=INTERVAL_DECISION_WORKFLOW,
@@ -647,7 +666,100 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             symbol=effective.symbol,
             next_run_at=utcnow_naive() + timedelta(minutes=cadence_minutes),
         )
+        plan = plan_lookup.get(effective.symbol, {})
+        trigger_payload = plan.get("trigger") if isinstance(plan.get("trigger"), dict) else None
+        next_ai_review_due_at = plan.get("next_ai_review_due_at")
+        last_ai_invoked_at = plan.get("last_ai_invoked_at")
+        last_ai_skip_reason = str(plan.get("last_ai_skip_reason") or "") or None
         try:
+            if trigger_payload is None:
+                record_audit_event(
+                    session,
+                    event_type="decision_ai_no_event",
+                    entity_type="symbol",
+                    entity_id=effective.symbol,
+                    severity="info",
+                    message="No deterministic entry or review trigger was detected for this interval cycle.",
+                    payload={
+                        "symbol": effective.symbol,
+                        "cadence": cadence_profile,
+                        "next_ai_review_due_at": next_ai_review_due_at,
+                    },
+                )
+                results.append(
+                    _finish_scheduler_run(
+                        session,
+                        row=row,
+                        success=True,
+                        message="Interval decision cycle skipped because no trigger was detected.",
+                        payload={
+                            "symbol": effective.symbol,
+                            "status": "skipped",
+                            "ai_review_status": "no_event",
+                            "trigger": None,
+                            "last_ai_trigger_reason": None,
+                            "last_ai_invoked_at": last_ai_invoked_at,
+                            "next_ai_review_due_at": next_ai_review_due_at,
+                            "trigger_deduped": False,
+                            "trigger_fingerprint": None,
+                            "last_ai_skip_reason": last_ai_skip_reason or "NO_EVENT",
+                            "cadence": cadence_profile,
+                            "auto_resume": auto_resume_result,
+                        },
+                    )
+                )
+                continue
+            if bool(plan.get("trigger_deduped")):
+                record_audit_event(
+                    session,
+                    event_type="decision_ai_deduped",
+                    entity_type="symbol",
+                    entity_id=effective.symbol,
+                    severity="info",
+                    message="Repeated trigger fingerprint was deduplicated before AI review.",
+                    payload={
+                        "symbol": effective.symbol,
+                        "trigger": trigger_payload,
+                        "next_ai_review_due_at": next_ai_review_due_at,
+                    },
+                )
+                results.append(
+                    _finish_scheduler_run(
+                        session,
+                        row=row,
+                        success=True,
+                        message="Interval decision cycle deduped an unchanged trigger.",
+                        payload={
+                            "symbol": effective.symbol,
+                            "status": "skipped",
+                            "ai_review_status": "deduped",
+                            "trigger": trigger_payload,
+                            "last_ai_trigger_reason": trigger_payload.get("trigger_reason"),
+                            "last_ai_invoked_at": last_ai_invoked_at,
+                            "next_ai_review_due_at": next_ai_review_due_at,
+                            "trigger_deduped": True,
+                            "trigger_fingerprint": trigger_payload.get("trigger_fingerprint"),
+                            "last_ai_skip_reason": last_ai_skip_reason or "TRIGGER_DEDUPED",
+                            "cadence": cadence_profile,
+                            "auto_resume": auto_resume_result,
+                        },
+                    )
+                )
+                continue
+            if str(trigger_payload.get("trigger_reason") or "") == "periodic_backstop_due":
+                record_audit_event(
+                    session,
+                    event_type="decision_ai_backstop_due",
+                    entity_type="symbol",
+                    entity_id=effective.symbol,
+                    severity="info",
+                    message="Periodic AI backstop review is due for this symbol.",
+                    payload={
+                        "symbol": effective.symbol,
+                        "trigger": trigger_payload,
+                        "next_ai_review_due_at": next_ai_review_due_at,
+                    },
+                )
             outcome = orchestrator.run_decision_cycle(
                 symbol=effective.symbol,
                 timeframe=effective.timeframe,
@@ -655,6 +767,12 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                 auto_resume_checked=True,
                 exchange_sync_checked=True,
                 include_inline_position_management=False,
+                selection_context=(
+                    dict(plan.get("selection_context"))
+                    if isinstance(plan.get("selection_context"), dict)
+                    else None
+                ),
+                review_trigger=trigger_payload,
             )
             results.append(
                 _finish_scheduler_run(
@@ -662,7 +780,13 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                     row=row,
                     success=True,
                     message="Interval decision cycle completed.",
-                    payload={**outcome, "symbol": effective.symbol, "auto_resume": auto_resume_result},
+                    payload={
+                        **outcome,
+                        "symbol": effective.symbol,
+                        "trigger": trigger_payload,
+                        "cadence": cadence_profile,
+                        "auto_resume": auto_resume_result,
+                    },
                 )
             )
         except Exception as exc:
@@ -672,10 +796,19 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                     row=row,
                     success=False,
                     message="Interval decision cycle failed.",
-                    payload={"symbol": effective.symbol, "error": str(exc)},
+                    payload={
+                        "symbol": effective.symbol,
+                        "error": str(exc),
+                        "trigger": trigger_payload,
+                    },
                 )
             )
-    return {"workflow": INTERVAL_DECISION_WORKFLOW, "results": results, "auto_resume": auto_resume_result}
+    return {
+        "workflow": INTERVAL_DECISION_WORKFLOW,
+        "results": results,
+        "auto_resume": auto_resume_result,
+        "candidate_selection": decision_plan.get("candidate_selection", {}),
+    }
 
 
 def run_due_exchange_sync_cycle(session: Session) -> dict[str, object] | None:

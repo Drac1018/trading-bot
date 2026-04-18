@@ -1,5 +1,87 @@
 # Architecture
 
+## 2026-04 AI Context Builder
+
+- `backend/trading_mvp/services/ai_context.py` builds one common AI input packet before provider invocation.
+- The packet is deterministic and pure-function oriented so unit tests do not need a live model call.
+- The builder combines:
+  - composite regime summary
+  - data quality / trust summary
+  - previous thesis snapshot + delta
+  - strategy engine / holding profile / slot / hard-stop context
+- This is an input-structure change only. It does not move execution authority out of `risk.py` and `execution.py`.
+
+## 2026-04 Historical Prior Context
+
+- `backend/trading_mvp/services/ai_prior_context.py` attaches report-only analytics to the AI packet as soft priors.
+- The prior packet is built from existing:
+  - strategy-engine bucket analytics
+  - capital-efficiency report buckets
+  - session / time-of-day bucket history
+- Conservative sample thresholds apply before any live influence:
+  - insufficient samples => `unavailable`
+  - unavailable prior => no confidence boost/penalty
+- The prior layer is soft only:
+  - it can reduce confidence
+  - it can bias AI toward `hold` / `should_abstain=true`
+  - it can downgrade aggressive holding-profile recommendations back toward `scalp`
+- It does not create a new hard blocker, and it does not weaken `risk.py` or `execution.py`.
+
+## 2026-04 Prompt Routing And Fail-Closed
+
+- `backend/trading_mvp/services/ai_prompt_routing.py` is the thin adapter between hybrid triggers and the model provider.
+- The adapter is responsible for:
+  - resolving `strategy_engine × trigger_type -> prompt_family`
+  - declaring `allowed_actions` / `forbidden_actions`
+  - bounding invalid provider output before it reaches `risk.py`
+  - applying fail-closed on new-entry-capable reviews when the provider times out, is unavailable, or returns invalid schema
+- `protection_review_event` and other survival-path contexts stay management-only. AI may advise, but provider failure does not block deterministic protection or reduction handling.
+- `breakout_exception_engine` remains scalp-only. The routing layer explicitly prevents swing/position promotion from that family.
+- `risk.py` and `execution.py` remain unchanged as the final deterministic approval and execution boundary.
+
+## 2026-04 Hybrid AI Review Trigger Model
+
+- `interval_decision_cycle` remains the scheduler-owned decision loop, but AI review is no longer a full-symbol interval scan.
+- The cycle now has two stages:
+  - deterministic pre-AI trigger planning in `orchestrator.build_interval_decision_plan()`
+  - selective AI dispatch in `scheduler.run_interval_decision_cycle()`
+- Entry-side AI review is created only when a deterministic candidate event exists for that symbol.
+- Open-position AI review is created only when position review is due from `holding_profile_cadence_hint`, when protection review requires it, or when a low-frequency periodic backstop becomes due.
+- `market_refresh_cycle`, `exchange_sync_cycle`, and `position_management_cycle` keep their existing cadence responsibilities and do not depend on AI availability.
+
+### Trigger reasons
+
+- `entry_candidate_event`
+- `breakout_exception_event`
+- `open_position_recheck_due`
+- `protection_review_event`
+- `manual_review_event`
+- `periodic_backstop_due`
+
+### Trigger payload contract
+
+- Every AI review trigger carries:
+  - `symbol`
+  - `timeframe`
+  - `strategy_engine`
+  - `holding_profile`
+  - `assigned_slot`
+  - `candidate_weight`
+  - `reason_codes`
+  - `trigger_fingerprint`
+  - `last_decision_at`
+  - `triggered_at`
+- `trigger_fingerprint` is used for debounce/dedupe. If the same symbol repeats with the same materially equivalent trigger fingerprint, the scheduler records a deduped skip instead of reinvoking AI.
+- `periodic_backstop_due` is the explicit escape hatch for stale-thesis refresh and missed-event recovery. It is a safety backstop, not an entry-frequency booster.
+
+### Safety boundary
+
+- `agents.py` still stops at trade intent generation.
+- `schemas.py` validates the trigger payload and the resulting decision shape.
+- `risk.py` remains the final deterministic allow/block gate.
+- `execution.py` still executes only approved intents.
+- Survival paths such as `reduce`, `exit`, `reduce_only`, `protection recovery`, and `emergency_exit` remain callable without AI and must not wait for the hybrid review cadence.
+
 ## Holding Profile Split
 
 - `agents.py`는 거래 의도와 `holding_profile` (`scalp | swing | position`)만 생성합니다.

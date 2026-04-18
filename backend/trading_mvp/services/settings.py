@@ -78,6 +78,8 @@ class EffectiveSymbolSettings:
     position_management_interval_seconds: int
     decision_cycle_interval_minutes: int
     ai_call_interval_minutes: int
+    ai_backstop_enabled: bool
+    ai_backstop_interval_minutes: int
 
 
 MINUTES_PER_30_DAY_MONTH = 30 * 24 * 60
@@ -90,6 +92,8 @@ DISPLAY_MAX_DIRECTIONAL_BIAS_PCT = 2.0
 DISPLAY_MAX_SAME_TIER_CONCENTRATION_PCT = 2.5
 AUTO_RESUME_GRACE_MAX_MINUTES = 15
 DEFAULT_LIMITED_LIVE_MAX_NOTIONAL = 500.0
+DEFAULT_AI_BACKSTOP_ENABLED = True
+DEFAULT_AI_BACKSTOP_INTERVAL_MINUTES = 180
 ROLLOUT_MODE_SUBMIT_ENABLED = {"limited_live", "full_live"}
 ROLLOUT_MODE_LIVE_PATH = {"shadow", "live_dry_run", "limited_live", "full_live"}
 RUNTIME_STATE_DETAIL_KEYS = {
@@ -263,6 +267,16 @@ def normalize_symbol_cadence_overrides(
                     if raw.get("ai_call_interval_minutes_override") not in {None, ""}
                     else None
                 ),
+                "ai_backstop_enabled_override": (
+                    bool(raw.get("ai_backstop_enabled_override"))
+                    if raw.get("ai_backstop_enabled_override") is not None
+                    else None
+                ),
+                "ai_backstop_interval_minutes_override": (
+                    int(raw["ai_backstop_interval_minutes_override"])
+                    if raw.get("ai_backstop_interval_minutes_override") not in {None, ""}
+                    else None
+                ),
             }
         )
     return normalized
@@ -299,6 +313,8 @@ def get_effective_symbol_settings(settings_row: Setting, symbol: str) -> Effecti
                 "position_management_interval_seconds_override",
                 "decision_cycle_interval_minutes_override",
                 "ai_call_interval_minutes_override",
+                "ai_backstop_enabled_override",
+                "ai_backstop_interval_minutes_override",
             )
         )
     return EffectiveSymbolSettings(
@@ -321,6 +337,15 @@ def get_effective_symbol_settings(settings_row: Setting, symbol: str) -> Effecti
         ai_call_interval_minutes=int(
             override.get("ai_call_interval_minutes_override")
             or settings_row.ai_call_interval_minutes
+        ),
+        ai_backstop_enabled=(
+            bool(override.get("ai_backstop_enabled_override"))
+            if override.get("ai_backstop_enabled_override") is not None
+            else DEFAULT_AI_BACKSTOP_ENABLED
+        ),
+        ai_backstop_interval_minutes=int(
+            override.get("ai_backstop_interval_minutes_override")
+            or DEFAULT_AI_BACKSTOP_INTERVAL_MINUTES
         ),
     )
 
@@ -812,6 +837,8 @@ def build_symbol_effective_cadences(
                 position_management_interval_seconds=effective.position_management_interval_seconds,
                 decision_cycle_interval_minutes=effective.decision_cycle_interval_minutes,
                 ai_call_interval_minutes=effective.ai_call_interval_minutes,
+                ai_backstop_enabled=effective.ai_backstop_enabled,
+                ai_backstop_interval_minutes=effective.ai_backstop_interval_minutes,
                 estimated_monthly_ai_calls=MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1),
                 last_market_refresh_at=last_market_refresh_at,
                 last_position_management_at=position_run_at,
@@ -1692,6 +1719,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     payload = AppSettingsResponse(
         id=settings_row.id,
         operational_status=operational_status,
+        control_status_summary=operational_status.control_status_summary,
         live_trading_enabled=settings_row.live_trading_enabled,
         rollout_mode=rollout_mode,
         exchange_submit_allowed=exchange_submit_allowed,

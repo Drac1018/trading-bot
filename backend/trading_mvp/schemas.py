@@ -7,6 +7,29 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RolloutMode = Literal["paper", "shadow", "live_dry_run", "limited_live", "full_live"]
 HoldingProfile = Literal["scalp", "swing", "position"]
+ConfidenceBand = Literal["high", "medium", "low", "abstain"]
+RecommendedHoldingProfile = Literal["scalp", "swing", "position", "hold_current"]
+PriorClassification = Literal["strong", "neutral", "weak", "unavailable"]
+CapitalEfficiencyClassification = Literal["efficient", "neutral", "inefficient", "unavailable"]
+PriorPenaltyLevel = Literal["none", "light", "medium", "strong"]
+RegimeStructure = Literal["trend", "range", "squeeze", "expansion", "transition"]
+RegimeDirection = Literal["bullish", "bearish", "neutral"]
+RegimeVolatility = Literal["calm", "normal", "fast", "shock"]
+RegimeParticipation = Literal["strong", "mixed", "weak"]
+RegimeDerivatives = Literal["tailwind", "neutral", "headwind", "unavailable"]
+RegimeExecution = Literal["clean", "normal", "stress", "unavailable"]
+PersistenceClass = Literal["early", "established", "extended"]
+TransitionRisk = Literal["low", "medium", "high"]
+DataQualityGrade = Literal["complete", "partial", "degraded", "unavailable"]
+AITriggerReason = Literal[
+    "entry_candidate_event",
+    "breakout_exception_event",
+    "open_position_recheck_due",
+    "protection_review_event",
+    "manual_review_event",
+    "periodic_backstop_due",
+]
+AI_CONTEXT_VERSION = "2026-04-context-v1"
 
 
 class StrictBaseModel(BaseModel):
@@ -32,8 +55,63 @@ class TradeDecision(StrictBaseModel):
     risk_pct: float = Field(gt=0.0, le=1.0)
     leverage: float = Field(gt=0.0, le=10.0)
     rationale_codes: list[str]
+    confidence_band: ConfidenceBand | None = None
+    recommended_holding_profile: RecommendedHoldingProfile | None = None
+    primary_reason_codes: list[str] = Field(default_factory=list)
+    no_trade_reason_codes: list[str] = Field(default_factory=list)
+    abstain_reason_codes: list[str] = Field(default_factory=list)
+    invalidation_reason_codes: list[str] = Field(default_factory=list)
+    expected_time_to_0_25r_minutes: int | None = Field(default=None, ge=0, le=10080)
+    expected_time_to_0_5r_minutes: int | None = Field(default=None, ge=0, le=10080)
+    expected_mae_r: float | None = None
+    regime_transition_risk: TransitionRisk | None = None
+    data_quality_penalty_applied: bool = False
+    should_abstain: bool = False
+    bounded_output_applied: bool = False
+    fallback_reason_codes: list[str] = Field(default_factory=list)
+    fail_closed_applied: bool = False
+    provider_status: str | None = None
+    engine_prior_classification: PriorClassification | None = None
+    capital_efficiency_classification: CapitalEfficiencyClassification | None = None
+    session_prior_classification: PriorClassification | None = None
+    time_of_day_prior_classification: PriorClassification | None = None
+    prior_penalty_level: PriorPenaltyLevel = "none"
+    prior_reason_codes: list[str] = Field(default_factory=list)
+    sample_threshold_satisfied: dict[str, bool] = Field(default_factory=dict)
+    confidence_adjustment_applied: bool = False
+    abstain_due_to_prior_and_quality: bool = False
+    expected_payoff_efficiency_hint_summary: dict[str, float | None] = Field(default_factory=dict)
+    prompt_family_hint: str | None = None
+    ai_context_version: str = AI_CONTEXT_VERSION
     explanation_short: str = Field(min_length=3, max_length=240)
     explanation_detailed: str = Field(min_length=10, max_length=600)
+
+    @model_validator(mode="after")
+    def _backfill_optional_ai_fields(self) -> TradeDecision:
+        if not self.primary_reason_codes and self.rationale_codes:
+            self.primary_reason_codes = list(self.rationale_codes)
+        if self.recommended_holding_profile is None:
+            self.recommended_holding_profile = (
+                "hold_current"
+                if self.decision not in {"long", "short"}
+                else self.holding_profile
+            )
+        if self.confidence_band is None:
+            if self.should_abstain:
+                self.confidence_band = "abstain"
+            elif self.confidence >= 0.72:
+                self.confidence_band = "high"
+            elif self.confidence >= 0.46:
+                self.confidence_band = "medium"
+            else:
+                self.confidence_band = "low"
+        if self.decision == "hold" and not self.no_trade_reason_codes and self.primary_reason_codes:
+            self.no_trade_reason_codes = list(self.primary_reason_codes)
+        if self.should_abstain and not self.abstain_reason_codes:
+            self.abstain_reason_codes = list(self.no_trade_reason_codes or self.primary_reason_codes)
+        if not self.ai_context_version:
+            self.ai_context_version = AI_CONTEXT_VERSION
+        return self
 
 
 class TradeDecisionCandidateScore(StrictBaseModel):
@@ -87,6 +165,119 @@ class TradeDecisionCandidate(StrictBaseModel):
 
 class TradeDecisionCandidateBatch(StrictBaseModel):
     items: list[TradeDecisionCandidate] = Field(default_factory=list)
+
+
+class AIReviewTriggerPayload(StrictBaseModel):
+    trigger_reason: AITriggerReason
+    symbol: str = Field(min_length=1, max_length=30)
+    timeframe: str = Field(min_length=1, max_length=20)
+    strategy_engine: str | None = Field(default=None, min_length=1, max_length=80)
+    holding_profile: HoldingProfile | None = None
+    assigned_slot: str | None = Field(default=None, min_length=1, max_length=40)
+    candidate_weight: float | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    trigger_fingerprint: str = Field(min_length=8, max_length=128)
+    last_decision_at: datetime | None = None
+    triggered_at: datetime
+
+
+class CompositeRegimePacket(StrictBaseModel):
+    structure_regime: RegimeStructure
+    direction_regime: RegimeDirection
+    volatility_regime: RegimeVolatility
+    participation_regime: RegimeParticipation
+    derivatives_regime: RegimeDerivatives
+    execution_regime: RegimeExecution
+    persistence_bars: int = Field(ge=0, default=0)
+    persistence_class: PersistenceClass = "early"
+    transition_risk: TransitionRisk = "medium"
+    regime_reason_codes: list[str] = Field(default_factory=list)
+
+
+class DataQualityPacket(StrictBaseModel):
+    data_quality_grade: DataQualityGrade = "complete"
+    missing_context_flags: list[str] = Field(default_factory=list)
+    stale_context_flags: list[str] = Field(default_factory=list)
+    derivatives_available: bool = False
+    orderbook_available: bool = False
+    spread_quality_available: bool = False
+    account_state_trustworthy: bool = True
+    market_state_trustworthy: bool = True
+
+
+class PreviousThesisDeltaPacket(StrictBaseModel):
+    previous_decision: Literal["hold", "long", "short", "reduce", "exit"] | None = None
+    previous_strategy_engine: str | None = None
+    previous_holding_profile: HoldingProfile | None = None
+    previous_rationale_codes: list[str] = Field(default_factory=list)
+    previous_no_trade_reason_codes: list[str] = Field(default_factory=list)
+    previous_invalidation_reason_codes: list[str] = Field(default_factory=list)
+    previous_regime_packet_summary: dict[str, Any] = Field(default_factory=dict)
+    previous_data_quality_grade: DataQualityGrade | None = None
+    last_ai_invoked_at: datetime | None = None
+    delta_changed_fields: list[str] = Field(default_factory=list)
+    delta_reason_codes_added: list[str] = Field(default_factory=list)
+    delta_reason_codes_removed: list[str] = Field(default_factory=list)
+    thesis_degrade_detected: bool = False
+    regime_transition_detected: bool = False
+    data_quality_changed: bool = False
+
+
+class AIPriorContextPacket(StrictBaseModel):
+    engine_prior_available: bool = False
+    engine_prior_sample_count: int = Field(ge=0, default=0)
+    engine_sample_threshold_satisfied: bool = False
+    engine_prior_classification: PriorClassification = "unavailable"
+    engine_expectancy_hint: float | None = None
+    engine_net_pnl_after_fees_hint: float | None = None
+    engine_avg_signed_slippage_bps_hint: float | None = None
+    engine_time_to_profit_hint_minutes: float | None = None
+    engine_drawdown_impact_hint: float | None = None
+    capital_efficiency_available: bool = False
+    capital_efficiency_sample_count: int = Field(ge=0, default=0)
+    capital_efficiency_sample_threshold_satisfied: bool = False
+    capital_efficiency_classification: CapitalEfficiencyClassification = "unavailable"
+    pnl_per_exposure_hour_hint: float | None = None
+    net_pnl_after_fees_per_hour_hint: float | None = None
+    time_to_0_25r_hint_minutes: float | None = None
+    time_to_0_5r_hint_minutes: float | None = None
+    time_to_fail_hint_minutes: float | None = None
+    capital_slot_occupancy_efficiency_hint: float | None = None
+    session_prior_available: bool = False
+    session_prior_sample_count: int = Field(ge=0, default=0)
+    session_sample_threshold_satisfied: bool = False
+    session_prior_classification: PriorClassification = "unavailable"
+    time_of_day_prior_available: bool = False
+    time_of_day_prior_sample_count: int = Field(ge=0, default=0)
+    time_of_day_sample_threshold_satisfied: bool = False
+    time_of_day_prior_classification: PriorClassification = "unavailable"
+    prior_reason_codes: list[str] = Field(default_factory=list)
+    prior_penalty_level: PriorPenaltyLevel = "none"
+    expected_payoff_efficiency_hint_summary: dict[str, float | None] = Field(default_factory=dict)
+
+
+class AIDecisionContextPacket(StrictBaseModel):
+    ai_context_version: str = AI_CONTEXT_VERSION
+    symbol: str = Field(min_length=1, max_length=30)
+    timeframe: str = Field(min_length=1, max_length=20)
+    trigger_type: AITriggerReason | None = None
+    composite_regime: CompositeRegimePacket
+    data_quality: DataQualityPacket
+    previous_thesis: PreviousThesisDeltaPacket = Field(default_factory=PreviousThesisDeltaPacket)
+    prior_context: AIPriorContextPacket = Field(default_factory=AIPriorContextPacket)
+    strategy_engine: str | None = None
+    strategy_engine_context: dict[str, Any] = Field(default_factory=dict)
+    holding_profile: HoldingProfile | None = None
+    holding_profile_reason: str | None = None
+    assigned_slot: str | None = Field(default=None, min_length=1, max_length=40)
+    candidate_weight: float | None = None
+    capacity_reason: str | None = None
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    hard_stop_active: bool | None = None
+    stop_widening_allowed: bool | None = None
+    initial_stop_type: str | None = None
+    selection_context_summary: dict[str, Any] = Field(default_factory=dict)
+    prompt_family_hint: str | None = None
 
 
 class ChiefReviewSummary(StrictBaseModel):
@@ -821,6 +1012,18 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     confidence: float | None = None
     rationale_codes: list[str] = Field(default_factory=list)
     explanation_short: str | None = None
+    holding_profile: HoldingProfile | None = None
+    holding_profile_reason: str | None = None
+    assigned_slot: str | None = None
+    candidate_weight: float | None = None
+    capacity_reason: str | None = None
+    portfolio_slot_soft_cap_applied: bool = False
+    last_ai_trigger_reason: AITriggerReason | None = None
+    last_ai_invoked_at: datetime | None = None
+    next_ai_review_due_at: datetime | None = None
+    trigger_deduped: bool = False
+    trigger_fingerprint: str | None = None
+    last_ai_skip_reason: str | None = None
     decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
     raw_output: dict[str, Any] = Field(default_factory=dict)
 
@@ -880,6 +1083,12 @@ class OperatorRiskSnapshot(StrictBaseModel):
     auto_resized_entry: bool = False
     size_adjustment_ratio: float | None = None
     auto_resize_reason: str | None = None
+    holding_profile: HoldingProfile | None = None
+    holding_profile_reason: str | None = None
+    assigned_slot: str | None = None
+    candidate_weight: float | None = None
+    capacity_reason: str | None = None
+    portfolio_slot_soft_cap_applied: bool = False
     exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
     debug_payload: dict[str, Any] = Field(default_factory=dict)
     current_cycle_result: dict[str, Any] = Field(default_factory=dict)
@@ -941,6 +1150,22 @@ class OperatorPositionSummary(StrictBaseModel):
     stop_widening_allowed: bool | None = None
 
 
+class OperatorCandidateSelectionSnapshot(StrictBaseModel):
+    symbol: str | None = None
+    selected: bool | None = None
+    selection_reason: str | None = None
+    selected_reason: str | None = None
+    rejected_reason: str | None = None
+    strategy_engine: str | None = None
+    holding_profile: HoldingProfile | None = None
+    holding_profile_reason: str | None = None
+    assigned_slot: str | None = None
+    candidate_weight: float | None = None
+    capacity_reason: str | None = None
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    portfolio_slot_soft_cap_applied: bool = False
+
+
 class OperatorProtectionSummary(StrictBaseModel):
     status: str = "unknown"
     protected: bool = False
@@ -974,11 +1199,11 @@ class OperatorSymbolSummary(StrictBaseModel):
     execution: OperatorExecutionSnapshot = Field(default_factory=OperatorExecutionSnapshot)
     open_position: OperatorPositionSummary = Field(default_factory=OperatorPositionSummary)
     protection_status: OperatorProtectionSummary = Field(default_factory=OperatorProtectionSummary)
+    candidate_selection: OperatorCandidateSelectionSnapshot = Field(default_factory=OperatorCandidateSelectionSnapshot)
     blocked_reasons: list[str] = Field(default_factory=list)
     live_execution_ready: bool = False
     stale_flags: list[str] = Field(default_factory=list)
     last_updated_at: datetime | None = None
-    candidate_selection: dict[str, Any] = Field(default_factory=dict)
     audit_events: list[AuditTimelineEntry] = Field(default_factory=list)
 
 
@@ -1474,6 +1699,8 @@ class SymbolCadenceOverride(StrictBaseModel):
     position_management_interval_seconds_override: int | None = Field(default=None, ge=30, le=86400)
     decision_cycle_interval_minutes_override: int | None = Field(default=None, ge=1, le=1440)
     ai_call_interval_minutes_override: int | None = Field(default=None, ge=5, le=1440)
+    ai_backstop_enabled_override: bool | None = None
+    ai_backstop_interval_minutes_override: int | None = Field(default=None, ge=15, le=10080)
 
 
 class SymbolEffectiveCadence(StrictBaseModel):
@@ -1485,6 +1712,8 @@ class SymbolEffectiveCadence(StrictBaseModel):
     position_management_interval_seconds: int = Field(ge=30, le=86400)
     decision_cycle_interval_minutes: int = Field(ge=1, le=1440)
     ai_call_interval_minutes: int = Field(ge=5, le=1440)
+    ai_backstop_enabled: bool = True
+    ai_backstop_interval_minutes: int = Field(ge=15, le=10080)
     estimated_monthly_ai_calls: int = Field(ge=0)
     last_market_refresh_at: datetime | None = None
     last_position_management_at: datetime | None = None
@@ -1499,6 +1728,7 @@ class SymbolEffectiveCadence(StrictBaseModel):
 class AppSettingsResponse(StrictBaseModel):
     id: int
     operational_status: OperationalStatusPayload
+    control_status_summary: ControlStatusSummary = Field(default_factory=ControlStatusSummary)
     live_trading_enabled: bool
     rollout_mode: RolloutMode = "paper"
     exchange_submit_allowed: bool = False

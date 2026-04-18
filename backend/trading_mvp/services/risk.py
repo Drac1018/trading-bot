@@ -278,6 +278,76 @@ def _setup_cluster_state_context(decision_context: dict[str, Any] | None) -> dic
     }
 
 
+def _recent_performance_suppression_context(
+    decision_context: dict[str, Any] | None,
+    decision: TradeDecision,
+) -> dict[str, Any]:
+    payload = (
+        decision_context.get("suppression_context")
+        if isinstance(decision_context, dict) and isinstance(decision_context.get("suppression_context"), dict)
+        else {}
+    )
+    if payload:
+        level = str(payload.get("level") or "none")
+        reason_codes = [
+            str(item)
+            for item in payload.get("reason_codes", [])
+            if item not in {None, ""}
+        ] if isinstance(payload.get("reason_codes"), list) else []
+        sources = [
+            str(item)
+            for item in payload.get("sources", [])
+            if item not in {None, ""}
+        ] if isinstance(payload.get("sources"), list) else []
+        return {
+            "level": level,
+            "sources": sources,
+            "reason_codes": list(dict.fromkeys(reason_codes)),
+            "applies_hard_block": bool(payload.get("applies_hard_block", level == "hard_block")),
+            "applies_risk_haircut": bool(payload.get("applies_risk_haircut", level in {"hard_block", "risk_haircut"})),
+            "applies_soft_bias": bool(payload.get("applies_soft_bias", level == "soft_bias")),
+            "hold_bias": float(payload.get("hold_bias", 0.0) or 0.0),
+            "confidence_after_adjustment": float(
+                payload.get("confidence_after_adjustment", getattr(decision, "confidence", 0.0)) or 0.0
+            ),
+            "risk_pct_after_adjustment": float(
+                payload.get("risk_pct_after_adjustment", getattr(decision, "risk_pct", 0.0)) or 0.0
+            ),
+            "source": "decision_context",
+        }
+
+    setup_cluster_state = _setup_cluster_state_context(decision_context)
+    fallback_reason_codes: list[str] = []
+    fallback_sources: list[str] = []
+    level = "none"
+    if ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes:
+        fallback_reason_codes.append(ADAPTIVE_SETUP_DISABLE_REASON_CODE)
+        fallback_sources.append("adaptive_setup_disable")
+        level = "hard_block"
+    if setup_cluster_state["active"]:
+        fallback_reason_codes.append(SETUP_CLUSTER_DISABLED_REASON_CODE)
+        fallback_sources.append("setup_cluster_disable")
+        level = "hard_block"
+    if level == "none" and any(
+        code in decision.rationale_codes for code in {"ADAPTIVE_HOLD_BIAS", "ADAPTIVE_SIGNAL_UNDERPERFORMING"}
+    ):
+        fallback_reason_codes.extend(["ADAPTIVE_HOLD_BIAS", "ADAPTIVE_SIGNAL_UNDERPERFORMING"])
+        fallback_sources.append("adaptive_hold_bias")
+        level = "soft_bias"
+    return {
+        "level": level,
+        "sources": list(dict.fromkeys(fallback_sources)),
+        "reason_codes": list(dict.fromkeys(fallback_reason_codes)),
+        "applies_hard_block": level == "hard_block",
+        "applies_risk_haircut": level in {"hard_block", "risk_haircut"},
+        "applies_soft_bias": level == "soft_bias",
+        "hold_bias": 0.0,
+        "confidence_after_adjustment": float(getattr(decision, "confidence", 0.0) or 0.0),
+        "risk_pct_after_adjustment": float(getattr(decision, "risk_pct", 0.0) or 0.0),
+        "source": "fallback_from_decision",
+    }
+
+
 def _meta_gate_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
     payload = (
         decision_context.get("meta_gate")
@@ -1271,6 +1341,7 @@ def evaluate_risk(
     entry_trigger_debug: dict[str, Any] = {}
     decision_agreement = _decision_agreement_context(decision_context)
     setup_cluster_state = _setup_cluster_state_context(decision_context)
+    suppression_context = _recent_performance_suppression_context(decision_context, decision)
     meta_gate = _meta_gate_context(decision_context)
     holding_profile = _holding_profile_context(decision, decision_context)
     holding_profile_name = str(holding_profile["holding_profile"])
@@ -1398,8 +1469,8 @@ def evaluate_risk(
     if is_entry_decision:
         entry_trigger_reason_codes, entry_trigger_debug = _entry_trigger_evaluation(decision, market_snapshot)
         blocked_reason_codes.extend(entry_trigger_reason_codes)
-    if is_entry_decision and not is_protection_recovery and ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes:
-        blocked_reason_codes.append(ADAPTIVE_SETUP_DISABLE_REASON_CODE)
+    if is_entry_decision and not is_protection_recovery and suppression_context["applies_hard_block"]:
+        blocked_reason_codes.extend(list(suppression_context["reason_codes"]))
     if (
         is_entry_decision
         and decision_agreement["ai_used"]
@@ -1407,8 +1478,6 @@ def evaluate_risk(
     ):
         agreement_block_reason_code = DECISION_AGREEMENT_DISAGREEMENT_REASON_CODE
         blocked_reason_codes.append(agreement_block_reason_code)
-    if is_entry_decision and setup_cluster_state["active"]:
-        blocked_reason_codes.append(SETUP_CLUSTER_DISABLED_REASON_CODE)
     if is_entry_decision and meta_gate["applies_block"]:
         blocked_reason_codes.extend(list(meta_gate["reject_reason_codes"]))
     if is_entry_decision and holding_profile_name in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}:
@@ -1841,10 +1910,15 @@ def evaluate_risk(
             "drawdown_state": drawdown_state_code,
             "same_side_pyramiding": same_side_pyramiding,
         },
+        "suppression_context": suppression_context,
         "setup_cluster_state": setup_cluster_state,
         "adaptive_setup_disable": {
-            "active": ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes,
-            "reason_code": ADAPTIVE_SETUP_DISABLE_REASON_CODE if ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes else None,
+            "active": ADAPTIVE_SETUP_DISABLE_REASON_CODE in suppression_context["reason_codes"],
+            "reason_code": (
+                ADAPTIVE_SETUP_DISABLE_REASON_CODE
+                if ADAPTIVE_SETUP_DISABLE_REASON_CODE in suppression_context["reason_codes"]
+                else None
+            ),
         },
         "sync_timestamps": sync_timestamp_debug,
         "market_derivatives_context": market_snapshot.derivatives_context.model_dump(mode="json"),

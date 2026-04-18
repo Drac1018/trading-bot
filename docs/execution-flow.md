@@ -1,5 +1,69 @@
 # Execution Flow
 
+## 2026-04 AI Context Plumbing
+
+- `run_decision_cycle()` now builds `ai_context` before calling `TradingDecisionAgent.run(...)`.
+- The packet is persisted with the decision input payload so audit/debug can compare the model input against the returned decision.
+- `run_decision_cycle()` also attaches `prior_context` from historical engine/capital/session analytics before the provider call.
+- `prior_context` is soft-only:
+  - min sample threshold 미달이면 `unavailable`
+  - strong prior는 confidence를 소폭 올릴 수 있음
+  - weak prior + poor quality는 `hold` / `should_abstain=true`로 더 쉽게 기울 수 있음
+  - `breakout_exception`, `swing`, `position` 문맥은 quality/prior 요구가 더 엄격함
+- The decision schema adds optional rationale, invalidation, abstain, regime-risk, and payoff-timing metadata, but the execution path still honors the same post-decision flow:
+  - schema validation
+  - `risk.py` final gate
+  - `execution.py`
+- Provider outputs that omit the new optional fields remain valid. The agent backfills only metadata defaults; it does not create a new execution action type.
+
+## 2026-04 Prompt Routing And Bounded Output
+
+- `TradingDecisionAgent.run(...)` now resolves a route contract before provider invocation:
+  - `trigger_type`
+  - `strategy_engine`
+  - `prompt_family`
+  - `allowed_actions`
+  - `forbidden_actions`
+- The provider sees that contract in both natural-language instructions and a structured payload block.
+- After provider output:
+  - invalid action for the current trigger is bounded to a safe `hold` / `reduce` / `exit`
+  - breakout-exception holding profile upgrades are bounded back to `scalp`
+  - loser profile upgrades and stop widening attempts are bounded before risk review
+- On new-entry-capable routes, provider timeout / unavailable / malformed / schema-invalid output is fail-closed into `hold`.
+- On protection/reduce/emergency-style routes, provider failure falls back to deterministic management behavior and does not block survival handling.
+- Historical priors do not block survival handling. `reduce`, `exit`, protection recovery, and other deterministic management paths ignore prior penalties for execution purposes.
+- `risk.py` still receives only the normalized decision. `execution.py` still receives only intents approved by `risk.py`.
+
+## 2026-04 Hybrid AI Review Dispatch
+
+- `interval_decision_cycle` now plans review triggers before any AI call.
+- The deterministic planner reuses candidate ranking, derivatives veto, meta gate, and slot allocation to decide whether a symbol has a real review event.
+- New-entry review is dispatched only for event-bearing candidate symbols.
+- Open-position review is dispatched only when one of the following is true:
+  - `open_position_recheck_due`
+  - `protection_review_event`
+  - `periodic_backstop_due`
+- If no event exists, the scheduler writes a `decision_ai_no_event` audit row and skips the AI call entirely.
+- If the same trigger fingerprint repeats, the scheduler writes `decision_ai_deduped` and skips the AI call.
+- If the periodic backstop becomes due, the scheduler writes `decision_ai_backstop_due` and allows a limited review even without a fresh entry candidate event.
+
+## 2026-04 Position Review Cadence
+
+- `holding_profile_cadence_hint.decision_interval_minutes` is now consumed by the scheduler for open-position AI review due checks.
+- Safe fallback behavior:
+  - if the cadence hint is missing, non-numeric, or invalid, the scheduler falls back to the effective symbol `ai_call_interval_minutes`
+  - cadence is used only for AI position review timing
+  - cadence does not delay `exchange_sync_cycle`
+  - cadence does not delay `market_refresh_cycle`
+  - cadence does not delay deterministic protection or emergency handling
+- `position_management_cycle` continues to run on the existing management cadence. The scheduler clamps any profile-derived review cadence so protection handling is never slowed below the configured management baseline.
+
+## 2026-04 Direct Decision Path Consistency
+
+- Direct `run_decision_cycle()` calls now rebuild an effective `selection_context` / slot summary for AI context and audit metadata when the caller did not provide one.
+- This keeps direct/manual decision runs aligned with the ranked scheduler path for slot, capacity, and trigger metadata, even when the underlying deterministic decision path is reviewing an open position.
+- Hard exposure blocks still win over slot soft caps. Slot allocation remains a soft sizing layer and does not override hard blockers.
+
 ## Holding Profile Overlay
 
 - 신규 진입 기본 프로필은 `holding_profile=scalp`입니다.

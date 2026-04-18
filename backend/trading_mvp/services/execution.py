@@ -2746,7 +2746,11 @@ def _bounded_reconcile_submission_unknown_orders(
         should_attempt_lookup = (
             not deadline_exceeded
             and not attempt_budget_exhausted
-            and (next_reconcile_at is None or observed_at >= next_reconcile_at)
+            and (
+                attempts <= 0
+                or next_reconcile_at is None
+                or observed_at >= next_reconcile_at
+            )
         )
 
         if should_attempt_lookup:
@@ -4918,12 +4922,20 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
     emergency_actions_taken: list[dict[str, object]] = []
     guarded_symbols = list(symbols) if mode_guard_reason_code is not None else []
     for item_symbol in symbols:
-        live_orders = list(
-            session.scalars(
+        live_orders = [
+            order
+            for order in session.scalars(
                 select(Order)
                 .where(Order.mode == "live", Order.symbol == item_symbol, Order.status.notin_(FINAL_ORDER_STATUSES))
             )
-        )
+            if str(
+                _as_object_dict(
+                    _as_object_dict(order.metadata_json).get("submission_tracking")
+                ).get("submission_state")
+                or ""
+            ).lower()
+            != "submit_unknown"
+        ]
         use_rest_order_fallback, fallback_reason = should_use_rest_order_reconciliation(
             settings_row,
             active_order_count=len(live_orders),
@@ -6291,9 +6303,7 @@ def _execute_live_trade_body(
         submission_tracking = dict(exc.submission_tracking)
         now = utcnow_naive()
         submission_tracking["reconcile_attempt_count"] = 0
-        submission_tracking["next_reconcile_at"] = (
-            now + timedelta(seconds=UNRESOLVED_SUBMISSION_RECONCILE_INTERVAL_SECONDS)
-        ).isoformat()
+        submission_tracking["next_reconcile_at"] = now.isoformat()
         submission_tracking["final_resolution_deadline"] = (
             now + timedelta(seconds=UNRESOLVED_SUBMISSION_RESOLUTION_DEADLINE_SECONDS)
         ).isoformat()

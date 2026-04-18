@@ -4,6 +4,8 @@ from datetime import timedelta
 
 import pytest
 from trading_mvp.models import AgentRun, Execution, Order, Position
+from trading_mvp.schemas import AIDecisionContextPacket, CompositeRegimePacket, DataQualityPacket
+from trading_mvp.services.ai_prior_context import build_ai_prior_context
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.strategy_engine_analytics import build_strategy_engine_bucket_report
 from trading_mvp.time_utils import utcnow_naive
@@ -236,3 +238,67 @@ def test_orchestrator_build_strategy_engine_bucket_report_wrapper(db_session) ->
     assert report.decisions_analyzed == 3
     assert report.traded_decisions == 3
     assert report.bucket_reports[0].efficiency_score >= report.bucket_reports[-1].efficiency_score
+
+
+def test_ai_prior_context_builder_consumes_engine_bucket_analytics(db_session) -> None:
+    now = utcnow_naive() - timedelta(hours=10)
+    for offset_hours, pnl in ((0, 14.0), (2, 8.0), (4, 10.0)):
+        _seed_strategy_engine_trade(
+            db_session,
+            symbol="BTCUSDT",
+            created_at=now + timedelta(hours=offset_hours),
+            strategy_engine="trend_pullback_engine",
+            session_label="asia",
+            time_of_day_bucket="utc_00_05",
+            net_pnl_after_fees=pnl,
+            signed_slippage_bps=4.0,
+            time_to_profit_minutes=18.0 + offset_hours,
+            drawdown_impact=0.24,
+        )
+
+    ai_context = AIDecisionContextPacket(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        composite_regime=CompositeRegimePacket(
+            structure_regime="trend",
+            direction_regime="bullish",
+            volatility_regime="normal",
+            participation_regime="strong",
+            derivatives_regime="tailwind",
+            execution_regime="clean",
+            regime_reason_codes=["TEST_REGIME"],
+        ),
+        data_quality=DataQualityPacket(
+            data_quality_grade="complete",
+            derivatives_available=True,
+            orderbook_available=True,
+            spread_quality_available=True,
+            account_state_trustworthy=True,
+            market_state_trustworthy=True,
+        ),
+        strategy_engine="trend_pullback_engine",
+    )
+    prior_context = build_ai_prior_context(
+        db_session,
+        ai_context=ai_context,
+        selection_context={
+            "scenario": "pullback_entry",
+            "entry_mode": "pullback_confirm",
+            "execution_policy_profile": "entry_btc_fast_calm",
+            "regime_summary": {
+                "primary_regime": "bullish",
+                "trend_alignment": "bullish_aligned",
+            },
+            "strategy_engine_context": {
+                "session_context": {
+                    "session_label": "asia",
+                    "time_of_day_bucket": "utc_00_05",
+                }
+            },
+        },
+    )
+
+    assert prior_context.engine_prior_available is True
+    assert prior_context.engine_prior_classification == "strong"
+    assert prior_context.engine_prior_sample_count == 3
+    assert prior_context.engine_expectancy_hint is not None

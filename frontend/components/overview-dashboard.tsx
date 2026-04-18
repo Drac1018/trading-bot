@@ -91,6 +91,18 @@ type OperatorDecisionSnapshot = {
   confidence: number | null;
   rationale_codes: string[];
   explanation_short: string | null;
+  holding_profile: string | null;
+  holding_profile_reason: string | null;
+  assigned_slot: string | null;
+  candidate_weight: number | null;
+  capacity_reason: string | null;
+  portfolio_slot_soft_cap_applied: boolean;
+  last_ai_trigger_reason: string | null;
+  last_ai_invoked_at: string | null;
+  next_ai_review_due_at: string | null;
+  trigger_deduped: boolean;
+  trigger_fingerprint: string | null;
+  last_ai_skip_reason: string | null;
 };
 
 type OperatorRiskSnapshot = {
@@ -113,7 +125,14 @@ type OperatorRiskSnapshot = {
   auto_resized_entry: boolean;
   size_adjustment_ratio: number | null;
   auto_resize_reason: string | null;
+  holding_profile: string | null;
+  holding_profile_reason: string | null;
+  assigned_slot: string | null;
+  candidate_weight: number | null;
+  capacity_reason: string | null;
+  portfolio_slot_soft_cap_applied: boolean;
   exposure_headroom_snapshot: Record<string, number>;
+  debug_payload: Record<string, unknown>;
 };
 
 type ExecutionFillSummary = {
@@ -158,7 +177,30 @@ type OperatorPositionSummary = {
   entry_price: number | null;
   mark_price: number | null;
   unrealized_pnl: number | null;
+  realized_pnl: number | null;
   leverage: number | null;
+  holding_profile: string | null;
+  holding_profile_reason: string | null;
+  initial_stop_type: string | null;
+  ai_stop_management_allowed: boolean | null;
+  hard_stop_active: boolean | null;
+  stop_widening_allowed: boolean | null;
+};
+
+type OperatorCandidateSelectionSnapshot = {
+  symbol: string | null;
+  selected: boolean | null;
+  selection_reason: string | null;
+  selected_reason: string | null;
+  rejected_reason: string | null;
+  strategy_engine: string | null;
+  holding_profile: string | null;
+  holding_profile_reason: string | null;
+  assigned_slot: string | null;
+  candidate_weight: number | null;
+  capacity_reason: string | null;
+  blocked_reason_codes: string[];
+  portfolio_slot_soft_cap_applied: boolean;
 };
 
 type OperatorProtectionSummary = {
@@ -192,6 +234,7 @@ type OperatorSymbolSummary = {
   execution: OperatorExecutionSnapshot;
   open_position: OperatorPositionSummary;
   protection_status: OperatorProtectionSummary;
+  candidate_selection: OperatorCandidateSelectionSnapshot;
   blocked_reasons: string[];
   live_execution_ready: boolean;
   stale_flags: string[];
@@ -485,6 +528,72 @@ function executionOutcomeSummary(symbol: OperatorSymbolSummary) {
     label: `${flowLabel} 주문 제출`,
     detail: executionStatus ?? "pending",
     kind: "warn" as const,
+  };
+}
+
+function translateAiTriggerReason(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    entry_candidate_event: "entry candidate event",
+    breakout_exception_event: "breakout exception event",
+    open_position_recheck_due: "open position recheck due",
+    protection_review_event: "protection review event",
+    manual_review_event: "manual review event",
+    periodic_backstop_due: "periodic backstop due",
+  };
+  return labels[value] ?? value;
+}
+
+function translateAiSkipReason(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    NO_EVENT: "no event",
+    TRIGGER_DEDUPED: "trigger deduped",
+    AI_DISABLED: "AI disabled",
+    AI_FAILURE_BACKOFF: "failure backoff",
+    AI_COOLDOWN_ACTIVE: "cooldown active",
+    PROTECTION_REVIEW_DETERMINISTIC_ONLY: "protection review deterministic only",
+  };
+  return labels[value] ?? value;
+}
+
+function aiReviewSummary(symbol: OperatorSymbolSummary) {
+  if (symbol.ai_decision.last_ai_skip_reason === "NO_EVENT") {
+    return {
+      label: "AI 미호출",
+      detail: "no event",
+      kind: "neutral" as const,
+    };
+  }
+  if (symbol.ai_decision.trigger_deduped || symbol.ai_decision.last_ai_skip_reason === "TRIGGER_DEDUPED") {
+    return {
+      label: "AI 재호출 생략",
+      detail: "deduped",
+      kind: "warn" as const,
+    };
+  }
+  if (symbol.ai_decision.last_ai_skip_reason) {
+    return {
+      label: "AI 미호출",
+      detail: translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason),
+      kind: "warn" as const,
+    };
+  }
+  if (symbol.ai_decision.last_ai_invoked_at || symbol.ai_decision.provider_name) {
+    return {
+      label: "AI 호출",
+      detail: translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
+      kind: "good" as const,
+    };
+  }
+  return {
+    label: "AI 상태 미확정",
+    detail: "-",
+    kind: "neutral" as const,
   };
 }
 
@@ -1328,6 +1437,7 @@ function SymbolStatusBoard({
             {visibleSymbols.map((item) => {
               const blockedReasons = filteredBlockedReasons(item);
               const recommendation = recommendationSummary(item.ai_decision.decision);
+              const review = aiReviewSummary(item);
               const riskOutcome = riskOutcomeSummary(item);
               const executionOutcome = executionOutcomeSummary(item);
               const rowSelected = selectedSymbol !== ALL_SYMBOLS && item.symbol === selectedSymbol;
@@ -1347,6 +1457,9 @@ function SymbolStatusBoard({
                     <div className="space-y-1">
                       <div className="font-medium text-slate-900">{recommendation.label}</div>
                       <div className="text-xs text-slate-500">{recommendation.detail}</div>
+                      <div className="text-xs text-slate-500">
+                        {review.label} / {review.detail}
+                      </div>
                     </div>
                   </td>
                   <td className="px-3 py-3 text-sm text-slate-700">
@@ -1450,6 +1563,7 @@ function SymbolDetailPanel({
   const adjustmentReasons = filteredAdjustmentReasons(symbol);
   const autoResized = symbol.risk_guard.auto_resized_entry;
   const recommendation = recommendationSummary(symbol.ai_decision.decision);
+  const review = aiReviewSummary(symbol);
   const riskOutcome = riskOutcomeSummary(symbol);
   const executionOutcome = executionOutcomeSummary(symbol);
 
@@ -1497,6 +1611,29 @@ function SymbolDetailPanel({
         )}
       </div>
 
+      <div className="grid gap-4 lg:grid-cols-4">
+        {valueCard("AI review", review.label, review.detail)}
+        {valueCard(
+          "trigger reason",
+          translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
+          `skip ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
+        )}
+        {valueCard(
+          "last / next review",
+          formatDateTime(symbol.ai_decision.last_ai_invoked_at),
+          `next ${formatDateTime(symbol.ai_decision.next_ai_review_due_at)}`,
+        )}
+        {valueCard(
+          "candidate slot",
+          symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-",
+          `weight ${
+            symbol.ai_decision.candidate_weight ?? symbol.candidate_selection.candidate_weight ?? "-"
+          } / capacity ${
+            symbol.ai_decision.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-"
+          }`,
+        )}
+      </div>
+
       <div className="grid gap-4 xl:grid-cols-[1.15fr,0.85fr]">
         <div className="grid gap-4 lg:grid-cols-3 xl:col-span-2">
           {valueCard("AI 추천", recommendation.label, recommendation.detail)}
@@ -1535,6 +1672,15 @@ function SymbolDetailPanel({
         {detailList([
           ["provider", symbol.ai_decision.provider_name ?? "-"],
           ["trigger event", symbol.ai_decision.trigger_event ?? "-"],
+          ["last ai trigger", translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)],
+          ["last ai skip", translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)],
+          ["next ai review", formatDateTime(symbol.ai_decision.next_ai_review_due_at)],
+          ["assigned slot", symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-"],
+          [
+            "candidate weight",
+            String(symbol.ai_decision.candidate_weight ?? symbol.candidate_selection.candidate_weight ?? "-"),
+          ],
+          ["capacity reason", symbol.ai_decision.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-"],
           ["timeframe", symbol.ai_decision.timeframe ?? symbol.timeframe ?? "-"],
           ["decision run id", String(symbol.ai_decision.decision_run_id ?? "-")],
         ])}
@@ -1628,6 +1774,18 @@ function SymbolDetailPanel({
             symbol.risk_guard.auto_resize_reason
               ? translateAutoResizeReason(symbol.risk_guard.auto_resize_reason)
               : "가장 타이트한 노출도 여유 한도",
+          )}
+          {valueCard(
+            "assigned slot",
+            symbol.risk_guard.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-",
+            `weight ${
+              symbol.risk_guard.candidate_weight ?? symbol.candidate_selection.candidate_weight ?? "-"
+            }`,
+          )}
+          {valueCard(
+            "slot soft cap",
+            symbol.risk_guard.portfolio_slot_soft_cap_applied ? "applied" : "not applied",
+            symbol.risk_guard.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-",
           )}
         </div>
         <details className="rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:col-span-2">
@@ -1771,6 +1929,16 @@ function SymbolDetailPanel({
               symbol.protection_status.last_event_type
                 ? `${symbol.protection_status.last_event_type} / ${formatDateTime(symbol.protection_status.last_event_at)}`
                 : "최근 protection 이벤트 없음",
+            )}
+            {valueCard(
+              "holding profile",
+              symbol.open_position.holding_profile ?? symbol.ai_decision.holding_profile ?? "-",
+              symbol.open_position.holding_profile_reason ?? symbol.ai_decision.holding_profile_reason ?? "-",
+            )}
+            {valueCard(
+              "hard stop",
+              symbol.open_position.hard_stop_active ? "active" : "inactive",
+              symbol.open_position.stop_widening_allowed === false ? "stop widening forbidden" : "widening state unknown",
             )}
           </div>
           {symbol.protection_status.last_error ? (

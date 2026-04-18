@@ -1,5 +1,244 @@
 # API
 
+## 2026-04 AI Context Packet
+
+- Trading decision input payloads can now include `ai_context`.
+- `AgentRun.input_payload.ai_context` and `AgentRun.metadata_json.ai_context` use the same structure.
+
+### `ai_context`
+
+- `ai_context_version`
+- `symbol`
+- `timeframe`
+- `trigger_type`
+- `composite_regime`
+- `data_quality`
+- `previous_thesis`
+- `prior_context`
+- `strategy_engine`
+- `strategy_engine_context`
+- `holding_profile`
+- `holding_profile_reason`
+- `assigned_slot`
+- `candidate_weight`
+- `capacity_reason`
+- `blocked_reason_codes`
+- `hard_stop_active`
+- `stop_widening_allowed`
+- `initial_stop_type`
+- `selection_context_summary`
+- `prompt_family_hint`
+
+### `composite_regime`
+
+- `structure_regime`: `trend | range | squeeze | expansion | transition`
+- `direction_regime`: `bullish | bearish | neutral`
+- `volatility_regime`: `calm | normal | fast | shock`
+- `participation_regime`: `strong | mixed | weak`
+- `derivatives_regime`: `tailwind | neutral | headwind | unavailable`
+- `execution_regime`: `clean | normal | stress | unavailable`
+- `persistence_bars`
+- `persistence_class`: `early | established | extended`
+- `transition_risk`: `low | medium | high`
+- `regime_reason_codes`
+
+### `data_quality`
+
+- `data_quality_grade`: `complete | partial | degraded | unavailable`
+- `missing_context_flags`
+- `stale_context_flags`
+- `derivatives_available`
+- `orderbook_available`
+- `spread_quality_available`
+- `account_state_trustworthy`
+- `market_state_trustworthy`
+
+### `previous_thesis`
+
+- `previous_decision`
+- `previous_strategy_engine`
+- `previous_holding_profile`
+- `previous_rationale_codes`
+- `previous_no_trade_reason_codes`
+- `previous_invalidation_reason_codes`
+- `previous_regime_packet_summary`
+- `previous_data_quality_grade`
+- `last_ai_invoked_at`
+- `delta_changed_fields`
+- `delta_reason_codes_added`
+- `delta_reason_codes_removed`
+- `thesis_degrade_detected`
+- `regime_transition_detected`
+- `data_quality_changed`
+
+### `prior_context`
+
+- `engine_prior_available`
+- `engine_prior_sample_count`
+- `engine_sample_threshold_satisfied`
+- `engine_prior_classification`: `strong | neutral | weak | unavailable`
+- `engine_expectancy_hint`
+- `engine_net_pnl_after_fees_hint`
+- `engine_avg_signed_slippage_bps_hint`
+- `engine_time_to_profit_hint_minutes`
+- `engine_drawdown_impact_hint`
+- `capital_efficiency_available`
+- `capital_efficiency_sample_count`
+- `capital_efficiency_sample_threshold_satisfied`
+- `capital_efficiency_classification`: `efficient | neutral | inefficient | unavailable`
+- `pnl_per_exposure_hour_hint`
+- `net_pnl_after_fees_per_hour_hint`
+- `time_to_0_25r_hint_minutes`
+- `time_to_0_5r_hint_minutes`
+- `time_to_fail_hint_minutes`
+- `capital_slot_occupancy_efficiency_hint`
+- `session_prior_available`
+- `session_prior_sample_count`
+- `session_sample_threshold_satisfied`
+- `session_prior_classification`: `strong | neutral | weak | unavailable`
+- `time_of_day_prior_available`
+- `time_of_day_prior_sample_count`
+- `time_of_day_sample_threshold_satisfied`
+- `time_of_day_prior_classification`: `strong | neutral | weak | unavailable`
+- `prior_reason_codes`
+- `prior_penalty_level`: `none | light | medium | strong`
+- `expected_payoff_efficiency_hint_summary`
+
+### Prior live behavior
+
+- prior는 soft-only 입니다. `risk.py` hard gate와 `execution.py` 실행 경계는 바뀌지 않습니다.
+- sample threshold 미달이면 해당 prior는 `unavailable`로 남고 live confidence/abstain에 영향 주지 않습니다.
+- `data_quality.degraded | unavailable`는 neutral이 아니라 uncertainty로 남습니다.
+- `breakout_exception_engine`, `swing`, `position` 문맥은 weak prior 또는 poor quality에서 더 쉽게 `hold` / `should_abstain=true`로 기웁니다.
+- `reduce`, `exit`, `protection_review_event` 같은 survival path는 prior 때문에 막히지 않습니다.
+
+## 2026-04 TradeDecision Optional Metadata Additions
+
+- Existing action enum stays unchanged: `hold | long | short | reduce | exit`
+- The response schema now also accepts:
+  - `confidence_band`
+  - `recommended_holding_profile`
+  - `primary_reason_codes`
+  - `no_trade_reason_codes`
+  - `abstain_reason_codes`
+  - `invalidation_reason_codes`
+  - `expected_time_to_0_25r_minutes`
+  - `expected_time_to_0_5r_minutes`
+  - `expected_mae_r`
+  - `regime_transition_risk`
+  - `data_quality_penalty_applied`
+  - `should_abstain`
+  - `bounded_output_applied`
+  - `fallback_reason_codes`
+  - `fail_closed_applied`
+  - `provider_status`
+  - `engine_prior_classification`
+  - `capital_efficiency_classification`
+  - `session_prior_classification`
+  - `time_of_day_prior_classification`
+  - `prior_penalty_level`
+  - `prior_reason_codes`
+  - `sample_threshold_satisfied`
+  - `confidence_adjustment_applied`
+  - `abstain_due_to_prior_and_quality`
+  - `expected_payoff_efficiency_hint_summary`
+  - `prompt_family_hint`
+  - `ai_context_version`
+- These fields are backward-compatible. Existing provider/mock payloads that only return the legacy minimum shape still validate.
+
+## 2026-04 Prompt Routing / Bounded Output / Fail-Closed
+
+- `TradingDecisionAgent` resolves prompt family from `strategy_engine × trigger_type`.
+- `ai_context.prior_context` is consumed as soft prior only:
+  - strong prior can lift confidence modestly
+  - weak prior and poor quality can lower confidence or set `should_abstain=true`
+  - inefficient capital efficiency can downgrade aggressive holding-profile proposals back toward `scalp`
+- These adjustments happen before bounded output reaches `risk.py`, but they do not create a new hard gate.
+- `TradingDecisionAgent` now resolves a prompt family from `strategy_engine × trigger_type`.
+- Current prompt families:
+  - `entry_pullback_review`
+  - `entry_continuation_review`
+  - `breakout_exception_review`
+  - `range_mean_reversion_review`
+  - `open_position_thesis_review`
+  - `protection_reduce_review`
+  - `periodic_backstop_review`
+- `AgentRun.metadata_json` for `trading_decision` now carries:
+  - `trigger_type`
+  - `strategy_engine_name`
+  - `prompt_family`
+  - `allowed_actions`
+  - `forbidden_actions`
+  - `bounded_output_applied`
+  - `fallback_reason_codes`
+  - `fail_closed_applied`
+  - `provider_status`
+  - `should_abstain`
+  - `abstain_reason_codes`
+- `TradingDecision.output_payload` can also carry the same bounded/fail-closed flags through:
+  - `bounded_output_applied`
+  - `fallback_reason_codes`
+  - `fail_closed_applied`
+  - `provider_status`
+  - `should_abstain`
+  - `abstain_reason_codes`
+- Fail-closed applies only to new-entry-capable review families. Provider timeout, provider unavailable, malformed output, or schema validation failure normalizes the decision to `hold` before `risk.py`.
+- `protection_review_event`, `reduce`, `exit`, protection recovery, and other deterministic survival paths remain executable without AI and are not blocked by provider failure.
+
+## 2026-04 Hybrid AI Review Fields
+
+### Trigger reasons
+
+- `entry_candidate_event`
+- `breakout_exception_event`
+- `open_position_recheck_due`
+- `protection_review_event`
+- `manual_review_event`
+- `periodic_backstop_due`
+
+### Settings payload additions
+
+- `symbol_cadence_overrides` rows may now include:
+  - `ai_backstop_enabled_override`
+  - `ai_backstop_interval_minutes_override`
+- `symbol_effective_cadences` rows now include:
+  - `ai_backstop_enabled`
+  - `ai_backstop_interval_minutes`
+
+### Operator / dashboard observability additions
+
+- `GET /api/dashboard/operator` symbol decision snapshot can now expose:
+  - `last_ai_trigger_reason`
+  - `last_ai_invoked_at`
+  - `next_ai_review_due_at`
+  - `trigger_deduped`
+  - `trigger_fingerprint`
+  - `last_ai_skip_reason`
+- These fields are sourced from the latest decision metadata and may be overlaid by the latest `interval_decision_cycle` scheduler outcome when the latest scheduler state is newer than the latest decision row.
+
+### Interval decision cycle audit states
+
+- `interval_decision_cycle` outcomes distinguish:
+  - AI invoked
+  - no event
+  - deduped trigger
+  - periodic backstop due
+- Expected audit events include:
+  - `decision_ai_invoked`
+  - `decision_ai_skipped`
+  - `decision_ai_no_event`
+  - `decision_ai_deduped`
+  - `decision_ai_backstop_due`
+
+### Execution boundary reminder
+
+- Hybrid review changes only affect when AI is consulted.
+- The execution boundary remains:
+  - schema validation
+  - `risk.py` final gate
+  - `execution.py`
+- `reduce`, `exit`, `reduce_only`, `protection recovery`, and `emergency` flows remain deterministic-capable paths and are not blocked on AI review availability.
+
 ## Holding Profile Fields
 
 - `TradeDecision`, decision metadata, candidate ranking, pending entry plan snapshot, `ExecutionIntent`, execution result, and `position_management` metadata can now carry:
@@ -385,6 +624,11 @@ staged rollout semantics:
       - `cluster_key`
       - `disable_reason_codes`
       - `disabled_at`, `cooldown_expires_at`
+    - `suppression_context`
+      - `level`: `none | risk_haircut | soft_bias | hard_block`
+      - `sources`
+      - `reason_codes`
+      - `applies_hard_block`, `applies_risk_haircut`, `applies_soft_bias`
       - `metrics`, `recovery_condition`
     - `drawdown_state`
       - `current_drawdown_state`
@@ -503,6 +747,11 @@ staged rollout semantics:
     - `expectancy < 0`
     - `net_pnl_after_fees < 0`
     - 그리고 `loss_streak >= 3` 또는 `avg_signed_slippage_bps >= 12`
+- `debug_payload.suppression_context`는 recent performance suppression의 최종 stage를 남깁니다.
+  - `hard_block`: adaptive setup disable 또는 setup cluster disable이 활성화되어 신규 진입을 최종 차단
+  - `soft_bias`: hold bias만 강하고 최종 차단은 아님
+  - `risk_haircut`: agents가 confidence/risk_pct를 낮춰 넘긴 상태
+  - source-of-truth는 `risk_guard`이며, `agents`는 suppression 정보를 metadata로만 전달합니다.
     - 최소 sample size `4`, lookback `8`
   - 상태 필드:
     - `status`: `active_disabled`, `cooldown_elapsed`, `metrics_recovered`, `monitoring`, `insufficient_data`

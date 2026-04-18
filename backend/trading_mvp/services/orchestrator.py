@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from datetime import datetime, timedelta
 from math import sqrt
@@ -24,6 +26,7 @@ from trading_mvp.models import (
 )
 from trading_mvp.providers import build_model_provider
 from trading_mvp.schemas import (
+    AIReviewTriggerPayload,
     FeaturePayload,
     MarketSnapshotPayload,
     PendingEntryPlanSnapshot,
@@ -44,6 +47,8 @@ from trading_mvp.services.agents import (
     build_trading_decision_input_payload,
     persist_agent_run,
 )
+from trading_mvp.services.ai_context import build_ai_decision_context
+from trading_mvp.services.ai_prior_context import build_ai_prior_context
 from trading_mvp.services.ai_usage import get_openai_call_gate
 from trading_mvp.services.audit import (
     create_alert,
@@ -495,6 +500,182 @@ class TradingOrchestrator:
             if isinstance(snapshot_time, str) and snapshot_time:
                 return snapshot_time
         return None
+
+    @staticmethod
+    def _agent_run_matches_symbol(
+        row: AgentRun,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> bool:
+        symbol_upper = symbol.upper()
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+        output_payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+        market_snapshot = input_payload.get("market_snapshot")
+        candidates = [
+            (
+                str(metadata.get("symbol") or "").upper(),
+                str(metadata.get("timeframe") or ""),
+            ),
+            (
+                str(output_payload.get("symbol") or "").upper(),
+                str(output_payload.get("timeframe") or ""),
+            ),
+            (
+                str(market_snapshot.get("symbol") or "").upper(),
+                str(market_snapshot.get("timeframe") or ""),
+            )
+            if isinstance(market_snapshot, dict)
+            else ("", ""),
+        ]
+        for candidate_symbol, candidate_timeframe in candidates:
+            if candidate_symbol != symbol_upper:
+                continue
+            if timeframe is None or not timeframe or candidate_timeframe in {"", timeframe}:
+                return True
+        return False
+
+    def _latest_symbol_decision_run(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> AgentRun | None:
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(AgentRun.role == AgentRole.TRADING_DECISION.value)
+                .order_by(desc(AgentRun.created_at))
+                .limit(100)
+            )
+        )
+        for row in rows:
+            if self._agent_run_matches_symbol(row, symbol=symbol, timeframe=timeframe):
+                return row
+        return None
+
+    def _latest_symbol_ai_invoked_at(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> datetime | None:
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(AgentRun.role == AgentRole.TRADING_DECISION.value)
+                .order_by(desc(AgentRun.created_at))
+                .limit(100)
+            )
+        )
+        for row in rows:
+            if not self._agent_run_matches_symbol(row, symbol=symbol, timeframe=timeframe):
+                continue
+            metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            if row.provider_name == "openai" or str(metadata.get("source") or "") == "llm":
+                return row.created_at
+        return None
+
+    @staticmethod
+    def _selection_ranking_lookup(candidate_selection: dict[str, object]) -> dict[str, dict[str, object]]:
+        return {
+            str(item.get("symbol") or "").upper(): dict(item)
+            for item in candidate_selection.get("rankings", [])
+            if isinstance(item, dict) and item.get("symbol")
+        }
+
+    def _selection_context_from_candidate_selection(
+        self,
+        *,
+        symbol: str,
+        candidate_selection: dict[str, object],
+    ) -> dict[str, object]:
+        ranking_lookup = self._selection_ranking_lookup(candidate_selection)
+        ranking_payload = ranking_lookup.get(symbol.upper(), {})
+        breadth_summary = (
+            dict(candidate_selection.get("breadth_summary") or {})
+            if isinstance(candidate_selection.get("breadth_summary"), dict)
+            else {}
+        )
+        candidate_payload = _as_dict(ranking_payload.get("candidate"))
+        slot_allocation = {
+            "assigned_slot": ranking_payload.get("assigned_slot"),
+            "slot_label": ranking_payload.get("slot_label"),
+            "candidate_weight": ranking_payload.get("candidate_weight"),
+            "portfolio_weight": ranking_payload.get("portfolio_weight"),
+            "slot_conviction_score": ranking_payload.get("slot_conviction_score"),
+            "meta_gate_probability": ranking_payload.get("meta_gate_probability"),
+            "agreement_alignment_score": ranking_payload.get("agreement_alignment_score"),
+            "agreement_level_hint": ranking_payload.get("agreement_level_hint"),
+            "execution_quality_score": ranking_payload.get("execution_quality_score"),
+            "risk_pct_multiplier": ranking_payload.get("slot_risk_pct_multiplier"),
+            "leverage_multiplier": ranking_payload.get("slot_leverage_multiplier"),
+            "notional_multiplier": ranking_payload.get("slot_notional_multiplier"),
+            "applies_soft_limit": ranking_payload.get("slot_applies_soft_cap"),
+        }
+        return {
+            "universe_breadth": breadth_summary,
+            "breadth_regime": candidate_selection.get("breadth_regime"),
+            "capacity_reason": candidate_selection.get("capacity_reason"),
+            "drawdown_capacity_reason": candidate_selection.get("drawdown_capacity_reason"),
+            "drawdown_state": dict(candidate_selection.get("drawdown_state") or {}),
+            "portfolio_weight": ranking_payload.get("portfolio_weight"),
+            "candidate_weight": ranking_payload.get("candidate_weight"),
+            "holding_profile": ranking_payload.get("holding_profile") or candidate_payload.get("holding_profile"),
+            "holding_profile_reason": ranking_payload.get("holding_profile_reason")
+            or candidate_payload.get("holding_profile_reason"),
+            "holding_profile_context": _as_dict(ranking_payload.get("holding_profile_context")),
+            "strategy_engine": ranking_payload.get("strategy_engine") or candidate_payload.get("strategy_engine"),
+            "strategy_engine_context": _as_dict(ranking_payload.get("strategy_engine_context")),
+            "assigned_slot": ranking_payload.get("assigned_slot"),
+            "slot_label": ranking_payload.get("slot_label"),
+            "slot_reason": ranking_payload.get("slot_reason"),
+            "slot_conviction_score": ranking_payload.get("slot_conviction_score"),
+            "meta_gate_probability": ranking_payload.get("meta_gate_probability"),
+            "agreement_alignment_score": ranking_payload.get("agreement_alignment_score"),
+            "agreement_level_hint": ranking_payload.get("agreement_level_hint"),
+            "execution_quality_score": ranking_payload.get("execution_quality_score"),
+            "slot_risk_pct_multiplier": ranking_payload.get("slot_risk_pct_multiplier"),
+            "slot_leverage_multiplier": ranking_payload.get("slot_leverage_multiplier"),
+            "slot_notional_multiplier": ranking_payload.get("slot_notional_multiplier"),
+            "slot_applies_soft_cap": ranking_payload.get("slot_applies_soft_cap"),
+            "slot_allocation": slot_allocation,
+            "breadth_score_multiplier": ranking_payload.get("breadth_score_multiplier"),
+            "breadth_score_adjustment": ranking_payload.get("breadth_score_adjustment"),
+            "breadth_hold_bias": ranking_payload.get("breadth_hold_bias"),
+            "breadth_adjustment_reasons": ranking_payload.get("breadth_adjustment_reasons"),
+            "selection_reason": ranking_payload.get("selection_reason"),
+            "selected_reason": ranking_payload.get("selected_reason"),
+            "rejected_reason": ranking_payload.get("rejected_reason"),
+            "selected": ranking_payload.get("selected"),
+            "entry_mode": ranking_payload.get("entry_mode"),
+            "candidate_entry_mode": ranking_payload.get("entry_mode"),
+            "scenario": candidate_payload.get("scenario"),
+            "expected_scenario": candidate_payload.get("scenario"),
+            "candidate": candidate_payload,
+            "score": _as_dict(ranking_payload.get("score")),
+            "reason_codes": list(candidate_payload.get("rationale_codes") or []),
+        }
+
+    def _default_selection_context_for_symbol(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        upto_index: int | None,
+        force_stale: bool,
+    ) -> dict[str, object]:
+        candidate_selection = self._rank_candidate_symbols(
+            decision_symbols=[symbol.upper()],
+            timeframe=timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+        )
+        return self._selection_context_from_candidate_selection(
+            symbol=symbol,
+            candidate_selection=candidate_selection,
+        )
 
     def _latest_feature_snapshot_payload(self, *, symbol: str, timeframe: str) -> dict[str, object]:
         row = self.session.scalar(
@@ -3729,6 +3910,12 @@ class TradingOrchestrator:
                 "execution_quality_score": slot_allocation_payload.get("execution_quality_score"),
                 "breadth_alignment_score": slot_allocation_payload.get("breadth_alignment_score"),
                 "performance_summary": performance_summary,
+                "entry_mode": item.get("entry_mode"),
+                "strategy_engine": item.get("strategy_engine"),
+                "strategy_engine_context": item.get("strategy_engine_context"),
+                "holding_profile": item.get("holding_profile"),
+                "holding_profile_reason": item.get("holding_profile_reason"),
+                "holding_profile_context": item.get("holding_profile_context"),
                 "candidate": candidate.model_dump(mode="json"),
                 "score": score.model_dump(mode="json"),
             }
@@ -4235,6 +4422,342 @@ class TradingOrchestrator:
             "auto_resume": auto_resume_result,
         }
 
+    @staticmethod
+    def _position_review_interval_minutes(
+        cadence_profile: dict[str, object],
+        *,
+        effective_settings: object,
+    ) -> int:
+        cadence_hint = _as_dict(cadence_profile.get("holding_profile_cadence_hint"))
+        hint_minutes = cadence_hint.get("decision_interval_minutes")
+        if isinstance(hint_minutes, (int, float)) and int(hint_minutes) > 0:
+            return int(hint_minutes)
+        effective_cadence = _as_dict(cadence_profile.get("effective_cadence"))
+        cadence_minutes = effective_cadence.get("ai_call_interval_minutes")
+        if isinstance(cadence_minutes, (int, float)) and int(cadence_minutes) > 0:
+            return int(cadence_minutes)
+        return max(int(getattr(effective_settings, "ai_call_interval_minutes", 30)), 1)
+
+    @staticmethod
+    def _next_due_at(*values: datetime | None) -> datetime | None:
+        due_values = [value for value in values if isinstance(value, datetime)]
+        return min(due_values) if due_values else None
+
+    @staticmethod
+    def _trigger_fingerprint(payload: dict[str, object]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+    def _build_review_trigger_payload(
+        self,
+        *,
+        trigger_reason: str,
+        symbol: str,
+        timeframe: str,
+        strategy_engine: str | None,
+        holding_profile: str | None,
+        assigned_slot: str | None,
+        candidate_weight: object,
+        reason_codes: list[str],
+        last_decision_at: datetime | None,
+        triggered_at: datetime,
+        fingerprint_material: dict[str, object],
+    ) -> AIReviewTriggerPayload:
+        return AIReviewTriggerPayload(
+            trigger_reason=trigger_reason,  # type: ignore[arg-type]
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_engine=strategy_engine or None,
+            holding_profile=(holding_profile or "scalp"),  # type: ignore[arg-type]
+            assigned_slot=assigned_slot or None,
+            candidate_weight=_safe_float(candidate_weight, default=0.0)
+            if candidate_weight not in {None, ""}
+            else None,
+            reason_codes=list(dict.fromkeys([str(code) for code in reason_codes if code])),
+            trigger_fingerprint=self._trigger_fingerprint(fingerprint_material),
+            last_decision_at=last_decision_at,
+            triggered_at=triggered_at,
+        )
+
+    def build_interval_decision_plan(
+        self,
+        *,
+        symbols: list[str],
+        timeframe: str | None = None,
+        upto_index: int | None = None,
+        force_stale: bool = False,
+        triggered_at: datetime | None = None,
+    ) -> dict[str, object]:
+        generated_at = triggered_at or utcnow_naive()
+        tracked_symbols = [item.upper() for item in symbols if item]
+        runtime_state = summarize_runtime_state(self.settings_row)
+        missing_protection_symbols = {
+            str(item).upper()
+            for item in runtime_state.get("missing_protection_symbols", [])
+            if item
+        }
+        effective_lookup = {
+            item.symbol: item
+            for item in get_effective_symbol_schedule(self.settings_row)
+            if item.enabled and item.symbol in tracked_symbols
+        }
+        open_positions_by_symbol = {
+            symbol: list(get_open_positions(self.session, symbol))
+            for symbol in tracked_symbols
+            if symbol in effective_lookup
+        }
+        flat_symbols = [
+            symbol
+            for symbol in tracked_symbols
+            if symbol in effective_lookup and not open_positions_by_symbol.get(symbol)
+        ]
+        candidate_selection = (
+            self._rank_candidate_symbols(
+                decision_symbols=flat_symbols,
+                timeframe=timeframe,
+                upto_index=upto_index,
+                force_stale=force_stale,
+            )
+            if flat_symbols
+            else {
+                "mode": "no_flat_symbols",
+                "breadth_summary": {},
+                "breadth_regime": "mixed",
+                "selected_symbols": [],
+                "skipped_symbols": [],
+                "rankings": [],
+            }
+        )
+        ranking_lookup = self._selection_ranking_lookup(candidate_selection)
+        plans: list[dict[str, object]] = []
+        for symbol in tracked_symbols:
+            effective = effective_lookup.get(symbol)
+            if effective is None:
+                continue
+            effective_timeframe = timeframe or effective.timeframe
+            open_positions = list(open_positions_by_symbol.get(symbol) or [])
+            latest_decision_run = self._latest_symbol_decision_run(
+                symbol=symbol,
+                timeframe=effective_timeframe,
+            )
+            last_decision_at = latest_decision_run.created_at if latest_decision_run is not None else None
+            last_ai_invoked_at = self._latest_symbol_ai_invoked_at(
+                symbol=symbol,
+                timeframe=effective_timeframe,
+            )
+            cadence_profile = self.get_symbol_cadence_profile(
+                symbol=symbol,
+                timeframe=effective_timeframe,
+                runtime_state=runtime_state,
+                open_positions=open_positions,
+            )
+            review_interval_minutes = self._position_review_interval_minutes(
+                cadence_profile,
+                effective_settings=effective,
+            )
+            position_review_due_at = (
+                last_decision_at + timedelta(minutes=review_interval_minutes)
+                if last_decision_at is not None
+                else None
+            )
+            backstop_due_at = (
+                last_decision_at + timedelta(minutes=effective.ai_backstop_interval_minutes)
+                if effective.ai_backstop_enabled and last_decision_at is not None
+                else None
+            )
+            next_ai_review_due_at = self._next_due_at(position_review_due_at, backstop_due_at)
+            trigger_payload: AIReviewTriggerPayload | None = None
+            selection_context: dict[str, object] | None = None
+            trigger_deduped = False
+            last_ai_skip_reason: str | None = None
+            latest_metadata = (
+                latest_decision_run.metadata_json
+                if latest_decision_run is not None and isinstance(latest_decision_run.metadata_json, dict)
+                else {}
+            )
+            latest_trigger_payload = _as_dict(latest_metadata.get("ai_trigger"))
+            latest_output_payload = (
+                latest_decision_run.output_payload
+                if latest_decision_run is not None and isinstance(latest_decision_run.output_payload, dict)
+                else {}
+            )
+
+            if open_positions:
+                position_row = open_positions[0]
+                position_metadata = _as_dict(getattr(position_row, "metadata_json", {}))
+                position_management = _as_dict(position_metadata.get("position_management"))
+                trigger_reason: str | None = None
+                reason_codes: list[str] = []
+                if symbol in missing_protection_symbols:
+                    trigger_reason = "protection_review_event"
+                    reason_codes.append("MISSING_PROTECTIVE_ORDERS")
+                elif str(runtime_state.get("operating_state") or "") == PROTECTION_REQUIRED_STATE:
+                    trigger_reason = "protection_review_event"
+                    reason_codes.append(PROTECTION_REQUIRED_STATE)
+                elif backstop_due_at is not None and backstop_due_at <= generated_at:
+                    trigger_reason = "periodic_backstop_due"
+                    reason_codes.append("PERIODIC_BACKSTOP_DUE")
+                elif position_review_due_at is not None and position_review_due_at <= generated_at:
+                    trigger_reason = "open_position_recheck_due"
+                    reason_codes.append("OPEN_POSITION_RECHECK_DUE")
+
+                if trigger_reason is not None:
+                    strategy_engine_name = _strategy_engine_name_from_payload(
+                        latest_metadata,
+                        latest_output_payload,
+                    )
+                    slot_allocation = _as_dict(latest_metadata.get("slot_allocation"))
+                    holding_profile = (
+                        str(position_management.get("holding_profile") or "")
+                        or str(cadence_profile.get("active_holding_profile") or "")
+                        or str(latest_metadata.get("holding_profile") or "")
+                        or "scalp"
+                    )
+                    trigger_payload = self._build_review_trigger_payload(
+                        trigger_reason=trigger_reason,
+                        symbol=symbol,
+                        timeframe=effective_timeframe,
+                        strategy_engine=strategy_engine_name or None,
+                        holding_profile=holding_profile,
+                        assigned_slot=str(slot_allocation.get("assigned_slot") or "") or None,
+                        candidate_weight=slot_allocation.get("candidate_weight"),
+                        reason_codes=reason_codes,
+                        last_decision_at=last_decision_at,
+                        triggered_at=generated_at,
+                        fingerprint_material={
+                            "trigger_reason": trigger_reason,
+                            "symbol": symbol,
+                            "timeframe": effective_timeframe,
+                            "holding_profile": holding_profile,
+                            "strategy_engine": strategy_engine_name,
+                            "assigned_slot": slot_allocation.get("assigned_slot"),
+                            "candidate_weight": round(
+                                _safe_float(slot_allocation.get("candidate_weight"), default=0.0),
+                                6,
+                            ),
+                            "reason_codes": sorted(reason_codes),
+                            "position_side": getattr(position_row, "side", None),
+                            "position_status": getattr(position_row, "status", None),
+                            "position_quantity": round(
+                                _safe_float(getattr(position_row, "quantity", None), default=0.0),
+                                8,
+                            ),
+                            "protection_state": bool(symbol in missing_protection_symbols),
+                        },
+                    )
+            else:
+                selection_context = self._selection_context_from_candidate_selection(
+                    symbol=symbol,
+                    candidate_selection=candidate_selection,
+                )
+                ranking_payload = ranking_lookup.get(symbol, {})
+                candidate_payload = _as_dict(selection_context.get("candidate"))
+                candidate_decision = str(candidate_payload.get("decision") or "").lower()
+                strategy_engine_name = str(
+                    selection_context.get("strategy_engine")
+                    or candidate_payload.get("strategy_engine")
+                    or "unspecified"
+                )
+                trigger_reason: str | None = None
+                reason_codes = [
+                    str(code)
+                    for code in candidate_payload.get("rationale_codes", [])
+                    if code not in {None, ""}
+                ] if isinstance(candidate_payload.get("rationale_codes"), list) else []
+                if bool(ranking_payload.get("selected")) and candidate_decision in {"long", "short"}:
+                    trigger_reason = (
+                        "breakout_exception_event"
+                        if strategy_engine_name == "breakout_exception_engine"
+                        or str(selection_context.get("entry_mode") or "") == "breakout_confirm"
+                        else "entry_candidate_event"
+                    )
+                elif backstop_due_at is not None and backstop_due_at <= generated_at:
+                    trigger_reason = "periodic_backstop_due"
+                    reason_codes = list(dict.fromkeys(reason_codes + ["PERIODIC_BACKSTOP_DUE"]))
+
+                if trigger_reason is not None:
+                    trigger_payload = self._build_review_trigger_payload(
+                        trigger_reason=trigger_reason,
+                        symbol=symbol,
+                        timeframe=effective_timeframe,
+                        strategy_engine=strategy_engine_name or None,
+                        holding_profile=str(
+                            selection_context.get("holding_profile")
+                            or candidate_payload.get("holding_profile")
+                            or "scalp"
+                        ),
+                        assigned_slot=str(selection_context.get("assigned_slot") or "") or None,
+                        candidate_weight=selection_context.get("candidate_weight"),
+                        reason_codes=reason_codes,
+                        last_decision_at=last_decision_at,
+                        triggered_at=generated_at,
+                        fingerprint_material={
+                            "trigger_reason": trigger_reason,
+                            "symbol": symbol,
+                            "timeframe": effective_timeframe,
+                            "strategy_engine": strategy_engine_name,
+                            "holding_profile": selection_context.get("holding_profile")
+                            or candidate_payload.get("holding_profile"),
+                            "assigned_slot": selection_context.get("assigned_slot"),
+                            "candidate_weight": round(
+                                _safe_float(selection_context.get("candidate_weight"), default=0.0),
+                                6,
+                            ),
+                            "reason_codes": sorted(reason_codes),
+                            "decision": candidate_payload.get("decision"),
+                            "scenario": candidate_payload.get("scenario"),
+                            "selection_reason": selection_context.get("selection_reason"),
+                            "slot_conviction_score": round(
+                                _safe_float(selection_context.get("slot_conviction_score"), default=0.0),
+                                6,
+                            ),
+                            "meta_gate_probability": round(
+                                _safe_float(selection_context.get("meta_gate_probability"), default=0.0),
+                                6,
+                            ),
+                            "score_total": round(
+                                _safe_float(_as_dict(selection_context.get("score")).get("total_score"), default=0.0),
+                                6,
+                            ),
+                        },
+                    )
+
+            if (
+                trigger_payload is not None
+                and trigger_payload.trigger_reason not in {"periodic_backstop_due", "manual_review_event"}
+                and str(latest_trigger_payload.get("trigger_reason") or "") == trigger_payload.trigger_reason
+                and str(latest_trigger_payload.get("trigger_fingerprint") or "") == trigger_payload.trigger_fingerprint
+            ):
+                trigger_deduped = True
+                last_ai_skip_reason = "TRIGGER_DEDUPED"
+
+            if trigger_payload is None:
+                last_ai_skip_reason = "NO_EVENT"
+
+            plans.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": effective_timeframe,
+                    "cadence": cadence_profile,
+                    "selection_context": selection_context,
+                    "trigger": trigger_payload.model_dump(mode="json") if trigger_payload is not None else None,
+                    "trigger_deduped": trigger_deduped,
+                    "last_decision_at": last_decision_at.isoformat() if last_decision_at is not None else None,
+                    "last_ai_invoked_at": last_ai_invoked_at.isoformat() if last_ai_invoked_at is not None else None,
+                    "next_ai_review_due_at": (
+                        next_ai_review_due_at.isoformat()
+                        if next_ai_review_due_at is not None
+                        else None
+                    ),
+                    "last_ai_skip_reason": last_ai_skip_reason,
+                }
+            )
+        return {
+            "generated_at": generated_at.isoformat(),
+            "candidate_selection": candidate_selection,
+            "plans": plans,
+        }
+
 
     def run_decision_cycle(
         self,
@@ -4250,6 +4773,7 @@ class TradingOrchestrator:
         market_snapshot_override: MarketSnapshotPayload | None = None,
         market_context_override: dict[str, MarketSnapshotPayload] | None = None,
         selection_context: dict[str, object] | None = None,
+        review_trigger: AIReviewTriggerPayload | dict[str, object] | None = None,
     ) -> dict[str, object]:
         auto_resume_result = self._ensure_auto_resume(
             trigger_event=trigger_event,
@@ -4329,6 +4853,25 @@ class TradingOrchestrator:
         )
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
         open_positions = get_open_positions(self.session, symbol)
+        if (
+            not open_positions
+            and not isinstance(selection_context, dict)
+            and trigger_event != TriggerEvent.REPLAY.value
+        ):
+            selection_context = self._default_selection_context_for_symbol(
+                symbol=symbol,
+                timeframe=timeframe,
+                upto_index=upto_index,
+                force_stale=force_stale,
+            )
+        effective_selection_context = dict(selection_context) if isinstance(selection_context, dict) else {}
+        if not effective_selection_context and trigger_event != TriggerEvent.REPLAY.value:
+            effective_selection_context = self._default_selection_context_for_symbol(
+                symbol=symbol,
+                timeframe=timeframe,
+                upto_index=upto_index,
+                force_stale=force_stale,
+            )
         position_management_context = build_position_management_context(
             open_positions[0] if open_positions else None,
             feature_payload=feature_payload,
@@ -4348,6 +4891,15 @@ class TradingOrchestrator:
             )
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
         runtime_state = summarize_runtime_state(self.settings_row)
+        latest_decision_run = self._latest_symbol_decision_run(
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        last_decision_at = latest_decision_run.created_at if latest_decision_run is not None else None
+        previous_ai_invoked_at = self._latest_symbol_ai_invoked_at(
+            symbol=symbol,
+            timeframe=timeframe,
+        )
         decision_reference = self._build_decision_reference_payload(
             symbol=symbol,
             timeframe=timeframe,
@@ -4441,6 +4993,106 @@ class TradingOrchestrator:
             setup_cluster_context=setup_cluster_context,
             include_adaptive_underperformance=True,
         )
+        review_interval_minutes = self._position_review_interval_minutes(
+            cadence_profile,
+            effective_settings=effective_settings,
+        )
+        next_ai_review_due_at = utcnow_naive() + timedelta(
+            minutes=(
+                review_interval_minutes
+                if open_positions
+                else effective_settings.ai_backstop_interval_minutes
+                if effective_settings.ai_backstop_enabled
+                else max(
+                    int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]),
+                    1,
+                )
+            )
+        )
+        review_trigger_payload = (
+            review_trigger
+            if isinstance(review_trigger, AIReviewTriggerPayload)
+            else AIReviewTriggerPayload.model_validate(review_trigger)
+            if isinstance(review_trigger, dict) and review_trigger
+            else None
+        )
+        latest_decision_metadata = (
+            latest_decision_run.metadata_json
+            if latest_decision_run is not None and isinstance(latest_decision_run.metadata_json, dict)
+            else {}
+        )
+        latest_decision_output = (
+            latest_decision_run.output_payload
+            if latest_decision_run is not None and isinstance(latest_decision_run.output_payload, dict)
+            else {}
+        )
+        latest_decision_input = (
+            latest_decision_run.input_payload
+            if latest_decision_run is not None and isinstance(latest_decision_run.input_payload, dict)
+            else {}
+        )
+        if review_trigger_payload is None and trigger_event == TriggerEvent.MANUAL.value:
+            candidate_payload = _as_dict(effective_selection_context.get("candidate"))
+            latest_slot_allocation = _as_dict(latest_decision_metadata.get("slot_allocation"))
+            strategy_engine_name = (
+                str(effective_selection_context.get("strategy_engine") or "")
+            ) or _strategy_engine_name_from_payload(
+                latest_decision_metadata,
+                latest_decision_output,
+            )
+            holding_profile = (
+                str(effective_selection_context.get("holding_profile") or "")
+            ) or str(cadence_profile.get("active_holding_profile") or "") or str(
+                latest_decision_metadata.get("holding_profile") or "scalp"
+            )
+            reason_codes = (
+                [str(code) for code in candidate_payload.get("rationale_codes", []) if code not in {None, ""}]
+                if isinstance(candidate_payload.get("rationale_codes"), list)
+                else []
+            )
+            review_trigger_payload = self._build_review_trigger_payload(
+                trigger_reason="manual_review_event",
+                symbol=symbol,
+                timeframe=timeframe,
+                strategy_engine=strategy_engine_name or None,
+                holding_profile=holding_profile or "scalp",
+                assigned_slot=(
+                    str(effective_selection_context.get("assigned_slot") or "")
+                )
+                or str(latest_slot_allocation.get("assigned_slot") or "")
+                or None,
+                candidate_weight=(
+                    effective_selection_context.get("candidate_weight")
+                    if effective_selection_context
+                    else latest_slot_allocation.get("candidate_weight")
+                ),
+                reason_codes=reason_codes,
+                last_decision_at=last_decision_at,
+                triggered_at=utcnow_naive(),
+                fingerprint_material={
+                    "trigger_reason": "manual_review_event",
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "strategy_engine": strategy_engine_name,
+                    "holding_profile": holding_profile or "scalp",
+                    "assigned_slot": (
+                        effective_selection_context.get("assigned_slot")
+                        if effective_selection_context
+                        else latest_slot_allocation.get("assigned_slot")
+                    ),
+                    "candidate_weight": round(
+                        _safe_float(
+                            effective_selection_context.get("candidate_weight")
+                            if effective_selection_context
+                            else latest_slot_allocation.get("candidate_weight"),
+                            default=0.0,
+                        ),
+                        6,
+                    ),
+                    "reason_codes": sorted(reason_codes),
+                    "open_position": bool(open_positions),
+                },
+            )
         openai_gate = get_openai_call_gate(
             self.session,
             self.settings_row,
@@ -4448,8 +5100,11 @@ class TradingOrchestrator:
             trigger_event,
             has_openai_key=bool(self.credentials.openai_api_key),
             symbol=symbol,
-            cooldown_minutes_override=int(
-                cadence_profile["effective_cadence"]["ai_call_interval_minutes"]
+            cooldown_minutes_override=(
+                0
+                if review_trigger_payload is not None
+                and review_trigger_payload.trigger_reason != "manual_review_event"
+                else int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"])
             ),
             manual_guard_minutes_override=max(
                 2,
@@ -4457,9 +5112,34 @@ class TradingOrchestrator:
             ),
         )
         ai_skipped_reason = str(cadence_profile.get("ai_skipped_reason") or "") or None
+        if review_trigger_payload is not None:
+            if review_trigger_payload.trigger_reason == "protection_review_event":
+                ai_skipped_reason = "PROTECTION_REVIEW_DETERMINISTIC_ONLY"
+            else:
+                ai_skipped_reason = None
         if ai_skipped_reason is None and not openai_gate.allowed:
             ai_skipped_reason = str(openai_gate.reason).upper() or None
         use_ai = openai_gate.allowed and ai_skipped_reason is None
+        ai_context = build_ai_decision_context(
+            market_snapshot=market_snapshot,
+            features=feature_payload,
+            risk_context=risk_context,
+            selection_context=effective_selection_context,
+            review_trigger=review_trigger_payload,
+            decision_reference=decision_reference,
+            previous_decision_output=latest_decision_output,
+            previous_decision_metadata=latest_decision_metadata,
+            previous_input_payload=latest_decision_input,
+            previous_ai_invoked_at=previous_ai_invoked_at,
+        )
+        ai_prior_context = build_ai_prior_context(
+            self.session,
+            ai_context=ai_context,
+            selection_context=effective_selection_context,
+            feature_payload=feature_payload,
+        )
+        ai_context = ai_context.model_copy(update={"prior_context": ai_prior_context})
+        ai_context_payload = ai_context.model_dump(mode="json")
         decision, provider_name, decision_metadata = self.trading_agent.run(
             market_snapshot,
             feature_payload,
@@ -4468,12 +5148,19 @@ class TradingOrchestrator:
             use_ai=use_ai,
             max_input_candles=self.settings_row.ai_max_input_candles,
             logic_variant=logic_variant,
+            ai_context=ai_context,
         )
         meta_gate_result = evaluate_meta_gate(
             decision,
             feature_payload=feature_payload,
             selection_context=dict(selection_context) if isinstance(selection_context, dict) else {},
             decision_metadata=decision_metadata,
+        )
+        decision_generated_at = utcnow_naive()
+        resolved_last_ai_invoked_at = (
+            decision_generated_at
+            if str(decision_metadata.get("source") or "") == "llm"
+            else previous_ai_invoked_at
         )
         decision_metadata = {
             **decision_metadata,
@@ -4488,14 +5175,41 @@ class TradingOrchestrator:
             "effective_cadence": dict(cadence_profile.get("effective_cadence") or {}),
             "analysis_context": _decision_analysis_context(
                 feature_payload,
-                universe_breadth=selection_context.get("universe_breadth") if isinstance(selection_context, dict) else None,
+                universe_breadth=effective_selection_context.get("universe_breadth") if effective_selection_context else None,
             ),
-            "selection_context": dict(selection_context) if isinstance(selection_context, dict) else None,
+            "selection_context": effective_selection_context or None,
             "slot_allocation": (
-                dict(selection_context.get("slot_allocation"))
-                if isinstance(selection_context, dict) and isinstance(selection_context.get("slot_allocation"), dict)
+                dict(effective_selection_context.get("slot_allocation"))
+                if isinstance(effective_selection_context.get("slot_allocation"), dict)
                 else None
             ),
+            "ai_context": ai_context_payload,
+            "ai_context_version": ai_context.ai_context_version,
+            "ai_trigger": review_trigger_payload.model_dump(mode="json") if review_trigger_payload is not None else None,
+            "last_ai_trigger_reason": review_trigger_payload.trigger_reason if review_trigger_payload is not None else None,
+            "last_ai_invoked_at": (
+                resolved_last_ai_invoked_at.isoformat()
+                if resolved_last_ai_invoked_at is not None
+                else None
+            ),
+            "next_ai_review_due_at": next_ai_review_due_at.isoformat(),
+            "trigger_deduped": False,
+            "trigger_fingerprint": (
+                review_trigger_payload.trigger_fingerprint
+                if review_trigger_payload is not None
+                else None
+            ),
+            "last_ai_skip_reason": ai_skipped_reason,
+            "engine_prior_classification": decision_metadata.get("engine_prior_classification"),
+            "capital_efficiency_classification": decision_metadata.get("capital_efficiency_classification"),
+            "session_prior_classification": decision_metadata.get("session_prior_classification"),
+            "time_of_day_prior_classification": decision_metadata.get("time_of_day_prior_classification"),
+            "prior_penalty_level": decision_metadata.get("prior_penalty_level"),
+            "prior_reason_codes": decision_metadata.get("prior_reason_codes"),
+            "sample_threshold_satisfied": decision_metadata.get("sample_threshold_satisfied"),
+            "confidence_adjustment_applied": decision_metadata.get("confidence_adjustment_applied"),
+            "abstain_due_to_prior_and_quality": decision_metadata.get("abstain_due_to_prior_and_quality"),
+            "expected_payoff_efficiency_hint_summary": decision_metadata.get("expected_payoff_efficiency_hint_summary"),
             "drawdown_state": drawdown_state,
             "position_management": position_management_result or {"position_management_context": position_management_context},
             "holding_profile_context": decision_metadata.get("holding_profile_context"),
@@ -4514,6 +5228,8 @@ class TradingOrchestrator:
                 feature_payload=feature_payload,
                 risk_context=risk_context,
                 decision_reference=decision_reference,
+                ai_trigger=review_trigger_payload.model_dump(mode="json") if review_trigger_payload is not None else None,
+                ai_context=ai_context,
             ),
             decision,
             provider_name=provider_name,
@@ -4535,21 +5251,52 @@ class TradingOrchestrator:
                 "decision": decision.model_dump(mode="json"),
                 "analysis_context": _decision_analysis_context(
                     feature_payload,
-                    universe_breadth=selection_context.get("universe_breadth") if isinstance(selection_context, dict) else None,
+                    universe_breadth=effective_selection_context.get("universe_breadth") if effective_selection_context else None,
                 ),
-                "selection_context": dict(selection_context) if isinstance(selection_context, dict) else None,
+                "selection_context": effective_selection_context or None,
                 "slot_allocation": (
-                    dict(selection_context.get("slot_allocation"))
-                    if isinstance(selection_context, dict) and isinstance(selection_context.get("slot_allocation"), dict)
+                    dict(effective_selection_context.get("slot_allocation"))
+                    if isinstance(effective_selection_context.get("slot_allocation"), dict)
                     else None
                 ),
                 "holding_profile_context": decision_metadata.get("holding_profile_context"),
                 "drawdown_state": drawdown_state,
                 "setup_cluster_state": decision_metadata.get("setup_cluster_state"),
                 "meta_gate": meta_gate_result.model_dump(mode="json"),
+                "ai_trigger": decision_metadata.get("ai_trigger"),
+                "prompt_family": decision_metadata.get("prompt_family"),
+                "bounded_output_applied": decision_metadata.get("bounded_output_applied"),
+                "fallback_reason_codes": decision_metadata.get("fallback_reason_codes"),
+                "fail_closed_applied": decision_metadata.get("fail_closed_applied"),
+                "engine_prior_classification": decision_metadata.get("engine_prior_classification"),
+                "capital_efficiency_classification": decision_metadata.get("capital_efficiency_classification"),
+                "session_prior_classification": decision_metadata.get("session_prior_classification"),
+                "time_of_day_prior_classification": decision_metadata.get("time_of_day_prior_classification"),
+                "prior_penalty_level": decision_metadata.get("prior_penalty_level"),
+                "prior_reason_codes": decision_metadata.get("prior_reason_codes"),
+                "sample_threshold_satisfied": decision_metadata.get("sample_threshold_satisfied"),
+                "confidence_adjustment_applied": decision_metadata.get("confidence_adjustment_applied"),
+                "abstain_due_to_prior_and_quality": decision_metadata.get("abstain_due_to_prior_and_quality"),
+                "expected_payoff_efficiency_hint_summary": decision_metadata.get("expected_payoff_efficiency_hint_summary"),
             },
             correlation_ids=decision_correlation_ids,
         )
+        if str(decision_metadata.get("source") or "") == "llm":
+            record_audit_event(
+                self.session,
+                event_type="decision_ai_invoked",
+                entity_type="decision_run",
+                entity_id=str(decision_run.id),
+                severity="info",
+                message="AI inference was invoked for the current decision review.",
+                payload={
+                    "symbol": symbol,
+                    "provider": provider_name,
+                    "trigger": decision_metadata.get("ai_trigger"),
+                    "next_ai_review_due_at": decision_metadata.get("next_ai_review_due_at"),
+                },
+                correlation_ids=decision_correlation_ids,
+            )
         if ai_skipped_reason is not None:
             record_audit_event(
                 self.session,
@@ -4564,6 +5311,28 @@ class TradingOrchestrator:
                     "cadence_reasons": list(cadence_profile.get("reasons") or []),
                     "ai_skipped_reason": ai_skipped_reason,
                     "gate": openai_gate.as_metadata(),
+                    "trigger": decision_metadata.get("ai_trigger"),
+                },
+                correlation_ids=decision_correlation_ids,
+            )
+        if bool(decision_metadata.get("bounded_output_applied")) or bool(decision_metadata.get("fail_closed_applied")):
+            record_audit_event(
+                self.session,
+                event_type="decision_ai_bounded",
+                entity_type="decision_run",
+                entity_id=str(decision_run.id),
+                severity="warning" if decision_metadata.get("fail_closed_applied") else "info",
+                message="AI output was bounded or fail-closed before risk approval.",
+                payload={
+                    "symbol": symbol,
+                    "provider": provider_name,
+                    "prompt_family": decision_metadata.get("prompt_family"),
+                    "trigger_type": decision_metadata.get("trigger_type"),
+                    "provider_status": decision_metadata.get("provider_status"),
+                    "fallback_reason_codes": decision_metadata.get("fallback_reason_codes"),
+                    "fail_closed_applied": decision_metadata.get("fail_closed_applied"),
+                    "should_abstain": decision_metadata.get("should_abstain"),
+                    "abstain_reason_codes": decision_metadata.get("abstain_reason_codes"),
                 },
                 correlation_ids=decision_correlation_ids,
             )
@@ -4659,6 +5428,12 @@ class TradingOrchestrator:
                     "cadence": cadence_profile,
                     "skip_reason": str(cadence_profile.get("skip_reason") or reason_code),
                     "ai_skipped_reason": ai_skipped_reason,
+                    "last_ai_trigger_reason": decision_metadata.get("last_ai_trigger_reason"),
+                    "last_ai_invoked_at": decision_metadata.get("last_ai_invoked_at"),
+                    "next_ai_review_due_at": decision_metadata.get("next_ai_review_due_at"),
+                    "trigger_deduped": bool(decision_metadata.get("trigger_deduped", False)),
+                    "trigger_fingerprint": decision_metadata.get("trigger_fingerprint"),
+                    "last_ai_skip_reason": decision_metadata.get("last_ai_skip_reason"),
                     "decision_reference": decision_reference,
                     "logic_variant": logic_variant,
                     "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
@@ -4676,6 +5451,7 @@ class TradingOrchestrator:
             execution_mode="historical_replay" if trigger_event == "historical_replay" else "live",
             decision_context={
                 "decision_agreement": decision_metadata.get("decision_agreement"),
+                "suppression_context": decision_metadata.get("suppression_context"),
                 "setup_cluster_state": decision_metadata.get("setup_cluster_state"),
                 "meta_gate": decision_metadata.get("meta_gate"),
                 "slot_allocation": decision_metadata.get("slot_allocation"),
@@ -4803,6 +5579,12 @@ class TradingOrchestrator:
             "cadence": cadence_profile,
             "skip_reason": str(cadence_profile.get("skip_reason") or "") or None,
             "ai_skipped_reason": ai_skipped_reason,
+            "last_ai_trigger_reason": decision_metadata.get("last_ai_trigger_reason"),
+            "last_ai_invoked_at": decision_metadata.get("last_ai_invoked_at"),
+            "next_ai_review_due_at": decision_metadata.get("next_ai_review_due_at"),
+            "trigger_deduped": bool(decision_metadata.get("trigger_deduped", False)),
+            "trigger_fingerprint": decision_metadata.get("trigger_fingerprint"),
+            "last_ai_skip_reason": decision_metadata.get("last_ai_skip_reason"),
             "decision_reference": decision_reference,
             "logic_variant": logic_variant,
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
@@ -4839,16 +5621,6 @@ class TradingOrchestrator:
             upto_index=upto_index,
             force_stale=force_stale,
         )
-        breadth_summary = (
-            dict(candidate_selection.get("breadth_summary") or {})
-            if isinstance(candidate_selection.get("breadth_summary"), dict)
-            else {}
-        )
-        ranking_lookup = {
-            str(item.get("symbol") or "").upper(): item
-            for item in candidate_selection.get("rankings", [])
-            if isinstance(item, dict) and item.get("symbol")
-        }
         selected_cycle_symbols = [
             str(item).upper()
             for item in candidate_selection.get("selected_symbols", decision_symbols)
@@ -4868,51 +5640,10 @@ class TradingOrchestrator:
                         auto_resume_checked=True,
                         logic_variant=logic_variant,
                         exchange_sync_checked=True,
-                        selection_context={
-                            "universe_breadth": breadth_summary,
-                            "breadth_regime": candidate_selection.get("breadth_regime"),
-                            "capacity_reason": candidate_selection.get("capacity_reason"),
-                            "drawdown_capacity_reason": candidate_selection.get("drawdown_capacity_reason"),
-                            "drawdown_state": dict(candidate_selection.get("drawdown_state") or {}),
-                            "portfolio_weight": (ranking_lookup.get(symbol, {}) or {}).get("portfolio_weight"),
-                            "candidate_weight": (ranking_lookup.get(symbol, {}) or {}).get("candidate_weight"),
-                            "holding_profile": (ranking_lookup.get(symbol, {}) or {}).get("holding_profile"),
-                            "holding_profile_reason": (ranking_lookup.get(symbol, {}) or {}).get("holding_profile_reason"),
-                            "holding_profile_context": (ranking_lookup.get(symbol, {}) or {}).get("holding_profile_context"),
-                            "strategy_engine": (ranking_lookup.get(symbol, {}) or {}).get("strategy_engine"),
-                            "strategy_engine_context": (ranking_lookup.get(symbol, {}) or {}).get("strategy_engine_context"),
-                            "assigned_slot": (ranking_lookup.get(symbol, {}) or {}).get("assigned_slot"),
-                            "slot_label": (ranking_lookup.get(symbol, {}) or {}).get("slot_label"),
-                            "slot_conviction_score": (ranking_lookup.get(symbol, {}) or {}).get("slot_conviction_score"),
-                            "meta_gate_probability": (ranking_lookup.get(symbol, {}) or {}).get("meta_gate_probability"),
-                            "agreement_alignment_score": (ranking_lookup.get(symbol, {}) or {}).get("agreement_alignment_score"),
-                            "agreement_level_hint": (ranking_lookup.get(symbol, {}) or {}).get("agreement_level_hint"),
-                            "execution_quality_score": (ranking_lookup.get(symbol, {}) or {}).get("execution_quality_score"),
-                            "slot_risk_pct_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("slot_risk_pct_multiplier"),
-                            "slot_leverage_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("slot_leverage_multiplier"),
-                            "slot_notional_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("slot_notional_multiplier"),
-                            "slot_allocation": {
-                                "assigned_slot": (ranking_lookup.get(symbol, {}) or {}).get("assigned_slot"),
-                                "slot_label": (ranking_lookup.get(symbol, {}) or {}).get("slot_label"),
-                                "candidate_weight": (ranking_lookup.get(symbol, {}) or {}).get("candidate_weight"),
-                                "portfolio_weight": (ranking_lookup.get(symbol, {}) or {}).get("portfolio_weight"),
-                                "slot_conviction_score": (ranking_lookup.get(symbol, {}) or {}).get("slot_conviction_score"),
-                                "meta_gate_probability": (ranking_lookup.get(symbol, {}) or {}).get("meta_gate_probability"),
-                                "agreement_alignment_score": (ranking_lookup.get(symbol, {}) or {}).get("agreement_alignment_score"),
-                                "agreement_level_hint": (ranking_lookup.get(symbol, {}) or {}).get("agreement_level_hint"),
-                                "execution_quality_score": (ranking_lookup.get(symbol, {}) or {}).get("execution_quality_score"),
-                                "risk_pct_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("slot_risk_pct_multiplier"),
-                                "leverage_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("slot_leverage_multiplier"),
-                                "notional_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("slot_notional_multiplier"),
-                                "capacity_reason": candidate_selection.get("capacity_reason"),
-                                "selected_reason": (ranking_lookup.get(symbol, {}) or {}).get("selected_reason"),
-                            },
-                            "breadth_score_multiplier": (ranking_lookup.get(symbol, {}) or {}).get("breadth_score_multiplier"),
-                            "breadth_score_adjustment": (ranking_lookup.get(symbol, {}) or {}).get("breadth_score_adjustment"),
-                            "breadth_hold_bias": (ranking_lookup.get(symbol, {}) or {}).get("breadth_hold_bias"),
-                            "breadth_adjustment_reasons": (ranking_lookup.get(symbol, {}) or {}).get("breadth_adjustment_reasons"),
-                            "selected_reason": (ranking_lookup.get(symbol, {}) or {}).get("selected_reason"),
-                        },
+                        selection_context=self._selection_context_from_candidate_selection(
+                            symbol=symbol,
+                            candidate_selection=candidate_selection,
+                        ),
                     )
                 )
             except Exception as exc:

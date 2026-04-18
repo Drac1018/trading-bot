@@ -1627,6 +1627,45 @@ def test_setup_cluster_disable_blocks_new_entry_but_not_reduce_path(db_session) 
     assert "SETUP_CLUSTER_DISABLED" not in reduce_result.reason_codes
 
 
+def test_recent_performance_soft_bias_does_not_block_entry_but_is_exposed_in_debug_payload(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_decision = _entry_decision(
+        entry_mode="pullback_confirm",
+        rationale_codes=["ADAPTIVE_HOLD_BIAS", "ADAPTIVE_SIGNAL_UNDERPERFORMING"],
+        entry_zone_min=snapshot.latest_price - 20.0,
+        entry_zone_max=snapshot.latest_price + 20.0,
+        stop_loss=snapshot.latest_price - 400.0,
+        take_profit=snapshot.latest_price + 700.0,
+        max_chase_bps=100.0,
+    )
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        entry_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "suppression_context": {
+                "level": "soft_bias",
+                "sources": ["adaptive_hold_bias"],
+                "reason_codes": ["ADAPTIVE_HOLD_BIAS", "ADAPTIVE_SIGNAL_UNDERPERFORMING"],
+                "applies_hard_block": False,
+                "applies_risk_haircut": False,
+                "applies_soft_bias": True,
+            }
+        },
+    )
+
+    assert entry_result.allowed is True
+    assert "ADAPTIVE_HOLD_BIAS" not in entry_result.blocked_reason_codes
+    assert entry_result.debug_payload["suppression_context"]["level"] == "soft_bias"
+    assert entry_result.debug_payload["suppression_context"]["applies_hard_block"] is False
+
+
 def test_full_agreement_keeps_entry_size_and_leverage(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.rollout_mode = "paper"

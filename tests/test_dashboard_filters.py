@@ -450,7 +450,34 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             "rationale_codes": ["TREND_UP"],
             "explanation_short": "BTC long candidate",
         },
-        metadata_json={},
+        metadata_json={
+            "source": "llm",
+            "holding_profile": "scalp",
+            "holding_profile_reason": "scalp_default_intraday_bias",
+            "selection_context": {
+                "assigned_slot": "slot_1",
+                "candidate_weight": 0.64,
+                "capacity_reason": "mixed_breadth_moderate_capacity",
+                "holding_profile": "scalp",
+                "holding_profile_reason": "scalp_default_intraday_bias",
+            },
+            "slot_allocation": {
+                "assigned_slot": "slot_1",
+                "candidate_weight": 0.64,
+                "capacity_reason": "mixed_breadth_moderate_capacity",
+                "applies_soft_limit": False,
+            },
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "trigger_fingerprint": "btc-trigger-seed",
+            },
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": (now - timedelta(minutes=6)).isoformat(),
+            "next_ai_review_due_at": (now + timedelta(minutes=9)).isoformat(),
+            "trigger_deduped": False,
+            "trigger_fingerprint": "btc-trigger-seed",
+            "last_ai_skip_reason": None,
+        },
         schema_valid=True,
     )
     eth_run = AgentRun(
@@ -513,7 +540,35 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             "rationale_codes": ["PULLBACK_ENTRY"],
             "explanation_short": "ETH long candidate",
         },
-        metadata_json={},
+        metadata_json={
+            "source": "llm",
+            "holding_profile": "swing",
+            "holding_profile_reason": "swing_intraday_trend_extension_allowed",
+            "selection_context": {
+                "assigned_slot": "slot_2",
+                "candidate_weight": 0.42,
+                "capacity_reason": "mixed_breadth_moderate_capacity",
+                "holding_profile": "swing",
+                "holding_profile_reason": "swing_intraday_trend_extension_allowed",
+                "slot_applies_soft_cap": True,
+            },
+            "slot_allocation": {
+                "assigned_slot": "slot_2",
+                "candidate_weight": 0.42,
+                "capacity_reason": "mixed_breadth_moderate_capacity",
+                "applies_soft_limit": True,
+            },
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "trigger_fingerprint": "eth-trigger-seed",
+            },
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": (now - timedelta(minutes=3)).isoformat(),
+            "next_ai_review_due_at": (now + timedelta(minutes=12)).isoformat(),
+            "trigger_deduped": False,
+            "trigger_fingerprint": "eth-trigger-seed",
+            "last_ai_skip_reason": None,
+        },
         schema_valid=True,
     )
     db_session.add_all([btc_run, eth_run])
@@ -529,7 +584,27 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
         reason_codes=["POSITION_STATE_STALE"],
         approved_risk_pct=0.0,
         approved_leverage=0.0,
-        payload={"allowed": False, "decision": "long", "operating_state": "TRADABLE"},
+        payload={
+            "allowed": False,
+            "decision": "long",
+            "operating_state": "TRADABLE",
+            "blocked_reason_codes": ["POSITION_STATE_STALE"],
+            "adjustment_reason_codes": [],
+            "debug_payload": {
+                "slot_allocation": {
+                    "assigned_slot": "slot_1",
+                    "candidate_weight": 0.64,
+                    "capacity_reason": "mixed_breadth_moderate_capacity",
+                    "applies_soft_limit": False,
+                },
+                "holding_profile": {
+                    "holding_profile": "scalp",
+                    "holding_profile_reason": "scalp_default_intraday_bias",
+                    "hard_stop_active": True,
+                    "stop_widening_allowed": False,
+                },
+            },
+        },
     )
     eth_risk = RiskCheck(
         symbol="ETHUSDT",
@@ -550,6 +625,21 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             "size_adjustment_ratio": 0.949367,
             "auto_resize_reason": "CLAMPED_TO_SINGLE_POSITION_HEADROOM",
             "exposure_headroom_snapshot": {"limiting_headroom_notional": 150000.0},
+            "adjustment_reason_codes": ["ENTRY_AUTO_RESIZED", "PORTFOLIO_SLOT_SOFT_CAP"],
+            "debug_payload": {
+                "slot_allocation": {
+                    "assigned_slot": "slot_2",
+                    "candidate_weight": 0.42,
+                    "capacity_reason": "mixed_breadth_moderate_capacity",
+                    "applies_soft_limit": True,
+                },
+                "holding_profile": {
+                    "holding_profile": "swing",
+                    "holding_profile_reason": "swing_intraday_trend_extension_allowed",
+                    "hard_stop_active": True,
+                    "stop_widening_allowed": False,
+                },
+            },
         },
     )
     db_session.add_all([btc_risk, eth_risk])
@@ -655,6 +745,46 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
     eth_fill_2.created_at = now - timedelta(seconds=5)
     db_session.add_all(
         [
+            SchedulerRun(
+                schedule_window="15m",
+                workflow="interval_decision_cycle",
+                status="success",
+                triggered_by="scheduler",
+                next_run_at=now + timedelta(minutes=1),
+                outcome={
+                    "symbol": "BTCUSDT",
+                    "last_ai_trigger_reason": "entry_candidate_event",
+                    "last_ai_invoked_at": (now - timedelta(minutes=6)).isoformat(),
+                    "next_ai_review_due_at": (now + timedelta(minutes=9)).isoformat(),
+                    "trigger_deduped": True,
+                    "trigger_fingerprint": "btc-trigger-seed",
+                    "last_ai_skip_reason": "TRIGGER_DEDUPED",
+                    "trigger": {
+                        "trigger_reason": "entry_candidate_event",
+                        "trigger_fingerprint": "btc-trigger-seed",
+                    },
+                },
+            ),
+            SchedulerRun(
+                schedule_window="15m",
+                workflow="interval_decision_cycle",
+                status="success",
+                triggered_by="scheduler",
+                next_run_at=now + timedelta(minutes=1),
+                outcome={
+                    "symbol": "ETHUSDT",
+                    "last_ai_trigger_reason": "entry_candidate_event",
+                    "last_ai_invoked_at": (now - timedelta(minutes=3)).isoformat(),
+                    "next_ai_review_due_at": (now + timedelta(minutes=12)).isoformat(),
+                    "trigger_deduped": False,
+                    "trigger_fingerprint": "eth-trigger-seed",
+                    "last_ai_skip_reason": None,
+                    "trigger": {
+                        "trigger_reason": "entry_candidate_event",
+                        "trigger_fingerprint": "eth-trigger-seed",
+                    },
+                },
+            ),
             AuditEvent(
                 event_type="live_approval_armed",
                 entity_type="settings",
@@ -711,6 +841,43 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
     mark_sync_success(settings, scope="positions", synced_at=now)
     mark_sync_success(settings, scope="open_orders", synced_at=now)
     mark_sync_success(settings, scope="protective_orders", synced_at=now)
+    set_candidate_selection_detail(
+        settings,
+        generated_at=now,
+        mode="portfolio_rotation_top_n",
+        max_selected=2,
+        selected_symbols=["BTCUSDT", "ETHUSDT"],
+        skipped_symbols=[],
+        capacity_reason="mixed_breadth_moderate_capacity",
+        rankings=[
+            {
+                "symbol": "BTCUSDT",
+                "selected": True,
+                "selection_reason": "ranked_portfolio_focus",
+                "selected_reason": "ranked_portfolio_focus",
+                "assigned_slot": "slot_1",
+                "candidate_weight": 0.64,
+                "capacity_reason": "mixed_breadth_moderate_capacity",
+                "holding_profile": "scalp",
+                "holding_profile_reason": "scalp_default_intraday_bias",
+                "strategy_engine": "trend_pullback_engine",
+                "slot_applies_soft_cap": False,
+            },
+            {
+                "symbol": "ETHUSDT",
+                "selected": True,
+                "selection_reason": "ranked_portfolio_focus",
+                "selected_reason": "ranked_portfolio_focus",
+                "assigned_slot": "slot_2",
+                "candidate_weight": 0.42,
+                "capacity_reason": "mixed_breadth_moderate_capacity",
+                "holding_profile": "swing",
+                "holding_profile_reason": "swing_intraday_trend_extension_allowed",
+                "strategy_engine": "trend_pullback_engine",
+                "slot_applies_soft_cap": True,
+            },
+        ],
+    )
     db_session.flush()
 
 
@@ -1089,9 +1256,27 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.latest_price == 70500.0
     assert btc.ai_decision.decision == "long"
     assert btc.ai_decision.raw_output == {}
+    assert btc.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert btc.ai_decision.trigger_deduped is True
+    assert btc.ai_decision.last_ai_skip_reason == "TRIGGER_DEDUPED"
+    assert btc.ai_decision.next_ai_review_due_at is not None
+    assert btc.ai_decision.assigned_slot == "slot_1"
+    assert btc.ai_decision.candidate_weight == 0.64
+    assert btc.ai_decision.capacity_reason == "mixed_breadth_moderate_capacity"
     assert btc.risk_guard.allowed is False
     assert btc.risk_guard.raw_payload == {}
+    assert btc.risk_guard.assigned_slot == "slot_1"
+    assert btc.risk_guard.candidate_weight == 0.64
+    assert btc.risk_guard.capacity_reason == "mixed_breadth_moderate_capacity"
+    assert btc.risk_guard.holding_profile == "scalp"
+    assert btc.risk_guard.holding_profile_reason == "scalp_default_intraday_bias"
+    assert btc.risk_guard.portfolio_slot_soft_cap_applied is False
     assert btc.blocked_reasons == ["POSITION_STATE_STALE"]
+    assert btc.candidate_selection.assigned_slot == "slot_1"
+    assert btc.candidate_selection.candidate_weight == 0.64
+    assert btc.candidate_selection.capacity_reason == "mixed_breadth_moderate_capacity"
+    assert btc.candidate_selection.blocked_reason_codes == ["POSITION_STATE_STALE"]
+    assert btc.candidate_selection.portfolio_slot_soft_cap_applied is False
     assert btc.open_position.is_open is True
     assert btc.open_position.holding_profile == "swing"
     assert btc.open_position.holding_profile_reason == "swing_intraday_trend_extension_allowed"
@@ -1120,13 +1305,32 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert eth.latest_price == 3400.0
     assert eth.ai_decision.decision == "long"
     assert eth.ai_decision.raw_output == {}
+    assert eth.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert eth.ai_decision.last_ai_invoked_at is not None
+    assert eth.ai_decision.next_ai_review_due_at is not None
+    assert eth.ai_decision.assigned_slot == "slot_2"
+    assert eth.ai_decision.candidate_weight == 0.42
+    assert eth.ai_decision.capacity_reason == "mixed_breadth_moderate_capacity"
+    assert eth.ai_decision.holding_profile == "swing"
+    assert eth.ai_decision.holding_profile_reason == "swing_intraday_trend_extension_allowed"
+    assert eth.ai_decision.portfolio_slot_soft_cap_applied is True
     assert eth.risk_guard.allowed is True
     assert eth.risk_guard.raw_payload == {}
     assert eth.risk_guard.auto_resized_entry is True
     assert eth.risk_guard.approved_projected_notional == 150000.0
     assert eth.risk_guard.approved_quantity == 44.117647
     assert eth.risk_guard.auto_resize_reason == "CLAMPED_TO_SINGLE_POSITION_HEADROOM"
+    assert eth.risk_guard.assigned_slot == "slot_2"
+    assert eth.risk_guard.candidate_weight == 0.42
+    assert eth.risk_guard.capacity_reason == "mixed_breadth_moderate_capacity"
+    assert eth.risk_guard.holding_profile == "swing"
+    assert eth.risk_guard.holding_profile_reason == "swing_intraday_trend_extension_allowed"
+    assert eth.risk_guard.portfolio_slot_soft_cap_applied is True
     assert eth.blocked_reasons == []
+    assert eth.candidate_selection.assigned_slot == "slot_2"
+    assert eth.candidate_selection.candidate_weight == 0.42
+    assert eth.candidate_selection.capacity_reason == "mixed_breadth_moderate_capacity"
+    assert eth.candidate_selection.portfolio_slot_soft_cap_applied is True
     assert eth.open_position.is_open is False
     assert eth.protection_status.status == "flat"
     assert eth.stale_flags == []
@@ -1263,14 +1467,31 @@ def test_operator_dashboard_api_returns_operator_flow(tmp_path, monkeypatch) -> 
         btc = next(item for item in payload["symbols"] if item["symbol"] == "BTCUSDT")
         eth = next(item for item in payload["symbols"] if item["symbol"] == "ETHUSDT")
         assert btc["latest_price"] == 70500.0
+        assert btc["ai_decision"]["last_ai_trigger_reason"] == "entry_candidate_event"
+        assert btc["ai_decision"]["trigger_deduped"] is True
+        assert btc["ai_decision"]["last_ai_skip_reason"] == "TRIGGER_DEDUPED"
+        assert btc["candidate_selection"]["assigned_slot"] == "slot_1"
+        assert btc["candidate_selection"]["candidate_weight"] == 0.64
+        assert btc["candidate_selection"]["capacity_reason"] == "mixed_breadth_moderate_capacity"
         assert btc["risk_guard"]["allowed"] is False
+        assert btc["risk_guard"]["assigned_slot"] == "slot_1"
+        assert btc["risk_guard"]["holding_profile"] == "scalp"
         assert btc["open_position"]["is_open"] is True
+        assert btc["open_position"]["holding_profile"] == "swing"
+        assert btc["open_position"]["hard_stop_active"] is True
+        assert btc["open_position"]["stop_widening_allowed"] is False
         assert eth["latest_price"] == 3400.0
+        assert eth["ai_decision"]["next_ai_review_due_at"] is not None
+        assert eth["ai_decision"]["assigned_slot"] == "slot_2"
+        assert eth["ai_decision"]["portfolio_slot_soft_cap_applied"] is True
         assert eth["risk_guard"]["allowed"] is True
         assert eth["risk_guard"]["auto_resized_entry"] is True
         assert eth["risk_guard"]["approved_projected_notional"] == 150000.0
         assert eth["risk_guard"]["approved_quantity"] == 44.117647
         assert eth["risk_guard"]["auto_resize_reason"] == "CLAMPED_TO_SINGLE_POSITION_HEADROOM"
+        assert eth["risk_guard"]["portfolio_slot_soft_cap_applied"] is True
+        assert eth["candidate_selection"]["assigned_slot"] == "slot_2"
+        assert eth["candidate_selection"]["candidate_weight"] == 0.42
         assert eth["execution"]["symbol"] == "ETHUSDT"
         assert len(payload["audit_events"]) >= 1
     finally:

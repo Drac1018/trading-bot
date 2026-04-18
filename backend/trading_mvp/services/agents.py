@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+import httpx
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
 from trading_mvp.enums import AgentRole, OperatingMode, PriorityLevel
@@ -15,6 +16,7 @@ from trading_mvp.models import (
 from trading_mvp.providers import ProviderResult, StructuredModelProvider
 from trading_mvp.schemas import (
     AgentRunRecord,
+    AIDecisionContextPacket,
     ChiefReviewSummary,
     FeaturePayload,
     MarketSnapshotPayload,
@@ -24,6 +26,11 @@ from trading_mvp.schemas import (
 from trading_mvp.services.adaptive_signal import (
     ADAPTIVE_SETUP_DISABLE_REASON_CODE,
     compute_adaptive_adjustment,
+)
+from trading_mvp.services.ai_prompt_routing import (
+    bound_trade_decision,
+    render_prompt_instructions,
+    resolve_prompt_route,
 )
 from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_POSITION,
@@ -168,8 +175,10 @@ def build_trading_decision_input_payload(
     feature_payload: FeaturePayload,
     risk_context: dict[str, Any],
     decision_reference: dict[str, Any],
+    ai_trigger: dict[str, Any] | None = None,
+    ai_context: AIDecisionContextPacket | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "market_snapshot": market_snapshot.model_dump(mode="json"),
         "market_context": {
             context_timeframe: snapshot.model_dump(mode="json")
@@ -179,11 +188,142 @@ def build_trading_decision_input_payload(
         "risk_context": risk_context,
         "decision_reference": decision_reference,
     }
+    if isinstance(ai_trigger, dict) and ai_trigger:
+        payload["ai_trigger"] = dict(ai_trigger)
+    if isinstance(ai_context, AIDecisionContextPacket):
+        payload["ai_context"] = ai_context.model_dump(mode="json")
+    elif isinstance(ai_context, dict) and ai_context:
+        payload["ai_context"] = dict(ai_context)
+    return payload
 
 
 class TradingDecisionAgent:
     def __init__(self, provider: StructuredModelProvider) -> None:
         self.provider = provider
+
+    @staticmethod
+    def _coerce_ai_context(
+        ai_context: AIDecisionContextPacket | dict[str, Any] | None,
+    ) -> AIDecisionContextPacket | None:
+        if isinstance(ai_context, AIDecisionContextPacket):
+            return ai_context
+        if isinstance(ai_context, dict) and ai_context:
+            try:
+                return AIDecisionContextPacket.model_validate(ai_context)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _serialize_ai_context(
+        ai_context: AIDecisionContextPacket | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if isinstance(ai_context, AIDecisionContextPacket):
+            return ai_context.model_dump(mode="json")
+        if isinstance(ai_context, dict) and ai_context:
+            return dict(ai_context)
+        return None
+
+    @staticmethod
+    def _provider_status_from_exception(exc: Exception) -> str:
+        if isinstance(exc, ValidationError):
+            return "schema_invalid"
+        if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+            return "timeout"
+        if isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code if exc.response is not None else 0
+            if status_code in {401, 403}:
+                return "unavailable"
+            if status_code in {429, 500, 502, 503, 504}:
+                return "upstream_error"
+            return "provider_error"
+        return "provider_error"
+
+    @staticmethod
+    def _route_metadata(route, *, provider_status: str) -> dict[str, Any]:  # noqa: ANN001
+        return {
+            "trigger_type": route.trigger_type,
+            "strategy_engine_name": route.strategy_engine,
+            "prompt_family": route.prompt_family,
+            "allowed_actions": list(route.allowed_actions),
+            "forbidden_actions": list(route.forbidden_actions),
+            "provider_status": provider_status,
+        }
+
+    @staticmethod
+    def _open_position_side(open_positions: list[Position]) -> str | None:
+        if not open_positions:
+            return None
+        side = str(getattr(open_positions[0], "side", "") or "").strip().lower()
+        return side if side in {"long", "short"} else None
+
+    @staticmethod
+    def _current_stop_loss(open_positions: list[Position]) -> float | None:
+        if not open_positions:
+            return None
+        stop_loss = getattr(open_positions[0], "stop_loss", None)
+        try:
+            return float(stop_loss) if stop_loss is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _has_losing_position(open_positions: list[Position]) -> bool:
+        for position in open_positions:
+            unrealized_pnl = getattr(position, "unrealized_pnl", None)
+            try:
+                if unrealized_pnl is not None and float(unrealized_pnl) < 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    @staticmethod
+    def _fail_closed_decision(
+        baseline: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        provider_status: str,
+        fail_reason_code: str,
+    ) -> TradeDecision:
+        current_profile = (
+            str((ai_context.holding_profile if ai_context is not None else None) or baseline.holding_profile or HOLDING_PROFILE_SCALP)
+            .strip()
+            .lower()
+            or HOLDING_PROFILE_SCALP
+        )
+        fail_codes = list(
+            dict.fromkeys(
+                [*baseline.rationale_codes, fail_reason_code, "AI_UNAVAILABLE_FAIL_CLOSED"]
+            )
+        )
+        return baseline.model_copy(
+            update={
+                "decision": "hold",
+                "entry_mode": "none",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
+                "invalidation_price": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+                "recommended_holding_profile": "hold_current",
+                "holding_profile": current_profile,
+                "primary_reason_codes": fail_codes,
+                "rationale_codes": fail_codes,
+                "no_trade_reason_codes": fail_codes,
+                "abstain_reason_codes": list(dict.fromkeys([fail_reason_code, "AI_UNAVAILABLE_FAIL_CLOSED"])),
+                "should_abstain": True,
+                "bounded_output_applied": True,
+                "fallback_reason_codes": list(dict.fromkeys([fail_reason_code, "AI_UNAVAILABLE_FAIL_CLOSED"])),
+                "fail_closed_applied": True,
+                "provider_status": provider_status,
+                "explanation_short": "AI failure blocked a new entry.",
+                "explanation_detailed": (
+                    "The provider failed, timed out, or returned invalid output on a new-entry review. "
+                    "The decision was normalized to hold before risk approval."
+                ),
+            }
+        )
 
     @staticmethod
     def _adaptive_brackets(
@@ -423,6 +563,225 @@ class TradingDecisionAgent:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _default_payoff_timing(
+        *,
+        holding_profile: str | None,
+        volatility_regime: str | None,
+    ) -> tuple[int | None, int | None]:
+        profile = str(holding_profile or HOLDING_PROFILE_SCALP).strip().lower()
+        base_timings = {
+            HOLDING_PROFILE_SCALP: (15, 45),
+            HOLDING_PROFILE_SWING: (90, 240),
+            HOLDING_PROFILE_POSITION: (240, 720),
+        }
+        time_to_quarter_r, time_to_half_r = base_timings.get(profile, base_timings[HOLDING_PROFILE_SCALP])
+        regime = str(volatility_regime or "normal")
+        multiplier = 1.0
+        if regime == "calm":
+            multiplier = 1.35
+        elif regime == "fast":
+            multiplier = 0.7
+        elif regime == "shock":
+            multiplier = 0.5
+        return max(int(round(time_to_quarter_r * multiplier)), 1), max(int(round(time_to_half_r * multiplier)), 1)
+
+    @staticmethod
+    def _default_expected_mae_r(*, volatility_regime: str | None) -> float:
+        regime = str(volatility_regime or "normal")
+        if regime == "calm":
+            return 0.35
+        if regime == "fast":
+            return 0.7
+        if regime == "shock":
+            return 0.9
+        return 0.5
+
+    def _apply_ai_schema_fields(
+        self,
+        decision: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+    ) -> TradeDecision:
+        if ai_context is None:
+            return decision
+        update: dict[str, Any] = {}
+        if decision.prompt_family_hint is None and ai_context.prompt_family_hint is not None:
+            update["prompt_family_hint"] = ai_context.prompt_family_hint
+        if decision.regime_transition_risk is None:
+            update["regime_transition_risk"] = ai_context.composite_regime.transition_risk
+        if not decision.data_quality_penalty_applied:
+            update["data_quality_penalty_applied"] = ai_context.data_quality.data_quality_grade != "complete"
+        if not decision.invalidation_reason_codes and decision.decision in {"long", "short"} and decision.invalidation_price is not None:
+            update["invalidation_reason_codes"] = ["INVALIDATION_PRICE_BREACH"]
+        if decision.decision in {"long", "short"}:
+            payoff_profile = decision.recommended_holding_profile or decision.holding_profile
+            quarter_r_minutes, half_r_minutes = self._default_payoff_timing(
+                holding_profile=payoff_profile,
+                volatility_regime=ai_context.composite_regime.volatility_regime,
+            )
+            if decision.expected_time_to_0_25r_minutes is None:
+                update["expected_time_to_0_25r_minutes"] = quarter_r_minutes
+            if decision.expected_time_to_0_5r_minutes is None:
+                update["expected_time_to_0_5r_minutes"] = half_r_minutes
+            if decision.expected_mae_r is None:
+                update["expected_mae_r"] = self._default_expected_mae_r(
+                    volatility_regime=ai_context.composite_regime.volatility_regime
+                )
+        elif decision.decision == "hold" and not decision.should_abstain:
+            if ai_context.data_quality.data_quality_grade in {"degraded", "unavailable"} and decision.confidence <= 0.5:
+                update["should_abstain"] = True
+        if decision.should_abstain and not decision.abstain_reason_codes:
+            update["abstain_reason_codes"] = list(decision.no_trade_reason_codes or decision.primary_reason_codes)
+        return decision.model_copy(update=update) if update else decision
+
+    @staticmethod
+    def _prior_observability_fields(ai_context: AIDecisionContextPacket | None) -> dict[str, Any]:
+        if ai_context is None:
+            return {
+                "engine_prior_classification": None,
+                "capital_efficiency_classification": None,
+                "session_prior_classification": None,
+                "time_of_day_prior_classification": None,
+                "prior_penalty_level": "none",
+                "prior_reason_codes": [],
+                "sample_threshold_satisfied": {},
+                "confidence_adjustment_applied": False,
+                "abstain_due_to_prior_and_quality": False,
+                "expected_payoff_efficiency_hint_summary": {},
+            }
+        prior_context = ai_context.prior_context
+        return {
+            "engine_prior_classification": prior_context.engine_prior_classification,
+            "capital_efficiency_classification": prior_context.capital_efficiency_classification,
+            "session_prior_classification": prior_context.session_prior_classification,
+            "time_of_day_prior_classification": prior_context.time_of_day_prior_classification,
+            "prior_penalty_level": prior_context.prior_penalty_level,
+            "prior_reason_codes": list(prior_context.prior_reason_codes),
+            "sample_threshold_satisfied": {
+                "engine": prior_context.engine_sample_threshold_satisfied,
+                "capital_efficiency": prior_context.capital_efficiency_sample_threshold_satisfied,
+                "session": prior_context.session_sample_threshold_satisfied,
+                "time_of_day": prior_context.time_of_day_sample_threshold_satisfied,
+            },
+            "confidence_adjustment_applied": False,
+            "abstain_due_to_prior_and_quality": False,
+            "expected_payoff_efficiency_hint_summary": dict(prior_context.expected_payoff_efficiency_hint_summary),
+        }
+
+    def _apply_prior_soft_adjustments(
+        self,
+        decision: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        route,
+    ) -> tuple[TradeDecision, dict[str, Any]]:  # noqa: ANN001
+        metadata = self._prior_observability_fields(ai_context)
+        if ai_context is None:
+            return decision, metadata
+        prior_context = ai_context.prior_context
+        base_update: dict[str, Any] = {
+            "engine_prior_classification": prior_context.engine_prior_classification,
+            "capital_efficiency_classification": prior_context.capital_efficiency_classification,
+            "session_prior_classification": prior_context.session_prior_classification,
+            "time_of_day_prior_classification": prior_context.time_of_day_prior_classification,
+            "prior_penalty_level": prior_context.prior_penalty_level,
+            "prior_reason_codes": list(prior_context.prior_reason_codes),
+            "sample_threshold_satisfied": dict(metadata["sample_threshold_satisfied"]),
+            "expected_payoff_efficiency_hint_summary": dict(prior_context.expected_payoff_efficiency_hint_summary),
+        }
+        if (not route.allow_new_entry) or decision.decision in {"reduce", "exit"}:
+            return decision.model_copy(update=base_update), metadata
+
+        recommended_profile = str(decision.recommended_holding_profile or decision.holding_profile or HOLDING_PROFILE_SCALP)
+        data_quality_grade = ai_context.data_quality.data_quality_grade
+        confidence_delta = 0.0
+        abstain_due_to_prior_and_quality = False
+        adjustment_codes: list[str] = []
+        update = dict(base_update)
+
+        if (
+            prior_context.engine_sample_threshold_satisfied
+            and prior_context.engine_prior_classification == "strong"
+            and data_quality_grade in {"complete", "partial"}
+        ):
+            confidence_delta += 0.04
+            adjustment_codes.append("ENGINE_PRIOR_CONFIDENCE_BOOST")
+        if prior_context.engine_sample_threshold_satisfied and prior_context.engine_prior_classification == "weak":
+            confidence_delta -= 0.08
+            adjustment_codes.append("ENGINE_PRIOR_CONFIDENCE_PENALTY")
+        if (
+            prior_context.capital_efficiency_sample_threshold_satisfied
+            and prior_context.capital_efficiency_classification == "inefficient"
+        ):
+            confidence_delta -= 0.07 if recommended_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION} else 0.03
+            adjustment_codes.append("CAPITAL_EFFICIENCY_CONSERVATISM")
+        if prior_context.session_sample_threshold_satisfied and prior_context.session_prior_classification == "weak":
+            confidence_delta -= 0.02
+            adjustment_codes.append("SESSION_PRIOR_SOFT_PENALTY")
+        if prior_context.time_of_day_sample_threshold_satisfied and prior_context.time_of_day_prior_classification == "weak":
+            confidence_delta -= 0.02
+            adjustment_codes.append("TIME_OF_DAY_PRIOR_SOFT_PENALTY")
+
+        if (
+            recommended_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}
+            and prior_context.capital_efficiency_sample_threshold_satisfied
+            and prior_context.capital_efficiency_classification == "inefficient"
+        ):
+            update["holding_profile"] = HOLDING_PROFILE_SCALP
+            update["recommended_holding_profile"] = HOLDING_PROFILE_SCALP
+            adjustment_codes.append("INEFFICIENT_CAPITAL_PROFILE_DOWNGRADE")
+
+        if (
+            recommended_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}
+            and data_quality_grade in {"degraded", "unavailable"}
+        ):
+            update["holding_profile"] = HOLDING_PROFILE_SCALP
+            update["recommended_holding_profile"] = HOLDING_PROFILE_SCALP if data_quality_grade == "degraded" else "hold_current"
+            confidence_delta -= 0.1 if data_quality_grade == "degraded" else 0.14
+            adjustment_codes.append("LONG_HOLDING_PROFILE_QUALITY_CONSERVATISM")
+            if data_quality_grade == "unavailable" and decision.decision in {"long", "short"}:
+                abstain_due_to_prior_and_quality = True
+
+        if (
+            ai_context.strategy_engine == "breakout_exception_engine"
+            and data_quality_grade in {"degraded", "unavailable"}
+            and decision.decision in {"long", "short"}
+        ):
+            update["decision"] = "hold"
+            update["entry_mode"] = "none"
+            update["entry_zone_min"] = None
+            update["entry_zone_max"] = None
+            update["recommended_holding_profile"] = "hold_current"
+            confidence_delta = min(confidence_delta, -0.14)
+            abstain_due_to_prior_and_quality = True
+            adjustment_codes.append("BREAKOUT_EXCEPTION_QUALITY_ABSTAIN")
+
+        confidence = self._clamp(decision.confidence + confidence_delta, 0.0, 1.0)
+        if confidence != decision.confidence:
+            update["confidence"] = round(confidence, 4)
+            metadata["confidence_adjustment_applied"] = True
+        if abstain_due_to_prior_and_quality:
+            combined_no_trade_codes = list(
+                dict.fromkeys(
+                    [
+                        *decision.no_trade_reason_codes,
+                        *decision.abstain_reason_codes,
+                        "PRIOR_QUALITY_CONSERVATISM",
+                        *adjustment_codes,
+                    ]
+                )
+            )
+            update["should_abstain"] = True
+            update["no_trade_reason_codes"] = combined_no_trade_codes
+            update["abstain_reason_codes"] = combined_no_trade_codes
+            metadata["abstain_due_to_prior_and_quality"] = True
+        update["confidence_adjustment_applied"] = metadata["confidence_adjustment_applied"]
+        update["abstain_due_to_prior_and_quality"] = metadata["abstain_due_to_prior_and_quality"]
+        update["prior_reason_codes"] = list(dict.fromkeys([*prior_context.prior_reason_codes, *adjustment_codes]))
+        metadata["prior_reason_codes"] = list(update["prior_reason_codes"])
+        return decision.model_copy(update=update), metadata
 
     @classmethod
     def _protective_stop_ready_for_add_on(
@@ -1015,6 +1374,60 @@ class TradingDecisionAgent:
         risk_context: dict[str, Any],
         provider_code: str,
     ) -> tuple[TradeDecision, dict[str, Any]]:
+        def _suppression_context(
+            *,
+            setup_disable: dict[str, Any],
+            setup_disable_exempt: bool,
+            setup_cluster_state: dict[str, Any],
+            hold_bias: float,
+            adjusted_confidence: float,
+            adjusted_risk_pct: float,
+        ) -> dict[str, Any]:
+            sources: list[str] = []
+            reason_codes: list[str] = []
+            level = "none"
+            if decision.decision not in {"long", "short"}:
+                return {
+                    "level": level,
+                    "sources": sources,
+                    "reason_codes": reason_codes,
+                    "applies_hard_block": False,
+                    "applies_risk_haircut": False,
+                    "applies_soft_bias": False,
+                    "hold_bias": round(hold_bias, 4),
+                    "confidence_after_adjustment": round(adjusted_confidence, 4),
+                    "risk_pct_after_adjustment": round(adjusted_risk_pct, 4),
+                }
+
+            if bool(setup_disable.get("active", False)) and not setup_disable_exempt:
+                sources.append("adaptive_setup_disable")
+                reason_codes.append(ADAPTIVE_SETUP_DISABLE_REASON_CODE)
+                level = "hard_block"
+            if bool(setup_cluster_state.get("active", False)):
+                sources.append("setup_cluster_disable")
+                reason_codes.append(SETUP_CLUSTER_DISABLED_REASON_CODE)
+                level = "hard_block"
+            if level == "none" and hold_bias >= 0.12 and adjusted_confidence <= 0.46:
+                sources.append("adaptive_hold_bias")
+                reason_codes.extend(["ADAPTIVE_HOLD_BIAS", "ADAPTIVE_SIGNAL_UNDERPERFORMING"])
+                level = "soft_bias"
+            elif level == "none" and (
+                adjusted_confidence < decision.confidence or adjusted_risk_pct < decision.risk_pct
+            ):
+                sources.append("adaptive_risk_haircut")
+                level = "risk_haircut"
+            return {
+                "level": level,
+                "sources": list(dict.fromkeys(sources)),
+                "reason_codes": list(dict.fromkeys(reason_codes)),
+                "applies_hard_block": level == "hard_block",
+                "applies_risk_haircut": level in {"hard_block", "risk_haircut"},
+                "applies_soft_bias": level == "soft_bias",
+                "hold_bias": round(hold_bias, 4),
+                "confidence_after_adjustment": round(adjusted_confidence, 4),
+                "risk_pct_after_adjustment": round(adjusted_risk_pct, 4),
+            }
+
         adaptive_context = risk_context.get("adaptive_signal_context")
         adjustment = compute_adaptive_adjustment(
             adaptive_context if isinstance(adaptive_context, dict) else None,
@@ -1023,40 +1436,32 @@ class TradingDecisionAgent:
             entry_mode=decision.entry_mode,
         )
         setup_cluster_state = self._resolve_setup_cluster_state(risk_context, decision)
+        adjusted_confidence = round(max(decision.confidence, 0.18), 4)
+        adjusted_risk_pct = round(max(decision.risk_pct, 0.001), 4)
+        hold_bias = 0.0
+        setup_disable: dict[str, Any] = {}
+        setup_disable_exempt = False
         if not adjustment.get("enabled"):
-            if decision.decision in {"long", "short"} and bool(setup_cluster_state.get("active", False)):
-                rationale_codes = list(dict.fromkeys(decision.rationale_codes + [SETUP_CLUSTER_DISABLED_REASON_CODE, provider_code]))
-                return (
-                    decision.model_copy(
-                        update={
-                            "decision": "hold",
-                            "confidence": round(max(0.24, decision.confidence), 4),
-                            "entry_mode": "none",
-                            "invalidation_price": None,
-                            "max_chase_bps": None,
-                            "idea_ttl_minutes": None,
-                            "stop_loss": None,
-                            "take_profit": None,
-                            "risk_pct": 0.001,
-                            "leverage": 1.0,
-                            "rationale_codes": rationale_codes,
-                            "explanation_short": "최근 같은 setup cluster 손실이 반복되어 신규 진입을 보류합니다.",
-                            "explanation_detailed": (
-                                f"Setup cluster {setup_cluster_state.get('cluster_key', 'unknown')} is temporarily disabled "
-                                f"because reasons={setup_cluster_state.get('disable_reason_codes', [])}. "
-                                "같은 구조의 연속 손실을 줄이기 위해 cooldown 또는 최근 지표 회복 전까지 hold를 유지합니다."
-                            ),
-                        }
-                    ),
-                    {**adjustment, "setup_cluster_state": setup_cluster_state},
-                )
+            suppression_context = _suppression_context(
+                setup_disable=setup_disable,
+                setup_disable_exempt=setup_disable_exempt,
+                setup_cluster_state=setup_cluster_state,
+                hold_bias=hold_bias,
+                adjusted_confidence=adjusted_confidence,
+                adjusted_risk_pct=adjusted_risk_pct,
+            )
+            rationale_codes = list(dict.fromkeys(decision.rationale_codes + suppression_context["reason_codes"] + [provider_code]))
             return (
                 decision.model_copy(
                     update={
-                        "rationale_codes": list(dict.fromkeys(decision.rationale_codes + [provider_code])),
+                        "rationale_codes": rationale_codes,
                     }
                 ),
-                {**adjustment, "setup_cluster_state": setup_cluster_state},
+                {
+                    **adjustment,
+                    "setup_cluster_state": setup_cluster_state,
+                    "suppression_context": suppression_context,
+                },
             )
 
         updated_decision = decision
@@ -1079,78 +1484,42 @@ class TradingDecisionAgent:
         hold_bias = float(adjustment.get("hold_bias", 0.0))
         rationale_codes = list(dict.fromkeys(decision.rationale_codes))
         setup_disable = adjustment.get("setup_disable") if isinstance(adjustment.get("setup_disable"), dict) else {}
-        setup_disable_active = bool(setup_disable.get("active", False))
         setup_disable_exempt = bool(set(rationale_codes) & {"PROTECTION_REQUIRED", "PROTECTION_RECOVERY", "PROTECTION_RESTORE"})
+        suppression_context = _suppression_context(
+            setup_disable=setup_disable,
+            setup_disable_exempt=setup_disable_exempt,
+            setup_cluster_state=setup_cluster_state,
+            hold_bias=hold_bias,
+            adjusted_confidence=adjusted_confidence,
+            adjusted_risk_pct=adjusted_risk_pct,
+        )
 
-        if decision.decision in {"long", "short"} and setup_disable_active and not setup_disable_exempt:
-            rationale_codes.append(ADAPTIVE_SETUP_DISABLE_REASON_CODE)
+        if decision.decision in {"long", "short"} and suppression_context["applies_hard_block"]:
+            rationale_codes.extend(suppression_context["reason_codes"])
             updated_decision = decision.model_copy(
                 update={
-                    "decision": "hold",
-                    "confidence": round(max(0.24, adjusted_confidence), 4),
-                    "entry_mode": "none",
-                    "invalidation_price": None,
-                    "max_chase_bps": None,
-                    "idea_ttl_minutes": None,
-                    "stop_loss": None,
-                    "take_profit": None,
-                    "risk_pct": 0.001,
-                    "leverage": 1.0,
+                    "confidence": adjusted_confidence,
+                    "risk_pct": adjusted_risk_pct,
                     "rationale_codes": rationale_codes,
-                    "explanation_short": "최근 실거래 성과가 약한 setup bucket 이라 진입을 보류합니다.",
+                    "explanation_short": "최근 저성과 suppression 이 active여서 신규 진입은 risk gate에서 차단될 가능성이 높습니다.",
                     "explanation_detailed": (
-                        f"Adaptive setup disable matched bucket={setup_disable.get('bucket_key', 'unknown')} "
-                        f"with reasons={setup_disable.get('disable_reason_codes', [])}. "
-                        "신규 진입은 일시 비활성화하고 다음 회복 또는 cooldown 해제 전까지 hold를 유지합니다."
+                        f"Recent performance suppression is active with sources={suppression_context['sources']} "
+                        f"and reasons={suppression_context['reason_codes']}. "
+                        "의도는 유지하되 최종 허용/차단은 risk guard가 담당합니다."
                     ),
                 }
             )
-        elif decision.decision in {"long", "short"} and bool(setup_cluster_state.get("active", False)):
-            rationale_codes.append(SETUP_CLUSTER_DISABLED_REASON_CODE)
+        elif decision.decision in {"long", "short"} and suppression_context["applies_soft_bias"]:
+            rationale_codes.extend(suppression_context["reason_codes"])
             updated_decision = decision.model_copy(
                 update={
-                    "decision": "hold",
-                    "confidence": round(max(0.24, adjusted_confidence), 4),
-                    "entry_mode": "none",
-                    "invalidation_price": None,
-                    "max_chase_bps": None,
-                    "idea_ttl_minutes": None,
-                    "stop_loss": None,
-                    "take_profit": None,
-                    "risk_pct": 0.001,
-                    "leverage": 1.0,
+                    "confidence": adjusted_confidence,
+                    "risk_pct": adjusted_risk_pct,
                     "rationale_codes": rationale_codes,
-                    "explanation_short": "최근 같은 setup cluster 손실이 반복되어 신규 진입을 보류합니다.",
+                    "explanation_short": "최근 실거래 성과 약화로 신규 진입을 더 보수적으로 다룹니다.",
                     "explanation_detailed": (
-                        f"Setup cluster {setup_cluster_state.get('cluster_key', 'unknown')} is temporarily disabled "
-                        f"because reasons={setup_cluster_state.get('disable_reason_codes', [])}. "
-                        "같은 구조의 연속 손실을 줄이기 위해 cooldown 또는 최근 지표 회복 전까지 hold를 유지합니다."
-                    ),
-                }
-            )
-        elif (
-            decision.decision in {"long", "short"}
-            and hold_bias >= 0.12
-            and adjusted_confidence <= 0.46
-        ):
-            rationale_codes.extend(["ADAPTIVE_HOLD_BIAS", "ADAPTIVE_SIGNAL_UNDERPERFORMING"])
-            updated_decision = decision.model_copy(
-                update={
-                    "decision": "hold",
-                    "confidence": round(max(0.24, adjusted_confidence), 4),
-                    "entry_mode": "none",
-                    "invalidation_price": None,
-                    "max_chase_bps": None,
-                    "idea_ttl_minutes": None,
-                    "stop_loss": None,
-                    "take_profit": None,
-                    "risk_pct": 0.001,
-                    "leverage": 1.0,
-                    "rationale_codes": rationale_codes,
-                    "explanation_short": "Recent live performance is weak enough to prefer hold.",
-                    "explanation_detailed": (
-                        "The adaptive layer detected underperformance in recent buckets for this setup. "
-                        "Instead of forcing a marginal entry, it increases hold bias and keeps the system conservative."
+                        "The adaptive layer detected recent underperformance for this setup. "
+                        "신규 진입 의도는 유지하되 confidence와 risk_pct를 낮춰 보수적으로 넘깁니다."
                     ),
                 }
             )
@@ -1175,6 +1544,7 @@ class TradingDecisionAgent:
             }
         )
         adjustment["setup_cluster_state"] = setup_cluster_state
+        adjustment["suppression_context"] = suppression_context
         return updated_decision, adjustment
 
     def _deterministic_decision_improved(
@@ -1905,7 +2275,10 @@ class TradingDecisionAgent:
         use_ai: bool,
         max_input_candles: int,
         logic_variant: str = "improved",
+        ai_context: AIDecisionContextPacket | dict[str, Any] | None = None,
     ) -> tuple[TradeDecision, str, dict[str, Any]]:
+        resolved_ai_context = self._coerce_ai_context(ai_context)
+        ai_context_payload = self._serialize_ai_context(ai_context)
         baseline = self._deterministic_decision(
             market_snapshot,
             features,
@@ -1926,6 +2299,24 @@ class TradingDecisionAgent:
             risk_context=risk_context,
             strategy_engine_selection=strategy_engine_selection,
         )
+        selected_engine_payload = (
+            strategy_engine_selection.get("selected_engine")
+            if isinstance(strategy_engine_selection, dict)
+            and isinstance(strategy_engine_selection.get("selected_engine"), dict)
+            else {}
+        )
+        prompt_route = resolve_prompt_route(
+            ai_context=resolved_ai_context,
+            strategy_engine=str(
+                (resolved_ai_context.strategy_engine if resolved_ai_context is not None else None)
+                or selected_engine_payload.get("engine_name")
+                or ""
+            )
+            or None,
+            has_open_position=bool(open_positions),
+        )
+        prompt_route_payload = prompt_route.to_payload()
+        prior_metadata = self._prior_observability_fields(resolved_ai_context)
         position_management_context = (
             risk_context.get("position_management_context")
             if isinstance(risk_context.get("position_management_context"), dict)
@@ -1936,8 +2327,11 @@ class TradingDecisionAgent:
             decision = baseline.model_copy(
                 update={
                     "rationale_codes": list(dict.fromkeys(baseline.rationale_codes + [provider_code])),
+                    "provider_status": "deterministic",
                 }
             )
+            decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
+            decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -1954,12 +2348,35 @@ class TradingDecisionAgent:
                     "holding_profile": decision.holding_profile,
                     "holding_profile_reason": decision.holding_profile_reason,
                     "holding_profile_context": baseline_holding_profile,
+                    "ai_context": ai_context_payload,
+                    "ai_context_version": (
+                        resolved_ai_context.ai_context_version
+                        if resolved_ai_context is not None
+                        else decision.ai_context_version
+                    ),
+                    **self._route_metadata(prompt_route, provider_status="deterministic"),
+                    "allowed_actions": list(prompt_route.allowed_actions),
+                    "forbidden_actions": list(prompt_route.forbidden_actions),
+                    "bounded_output_applied": decision.bounded_output_applied,
+                    "fallback_reason_codes": list(decision.fallback_reason_codes),
+                    "fail_closed_applied": decision.fail_closed_applied,
+                    "should_abstain": decision.should_abstain,
+                    "abstain_reason_codes": list(decision.abstain_reason_codes),
                     **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
                     "setup_cluster_state": {"matched": False, "active": False},
+                    "suppression_context": {
+                        "level": "none",
+                        "sources": [],
+                        "reason_codes": [],
+                        "applies_hard_block": False,
+                        "applies_risk_haircut": False,
+                        "applies_soft_bias": False,
+                    },
                     "adaptive_signal_adjustment": {
                         "enabled": False,
                         "status": "disabled_for_baseline_old",
                     },
+                    **prior_metadata,
                 },
             )
         if not use_ai:
@@ -1975,6 +2392,9 @@ class TradingDecisionAgent:
                 risk_context=risk_context,
                 strategy_engine_selection=strategy_engine_selection,
             )
+            decision = decision.model_copy(update={"provider_status": "deterministic"})
+            decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
+            decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -1991,9 +2411,25 @@ class TradingDecisionAgent:
                     "holding_profile": decision.holding_profile,
                     "holding_profile_reason": decision.holding_profile_reason,
                     "holding_profile_context": holding_profile_context,
+                    "ai_context": ai_context_payload,
+                    "ai_context_version": (
+                        resolved_ai_context.ai_context_version
+                        if resolved_ai_context is not None
+                        else decision.ai_context_version
+                    ),
+                    **self._route_metadata(prompt_route, provider_status="deterministic"),
+                    "allowed_actions": list(prompt_route.allowed_actions),
+                    "forbidden_actions": list(prompt_route.forbidden_actions),
+                    "bounded_output_applied": decision.bounded_output_applied,
+                    "fallback_reason_codes": list(decision.fallback_reason_codes),
+                    "fail_closed_applied": decision.fail_closed_applied,
+                    "should_abstain": decision.should_abstain,
+                    "abstain_reason_codes": list(decision.abstain_reason_codes),
                     **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
                     "setup_cluster_state": adaptive_adjustment.get("setup_cluster_state"),
+                    "suppression_context": adaptive_adjustment.get("suppression_context"),
                     "adaptive_signal_adjustment": adaptive_adjustment,
+                    **prior_metadata,
                 },
             )
 
@@ -2077,32 +2513,14 @@ class TradingDecisionAgent:
                 "strategy_engine_selection": strategy_engine_selection,
                 "logic_variant": logic_variant,
             }
+            if ai_context_payload is not None:
+                compact_payload["ai_context"] = ai_context_payload
+            compact_payload["ai_prompt_route"] = prompt_route_payload
             provider_result = self.provider.generate(
                 AgentRole.TRADING_DECISION.value,
                 compact_payload,
                 response_model=TradeDecision,
-                instructions=(
-                    "You are the trading decision role inside a risk-controlled live trading system. "
-                    "Return one structured decision. Stay conservative and concise. "
-                    "Do not exceed the provided leverage, notional headroom, or risk context. "
-                    "Never propose size or leverage beyond the provided risk budget. "
-                    "If the remaining budget is small or zero, prefer hold. "
-                    "If an open position already exists, prefer reduce, protect, or exit before proposing a new entry. "
-                    "If confidence is weak, return hold. "
-                    "For new long or short ideas, treat your output as a directional idea, not direct execution authority. "
-                    "Prefer pullback or rebound entries inside aligned trends over breakout chasing. "
-                    "Use breakout_confirm only as a rare exception when trend, momentum, and volume are strongly aligned. "
-                    "Keep immediate new entries disabled inside the agent. "
-                    "Set entry_mode to breakout_confirm, pullback_confirm, or none for new ideas. "
-                    "For long entries, entry_zone should usually sit below the current price as a pullback zone. "
-                    "For short entries, entry_zone should usually sit above the current price as a rebound zone. "
-                    "Default holding_profile should stay scalp. "
-                    "Use swing or position only when the regime is strongly aligned across higher timeframes, breadth is not weak, and lead-lag plus derivatives context support it. "
-                    "Provide a valid invalidation_price on the wrong side of the trade, plus a conservative max_chase_bps. "
-                    "Use entry_mode=none for hold, reduce, or exit. "
-                    "Reserve immediate only for externally triggered plan execution, not for fresh agent ideas. "
-                    "Keep explanation_short brief and explanation_detailed under 3 sentences."
-                ),
+                instructions=render_prompt_instructions(route=prompt_route),
             )
             decision = self._normalize_entry_trigger_fields(
                 TradeDecision.model_validate(provider_result.output),
@@ -2121,6 +2539,23 @@ class TradingDecisionAgent:
                 risk_context=risk_context,
                 strategy_engine_selection=strategy_engine_selection,
             )
+            decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
+            decision, adjusted_prior_metadata = self._apply_prior_soft_adjustments(
+                decision,
+                ai_context=resolved_ai_context,
+                route=prompt_route,
+            )
+            bounded_result = bound_trade_decision(
+                decision=decision,
+                route=prompt_route,
+                ai_context=resolved_ai_context,
+                has_open_position=bool(open_positions),
+                open_position_side=self._open_position_side(open_positions),
+                current_stop_loss=self._current_stop_loss(open_positions),
+                losing_position=self._has_losing_position(open_positions),
+                provider_status="ok",
+            )
+            decision = bounded_result.decision
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -2133,23 +2568,62 @@ class TradingDecisionAgent:
             metadata["holding_profile"] = decision.holding_profile
             metadata["holding_profile_reason"] = decision.holding_profile_reason
             metadata["holding_profile_context"] = holding_profile_context
+            metadata["ai_context"] = ai_context_payload
+            metadata["ai_context_version"] = (
+                resolved_ai_context.ai_context_version
+                if resolved_ai_context is not None
+                else decision.ai_context_version
+            )
+            metadata.update(self._route_metadata(prompt_route, provider_status="ok"))
+            metadata["allowed_actions"] = list(prompt_route.allowed_actions)
+            metadata["forbidden_actions"] = list(prompt_route.forbidden_actions)
+            metadata["bounded_output_applied"] = bounded_result.bounded_output_applied
+            metadata["fallback_reason_codes"] = list(bounded_result.fallback_reason_codes)
+            metadata["fail_closed_applied"] = bounded_result.fail_closed_applied
+            metadata["should_abstain"] = decision.should_abstain
+            metadata["abstain_reason_codes"] = list(bounded_result.abstain_reason_codes)
             metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
             metadata["setup_cluster_state"] = adaptive_adjustment.get("setup_cluster_state")
+            metadata["suppression_context"] = adaptive_adjustment.get("suppression_context")
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
+            metadata.update(adjusted_prior_metadata)
             return decision, provider_result.provider, metadata
         except Exception as exc:
-            decision, adaptive_adjustment = self._apply_adaptive_adjustment(
-                baseline.model_copy(update={"rationale_codes": baseline.rationale_codes + ["LLM_FALLBACK"]}),
-                risk_context=risk_context,
-                provider_code=f"PROVIDER_{self.provider.name.upper()}",
-            )
-            decision, holding_profile_context = self._apply_holding_profile_fields(
-                decision,
-                market_snapshot=market_snapshot,
-                features=features,
-                risk_context=risk_context,
-                strategy_engine_selection=strategy_engine_selection,
-            )
+            provider_status = self._provider_status_from_exception(exc)
+            if prompt_route.fail_closed:
+                reason_code = (
+                    "AI_SCHEMA_INVALID"
+                    if provider_status == "schema_invalid"
+                    else "AI_UNAVAILABLE_FAIL_CLOSED"
+                )
+                decision = self._fail_closed_decision(
+                    baseline,
+                    ai_context=resolved_ai_context,
+                    provider_status=provider_status,
+                    fail_reason_code=reason_code,
+                )
+                holding_profile_context = baseline_holding_profile
+                adaptive_adjustment = {
+                    "enabled": False,
+                    "status": "fail_closed",
+                    "reason_codes": [reason_code, "AI_UNAVAILABLE_FAIL_CLOSED"],
+                }
+            else:
+                decision, adaptive_adjustment = self._apply_adaptive_adjustment(
+                    baseline.model_copy(update={"rationale_codes": baseline.rationale_codes + ["LLM_FALLBACK"]}),
+                    risk_context=risk_context,
+                    provider_code=f"PROVIDER_{self.provider.name.upper()}",
+                )
+                decision, holding_profile_context = self._apply_holding_profile_fields(
+                    decision,
+                    market_snapshot=market_snapshot,
+                    features=features,
+                    risk_context=risk_context,
+                    strategy_engine_selection=strategy_engine_selection,
+                )
+                decision = decision.model_copy(update={"provider_status": provider_status})
+            decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
+            decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -2163,9 +2637,25 @@ class TradingDecisionAgent:
             metadata["holding_profile"] = decision.holding_profile
             metadata["holding_profile_reason"] = decision.holding_profile_reason
             metadata["holding_profile_context"] = holding_profile_context
+            metadata["ai_context"] = ai_context_payload
+            metadata["ai_context_version"] = (
+                resolved_ai_context.ai_context_version
+                if resolved_ai_context is not None
+                else decision.ai_context_version
+            )
+            metadata.update(self._route_metadata(prompt_route, provider_status=provider_status))
+            metadata["allowed_actions"] = list(prompt_route.allowed_actions)
+            metadata["forbidden_actions"] = list(prompt_route.forbidden_actions)
+            metadata["bounded_output_applied"] = decision.bounded_output_applied
+            metadata["fallback_reason_codes"] = list(decision.fallback_reason_codes)
+            metadata["fail_closed_applied"] = decision.fail_closed_applied
+            metadata["should_abstain"] = decision.should_abstain
+            metadata["abstain_reason_codes"] = list(decision.abstain_reason_codes)
             metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
             metadata["setup_cluster_state"] = adaptive_adjustment.get("setup_cluster_state")
+            metadata["suppression_context"] = adaptive_adjustment.get("suppression_context")
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
+            metadata.update(prior_metadata)
             return decision, "deterministic-mock", metadata
 
 

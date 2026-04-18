@@ -7,9 +7,14 @@ import pytest
 from trading_mvp.models import AgentRun, Execution, Order, Position, RiskCheck
 from trading_mvp.providers import ProviderResult
 from trading_mvp.schemas import (
+    AIDecisionContextPacket,
+    AIPriorContextPacket,
+    CompositeRegimePacket,
+    DataQualityPacket,
     DerivativesContextPayload,
     MarketCandle,
     MarketSnapshotPayload,
+    PreviousThesisDeltaPacket,
     TradeDecision,
 )
 from trading_mvp.services.adaptive_signal import (
@@ -1350,12 +1355,14 @@ def test_trading_agent_holds_when_matching_setup_cluster_is_active() -> None:
         max_input_candles=16,
     )
 
-    assert decision.decision == "hold"
+    assert decision.decision == "long"
     assert "SETUP_CLUSTER_DISABLED" in decision.rationale_codes
     assert metadata["setup_cluster_state"]["matched"] is True
     assert metadata["setup_cluster_state"]["active"] is True
     assert metadata["setup_cluster_state"]["status"] == "active_disabled"
     assert metadata["setup_cluster_state"]["cooldown_active"] is True
+    assert metadata["suppression_context"]["level"] == "hard_block"
+    assert "setup_cluster_disable" in metadata["suppression_context"]["sources"]
 
 
 def test_trading_agent_ignores_non_matching_setup_cluster_context() -> None:
@@ -1783,6 +1790,7 @@ def test_trading_agent_applies_adaptive_confidence_and_risk_discount() -> None:
     assert "ADAPTIVE_CONFIDENCE_DISCOUNT" in adaptive_decision.rationale_codes
     assert "ADAPTIVE_RISK_REDUCED" in adaptive_decision.rationale_codes
     assert metadata["adaptive_signal_adjustment"]["status"] == "active"
+    assert metadata["suppression_context"]["level"] == "risk_haircut"
 
 
 def test_trading_agent_keeps_default_behavior_when_adaptive_data_is_missing() -> None:
@@ -1820,7 +1828,7 @@ def test_trading_agent_keeps_default_behavior_when_adaptive_data_is_missing() ->
     assert metadata["adaptive_signal_adjustment"]["status"] == "insufficient_data"
 
 
-def test_adaptive_signal_disables_underperforming_setup_bucket_and_biases_hold(db_session) -> None:
+def test_adaptive_signal_disables_underperforming_setup_bucket_and_marks_hard_block_for_risk(db_session) -> None:
     _seed_setup_bucket_history(
         db_session,
         net_pnls=[-28.0, -22.0, -18.0, -14.0],
@@ -1871,9 +1879,11 @@ def test_adaptive_signal_disables_underperforming_setup_bucket_and_biases_hold(d
         max_input_candles=16,
     )
 
-    assert decision.decision == "hold"
+    assert decision.decision == "long"
     assert ADAPTIVE_SETUP_DISABLE_REASON_CODE in decision.rationale_codes
     assert metadata["adaptive_signal_adjustment"]["setup_disable"]["active"] is True
+    assert metadata["suppression_context"]["level"] == "hard_block"
+    assert "adaptive_setup_disable" in metadata["suppression_context"]["sources"]
 
 
 def test_adaptive_signal_setup_disable_recovers_after_cooldown(db_session) -> None:
@@ -2046,3 +2056,135 @@ def test_trading_agent_metadata_includes_strategy_engine_selection() -> None:
 
     assert metadata["strategy_engine"]["selected_engine"]["engine_name"] == "trend_continuation_engine"
     assert metadata["strategy_engine"]["session_context"]["session_label"] in {"asia", "europe", "us", "after_hours"}
+
+
+def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_fields() -> None:
+    captured_payloads: list[dict[str, object]] = []
+
+    class ContextAwareProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            captured_payloads.append(dict(payload))
+            latest_price = float(payload["market_snapshot"]["latest_price"])
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "decision": "long",
+                    "confidence": 0.67,
+                    "symbol": payload["market_snapshot"]["symbol"],
+                    "timeframe": payload["market_snapshot"]["timeframe"],
+                    "entry_zone_min": latest_price - 80.0,
+                    "entry_zone_max": latest_price - 20.0,
+                    "entry_mode": "pullback_confirm",
+                    "invalidation_price": latest_price - 6.0,
+                    "max_chase_bps": 10.0,
+                    "idea_ttl_minutes": 30,
+                    "stop_loss": latest_price - 6.0,
+                    "take_profit": latest_price + 9.0,
+                    "max_holding_minutes": 180,
+                    "risk_pct": 0.01,
+                    "leverage": 2.0,
+                    "rationale_codes": ["TREND_UP", "ALIGNED_PULLBACK"],
+                    "explanation_short": "ai context propagation test",
+                    "explanation_detailed": "The provider returns the legacy minimum shape while the agent backfills the new optional metadata from ai context.",
+                },
+                usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+            )
+
+    bullish_base = _snapshot(
+        "15m",
+        [100, 100.4, 100.6, 100.8, 100.7, 101.0, 101.2, 101.1, 101.4, 101.6, 101.8, 102.0, 102.2, 102.1, 102.4, 103.1],
+        volumes=[900, 920, 940, 960, 955, 980, 1000, 1020, 1040, 1060, 1090, 1120, 1150, 1180, 1220, 1260],
+    )
+    bullish_features = compute_features(
+        bullish_base,
+        {
+            "1h": _snapshot("1h", [98, 98.7, 99.4, 100.1, 100.9, 101.8, 102.7, 103.6, 104.4, 105.2, 106.1, 107.0, 108.0, 109.1, 110.2, 111.4]),
+            "4h": _snapshot("4h", [92, 93.4, 94.9, 96.6, 98.4, 100.1, 102.0, 104.1, 106.4, 108.8, 111.3, 114.0, 116.8, 119.7, 122.7, 125.8]),
+        },
+    )
+    ai_context = AIDecisionContextPacket(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trigger_type="entry_candidate_event",
+        composite_regime=CompositeRegimePacket(
+            structure_regime="trend",
+            direction_regime="bullish",
+            volatility_regime="fast",
+            participation_regime="strong",
+            derivatives_regime="tailwind",
+            execution_regime="clean",
+            persistence_bars=5,
+            persistence_class="established",
+            transition_risk="medium",
+            regime_reason_codes=["TREND_UP"],
+        ),
+        data_quality=DataQualityPacket(
+            data_quality_grade="partial",
+            missing_context_flags=["orderbook_context_unavailable"],
+            stale_context_flags=[],
+            derivatives_available=True,
+            orderbook_available=False,
+            spread_quality_available=True,
+            account_state_trustworthy=True,
+            market_state_trustworthy=True,
+        ),
+        previous_thesis=PreviousThesisDeltaPacket(),
+        prior_context=AIPriorContextPacket(
+            engine_prior_available=True,
+            engine_prior_sample_count=4,
+            engine_sample_threshold_satisfied=True,
+            engine_prior_classification="strong",
+            capital_efficiency_available=True,
+            capital_efficiency_sample_count=4,
+            capital_efficiency_sample_threshold_satisfied=True,
+            capital_efficiency_classification="efficient",
+            prior_reason_codes=["ENGINE_PRIOR_STRONG", "CAPITAL_EFFICIENCY_EFFICIENT"],
+            prior_penalty_level="none",
+            expected_payoff_efficiency_hint_summary={"time_to_0_25r_hint_minutes": 20.0},
+        ),
+        strategy_engine="trend_pullback_engine",
+        strategy_engine_context={"engine_name": "trend_pullback_engine"},
+        holding_profile="swing",
+        holding_profile_reason="intraday_alignment_supports_swing",
+        assigned_slot="slot_2",
+        candidate_weight=0.36,
+        capacity_reason="mixed_breadth_moderate_capacity",
+        blocked_reason_codes=[],
+        hard_stop_active=True,
+        stop_widening_allowed=False,
+        initial_stop_type="deterministic_hard_stop",
+        selection_context_summary={"assigned_slot": "slot_2", "candidate_weight": 0.36},
+        prompt_family_hint="entry_candidate_event:trend_pullback_engine",
+    )
+
+    decision, provider_name, metadata = TradingDecisionAgent(ContextAwareProvider()).run(
+        bullish_base,
+        bullish_features,
+        [],
+        _risk_context(),
+        use_ai=True,
+        max_input_candles=16,
+        ai_context=ai_context,
+    )
+
+    assert provider_name == "openai"
+    assert captured_payloads[0]["ai_context"]["strategy_engine"] == "trend_pullback_engine"
+    assert captured_payloads[0]["ai_context"]["holding_profile"] == "swing"
+    assert captured_payloads[0]["ai_context"]["prior_context"]["engine_prior_classification"] == "strong"
+    assert decision.prompt_family_hint == "entry_candidate_event:trend_pullback_engine"
+    assert decision.regime_transition_risk == "medium"
+    assert decision.data_quality_penalty_applied is True
+    assert decision.expected_time_to_0_25r_minutes is not None
+    assert decision.expected_time_to_0_5r_minutes is not None
+    assert decision.expected_mae_r is not None
+    assert decision.invalidation_reason_codes == ["INVALIDATION_PRICE_BREACH"]
+    assert decision.provider_status == "ok"
+    assert metadata["ai_context"]["assigned_slot"] == "slot_2"
+    assert metadata["ai_context_version"] == decision.ai_context_version
+    assert metadata["prompt_family"] == "entry_pullback_review"
+    assert metadata["engine_prior_classification"] == "strong"
+    assert metadata["capital_efficiency_classification"] == "efficient"
+    assert metadata["allowed_actions"] == ["hold", "long", "short"]
+    assert metadata["bounded_output_applied"] is False

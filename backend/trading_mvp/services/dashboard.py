@@ -29,6 +29,7 @@ from trading_mvp.schemas import (
     DashboardHoldBlockedSummary,
     DashboardProfitabilityResponse,
     DashboardProfitabilityWindow,
+    OperatorCandidateSelectionSnapshot,
     DecisionReferencePayload,
     OperatorControlState,
     OperatorDashboardResponse,
@@ -244,6 +245,8 @@ def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingE
         posture=row.posture,
         rationale_codes=_as_string_list(row.rationale_codes),
         entry_mode=row.entry_mode if row.entry_mode in {"breakout_confirm", "pullback_confirm", "immediate", "none"} else None,
+        holding_profile=_as_holding_profile(metadata.get("holding_profile")) or "scalp",  # type: ignore[arg-type]
+        holding_profile_reason=str(metadata.get("holding_profile_reason") or "") or None,
         entry_zone_min=row.entry_zone_min,
         entry_zone_max=row.entry_zone_max,
         invalidation_price=row.invalidation_price,
@@ -384,6 +387,13 @@ def _as_dict(value: object) -> dict[str, Any]:
     return {str(key): item for key, item in value.items()}
 
 
+def _as_holding_profile(value: object) -> str | None:
+    profile = str(value or "").strip().lower()
+    if profile in {"scalp", "swing", "position"}:
+        return profile
+    return None
+
+
 def _compact_dict(
     value: object,
     *,
@@ -444,6 +454,32 @@ def _compact_risk_debug_payload(value: object) -> dict[str, Any]:
     entry_trigger = _compact_dict(source.get("entry_trigger"))
     if entry_trigger:
         compact["entry_trigger"] = entry_trigger
+    slot_allocation = _compact_dict(
+        source.get("slot_allocation"),
+        allowed_keys=(
+            "assigned_slot",
+            "candidate_weight",
+            "capacity_reason",
+            "selected_reason",
+            "applies_soft_limit",
+            "risk_pct_multiplier",
+            "leverage_multiplier",
+            "notional_multiplier",
+        ),
+    )
+    if slot_allocation:
+        compact["slot_allocation"] = slot_allocation
+    holding_profile = _compact_dict(
+        source.get("holding_profile"),
+        allowed_keys=(
+            "holding_profile",
+            "holding_profile_reason",
+            "hard_stop_active",
+            "stop_widening_allowed",
+        ),
+    )
+    if holding_profile:
+        compact["holding_profile"] = holding_profile
     sync_timestamps = _compact_dict(source.get("sync_timestamps"))
     if sync_timestamps:
         compact["sync_timestamps"] = sync_timestamps
@@ -1290,7 +1326,44 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     if row is None:
         return OperatorDecisionSnapshot()
     payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    ai_trigger = _as_dict(metadata.get("ai_trigger"))
+    selection_context = _as_dict(metadata.get("selection_context"))
+    slot_allocation = _as_dict(metadata.get("slot_allocation"))
+    if not slot_allocation:
+        slot_allocation = _as_dict(selection_context.get("slot_allocation"))
+    holding_profile_context = _as_dict(metadata.get("holding_profile_context"))
+    if not holding_profile_context:
+        holding_profile_context = _as_dict(selection_context.get("holding_profile_context"))
     decision_reference = _compact_decision_reference(_build_decision_reference(row))
+    holding_profile = (
+        _as_holding_profile(selection_context.get("holding_profile"))
+        or _as_holding_profile(metadata.get("holding_profile"))
+        or _as_holding_profile(holding_profile_context.get("holding_profile"))
+        or _as_holding_profile(payload.get("holding_profile"))
+    )
+    holding_profile_reason = str(
+        selection_context.get("holding_profile_reason")
+        or metadata.get("holding_profile_reason")
+        or holding_profile_context.get("holding_profile_reason")
+        or payload.get("holding_profile_reason")
+        or ""
+    ) or None
+    assigned_slot = str(
+        selection_context.get("assigned_slot")
+        or slot_allocation.get("assigned_slot")
+        or ""
+    ) or None
+    candidate_weight_raw = (
+        selection_context.get("candidate_weight")
+        if selection_context.get("candidate_weight") not in {None, ""}
+        else slot_allocation.get("candidate_weight")
+    )
+    capacity_reason = str(
+        selection_context.get("capacity_reason")
+        or slot_allocation.get("capacity_reason")
+        or ""
+    ) or None
     return OperatorDecisionSnapshot(
         decision_run_id=row.id,
         created_at=row.created_at,
@@ -1304,9 +1377,100 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         confidence=_as_float(payload.get("confidence"), default=0.0) if payload.get("confidence") is not None else None,
         rationale_codes=_as_string_list(payload.get("rationale_codes", [])),
         explanation_short=str(payload.get("explanation_short") or "") or None,
+        holding_profile=holding_profile,  # type: ignore[arg-type]
+        holding_profile_reason=holding_profile_reason,
+        assigned_slot=assigned_slot,
+        candidate_weight=_as_float(candidate_weight_raw, default=0.0)
+        if candidate_weight_raw not in {None, ""}
+        else None,
+        capacity_reason=capacity_reason,
+        portfolio_slot_soft_cap_applied=bool(
+            slot_allocation.get("applies_soft_limit") or selection_context.get("slot_applies_soft_cap")
+        ),
+        last_ai_trigger_reason=str(
+            metadata.get("last_ai_trigger_reason")
+            or ai_trigger.get("trigger_reason")
+            or ""
+        )
+        or None,
+        last_ai_invoked_at=(
+            _as_datetime(metadata.get("last_ai_invoked_at"))
+            or (row.created_at if str(metadata.get("source") or "") == "llm" else None)
+        ),
+        next_ai_review_due_at=_as_datetime(metadata.get("next_ai_review_due_at")),
+        trigger_deduped=bool(metadata.get("trigger_deduped", False)),
+        trigger_fingerprint=str(
+            metadata.get("trigger_fingerprint")
+            or ai_trigger.get("trigger_fingerprint")
+            or ""
+        )
+        or None,
+        last_ai_skip_reason=str(
+            metadata.get("last_ai_skip_reason")
+            or metadata.get("ai_skipped_reason")
+            or ""
+        )
+        or None,
         decision_reference=decision_reference,
         raw_output={},
     )
+
+
+def _interval_review_state_from_scheduler(row: SchedulerRun | None) -> dict[str, Any]:
+    if row is None or not isinstance(row.outcome, dict):
+        return {}
+    outcome = row.outcome
+    trigger = _as_dict(outcome.get("trigger"))
+    return {
+        "last_ai_trigger_reason": str(
+            outcome.get("last_ai_trigger_reason")
+            or trigger.get("trigger_reason")
+            or ""
+        )
+        or None,
+        "last_ai_invoked_at": _as_datetime(outcome.get("last_ai_invoked_at")),
+        "next_ai_review_due_at": _as_datetime(outcome.get("next_ai_review_due_at")),
+        "trigger_deduped": bool(outcome.get("trigger_deduped", False)),
+        "trigger_fingerprint": str(
+            outcome.get("trigger_fingerprint")
+            or trigger.get("trigger_fingerprint")
+            or ""
+        )
+        or None,
+        "last_ai_skip_reason": str(outcome.get("last_ai_skip_reason") or "") or None,
+    }
+
+
+def _overlay_interval_review_state(
+    snapshot: OperatorDecisionSnapshot,
+    *,
+    decision_row: AgentRun | None,
+    interval_row: SchedulerRun | None,
+) -> OperatorDecisionSnapshot:
+    if interval_row is None:
+        return snapshot
+    interval_state = _interval_review_state_from_scheduler(interval_row)
+    if not interval_state:
+        return snapshot
+    decision_created_at = decision_row.created_at if decision_row is not None else None
+    update: dict[str, Any] = {}
+    if interval_state.get("next_ai_review_due_at") is not None:
+        update["next_ai_review_due_at"] = interval_state["next_ai_review_due_at"]
+    if interval_state.get("last_ai_skip_reason") is not None:
+        update["last_ai_skip_reason"] = interval_state["last_ai_skip_reason"]
+    if bool(interval_state.get("trigger_deduped")):
+        update["trigger_deduped"] = True
+    if interval_state.get("last_ai_trigger_reason") is not None and (
+        decision_created_at is None or interval_row.created_at >= decision_created_at
+    ):
+        update["last_ai_trigger_reason"] = interval_state["last_ai_trigger_reason"]
+    if interval_state.get("trigger_fingerprint") is not None and (
+        decision_created_at is None or interval_row.created_at >= decision_created_at
+    ):
+        update["trigger_fingerprint"] = interval_state["trigger_fingerprint"]
+    if interval_state.get("last_ai_invoked_at") is not None:
+        update["last_ai_invoked_at"] = interval_state["last_ai_invoked_at"]
+    return snapshot.model_copy(update=update) if update else snapshot
 
 
 def _risk_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
@@ -1380,6 +1544,10 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     reason_codes = _as_string_list(payload.get("reason_codes", []))
     blocked_reason_codes = _as_string_list(payload.get("blocked_reason_codes", []))
     adjustment_reason_codes = _as_string_list(payload.get("adjustment_reason_codes", []))
+    debug_payload = _as_dict(payload.get("debug_payload", {}))
+    slot_allocation = _as_dict(debug_payload.get("slot_allocation"))
+    holding_profile = _as_dict(debug_payload.get("holding_profile"))
+    candidate_weight_raw = slot_allocation.get("candidate_weight")
     return OperatorRiskSnapshot(
         risk_check_id=row.id,
         decision_run_id=row.decision_run_id,
@@ -1413,11 +1581,21 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
         if payload.get("size_adjustment_ratio") is not None
         else None,
         auto_resize_reason=str(payload.get("auto_resize_reason") or "") or None,
+        holding_profile=_as_holding_profile(holding_profile.get("holding_profile")),  # type: ignore[arg-type]
+        holding_profile_reason=str(holding_profile.get("holding_profile_reason") or "") or None,
+        assigned_slot=str(slot_allocation.get("assigned_slot") or "") or None,
+        candidate_weight=_as_float(candidate_weight_raw, default=0.0)
+        if candidate_weight_raw not in {None, ""}
+        else None,
+        capacity_reason=str(slot_allocation.get("capacity_reason") or "") or None,
+        portfolio_slot_soft_cap_applied=bool(
+            slot_allocation.get("applies_soft_limit") or "PORTFOLIO_SLOT_SOFT_CAP" in adjustment_reason_codes
+        ),
         exposure_headroom_snapshot={
             str(key): _as_float(value, default=0.0)
             for key, value in _as_dict(payload.get("exposure_headroom_snapshot")).items()
         },
-        debug_payload=_as_dict(payload.get("debug_payload", {})),
+        debug_payload=debug_payload,
         current_cycle_result=dict(payload),
         raw_payload={},
     )
@@ -1589,6 +1767,32 @@ def _build_protection_snapshot(
     )
 
 
+def _build_candidate_selection_snapshot(
+    payload: dict[str, object] | None,
+    *,
+    blocked_reason_codes: list[str] | None = None,
+) -> OperatorCandidateSelectionSnapshot:
+    source = dict(payload) if isinstance(payload, dict) else {}
+    candidate_weight_raw = source.get("candidate_weight")
+    return OperatorCandidateSelectionSnapshot(
+        symbol=str(source.get("symbol") or "") or None,
+        selected=bool(source.get("selected")) if "selected" in source else None,
+        selection_reason=str(source.get("selection_reason") or "") or None,
+        selected_reason=str(source.get("selected_reason") or "") or None,
+        rejected_reason=str(source.get("rejected_reason") or "") or None,
+        strategy_engine=str(source.get("strategy_engine") or "") or None,
+        holding_profile=_as_holding_profile(source.get("holding_profile")),  # type: ignore[arg-type]
+        holding_profile_reason=str(source.get("holding_profile_reason") or "") or None,
+        assigned_slot=str(source.get("assigned_slot") or "") or None,
+        candidate_weight=_as_float(candidate_weight_raw, default=0.0)
+        if candidate_weight_raw not in {None, ""}
+        else None,
+        capacity_reason=str(source.get("capacity_reason") or "") or None,
+        blocked_reason_codes=list(blocked_reason_codes or []),
+        portfolio_slot_soft_cap_applied=bool(source.get("slot_applies_soft_cap", False)),
+    )
+
+
 def _build_symbol_stale_flags(
     sync_freshness_summary: dict[str, Any],
     market_row: MarketSnapshot | None,
@@ -1746,6 +1950,19 @@ def _build_operator_symbol_summaries(
         symbol = row.symbol.upper()
         latest_orders.setdefault(symbol, row)
 
+    latest_interval_reviews: dict[str, SchedulerRun] = {}
+    for row in session.scalars(
+        select(SchedulerRun)
+        .where(SchedulerRun.workflow == "interval_decision_cycle")
+        .order_by(desc(SchedulerRun.created_at))
+    ):
+        outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        symbol = str(outcome.get("symbol") or "").upper()
+        if symbol in symbol_keys and symbol not in latest_interval_reviews:
+            latest_interval_reviews[symbol] = row
+        if len(latest_interval_reviews) == len(symbol_keys):
+            break
+
     latest_executions_by_order_id: dict[int, Execution] = {}
     recent_executions_by_symbol: dict[str, list[Execution]] = defaultdict(list)
     order_ids = [row.id for row in latest_orders.values()]
@@ -1798,6 +2015,7 @@ def _build_operator_symbol_summaries(
     for symbol in tracked_symbols:
         symbol_key = symbol.upper()
         decision_row = latest_decisions.get(symbol_key)
+        interval_review_row = latest_interval_reviews.get(symbol_key)
         risk_row = latest_risks.get(symbol_key)
         order_row = latest_orders.get(symbol_key)
         execution_row = latest_executions_by_order_id.get(order_row.id) if order_row is not None else None
@@ -1826,6 +2044,11 @@ def _build_operator_symbol_summaries(
             position_row.created_at if position_row is not None else None,
         )
         decision_snapshot = _build_decision_snapshot(decision_row)
+        decision_snapshot = _overlay_interval_review_state(
+            decision_snapshot,
+            decision_row=decision_row,
+            interval_row=interval_review_row,
+        )
         decision_snapshot = decision_snapshot.model_copy(
             update={
                 "decision_reference": _annotate_decision_reference(
@@ -1858,7 +2081,10 @@ def _build_operator_symbol_summaries(
                     latest_event=latest_protection_event_by_symbol.get(symbol_key),
                 ),
                 blocked_reasons=_risk_reason_codes_from_row(risk_row),
-                candidate_selection=candidate_selection_map.get(symbol_key, {}),
+                candidate_selection=_build_candidate_selection_snapshot(
+                    candidate_selection_map.get(symbol_key),
+                    blocked_reason_codes=_risk_reason_codes_from_row(risk_row),
+                ),
                 live_execution_ready=overview.live_execution_ready and len(stale_flags) == 0,
                 stale_flags=stale_flags,
                 last_updated_at=last_updated_at,
