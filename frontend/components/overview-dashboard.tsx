@@ -228,6 +228,7 @@ type OperatorSymbolSummary = {
   timeframe: string | null;
   latest_price: number | null;
   market_snapshot_time: string | null;
+  market_candle_time: string | null;
   market_context_summary: Record<string, unknown>;
   ai_decision: OperatorDecisionSnapshot;
   risk_guard: OperatorRiskSnapshot;
@@ -337,6 +338,7 @@ const syncScopeLabelMap: Record<string, string> = {
   protective_orders: "보호 주문",
   market_snapshot: "시장 스냅샷",
   market_snapshot_incomplete: "시장 스냅샷 불완전",
+  feature_input_missing: "피처 입력 없음",
 };
 
 const accountSummaryBasisLabelMap: Record<string, string> = {
@@ -848,6 +850,17 @@ function auditPayloadRows(payload: Record<string, unknown> | null | undefined): 
 
 function translateSyncScope(value: string) {
   return syncScopeLabelMap[value] ?? value;
+}
+
+function formatMarketTiming(symbol: OperatorSymbolSummary) {
+  const parts: string[] = [];
+  if (symbol.market_candle_time) {
+    parts.push(`캔들 ${formatDateTime(symbol.market_candle_time)}`);
+  }
+  if (symbol.market_snapshot_time) {
+    parts.push(`수집 ${formatDateTime(symbol.market_snapshot_time)}`);
+  }
+  return parts.join(" / ") || "기록 없음";
 }
 
 function syncBadge(scope: SyncScopeStatus | undefined) {
@@ -1745,7 +1758,7 @@ function SymbolDetailPanel({
         {valueCard(
           "현재가",
           symbol.latest_price !== null ? formatNumber(symbol.latest_price, 2) : "-",
-          `마켓 스냅샷 ${formatDateTime(symbol.market_snapshot_time)}`,
+          formatMarketTiming(symbol),
         )}
         {valueCard(
           "데이터 상태",

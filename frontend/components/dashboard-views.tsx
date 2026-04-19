@@ -54,6 +54,30 @@ function formatDateTime(value: string | null | undefined) {
   }).format(parsed);
 }
 
+function translateMarketInputFlag(value: string) {
+  const labels: Record<string, string> = {
+    account: "계좌 stale",
+    positions: "포지션 stale",
+    open_orders: "오더 stale",
+    protective_orders: "보호 주문 stale",
+    market_snapshot: "시장 스냅샷 stale",
+    market_snapshot_incomplete: "시장 스냅샷 불완전",
+    feature_input_missing: "피처 입력 없음",
+  };
+  return labels[value] ?? value;
+}
+
+function formatMarketTiming(symbol: OperatorDashboardPayload["symbols"][number]) {
+  const parts: string[] = [];
+  if (symbol.market_candle_time) {
+    parts.push(`캔들 ${formatDateTime(symbol.market_candle_time)}`);
+  }
+  if (symbol.market_snapshot_time) {
+    parts.push(`수집 ${formatDateTime(symbol.market_snapshot_time)}`);
+  }
+  return `${parts.join(" / ") || "기록 없음"} / ${symbol.timeframe ?? "-"}`;
+}
+
 function formatNumber(value: number | null | undefined, digits = 2) {
   if (value === null || value === undefined) {
     return "-";
@@ -426,7 +450,7 @@ export function MarketSignalView({
                 <div>
                   <h3 className="text-lg font-semibold text-slate-950">{symbol.symbol}</h3>
                   <p className="mt-1 text-sm text-slate-500">
-                    스냅샷 {formatDateTime(symbol.market_snapshot_time)} / {symbol.timeframe ?? "-"}
+                    {formatMarketTiming(symbol)}
                   </p>
                 </div>
                 <span
@@ -454,7 +478,9 @@ export function MarketSignalView({
                 {metricCard(
                   "신선도",
                   symbol.stale_flags.length > 0 ? "주의" : "정상",
-                  symbol.stale_flags.length > 0 ? symbol.stale_flags.join(", ") : "stale flag 없음",
+                  symbol.stale_flags.length > 0
+                    ? symbol.stale_flags.map(translateMarketInputFlag).join(", ")
+                    : "이상 플래그 없음",
                 )}
               </div>
             </div>

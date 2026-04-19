@@ -1643,15 +1643,35 @@ def _decision_timeframe(row: AgentRun | None) -> str | None:
     return timeframe or None
 
 
-def _extract_symbol_market_context(row: AgentRun | None, market_row: MarketSnapshot | None) -> dict[str, Any]:
+def _extract_symbol_market_context(
+    row: AgentRun | None,
+    market_row: MarketSnapshot | None,
+    feature_row: FeatureSnapshot | None,
+) -> dict[str, Any]:
     if row is not None and isinstance(row.input_payload, dict):
         features = _as_dict(row.input_payload.get("features", {}))
         regime = _as_dict(features.get("regime", {}))
         if regime:
             return _compact_market_context_summary(regime)
+    if feature_row is not None and isinstance(feature_row.payload, dict):
+        regime = _as_dict(feature_row.payload.get("regime", {}))
+        if regime:
+            return _compact_market_context_summary(regime)
     if market_row is not None and isinstance(market_row.payload, dict):
         return _compact_market_context_summary(market_row.payload.get("regime_summary", {}))
     return {}
+
+
+def _extract_latest_candle_time(market_row: MarketSnapshot | None) -> datetime | None:
+    if market_row is None or not isinstance(market_row.payload, dict):
+        return None
+    candles = market_row.payload.get("candles")
+    if not isinstance(candles, list) or not candles:
+        return None
+    latest = candles[-1]
+    if not isinstance(latest, dict):
+        return None
+    return _as_datetime(latest.get("timestamp"))
 
 
 def _build_execution_snapshot_from_rows(
@@ -1824,6 +1844,7 @@ def _build_candidate_selection_snapshot(
 def _build_symbol_stale_flags(
     sync_freshness_summary: dict[str, Any],
     market_row: MarketSnapshot | None,
+    market_context_summary: dict[str, Any],
 ) -> list[str]:
     flags: list[str] = []
     for scope, payload in sync_freshness_summary.items():
@@ -1838,6 +1859,8 @@ def _build_symbol_stale_flags(
             flags.append("market_snapshot")
         if not market_row.is_complete:
             flags.append("market_snapshot_incomplete")
+    if not market_context_summary:
+        flags.append("feature_input_missing")
     return flags
 
 
@@ -1938,6 +1961,15 @@ def _build_operator_symbol_summaries(
     ):
         symbol = row.symbol.upper()
         latest_markets.setdefault(symbol, row)
+
+    latest_features: dict[str, FeatureSnapshot] = {}
+    for row in session.scalars(
+        select(FeatureSnapshot)
+        .where(FeatureSnapshot.symbol.in_(symbol_keys))
+        .order_by(desc(FeatureSnapshot.feature_time))
+    ):
+        symbol = row.symbol.upper()
+        latest_features.setdefault(symbol, row)
 
     latest_decisions: dict[str, AgentRun] = {}
     for row in session.scalars(
@@ -2049,6 +2081,8 @@ def _build_operator_symbol_summaries(
         execution_row = latest_executions_by_order_id.get(order_row.id) if order_row is not None else None
         position_row = open_positions.get(symbol_key)
         market_row = latest_markets.get(symbol_key)
+        feature_row = latest_features.get(symbol_key)
+        market_context_summary = _extract_symbol_market_context(decision_row, market_row, feature_row)
         protection_state = (
             _build_position_protection_state(session, position_row)
             if position_row is not None
@@ -2062,9 +2096,10 @@ def _build_operator_symbol_summaries(
                 "order_ids": [],
             }
         )
-        stale_flags = _build_symbol_stale_flags(overview.sync_freshness_summary, market_row)
+        stale_flags = _build_symbol_stale_flags(overview.sync_freshness_summary, market_row, market_context_summary)
         last_updated_at = _latest_timestamp(
             market_row.snapshot_time if market_row is not None else None,
+            feature_row.feature_time if feature_row is not None else None,
             decision_row.created_at if decision_row is not None else None,
             risk_row.created_at if risk_row is not None else None,
             order_row.created_at if order_row is not None else None,
@@ -2092,7 +2127,8 @@ def _build_operator_symbol_summaries(
                 timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
                 latest_price=market_row.latest_price if market_row is not None else None,
                 market_snapshot_time=market_row.snapshot_time if market_row is not None else None,
-                market_context_summary=_extract_symbol_market_context(decision_row, market_row),
+                market_candle_time=_extract_latest_candle_time(market_row),
+                market_context_summary=market_context_summary,
                 ai_decision=decision_snapshot,
                 pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),
                 risk_guard=_build_risk_snapshot(risk_row),

@@ -1229,6 +1229,7 @@ class OperatorSymbolSummary(StrictBaseModel):
     timeframe: str | None = None
     latest_price: float | None = None
     market_snapshot_time: datetime | None = None
+    market_candle_time: datetime | None = None
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     ai_decision: OperatorDecisionSnapshot = Field(default_factory=OperatorDecisionSnapshot)
     pending_entry_plan: PendingEntryPlanSnapshot = Field(default_factory=PendingEntryPlanSnapshot)

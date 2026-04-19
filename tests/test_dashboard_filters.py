@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from threading import Event
 
 from fastapi.testclient import TestClient
 from trading_mvp.main import app
-from trading_mvp.models import AuditEvent, Execution, Order, Position, RiskCheck, SchedulerRun
+from trading_mvp.models import (
+    AuditEvent,
+    Execution,
+    FeatureSnapshot,
+    MarketSnapshot,
+    Order,
+    Position,
+    RiskCheck,
+    SchedulerRun,
+)
 from trading_mvp.services.dashboard import (
     classify_audit_event,
     get_audit_timeline,
@@ -1399,6 +1408,159 @@ def test_overview_prioritizes_stale_sync_reasons_in_operational_status(db_sessio
     assert overview.blocked_reasons[0] == "POSITION_STATE_STALE"
     assert "MAX_CONSECUTIVE_LOSSES_REACHED" in overview.blocked_reasons
     assert overview.guard_mode_reason_code == "POSITION_STATE_STALE"
+
+
+def test_operator_dashboard_flags_missing_feature_input_and_uses_candle_timestamp(db_session) -> None:
+    snapshot_time = datetime(2026, 4, 19, 12, 22, 4)
+    candle_time = datetime(2026, 4, 19, 12, 15, 0)
+
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "ADAUSDT"
+    settings.tracked_symbols = ["ADAUSDT"]
+    settings.default_timeframe = "15m"
+    settings.live_trading_enabled = True
+    settings.manual_live_approval = True
+    settings.live_execution_armed = True
+    settings.live_execution_armed_until = snapshot_time + timedelta(minutes=15)
+    db_session.add(settings)
+    db_session.flush()
+
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings, scope=scope, synced_at=snapshot_time)
+    db_session.add(settings)
+    db_session.flush()
+
+    db_session.add(
+        MarketSnapshot(
+            symbol="ADAUSDT",
+            timeframe="15m",
+            snapshot_time=snapshot_time,
+            latest_price=0.2477,
+            latest_volume=2321802.0,
+            candle_count=60,
+            is_stale=False,
+            is_complete=True,
+            payload={
+                "symbol": "ADAUSDT",
+                "timeframe": "15m",
+                "snapshot_time": snapshot_time.isoformat(),
+                "latest_price": 0.2477,
+                "latest_volume": 2321802.0,
+                "candle_count": 60,
+                "is_stale": False,
+                "is_complete": True,
+                "candles": [
+                    {
+                        "timestamp": candle_time.isoformat(),
+                        "open": 0.2481,
+                        "high": 0.2482,
+                        "low": 0.2476,
+                        "close": 0.2477,
+                        "volume": 2321802.0,
+                    }
+                ],
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+
+    ada = payload.symbols[0]
+    assert ada.symbol == "ADAUSDT"
+    assert ada.market_snapshot_time == snapshot_time
+    assert ada.market_candle_time == candle_time
+    assert ada.market_context_summary == {}
+    assert "feature_input_missing" in ada.stale_flags
+    assert ada.live_execution_ready is False
+
+
+def test_operator_dashboard_uses_feature_snapshot_market_context_fallback(db_session) -> None:
+    snapshot_time = datetime(2026, 4, 19, 12, 22, 4)
+    candle_time = datetime(2026, 4, 19, 12, 15, 0)
+
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "ADAUSDT"
+    settings.tracked_symbols = ["ADAUSDT"]
+    settings.default_timeframe = "15m"
+    settings.live_trading_enabled = True
+    settings.manual_live_approval = True
+    settings.live_execution_armed = True
+    settings.live_execution_armed_until = snapshot_time + timedelta(minutes=15)
+    db_session.add(settings)
+    db_session.flush()
+
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings, scope=scope, synced_at=snapshot_time)
+    db_session.add(settings)
+    db_session.flush()
+
+    market = MarketSnapshot(
+        symbol="ADAUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=0.2477,
+        latest_volume=2321802.0,
+        candle_count=60,
+        is_stale=False,
+        is_complete=True,
+        payload={
+            "symbol": "ADAUSDT",
+            "timeframe": "15m",
+            "snapshot_time": snapshot_time.isoformat(),
+            "latest_price": 0.2477,
+            "latest_volume": 2321802.0,
+            "candle_count": 60,
+            "is_stale": False,
+            "is_complete": True,
+            "candles": [
+                {
+                    "timestamp": candle_time.isoformat(),
+                    "open": 0.2481,
+                    "high": 0.2482,
+                    "low": 0.2476,
+                    "close": 0.2477,
+                    "volume": 2321802.0,
+                }
+            ],
+        },
+    )
+    db_session.add(market)
+    db_session.flush()
+    db_session.add(
+        FeatureSnapshot(
+            symbol="ADAUSDT",
+            timeframe="15m",
+            market_snapshot_id=market.id,
+            feature_time=snapshot_time,
+            trend_score=1.2,
+            volatility_pct=0.02,
+            volume_ratio=1.4,
+            drawdown_pct=0.01,
+            rsi=58.0,
+            atr=0.004,
+            payload={
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volatility_regime": "normal",
+                    "volume_regime": "strong",
+                    "momentum_state": "stable",
+                    "weak_volume": False,
+                    "momentum_weakening": False,
+                }
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+
+    ada = payload.symbols[0]
+    assert ada.market_candle_time == candle_time
+    assert ada.market_context_summary["primary_regime"] == "bullish"
+    assert ada.market_context_summary["trend_alignment"] == "bullish_aligned"
+    assert "feature_input_missing" not in ada.stale_flags
 
 
 def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_factory) -> None:
