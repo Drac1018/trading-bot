@@ -8,7 +8,7 @@ import { formatDisplayValue } from "../lib/ui-copy";
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const scheduleOptions = ["1h"] as const;
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
-const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기", "AI 설정", "Binance 연동"] as const;
+const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기 / 가드", "AI 입력 / 모델", "Binance 연동"] as const;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
 
 type RolloutMode = (typeof rolloutModeOptions)[number];
@@ -328,15 +328,15 @@ function dedupeReasons(values: string[]) {
 function rolloutModeLabel(mode: RolloutMode) {
   switch (mode) {
     case "paper":
-      return "paper";
+      return "페이퍼";
     case "shadow":
-      return "shadow";
+      return "섀도";
     case "live_dry_run":
-      return "live dry-run";
+      return "실거래 드라이런";
     case "limited_live":
-      return "limited live";
+      return "제한 실거래";
     case "full_live":
-      return "full live";
+      return "전체 실거래";
     default:
       return mode;
   }
@@ -379,18 +379,18 @@ function ControlStatusPanel({ state }: { state: SettingsPayload }) {
   const primaryBlocker = currentCycleBlockedReasons[0];
   const cards = [
     {
-      label: "rollout mode",
+      label: "운영 모드",
       value: rolloutModeLabel(summary.rollout_mode),
       detail:
         summary.rollout_mode === "paper"
-          ? "paper 경로만 사용하고 거래소 submit은 비활성화됩니다."
+          ? "페이퍼 경로만 사용하고 거래소 주문 제출은 비활성화됩니다."
           : summary.rollout_mode === "shadow"
-            ? "AI/risk/execution intent와 audit까지만 수행하고 실제 submit은 금지됩니다."
+            ? "AI / 리스크 / 실행 intent와 감사 로그까지만 수행하고 실제 주문 제출은 금지됩니다."
             : summary.rollout_mode === "live_dry_run"
-              ? "거래소 sync와 preflight까지 수행하고 실제 submit은 금지됩니다."
+              ? "거래소 동기화와 사전 점검까지만 수행하고 실제 주문 제출은 금지됩니다."
               : summary.rollout_mode === "limited_live"
-                ? `실제 submit은 허용되지만 주문당 notional이 ${formatDisplayValue(summary.limited_live_max_notional, "limited_live_max_notional")}로 제한됩니다.`
-                : "기존 full live submit 경로를 사용합니다.",
+                ? `실제 주문 제출은 허용되지만 주문당 notional이 ${formatDisplayValue(summary.limited_live_max_notional, "limited_live_max_notional")}로 제한됩니다.`
+                : "전체 실거래 주문 제출 경로를 사용합니다.",
       tone:
         summary.rollout_mode === "full_live"
           ? ("good" as const)
@@ -408,7 +408,7 @@ function ControlStatusPanel({ state }: { state: SettingsPayload }) {
             : "주문 차단",
       detail:
         summary.exchange_can_trade === null
-          ? "최근 account sync에 거래소 canTrade truth가 없습니다."
+          ? "최근 계좌 동기화에 거래소 canTrade 상태가 없습니다."
           : summary.exchange_can_trade
             ? "거래소 계좌 상태 기준으로 신규 주문이 가능합니다."
             : "거래소 계좌 상태 기준으로 신규 주문이 차단됩니다.",
@@ -579,7 +579,7 @@ function SymbolCadenceOverridePanel({
           <StatusPill>{mergedSymbols.length}개 심볼</StatusPill>
         </div>
         <p className="text-sm leading-6 text-slate-600">
-          core symbol은 더 짧게, satellite symbol은 더 보수적으로 운영할 수 있습니다. 비워 두면 전역 기본값을 그대로 상속합니다.
+          핵심 심볼은 더 짧게, 보조 심볼은 더 보수적으로 운영할 수 있습니다. 비워 두면 전역 기본값을 그대로 상속합니다.
         </p>
       </div>
       <div className="mt-4 grid gap-4 2xl:grid-cols-2">
@@ -640,7 +640,7 @@ function SymbolCadenceOverridePanel({
                     placeholder={`${form.position_management_interval_seconds}`}
                   />
                 </Field>
-                <Field label="신규 판단(분)" hint={`전역 ${form.decision_cycle_interval_minutes}분`}>
+                <Field label="의사결정 점검(분)" hint={`전역 ${form.decision_cycle_interval_minutes}분 · 이벤트 기반 재검토 여부 확인 기준`}>
                   <input
                     className={inputClass}
                     type="number"
@@ -651,7 +651,7 @@ function SymbolCadenceOverridePanel({
                     placeholder={`${form.decision_cycle_interval_minutes}`}
                   />
                 </Field>
-                <Field label="AI 최소 호출(분)" hint={`전역 ${form.ai_call_interval_minutes}분`}>
+                <Field label="AI 재호출 가드(분)" hint={`전역 ${form.ai_call_interval_minutes}분 · 동일 심볼 최소 간격`}>
                   <input
                     className={inputClass}
                     type="number"
@@ -671,26 +671,26 @@ function SymbolCadenceOverridePanel({
                       <div><p className="text-xs text-slate-500">타임프레임</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.timeframe}</p></div>
                       <div><p className="text-xs text-slate-500">시장 갱신</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.market_refresh_interval_minutes}분</p></div>
                       <div><p className="text-xs text-slate-500">포지션 관리</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.position_management_interval_seconds}초</p></div>
-                      <div><p className="text-xs text-slate-500">신규 판단</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.decision_cycle_interval_minutes}분</p></div>
-                      <div><p className="text-xs text-slate-500">AI 최소 호출</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.ai_call_interval_minutes}분</p></div>
+                      <div><p className="text-xs text-slate-500">의사결정 점검</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.decision_cycle_interval_minutes}분</p></div>
+                      <div><p className="text-xs text-slate-500">AI 재호출 가드</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.ai_call_interval_minutes}분</p></div>
                     </div>
                     <div className="grid gap-3 lg:grid-cols-2">
                       <div className="rounded-2xl bg-white px-4 py-3">
-                        <p className="text-xs text-slate-500">마지막 AI 판단 / 다음 AI due</p>
+                        <p className="text-xs text-slate-500">마지막 AI 호출 / 다음 재호출 가능</p>
                         <p className="mt-2 break-all text-sm font-semibold text-slate-900">{formatDisplayValue(effective.last_ai_decision_at, "last_ai_decision_at")}</p>
                         <p className="mt-1 break-all text-sm text-slate-700">{formatDisplayValue(effective.next_ai_call_due_at, "next_ai_call_due_at")}</p>
                       </div>
                       <div className="rounded-2xl bg-white px-4 py-3">
-                        <p className="text-xs text-slate-500">최근 실행 / 다음 due</p>
+                        <p className="text-xs text-slate-500">최근 사이클 / 다음 점검</p>
                         <p className="mt-2 break-all text-sm text-slate-700">시장 갱신 {formatDisplayValue(effective.last_market_refresh_at, "last_market_refresh_at")}</p>
                         <p className="mt-1 break-all text-sm text-slate-700">포지션 관리 {formatDisplayValue(effective.last_position_management_at, "last_position_management_at")}</p>
-                        <p className="mt-1 break-all text-sm text-slate-700">신규 판단 {formatDisplayValue(effective.last_decision_at, "last_decision_at")}</p>
-                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">다음 신규 판단 {formatDisplayValue(effective.next_decision_due_at, "next_decision_due_at")}</p>
+                        <p className="mt-1 break-all text-sm text-slate-700">의사결정 점검 {formatDisplayValue(effective.last_decision_at, "last_decision_at")}</p>
+                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">다음 점검 예정 {formatDisplayValue(effective.next_decision_due_at, "next_decision_due_at")}</p>
                       </div>
                     </div>
                   </div>
                 ) : (
-                  <p className="text-sm text-slate-500">저장 후 실효 cadence와 마지막 실행 시각이 계산됩니다.</p>
+                  <p className="text-sm text-slate-500">저장 후 실제 주기와 마지막 실행 시각이 계산됩니다.</p>
                 )}
               </div>
             </div>
@@ -939,10 +939,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
           <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면은 변경 가능한 설정값과 즉시 제어를 다루되, 현재 gate 상태도 함께 보여줍니다. 심볼별 AI 추천, risk 승인, 실제 실행 흐름은 개요 화면에서 이어서 확인합니다.</p>
         </div>
         <div className="grid gap-2 sm:grid-cols-2">
-          <StatusPill tone={state.openai_api_key_configured ? "good" : "warn"}>OpenAI: {state.openai_api_key_configured ? "설정됨" : "없음"}</StatusPill>
-          <StatusPill tone={state.binance_api_key_configured ? "good" : "warn"}>Binance Key: {state.binance_api_key_configured ? "설정됨" : "없음"}</StatusPill>
-          <StatusPill tone={state.binance_api_secret_configured ? "good" : "warn"}>Binance Secret: {state.binance_api_secret_configured ? "설정됨" : "없음"}</StatusPill>
-          <StatusPill tone="neutral">심볼별 AI / risk / execution 흐름은 개요에서 확인</StatusPill>
+          <StatusPill tone={state.openai_api_key_configured ? "good" : "warn"}>OpenAI 키: {state.openai_api_key_configured ? "설정됨" : "없음"}</StatusPill>
+          <StatusPill tone={state.binance_api_key_configured ? "good" : "warn"}>Binance 키: {state.binance_api_key_configured ? "설정됨" : "없음"}</StatusPill>
+          <StatusPill tone={state.binance_api_secret_configured ? "good" : "warn"}>Binance 시크릿: {state.binance_api_secret_configured ? "설정됨" : "없음"}</StatusPill>
+          <StatusPill tone="neutral">심볼별 AI / 리스크 / 실행 흐름은 개요 화면에서 확인</StatusPill>
         </div>
       </div>
 
@@ -955,9 +955,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <MetricCard label="기본 심볼" value={form.default_symbol} tone="dark" />
-        <MetricCard label="기본 시장 타임프레임" value={form.default_timeframe} />
-        <MetricCard label="관측 월간 AI 환산" value={`${state.observed_monthly_ai_calls_projection.toLocaleString("ko-KR")}회`} tone="warm" />
+        <MetricCard label="운영 모드" value={rolloutModeLabel(form.rollout_mode)} tone="dark" />
+        <MetricCard label="기본 심볼 / 타임프레임" value={`${form.default_symbol} / ${form.default_timeframe}`} />
+        <MetricCard label="AI 동작 방식" value="이벤트 기반 + 주기 백스톱" tone="warm" />
         <MetricCard label="최근 24시간 AI 호출" value={`${state.recent_ai_calls_24h.toLocaleString("ko-KR")}회`} />
       </div>
 
@@ -982,7 +982,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
           </p>
             <ControlStatusPanel state={state} />
             <div className="mt-4 grid gap-4 md:grid-cols-2">
-              <Field label="rollout mode">
+              <Field label="운영 모드">
                 <select
                   className={inputClass}
                   value={form.rollout_mode}
@@ -1137,12 +1137,12 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">운영 주기 기본값</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            거래소 동기화, 시장 갱신, 포지션 관리, 신규 판단, AI 최소 호출 간격의 전역 기본값을 분리해 관리합니다. AI 자체는 고정 15분 주기가 아니라 이벤트 기반 + periodic backstop으로 호출됩니다.
+            거래소 동기화, 시장 갱신, 포지션 관리, 의사결정 점검, AI 재호출 가드의 전역 기본값을 분리해 관리합니다. AI 자체는 고정 15분 정기호출이 아니라 이벤트 기반 + 주기 백스톱으로 동작합니다.
           </p>
           <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">운영 원칙</p>
             <p className="mt-2 text-sm leading-6 text-slate-700">
-              거래소 동기화는 전역 공용 주기만 사용합니다. 심볼별 override는 시장 갱신, 포지션 관리, 신규 판단, AI 최소 호출 간격에만 적용됩니다.
+              거래소 동기화는 전역 공용 주기만 사용합니다. 심볼별 override는 시장 갱신, 포지션 관리, 의사결정 점검, AI 재호출 가드에만 적용됩니다.
             </p>
           </div>
           <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
@@ -1155,12 +1155,12 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <Field label="포지션 관리(초)">
               <input className={inputClass} type="number" min={30} max={3600} value={form.position_management_interval_seconds} onChange={(event) => updateField("position_management_interval_seconds", Number(event.target.value))} />
             </Field>
-            <Field label="신규 판단(분)">
-              <input className={inputClass} type="number" min={1} value={form.decision_cycle_interval_minutes} onChange={(event) => updateField("decision_cycle_interval_minutes", Number(event.target.value))} />
-            </Field>
-            <Field label="AI 최소 호출(분)">
-              <input className={inputClass} type="number" min={5} value={form.ai_call_interval_minutes} onChange={(event) => updateField("ai_call_interval_minutes", Number(event.target.value))} />
-            </Field>
+              <Field label="의사결정 점검(분)" hint="주기 점검 cycle이 재검토 여부를 확인하는 기본 간격입니다.">
+                <input className={inputClass} type="number" min={1} value={form.decision_cycle_interval_minutes} onChange={(event) => updateField("decision_cycle_interval_minutes", Number(event.target.value))} />
+              </Field>
+              <Field label="AI 재호출 가드(분)" hint="동일 심볼에서 AI를 다시 부를 수 있는 최소 간격입니다.">
+                <input className={inputClass} type="number" min={5} value={form.ai_call_interval_minutes} onChange={(event) => updateField("ai_call_interval_minutes", Number(event.target.value))} />
+              </Field>
           </div>
           <div className="mt-4">
             <p className="text-sm font-semibold text-slate-900">스케줄 윈도우</p>
@@ -1239,15 +1239,21 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">AI 설정</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            모델과 입력 품질만 조정합니다. 신규 판단 주기와 AI 최소 호출 간격은 위 운영 주기 섹션에서 관리합니다.
+            여기서는 제공자, 모델, 입력 길이, 온도만 조정합니다. 호출 타이밍은 위 운영 주기 섹션에서 관리하고, 신규 진입은 이벤트 기반 + 행동 바운딩 + 실패 시 차단 경로를 따릅니다.
           </p>
+          <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
+            <p className="text-xs text-slate-500">현재 AI 운영 원칙</p>
+            <p className="mt-2 text-sm leading-6 text-slate-700">
+              고정 15분 AI 호출이 아니라 트리거 기반으로만 평가를 시도합니다. 위의 의사결정 점검 간격은 주기 review 재검토 계산용이고, AI 재호출 가드는 동일 심볼 과호출을 막는 최소 간격입니다.
+            </p>
+          </div>
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <Toggle checked={form.ai_enabled} label="OpenAI 사용" onChange={(value) => updateField("ai_enabled", value)} />
-            <Field label="제공자"><select className={inputClass} value={form.ai_provider} onChange={(event) => updateField("ai_provider", event.target.value as "openai" | "mock")}><option value="openai">OpenAI</option><option value="mock">Mock</option></select></Field>
+            <Field label="제공자"><select className={inputClass} value={form.ai_provider} onChange={(event) => updateField("ai_provider", event.target.value as "openai" | "mock")}><option value="openai">OpenAI</option><option value="mock">모의 응답</option></select></Field>
             <Field label="모델"><input className={inputClass} value={form.ai_model} onChange={(event) => updateField("ai_model", event.target.value)} /></Field>
-            <Field label="Temperature"><input className={inputClass} type="number" min={0} max={1} step="0.05" value={form.ai_temperature} onChange={(event) => updateField("ai_temperature", Number(event.target.value))} /></Field>
+            <Field label="온도" hint="낮게 유지할수록 응답 분산이 줄어듭니다."><input className={inputClass} type="number" min={0} max={1} step="0.05" value={form.ai_temperature} onChange={(event) => updateField("ai_temperature", Number(event.target.value))} /></Field>
             <Field label="AI 입력 캔들 수"><input className={inputClass} type="number" min={16} max={200} value={form.ai_max_input_candles} onChange={(event) => updateField("ai_max_input_candles", Number(event.target.value))} /></Field>
-            <Field label="OpenAI API Key"><input className={inputClass} type="password" autoComplete="off" value={form.openai_api_key} onChange={(event) => updateField("openai_api_key", event.target.value)} placeholder="sk-..." /></Field>
+            <Field label="OpenAI API 키"><input className={inputClass} type="password" autoComplete="off" value={form.openai_api_key} onChange={(event) => updateField("openai_api_key", event.target.value)} placeholder="sk-..." /></Field>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={form.clear_openai_api_key} onChange={(event) => updateField("clear_openai_api_key", event.target.checked)} /> 저장된 키 제거</label>
@@ -1257,18 +1263,18 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">Binance 연동</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            시세 사용 여부, 선물/Testnet 경로, API 자격증명을 관리합니다. 실제 계좌 상태 확인은 위 실거래 제어의 거래소 동기화 버튼을 사용합니다.
+            시세 사용 여부, 선물 / 테스트넷 경로, API 자격증명을 관리합니다. 실제 계좌 상태 확인은 위 실거래 제어의 거래소 동기화 버튼을 사용합니다.
           </p>
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <Toggle checked={form.binance_market_data_enabled} label="Binance 시세 사용" onChange={(value) => updateField("binance_market_data_enabled", value)} />
-            <Toggle checked={form.binance_futures_enabled} label="USD-M Futures" onChange={(value) => updateField("binance_futures_enabled", value)} />
-            <Toggle checked={form.binance_testnet_enabled} label="Testnet 사용" onChange={(value) => updateField("binance_testnet_enabled", value)} />
-            <Field label="Binance API Key"><input className={inputClass} type="password" autoComplete="off" value={form.binance_api_key} onChange={(event) => updateField("binance_api_key", event.target.value)} /></Field>
-            <Field label="Binance API Secret"><input className={inputClass} type="password" autoComplete="off" value={form.binance_api_secret} onChange={(event) => updateField("binance_api_secret", event.target.value)} /></Field>
+            <Toggle checked={form.binance_futures_enabled} label="USD-M 선물" onChange={(value) => updateField("binance_futures_enabled", value)} />
+            <Toggle checked={form.binance_testnet_enabled} label="테스트넷 사용" onChange={(value) => updateField("binance_testnet_enabled", value)} />
+            <Field label="Binance API 키"><input className={inputClass} type="password" autoComplete="off" value={form.binance_api_key} onChange={(event) => updateField("binance_api_key", event.target.value)} /></Field>
+            <Field label="Binance API 시크릿"><input className={inputClass} type="password" autoComplete="off" value={form.binance_api_secret} onChange={(event) => updateField("binance_api_secret", event.target.value)} /></Field>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-3">
-            <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={form.clear_binance_api_key} onChange={(event) => updateField("clear_binance_api_key", event.target.checked)} /> 저장된 Key 제거</label>
-            <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={form.clear_binance_api_secret} onChange={(event) => updateField("clear_binance_api_secret", event.target.checked)} /> 저장된 Secret 제거</label>
+            <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={form.clear_binance_api_key} onChange={(event) => updateField("clear_binance_api_key", event.target.checked)} /> 저장된 키 제거</label>
+            <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={form.clear_binance_api_secret} onChange={(event) => updateField("clear_binance_api_secret", event.target.checked)} /> 저장된 시크릿 제거</label>
           </div>
         </div>
       </section>

@@ -54,12 +54,15 @@ export default async function DashboardPage({
       ? await fetchJson<OperatorDashboardPayload>("/api/dashboard/operator")
       : null;
 
-  const sections = await Promise.all(
-    config.sections.map(async (section) => ({
-      ...section,
-      rows: await fetchJson<Row[] | Row>(section.endpoint),
-    })),
-  );
+  const sections =
+    slug === "settings"
+      ? []
+      : await Promise.all(
+          config.sections.map(async (section) => ({
+            ...section,
+            rows: await fetchJson<Row[] | Row>(section.endpoint),
+          })),
+        );
 
   const normalizedSections = sections.map((section) => ({
     ...section,
@@ -101,6 +104,8 @@ export default async function DashboardPage({
     content = <SchedulerView operator={operatorPayload} schedulerRows={normalizedSections[0]?.rows ?? []} />;
   } else if (slug === "agents") {
     content = <AgentDebugView agentRows={normalizedSections[0]?.rows ?? []} />;
+  } else if (slug === "settings") {
+    content = null;
   } else {
     content = normalizedSections.map((section) => (
       <DataTable

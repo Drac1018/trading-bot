@@ -1411,8 +1411,8 @@ def test_overview_prioritizes_stale_sync_reasons_in_operational_status(db_sessio
 
 
 def test_operator_dashboard_flags_missing_feature_input_and_uses_candle_timestamp(db_session) -> None:
-    snapshot_time = datetime(2026, 4, 19, 12, 22, 4)
-    candle_time = datetime(2026, 4, 19, 12, 15, 0)
+    snapshot_time = utcnow_naive() - timedelta(minutes=5)
+    candle_time = snapshot_time - timedelta(minutes=7, seconds=4)
 
     settings = get_or_create_settings(db_session)
     settings.default_symbol = "ADAUSDT"
@@ -1472,12 +1472,16 @@ def test_operator_dashboard_flags_missing_feature_input_and_uses_candle_timestam
     assert ada.market_candle_time == candle_time
     assert ada.market_context_summary == {}
     assert "feature_input_missing" in ada.stale_flags
+    assert ada.feature_input_delay_minutes is not None
+    assert ada.feature_input_delay_minutes >= 5
+    assert ada.feature_input_delay_threshold_minutes == 30
+    assert ada.feature_input_delayed is False
     assert ada.live_execution_ready is False
 
 
 def test_operator_dashboard_uses_feature_snapshot_market_context_fallback(db_session) -> None:
-    snapshot_time = datetime(2026, 4, 19, 12, 22, 4)
-    candle_time = datetime(2026, 4, 19, 12, 15, 0)
+    snapshot_time = utcnow_naive() - timedelta(minutes=5)
+    candle_time = snapshot_time - timedelta(minutes=7, seconds=4)
 
     settings = get_or_create_settings(db_session)
     settings.default_symbol = "ADAUSDT"
@@ -1561,6 +1565,73 @@ def test_operator_dashboard_uses_feature_snapshot_market_context_fallback(db_ses
     assert ada.market_context_summary["primary_regime"] == "bullish"
     assert ada.market_context_summary["trend_alignment"] == "bullish_aligned"
     assert "feature_input_missing" not in ada.stale_flags
+    assert ada.feature_input_delay_minutes is None
+    assert ada.feature_input_delay_threshold_minutes is None
+    assert ada.feature_input_delayed is False
+
+
+def test_operator_dashboard_marks_feature_input_delay_after_threshold(db_session) -> None:
+    snapshot_time = utcnow_naive() - timedelta(minutes=45)
+    candle_time = snapshot_time - timedelta(minutes=15)
+
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "ADAUSDT"
+    settings.tracked_symbols = ["ADAUSDT"]
+    settings.default_timeframe = "15m"
+    settings.live_trading_enabled = True
+    settings.manual_live_approval = True
+    settings.live_execution_armed = True
+    settings.live_execution_armed_until = snapshot_time + timedelta(minutes=15)
+    db_session.add(settings)
+    db_session.flush()
+
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings, scope=scope, synced_at=snapshot_time)
+    db_session.add(settings)
+    db_session.flush()
+
+    db_session.add(
+        MarketSnapshot(
+            symbol="ADAUSDT",
+            timeframe="15m",
+            snapshot_time=snapshot_time,
+            latest_price=0.2477,
+            latest_volume=2321802.0,
+            candle_count=60,
+            is_stale=False,
+            is_complete=True,
+            payload={
+                "symbol": "ADAUSDT",
+                "timeframe": "15m",
+                "snapshot_time": snapshot_time.isoformat(),
+                "latest_price": 0.2477,
+                "latest_volume": 2321802.0,
+                "candle_count": 60,
+                "is_stale": False,
+                "is_complete": True,
+                "candles": [
+                    {
+                        "timestamp": candle_time.isoformat(),
+                        "open": 0.2481,
+                        "high": 0.2482,
+                        "low": 0.2476,
+                        "close": 0.2477,
+                        "volume": 2321802.0,
+                    }
+                ],
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+
+    ada = payload.symbols[0]
+    assert "feature_input_missing" in ada.stale_flags
+    assert ada.feature_input_delay_threshold_minutes == 30
+    assert ada.feature_input_delay_minutes is not None
+    assert ada.feature_input_delay_minutes >= 45
+    assert ada.feature_input_delayed is True
 
 
 def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_factory) -> None:

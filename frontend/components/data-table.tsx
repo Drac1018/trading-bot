@@ -1,7 +1,7 @@
 import {
   formatDisplayValue,
   formatListValue,
-  getRowTitle,
+  getRowTitle as defaultGetRowTitle,
   normalizeDisplayValue,
   translateLabel,
 } from "../lib/ui-copy";
@@ -50,6 +50,8 @@ export function DataTable({
   emptyStateTitle,
   emptyStateDescription,
   hiddenColumns = [],
+  rowTitleFormatter,
+  labelOverrides,
 }: {
   title: string;
   description: string;
@@ -57,9 +59,12 @@ export function DataTable({
   emptyStateTitle?: string;
   emptyStateDescription?: string;
   hiddenColumns?: string[];
+  rowTitleFormatter?: (row: TableRow, index: number) => string;
+  labelOverrides?: Partial<Record<string, string>>;
 }) {
   const { primary, detail } = splitTableColumns(rows, new Set(hiddenColumns));
   const rowKeys = buildTableRowKeys(rows);
+  const getLabel = (column: string) => labelOverrides?.[column] ?? translateLabel(column);
 
   return (
     <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
@@ -84,7 +89,9 @@ export function DataTable({
             <article key={rowKeys[index]} className="rounded-[1.6rem] border border-amber-100 bg-canvas/90 p-4 shadow-sm">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
-                  <h3 className="text-base font-semibold text-ink">{getRowTitle(row, index)}</h3>
+                  <h3 className="text-base font-semibold text-ink">
+                    {rowTitleFormatter ? rowTitleFormatter(row, index) : defaultGetRowTitle(row, index)}
+                  </h3>
                   <p className="mt-1 text-xs text-slate-500">항목 #{index + 1}</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -119,7 +126,7 @@ export function DataTable({
                 {primary.map((column) => (
                   <div key={column} className="rounded-2xl border border-amber-100 bg-white px-4 py-3">
                     <dt className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                      {translateLabel(column)}
+                      {getLabel(column)}
                     </dt>
                     <dd className="mt-2 min-w-0 text-sm leading-6 text-ink">{renderValue(row[column], column)}</dd>
                   </div>
@@ -135,7 +142,7 @@ export function DataTable({
                     {detail.map((column) => (
                       <div key={column} className="space-y-2">
                         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                          {translateLabel(column)}
+                          {getLabel(column)}
                         </p>
                         {renderValue(row[column], column)}
                       </div>

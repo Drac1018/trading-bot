@@ -505,7 +505,7 @@ def test_ai_disabled_hourly_window_creates_only_market_snapshots(monkeypatch, db
 
     assert result["status"] == "market_data_only"
     assert db_session.scalar(select(MarketSnapshot).limit(1)) is not None
-    assert db_session.scalar(select(FeatureSnapshot).limit(1)) is None
+    assert db_session.scalar(select(FeatureSnapshot).limit(1)) is not None
     assert db_session.scalar(select(AgentRun).limit(1)) is None
     assert db_session.scalar(select(RiskCheck).limit(1)) is None
 
@@ -553,7 +553,7 @@ def test_ai_enabled_hourly_window_only_refreshes_market_data(monkeypatch, db_ses
     assert scheduler_run is not None
     assert scheduler_run.workflow == "market_refresh_cycle"
     assert db_session.scalar(select(MarketSnapshot).limit(1)) is not None
-    assert db_session.scalar(select(FeatureSnapshot).limit(1)) is None
+    assert db_session.scalar(select(FeatureSnapshot).limit(1)) is not None
     assert db_session.scalar(select(AgentRun).limit(1)) is None
     assert db_session.scalar(select(RiskCheck).limit(1)) is None
 
@@ -3534,7 +3534,9 @@ def test_scheduler_market_refresh_cycle_runs_without_ai_or_new_entry(monkeypatch
 
     assert result["workflow"] == "market_refresh_cycle"
     assert result["results"][0]["status"] == "success"
+    assert result["results"][0]["feature_snapshot_id"] is not None
     assert db_session.scalar(select(MarketSnapshot).limit(1)) is not None
+    assert db_session.scalar(select(FeatureSnapshot).limit(1)) is not None
     assert db_session.scalar(select(AgentRun).limit(1)) is None
     assert db_session.scalar(select(Order).limit(1)) is None
 

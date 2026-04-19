@@ -75,7 +75,7 @@ function formatMarketTiming(symbol: OperatorDashboardPayload["symbols"][number])
   if (symbol.market_snapshot_time) {
     parts.push(`수집 ${formatDateTime(symbol.market_snapshot_time)}`);
   }
-  return `${parts.join(" / ") || "기록 없음"} / ${symbol.timeframe ?? "-"}`;
+  return `${parts.join(" / ") || "기록 없음"} / 시장 ${symbol.timeframe ?? "-"}`;
 }
 
 function formatNumber(value: number | null | undefined, digits = 2) {
@@ -426,6 +426,17 @@ export function MarketSignalView({
     selectedSymbol === "ALL"
       ? features
       : features.filter((row) => String(row.symbol ?? "").toUpperCase() === selectedSymbol);
+  const formatMarketSnapshotRowTitle = (row: Row, index: number) => {
+    const symbol = typeof row.symbol === "string" ? row.symbol : null;
+    const timeframe = typeof row.timeframe === "string" ? row.timeframe : null;
+    if (symbol && timeframe) {
+      return `${symbol} / 시장 ${timeframe}`;
+    }
+    if (symbol) {
+      return symbol;
+    }
+    return `항목 ${index + 1}`;
+  };
 
   return (
     <div className="space-y-6">
@@ -444,7 +455,10 @@ export function MarketSignalView({
           />
         </div>
         <div className="mt-5 grid gap-4 xl:grid-cols-2">
-          {symbols.map((symbol) => (
+          {symbols.map((symbol) => {
+            const featureInputMissing = symbol.stale_flags.includes("feature_input_missing");
+            const featureInputDelayed = symbol.feature_input_delayed;
+            return (
             <div key={symbol.symbol} className="rounded-2xl border border-slate-200 bg-white p-4">
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -455,10 +469,10 @@ export function MarketSignalView({
                 </div>
                 <span
                   className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
-                    symbol.stale_flags.length > 0 ? "warn" : "good",
+                    featureInputDelayed ? "danger" : symbol.stale_flags.length > 0 ? "warn" : "good",
                   )}`}
                 >
-                  {symbol.stale_flags.length > 0 ? "입력 주의" : "입력 정상"}
+                  {featureInputDelayed ? "입력 지연" : symbol.stale_flags.length > 0 ? "입력 주의" : "입력 정상"}
                 </span>
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -466,25 +480,44 @@ export function MarketSignalView({
                 {metricCard(
                   "시장 레짐",
                   String(symbol.market_context_summary.primary_regime ?? "-"),
-                  `정렬 ${String(symbol.market_context_summary.trend_alignment ?? "-")}`,
+                  featureInputDelayed
+                    ? "피처 입력 생성 지연"
+                    : featureInputMissing
+                      ? "피처 입력 대기"
+                    : `정렬 ${String(symbol.market_context_summary.trend_alignment ?? "-")}`,
                 )}
                 {metricCard(
                   "변동성 / 거래량",
                   `${String(symbol.market_context_summary.volatility_regime ?? "-")} / ${String(
                     symbol.market_context_summary.volume_regime ?? "-",
                   )}`,
-                  "시장 상태 입력",
+                  featureInputDelayed ? "피처 입력 생성 지연" : featureInputMissing ? "피처 입력 대기" : "시장 상태 입력",
                 )}
                 {metricCard(
                   "신선도",
-                  symbol.stale_flags.length > 0 ? "주의" : "정상",
-                  symbol.stale_flags.length > 0
+                  featureInputDelayed ? "지연" : symbol.stale_flags.length > 0 ? "주의" : "정상",
+                  featureInputDelayed
+                    ? `피처 입력 없음, ${symbol.feature_input_delay_minutes ?? "-"}분 경과`
+                    : symbol.stale_flags.length > 0
                     ? symbol.stale_flags.map(translateMarketInputFlag).join(", ")
                     : "이상 플래그 없음",
                 )}
               </div>
+              {featureInputMissing ? (
+                <div
+                  className={`mt-3 rounded-2xl px-4 py-3 text-sm leading-6 ${
+                    featureInputDelayed
+                      ? "border border-rose-200 bg-rose-50 text-rose-900"
+                      : "border border-amber-200 bg-amber-50 text-amber-900"
+                  }`}
+                >
+                  {featureInputDelayed
+                    ? `시장 스냅샷은 수집됐지만 피처 입력 생성이 ${symbol.feature_input_delay_minutes ?? "-"}분째 지연되고 있습니다. 시장 ${symbol.timeframe ?? "-"} 기준 예상 대기 ${symbol.feature_input_delay_threshold_minutes ?? "-"}분을 넘겼습니다.`
+                    : "시장 스냅샷은 수집됐지만 피처 입력은 아직 생성되지 않았습니다."}
+                </div>
+              ) : null}
             </div>
-          ))}
+          )})}
         </div>
       </section>
 
@@ -495,6 +528,8 @@ export function MarketSignalView({
         emptyStateTitle="표시할 시장 스냅샷이 없습니다."
         emptyStateDescription="선택한 심볼 기준으로 아직 저장된 market snapshot이 없습니다."
         hiddenColumns={["candle_count", "candles", "payload"]}
+        rowTitleFormatter={formatMarketSnapshotRowTitle}
+        labelOverrides={{ timeframe: "시장 타임프레임" }}
       />
 
       <DataTable

@@ -20,8 +20,8 @@ type UsageSettings = {
 };
 
 const roleLabels: Record<string, string> = {
-  trading_decision: "거래 의사결정",
-  chief_review: "운영 요약",
+  trading_decision: "거래 판단",
+  chief_review: "운영 검토",
 };
 
 function formatNumber(value: number) {
@@ -91,22 +91,17 @@ export function AIUsagePanel({ settings }: { settings: UsageSettings }) {
     <section className="space-y-5 rounded-[1.9rem] border border-amber-200/70 bg-canvas/70 p-4 sm:p-5">
       <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">AI 사용량 관측</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">AI 사용 관측</p>
           <h3 className="mt-2 text-xl font-semibold text-slate-900">실제 호출 기록 기준 모니터링</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            hybrid trigger 이후 AI는 고정 interval이 아니라 이벤트 기반 + periodic backstop으로 호출됩니다.
-            그래서 이 영역은 설정 기반 추정치가 아니라 최근 실제 호출 기록과 관측 환산만 보여줍니다.
+            하이브리드 트리거 이후 AI는 고정 주기가 아니라 이벤트 기반 + 주기 백스톱으로 호출됩니다.
+            그래서 이 영역은 설정값이 아니라 최근 실제 호출 기록과 관측 환산을 보여줍니다.
             수동 실행 보호 간격은 최소 {settings.manual_ai_guard_minutes}분입니다.
           </p>
         </div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <MetricCard
-          label="관측 월간 환산"
-          value={`${formatNumber(settings.observed_monthly_ai_calls_projection)}회`}
-          hint="최근 24시간 또는 7일 실제 호출 기록을 기준으로 환산한 값입니다."
-        />
         <MetricCard
           label="최근 24시간 호출"
           value={`${formatNumber(settings.recent_ai_calls_24h)}회`}
@@ -120,7 +115,7 @@ export function AIUsagePanel({ settings }: { settings: UsageSettings }) {
         <MetricCard
           label="수동 보호 간격"
           value={`${formatNumber(settings.manual_ai_guard_minutes)}분`}
-          hint="반복 수동 호출로 인한 과도한 AI 호출을 막는 최소 간격입니다."
+          hint="반복 수동 실행으로 인한 과도한 AI 호출을 막는 최소 간격입니다."
         />
         <MetricCard
           label="최근 24시간 토큰"
@@ -129,12 +124,20 @@ export function AIUsagePanel({ settings }: { settings: UsageSettings }) {
             settings.recent_ai_tokens_24h.completion_tokens ?? 0,
           )}`}
         />
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
         <MetricCard
           label="최근 7일 토큰"
           value={formatNumber(token7d)}
           hint={`Prompt ${formatNumber(settings.recent_ai_tokens_7d.prompt_tokens ?? 0)} / Completion ${formatNumber(
             settings.recent_ai_tokens_7d.completion_tokens ?? 0,
           )}`}
+        />
+        <MetricCard
+          label="관측 월간 환산"
+          value={`${formatNumber(settings.observed_monthly_ai_calls_projection)}회`}
+          hint="최근 24시간 또는 7일 실제 호출 기록을 기준으로 환산한 참고값입니다."
         />
       </div>
 

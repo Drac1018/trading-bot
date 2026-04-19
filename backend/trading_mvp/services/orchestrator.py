@@ -4058,11 +4058,32 @@ class TradingOrchestrator:
                 upto_index=upto_index,
                 force_stale=force_stale,
             )
+            feature_row: FeatureSnapshot | None = None
+            feature_generation_error: str | None = None
+            try:
+                market_context = build_market_context(
+                    symbol=symbol,
+                    base_timeframe=effective_timeframe,
+                    upto_index=upto_index,
+                    force_stale=force_stale,
+                    use_binance=self.settings_row.binance_market_data_enabled,
+                    binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+                    stale_threshold_seconds=self.settings_row.stale_market_seconds,
+                )
+                higher_timeframe_context = {
+                    tf: payload for tf, payload in market_context.items() if tf != effective_timeframe
+                }
+                feature_payload = compute_features(market_snapshot, higher_timeframe_context)
+                feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
+            except Exception as exc:
+                feature_generation_error = str(exc)
             results.append(
                 {
                     "symbol": symbol,
                     "timeframe": effective_timeframe,
                     "market_snapshot_id": market_row.id,
+                    "feature_snapshot_id": feature_row.id if feature_row is not None else None,
+                    "feature_generation_error": feature_generation_error,
                     "snapshot_time": market_snapshot.snapshot_time.isoformat(),
                     "latest_price": market_snapshot.latest_price,
                     "status": status,

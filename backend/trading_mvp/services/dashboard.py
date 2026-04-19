@@ -1869,6 +1869,48 @@ def _latest_timestamp(*timestamps: datetime | None) -> datetime | None:
     return max(values) if values else None
 
 
+def _parse_timeframe_minutes(value: str | None) -> int | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) < 2:
+        return None
+    unit = normalized[-1]
+    amount_raw = normalized[:-1]
+    try:
+        amount = int(amount_raw)
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    if unit == "m":
+        return amount
+    if unit == "h":
+        return amount * 60
+    if unit == "d":
+        return amount * 60 * 24
+    return None
+
+
+def _build_feature_input_delay_summary(
+    *,
+    now: datetime,
+    timeframe: str | None,
+    market_snapshot_time: datetime | None,
+    market_candle_time: datetime | None,
+    stale_flags: list[str],
+) -> tuple[int | None, int | None, bool]:
+    if "feature_input_missing" not in stale_flags:
+        return None, None, False
+    timeframe_minutes = _parse_timeframe_minutes(timeframe)
+    threshold_minutes = max((timeframe_minutes or 15) * 2, 20)
+    reference_time = market_snapshot_time or market_candle_time
+    if reference_time is None:
+        return None, threshold_minutes, False
+    age_minutes = max(0, int((now - reference_time).total_seconds() // 60))
+    return age_minutes, threshold_minutes, age_minutes >= threshold_minutes
+
+
 def _audit_event_matches_symbol(row: dict[str, object], symbol: str) -> bool:
     symbol_key = symbol.upper()
     entity_id = str(row.get("entity_id") or "").upper()
@@ -1945,6 +1987,7 @@ def _build_operator_symbol_summaries(
     tracked_symbols: list[str],
     overview: OverviewResponse,
 ) -> list[OperatorSymbolSummary]:
+    now = utcnow_naive()
     symbol_keys = [item.upper() for item in tracked_symbols if item]
     settings_row = get_or_create_settings(session)
     runtime_summary = summarize_runtime_state(settings_row)
@@ -2082,6 +2125,7 @@ def _build_operator_symbol_summaries(
         position_row = open_positions.get(symbol_key)
         market_row = latest_markets.get(symbol_key)
         feature_row = latest_features.get(symbol_key)
+        market_candle_time = _extract_latest_candle_time(market_row)
         market_context_summary = _extract_symbol_market_context(decision_row, market_row, feature_row)
         protection_state = (
             _build_position_protection_state(session, position_row)
@@ -2097,6 +2141,15 @@ def _build_operator_symbol_summaries(
             }
         )
         stale_flags = _build_symbol_stale_flags(overview.sync_freshness_summary, market_row, market_context_summary)
+        feature_input_delay_minutes, feature_input_delay_threshold_minutes, feature_input_delayed = (
+            _build_feature_input_delay_summary(
+                now=now,
+                timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
+                market_snapshot_time=market_row.snapshot_time if market_row is not None else None,
+                market_candle_time=market_candle_time,
+                stale_flags=stale_flags,
+            )
+        )
         last_updated_at = _latest_timestamp(
             market_row.snapshot_time if market_row is not None else None,
             feature_row.feature_time if feature_row is not None else None,
@@ -2127,7 +2180,10 @@ def _build_operator_symbol_summaries(
                 timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
                 latest_price=market_row.latest_price if market_row is not None else None,
                 market_snapshot_time=market_row.snapshot_time if market_row is not None else None,
-                market_candle_time=_extract_latest_candle_time(market_row),
+                market_candle_time=market_candle_time,
+                feature_input_delay_minutes=feature_input_delay_minutes,
+                feature_input_delay_threshold_minutes=feature_input_delay_threshold_minutes,
+                feature_input_delayed=feature_input_delayed,
                 market_context_summary=market_context_summary,
                 ai_decision=decision_snapshot,
                 pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),

@@ -619,10 +619,13 @@ staged rollout semantics:
 - symbol snapshot에는 additive `pending_entry_plan` 필드가 포함될 수 있습니다.
   - 현재 symbol에 `armed` plan이 있으면 `symbol`, `side`, `plan_status`, `entry_mode`, `entry_zone_min`, `entry_zone_max`, `expires_at`, `idempotency_key`, `metadata`가 내려갑니다.
 - `symbols`는 tracked symbol별 최신 snapshot 배열입니다.
-- 각 symbol row는 `symbol`, `timeframe`, `latest_price`, `market_snapshot_time`, `market_candle_time`, `ai_decision`, `risk_guard`, `execution`, `open_position`, `protection_status`, `blocked_reasons`, `live_execution_ready`, `stale_flags`, `last_updated_at`, `audit_events`를 포함합니다.
+- 각 symbol row는 `symbol`, `timeframe`, `latest_price`, `market_snapshot_time`, `market_candle_time`, `feature_input_delay_minutes`, `feature_input_delay_threshold_minutes`, `feature_input_delayed`, `ai_decision`, `risk_guard`, `execution`, `open_position`, `protection_status`, `blocked_reasons`, `live_execution_ready`, `stale_flags`, `last_updated_at`, `audit_events`를 포함합니다.
   - `market_snapshot_time`: 시장 스냅샷 수집 시각
   - `market_candle_time`: 최신 캔들 시각. UI에서는 timeframe 경계 확인용으로 이 값을 우선 노출할 수 있습니다.
   - `stale_flags`는 sync/market stale 외에 `feature_input_missing`을 포함할 수 있습니다. 이 경우 가격 스냅샷은 있어도 market regime / alignment / volatility / volume 요약 입력이 아직 생성되지 않은 상태입니다.
+  - `feature_input_delay_minutes`: `feature_input_missing`가 지속된 분 단위 경과 시간. feature row가 있으면 `null`
+  - `feature_input_delay_threshold_minutes`: 운영 UI에서 `대기 -> 생성 지연`으로 승격하는 기준 분. 현재는 `max(timeframe x 2, 20분)`을 사용합니다.
+  - `feature_input_delayed`: `feature_input_missing`가 기준 시간을 넘겼는지 여부
   - `open_position`: 기존 포지션 snapshot 외에 `holding_profile`, `holding_profile_reason`, `initial_stop_type`, `ai_stop_management_allowed`, `hard_stop_active`, `stop_widening_allowed`가 additive로 포함될 수 있습니다.
   - `execution.recent_fills`: 최근 fill ladder 요약. `execution_id`, `external_trade_id`, `fill_price`, `fill_quantity`, `fee_paid`, `commission_asset`, `realized_pnl`, `created_at`
   - `protection_status`: 기본 protected/missing 상태 외에 `recovery_status`, `auto_recovery_active`, `failure_count`, `last_error`, `last_transition_at`, `trigger_source`, `lifecycle_state`, `verification_status`, `last_event_type`, `last_event_message`, `last_event_at`

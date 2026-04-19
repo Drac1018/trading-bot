@@ -229,6 +229,9 @@ type OperatorSymbolSummary = {
   latest_price: number | null;
   market_snapshot_time: string | null;
   market_candle_time: string | null;
+  feature_input_delay_minutes: number | null;
+  feature_input_delay_threshold_minutes: number | null;
+  feature_input_delayed: boolean;
   market_context_summary: Record<string, unknown>;
   ai_decision: OperatorDecisionSnapshot;
   risk_guard: OperatorRiskSnapshot;
