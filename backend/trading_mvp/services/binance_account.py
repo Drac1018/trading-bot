@@ -22,7 +22,7 @@ from trading_mvp.services.settings import (
     get_or_create_settings,
     get_runtime_credentials,
     is_live_execution_ready,
-    serialize_settings,
+    serialize_settings_view,
 )
 from trading_mvp.time_utils import utcnow_naive
 
@@ -80,7 +80,7 @@ def _build_client(settings_row: Setting) -> BinanceClient:
 def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
     settings_row = get_or_create_settings(session)
     credentials = get_runtime_credentials(settings_row)
-    settings_payload = serialize_settings(settings_row)
+    settings_payload = serialize_settings_view(settings_row)
     latest_blocked_reasons = get_latest_blocked_reasons(session)
     auto_resume_last_blockers = [str(item) for item in settings_payload.get("auto_resume_last_blockers", []) if item]
     guard_mode_reason = derive_guard_mode_reason(

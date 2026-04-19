@@ -73,6 +73,14 @@ class OpenAICallGate:
         return payload
 
 
+@dataclass(slots=True)
+class AgentRunUsageRow:
+    created_at: datetime
+    role: str
+    provider_name: str
+    metadata_json: dict[str, Any]
+
+
 def manual_ai_guard_minutes(settings_row: Setting) -> int:
     return max(2, min(int(settings_row.ai_call_interval_minutes), 5))
 
@@ -280,9 +288,19 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
     now = utcnow_naive()
     cutoff_7d = now - timedelta(days=7)
     cutoff_24h = now - timedelta(hours=24)
-    rows_7d = list(
-        session.scalars(select(AgentRun).where(AgentRun.created_at >= cutoff_7d).order_by(desc(AgentRun.created_at)))
-    )
+    rows_7d = [
+        AgentRunUsageRow(
+            created_at=row.created_at,
+            role=row.role,
+            provider_name=row.provider_name,
+            metadata_json=row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        )
+        for row in session.execute(
+            select(AgentRun.created_at, AgentRun.role, AgentRun.provider_name, AgentRun.metadata_json)
+            .where(AgentRun.created_at >= cutoff_7d)
+            .order_by(desc(AgentRun.created_at))
+        )
+    ]
     rows_24h = [row for row in rows_7d if row.created_at >= cutoff_24h]
 
     summary_24h = _summarize_attempt_rows(rows_24h)

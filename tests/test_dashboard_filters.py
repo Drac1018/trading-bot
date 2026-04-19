@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from threading import Event
 
 from fastapi.testclient import TestClient
@@ -454,6 +454,9 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             "confidence": 0.78,
             "rationale_codes": ["TREND_UP"],
             "explanation_short": "BTC long candidate",
+            "event_risk_acknowledgement": "High-impact macro event is approaching; event-aware caution applied.",
+            "confidence_penalty_reason": "EVENT_WINDOW_PROXIMITY",
+            "scenario_note": "Prefer confirmation after the event before fresh entry.",
         },
         metadata_json={
             "source": "llm",
@@ -1814,6 +1817,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert btc["ai_decision"]["last_ai_trigger_reason"] == "entry_candidate_event"
     assert btc["ai_decision"]["trigger_deduped"] is True
     assert btc["ai_decision"]["last_ai_skip_reason"] == "TRIGGER_DEDUPED"
+    assert btc["ai_decision"]["event_risk_acknowledgement"] == "High-impact macro event is approaching; event-aware caution applied."
+    assert btc["ai_decision"]["confidence_penalty_reason"] == "EVENT_WINDOW_PROXIMITY"
+    assert btc["ai_decision"]["scenario_note"] == "Prefer confirmation after the event before fresh entry."
     assert btc["candidate_selection"]["assigned_slot"] == "slot_1"
     assert btc["candidate_selection"]["candidate_weight"] == 0.64
     assert btc["candidate_selection"]["capacity_reason"] == "mixed_breadth_moderate_capacity"
@@ -1828,6 +1834,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert eth["ai_decision"]["next_ai_review_due_at"] is not None
     assert eth["ai_decision"]["assigned_slot"] == "slot_2"
     assert eth["ai_decision"]["portfolio_slot_soft_cap_applied"] is True
+    assert eth["ai_decision"]["event_risk_acknowledgement"] is None
+    assert eth["ai_decision"]["confidence_penalty_reason"] is None
+    assert eth["ai_decision"]["scenario_note"] is None
     assert eth["risk_guard"]["allowed"] is True
     assert eth["risk_guard"]["auto_resized_entry"] is True
     assert eth["risk_guard"]["approved_projected_notional"] == 150000.0

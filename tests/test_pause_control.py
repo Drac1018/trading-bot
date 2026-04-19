@@ -25,7 +25,6 @@ def _build_live_settings_payload() -> AppSettingsUpdateRequest:
         default_symbol="BTCUSDT",
         tracked_symbols=["BTCUSDT"],
         default_timeframe="15m",
-        schedule_windows=["1h", "4h", "12h", "24h"],
         max_leverage=3.0,
         max_risk_per_trade=0.01,
         max_daily_loss=0.02,

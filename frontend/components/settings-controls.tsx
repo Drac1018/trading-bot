@@ -1,12 +1,11 @@
 ﻿"use client";
 
-import { useMemo, useState, useTransition, type ReactNode } from "react";
+import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
 
-import { AIUsagePanel } from "./ai-usage-panel";
+import { AIUsagePanel, type AIUsagePayload } from "./ai-usage-panel";
 import { formatDisplayValue } from "../lib/ui-copy";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const scheduleOptions = ["1h"] as const;
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기 / 가드", "AI 입력 / 모델", "Binance 연동"] as const;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
@@ -74,6 +73,10 @@ type ReconciliationSummary = {
   guarded_symbols_count?: number;
 };
 
+type SettingsCadencePayload = {
+  items: SymbolEffectiveCadence[];
+};
+
 export type SettingsPayload = {
   can_enter_new_position: boolean;
   blocked_reasons: string[];
@@ -85,12 +88,6 @@ export type SettingsPayload = {
   protection_recovery_failure_count: number;
   missing_protection_symbols: string[];
   missing_protection_items: Record<string, string[]>;
-  pnl_summary: Record<string, unknown>;
-  account_sync_summary: Record<string, unknown>;
-  exposure_summary: Record<string, unknown>;
-  execution_policy_summary: Record<string, unknown>;
-  market_context_summary: Record<string, unknown>;
-  adaptive_protection_summary: Record<string, unknown>;
   adaptive_signal_summary: Record<string, unknown>;
   position_management_summary: Record<string, unknown>;
   rollout_mode: RolloutMode;
@@ -128,9 +125,7 @@ export type SettingsPayload = {
   exchange_sync_interval_seconds: number;
   market_refresh_interval_minutes: number;
   position_management_interval_seconds: number;
-  schedule_windows: string[];
   symbol_cadence_overrides: SymbolCadenceOverride[];
-  symbol_effective_cadences: SymbolEffectiveCadence[];
   max_leverage: number;
   max_risk_per_trade: number;
   max_daily_loss: number;
@@ -157,22 +152,6 @@ export type SettingsPayload = {
   openai_api_key_configured: boolean;
   binance_api_key_configured: boolean;
   binance_api_secret_configured: boolean;
-  recent_ai_calls_24h: number;
-  recent_ai_calls_7d: number;
-  recent_ai_successes_24h: number;
-  recent_ai_successes_7d: number;
-  recent_ai_failures_24h: number;
-  recent_ai_failures_7d: number;
-  recent_ai_tokens_24h: Record<string, number>;
-  recent_ai_tokens_7d: Record<string, number>;
-  recent_ai_role_calls_24h: Record<string, number>;
-  recent_ai_role_calls_7d: Record<string, number>;
-  recent_ai_role_failures_24h: Record<string, number>;
-  recent_ai_role_failures_7d: Record<string, number>;
-  recent_ai_failure_reasons: string[];
-  observed_monthly_ai_calls_projection: number;
-  observed_monthly_ai_calls_projection_breakdown: Record<string, number>;
-  manual_ai_guard_minutes: number;
 };
 
 type LiveSyncResult = {
@@ -191,19 +170,14 @@ type FormState = Omit<
   SettingsPayload,
   | "id" | "mode" | "operating_state" | "protection_recovery_status" | "protection_recovery_active"
   | "protection_recovery_failure_count" | "missing_protection_symbols" | "missing_protection_items"
-  | "pnl_summary" | "account_sync_summary" | "exposure_summary" | "execution_policy_summary" | "market_context_summary" | "adaptive_protection_summary" | "adaptive_signal_summary"
-  | "position_management_summary" | "symbol_effective_cadences"
+  | "adaptive_signal_summary"
+  | "position_management_summary"
   | "can_enter_new_position" | "blocked_reasons" | "reconciliation_summary" | "operator_alert"
   | "exchange_submit_allowed"
   | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
   | "pause_recovery_class" | "control_status_summary" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
-  | "recent_ai_calls_24h" | "recent_ai_calls_7d" | "recent_ai_successes_24h" | "recent_ai_successes_7d"
-  | "recent_ai_failures_24h" | "recent_ai_failures_7d" | "recent_ai_tokens_24h"
-  | "recent_ai_tokens_7d" | "recent_ai_role_calls_24h" | "recent_ai_role_calls_7d" | "recent_ai_role_failures_24h"
-  | "recent_ai_role_failures_7d" | "recent_ai_failure_reasons" | "observed_monthly_ai_calls_projection"
-  | "observed_monthly_ai_calls_projection_breakdown" | "manual_ai_guard_minutes"
 > & {
   openai_api_key: string;
   binance_api_key: string;
@@ -262,7 +236,6 @@ function toFormState(initial: SettingsPayload): FormState {
     exchange_sync_interval_seconds: initial.exchange_sync_interval_seconds,
     market_refresh_interval_minutes: initial.market_refresh_interval_minutes,
     position_management_interval_seconds: initial.position_management_interval_seconds,
-    schedule_windows: initial.schedule_windows,
     symbol_cadence_overrides: initial.symbol_cadence_overrides,
     max_leverage: initial.max_leverage,
     max_risk_per_trade: initial.max_risk_per_trade,
@@ -790,6 +763,8 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
 
 export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const [state, setState] = useState(initial);
+  const [symbolCadences, setSymbolCadences] = useState<SymbolEffectiveCadence[]>([]);
+  const [aiUsage, setAiUsage] = useState<AIUsagePayload | null>(null);
   const [form, setForm] = useState<FormState>(() => toFormState(initial));
   const [message, setMessage] = useState("");
   const [liveSyncResult, setLiveSyncResult] = useState<LiveSyncResult | null>(null);
@@ -815,8 +790,8 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     [form.symbol_cadence_overrides, mergedSymbols],
   );
   const effectiveCadenceBySymbol = useMemo(
-    () => Object.fromEntries(state.symbol_effective_cadences.map((item) => [item.symbol, item])),
-    [state.symbol_effective_cadences],
+    () => Object.fromEntries(symbolCadences.map((item) => [item.symbol, item])),
+    [symbolCadences],
   );
   const adaptiveSignalSummary = state.adaptive_signal_summary ?? {};
   const positionManagementSummary = state.position_management_summary ?? {};
@@ -840,7 +815,30 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     return body as T;
   };
 
-  const syncSettings = (next: SettingsPayload) => { setState(next); setForm(toFormState(next)); };
+  const refreshAuxiliaryData = async () => {
+    const [cadencePayload, usagePayload] = await Promise.all([
+      requestJson<SettingsCadencePayload>("/api/settings/cadences"),
+      requestJson<AIUsagePayload>("/api/settings/ai-usage"),
+    ]);
+    setSymbolCadences(cadencePayload.items);
+    setAiUsage(usagePayload);
+  };
+
+  useEffect(() => {
+    void refreshAuxiliaryData().catch(() => {
+      setSymbolCadences([]);
+      setAiUsage(null);
+    });
+  }, []);
+
+  const syncSettings = (next: SettingsPayload) => {
+    setState(next);
+    setForm(toFormState(next));
+    void refreshAuxiliaryData().catch(() => {
+      setSymbolCadences([]);
+      setAiUsage(null);
+    });
+  };
   const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((current) => ({ ...current, [key]: value }));
   const updateSymbolOverride = (
     symbol: string,
@@ -879,7 +877,6 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     exchange_sync_interval_seconds: form.exchange_sync_interval_seconds,
     market_refresh_interval_minutes: form.market_refresh_interval_minutes,
     position_management_interval_seconds: form.position_management_interval_seconds,
-    schedule_windows: form.schedule_windows,
     symbol_cadence_overrides: normalizeSymbolOverrides(
       form.symbol_cadence_overrides.filter((item) => mergedSymbols.includes(item.symbol)),
     ),
@@ -958,7 +955,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <MetricCard label="운영 모드" value={rolloutModeLabel(form.rollout_mode)} tone="dark" />
         <MetricCard label="기본 심볼 / 타임프레임" value={`${form.default_symbol} / ${form.default_timeframe}`} />
         <MetricCard label="AI 동작 방식" value="이벤트 기반 + 주기 백스톱" tone="warm" />
-        <MetricCard label="최근 24시간 AI 호출" value={`${state.recent_ai_calls_24h.toLocaleString("ko-KR")}회`} />
+        <MetricCard
+          label="최근 24시간 AI 호출"
+          value={aiUsage ? `${aiUsage.recent_ai_calls_24h.toLocaleString("ko-KR")}회` : "불러오는 중"}
+        />
       </div>
 
       {showOneWayRequiredBanner ? (
@@ -1162,29 +1162,6 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
                 <input className={inputClass} type="number" min={5} value={form.ai_call_interval_minutes} onChange={(event) => updateField("ai_call_interval_minutes", Number(event.target.value))} />
               </Field>
           </div>
-          <div className="mt-4">
-            <p className="text-sm font-semibold text-slate-900">스케줄 윈도우</p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {scheduleOptions.map((window) => {
-                const active = form.schedule_windows.includes(window);
-                return (
-                  <button
-                    key={window}
-                    className={`rounded-full px-4 py-2 text-sm font-semibold ${active ? "bg-amber-400 text-slate-900" : "border border-amber-200 bg-white text-slate-600"}`}
-                    onClick={() =>
-                      updateField(
-                        "schedule_windows",
-                        active ? form.schedule_windows.filter((item) => item !== window) : [...form.schedule_windows, window],
-                      )
-                    }
-                    type="button"
-                  >
-                    {window}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
         </div>
 
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
@@ -1279,10 +1256,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         </div>
       </section>
 
-      <AIUsagePanel settings={state} />
+      <AIUsagePanel usage={aiUsage} />
 
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <p className="text-sm text-slate-600">추적 심볼, 실거래 설정, 스케줄 윈도우, 인증 정보 변경은 한 번에 함께 저장됩니다.</p>
+        <p className="text-sm text-slate-600">추적 심볼, 실거래 설정, 운영 주기, 인증 정보 변경은 한 번에 함께 저장됩니다.</p>
         <button className="rounded-full bg-amber-400 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60" disabled={isPending} onClick={save} type="button">{isPending ? "저장 중..." : "설정 저장"}</button>
       </div>
       {message ? <p className="text-sm text-slate-600">{message}</p> : null}

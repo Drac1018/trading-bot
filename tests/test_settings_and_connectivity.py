@@ -27,6 +27,9 @@ from trading_mvp.services.runtime_state import mark_sync_success, set_drawdown_s
 from trading_mvp.services.settings import (
     get_or_create_settings,
     serialize_settings,
+    serialize_settings_ai_usage,
+    serialize_settings_cadences,
+    serialize_settings_view,
     should_call_openai,
     update_settings,
 )
@@ -46,7 +49,6 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         exchange_sync_interval_seconds=60,
         market_refresh_interval_minutes=1,
         position_management_interval_seconds=60,
-        schedule_windows=["1h", "4h", "12h", "24h"],
         symbol_cadence_overrides=[
             {
                 "symbol": "BTCUSDT",
@@ -133,6 +135,46 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert "estimated_monthly_ai_calls" not in serialized
     assert "estimated_monthly_ai_calls" not in serialized["symbol_effective_cadences"][0]
     assert "starting_equity" not in serialized
+
+
+def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    serialized = serialize_settings_view(row)
+
+    assert "schedule_windows" not in serialized
+    assert "symbol_effective_cadences" not in serialized
+    assert "recent_ai_calls_24h" not in serialized
+    assert "pnl_summary" not in serialized
+    assert serialized["default_symbol"] == "BTCUSDT"
+    assert serialized["control_status_summary"]["rollout_mode"] == "full_live"
+
+
+def test_settings_auxiliary_serializers_expose_cadences_and_ai_usage(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="entry_candidate_event",
+            schema_name="TradeDecision",
+            provider_name="openai",
+            summary="decision",
+            input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+            output_payload={"decision": "hold"},
+            metadata_json={
+                "source": "llm",
+                "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+            },
+        )
+    )
+    db_session.flush()
+
+    cadences = serialize_settings_cadences(row)
+    usage = serialize_settings_ai_usage(row)
+
+    assert cadences["items"][0]["symbol"] == "BTCUSDT"
+    assert usage["recent_ai_calls_24h"] == 1
+    assert usage["manual_ai_guard_minutes"] == 5
 
 
 def test_serialize_settings_reports_unknown_live_snapshot_without_synthetic_equity(db_session) -> None:
@@ -733,6 +775,42 @@ def test_serialize_settings_reports_emergency_exit_guard_reason(db_session) -> N
     assert serialized["guard_mode_reason_category"] == "operating_state"
     assert serialized["guard_mode_reason_code"] == "EMERGENCY_EXIT"
     assert serialized["guard_mode_reason_message"] == "비상 청산 상태가 진행 중이라 가드 모드입니다."
+
+
+def test_settings_api_splits_heavy_payloads(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_view_split.db")
+
+    with TestingSessionLocal() as session:
+        update_settings(session, build_settings_payload())
+        session.add(
+            AgentRun(
+                role="trading_decision",
+                trigger_event="entry_candidate_event",
+                schema_name="TradeDecision",
+                provider_name="openai",
+                summary="decision",
+                input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+                output_payload={"decision": "hold"},
+                metadata_json={
+                    "source": "llm",
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+                },
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        view_response = client.get("/api/settings")
+        cadence_response = client.get("/api/settings/cadences")
+        usage_response = client.get("/api/settings/ai-usage")
+
+    assert view_response.status_code == 200
+    assert cadence_response.status_code == 200
+    assert usage_response.status_code == 200
+    assert "symbol_effective_cadences" not in view_response.json()
+    assert "recent_ai_calls_24h" not in view_response.json()
+    assert cadence_response.json()["items"][0]["symbol"] == "BTCUSDT"
+    assert usage_response.json()["recent_ai_calls_24h"] == 1
 
 
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:

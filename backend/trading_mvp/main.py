@@ -60,7 +60,9 @@ from trading_mvp.services.settings import (
     arm_live_execution,
     disarm_live_execution,
     get_or_create_settings,
-    serialize_settings,
+    serialize_settings_ai_usage,
+    serialize_settings_cadences,
+    serialize_settings_view,
     set_trading_pause,
     update_settings,
 )
@@ -339,7 +341,17 @@ def alerts(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 @app.get("/api/settings")
 def settings_view(db: Session = Depends(get_db)) -> dict[str, object]:
     _refresh_exchange_sync_for_read(triggered_by="api_settings_view")
-    return serialize_settings(get_or_create_settings(db))
+    return serialize_settings_view(get_or_create_settings(db))
+
+
+@app.get("/api/settings/cadences")
+def settings_cadences(db: Session = Depends(get_db)) -> dict[str, object]:
+    return serialize_settings_cadences(get_or_create_settings(db))
+
+
+@app.get("/api/settings/ai-usage")
+def settings_ai_usage(db: Session = Depends(get_db)) -> dict[str, object]:
+    return serialize_settings_ai_usage(get_or_create_settings(db))
 
 
 @app.get("/api/binance/account")
@@ -360,7 +372,7 @@ def settings_update(payload: AppSettingsUpdateRequest, db: Session = Depends(get
         payload={"ai_enabled": row.ai_enabled, "binance_market_data_enabled": row.binance_market_data_enabled},
     )
     db.commit()
-    return serialize_settings(row)
+    return serialize_settings_view(row)
 
 
 @app.post("/api/settings/pause")
@@ -382,7 +394,7 @@ def pause_trading(db: Session = Depends(get_db)) -> dict[str, object]:
         payload={"trading_paused": True, "reason_code": row.pause_reason_code, "pause_origin": row.pause_origin},
     )
     db.commit()
-    return serialize_settings(row)
+    return serialize_settings_view(row)
 
 
 @app.post("/api/settings/resume")
@@ -398,7 +410,7 @@ def resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
         payload={"trading_paused": False},
     )
     db.commit()
-    return serialize_settings(row)
+    return serialize_settings_view(row)
 
 
 @app.post("/api/settings/live/arm")
@@ -417,7 +429,7 @@ def arm_live(
         payload={"armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None},
     )
     db.commit()
-    return serialize_settings(row)
+    return serialize_settings_view(row)
 
 
 @app.post("/api/settings/live/disarm")
@@ -433,7 +445,7 @@ def disarm_live(db: Session = Depends(get_db)) -> dict[str, object]:
         payload={},
     )
     db.commit()
-    return serialize_settings(row)
+    return serialize_settings_view(row)
 
 
 @app.post("/api/settings/test/openai")

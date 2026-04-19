@@ -304,7 +304,11 @@
   - `management_action`
   - `legacy_semantics_preserved`
   - `analytics_excluded_from_entry_stats`
+  - `event_risk_acknowledgement`
+  - `confidence_penalty_reason`
+  - `scenario_note`
 - These fields are sourced from the latest decision metadata and may be overlaid by the latest `interval_decision_cycle` scheduler outcome when the latest scheduler state is newer than the latest decision row.
+- `event_risk_acknowledgement`, `confidence_penalty_reason`, `scenario_note` are read-only AI rationale fields. They do not override `risk_guard` allow/block precedence or execution state.
 
 ### Analytics / prior filtering
 
@@ -386,6 +390,15 @@
 - `POST /api/settings/live/disarm`
 
 ### `GET /api/settings`
+
+- 2026-04-20 기준 `GET /api/settings`는 settings 화면 첫 진입용 lean payload입니다.
+- 무거운 `symbol_effective_cadences`, `recent_ai_calls_*` / `recent_ai_tokens_*` / `observed_monthly_ai_calls_projection*`는 더 이상 이 endpoint에 포함하지 않습니다.
+- 분리 endpoint:
+  - `GET /api/settings/cadences`
+  - `GET /api/settings/ai-usage`
+- `schedule_windows`는 더 이상 public settings API나 UI에 노출하지 않습니다.
+- cadence는 고정 스케줄 윈도우가 아니라 `decision_cycle_interval_minutes`, `ai_call_interval_minutes`,
+  `symbol_cadence_overrides`, `symbol_effective_cadences` 기준으로 해석합니다.
 
 - `operational_status`
   - overview / account / settings가 공통으로 재사용할 표준 운영 상태 payload
@@ -472,7 +485,9 @@
 - `time_stop_minutes`
 - `time_stop_profit_floor`
 - `symbol_cadence_overrides`
+  - `GET /api/settings`에 포함됩니다.
 - `symbol_effective_cadences`
+  - `GET /api/settings`가 아니라 `GET /api/settings/cadences`에서 분리 제공됩니다.
 
 `symbol_cadence_overrides` row:
 

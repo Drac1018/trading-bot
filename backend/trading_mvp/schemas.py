@@ -1924,7 +1924,6 @@ class AppSettingsResponse(StrictBaseModel):
     exchange_sync_interval_seconds: int
     market_refresh_interval_minutes: int
     position_management_interval_seconds: int
-    schedule_windows: list[str]
     symbol_cadence_overrides: list[SymbolCadenceOverride] = Field(default_factory=list)
     symbol_effective_cadences: list[SymbolEffectiveCadence] = Field(default_factory=list)
     max_leverage: float
@@ -1982,6 +1981,106 @@ class AppSettingsResponse(StrictBaseModel):
     manual_ai_guard_minutes: int
 
 
+class AppSettingsViewResponse(StrictBaseModel):
+    id: int
+    can_enter_new_position: bool = False
+    blocked_reasons: list[str] = Field(default_factory=list)
+    live_trading_enabled: bool
+    rollout_mode: RolloutMode = "paper"
+    exchange_submit_allowed: bool = False
+    limited_live_max_notional: float | None = None
+    live_trading_env_enabled: bool
+    manual_live_approval: bool
+    live_execution_armed: bool
+    live_execution_armed_until: datetime | None = None
+    live_approval_window_minutes: int
+    live_execution_ready: bool
+    trading_paused: bool
+    guard_mode_reason_category: str | None = None
+    guard_mode_reason_code: str | None = None
+    guard_mode_reason_message: str | None = None
+    pause_reason_code: str | None = None
+    pause_origin: str | None = None
+    pause_reason_detail: dict[str, Any] = Field(default_factory=dict)
+    pause_triggered_at: datetime | None = None
+    auto_resume_after: datetime | None = None
+    auto_resume_whitelisted: bool = False
+    auto_resume_eligible: bool = False
+    auto_resume_status: str = "not_paused"
+    auto_resume_last_blockers: list[str] = Field(default_factory=list)
+    latest_blocked_reasons: list[str] = Field(default_factory=list)
+    control_status_summary: ControlStatusSummary = Field(default_factory=ControlStatusSummary)
+    reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
+    operator_alert: dict[str, Any] = Field(default_factory=dict)
+    mode: str
+    operating_state: str = "TRADABLE"
+    protection_recovery_status: str = "idle"
+    protection_recovery_active: bool = False
+    protection_recovery_failure_count: int = 0
+    missing_protection_symbols: list[str] = Field(default_factory=list)
+    missing_protection_items: dict[str, list[str]] = Field(default_factory=dict)
+    pause_severity: str | None = None
+    pause_recovery_class: str | None = None
+    default_symbol: str
+    tracked_symbols: list[str]
+    default_timeframe: str
+    exchange_sync_interval_seconds: int
+    market_refresh_interval_minutes: int
+    position_management_interval_seconds: int
+    symbol_cadence_overrides: list[SymbolCadenceOverride] = Field(default_factory=list)
+    max_leverage: float
+    max_risk_per_trade: float
+    max_daily_loss: float
+    max_consecutive_losses: int
+    stale_market_seconds: int
+    slippage_threshold_pct: float
+    adaptive_signal_enabled: bool
+    position_management_enabled: bool
+    break_even_enabled: bool
+    atr_trailing_stop_enabled: bool
+    partial_take_profit_enabled: bool
+    holding_edge_decay_enabled: bool
+    reduce_on_regime_shift_enabled: bool
+    adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
+    position_management_summary: dict[str, Any] = Field(default_factory=dict)
+    ai_enabled: bool
+    ai_provider: str
+    ai_model: str
+    ai_call_interval_minutes: int
+    decision_cycle_interval_minutes: int
+    ai_max_input_candles: int
+    ai_temperature: float
+    binance_market_data_enabled: bool
+    binance_testnet_enabled: bool
+    binance_futures_enabled: bool
+    openai_api_key_configured: bool
+    binance_api_key_configured: bool
+    binance_api_secret_configured: bool
+
+
+class AppSettingsCadenceResponse(StrictBaseModel):
+    items: list[SymbolEffectiveCadence] = Field(default_factory=list)
+
+
+class AppSettingsAIUsageResponse(StrictBaseModel):
+    recent_ai_calls_24h: int
+    recent_ai_calls_7d: int
+    recent_ai_successes_24h: int
+    recent_ai_successes_7d: int
+    recent_ai_failures_24h: int
+    recent_ai_failures_7d: int
+    recent_ai_tokens_24h: dict[str, int]
+    recent_ai_tokens_7d: dict[str, int]
+    recent_ai_role_calls_24h: dict[str, int]
+    recent_ai_role_calls_7d: dict[str, int]
+    recent_ai_role_failures_24h: dict[str, int]
+    recent_ai_role_failures_7d: dict[str, int]
+    recent_ai_failure_reasons: list[str] = Field(default_factory=list)
+    observed_monthly_ai_calls_projection: int
+    observed_monthly_ai_calls_projection_breakdown: dict[str, int] = Field(default_factory=dict)
+    manual_ai_guard_minutes: int
+
+
 class AppSettingsUpdateRequest(StrictBaseModel):
     live_trading_enabled: bool
     rollout_mode: RolloutMode | None = None
@@ -1994,7 +2093,6 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     exchange_sync_interval_seconds: int = Field(default=60, ge=30, le=3600)
     market_refresh_interval_minutes: int = Field(default=1, ge=1, le=1440)
     position_management_interval_seconds: int = Field(default=60, ge=30, le=3600)
-    schedule_windows: list[str]
     symbol_cadence_overrides: list[SymbolCadenceOverride] = Field(default_factory=list)
     max_leverage: float = Field(gt=0.0, le=5.0)
     max_risk_per_trade: float = Field(gt=0.0, le=0.02)

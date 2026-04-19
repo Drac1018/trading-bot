@@ -21,8 +21,11 @@ from trading_mvp.models import (
     SystemHealthEvent,
 )
 from trading_mvp.schemas import (
+    AppSettingsAIUsageResponse,
+    AppSettingsCadenceResponse,
     AppSettingsResponse,
     AppSettingsUpdateRequest,
+    AppSettingsViewResponse,
     ControlStatusSummary,
     OperationalStatusPayload,
     RolloutMode,
@@ -766,70 +769,119 @@ def get_latest_risk_gate_status(session: Session | None) -> tuple[bool | None, l
     return bool(latest_risk.allowed), _prioritize_blocked_reasons(reason_codes)
 
 
-def _scheduler_symbol_timestamps(
+def _agent_run_symbol(row: AgentRun) -> str | None:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    symbol = metadata.get("symbol")
+    if isinstance(symbol, str) and symbol:
+        return symbol.upper()
+    input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+    market_snapshot = input_payload.get("market_snapshot")
+    if isinstance(market_snapshot, dict):
+        market_symbol = market_snapshot.get("symbol")
+        if isinstance(market_symbol, str) and market_symbol:
+            return market_symbol.upper()
+    output_payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    output_symbol = output_payload.get("symbol")
+    if isinstance(output_symbol, str) and output_symbol:
+        return output_symbol.upper()
+    return None
+
+
+def _latest_scheduler_timestamps_by_symbol(
     session: Session | None,
-    workflow: str,
-    symbol: str,
-) -> tuple[datetime | None, datetime | None]:
-    if session is None:
-        return None, None
+    *,
+    workflows: list[str],
+    symbols: list[str],
+    limit: int = 500,
+) -> dict[tuple[str, str], tuple[datetime | None, datetime | None]]:
+    if session is None or not workflows or not symbols:
+        return {}
+    symbol_set = {symbol.upper() for symbol in symbols}
+    targets = {(workflow, symbol) for workflow in workflows for symbol in symbol_set}
+    resolved: dict[tuple[str, str], tuple[datetime | None, datetime | None]] = {}
     rows = list(
         session.scalars(
             select(SchedulerRun)
-            .where(SchedulerRun.workflow == workflow)
+            .where(SchedulerRun.workflow.in_(workflows))
             .order_by(desc(SchedulerRun.created_at))
-            .limit(100)
+            .limit(limit)
         )
     )
-    symbol_upper = symbol.upper()
     for row in rows:
         outcome = row.outcome if isinstance(row.outcome, dict) else {}
-        if str(outcome.get("symbol", "")).upper() == symbol_upper:
-            return row.created_at, row.next_run_at
-    return None, None
-
-
-def _latest_symbol_decision_run(session: Session | None, symbol: str) -> AgentRun | None:
-    if session is None:
-        return None
-    symbol_upper = symbol.upper()
-    rows = list(
-        session.scalars(
-            select(AgentRun)
-            .where(AgentRun.role == "trading_decision")
-            .order_by(desc(AgentRun.created_at))
-            .limit(100)
-        )
-    )
-    for row in rows:
-        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
-        market_snapshot = input_payload.get("market_snapshot")
-        if isinstance(market_snapshot, dict) and str(market_snapshot.get("symbol", "")).upper() == symbol_upper:
-            return row
-    return None
-
-
-def _latest_symbol_ai_attempt_at(session: Session | None, symbol: str) -> datetime | None:
-    if session is None:
-        return None
-    symbol_upper = symbol.upper()
-    rows = list(
-        session.scalars(
-            select(AgentRun)
-            .where(AgentRun.role == "trading_decision")
-            .order_by(desc(AgentRun.created_at))
-            .limit(100)
-        )
-    )
-    for row in rows:
-        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
-        market_snapshot = input_payload.get("market_snapshot")
-        if not isinstance(market_snapshot, dict) or str(market_snapshot.get("symbol", "")).upper() != symbol_upper:
+        symbol = str(outcome.get("symbol", "")).upper()
+        key = (row.workflow, symbol)
+        if symbol not in symbol_set or key not in targets or key in resolved:
             continue
+        resolved[key] = (row.created_at, row.next_run_at)
+        if len(resolved) == len(targets):
+            break
+    return resolved
+
+
+def _latest_decision_activity_by_symbol(
+    session: Session | None,
+    *,
+    symbols: list[str],
+    limit: int = 500,
+) -> tuple[dict[str, AgentRun], dict[str, datetime]]:
+    if session is None or not symbols:
+        return {}, {}
+    symbol_set = {symbol.upper() for symbol in symbols}
+    latest_runs: dict[str, AgentRun] = {}
+    latest_ai_attempts: dict[str, datetime] = {}
+    rows = list(
+        session.scalars(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(limit)
+        )
+    )
+    for row in rows:
+        symbol = _agent_run_symbol(row)
+        if symbol is None or symbol not in symbol_set:
+            continue
+        if symbol not in latest_runs:
+            latest_runs[symbol] = row
         metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
-        if row.provider_name == "openai" or metadata.get("source") in {"llm", "llm_fallback"}:
-            return row.created_at
-    return None
+        if symbol not in latest_ai_attempts and (
+            row.provider_name == "openai" or metadata.get("source") in {"llm", "llm_fallback"}
+        ):
+            latest_ai_attempts[symbol] = row.created_at
+        if len(latest_runs) == len(symbol_set) and len(latest_ai_attempts) == len(symbol_set):
+            break
+    return latest_runs, latest_ai_attempts
+
+
+def _latest_market_snapshots_by_symbol(
+    session: Session | None,
+    *,
+    effective_schedule: list[EffectiveSymbolSettings],
+    limit: int = 500,
+) -> dict[tuple[str, str], MarketSnapshot]:
+    if session is None or not effective_schedule:
+        return {}
+    symbols = sorted({item.symbol.upper() for item in effective_schedule})
+    timeframes = sorted({item.timeframe for item in effective_schedule})
+    targets = {(item.symbol.upper(), item.timeframe) for item in effective_schedule}
+    resolved: dict[tuple[str, str], MarketSnapshot] = {}
+    rows = list(
+        session.scalars(
+            select(MarketSnapshot)
+            .where(MarketSnapshot.symbol.in_(symbols), MarketSnapshot.timeframe.in_(timeframes))
+            .order_by(desc(MarketSnapshot.snapshot_time))
+            .limit(limit)
+        )
+    )
+    for row in rows:
+        key = (row.symbol.upper(), row.timeframe)
+        if key not in targets or key in resolved:
+            continue
+        resolved[key] = row
+        if len(resolved) == len(targets):
+            break
+    return resolved
 
 
 def build_symbol_effective_cadences(
@@ -838,33 +890,32 @@ def build_symbol_effective_cadences(
 ) -> list[SymbolEffectiveCadence]:
     items: list[SymbolEffectiveCadence] = []
     now = utcnow_naive()
-    for effective in get_effective_symbol_schedule(settings_row):
-        latest_market_snapshot = (
-            session.scalar(
-                select(MarketSnapshot)
-                .where(
-                    MarketSnapshot.symbol == effective.symbol,
-                    MarketSnapshot.timeframe == effective.timeframe,
-                )
-                .order_by(desc(MarketSnapshot.snapshot_time))
-                .limit(1)
-            )
-            if session is not None
-            else None
+    effective_schedule = get_effective_symbol_schedule(settings_row)
+    symbols = [item.symbol for item in effective_schedule]
+    scheduler_index = _latest_scheduler_timestamps_by_symbol(
+        session,
+        workflows=["market_refresh_cycle", "position_management_cycle", "interval_decision_cycle"],
+        symbols=symbols,
+    )
+    latest_runs, latest_ai_attempts = _latest_decision_activity_by_symbol(session, symbols=symbols)
+    latest_snapshots = _latest_market_snapshots_by_symbol(session, effective_schedule=effective_schedule)
+
+    for effective in effective_schedule:
+        latest_market_snapshot = latest_snapshots.get((effective.symbol.upper(), effective.timeframe))
+        market_run_at, market_next_due = scheduler_index.get(
+            ("market_refresh_cycle", effective.symbol.upper()),
+            (None, None),
         )
-        market_run_at, market_next_due = _scheduler_symbol_timestamps(session, "market_refresh_cycle", effective.symbol)
-        position_run_at, position_next_due = _scheduler_symbol_timestamps(
-            session,
-            "position_management_cycle",
-            effective.symbol,
+        position_run_at, position_next_due = scheduler_index.get(
+            ("position_management_cycle", effective.symbol.upper()),
+            (None, None),
         )
-        decision_run_at, decision_next_due = _scheduler_symbol_timestamps(
-            session,
-            "interval_decision_cycle",
-            effective.symbol,
+        decision_run_at, decision_next_due = scheduler_index.get(
+            ("interval_decision_cycle", effective.symbol.upper()),
+            (None, None),
         )
-        decision_agent_run = _latest_symbol_decision_run(session, effective.symbol)
-        last_ai_decision_at = _latest_symbol_ai_attempt_at(session, effective.symbol)
+        decision_agent_run = latest_runs.get(effective.symbol.upper())
+        last_ai_decision_at = latest_ai_attempts.get(effective.symbol.upper())
         last_market_refresh_at = market_run_at or (
             latest_market_snapshot.snapshot_time if latest_market_snapshot is not None else None
         )
@@ -1746,7 +1797,6 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         exchange_sync_interval_seconds=settings_row.exchange_sync_interval_seconds,
         market_refresh_interval_minutes=settings_row.market_refresh_interval_minutes,
         position_management_interval_seconds=settings_row.position_management_interval_seconds,
-        schedule_windows=settings_row.schedule_windows,
         symbol_cadence_overrides=symbol_cadence_overrides,
         symbol_effective_cadences=symbol_effective_cadences,
         max_leverage=effective_max_leverage,
@@ -1811,6 +1861,198 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         observed_monthly_ai_calls_projection_breakdown=usage_metrics[
             "observed_monthly_ai_calls_projection_breakdown"
         ],
+        manual_ai_guard_minutes=manual_ai_guard_minutes(settings_row),
+    )
+    return payload.model_dump(mode="json")
+
+
+def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
+    defaults = get_settings()
+    credentials = get_runtime_credentials(settings_row, defaults=defaults)
+    current_session = object_session(settings_row)
+    rollout_mode = get_rollout_mode(settings_row)
+    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
+    mode = "live_guarded"
+    if settings_row.trading_paused:
+        mode = "paused"
+    elif is_live_execution_ready(settings_row, defaults=defaults) and exchange_submit_allowed:
+        mode = "live_ready"
+
+    effective_max_leverage = min(settings_row.max_leverage, DISPLAY_MAX_LEVERAGE)
+    effective_max_risk_per_trade = min(settings_row.max_risk_per_trade, DISPLAY_MAX_RISK_PER_TRADE)
+    effective_max_daily_loss = min(settings_row.max_daily_loss, DISPLAY_MAX_DAILY_LOSS)
+    runtime_state = summarize_runtime_state(settings_row)
+    latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
+    account_sync_summary = (
+        _build_account_sync_summary(current_session, settings_row, latest_pnl)
+        if latest_pnl is not None
+        else _build_unknown_account_sync_summary(settings_row)
+    )
+    sync_freshness_summary = build_sync_freshness_summary(settings_row)
+    market_freshness_summary = _build_market_freshness_summary(current_session, settings_row)
+    market_context_summary = _build_market_context_summary(current_session, settings_row)
+    adaptive_signal_context = build_adaptive_signal_context(
+        current_session,
+        enabled=settings_row.adaptive_signal_enabled,
+        symbol=settings_row.default_symbol.upper(),
+        timeframe=settings_row.default_timeframe,
+        regime=str(market_context_summary.get("primary_regime", "unknown")),
+        settings_row=settings_row,
+    )
+    latest_decision_rationale_codes: list[str] = []
+    latest_decision_code: str | None = None
+    latest_trading_run: AgentRun | None = None
+    if current_session is not None:
+        latest_trading_run = current_session.scalar(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(1)
+        )
+        if latest_trading_run is not None:
+            payload = latest_trading_run.output_payload or {}
+            latest_decision_code = str(payload.get("decision") or "") or None
+            raw_codes = payload.get("rationale_codes", [])
+            if isinstance(raw_codes, list):
+                latest_decision_rationale_codes = [str(item) for item in raw_codes if item not in {None, ""}]
+    current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
+    adaptive_signal_summary = summarize_adaptive_signal_state(
+        adaptive_signal_context,
+        latest_rationale_codes=latest_decision_rationale_codes,
+        latest_decision=latest_decision_code,
+        latest_entry_mode=(
+            str(latest_trading_run.output_payload.get("entry_mode"))
+            if current_session is not None
+            and latest_trading_run is not None
+            and isinstance(latest_trading_run.output_payload, dict)
+            and latest_trading_run.output_payload.get("entry_mode") not in {None, ""}
+            else None
+        ),
+    )
+    position_management_summary = _build_position_management_summary(current_session, settings_row)
+    operational_status = build_operational_status_payload(
+        settings_row,
+        session=current_session,
+        defaults=defaults,
+        runtime_state=runtime_state,
+        blocked_reasons=current_cycle_blocked_reasons,
+        latest_blocked_reasons=current_cycle_blocked_reasons,
+        risk_allowed=current_risk_allowed,
+        account_sync_summary=account_sync_summary,
+        sync_freshness_summary=sync_freshness_summary,
+        market_freshness_summary=market_freshness_summary,
+    )
+    symbol_cadence_overrides = [
+        SymbolCadenceOverride(**item) for item in get_symbol_cadence_overrides(settings_row)
+    ]
+    payload = AppSettingsViewResponse(
+        id=settings_row.id,
+        can_enter_new_position=operational_status.can_enter_new_position,
+        blocked_reasons=operational_status.blocked_reasons,
+        live_trading_enabled=settings_row.live_trading_enabled,
+        rollout_mode=rollout_mode,
+        exchange_submit_allowed=exchange_submit_allowed,
+        limited_live_max_notional=get_limited_live_max_notional(settings_row),
+        live_trading_env_enabled=defaults.live_trading_env_enabled,
+        manual_live_approval=settings_row.manual_live_approval,
+        live_execution_armed=is_live_execution_armed(settings_row),
+        live_execution_armed_until=settings_row.live_execution_armed_until,
+        live_approval_window_minutes=settings_row.live_approval_window_minutes,
+        live_execution_ready=operational_status.live_execution_ready,
+        trading_paused=operational_status.trading_paused,
+        guard_mode_reason_category=operational_status.guard_mode_reason_category,
+        guard_mode_reason_code=operational_status.guard_mode_reason_code,
+        guard_mode_reason_message=operational_status.guard_mode_reason_message,
+        pause_reason_code=operational_status.pause_reason_code,
+        pause_origin=operational_status.pause_origin,
+        pause_reason_detail=settings_row.pause_reason_detail,
+        pause_triggered_at=operational_status.pause_triggered_at,
+        auto_resume_after=operational_status.auto_resume_after,
+        auto_resume_whitelisted=pause_reason_allows_auto_resume(settings_row.pause_reason_code),
+        auto_resume_eligible=operational_status.auto_resume_eligible,
+        auto_resume_status=operational_status.auto_resume_status,
+        auto_resume_last_blockers=operational_status.auto_resume_last_blockers,
+        latest_blocked_reasons=operational_status.latest_blocked_reasons,
+        control_status_summary=operational_status.control_status_summary,
+        reconciliation_summary=operational_status.reconciliation_summary,
+        operator_alert=operational_status.operator_alert,
+        mode=mode,
+        operating_state=operational_status.operating_state,
+        protection_recovery_status=operational_status.protection_recovery_status,
+        protection_recovery_active=operational_status.protection_recovery_active,
+        protection_recovery_failure_count=operational_status.protection_recovery_failure_count,
+        missing_protection_symbols=operational_status.missing_protection_symbols,
+        missing_protection_items=operational_status.missing_protection_items,
+        pause_severity=operational_status.pause_severity,
+        pause_recovery_class=operational_status.pause_recovery_class,
+        default_symbol=settings_row.default_symbol.upper(),
+        tracked_symbols=get_effective_symbols(settings_row),
+        default_timeframe=settings_row.default_timeframe,
+        exchange_sync_interval_seconds=settings_row.exchange_sync_interval_seconds,
+        market_refresh_interval_minutes=settings_row.market_refresh_interval_minutes,
+        position_management_interval_seconds=settings_row.position_management_interval_seconds,
+        symbol_cadence_overrides=symbol_cadence_overrides,
+        max_leverage=effective_max_leverage,
+        max_risk_per_trade=effective_max_risk_per_trade,
+        max_daily_loss=effective_max_daily_loss,
+        max_consecutive_losses=settings_row.max_consecutive_losses,
+        stale_market_seconds=settings_row.stale_market_seconds,
+        slippage_threshold_pct=settings_row.slippage_threshold_pct,
+        adaptive_signal_enabled=settings_row.adaptive_signal_enabled,
+        position_management_enabled=settings_row.position_management_enabled,
+        break_even_enabled=settings_row.break_even_enabled,
+        atr_trailing_stop_enabled=settings_row.atr_trailing_stop_enabled,
+        partial_take_profit_enabled=settings_row.partial_take_profit_enabled,
+        holding_edge_decay_enabled=settings_row.holding_edge_decay_enabled,
+        reduce_on_regime_shift_enabled=settings_row.reduce_on_regime_shift_enabled,
+        adaptive_signal_summary=adaptive_signal_summary,
+        position_management_summary=position_management_summary,
+        ai_enabled=settings_row.ai_enabled,
+        ai_provider=settings_row.ai_provider,
+        ai_model=settings_row.ai_model,
+        ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
+        decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
+        ai_max_input_candles=settings_row.ai_max_input_candles,
+        ai_temperature=settings_row.ai_temperature,
+        binance_market_data_enabled=settings_row.binance_market_data_enabled,
+        binance_testnet_enabled=settings_row.binance_testnet_enabled,
+        binance_futures_enabled=settings_row.binance_futures_enabled,
+        openai_api_key_configured=bool(credentials.openai_api_key),
+        binance_api_key_configured=bool(credentials.binance_api_key),
+        binance_api_secret_configured=bool(credentials.binance_api_secret),
+    )
+    return payload.model_dump(mode="json")
+
+
+def serialize_settings_cadences(settings_row: Setting) -> dict[str, object]:
+    current_session = object_session(settings_row)
+    payload = AppSettingsCadenceResponse(
+        items=build_symbol_effective_cadences(current_session, settings_row),
+    )
+    return payload.model_dump(mode="json")
+
+
+def serialize_settings_ai_usage(settings_row: Setting) -> dict[str, object]:
+    current_session = object_session(settings_row)
+    usage_metrics: AIUsageMetrics = build_ai_usage_metrics(current_session) if current_session is not None else {
+        "recent_ai_calls_24h": 0,
+        "recent_ai_calls_7d": 0,
+        "recent_ai_successes_24h": 0,
+        "recent_ai_successes_7d": 0,
+        "recent_ai_failures_24h": 0,
+        "recent_ai_failures_7d": 0,
+        "recent_ai_tokens_24h": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_tokens_7d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_role_calls_24h": {},
+        "recent_ai_role_calls_7d": {},
+        "recent_ai_role_failures_24h": {},
+        "recent_ai_role_failures_7d": {},
+        "recent_ai_failure_reasons": [],
+        "observed_monthly_ai_calls_projection": 0,
+        "observed_monthly_ai_calls_projection_breakdown": {},
+    }
+    payload = AppSettingsAIUsageResponse(
+        **usage_metrics,
         manual_ai_guard_minutes=manual_ai_guard_minutes(settings_row),
     )
     return payload.model_dump(mode="json")
@@ -1952,7 +2194,6 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.exchange_sync_interval_seconds = payload.exchange_sync_interval_seconds
     row.market_refresh_interval_minutes = payload.market_refresh_interval_minutes
     row.position_management_interval_seconds = payload.position_management_interval_seconds
-    row.schedule_windows = payload.schedule_windows
     row.symbol_cadence_overrides = normalize_symbol_cadence_overrides(payload.symbol_cadence_overrides)
     row.max_leverage = payload.max_leverage
     row.max_risk_per_trade = payload.max_risk_per_trade
