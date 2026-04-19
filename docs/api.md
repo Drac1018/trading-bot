@@ -1,5 +1,26 @@
 # API
 
+## 2026-04 Live Account Snapshot Unknown Fallback
+
+- `starting_equity`는 live operator/settings payload에서 제거된 상태였고, 이제 settings model/config/update schema/replay baseline에서도 제거되었습니다.
+- 첫 Binance account sync 전에는 synthetic starting balance를 만들지 않습니다.
+- `pnl_summary` / `account_sync_summary`는 아래처럼 동작합니다.
+  - `account_snapshot_available=false`
+  - `basis=live_account_snapshot_unavailable`
+  - `equity`, `wallet_balance`, `available_balance`, `cash_balance` -> `null`
+  - `realized_pnl`, `fee_total`, `funding_total`, `net_pnl`, `daily_pnl`, `cumulative_pnl` -> ledger 기준 유지
+- live snapshot이 존재하면:
+  - `account_snapshot_available=true`
+  - `basis=live_account_snapshot_preferred`
+  - `account_sync_summary.status=exchange_synced | fallback_reconciled | stale`
+- `GET /api/settings`, `GET /api/dashboard/operator`, orchestrator/debug payload의 account snapshot도 같은 원칙을 따릅니다.
+- dashboard는 `account_sync_summary.account_snapshot_available`과 `pnl_summary.basis`를 사용해:
+  - 실계좌 스냅샷 반영 여부
+  - 마지막 동기화 시각
+  - unknown fallback 상태
+  를 직접 표시할 수 있습니다.
+- replay validation equity curve도 더 이상 `starting_equity`를 더하지 않고 순손익 기준 0-baseline series로 계산됩니다.
+
 ## 2026-04 AI Context Packet
 
 - Trading decision input payloads can now include `ai_context`.
@@ -96,10 +117,13 @@
 - `session_prior_sample_count`
 - `session_sample_threshold_satisfied`
 - `session_prior_classification`: `strong | neutral | weak | unavailable`
+- `session_prior_recency_minutes`
 - `time_of_day_prior_available`
 - `time_of_day_prior_sample_count`
 - `time_of_day_sample_threshold_satisfied`
 - `time_of_day_prior_classification`: `strong | neutral | weak | unavailable`
+- `time_of_day_prior_recency_minutes`
+- `session_time_calibration_reason_codes`
 - `prior_reason_codes`
 - `prior_penalty_level`: `none | light | medium | strong`
 - `expected_payoff_efficiency_hint_summary`
@@ -111,6 +135,11 @@
 - `data_quality.degraded | unavailable`는 neutral이 아니라 uncertainty로 남습니다.
 - `breakout_exception_engine`, `swing`, `position` 문맥은 weak prior 또는 poor quality에서 더 쉽게 `hold` / `should_abstain=true`로 기웁니다.
 - `reduce`, `exit`, `protection_review_event` 같은 survival path는 prior 때문에 막히지 않습니다.
+- session/time prior는 sample threshold를 넘겨도 아래 조건이면 `strong`으로 승격되지 않거나 `neutral`로 보수화될 수 있습니다:
+  - 최신 bucket recency가 너무 오래됨
+  - threshold edge 부근의 희소 표본
+  - engine 표본 대비 session/time bucket concentration이 너무 낮음
+- weak session/time prior alone은 light penalty only입니다. degraded/unavailable quality와 함께 들어올 때만 추가 confidence penalty 또는 abstain bias가 붙습니다.
 
 ## 2026-04 TradeDecision Optional Metadata Additions
 
@@ -136,6 +165,12 @@
   - `capital_efficiency_classification`
   - `session_prior_classification`
   - `time_of_day_prior_classification`
+  - `session_prior_sample_count`
+  - `time_of_day_prior_sample_count`
+  - `session_prior_recency_minutes`
+  - `time_of_day_prior_recency_minutes`
+  - `session_time_calibration_reason_codes`
+  - `session_time_penalty_applied`
   - `prior_penalty_level`
   - `prior_reason_codes`
   - `sample_threshold_satisfied`
@@ -201,7 +236,18 @@
   - `provider_status`
   - `should_abstain`
   - `abstain_reason_codes`
+- Data-quality-driven entry conservatism can also surface through:
+  - `data_quality_fail_closed_applied`
+  - `data_quality_block_reason_codes`
+  - `minimum_quality_required`
+  - `abstain_due_to_data_quality`
+  - `quality_penalty_level`
+  - `provider_not_called_due_to_quality`
 - Fail-closed applies only to new-entry-capable review families. Provider timeout, provider unavailable, malformed output, or schema validation failure normalizes the decision to `hold` before `risk.py`.
+- Quality fail-closed is additive and still AI-layer only:
+  - `data_quality_grade=unavailable` on a new-entry-capable route blocks provider invocation and fail-closes to `hold`
+  - `data_quality_grade=degraded` on `breakout_exception_engine` / `breakout_exception_event` blocks provider invocation and fail-closes to `hold`
+  - degraded or unavailable quality plus a provider-proposed `swing` / `position` new entry is bounded back to `hold` with abstain metadata
 - `protection_review_event`, `reduce`, `exit`, protection recovery, and other deterministic survival paths remain executable without AI and are not blocked by provider failure.
 
 ## 2026-04 Hybrid AI Review Fields
@@ -223,6 +269,9 @@
 - `symbol_effective_cadences` rows now include:
   - `ai_backstop_enabled`
   - `ai_backstop_interval_minutes`
+- Interval-based AI monthly estimate fields were removed from settings payloads.
+  - AI 호출은 fixed 15분 주기가 아니라 event-driven + periodic backstop 기준으로 동작합니다.
+  - settings payload는 observed usage(`recent_ai_calls_*`, `observed_monthly_ai_calls_projection*`)만 노출합니다.
 
 ### Operator / dashboard observability additions
 
@@ -269,9 +318,17 @@
   - `dedupe_reason`
   - `last_material_review_at`
   - `forced_review_reason`
+  - `applied_review_cadence_minutes`
+  - `review_cadence_source`
+  - `holding_profile_cadence_hint`
+  - `cadence_fallback_reason`
+  - `max_review_age_minutes`
+  - `cadence_profile_summary`
 - `open_position_recheck_due` dedupe is bucketed on stable review context rather than raw noise values. The basis includes `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
 - Same open-position fingerprint is deduped only when the trigger remains materially unchanged. A material bucket change reopens review immediately.
 - Even when the fingerprint is unchanged, open-position review can be forced once the max review age is exceeded. The default forced-review ceiling is conservative: `min(backstop interval, 3x position review cadence)`.
+- The interval scheduler now consumes the same open-position review cadence directly for symbol due-gating. `scalp / swing / position` cadence hints therefore affect both `open_position_recheck_due` generation and when the scheduler revisits that symbol.
+- If no trusted holding-profile cadence can be resolved, review cadence falls back conservatively to effective AI cadence and records `review_cadence_source` plus `cadence_fallback_reason` instead of silently treating the missing hint as neutral.
 - `protection_review_event` remains dedupe-exempt so protection recovery is not delayed by unchanged AI review fingerprints.
 
 ### Execution boundary reminder
@@ -419,7 +476,6 @@
 - `position_management_interval_seconds`
 - `decision_cycle_interval_minutes`
 - `ai_call_interval_minutes`
-- `estimated_monthly_ai_calls`
 - `last_market_refresh_at`
 - `last_position_management_at`
 - `last_decision_at`

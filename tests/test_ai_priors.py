@@ -753,10 +753,13 @@ def test_weak_session_and_time_prior_remain_soft_only() -> None:
         session_prior_sample_count=6,
         session_sample_threshold_satisfied=True,
         session_prior_classification="weak",
+        session_prior_recency_minutes=90.0,
         time_of_day_prior_available=True,
         time_of_day_prior_sample_count=7,
         time_of_day_sample_threshold_satisfied=True,
         time_of_day_prior_classification="weak",
+        time_of_day_prior_recency_minutes=120.0,
+        session_time_calibration_reason_codes=["SESSION_PRIOR_STRONG_SAMPLE_EDGE"],
         prior_reason_codes=["SESSION_PRIOR_WEAK", "TIME_OF_DAY_PRIOR_WEAK"],
         prior_penalty_level="light",
     )
@@ -776,8 +779,105 @@ def test_weak_session_and_time_prior_remain_soft_only() -> None:
     assert decision.decision == "long"
     assert decision.should_abstain is False
     assert decision.confidence < 0.68
+    assert decision.session_prior_sample_count == 6
+    assert decision.time_of_day_prior_sample_count == 7
+    assert decision.session_prior_recency_minutes == 90.0
+    assert decision.time_of_day_prior_recency_minutes == 120.0
+    assert decision.session_time_calibration_reason_codes == ["SESSION_PRIOR_STRONG_SAMPLE_EDGE"]
+    assert decision.session_time_penalty_applied is False
     assert metadata["confidence_adjustment_applied"] is True
     assert metadata["abstain_due_to_prior_and_quality"] is False
+    assert metadata["session_time_penalty_applied"] is False
+
+
+def test_session_time_prior_strong_is_softened_when_stale_and_edge_sample(db_session) -> None:
+    now = utcnow_naive() - timedelta(days=10)
+    for offset_hours, pnl in enumerate((14.0, 13.0, 12.0, 11.0, 10.0, 9.0)):
+        _seed_engine_trade(
+            db_session,
+            created_at=now + timedelta(hours=offset_hours),
+            strategy_engine="trend_pullback_engine",
+            session_label="asia",
+            time_of_day_bucket="utc_00_05",
+            net_pnl_after_fees=pnl,
+            signed_slippage_bps=3.0,
+            time_to_profit_minutes=15.0 + offset_hours,
+            drawdown_impact=0.18,
+        )
+
+    prior_context = build_ai_prior_context(
+        db_session,
+        ai_context=_ai_context(),
+        selection_context={
+            "scenario": "pullback_entry",
+            "entry_mode": "pullback_confirm",
+            "execution_policy_profile": "entry_btc_fast_calm",
+            "regime_summary": {
+                "primary_regime": "bullish",
+                "trend_alignment": "bullish_aligned",
+            },
+            "strategy_engine_context": {
+                "session_context": {
+                    "session_label": "asia",
+                    "time_of_day_bucket": "utc_00_05",
+                }
+            },
+        },
+    )
+
+    assert prior_context.engine_prior_classification == "strong"
+    assert prior_context.session_prior_classification == "neutral"
+    assert prior_context.time_of_day_prior_classification == "neutral"
+    assert prior_context.session_prior_recency_minutes is not None
+    assert prior_context.time_of_day_prior_recency_minutes is not None
+    assert "SESSION_PRIOR_STRONG_SAMPLE_EDGE" in prior_context.session_time_calibration_reason_codes
+    assert "SESSION_PRIOR_STRONG_RECENCY_STALE" in prior_context.session_time_calibration_reason_codes
+    assert "TIME_OF_DAY_PRIOR_STRONG_SAMPLE_EDGE" in prior_context.session_time_calibration_reason_codes
+    assert "TIME_OF_DAY_PRIOR_STRONG_RECENCY_STALE" in prior_context.session_time_calibration_reason_codes
+
+
+def test_weak_session_time_prior_with_degraded_quality_adds_stronger_soft_penalty() -> None:
+    prior_context = AIPriorContextPacket(
+        session_prior_available=True,
+        session_prior_sample_count=6,
+        session_sample_threshold_satisfied=True,
+        session_prior_classification="weak",
+        session_prior_recency_minutes=80.0,
+        time_of_day_prior_available=True,
+        time_of_day_prior_sample_count=7,
+        time_of_day_sample_threshold_satisfied=True,
+        time_of_day_prior_classification="weak",
+        time_of_day_prior_recency_minutes=105.0,
+        prior_reason_codes=["SESSION_PRIOR_WEAK", "TIME_OF_DAY_PRIOR_WEAK"],
+        prior_penalty_level="medium",
+    )
+    ai_context = _ai_context(
+        data_quality_grade="degraded",
+        holding_profile="position",
+        prior_context=prior_context,
+    )
+    route = resolve_prompt_route(
+        ai_context=ai_context,
+        strategy_engine="trend_pullback_engine",
+        has_open_position=False,
+    )
+
+    decision, metadata = _agent()._apply_prior_soft_adjustments(
+        _decision(
+            holding_profile="position",
+            recommended_holding_profile="position",
+        ),
+        ai_context=ai_context,
+        route=route,
+    )
+
+    assert decision.decision == "long"
+    assert decision.should_abstain is True
+    assert decision.confidence <= 0.58
+    assert decision.session_time_penalty_applied is True
+    assert metadata["session_time_penalty_applied"] is True
+    assert metadata["abstain_due_to_prior_and_quality"] is True
+    assert "SESSION_TIME_PRIOR_QUALITY_CONSERVATISM" in decision.prior_reason_codes
 
 
 def test_degraded_quality_and_breakout_exception_bias_to_abstain() -> None:

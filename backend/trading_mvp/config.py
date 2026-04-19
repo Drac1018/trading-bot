@@ -24,7 +24,6 @@ class Settings(BaseSettings):
     live_trading_env_enabled: bool = False
     manual_live_approval: bool = False
     trading_paused: bool = False
-    starting_equity: float = 100000.0
     max_leverage: float = 5.0
     max_risk_per_trade: float = 0.02
     max_daily_loss: float = 0.05

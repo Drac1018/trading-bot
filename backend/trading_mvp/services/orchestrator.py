@@ -2537,20 +2537,11 @@ class TradingOrchestrator:
         )
         return {"status": "ok", "trigger_event": trigger_event, **result}
 
-    def _account_snapshot_preview(self) -> dict[str, float | int | str]:
+    def _account_snapshot_preview(self) -> dict[str, object]:
         latest = self.session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
         if latest is not None:
             return account_snapshot_to_dict(latest)
-        return {
-            "snapshot_date": utcnow_naive().date().isoformat(),
-            "equity": self.settings_row.starting_equity,
-            "cash_balance": self.settings_row.starting_equity,
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "daily_pnl": 0.0,
-            "cumulative_pnl": 0.0,
-            "consecutive_losses": 0,
-        }
+        return account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row))
 
     @staticmethod
     def _should_attempt_auto_resume(trigger_event: str) -> bool:
@@ -4440,6 +4431,172 @@ class TradingOrchestrator:
         return max(int(getattr(effective_settings, "ai_call_interval_minutes", 30)), 1)
 
     @staticmethod
+    def _validated_holding_profile(profile: object) -> str | None:
+        normalized = str(profile or "").strip().lower()
+        if not normalized:
+            return None
+        resolved = resolve_holding_profile_cadence_hint(normalized)
+        resolved_profile = str(resolved.get("holding_profile") or "").strip().lower()
+        return resolved_profile if resolved_profile == normalized else None
+
+    @classmethod
+    def _resolve_position_review_holding_profile(
+        cls,
+        *,
+        review_trigger: AIReviewTriggerPayload | None = None,
+        position_management: dict[str, object] | None = None,
+        latest_metadata: dict[str, object] | None = None,
+        cadence_profile: dict[str, object] | None = None,
+    ) -> str | None:
+        candidates = [
+            review_trigger.holding_profile if review_trigger is not None else None,
+            _as_dict(position_management or {}).get("holding_profile"),
+            _as_dict(latest_metadata or {}).get("holding_profile"),
+            _as_dict(cadence_profile or {}).get("active_holding_profile"),
+        ]
+        for candidate in candidates:
+            validated = cls._validated_holding_profile(candidate)
+            if validated is not None:
+                return validated
+        return None
+
+    @classmethod
+    def _position_review_cadence_details(
+        cls,
+        cadence_profile: dict[str, object],
+        *,
+        effective_settings: object,
+        holding_profile: str | None,
+    ) -> dict[str, object]:
+        effective_cadence = _as_dict(cadence_profile.get("effective_cadence"))
+        cadence_profile_summary = {
+            "mode": str(cadence_profile.get("mode") or "") or None,
+            "active_holding_profile": str(cadence_profile.get("active_holding_profile") or "") or None,
+            "holding_profile_cadence_source": (
+                str(cadence_profile.get("holding_profile_cadence_source") or "") or None
+            ),
+            "effective_cadence": {
+                "decision_cycle_interval_minutes": effective_cadence.get("decision_cycle_interval_minutes"),
+                "ai_call_interval_minutes": effective_cadence.get("ai_call_interval_minutes"),
+                "position_management_interval_seconds": effective_cadence.get("position_management_interval_seconds"),
+            },
+        }
+        validated_profile = cls._validated_holding_profile(holding_profile)
+        if validated_profile is not None:
+            cadence_hint = resolve_holding_profile_cadence_hint(validated_profile)
+            hint_minutes = cadence_hint.get("decision_interval_minutes")
+            if isinstance(hint_minutes, (int, float)) and int(hint_minutes) > 0:
+                return {
+                    "applied_review_cadence_minutes": int(hint_minutes),
+                    "review_cadence_source": "holding_profile_cadence_hint",
+                    "holding_profile_cadence_hint": dict(cadence_hint),
+                    "cadence_fallback_reason": None,
+                    "cadence_profile_summary": cadence_profile_summary,
+                }
+
+        effective_minutes = effective_cadence.get("ai_call_interval_minutes")
+        if isinstance(effective_minutes, (int, float)) and int(effective_minutes) > 0:
+            return {
+                "applied_review_cadence_minutes": int(effective_minutes),
+                "review_cadence_source": "effective_ai_call_interval_minutes",
+                "holding_profile_cadence_hint": {},
+                "cadence_fallback_reason": "HOLDING_PROFILE_CADENCE_HINT_MISSING",
+                "cadence_profile_summary": cadence_profile_summary,
+            }
+
+        return {
+            "applied_review_cadence_minutes": max(
+                int(getattr(effective_settings, "ai_call_interval_minutes", 30)),
+                1,
+            ),
+            "review_cadence_source": "settings_ai_call_interval_minutes",
+            "holding_profile_cadence_hint": {},
+            "cadence_fallback_reason": "EFFECTIVE_AI_CADENCE_UNAVAILABLE",
+            "cadence_profile_summary": cadence_profile_summary,
+        }
+
+    def resolve_interval_decision_schedule_details(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        effective_settings: object,
+        cadence_profile: dict[str, object] | None = None,
+        open_positions: list[Position] | None = None,
+        latest_decision_run: AgentRun | None = None,
+        review_trigger: AIReviewTriggerPayload | None = None,
+    ) -> dict[str, object]:
+        cadence_profile = (
+            cadence_profile
+            if isinstance(cadence_profile, dict)
+            else self.get_symbol_cadence_profile(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_positions=open_positions,
+            )
+        )
+        effective_cadence = _as_dict(cadence_profile.get("effective_cadence"))
+        scheduler_interval_minutes = (
+            int(effective_cadence.get("decision_cycle_interval_minutes"))
+            if isinstance(effective_cadence.get("decision_cycle_interval_minutes"), (int, float))
+            and int(effective_cadence.get("decision_cycle_interval_minutes")) > 0
+            else max(int(getattr(effective_settings, "decision_cycle_interval_minutes", 1)), 1)
+        )
+        open_positions = (
+            open_positions
+            if open_positions is not None
+            else get_open_positions(self.session, symbol)
+        )
+        latest_decision_run = (
+            latest_decision_run
+            if latest_decision_run is not None
+            else self._latest_symbol_decision_run(symbol=symbol, timeframe=timeframe)
+        )
+        latest_metadata = (
+            latest_decision_run.metadata_json
+            if latest_decision_run is not None and isinstance(latest_decision_run.metadata_json, dict)
+            else {}
+        )
+        cadence_profile_summary = {
+            "mode": str(cadence_profile.get("mode") or "") or None,
+            "active_holding_profile": str(cadence_profile.get("active_holding_profile") or "") or None,
+            "holding_profile_cadence_source": (
+                str(cadence_profile.get("holding_profile_cadence_source") or "") or None
+            ),
+            "effective_cadence": dict(effective_cadence),
+        }
+        if not open_positions:
+            return {
+                "scheduler_interval_minutes": scheduler_interval_minutes,
+                "applied_review_cadence_minutes": None,
+                "review_cadence_source": None,
+                "holding_profile_cadence_hint": {},
+                "cadence_fallback_reason": None,
+                "cadence_profile_summary": cadence_profile_summary,
+                "holding_profile": None,
+            }
+
+        position_row = open_positions[0]
+        position_metadata = _as_dict(getattr(position_row, "metadata_json", {}))
+        position_management = _as_dict(position_metadata.get("position_management"))
+        holding_profile = self._resolve_position_review_holding_profile(
+            review_trigger=review_trigger,
+            position_management=position_management,
+            latest_metadata=latest_metadata,
+            cadence_profile=cadence_profile,
+        )
+        cadence_details = self._position_review_cadence_details(
+            cadence_profile,
+            effective_settings=effective_settings,
+            holding_profile=holding_profile,
+        )
+        return {
+            **cadence_details,
+            "scheduler_interval_minutes": int(cadence_details["applied_review_cadence_minutes"]),
+            "holding_profile": holding_profile or "scalp",
+        }
+
+    @staticmethod
     def _open_position_max_review_age_minutes(
         review_interval_minutes: int,
         *,
@@ -4810,6 +4967,12 @@ class TradingOrchestrator:
         fingerprint_changed_fields: list[str] | None = None,
         dedupe_reason: str | None = None,
         forced_review_reason: str | None = None,
+        applied_review_cadence_minutes: int | None = None,
+        review_cadence_source: str | None = None,
+        holding_profile_cadence_hint: dict[str, object] | None = None,
+        cadence_fallback_reason: str | None = None,
+        max_review_age_minutes: int | None = None,
+        cadence_profile_summary: dict[str, object] | None = None,
     ) -> AIReviewTriggerPayload:
         return AIReviewTriggerPayload(
             trigger_reason=trigger_reason,  # type: ignore[arg-type]
@@ -4829,6 +4992,12 @@ class TradingOrchestrator:
             last_decision_at=last_decision_at,
             last_material_review_at=last_material_review_at,
             forced_review_reason=forced_review_reason,
+            applied_review_cadence_minutes=applied_review_cadence_minutes,
+            review_cadence_source=review_cadence_source,
+            holding_profile_cadence_hint=dict(holding_profile_cadence_hint or {}),
+            cadence_fallback_reason=cadence_fallback_reason,
+            max_review_age_minutes=max_review_age_minutes,
+            cadence_profile_summary=dict(cadence_profile_summary or {}),
             triggered_at=triggered_at,
         )
 
@@ -4873,6 +5042,22 @@ class TradingOrchestrator:
                     last_decision_at=_coerce_datetime(review_trigger.get("last_decision_at")),
                     last_material_review_at=_coerce_datetime(review_trigger.get("last_material_review_at")),
                     forced_review_reason=str(review_trigger.get("forced_review_reason") or "") or None,
+                    applied_review_cadence_minutes=(
+                        int(review_trigger.get("applied_review_cadence_minutes"))
+                        if isinstance(review_trigger.get("applied_review_cadence_minutes"), (int, float))
+                        and int(review_trigger.get("applied_review_cadence_minutes")) > 0
+                        else None
+                    ),
+                    review_cadence_source=str(review_trigger.get("review_cadence_source") or "") or None,
+                    holding_profile_cadence_hint=_as_dict(review_trigger.get("holding_profile_cadence_hint")),
+                    cadence_fallback_reason=str(review_trigger.get("cadence_fallback_reason") or "") or None,
+                    max_review_age_minutes=(
+                        int(review_trigger.get("max_review_age_minutes"))
+                        if isinstance(review_trigger.get("max_review_age_minutes"), (int, float))
+                        and int(review_trigger.get("max_review_age_minutes")) > 0
+                        else None
+                    ),
+                    cadence_profile_summary=_as_dict(review_trigger.get("cadence_profile_summary")),
                     triggered_at=triggered_at,
                 )
             except Exception:
@@ -4955,9 +5140,20 @@ class TradingOrchestrator:
                 runtime_state=runtime_state,
                 open_positions=open_positions,
             )
-            review_interval_minutes = self._position_review_interval_minutes(
-                cadence_profile,
+            schedule_details = self.resolve_interval_decision_schedule_details(
+                symbol=symbol,
+                timeframe=effective_timeframe,
                 effective_settings=effective,
+                cadence_profile=cadence_profile,
+                open_positions=open_positions,
+                latest_decision_run=latest_decision_run,
+            )
+            review_interval_minutes = int(
+                schedule_details.get("applied_review_cadence_minutes")
+                or self._position_review_interval_minutes(
+                    cadence_profile,
+                    effective_settings=effective,
+                )
             )
             position_review_due_at = (
                 last_decision_at + timedelta(minutes=review_interval_minutes)
@@ -4992,6 +5188,18 @@ class TradingOrchestrator:
                 else {}
             )
             max_review_due_at: datetime | None = None
+            max_review_age_minutes = (
+                self._open_position_max_review_age_minutes(
+                    review_interval_minutes,
+                    backstop_interval_minutes=(
+                        effective.ai_backstop_interval_minutes
+                        if effective.ai_backstop_enabled
+                        else None
+                    ),
+                )
+                if open_positions
+                else None
+            )
 
             if open_positions:
                 position_row = open_positions[0]
@@ -5018,12 +5226,7 @@ class TradingOrchestrator:
                         latest_output_payload,
                     )
                     slot_allocation = _as_dict(latest_metadata.get("slot_allocation"))
-                    holding_profile = (
-                        str(position_management.get("holding_profile") or "")
-                        or str(cadence_profile.get("active_holding_profile") or "")
-                        or str(latest_metadata.get("holding_profile") or "")
-                        or "scalp"
-                    )
+                    holding_profile = str(schedule_details.get("holding_profile") or "scalp")
                     fingerprint_basis = self._build_open_position_recheck_fingerprint_basis(
                         symbol=symbol,
                         timeframe=effective_timeframe,
@@ -5050,14 +5253,7 @@ class TradingOrchestrator:
                     forced_review_reason: str | None = None
                     if trigger_reason == "open_position_recheck_due" and last_material_review_at is not None:
                         max_review_due_at = last_material_review_at + timedelta(
-                            minutes=self._open_position_max_review_age_minutes(
-                                review_interval_minutes,
-                                backstop_interval_minutes=(
-                                    effective.ai_backstop_interval_minutes
-                                    if effective.ai_backstop_enabled
-                                    else None
-                                ),
-                            )
+                            minutes=max_review_age_minutes or review_interval_minutes
                         )
                         if max_review_due_at <= generated_at:
                             forced_review_reason = "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
@@ -5077,6 +5273,24 @@ class TradingOrchestrator:
                         fingerprint_basis=fingerprint_basis,
                         fingerprint_changed_fields=fingerprint_changed_fields,
                         forced_review_reason=forced_review_reason,
+                        applied_review_cadence_minutes=int(
+                            schedule_details.get("applied_review_cadence_minutes") or review_interval_minutes
+                        ),
+                        review_cadence_source=str(
+                            schedule_details.get("review_cadence_source") or ""
+                        )
+                        or None,
+                        holding_profile_cadence_hint=_as_dict(
+                            schedule_details.get("holding_profile_cadence_hint")
+                        ),
+                        cadence_fallback_reason=str(
+                            schedule_details.get("cadence_fallback_reason") or ""
+                        )
+                        or None,
+                        max_review_age_minutes=max_review_age_minutes,
+                        cadence_profile_summary=_as_dict(
+                            schedule_details.get("cadence_profile_summary")
+                        ),
                         fingerprint_material={
                             "trigger_reason": trigger_reason,
                             "symbol": symbol,
@@ -5225,6 +5439,16 @@ class TradingOrchestrator:
                         planned_next_ai_review_due_at.isoformat()
                         if planned_next_ai_review_due_at is not None
                         else None
+                    ),
+                    "applied_review_cadence_minutes": schedule_details.get("applied_review_cadence_minutes"),
+                    "review_cadence_source": schedule_details.get("review_cadence_source"),
+                    "holding_profile_cadence_hint": _as_dict(
+                        schedule_details.get("holding_profile_cadence_hint")
+                    ),
+                    "cadence_fallback_reason": schedule_details.get("cadence_fallback_reason"),
+                    "max_review_age_minutes": max_review_age_minutes,
+                    "cadence_profile_summary": _as_dict(
+                        schedule_details.get("cadence_profile_summary")
                     ),
                     "fingerprint_changed_fields": (
                         list(trigger_payload.fingerprint_changed_fields)
@@ -5481,22 +5705,6 @@ class TradingOrchestrator:
             setup_cluster_context=setup_cluster_context,
             include_adaptive_underperformance=True,
         )
-        review_interval_minutes = self._position_review_interval_minutes(
-            cadence_profile,
-            effective_settings=effective_settings,
-        )
-        next_ai_review_due_at = utcnow_naive() + timedelta(
-            minutes=(
-                review_interval_minutes
-                if open_positions
-                else effective_settings.ai_backstop_interval_minutes
-                if effective_settings.ai_backstop_enabled
-                else max(
-                    int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]),
-                    1,
-                )
-            )
-        )
         review_trigger_payload = self._review_trigger_payload_from_input(review_trigger)
         latest_decision_metadata = (
             latest_decision_run.metadata_json
@@ -5524,8 +5732,8 @@ class TradingOrchestrator:
             )
             holding_profile = (
                 str(effective_selection_context.get("holding_profile") or "")
-            ) or str(cadence_profile.get("active_holding_profile") or "") or str(
-                latest_decision_metadata.get("holding_profile") or "scalp"
+            ) or str(latest_decision_metadata.get("holding_profile") or "") or str(
+                cadence_profile.get("active_holding_profile") or "scalp"
             )
             reason_codes = (
                 [str(code) for code in candidate_payload.get("rationale_codes", []) if code not in {None, ""}]
@@ -5574,6 +5782,68 @@ class TradingOrchestrator:
                     "reason_codes": sorted(reason_codes),
                     "open_position": bool(open_positions),
                 },
+            )
+        schedule_details = self.resolve_interval_decision_schedule_details(
+            symbol=symbol,
+            timeframe=timeframe,
+            effective_settings=effective_settings,
+            cadence_profile=cadence_profile,
+            open_positions=open_positions,
+            latest_decision_run=latest_decision_run,
+            review_trigger=review_trigger_payload,
+        )
+        review_interval_minutes = int(
+            schedule_details.get("applied_review_cadence_minutes")
+            or self._position_review_interval_minutes(
+                cadence_profile,
+                effective_settings=effective_settings,
+            )
+        )
+        max_review_age_minutes = (
+            self._open_position_max_review_age_minutes(
+                review_interval_minutes,
+                backstop_interval_minutes=(
+                    effective_settings.ai_backstop_interval_minutes
+                    if effective_settings.ai_backstop_enabled
+                    else None
+                ),
+            )
+            if open_positions
+            else None
+        )
+        next_ai_review_due_at = utcnow_naive() + timedelta(
+            minutes=(
+                review_interval_minutes
+                if open_positions
+                else effective_settings.ai_backstop_interval_minutes
+                if effective_settings.ai_backstop_enabled
+                else max(
+                    int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]),
+                    1,
+                )
+            )
+        )
+        if review_trigger_payload is not None and open_positions:
+            review_trigger_payload = review_trigger_payload.model_copy(
+                update={
+                    "applied_review_cadence_minutes": int(
+                        schedule_details.get("applied_review_cadence_minutes")
+                        or review_interval_minutes
+                    ),
+                    "review_cadence_source": (
+                        str(schedule_details.get("review_cadence_source") or "") or None
+                    ),
+                    "holding_profile_cadence_hint": _as_dict(
+                        schedule_details.get("holding_profile_cadence_hint")
+                    ),
+                    "cadence_fallback_reason": (
+                        str(schedule_details.get("cadence_fallback_reason") or "") or None
+                    ),
+                    "max_review_age_minutes": max_review_age_minutes,
+                    "cadence_profile_summary": _as_dict(
+                        schedule_details.get("cadence_profile_summary")
+                    ),
+                }
             )
         openai_gate = get_openai_call_gate(
             self.session,
@@ -5700,10 +5970,26 @@ class TradingOrchestrator:
                 else None
             ),
             "last_ai_skip_reason": ai_skipped_reason,
+            "applied_review_cadence_minutes": schedule_details.get("applied_review_cadence_minutes"),
+            "review_cadence_source": schedule_details.get("review_cadence_source"),
+            "holding_profile_cadence_hint": _as_dict(
+                schedule_details.get("holding_profile_cadence_hint")
+            ),
+            "cadence_fallback_reason": schedule_details.get("cadence_fallback_reason"),
+            "max_review_age_minutes": max_review_age_minutes,
+            "cadence_profile_summary": _as_dict(
+                schedule_details.get("cadence_profile_summary")
+            ),
             "engine_prior_classification": decision_metadata.get("engine_prior_classification"),
             "capital_efficiency_classification": decision_metadata.get("capital_efficiency_classification"),
             "session_prior_classification": decision_metadata.get("session_prior_classification"),
             "time_of_day_prior_classification": decision_metadata.get("time_of_day_prior_classification"),
+            "session_prior_sample_count": decision_metadata.get("session_prior_sample_count"),
+            "time_of_day_prior_sample_count": decision_metadata.get("time_of_day_prior_sample_count"),
+            "session_prior_recency_minutes": decision_metadata.get("session_prior_recency_minutes"),
+            "time_of_day_prior_recency_minutes": decision_metadata.get("time_of_day_prior_recency_minutes"),
+            "session_time_calibration_reason_codes": decision_metadata.get("session_time_calibration_reason_codes"),
+            "session_time_penalty_applied": decision_metadata.get("session_time_penalty_applied"),
             "prior_penalty_level": decision_metadata.get("prior_penalty_level"),
             "prior_reason_codes": decision_metadata.get("prior_reason_codes"),
             "sample_threshold_satisfied": decision_metadata.get("sample_threshold_satisfied"),
@@ -5780,6 +6066,12 @@ class TradingOrchestrator:
                 "bounded_output_applied": decision_metadata.get("bounded_output_applied"),
                 "fallback_reason_codes": decision_metadata.get("fallback_reason_codes"),
                 "fail_closed_applied": decision_metadata.get("fail_closed_applied"),
+                "data_quality_fail_closed_applied": decision_metadata.get("data_quality_fail_closed_applied"),
+                "data_quality_block_reason_codes": decision_metadata.get("data_quality_block_reason_codes"),
+                "minimum_quality_required": decision_metadata.get("minimum_quality_required"),
+                "abstain_due_to_data_quality": decision_metadata.get("abstain_due_to_data_quality"),
+                "quality_penalty_level": decision_metadata.get("quality_penalty_level"),
+                "provider_not_called_due_to_quality": decision_metadata.get("provider_not_called_due_to_quality"),
                 "fingerprint_changed_fields": decision_metadata.get("fingerprint_changed_fields"),
                 "dedupe_reason": decision_metadata.get("dedupe_reason"),
                 "last_material_review_at": decision_metadata.get("last_material_review_at"),
@@ -5788,6 +6080,12 @@ class TradingOrchestrator:
                 "capital_efficiency_classification": decision_metadata.get("capital_efficiency_classification"),
                 "session_prior_classification": decision_metadata.get("session_prior_classification"),
                 "time_of_day_prior_classification": decision_metadata.get("time_of_day_prior_classification"),
+                "session_prior_sample_count": decision_metadata.get("session_prior_sample_count"),
+                "time_of_day_prior_sample_count": decision_metadata.get("time_of_day_prior_sample_count"),
+                "session_prior_recency_minutes": decision_metadata.get("session_prior_recency_minutes"),
+                "time_of_day_prior_recency_minutes": decision_metadata.get("time_of_day_prior_recency_minutes"),
+                "session_time_calibration_reason_codes": decision_metadata.get("session_time_calibration_reason_codes"),
+                "session_time_penalty_applied": decision_metadata.get("session_time_penalty_applied"),
                 "prior_penalty_level": decision_metadata.get("prior_penalty_level"),
                 "prior_reason_codes": decision_metadata.get("prior_reason_codes"),
                 "sample_threshold_satisfied": decision_metadata.get("sample_threshold_satisfied"),
@@ -5820,6 +6118,10 @@ class TradingOrchestrator:
                     "fingerprint_changed_fields": decision_metadata.get("fingerprint_changed_fields"),
                     "last_material_review_at": decision_metadata.get("last_material_review_at"),
                     "forced_review_reason": decision_metadata.get("forced_review_reason"),
+                    "applied_review_cadence_minutes": decision_metadata.get("applied_review_cadence_minutes"),
+                    "review_cadence_source": decision_metadata.get("review_cadence_source"),
+                    "cadence_fallback_reason": decision_metadata.get("cadence_fallback_reason"),
+                    "max_review_age_minutes": decision_metadata.get("max_review_age_minutes"),
                 },
                 correlation_ids=decision_correlation_ids,
             )
@@ -5842,6 +6144,10 @@ class TradingOrchestrator:
                     "dedupe_reason": decision_metadata.get("dedupe_reason"),
                     "last_material_review_at": decision_metadata.get("last_material_review_at"),
                     "forced_review_reason": decision_metadata.get("forced_review_reason"),
+                    "applied_review_cadence_minutes": decision_metadata.get("applied_review_cadence_minutes"),
+                    "review_cadence_source": decision_metadata.get("review_cadence_source"),
+                    "cadence_fallback_reason": decision_metadata.get("cadence_fallback_reason"),
+                    "max_review_age_minutes": decision_metadata.get("max_review_age_minutes"),
                     "intent_family": decision_metadata.get("intent_family"),
                     "management_action": decision_metadata.get("management_action"),
                 },
@@ -5863,6 +6169,12 @@ class TradingOrchestrator:
                     "provider_status": decision_metadata.get("provider_status"),
                     "fallback_reason_codes": decision_metadata.get("fallback_reason_codes"),
                     "fail_closed_applied": decision_metadata.get("fail_closed_applied"),
+                    "data_quality_fail_closed_applied": decision_metadata.get("data_quality_fail_closed_applied"),
+                    "data_quality_block_reason_codes": decision_metadata.get("data_quality_block_reason_codes"),
+                    "minimum_quality_required": decision_metadata.get("minimum_quality_required"),
+                    "abstain_due_to_data_quality": decision_metadata.get("abstain_due_to_data_quality"),
+                    "quality_penalty_level": decision_metadata.get("quality_penalty_level"),
+                    "provider_not_called_due_to_quality": decision_metadata.get("provider_not_called_due_to_quality"),
                     "should_abstain": decision_metadata.get("should_abstain"),
                     "abstain_reason_codes": decision_metadata.get("abstain_reason_codes"),
                 },
@@ -5970,6 +6282,12 @@ class TradingOrchestrator:
                     "last_material_review_at": decision_metadata.get("last_material_review_at"),
                     "forced_review_reason": decision_metadata.get("forced_review_reason"),
                     "last_ai_skip_reason": decision_metadata.get("last_ai_skip_reason"),
+                    "applied_review_cadence_minutes": decision_metadata.get("applied_review_cadence_minutes"),
+                    "review_cadence_source": decision_metadata.get("review_cadence_source"),
+                    "holding_profile_cadence_hint": decision_metadata.get("holding_profile_cadence_hint"),
+                    "cadence_fallback_reason": decision_metadata.get("cadence_fallback_reason"),
+                    "max_review_age_minutes": decision_metadata.get("max_review_age_minutes"),
+                    "cadence_profile_summary": decision_metadata.get("cadence_profile_summary"),
                     "decision_reference": decision_reference,
                     "logic_variant": logic_variant,
                     "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),
@@ -6125,6 +6443,12 @@ class TradingOrchestrator:
             "last_material_review_at": decision_metadata.get("last_material_review_at"),
             "forced_review_reason": decision_metadata.get("forced_review_reason"),
             "last_ai_skip_reason": decision_metadata.get("last_ai_skip_reason"),
+            "applied_review_cadence_minutes": decision_metadata.get("applied_review_cadence_minutes"),
+            "review_cadence_source": decision_metadata.get("review_cadence_source"),
+            "holding_profile_cadence_hint": decision_metadata.get("holding_profile_cadence_hint"),
+            "cadence_fallback_reason": decision_metadata.get("cadence_fallback_reason"),
+            "max_review_age_minutes": decision_metadata.get("max_review_age_minutes"),
+            "cadence_profile_summary": decision_metadata.get("cadence_profile_summary"),
             "decision_reference": decision_reference,
             "logic_variant": logic_variant,
             "account": account_snapshot_to_dict(get_latest_pnl_snapshot(self.session, self.settings_row)),

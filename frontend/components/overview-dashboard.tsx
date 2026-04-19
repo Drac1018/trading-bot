@@ -274,6 +274,7 @@ export type OperatorDashboardPayload = {
     protected_positions: number;
     unprotected_positions: number;
     open_positions: number;
+    pnl_summary: Record<string, unknown>;
     daily_pnl: number;
     cumulative_pnl: number;
     account_sync_summary: Record<string, unknown>;
@@ -323,9 +324,9 @@ const reasonCodeLabelMap: Record<string, string> = {
   EMERGENCY_EXIT: "비상 청산 상태",
   MANUAL_USER_REQUEST: "수동 중지",
   PROTECTIVE_ORDER_FAILURE: "보호 주문 이상",
-  ACCOUNT_STATE_STALE: "계좌 상태 stale",
-  POSITION_STATE_STALE: "포지션 상태 stale",
-  OPEN_ORDERS_STATE_STALE: "오더 상태 stale",
+  ACCOUNT_STATE_STALE: "계좌 상태 지연",
+  POSITION_STATE_STALE: "포지션 상태 지연",
+  OPEN_ORDERS_STATE_STALE: "오더 상태 지연",
   PROTECTION_STATE_UNVERIFIED: "보호 주문 검증 불가",
 };
 
@@ -336,6 +337,18 @@ const syncScopeLabelMap: Record<string, string> = {
   protective_orders: "보호 주문",
   market_snapshot: "시장 스냅샷",
   market_snapshot_incomplete: "시장 스냅샷 불완전",
+};
+
+const accountSummaryBasisLabelMap: Record<string, string> = {
+  live_account_snapshot_preferred: "실계좌 스냅샷 기준",
+  live_account_snapshot_unavailable: "실계좌 스냅샷 없음",
+};
+
+const accountSyncStatusLabelMap: Record<string, string> = {
+  exchange_synced: "거래소 동기화 완료",
+  fallback_reconciled: "보수적 대체 반영",
+  stale: "지연",
+  unknown: "미확정",
 };
 
 function formatNumber(value: number, digits = 0) {
@@ -382,6 +395,26 @@ function formatFreshnessSeconds(value: number | null | undefined) {
     return `${Math.floor(value / 60)}분`;
   }
   return `${Math.floor(value / 3600)}시간 ${Math.floor((value % 3600) / 60)}분`;
+}
+
+function recordString(
+  source: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  const value = source?.[key];
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function recordBoolean(
+  source: Record<string, unknown> | null | undefined,
+  key: string,
+): boolean | null {
+  const value = source?.[key];
+  return typeof value === "boolean" ? value : null;
 }
 
 function badgeClass(kind: "good" | "warn" | "danger" | "neutral") {
@@ -536,12 +569,12 @@ function translateAiTriggerReason(value: string | null | undefined) {
     return "-";
   }
   const labels: Record<string, string> = {
-    entry_candidate_event: "entry candidate event",
-    breakout_exception_event: "breakout exception event",
-    open_position_recheck_due: "open position recheck due",
-    protection_review_event: "protection review event",
-    manual_review_event: "manual review event",
-    periodic_backstop_due: "periodic backstop due",
+    entry_candidate_event: "신규 진입 후보 이벤트",
+    breakout_exception_event: "브레이크아웃 예외 이벤트",
+    open_position_recheck_due: "오픈 포지션 재검토 시점 도래",
+    protection_review_event: "보호 상태 점검 이벤트",
+    manual_review_event: "수동 검토 이벤트",
+    periodic_backstop_due: "주기적 백스톱 검토",
   };
   return labels[value] ?? value;
 }
@@ -551,12 +584,12 @@ function translateAiSkipReason(value: string | null | undefined) {
     return "-";
   }
   const labels: Record<string, string> = {
-    NO_EVENT: "no event",
-    TRIGGER_DEDUPED: "trigger deduped",
-    AI_DISABLED: "AI disabled",
-    AI_FAILURE_BACKOFF: "failure backoff",
-    AI_COOLDOWN_ACTIVE: "cooldown active",
-    PROTECTION_REVIEW_DETERMINISTIC_ONLY: "protection review deterministic only",
+    NO_EVENT: "이벤트 없음",
+    TRIGGER_DEDUPED: "동일 상태 중복으로 생략",
+    AI_DISABLED: "AI 비활성",
+    AI_FAILURE_BACKOFF: "AI 실패 후 대기",
+    AI_COOLDOWN_ACTIVE: "AI 재호출 대기 중",
+    PROTECTION_REVIEW_DETERMINISTIC_ONLY: "보호 검토는 결정론 경로만 사용",
   };
   return labels[value] ?? value;
 }
@@ -565,14 +598,14 @@ function aiReviewSummary(symbol: OperatorSymbolSummary) {
   if (symbol.ai_decision.last_ai_skip_reason === "NO_EVENT") {
     return {
       label: "AI 미호출",
-      detail: "no event",
+      detail: "이벤트 없음",
       kind: "neutral" as const,
     };
   }
   if (symbol.ai_decision.trigger_deduped || symbol.ai_decision.last_ai_skip_reason === "TRIGGER_DEDUPED") {
     return {
       label: "AI 재호출 생략",
-      detail: "deduped",
+      detail: "동일 상태 중복",
       kind: "warn" as const,
     };
   }
@@ -602,6 +635,94 @@ function translateOperatingState(value: string | null | undefined) {
     return "-";
   }
   return operatingStateLabelMap[value] ?? value;
+}
+
+function translateAccountSummaryBasis(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  return accountSummaryBasisLabelMap[value] ?? value;
+}
+
+function translateAccountSyncStatus(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  return accountSyncStatusLabelMap[value] ?? value;
+}
+
+function translatePauseOrigin(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    manual: "수동",
+    system: "시스템",
+    api: "API 요청",
+  };
+  return labels[value] ?? value;
+}
+
+function translateAutoResumeStatus(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    not_paused: "중지 아님",
+    idle: "대기",
+    blocked: "차단",
+    resumed: "복구됨",
+    not_eligible: "대상 아님",
+    waiting: "대기 중",
+    cooldown: "쿨다운 중",
+  };
+  return labels[value] ?? value;
+}
+
+function translateAdaptiveStatus(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    disabled: "비활성",
+    enabled: "활성",
+    observe_only: "관찰 전용",
+    unavailable: "정보 없음",
+    not_applicable: "해당 없음",
+    exempt: "예외",
+    monitoring: "모니터링",
+    active_disabled: "비활성 감시",
+    cooldown_elapsed: "쿨다운 종료",
+  };
+  return labels[value] ?? value;
+}
+
+function translateProtectionRecoveryStatus(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    idle: "대기",
+    active: "복구 진행 중",
+    recreating: "보호 주문 재생성 중",
+    recovery_pending: "복구 대기",
+    restored: "복구 완료",
+    manage_only: "관리 전용",
+    emergency_exit: "비상 청산",
+  };
+  return labels[value] ?? value;
+}
+
+function translateProtectionVerificationStatus(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const labels: Record<string, string> = {
+    verified: "검증 완료",
+    verify_failed: "검증 실패",
+    pending: "검증 대기",
+  };
+  return labels[value] ?? value;
 }
 
 function translateReasonCode(value: string | null | undefined) {
@@ -915,6 +1036,38 @@ function filteredAdjustmentReasons(symbol: OperatorSymbolSummary) {
   return symbol.risk_guard.adjustment_reason_codes.filter((item, index, array) => array.indexOf(item) === index);
 }
 
+function accountSnapshotCard(control: OperatorDashboardPayload["control"]) {
+  const accountSummary = control.account_sync_summary;
+  const pnlSummary = control.pnl_summary;
+  const snapshotAvailable = recordBoolean(accountSummary, "account_snapshot_available");
+  const lastSyncedAt = recordString(accountSummary, "last_synced_at");
+  const note =
+    recordString(accountSummary, "note") ??
+    recordString(pnlSummary, "basis_note") ??
+    "첫 Binance 계좌 동기화 전까지 자산/잔고는 unknown으로 유지됩니다.";
+  const syncStatus = translateAccountSyncStatus(recordString(accountSummary, "status"));
+  const basis = translateAccountSummaryBasis(recordString(pnlSummary, "basis"));
+
+  if (snapshotAvailable) {
+    const rawStatus = recordString(accountSummary, "status");
+    const value =
+      rawStatus === "stale"
+        ? "지연 스냅샷"
+        : rawStatus === "fallback_reconciled"
+          ? "보수적 대체 반영"
+          : "실계좌 반영";
+    return {
+      value,
+      hint: `${syncStatus} / ${lastSyncedAt ? `마지막 동기화 ${formatDateTime(lastSyncedAt)}` : basis}`,
+    };
+  }
+
+  return {
+    value: "스냅샷 없음",
+    hint: `${basis} / ${note}`,
+  };
+}
+
 function latestActivityTimestamp(symbol: OperatorSymbolSummary) {
   const value =
     symbol.last_updated_at ??
@@ -1036,13 +1189,14 @@ function GlobalOperatorSummary({
   const focusRiskOutcome = focusSymbol ? riskOutcomeSummary(focusSymbol) : null;
   const focusExecutionOutcome = focusSymbol ? executionOutcomeSummary(focusSymbol) : null;
   const recentGlobalAuditEvents = globalAuditEvents.slice(0, 3);
+  const accountSnapshot = accountSnapshotCard(control);
 
   return (
     <section className="space-y-6 rounded-[2rem] border border-amber-200/70 bg-white/90 p-6 shadow-frame sm:p-7">
       <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.34em] text-slate-500">
-            Global Operator Summary
+            전역 운영 요약
           </p>
           <h1 className="mt-3 font-display text-3xl leading-tight text-slate-950 sm:text-4xl">
             전역 운영 상태와 심볼별 현황
@@ -1072,12 +1226,12 @@ function GlobalOperatorSummary({
         <p className="mt-2 text-base leading-7 sm:text-lg">{status.detail}</p>
         <div className="mt-4 flex flex-wrap gap-3 text-sm text-white/75">
           <span>운영 상태 {translateOperatingState(control.operating_state)}</span>
-          <span>자동 복구 {control.auto_resume_status}</span>
+          <span>자동 복구 {translateAutoResumeStatus(control.auto_resume_status)}</span>
           <span>보호 복구 {control.protection_recovery_status}</span>
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         {valueCard(
           "신규 진입",
           control.can_enter_new_position ? "가능" : "차단",
@@ -1098,6 +1252,7 @@ function GlobalOperatorSummary({
           formatMoney(control.daily_pnl),
           `누적 ${formatMoney(control.cumulative_pnl)}`,
         )}
+        {valueCard("계좌 스냅샷", accountSnapshot.value, accountSnapshot.hint)}
       </div>
 
       {focusSymbol && focusRecommendation && focusRiskOutcome && focusExecutionOutcome ? (
@@ -1137,10 +1292,10 @@ function GlobalOperatorSummary({
       <div className="grid gap-4 xl:grid-cols-2">
         <div className="rounded-2xl border border-slate-200 bg-white">
           {[
-            ["기본 심볼 / 타임프레임", `${control.default_symbol} / ${control.default_timeframe}`],
+            ["기본 심볼 / 시장 타임프레임", `${control.default_symbol} / ${control.default_timeframe}`],
             ["추적 심볼", control.tracked_symbols.join(", ")],
             ["pause 사유", translateReasonCode(control.pause_reason_code)],
-            ["pause origin", control.pause_origin ?? "-"],
+            ["중지 주체", translatePauseOrigin(control.pause_origin)],
             ["자동 복구 가능", control.auto_resume_eligible ? "가능" : "불가"],
             ["자동 복구 예정", formatDateTime(control.auto_resume_after)],
             [
@@ -1156,6 +1311,12 @@ function GlobalOperatorSummary({
                 : "-",
             ],
             ["다음 실행 예정", formatDateTime(control.scheduler_next_run_at)],
+            [
+              "계좌 스냅샷",
+              recordBoolean(control.account_sync_summary, "account_snapshot_available") ? "실계좌 반영" : "없음",
+            ],
+            ["계좌 동기화 상태", translateAccountSyncStatus(recordString(control.account_sync_summary, "status"))],
+            ["계좌 요약 기준", translateAccountSummaryBasis(recordString(control.pnl_summary, "basis"))],
           ].map(([label, value], index) => (
             <div
               key={String(label)}
@@ -1192,7 +1353,7 @@ function GlobalOperatorSummary({
       <div className="rounded-2xl border border-slate-200 bg-white p-4">
         <h3 className="text-sm font-semibold text-slate-950">거래소 상태 동기화 freshness</h3>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          계좌, 포지션, 오더, 보호 주문 중 하나라도 stale 또는 불완전이면 신규 진입은 차단될 수
+          계좌, 포지션, 오더, 보호 주문 중 하나라도 지연 상태이거나 불완전하면 신규 진입은 차단될 수
           있습니다.
         </p>
         <div className="mt-4 grid gap-3 lg:grid-cols-2">
@@ -1271,15 +1432,15 @@ function GlobalOperatorSummary({
           </div>
 
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
-            <h3 className="text-sm font-semibold text-slate-950">Adaptive 개입 요약</h3>
+            <h3 className="text-sm font-semibold text-slate-950">적응형 개입 요약</h3>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {valueCard(
                 "상태",
-                String(market.adaptive_signal_summary.status ?? "disabled"),
+                translateAdaptiveStatus(String(market.adaptive_signal_summary.status ?? "disabled")),
                 `입력 ${Array.isArray(market.adaptive_signal_summary.active_inputs) ? market.adaptive_signal_summary.active_inputs.join(", ") || "없음" : "없음"}`,
               )}
               {valueCard(
-                "confidence / risk",
+                "신뢰도 / 리스크",
                 `${formatNumber(Number(market.adaptive_signal_summary.confidence_multiplier ?? 1), 2)}x`,
                 `risk 배수 ${formatNumber(Number(market.adaptive_signal_summary.risk_pct_multiplier ?? 1), 2)}x`,
               )}
@@ -1489,8 +1650,8 @@ function SymbolStatusBoard({
                       </div>
                       {item.protection_status.recovery_status ? (
                         <div className="text-xs text-slate-500">
-                          {item.protection_status.recovery_status}
-                          {item.protection_status.auto_recovery_active ? " / auto" : ""}
+                          {translateProtectionRecoveryStatus(item.protection_status.recovery_status)}
+                          {item.protection_status.auto_recovery_active ? " / 자동" : ""}
                         </div>
                       ) : null}
                     </div>
@@ -1612,23 +1773,23 @@ function SymbolDetailPanel({
       </div>
 
       <div className="grid gap-4 lg:grid-cols-4">
-        {valueCard("AI review", review.label, review.detail)}
+        {valueCard("AI 검토", review.label, review.detail)}
         {valueCard(
-          "trigger reason",
+          "호출 / 생략 사유",
           translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
-          `skip ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
+          `미호출 ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
         )}
         {valueCard(
-          "last / next review",
+          "최근 / 다음 검토",
           formatDateTime(symbol.ai_decision.last_ai_invoked_at),
-          `next ${formatDateTime(symbol.ai_decision.next_ai_review_due_at)}`,
+          `다음 ${formatDateTime(symbol.ai_decision.next_ai_review_due_at)}`,
         )}
         {valueCard(
-          "candidate slot",
+          "슬롯 / 후보 강도",
           symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-",
-          `weight ${
+          `가중치 ${
             symbol.ai_decision.candidate_weight ?? symbol.candidate_selection.candidate_weight ?? "-"
-          } / capacity ${
+          } / 여유 사유 ${
             symbol.ai_decision.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-"
           }`,
         )}
@@ -1659,8 +1820,8 @@ function SymbolDetailPanel({
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
             {symbol.ai_decision.rationale_codes.length === 0 ? (
-              <span className="text-sm text-slate-500">rationale code 없음</span>
-            ) : (
+                <span className="text-sm text-slate-500">근거 코드 없음</span>
+              ) : (
               symbol.ai_decision.rationale_codes.map((code) => (
                 <span key={code} className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
                   {translateReasonCode(code)}
@@ -1670,19 +1831,19 @@ function SymbolDetailPanel({
           </div>
         </div>
         {detailList([
-          ["provider", symbol.ai_decision.provider_name ?? "-"],
-          ["trigger event", symbol.ai_decision.trigger_event ?? "-"],
-          ["last ai trigger", translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)],
-          ["last ai skip", translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)],
-          ["next ai review", formatDateTime(symbol.ai_decision.next_ai_review_due_at)],
-          ["assigned slot", symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-"],
+          ["AI 제공자", symbol.ai_decision.provider_name ?? "-"],
+          ["호출 이벤트", symbol.ai_decision.trigger_event ?? "-"],
+          ["마지막 AI 호출 사유", translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)],
+          ["마지막 AI 미호출 사유", translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)],
+          ["다음 AI 검토 예정", formatDateTime(symbol.ai_decision.next_ai_review_due_at)],
+          ["배정 슬롯", symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-"],
           [
-            "candidate weight",
+            "후보 가중치",
             String(symbol.ai_decision.candidate_weight ?? symbol.candidate_selection.candidate_weight ?? "-"),
           ],
-          ["capacity reason", symbol.ai_decision.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-"],
-          ["timeframe", symbol.ai_decision.timeframe ?? symbol.timeframe ?? "-"],
-          ["decision run id", String(symbol.ai_decision.decision_run_id ?? "-")],
+          ["슬롯 여유 사유", symbol.ai_decision.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-"],
+          ["타임프레임", symbol.ai_decision.timeframe ?? symbol.timeframe ?? "-"],
+          ["판단 실행 ID", String(symbol.ai_decision.decision_run_id ?? "-")],
         ])}
       </div>
 
@@ -1737,7 +1898,7 @@ function SymbolDetailPanel({
             "결정론적 리스크 엔진이 허용한 최대 레버리지",
           )}
           {valueCard(
-            "approved projected notional",
+            "승인 예상 노셔널",
             symbol.risk_guard.approved_projected_notional !== null
               ? formatNumber(symbol.risk_guard.approved_projected_notional, 2)
               : "-",
@@ -1747,10 +1908,10 @@ function SymbolDetailPanel({
                     ? formatRatio(symbol.risk_guard.size_adjustment_ratio)
                     : "-"
                 }`
-              : "리스크 승인 기준 최종 notional",
+              : "리스크 승인 기준 최종 노셔널",
           )}
           {valueCard(
-            "approved quantity",
+            "승인 수량",
             symbol.risk_guard.approved_quantity !== null
               ? formatNumber(symbol.risk_guard.approved_quantity, 6)
               : "-",
@@ -1762,12 +1923,12 @@ function SymbolDetailPanel({
             autoResized ? "리스크 여유 한도에 맞춰 신규 진입 크기를 자동 축소했습니다." : "원래 요청 크기가 그대로 승인되었습니다.",
           )}
           {valueCard(
-            "risk snapshot",
+            "리스크 스냅샷",
             symbol.risk_guard.snapshot_id !== null ? String(symbol.risk_guard.snapshot_id) : "-",
-            symbol.risk_guard.as_of ? `as of ${formatDateTime(symbol.risk_guard.as_of)}` : "현재 cycle risk 기준 시각",
+            symbol.risk_guard.as_of ? `기준 시각 ${formatDateTime(symbol.risk_guard.as_of)}` : "현재 cycle risk 기준 시각",
           )}
           {valueCard(
-            "headroom",
+            "노출 여유",
             symbol.risk_guard.exposure_headroom_snapshot.limiting_headroom_notional !== undefined
               ? formatNumber(symbol.risk_guard.exposure_headroom_snapshot.limiting_headroom_notional, 2)
               : "-",
@@ -1776,15 +1937,15 @@ function SymbolDetailPanel({
               : "가장 타이트한 노출도 여유 한도",
           )}
           {valueCard(
-            "assigned slot",
+            "배정 슬롯",
             symbol.risk_guard.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-",
-            `weight ${
+            `가중치 ${
               symbol.risk_guard.candidate_weight ?? symbol.candidate_selection.candidate_weight ?? "-"
             }`,
           )}
           {valueCard(
-            "slot soft cap",
-            symbol.risk_guard.portfolio_slot_soft_cap_applied ? "applied" : "not applied",
+            "슬롯 soft cap",
+            symbol.risk_guard.portfolio_slot_soft_cap_applied ? "적용" : "미적용",
             symbol.risk_guard.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-",
           )}
         </div>
@@ -1794,11 +1955,11 @@ function SymbolDetailPanel({
           </summary>
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
             {valueCard(
-              "raw projected notional",
+              "원본 예상 노셔널",
               symbol.risk_guard.raw_projected_notional !== null
                 ? formatNumber(symbol.risk_guard.raw_projected_notional, 2)
                 : "-",
-              "원래 계산된 신규 진입 예상 notional",
+              "원래 계산된 신규 진입 예상 노셔널",
             )}
             {valueCard(
               "축소 비율",
@@ -1902,43 +2063,47 @@ function SymbolDetailPanel({
               `${String(symbol.market_context_summary.volume_regime ?? "-")} / ${String(
                 symbol.market_context_summary.momentum_state ?? "-",
               )}`,
-              `weak_volume ${String(symbol.market_context_summary.weak_volume ?? false)}`,
+              `약한 거래량 ${String(symbol.market_context_summary.weak_volume ?? false)}`,
             )}
             {valueCard(
-              "심볼 readiness",
+              "심볼 준비 상태",
               symbol.live_execution_ready ? "가능" : "주의",
-              symbol.stale_flags.length === 0 ? "전역 readiness와 동기화 상태 기준" : symbol.stale_flags.join(", "),
+              symbol.stale_flags.length === 0
+                ? "전역 진입 가능성과 동기화 상태 기준"
+                : symbol.stale_flags.map(translateSyncScope).join(", "),
             )}
             {valueCard(
               "보호 주문 수",
               String(symbol.protection_status.protective_order_count),
-              `stop ${symbol.protection_status.has_stop_loss ? "있음" : "없음"} / tp ${
+              `손절 ${symbol.protection_status.has_stop_loss ? "있음" : "없음"} / 익절 ${
                 symbol.protection_status.has_take_profit ? "있음" : "없음"
               }`,
             )}
             {valueCard(
-              "protection recovery",
-              symbol.protection_status.recovery_status ?? "-",
+              "보호 복구 상태",
+              translateProtectionRecoveryStatus(symbol.protection_status.recovery_status),
               symbol.protection_status.auto_recovery_active
-                ? `auto recovery / failures ${symbol.protection_status.failure_count}`
-                : `failures ${symbol.protection_status.failure_count}`,
+                ? `자동 복구 중 / 실패 ${symbol.protection_status.failure_count}회`
+                : `실패 ${symbol.protection_status.failure_count}회`,
             )}
             {valueCard(
-              "protective verify",
-              symbol.protection_status.verification_status ?? (symbol.protection_status.protected ? "verified" : "-"),
+              "보호 주문 검증",
+              translateProtectionVerificationStatus(
+                symbol.protection_status.verification_status ?? (symbol.protection_status.protected ? "verified" : "-"),
+              ),
               symbol.protection_status.last_event_type
                 ? `${symbol.protection_status.last_event_type} / ${formatDateTime(symbol.protection_status.last_event_at)}`
-                : "최근 protection 이벤트 없음",
+                : "최근 보호 이벤트 없음",
             )}
             {valueCard(
-              "holding profile",
+              "보유 프로필",
               symbol.open_position.holding_profile ?? symbol.ai_decision.holding_profile ?? "-",
               symbol.open_position.holding_profile_reason ?? symbol.ai_decision.holding_profile_reason ?? "-",
             )}
             {valueCard(
-              "hard stop",
-              symbol.open_position.hard_stop_active ? "active" : "inactive",
-              symbol.open_position.stop_widening_allowed === false ? "stop widening forbidden" : "widening state unknown",
+              "하드 스톱",
+              symbol.open_position.hard_stop_active ? "활성" : "비활성",
+              symbol.open_position.stop_widening_allowed === false ? "손절 확대 금지" : "확대 가능 여부 미확정",
             )}
           </div>
           {symbol.protection_status.last_error ? (

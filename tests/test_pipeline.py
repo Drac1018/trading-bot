@@ -215,6 +215,11 @@ def _interval_review_plan(
     dedupe_reason: str | None = None,
     fingerprint_changed_fields: list[str] | None = None,
     forced_review_reason: str | None = None,
+    applied_review_cadence_minutes: int | None = 15,
+    review_cadence_source: str | None = "holding_profile_cadence_hint",
+    holding_profile_cadence_hint: dict[str, object] | None = None,
+    cadence_fallback_reason: str | None = None,
+    max_review_age_minutes: int | None = 45,
 ) -> dict[str, object]:
     now = utcnow_naive()
     trigger = (
@@ -233,6 +238,18 @@ def _interval_review_plan(
             "last_decision_at": None,
             "last_material_review_at": now.isoformat(),
             "forced_review_reason": forced_review_reason,
+            "applied_review_cadence_minutes": applied_review_cadence_minutes,
+            "review_cadence_source": review_cadence_source,
+            "holding_profile_cadence_hint": dict(
+                holding_profile_cadence_hint
+                or {"holding_profile": "scalp", "decision_interval_minutes": 15}
+            ),
+            "cadence_fallback_reason": cadence_fallback_reason,
+            "max_review_age_minutes": max_review_age_minutes,
+            "cadence_profile_summary": {
+                "mode": "watch",
+                "active_holding_profile": "scalp",
+            },
             "triggered_at": now.isoformat(),
         }
         if trigger_reason is not None
@@ -259,6 +276,18 @@ def _interval_review_plan(
                 "last_ai_invoked_at": None,
                 "last_material_review_at": now.isoformat(),
                 "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                "applied_review_cadence_minutes": applied_review_cadence_minutes,
+                "review_cadence_source": review_cadence_source,
+                "holding_profile_cadence_hint": dict(
+                    holding_profile_cadence_hint
+                    or {"holding_profile": "scalp", "decision_interval_minutes": 15}
+                ),
+                "cadence_fallback_reason": cadence_fallback_reason,
+                "max_review_age_minutes": max_review_age_minutes,
+                "cadence_profile_summary": {
+                    "mode": "watch",
+                    "active_holding_profile": "scalp",
+                },
                 "fingerprint_changed_fields": list(fingerprint_changed_fields or []),
                 "dedupe_reason": dedupe_reason,
                 "forced_review_reason": forced_review_reason,
@@ -2631,6 +2660,11 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
             MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70000.0, high=70070.0, low=69980.0, close=70030.0, volume=980.0),
             MarketCandle(timestamp=snapshot_time, open=70030.0, high=70090.0, low=70010.0, close=70060.0, volume=1020.0),
         ],
+        derivatives_context=DerivativesContextPayload(
+            source="binance_public",
+            spread_bps=2.0,
+            spread_stress_score=0.2,
+        ),
     )
     feature_payload = FeaturePayload(
         symbol="BTCUSDT",
@@ -2712,6 +2746,17 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
             capital_efficiency_sample_count=3,
             capital_efficiency_sample_threshold_satisfied=True,
             capital_efficiency_classification="efficient",
+            session_prior_available=True,
+            session_prior_sample_count=6,
+            session_sample_threshold_satisfied=True,
+            session_prior_classification="neutral",
+            session_prior_recency_minutes=135.0,
+            time_of_day_prior_available=True,
+            time_of_day_prior_sample_count=7,
+            time_of_day_sample_threshold_satisfied=True,
+            time_of_day_prior_classification="weak",
+            time_of_day_prior_recency_minutes=165.0,
+            session_time_calibration_reason_codes=["TIME_OF_DAY_PRIOR_STRONG_SAMPLE_EDGE"],
             prior_reason_codes=["ENGINE_PRIOR_STRONG"],
             prior_penalty_level="none",
             expected_payoff_efficiency_hint_summary={"time_to_0_25r_hint_minutes": 18.0},
@@ -2752,7 +2797,15 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
                 explanation_detailed="Manual review path keeps selection context for audit and risk plumbing.",
             ),
             "deterministic-mock",
-            {"source": "deterministic"},
+            {
+                "source": "deterministic",
+                "session_prior_sample_count": 6,
+                "time_of_day_prior_sample_count": 7,
+                "session_prior_recency_minutes": 135.0,
+                "time_of_day_prior_recency_minutes": 165.0,
+                "session_time_calibration_reason_codes": ["TIME_OF_DAY_PRIOR_STRONG_SAMPLE_EDGE"],
+                "session_time_penalty_applied": False,
+            },
         )
 
     orchestrator = TradingOrchestrator(db_session)
@@ -2796,13 +2849,26 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
     assert captured_ai_context["holding_profile"] == "scalp"
     assert captured_ai_context["hard_stop_active"] is True
     assert captured_ai_context["prior_context"]["engine_prior_classification"] == "strong"
+    assert captured_ai_context["prior_context"]["session_prior_recency_minutes"] == 135.0
+    assert captured_ai_context["prior_context"]["time_of_day_prior_recency_minutes"] == 165.0
+    assert captured_ai_context["prior_context"]["session_time_calibration_reason_codes"] == [
+        "TIME_OF_DAY_PRIOR_STRONG_SAMPLE_EDGE"
+    ]
     assert decision_row is not None
     assert decision_row.input_payload["ai_context"]["assigned_slot"] == "slot_1"
     assert decision_row.input_payload["ai_context"]["strategy_engine"] == "trend_pullback_engine"
     assert decision_row.input_payload["ai_context"]["prior_context"]["engine_prior_classification"] == "strong"
+    assert decision_row.input_payload["ai_context"]["prior_context"]["session_prior_sample_count"] == 6
+    assert decision_row.input_payload["ai_context"]["prior_context"]["time_of_day_prior_sample_count"] == 7
     assert decision_row.input_payload["ai_trigger"]["fingerprint_changed_fields"] == ["position_state_bucket"]
     assert decision_row.metadata_json["slot_allocation"]["assigned_slot"] == "slot_1"
     assert decision_row.metadata_json["ai_context"]["holding_profile"] == "scalp"
+    assert decision_row.metadata_json["session_prior_recency_minutes"] == 135.0
+    assert decision_row.metadata_json["time_of_day_prior_recency_minutes"] == 165.0
+    assert decision_row.metadata_json["session_time_calibration_reason_codes"] == [
+        "TIME_OF_DAY_PRIOR_STRONG_SAMPLE_EDGE"
+    ]
+    assert decision_row.metadata_json["session_time_penalty_applied"] is False
     assert decision_row.metadata_json["fingerprint_changed_fields"] == ["position_state_bucket"]
     assert decision_row.metadata_json["forced_review_reason"] == "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
     assert decision_row.metadata_json["last_material_review_at"] is not None
@@ -2812,6 +2878,193 @@ def test_direct_decision_path_keeps_slot_context(monkeypatch, db_session) -> Non
     assert result["last_ai_trigger_reason"] == "manual_review_event"
     assert result["fingerprint_changed_fields"] == ["position_state_bucket"]
     assert result["forced_review_reason"] == "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
+
+
+def test_manual_open_position_review_surfaces_cadence_metadata(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    snapshot_time = utcnow_naive()
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70000.0,
+        latest_volume=1000.0,
+        candle_count=3,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=2), open=69950.0, high=70040.0, low=69920.0, close=70000.0, volume=900.0),
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70000.0, high=70070.0, low=69980.0, close=70030.0, volume=980.0),
+            MarketCandle(timestamp=snapshot_time, open=70030.0, high=70090.0, low=70010.0, close=70060.0, volume=1020.0),
+        ],
+        derivatives_context=DerivativesContextPayload(
+            source="binance_public",
+            spread_bps=2.0,
+            spread_stress_score=0.2,
+        ),
+    )
+    feature_payload = FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=0.32,
+        volatility_pct=0.002,
+        volume_ratio=1.08,
+        drawdown_pct=0.001,
+        rsi=58.0,
+        atr=90.0,
+        atr_pct=0.0013,
+        momentum_score=0.18,
+        multi_timeframe={
+            "15m": TimeframeFeatureContext(
+                timeframe="15m",
+                trend_score=0.32,
+                volatility_pct=0.002,
+                volume_ratio=1.08,
+                drawdown_pct=0.001,
+                rsi=58.0,
+                atr=90.0,
+                atr_pct=0.0013,
+                momentum_score=0.18,
+            )
+        },
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime="normal",
+            momentum_state="strengthening",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        data_quality_flags=[],
+    )
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=70120.0,
+            leverage=2.0,
+            stop_loss=69400.0,
+            take_profit=71200.0,
+            metadata_json={
+                "position_management": {
+                    "holding_profile": "position",
+                    "holding_profile_reason": "manual_position_review",
+                    "hard_stop_active": True,
+                    "stop_widening_allowed": False,
+                }
+            },
+        )
+    )
+    db_session.flush()
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
+
+    class DummyGate:
+        allowed = True
+        reason = "allowed"
+
+        def as_metadata(self) -> dict[str, object]:
+            return {"allowed": True, "reason": "allowed"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: DummyGate())
+
+    def fake_build_ai_prior_context(*args, **kwargs):  # noqa: ANN002, ANN003
+        return AIPriorContextPacket(
+            engine_prior_available=True,
+            engine_prior_sample_count=3,
+            engine_sample_threshold_satisfied=True,
+            engine_prior_classification="strong",
+            capital_efficiency_available=True,
+            capital_efficiency_sample_count=3,
+            capital_efficiency_sample_threshold_satisfied=True,
+            capital_efficiency_classification="efficient",
+            prior_reason_codes=["ENGINE_PRIOR_STRONG"],
+            prior_penalty_level="none",
+            expected_payoff_efficiency_hint_summary={"time_to_0_25r_hint_minutes": 18.0},
+        )
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_ai_prior_context",
+        fake_build_ai_prior_context,
+    )
+
+    def fake_run(_market_snapshot, _feature_payload, _open_positions, _risk_context, *, use_ai, **kwargs):
+        return (
+            TradeDecision(
+                decision="hold",
+                confidence=0.44,
+                symbol="BTCUSDT",
+                timeframe="15m",
+                entry_zone_min=None,
+                entry_zone_max=None,
+                entry_mode="none",
+                invalidation_price=None,
+                max_chase_bps=None,
+                idea_ttl_minutes=None,
+                stop_loss=None,
+                take_profit=None,
+                max_holding_minutes=180,
+                risk_pct=0.01,
+                leverage=1.0,
+                rationale_codes=["MANUAL_POSITION_REVIEW"],
+                explanation_short="manual open-position review hold",
+                explanation_detailed="Manual open-position review keeps cadence metadata visible.",
+            ),
+            "deterministic-mock",
+            {"source": "deterministic"},
+        )
+
+    orchestrator = TradingOrchestrator(db_session)
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_run)
+
+    result = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+        review_trigger={
+            "trigger_reason": "manual_review_event",
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "strategy_engine": "trend_pullback_engine",
+            "holding_profile": "position",
+            "reason_codes": ["MANUAL_REVIEW"],
+            "trigger_fingerprint": "manual-position-trigger-1234",
+            "fingerprint_basis": {"position_state_bucket": "profit"},
+            "fingerprint_changed_fields": ["position_state_bucket"],
+            "last_decision_at": snapshot_time.isoformat(),
+            "last_material_review_at": snapshot_time.isoformat(),
+            "triggered_at": snapshot_time.isoformat(),
+        },
+    )
+    decision_row = db_session.get(AgentRun, result["decision_run_id"])
+
+    assert decision_row is not None
+    assert decision_row.input_payload["ai_trigger"]["applied_review_cadence_minutes"] == 30
+    assert decision_row.input_payload["ai_trigger"]["review_cadence_source"] == "holding_profile_cadence_hint"
+    assert decision_row.input_payload["ai_trigger"]["holding_profile_cadence_hint"]["decision_interval_minutes"] == 30
+    assert decision_row.metadata_json["applied_review_cadence_minutes"] == 30
+    assert decision_row.metadata_json["review_cadence_source"] == "holding_profile_cadence_hint"
+    assert decision_row.metadata_json["max_review_age_minutes"] == 90
+    assert result["applied_review_cadence_minutes"] == 30
+    assert result["review_cadence_source"] == "holding_profile_cadence_hint"
+    assert result["holding_profile_cadence_hint"]["holding_profile"] == "position"
+    assert result["max_review_age_minutes"] == 90
 
 
 def test_pipeline_persists_management_intent_semantics_for_protection_restore(monkeypatch, db_session) -> None:
@@ -2990,6 +3243,11 @@ def test_pipeline_persists_bounded_breakout_output_metadata(monkeypatch, db_sess
             MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70000.0, high=70070.0, low=69980.0, close=70030.0, volume=980.0),
             MarketCandle(timestamp=snapshot_time, open=70030.0, high=70090.0, low=70010.0, close=70060.0, volume=1020.0),
         ],
+        derivatives_context=DerivativesContextPayload(
+            source="binance_public",
+            spread_bps=2.0,
+            spread_stress_score=0.2,
+        ),
     )
     feature_payload = FeaturePayload(
         symbol="BTCUSDT",
@@ -3089,13 +3347,13 @@ def test_pipeline_persists_bounded_breakout_output_metadata(monkeypatch, db_sess
             engine_prior_available=True,
             engine_prior_sample_count=4,
             engine_sample_threshold_satisfied=True,
-            engine_prior_classification="weak",
+            engine_prior_classification="strong",
             capital_efficiency_available=True,
             capital_efficiency_sample_count=4,
             capital_efficiency_sample_threshold_satisfied=True,
-            capital_efficiency_classification="inefficient",
-            prior_reason_codes=["ENGINE_PRIOR_WEAK", "CAPITAL_EFFICIENCY_INEFFICIENT"],
-            prior_penalty_level="strong",
+            capital_efficiency_classification="efficient",
+            prior_reason_codes=["ENGINE_PRIOR_STRONG", "CAPITAL_EFFICIENCY_EFFICIENT"],
+            prior_penalty_level="none",
             expected_payoff_efficiency_hint_summary={"time_to_fail_hint_minutes": 22.0},
         ),
     )
@@ -3122,9 +3380,126 @@ def test_pipeline_persists_bounded_breakout_output_metadata(monkeypatch, db_sess
     assert decision_row.metadata_json["bounded_output_applied"] is True
     assert "INVALID_HOLDING_PROFILE_FOR_ENGINE" in decision_row.metadata_json["fallback_reason_codes"]
     assert decision_row.metadata_json["provider_status"] == "ok"
-    assert decision_row.metadata_json["engine_prior_classification"] == "weak"
-    assert decision_row.metadata_json["capital_efficiency_classification"] == "inefficient"
-    assert decision_row.metadata_json["prior_penalty_level"] == "strong"
+    assert decision_row.metadata_json["engine_prior_classification"] == "strong"
+    assert decision_row.metadata_json["capital_efficiency_classification"] == "efficient"
+    assert decision_row.metadata_json["prior_penalty_level"] == "none"
+
+
+def test_pipeline_persists_quality_fail_closed_metadata_when_provider_not_called(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    snapshot_time = utcnow_naive()
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70000.0,
+        latest_volume=1000.0,
+        candle_count=3,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=2), open=69950.0, high=70040.0, low=69920.0, close=70000.0, volume=900.0),
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70000.0, high=70070.0, low=69980.0, close=70030.0, volume=980.0),
+            MarketCandle(timestamp=snapshot_time, open=70030.0, high=70090.0, low=70010.0, close=70060.0, volume=1020.0),
+        ],
+    )
+    feature_payload = FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=0.32,
+        volatility_pct=0.002,
+        volume_ratio=1.08,
+        drawdown_pct=0.001,
+        rsi=58.0,
+        atr=90.0,
+        atr_pct=0.0013,
+        momentum_score=0.18,
+        multi_timeframe={
+            "15m": TimeframeFeatureContext(
+                timeframe="15m",
+                trend_score=0.32,
+                volatility_pct=0.002,
+                volume_ratio=1.08,
+                drawdown_pct=0.001,
+                rsi=58.0,
+                atr=90.0,
+                atr_pct=0.0013,
+                momentum_score=0.18,
+            )
+        },
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime="normal",
+            momentum_state="strengthening",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        data_quality_flags=["STALE_MARKET_DATA"],
+    )
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": ["BTCUSDT"],
+            "skipped_symbols": [],
+            "rankings": [_ranking_candidate_payload(symbol="BTCUSDT", strategy_engine="breakout_exception_engine")],
+        },
+    )
+    monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
+
+    class DummyGate:
+        allowed = True
+        reason = "allowed"
+
+        def as_metadata(self) -> dict[str, object]:
+            return {"allowed": True, "reason": "allowed"}
+
+    class ShouldNotRunProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            raise AssertionError("provider should not be called when degraded breakout quality is blocked")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: DummyGate())
+    orchestrator = TradingOrchestrator(db_session)
+    orchestrator.trading_agent = TradingDecisionAgent(ShouldNotRunProvider())
+
+    result = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+    )
+    decision_row = db_session.get(AgentRun, result["decision_run_id"])
+
+    assert decision_row is not None
+    assert decision_row.output_payload["decision"] == "hold"
+    assert decision_row.output_payload["data_quality_fail_closed_applied"] is True
+    assert decision_row.output_payload["provider_not_called_due_to_quality"] is True
+    assert "BREAKOUT_QUALITY_INSUFFICIENT" in decision_row.output_payload["data_quality_block_reason_codes"]
+    assert decision_row.metadata_json["provider_status"] == "quality_blocked"
+    assert decision_row.metadata_json["data_quality_fail_closed_applied"] is True
+    assert decision_row.metadata_json["provider_not_called_due_to_quality"] is True
+    assert "BREAKOUT_QUALITY_INSUFFICIENT" in decision_row.metadata_json["data_quality_block_reason_codes"]
 
 
 def test_scheduler_market_refresh_cycle_runs_without_ai_or_new_entry(monkeypatch, db_session) -> None:

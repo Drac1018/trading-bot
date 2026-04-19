@@ -73,7 +73,18 @@ def _ai_context(
     trigger_type: str,
     strategy_engine: str,
     holding_profile: str = "scalp",
+    data_quality_grade: str = "complete",
+    missing_context_flags: list[str] | None = None,
+    stale_context_flags: list[str] | None = None,
+    derivatives_available: bool | None = None,
+    orderbook_available: bool | None = None,
+    spread_quality_available: bool | None = None,
 ) -> AIDecisionContextPacket:
+    resolved_derivatives_available = derivatives_available if derivatives_available is not None else data_quality_grade != "unavailable"
+    resolved_orderbook_available = orderbook_available if orderbook_available is not None else data_quality_grade in {"complete", "partial"}
+    resolved_spread_quality_available = (
+        spread_quality_available if spread_quality_available is not None else data_quality_grade != "unavailable"
+    )
     return AIDecisionContextPacket(
         symbol="BTCUSDT",
         timeframe="15m",
@@ -91,14 +102,14 @@ def _ai_context(
             regime_reason_codes=["TEST_REGIME"],
         ),
         data_quality=DataQualityPacket(
-            data_quality_grade="complete",
-            missing_context_flags=[],
-            stale_context_flags=[],
-            derivatives_available=True,
-            orderbook_available=True,
-            spread_quality_available=True,
-            account_state_trustworthy=True,
-            market_state_trustworthy=True,
+            data_quality_grade=data_quality_grade,  # type: ignore[arg-type]
+            missing_context_flags=list(missing_context_flags or []),
+            stale_context_flags=list(stale_context_flags or []),
+            derivatives_available=resolved_derivatives_available,
+            orderbook_available=resolved_orderbook_available,
+            spread_quality_available=resolved_spread_quality_available,
+            account_state_trustworthy=data_quality_grade != "unavailable",
+            market_state_trustworthy=data_quality_grade != "unavailable",
         ),
         previous_thesis=PreviousThesisDeltaPacket(),
         strategy_engine=strategy_engine,
@@ -152,6 +163,96 @@ def test_entry_path_provider_timeout_fail_closed() -> None:
     assert "AI_UNAVAILABLE_FAIL_CLOSED" in decision.fallback_reason_codes
     assert metadata["fail_closed_applied"] is True
     assert metadata["provider_status"] == "timeout"
+
+
+def test_unavailable_quality_entry_fail_closed_without_provider_call() -> None:
+    class ShouldNotRunProvider:
+        name = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            self.calls += 1
+            raise AssertionError("provider should not be called when quality is unavailable")
+
+    snapshot, features = _features()
+    provider = ShouldNotRunProvider()
+    agent = TradingDecisionAgent(provider)
+
+    decision, provider_name, metadata = agent.run(
+        snapshot,
+        features,
+        [],
+        _risk_context(),
+        use_ai=True,
+        max_input_candles=16,
+        ai_context=_ai_context(
+            trigger_type="entry_candidate_event",
+            strategy_engine="trend_pullback_engine",
+            data_quality_grade="unavailable",
+            missing_context_flags=["orderbook_context_unavailable"],
+            stale_context_flags=["market_snapshot_stale"],
+            derivatives_available=False,
+            orderbook_available=False,
+            spread_quality_available=False,
+        ),
+    )
+
+    assert provider.calls == 0
+    assert provider_name == "deterministic-mock"
+    assert decision.decision == "hold"
+    assert decision.fail_closed_applied is True
+    assert decision.data_quality_fail_closed_applied is True
+    assert decision.provider_not_called_due_to_quality is True
+    assert decision.provider_status == "quality_blocked"
+    assert "DATA_QUALITY_UNAVAILABLE_FAIL_CLOSED" in decision.fallback_reason_codes
+    assert "DATA_QUALITY_UNAVAILABLE_FAIL_CLOSED" in decision.data_quality_block_reason_codes
+    assert metadata["provider_not_called_due_to_quality"] is True
+    assert metadata["data_quality_fail_closed_applied"] is True
+    assert metadata["provider_status"] == "quality_blocked"
+
+
+def test_degraded_breakout_quality_fail_closed_without_provider_call() -> None:
+    class ShouldNotRunProvider:
+        name = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            self.calls += 1
+            raise AssertionError("provider should not be called for degraded breakout entry review")
+
+    snapshot, features = _features()
+    provider = ShouldNotRunProvider()
+    agent = TradingDecisionAgent(provider)
+
+    decision, provider_name, metadata = agent.run(
+        snapshot,
+        features,
+        [],
+        _risk_context(),
+        use_ai=True,
+        max_input_candles=16,
+        ai_context=_ai_context(
+            trigger_type="breakout_exception_event",
+            strategy_engine="breakout_exception_engine",
+            data_quality_grade="degraded",
+            stale_context_flags=["market_snapshot_stale"],
+        ),
+    )
+
+    assert provider.calls == 0
+    assert provider_name == "deterministic-mock"
+    assert decision.decision == "hold"
+    assert decision.fail_closed_applied is True
+    assert decision.should_abstain is True
+    assert decision.provider_status == "quality_blocked"
+    assert "BREAKOUT_QUALITY_INSUFFICIENT" in decision.data_quality_block_reason_codes
+    assert metadata["data_quality_fail_closed_applied"] is True
+    assert metadata["provider_not_called_due_to_quality"] is True
+    assert metadata["minimum_quality_required"] == "partial_or_better_with_breakout_context"
 
 
 def test_malformed_output_fail_closed() -> None:
@@ -213,12 +314,22 @@ def test_protection_review_provider_failure_keeps_deterministic_management() -> 
         _risk_context(state="PROTECTION_REQUIRED"),
         use_ai=True,
         max_input_candles=16,
-        ai_context=_ai_context(trigger_type="protection_review_event", strategy_engine="protection_reduce_engine"),
+        ai_context=_ai_context(
+            trigger_type="protection_review_event",
+            strategy_engine="protection_reduce_engine",
+            data_quality_grade="unavailable",
+            missing_context_flags=["orderbook_context_unavailable"],
+            stale_context_flags=["market_snapshot_stale"],
+            derivatives_available=False,
+            orderbook_available=False,
+            spread_quality_available=False,
+        ),
     )
 
     assert provider_name == "deterministic-mock"
     assert decision.decision == "long"
     assert decision.fail_closed_applied is False
     assert decision.provider_status == "timeout"
+    assert decision.provider_not_called_due_to_quality is False
     assert metadata["fail_closed_applied"] is False
     assert metadata["provider_status"] == "timeout"

@@ -213,6 +213,7 @@ def test_build_strategy_engine_bucket_report_aggregates_engine_buckets(db_sessio
     assert pullback_bucket.average_time_to_profit_minutes == pytest.approx(21.0, rel=1e-6)
     assert pullback_bucket.average_drawdown_impact == pytest.approx(0.25, rel=1e-6)
     assert pullback_bucket.classification == "strong"
+    assert pullback_bucket.latest_decision_at is not None
 
 
 def test_build_strategy_engine_bucket_report_marks_weak_engine_buckets(db_session) -> None:

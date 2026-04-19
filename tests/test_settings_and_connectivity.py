@@ -78,7 +78,6 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         time_stop_profit_floor=0.2,
         holding_edge_decay_enabled=True,
         reduce_on_regime_shift_enabled=True,
-        starting_equity=100000.0,
         ai_enabled=True,
         ai_provider="openai",
         ai_model="gpt-4.1-mini",
@@ -130,9 +129,25 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["operational_status"]["live_execution_ready"] == serialized["live_execution_ready"]
     assert serialized["operational_status"]["rollout_mode"] == "full_live"
     assert serialized["operational_status"]["approval_armed"] == serialized["approval_armed"]
-    assert serialized["estimated_monthly_ai_calls_breakdown"]["trading_decision"] == 5760
     assert serialized["symbol_effective_cadences"][0]["symbol"] == "BTCUSDT"
-    assert serialized["symbol_effective_cadences"][0]["estimated_monthly_ai_calls"] == 4320
+    assert "estimated_monthly_ai_calls" not in serialized
+    assert "estimated_monthly_ai_calls" not in serialized["symbol_effective_cadences"][0]
+    assert "starting_equity" not in serialized
+
+
+def test_serialize_settings_reports_unknown_live_snapshot_without_synthetic_equity(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    serialized = serialize_settings(row)
+
+    assert "starting_equity" not in serialized
+    assert serialized["pnl_summary"]["account_snapshot_available"] is False
+    assert serialized["pnl_summary"]["basis"] == "live_account_snapshot_unavailable"
+    assert serialized["pnl_summary"]["equity"] is None
+    assert serialized["pnl_summary"]["wallet_balance"] is None
+    assert serialized["account_sync_summary"]["account_snapshot_available"] is False
+    assert serialized["account_sync_summary"]["status"] == "unknown"
+    assert serialized["account_sync_summary"]["equity"] is None
 
 
 def test_serialize_settings_exposes_rollout_mode_and_submit_gate(db_session) -> None:
@@ -328,9 +343,7 @@ def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
     assert serialized["recent_ai_failures_24h"] == 1
     assert serialized["recent_ai_tokens_24h"]["total_tokens"] == 120
     assert serialized["recent_ai_role_calls_7d"]["chief_review"] == 1
-    assert "integration_planner" not in serialized["estimated_monthly_ai_calls_breakdown"]
-    assert "ui_ux" not in serialized["estimated_monthly_ai_calls_breakdown"]
-    assert serialized["estimated_monthly_ai_calls_breakdown"]["chief_review"] > 0
+    assert "estimated_monthly_ai_calls_breakdown" not in serialized
     assert "BAD_REQUEST x1" in serialized["recent_ai_failure_reasons"]
     assert serialized["observed_monthly_ai_calls_projection"] == 60
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -22,6 +22,7 @@ class _EngineBucketAccumulator:
     signed_slippages: list[float] = field(default_factory=list)
     time_to_profit_minutes: list[float] = field(default_factory=list)
     drawdown_impacts: list[float] = field(default_factory=list)
+    latest_decision_at: datetime | None = None
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -256,6 +257,8 @@ def build_strategy_engine_bucket_report(
         )
         accumulator = accumulators[bucket_key]
         accumulator.decisions += 1
+        if accumulator.latest_decision_at is None or decision_row.created_at > accumulator.latest_decision_at:
+            accumulator.latest_decision_at = decision_row.created_at
         bucket_context[bucket_key] = {
             "strategy_engine": strategy_engine,
             "symbol": symbol,
@@ -356,6 +359,7 @@ def build_strategy_engine_bucket_report(
                 efficiency_score=efficiency_score,
                 classification=classification,
                 reasons=reasons,
+                latest_decision_at=accumulator.latest_decision_at,
             )
         )
     bucket_reports.sort(key=lambda item: (item.classification != "strong", -item.efficiency_score, -item.net_pnl_after_fees))

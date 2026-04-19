@@ -10,6 +10,11 @@
   - strong prior는 confidence를 소폭 올릴 수 있음
   - weak prior + poor quality는 `hold` / `should_abstain=true`로 더 쉽게 기울 수 있음
   - `breakout_exception`, `swing`, `position` 문맥은 quality/prior 요구가 더 엄격함
+- session/time prior는 아래 조건이면 `strong`에서 `neutral`로 보수화될 수 있음:
+  - stale bucket recency
+  - threshold edge sample count
+  - diluted bucket concentration
+- weak session/time prior alone은 light penalty only이며, degraded/unavailable quality와 겹칠 때만 추가 confidence penalty 또는 abstain bias가 붙음
 - The decision schema adds optional rationale, invalidation, abstain, regime-risk, and payoff-timing metadata, but the execution path still honors the same post-decision flow:
   - schema validation
   - `risk.py` final gate
@@ -43,7 +48,12 @@
   - breakout-exception holding profile upgrades are bounded back to `scalp`
   - loser profile upgrades and stop widening attempts are bounded before risk review
 - On new-entry-capable routes, provider timeout / unavailable / malformed / schema-invalid output is fail-closed into `hold`.
+- On new-entry-capable routes, data quality can also block before provider invocation:
+  - `unavailable` quality => fail-closed `hold`
+  - degraded breakout review => fail-closed `hold`
+  - degraded/unavailable long-horizon entry proposal => bounded to `hold` with abstain metadata
 - On protection/reduce/emergency-style routes, provider failure falls back to deterministic management behavior and does not block survival handling.
+- Protection/reduce/exit/emergency/recovery survival paths are not blocked by these data-quality entry rules.
 - Historical priors do not block survival handling. `reduce`, `exit`, protection recovery, and other deterministic management paths ignore prior penalties for execution purposes.
 - `risk.py` still receives only the normalized decision. `execution.py` still receives only intents approved by `risk.py`.
 - Historical analytics / prior builders now exclude non-entry intent rows from entry stats so management/protection behavior does not contaminate entry expectancy or payoff timing.
@@ -77,6 +87,13 @@
 - Direct `run_decision_cycle()` calls now rebuild an effective `selection_context` / slot summary for AI context and audit metadata when the caller did not provide one.
 - This keeps direct/manual decision runs aligned with the ranked scheduler path for slot, capacity, and trigger metadata, even when the underlying deterministic decision path is reviewing an open position.
 - Hard exposure blocks still win over slot soft caps. Slot allocation remains a soft sizing layer and does not override hard blockers.
+
+## 2026-04 Strategy Engine Interpretation
+
+- For an operator-readable summary of each engine's allowed narrative, holding-profile bias, and trigger relationship, see:
+  - `docs/strategy-engine-rule-surface.md`
+- This document should be read as a flow reference.
+- The rule-surface document should be read as an engine interpretation reference.
 
 ## Holding Profile Overlay
 

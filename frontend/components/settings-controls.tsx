@@ -41,7 +41,6 @@ type SymbolEffectiveCadence = {
   position_management_interval_seconds: number;
   decision_cycle_interval_minutes: number;
   ai_call_interval_minutes: number;
-  estimated_monthly_ai_calls: number;
   last_market_refresh_at: string | null;
   last_position_management_at: string | null;
   last_decision_at: string | null;
@@ -145,7 +144,6 @@ export type SettingsPayload = {
   partial_take_profit_enabled: boolean;
   holding_edge_decay_enabled: boolean;
   reduce_on_regime_shift_enabled: boolean;
-  starting_equity: number;
   ai_enabled: boolean;
   ai_provider: "openai" | "mock";
   ai_model: string;
@@ -159,10 +157,6 @@ export type SettingsPayload = {
   openai_api_key_configured: boolean;
   binance_api_key_configured: boolean;
   binance_api_secret_configured: boolean;
-  estimated_monthly_ai_calls: number;
-  estimated_monthly_ai_calls_breakdown: Record<string, number>;
-  projected_monthly_ai_calls_if_enabled: number;
-  projected_monthly_ai_calls_breakdown_if_enabled: Record<string, number>;
   recent_ai_calls_24h: number;
   recent_ai_calls_7d: number;
   recent_ai_successes_24h: number;
@@ -205,9 +199,8 @@ type FormState = Omit<
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
   | "pause_recovery_class" | "control_status_summary" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
-  | "estimated_monthly_ai_calls" | "estimated_monthly_ai_calls_breakdown" | "projected_monthly_ai_calls_if_enabled"
-  | "projected_monthly_ai_calls_breakdown_if_enabled" | "recent_ai_calls_24h" | "recent_ai_calls_7d" | "recent_ai_successes_24h"
-  | "recent_ai_successes_7d" | "recent_ai_failures_24h" | "recent_ai_failures_7d" | "recent_ai_tokens_24h"
+  | "recent_ai_calls_24h" | "recent_ai_calls_7d" | "recent_ai_successes_24h" | "recent_ai_successes_7d"
+  | "recent_ai_failures_24h" | "recent_ai_failures_7d" | "recent_ai_tokens_24h"
   | "recent_ai_tokens_7d" | "recent_ai_role_calls_24h" | "recent_ai_role_calls_7d" | "recent_ai_role_failures_24h"
   | "recent_ai_role_failures_7d" | "recent_ai_failure_reasons" | "observed_monthly_ai_calls_projection"
   | "observed_monthly_ai_calls_projection_breakdown" | "manual_ai_guard_minutes"
@@ -284,7 +277,6 @@ function toFormState(initial: SettingsPayload): FormState {
     partial_take_profit_enabled: initial.partial_take_profit_enabled,
     holding_edge_decay_enabled: initial.holding_edge_decay_enabled,
     reduce_on_regime_shift_enabled: initial.reduce_on_regime_shift_enabled,
-    starting_equity: initial.starting_equity,
     ai_enabled: initial.ai_enabled,
     ai_provider: initial.ai_provider,
     ai_model: initial.ai_model,
@@ -684,16 +676,16 @@ function SymbolCadenceOverridePanel({
                     </div>
                     <div className="grid gap-3 lg:grid-cols-2">
                       <div className="rounded-2xl bg-white px-4 py-3">
-                        <p className="text-xs text-slate-500">월간 AI 예상 / 마지막 AI 판단</p>
-                        <p className="mt-2 text-sm font-semibold text-slate-900">{effective.estimated_monthly_ai_calls.toLocaleString("ko-KR")}회</p>
-                        <p className="mt-1 break-all text-sm text-slate-700">{formatDisplayValue(effective.last_ai_decision_at, "last_ai_decision_at")}</p>
+                        <p className="text-xs text-slate-500">마지막 AI 판단 / 다음 AI due</p>
+                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">{formatDisplayValue(effective.last_ai_decision_at, "last_ai_decision_at")}</p>
+                        <p className="mt-1 break-all text-sm text-slate-700">{formatDisplayValue(effective.next_ai_call_due_at, "next_ai_call_due_at")}</p>
                       </div>
                       <div className="rounded-2xl bg-white px-4 py-3">
                         <p className="text-xs text-slate-500">최근 실행 / 다음 due</p>
                         <p className="mt-2 break-all text-sm text-slate-700">시장 갱신 {formatDisplayValue(effective.last_market_refresh_at, "last_market_refresh_at")}</p>
                         <p className="mt-1 break-all text-sm text-slate-700">포지션 관리 {formatDisplayValue(effective.last_position_management_at, "last_position_management_at")}</p>
                         <p className="mt-1 break-all text-sm text-slate-700">신규 판단 {formatDisplayValue(effective.last_decision_at, "last_decision_at")}</p>
-                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">다음 AI {formatDisplayValue(effective.next_ai_call_due_at, "next_ai_call_due_at")}</p>
+                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">다음 신규 판단 {formatDisplayValue(effective.next_decision_due_at, "next_decision_due_at")}</p>
                       </div>
                     </div>
                   </div>
@@ -904,7 +896,6 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     partial_take_profit_enabled: form.partial_take_profit_enabled,
     holding_edge_decay_enabled: form.holding_edge_decay_enabled,
     reduce_on_regime_shift_enabled: form.reduce_on_regime_shift_enabled,
-    starting_equity: form.starting_equity,
     ai_enabled: form.ai_enabled,
     ai_provider: form.ai_provider,
     ai_model: form.ai_model,
@@ -965,9 +956,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="기본 심볼" value={form.default_symbol} tone="dark" />
-        <MetricCard label="기본 타임프레임" value={form.default_timeframe} />
-        <MetricCard label="현재 월간 AI 호출" value={`${state.estimated_monthly_ai_calls.toLocaleString("ko-KR")}회`} tone="warm" />
-        <MetricCard label="AI 활성화 예상" value={`${state.projected_monthly_ai_calls_if_enabled.toLocaleString("ko-KR")}회`} />
+        <MetricCard label="기본 시장 타임프레임" value={form.default_timeframe} />
+        <MetricCard label="관측 월간 AI 환산" value={`${state.observed_monthly_ai_calls_projection.toLocaleString("ko-KR")}회`} tone="warm" />
+        <MetricCard label="최근 24시간 AI 호출" value={`${state.recent_ai_calls_24h.toLocaleString("ko-KR")}회`} />
       </div>
 
       {showOneWayRequiredBanner ? (
@@ -1068,7 +1059,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">시장 / 리스크</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            심볼 구성, 기본 타임프레임, 손실 한도와 같은 전역 입력 기준을 이 영역에서 관리합니다.
+            심볼 구성, 기본 시장 타임프레임, 손실 한도와 같은 전역 입력 기준을 이 영역에서 관리합니다.
           </p>
           <div className="mt-4 space-y-4">
             <Field label="기본 심볼">
@@ -1117,7 +1108,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             </div>
 
             <div className="grid gap-4 md:grid-cols-2">
-              <Field label="기본 타임프레임">
+              <Field label="기본 시장 타임프레임" hint="AI 호출 주기가 아니라 캔들/시장 기준 타임프레임입니다.">
                 <input className={inputClass} value={form.default_timeframe} onChange={(event) => updateField("default_timeframe", event.target.value)} />
               </Field>
               <Field label="최대 레버리지" hint="런타임 하드 상한은 5x로 유지됩니다.">
@@ -1138,9 +1129,6 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               <Field label="슬리피지 임계값">
                 <input className={inputClass} type="number" min={0.0001} max={0.1} step="0.0001" value={form.slippage_threshold_pct} onChange={(event) => updateField("slippage_threshold_pct", Number(event.target.value))} />
               </Field>
-              <Field label="시작 자본">
-                <input className={inputClass} type="number" min={1} value={form.starting_equity} onChange={(event) => updateField("starting_equity", Number(event.target.value))} />
-              </Field>
             </div>
           </div>
         </div>
@@ -1149,7 +1137,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">운영 주기 기본값</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            거래소 동기화, 시장 갱신, 포지션 관리, 신규 판단, AI 최소 호출 간격의 전역 기본값을 분리해 관리합니다.
+            거래소 동기화, 시장 갱신, 포지션 관리, 신규 판단, AI 최소 호출 간격의 전역 기본값을 분리해 관리합니다. AI 자체는 고정 15분 주기가 아니라 이벤트 기반 + periodic backstop으로 호출됩니다.
           </p>
           <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">운영 원칙</p>

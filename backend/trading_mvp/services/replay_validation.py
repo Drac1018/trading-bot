@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
-import json
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import create_engine, select
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from trading_mvp.database import Base
 from trading_mvp.models import AgentRun, Execution, Order, Position, RiskCheck, Setting
 from trading_mvp.schemas import (
+    MarketCandle,
     MarketSnapshotPayload,
     ReplayBreakdownEntry,
     ReplayComparisonEntry,
@@ -23,13 +25,20 @@ from trading_mvp.schemas import (
     RiskCheckResult,
     TradeDecision,
 )
-from trading_mvp.services.account import calculate_unrealized_pnl, create_exchange_pnl_snapshot, get_latest_pnl_snapshot
+from trading_mvp.services.account import (
+    calculate_unrealized_pnl,
+    create_exchange_pnl_snapshot,
+    get_latest_pnl_snapshot,
+)
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.execution import _reduce_fraction_for_decision, build_execution_intent
 from trading_mvp.services.execution_policy import select_execution_plan
 from trading_mvp.services.market_data import generate_seed_candles
 from trading_mvp.services.orchestrator import TradingOrchestrator
-from trading_mvp.services.position_management import mark_partial_take_profit_taken, seed_position_management_metadata
+from trading_mvp.services.position_management import (
+    mark_partial_take_profit_taken,
+    seed_position_management_metadata,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 REPLAY_FEE_RATE = 0.0004
@@ -701,7 +710,7 @@ def _record_equity_point(session: Session, settings_row: Setting, variant_state:
     for execution in session.scalars(select(Execution)):
         net_realized += float(execution.realized_pnl) - float(execution.fee_paid)
     unrealized = sum(float(position.unrealized_pnl) for position in session.scalars(select(Position).where(Position.status == "open")))
-    variant_state.equity_points.append(round(float(settings_row.starting_equity) + net_realized + unrealized, 8))
+    variant_state.equity_points.append(round(net_realized + unrealized, 8))
 
 
 def _accumulate_decision(bucket: ReplayAccumulator, record: ReplayDecisionRecord) -> None:
@@ -981,7 +990,7 @@ def _summarize_metrics(
     expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
     equity_series = equity_points if equity_points else []
     cumulative = 0.0
-    peak = equity_series[0] if equity_series else 0.0
+    peak = 0.0
     max_drawdown = 0.0
     if equity_series:
         for equity in equity_series:

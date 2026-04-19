@@ -1,5 +1,15 @@
 # Architecture
 
+## 2026-04 Live Snapshot Availability
+
+- `starting_equity`는 더 이상 live fallback, settings model/config, replay baseline에 사용되지 않습니다.
+- 첫 Binance account sync 전에는 synthetic balance/equity를 만들지 않고 `unknown` 상태를 유지합니다.
+- `pnl_summary`와 `account_sync_summary`는 둘 다 `account_snapshot_available`를 내려주며:
+  - `false`면 실계좌 잔고/자산은 아직 신뢰 가능한 snapshot이 없다는 뜻입니다.
+  - `true`면 최신 Binance account snapshot 기준 balance/equity를 반영하고 있다는 뜻입니다.
+- operator/dashboard는 이 상태를 직접 표시하고, exposure summary는 snapshot이 없을 때 `unknown`으로 남습니다.
+- replay validation equity curve는 이제 순손익 0-baseline series로 계산되며, historical drawdown은 synthetic starting balance 없이 집계됩니다.
+
 ## 2026-04 AI Context Builder
 
 - `backend/trading_mvp/services/ai_context.py` builds one common AI input packet before provider invocation.
@@ -27,6 +37,11 @@
   - it can reduce confidence
   - it can bias AI toward `hold` / `should_abstain=true`
   - it can downgrade aggressive holding-profile recommendations back toward `scalp`
+- Session/time priors are additionally calibrated by:
+  - bucket recency
+  - threshold-edge sample size
+  - bucket concentration versus engine sample count
+- Weak session/time prior alone remains light-only. It becomes more conservative only when combined with degraded/unavailable data quality.
 - It does not create a new hard blocker, and it does not weaken `risk.py` or `execution.py`.
 
 ## 2026-04 Management Intent Semantics
@@ -58,6 +73,16 @@
 - `protection_review_event` and other survival-path contexts stay management-only. AI may advise, but provider failure does not block deterministic protection or reduction handling.
 - `breakout_exception_engine` remains scalp-only. The routing layer explicitly prevents swing/position promotion from that family.
 - `risk.py` and `execution.py` remain unchanged as the final deterministic approval and execution boundary.
+
+## 2026-04 Strategy Engine Rule Surface
+
+- Operator-facing engine heuristics are summarized in `docs/strategy-engine-rule-surface.md`.
+- That document is descriptive, not normative:
+  - it explains the current selection / routing surface
+  - it does not redefine risk or execution semantics
+- The key split remains:
+  - entry engines: `trend_pullback`, `trend_continuation`, `range_mean_reversion`, `breakout_exception`
+  - management engine: `protection_reduce`
 
 ## 2026-04 Hybrid AI Review Trigger Model
 
@@ -99,7 +124,14 @@
   - `forced_review_reason`
 - `trigger_fingerprint` is used for debounce/dedupe. If the same symbol repeats with the same materially equivalent trigger fingerprint, the scheduler records a deduped skip instead of reinvoking AI.
 - `open_position_recheck_due` uses a dedicated bucketed fingerprint basis: `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
+- Entry-capable AI routes consume `data_quality` as an AI-layer safety gate before `risk.py`:
+  - unavailable quality fail-closes new entry reviews
+  - degraded breakout reviews fail-close before provider invocation
+  - degraded/unavailable long-horizon entry proposals are bounded back to `hold`
+- Survival paths remain deterministic and are not blocked by these quality gates.
 - The open-position fingerprint intentionally avoids raw noisy values. Material bucket changes reopen AI review; same-basis repeats are deduped.
+- The scheduler due gate now uses the resolved open-position review cadence directly instead of relying only on symbol-level interval cadence. This keeps `scalp / swing / position` cadence hints aligned with the actual revisit timing for `open_position_recheck_due`.
+- Review cadence observability is explicit: `applied_review_cadence_minutes`, `review_cadence_source`, `holding_profile_cadence_hint`, `cadence_fallback_reason`, and `max_review_age_minutes` are persisted alongside trigger metadata.
 - A stable fingerprint is not allowed to suppress review forever. Once the max review age is exceeded, the scheduler sets `forced_review_reason=OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED` and allows the review to proceed even if the fingerprint is unchanged.
 - The forced-review ceiling is conservative and bounded by cadence: `min(backstop interval, 3x position review cadence)`.
 - `protection_review_event` is dedupe-exempt so protection/emergency style survival paths are not delayed by unchanged fingerprints.

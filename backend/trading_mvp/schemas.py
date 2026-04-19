@@ -73,10 +73,22 @@ class TradeDecision(StrictBaseModel):
     fallback_reason_codes: list[str] = Field(default_factory=list)
     fail_closed_applied: bool = False
     provider_status: str | None = None
+    data_quality_fail_closed_applied: bool = False
+    data_quality_block_reason_codes: list[str] = Field(default_factory=list)
+    minimum_quality_required: str | None = None
+    abstain_due_to_data_quality: bool = False
+    quality_penalty_level: PriorPenaltyLevel = "none"
+    provider_not_called_due_to_quality: bool = False
     engine_prior_classification: PriorClassification | None = None
     capital_efficiency_classification: CapitalEfficiencyClassification | None = None
     session_prior_classification: PriorClassification | None = None
     time_of_day_prior_classification: PriorClassification | None = None
+    session_prior_sample_count: int | None = None
+    time_of_day_prior_sample_count: int | None = None
+    session_prior_recency_minutes: float | None = None
+    time_of_day_prior_recency_minutes: float | None = None
+    session_time_calibration_reason_codes: list[str] = Field(default_factory=list)
+    session_time_penalty_applied: bool = False
     prior_penalty_level: PriorPenaltyLevel = "none"
     prior_reason_codes: list[str] = Field(default_factory=list)
     sample_threshold_satisfied: dict[str, bool] = Field(default_factory=dict)
@@ -189,6 +201,12 @@ class AIReviewTriggerPayload(StrictBaseModel):
     last_decision_at: datetime | None = None
     last_material_review_at: datetime | None = None
     forced_review_reason: str | None = None
+    applied_review_cadence_minutes: int | None = None
+    review_cadence_source: str | None = None
+    holding_profile_cadence_hint: dict[str, Any] = Field(default_factory=dict)
+    cadence_fallback_reason: str | None = None
+    max_review_age_minutes: int | None = None
+    cadence_profile_summary: dict[str, Any] = Field(default_factory=dict)
     triggered_at: datetime
 
 
@@ -258,10 +276,13 @@ class AIPriorContextPacket(StrictBaseModel):
     session_prior_sample_count: int = Field(ge=0, default=0)
     session_sample_threshold_satisfied: bool = False
     session_prior_classification: PriorClassification = "unavailable"
+    session_prior_recency_minutes: float | None = None
     time_of_day_prior_available: bool = False
     time_of_day_prior_sample_count: int = Field(ge=0, default=0)
     time_of_day_sample_threshold_satisfied: bool = False
     time_of_day_prior_classification: PriorClassification = "unavailable"
+    time_of_day_prior_recency_minutes: float | None = None
+    session_time_calibration_reason_codes: list[str] = Field(default_factory=list)
     prior_reason_codes: list[str] = Field(default_factory=list)
     prior_penalty_level: PriorPenaltyLevel = "none"
     expected_payoff_efficiency_hint_summary: dict[str, float | None] = Field(default_factory=dict)
@@ -799,6 +820,7 @@ class StrategyEngineBucketEntry(StrictBaseModel):
     efficiency_score: float = 0.0
     classification: Literal["strong", "mixed", "weak"] = "mixed"
     reasons: list[str] = Field(default_factory=list)
+    latest_decision_at: datetime | None = None
 
 
 class StrategyEngineReportResponse(StrictBaseModel):
@@ -1729,7 +1751,6 @@ class SymbolEffectiveCadence(StrictBaseModel):
     ai_call_interval_minutes: int = Field(ge=5, le=1440)
     ai_backstop_enabled: bool = True
     ai_backstop_interval_minutes: int = Field(ge=15, le=10080)
-    estimated_monthly_ai_calls: int = Field(ge=0)
     last_market_refresh_at: datetime | None = None
     last_position_management_at: datetime | None = None
     last_decision_at: datetime | None = None
@@ -1826,7 +1847,6 @@ class AppSettingsResponse(StrictBaseModel):
     time_stop_profit_floor: float
     holding_edge_decay_enabled: bool
     reduce_on_regime_shift_enabled: bool
-    starting_equity: float
     ai_enabled: bool
     ai_provider: str
     ai_model: str
@@ -1841,10 +1861,6 @@ class AppSettingsResponse(StrictBaseModel):
     openai_api_key_configured: bool
     binance_api_key_configured: bool
     binance_api_secret_configured: bool
-    estimated_monthly_ai_calls: int
-    estimated_monthly_ai_calls_breakdown: dict[str, int]
-    projected_monthly_ai_calls_if_enabled: int
-    projected_monthly_ai_calls_breakdown_if_enabled: dict[str, int]
     recent_ai_calls_24h: int
     recent_ai_calls_7d: int
     recent_ai_successes_24h: int
@@ -1900,7 +1916,6 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     time_stop_profit_floor: float = Field(default=0.15, ge=-1.0, le=2.0)
     holding_edge_decay_enabled: bool = True
     reduce_on_regime_shift_enabled: bool = True
-    starting_equity: float = Field(gt=0.0)
     ai_enabled: bool
     ai_provider: Literal["openai", "mock"]
     ai_model: str = Field(min_length=1, max_length=80)

@@ -2148,6 +2148,17 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
             capital_efficiency_sample_count=4,
             capital_efficiency_sample_threshold_satisfied=True,
             capital_efficiency_classification="efficient",
+            session_prior_available=True,
+            session_prior_sample_count=6,
+            session_sample_threshold_satisfied=True,
+            session_prior_classification="neutral",
+            session_prior_recency_minutes=75.0,
+            time_of_day_prior_available=True,
+            time_of_day_prior_sample_count=7,
+            time_of_day_sample_threshold_satisfied=True,
+            time_of_day_prior_classification="neutral",
+            time_of_day_prior_recency_minutes=95.0,
+            session_time_calibration_reason_codes=["SESSION_PRIOR_STRONG_SAMPLE_EDGE"],
             prior_reason_codes=["ENGINE_PRIOR_STRONG", "CAPITAL_EFFICIENCY_EFFICIENT"],
             prior_penalty_level="none",
             expected_payoff_efficiency_hint_summary={"time_to_0_25r_hint_minutes": 20.0},
@@ -2194,5 +2205,116 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert metadata["prompt_family"] == "entry_pullback_review"
     assert metadata["engine_prior_classification"] == "strong"
     assert metadata["capital_efficiency_classification"] == "efficient"
+    assert metadata["session_prior_sample_count"] == 6
+    assert metadata["time_of_day_prior_sample_count"] == 7
+    assert metadata["session_prior_recency_minutes"] == 75.0
+    assert metadata["time_of_day_prior_recency_minutes"] == 95.0
+    assert metadata["session_time_calibration_reason_codes"] == ["SESSION_PRIOR_STRONG_SAMPLE_EDGE"]
+    assert metadata["session_time_penalty_applied"] is False
     assert metadata["allowed_actions"] == ["hold", "long", "short"]
     assert metadata["bounded_output_applied"] is False
+
+
+def test_trading_agent_bounds_degraded_long_horizon_entry_to_hold() -> None:
+    class LongHorizonProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            latest_price = float(payload["market_snapshot"]["latest_price"])
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "decision": "long",
+                    "confidence": 0.66,
+                    "symbol": payload["market_snapshot"]["symbol"],
+                    "timeframe": payload["market_snapshot"]["timeframe"],
+                    "entry_zone_min": latest_price - 25.0,
+                    "entry_zone_max": latest_price - 5.0,
+                    "entry_mode": "pullback_confirm",
+                    "holding_profile": "position",
+                    "recommended_holding_profile": "position",
+                    "invalidation_price": latest_price - 14.0,
+                    "max_chase_bps": 8.0,
+                    "idea_ttl_minutes": 20,
+                    "stop_loss": latest_price - 14.0,
+                    "take_profit": latest_price + 20.0,
+                    "max_holding_minutes": 240,
+                    "risk_pct": 0.01,
+                    "leverage": 2.0,
+                    "rationale_codes": ["LONG_HORIZON_PROVIDER_OUTPUT"],
+                    "explanation_short": "provider suggests a long-horizon entry",
+                    "explanation_detailed": "The provider proposes a position-style entry despite degraded market quality.",
+                },
+            )
+
+    bullish_base = _snapshot(
+        "15m",
+        [100, 100.4, 100.6, 100.8, 100.7, 101.0, 101.2, 101.1, 101.4, 101.6, 101.8, 102.0, 102.2, 102.1, 102.4, 103.1],
+        volumes=[900, 920, 940, 960, 955, 980, 1000, 1020, 1040, 1060, 1090, 1120, 1150, 1180, 1220, 1260],
+    )
+    bullish_features = compute_features(
+        bullish_base,
+        {
+            "1h": _snapshot("1h", [98, 98.7, 99.4, 100.1, 100.9, 101.8, 102.7, 103.6, 104.4, 105.2, 106.1, 107.0, 108.0, 109.1, 110.2, 111.4]),
+            "4h": _snapshot("4h", [92, 93.4, 94.9, 96.6, 98.4, 100.1, 102.0, 104.1, 106.4, 108.8, 111.3, 114.0, 116.8, 119.7, 122.7, 125.8]),
+        },
+    )
+    ai_context = AIDecisionContextPacket(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trigger_type="entry_candidate_event",
+        composite_regime=CompositeRegimePacket(
+            structure_regime="trend",
+            direction_regime="bullish",
+            volatility_regime="normal",
+            participation_regime="strong",
+            derivatives_regime="tailwind",
+            execution_regime="clean",
+            persistence_bars=5,
+            persistence_class="established",
+            transition_risk="medium",
+            regime_reason_codes=["TREND_UP"],
+        ),
+        data_quality=DataQualityPacket(
+            data_quality_grade="degraded",
+            missing_context_flags=["orderbook_context_unavailable"],
+            stale_context_flags=["market_snapshot_stale"],
+            derivatives_available=True,
+            orderbook_available=False,
+            spread_quality_available=False,
+            account_state_trustworthy=True,
+            market_state_trustworthy=False,
+        ),
+        previous_thesis=PreviousThesisDeltaPacket(),
+        strategy_engine="trend_pullback_engine",
+        strategy_engine_context={"engine_name": "trend_pullback_engine"},
+        holding_profile="position",
+        holding_profile_reason="provider_requests_position_style_review",
+        hard_stop_active=True,
+        stop_widening_allowed=False,
+        initial_stop_type="deterministic_hard_stop",
+    )
+
+    decision, provider_name, metadata = TradingDecisionAgent(LongHorizonProvider()).run(
+        bullish_base,
+        bullish_features,
+        [],
+        _risk_context(),
+        use_ai=True,
+        max_input_candles=16,
+        ai_context=ai_context,
+    )
+
+    assert provider_name == "openai"
+    assert decision.decision == "hold"
+    assert decision.should_abstain is True
+    assert decision.bounded_output_applied is True
+    assert decision.fail_closed_applied is False
+    assert decision.abstain_due_to_data_quality is True
+    assert decision.provider_not_called_due_to_quality is False
+    assert decision.quality_penalty_level == "medium"
+    assert "LONG_HOLDING_PROFILE_QUALITY_INSUFFICIENT" in decision.fallback_reason_codes
+    assert "LONG_HOLDING_PROFILE_QUALITY_INSUFFICIENT" in decision.data_quality_block_reason_codes
+    assert metadata["provider_status"] == "ok"
+    assert metadata["provider_not_called_due_to_quality"] is False
+    assert metadata["abstain_due_to_data_quality"] is True

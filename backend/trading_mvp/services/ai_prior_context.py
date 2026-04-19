@@ -26,6 +26,12 @@ ENGINE_PRIOR_MIN_SAMPLES = 3
 CAPITAL_EFFICIENCY_PRIOR_MIN_SAMPLES = 3
 SESSION_PRIOR_MIN_SAMPLES = 5
 TIME_OF_DAY_PRIOR_MIN_SAMPLES = 6
+SESSION_PRIOR_STRONG_SAMPLE_BUFFER = 2
+TIME_OF_DAY_PRIOR_STRONG_SAMPLE_BUFFER = 3
+SESSION_PRIOR_STRONG_MAX_RECENCY_MINUTES = 7 * 24 * 60
+TIME_OF_DAY_PRIOR_STRONG_MAX_RECENCY_MINUTES = 5 * 24 * 60
+SESSION_PRIOR_STRONG_MIN_CONCENTRATION = 0.55
+TIME_OF_DAY_PRIOR_STRONG_MIN_CONCENTRATION = 0.65
 PRIOR_REPORT_CACHE_TTL_SECONDS = 15
 _PRIOR_REPORT_CACHE_SESSION_KEY = "ai_prior_context_report_cache_v1"
 
@@ -407,6 +413,71 @@ def _derive_capital_efficiency_prior(
     }
 
 
+def _latest_decision_at(rows: list[StrategyEngineBucketEntry]) -> datetime | None:
+    latest: datetime | None = None
+    for row in rows:
+        row_latest = getattr(row, "latest_decision_at", None)
+        if isinstance(row_latest, datetime) and (latest is None or row_latest > latest):
+            latest = row_latest
+    return latest
+
+
+def _recency_minutes(
+    *,
+    latest_decision_at: datetime | None,
+    reference_time: datetime,
+) -> float | None:
+    if latest_decision_at is None:
+        return None
+    return float(max(int((reference_time - latest_decision_at).total_seconds() // 60), 0))
+
+
+def _calibrate_temporal_prior(
+    prior: dict[str, Any],
+    *,
+    rows: list[StrategyEngineBucketEntry],
+    engine_sample_count: int,
+    reference_time: datetime,
+    prefix: str,
+    minimum_samples: int,
+    strong_sample_buffer: int,
+    strong_max_recency_minutes: int,
+    strong_min_concentration: float,
+) -> dict[str, Any]:
+    sample_count = int(prior["sample_count"])
+    latest_decision_at = _latest_decision_at(rows)
+    recency_minutes = _recency_minutes(
+        latest_decision_at=latest_decision_at,
+        reference_time=reference_time,
+    )
+    concentration = (
+        float(sample_count) / float(max(engine_sample_count, 1))
+        if engine_sample_count > 0
+        else None
+    )
+    classification = str(prior["classification"])
+    calibration_reason_codes: list[str] = []
+
+    if bool(prior["available"]) and classification == "strong":
+        if sample_count < minimum_samples + strong_sample_buffer:
+            calibration_reason_codes.append(f"{prefix}_PRIOR_STRONG_SAMPLE_EDGE")
+        if recency_minutes is None or recency_minutes > strong_max_recency_minutes:
+            calibration_reason_codes.append(f"{prefix}_PRIOR_STRONG_RECENCY_STALE")
+        if concentration is not None and concentration < strong_min_concentration:
+            calibration_reason_codes.append(f"{prefix}_PRIOR_STRONG_CONCENTRATION_DILUTED")
+        if calibration_reason_codes:
+            classification = "neutral"
+            calibration_reason_codes.append(f"{prefix}_PRIOR_STRONG_DOWNGRADED_TO_NEUTRAL")
+
+    return {
+        **prior,
+        "classification": classification,
+        "recency_minutes": recency_minutes,
+        "concentration": round(concentration, 6) if concentration is not None else None,
+        "calibration_reason_codes": calibration_reason_codes,
+    }
+
+
 def _penalty_level(
     *,
     ai_context: AIDecisionContextPacket,
@@ -420,7 +491,8 @@ def _penalty_level(
         penalty_score = max(penalty_score, 2)
     if capital_classification == "inefficient":
         penalty_score = max(penalty_score, 1)
-    if session_classification == "weak" or time_classification == "weak":
+    session_time_weak = session_classification == "weak" or time_classification == "weak"
+    if session_time_weak:
         penalty_score = max(penalty_score, 1)
 
     quality_severity = _DATA_QUALITY_SEVERITY.get(ai_context.data_quality.data_quality_grade, 0)
@@ -429,6 +501,8 @@ def _penalty_level(
         or ai_context.holding_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}
     )
     if quality_severity >= 2 and (engine_classification == "weak" or capital_classification == "inefficient"):
+        penalty_score = min(3, max(penalty_score + 1, 2))
+    if quality_severity >= 2 and session_time_weak:
         penalty_score = min(3, max(penalty_score + 1, 2))
     if aggressive_context and quality_severity >= 2 and engine_classification != "strong":
         penalty_score = max(penalty_score, 3 if quality_severity >= 3 else 2)
@@ -679,6 +753,28 @@ def build_ai_prior_context(
         minimum_samples=TIME_OF_DAY_PRIOR_MIN_SAMPLES,
         unavailable_reason_code="TIME_OF_DAY_PRIOR_UNAVAILABLE_INSUFFICIENT_SAMPLES",
     )
+    session_prior = _calibrate_temporal_prior(
+        session_prior,
+        rows=matching_session_rows,
+        engine_sample_count=int(engine_prior["sample_count"]),
+        reference_time=engine_report.generated_at,
+        prefix="SESSION",
+        minimum_samples=SESSION_PRIOR_MIN_SAMPLES,
+        strong_sample_buffer=SESSION_PRIOR_STRONG_SAMPLE_BUFFER,
+        strong_max_recency_minutes=SESSION_PRIOR_STRONG_MAX_RECENCY_MINUTES,
+        strong_min_concentration=SESSION_PRIOR_STRONG_MIN_CONCENTRATION,
+    )
+    time_of_day_prior = _calibrate_temporal_prior(
+        time_of_day_prior,
+        rows=matching_time_rows,
+        engine_sample_count=int(engine_prior["sample_count"]),
+        reference_time=engine_report.generated_at,
+        prefix="TIME_OF_DAY",
+        minimum_samples=TIME_OF_DAY_PRIOR_MIN_SAMPLES,
+        strong_sample_buffer=TIME_OF_DAY_PRIOR_STRONG_SAMPLE_BUFFER,
+        strong_max_recency_minutes=TIME_OF_DAY_PRIOR_STRONG_MAX_RECENCY_MINUTES,
+        strong_min_concentration=TIME_OF_DAY_PRIOR_STRONG_MIN_CONCENTRATION,
+    )
     capital_efficiency_prior = _derive_capital_efficiency_prior(
         matching_capital_rows,
         minimum_samples=CAPITAL_EFFICIENCY_PRIOR_MIN_SAMPLES,
@@ -689,6 +785,8 @@ def build_ai_prior_context(
         list(capital_efficiency_prior["reason_codes"]),
         [code.replace("ENGINE_PRIOR_", "SESSION_PRIOR_") for code in session_prior["reason_codes"]],
         [code.replace("ENGINE_PRIOR_", "TIME_OF_DAY_PRIOR_") for code in time_of_day_prior["reason_codes"]],
+        list(session_prior["calibration_reason_codes"]),
+        list(time_of_day_prior["calibration_reason_codes"]),
     )
     prior_penalty_level = _penalty_level(
         ai_context=ai_context,
@@ -728,10 +826,16 @@ def build_ai_prior_context(
         session_prior_sample_count=int(session_prior["sample_count"]),
         session_sample_threshold_satisfied=bool(session_prior["threshold_satisfied"]),
         session_prior_classification=str(session_prior["classification"]),  # type: ignore[arg-type]
+        session_prior_recency_minutes=session_prior["recency_minutes"],
         time_of_day_prior_available=bool(time_of_day_prior["available"]),
         time_of_day_prior_sample_count=int(time_of_day_prior["sample_count"]),
         time_of_day_sample_threshold_satisfied=bool(time_of_day_prior["threshold_satisfied"]),
         time_of_day_prior_classification=str(time_of_day_prior["classification"]),  # type: ignore[arg-type]
+        time_of_day_prior_recency_minutes=time_of_day_prior["recency_minutes"],
+        session_time_calibration_reason_codes=_unique_codes(
+            list(session_prior["calibration_reason_codes"]),
+            list(time_of_day_prior["calibration_reason_codes"]),
+        ),
         prior_reason_codes=prior_reason_codes,
         prior_penalty_level=prior_penalty_level,  # type: ignore[arg-type]
         expected_payoff_efficiency_hint_summary=payoff_efficiency_summary,

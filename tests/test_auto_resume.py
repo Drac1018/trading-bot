@@ -4,9 +4,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
-from trading_mvp.database import Base, get_db
+from sqlalchemy import select
 from trading_mvp.main import app
 from trading_mvp.models import AuditEvent, PnLSnapshot, Position, SchedulerRun
 from trading_mvp.schemas import AppSettingsUpdateRequest
@@ -37,7 +35,6 @@ def _build_live_settings_payload() -> AppSettingsUpdateRequest:
         max_consecutive_losses=3,
         stale_market_seconds=1800,
         slippage_threshold_pct=0.003,
-        starting_equity=100000.0,
         ai_enabled=True,
         ai_provider="openai",
         ai_model="gpt-4.1-mini",
@@ -293,15 +290,8 @@ def test_scheduler_path_attempts_auto_resume_before_interval_cycle(db_session, m
     assert scheduler_run.status == "success"
 
 
-def test_manual_cycle_api_attempts_auto_resume_before_running(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'auto_resume_cycle.db'}", future=True)
-    testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
-
-    def override_get_db():
-        with testing_session() as session:
-            yield session
+def test_manual_cycle_api_attempts_auto_resume_before_running(testclient_db_factory, monkeypatch) -> None:
+    testing_session = testclient_db_factory("auto_resume_cycle.db")
 
     call_state = {"count": 0}
 
@@ -320,21 +310,17 @@ def test_manual_cycle_api_attempts_auto_resume_before_running(tmp_path, monkeypa
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.attempt_auto_resume", fake_attempt)
     monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
-    app.dependency_overrides[get_db] = override_get_db
 
-    try:
-        with testing_session() as session:
-            update_settings(session, _build_live_settings_payload())
-            session.commit()
+    with testing_session() as session:
+        update_settings(session, _build_live_settings_payload())
+        session.commit()
 
-        with TestClient(app) as client:
-            response = client.post("/api/cycles/run")
-            assert response.status_code == 200
-            payload = response.json()
-            assert payload["auto_resume"]["status"] == "resumed"
-            assert call_state["count"] == 1
-    finally:
-        app.dependency_overrides.clear()
+    with TestClient(app) as client:
+        response = client.post("/api/cycles/run")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["auto_resume"]["status"] == "resumed"
+        assert call_state["count"] == 1
 
 
 def test_recoverable_system_pause_can_resume_via_approval_grace_window(db_session, monkeypatch) -> None:
@@ -425,15 +411,8 @@ def test_auto_resume_reports_symbol_detail_for_market_data_failure(db_session, m
     )
 
 
-def test_live_sync_runs_auto_resume_precheck_before_sync(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'live_sync_precheck.db'}", future=True)
-    testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
-
-    def override_get_db():
-        with testing_session() as session:
-            yield session
+def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, monkeypatch) -> None:
+    testing_session = testclient_db_factory("live_sync_precheck.db")
 
     call_order: list[str] = []
 
@@ -487,45 +466,34 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(tmp_path, monkeypatch) 
 
     monkeypatch.setattr("trading_mvp.main.attempt_auto_resume", fake_attempt)
     monkeypatch.setattr("trading_mvp.main.sync_live_state", fake_sync)
-    app.dependency_overrides[get_db] = override_get_db
 
-    try:
-        with testing_session() as session:
-            update_settings(session, _build_live_settings_payload())
-            set_trading_pause(
-                session,
-                True,
-                reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
-                reason_detail={"source": "exchange"},
-                pause_origin="system",
-                auto_resume_after=utcnow_naive() - timedelta(minutes=1),
-                preserve_live_arm=True,
-            )
-            session.commit()
+    with testing_session() as session:
+        update_settings(session, _build_live_settings_payload())
+        set_trading_pause(
+            session,
+            True,
+            reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+            reason_detail={"source": "exchange"},
+            pause_origin="system",
+            auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+            preserve_live_arm=True,
+        )
+        session.commit()
 
-        with TestClient(app) as client:
-            response = client.post("/api/live/sync")
-            assert response.status_code == 200
-            payload = response.json()
-            assert payload["auto_resume_precheck"]["trigger_source"] == "api_live_sync_precheck"
-            assert payload["auto_resume_postcheck"]["trigger_source"] == "api_live_sync_postcheck"
-            assert payload["operating_state"] == "PROTECTION_REQUIRED"
-            assert payload["protection_recovery_status"] == "recreating"
-            assert payload["missing_protection_items"] == {"BTCUSDT": ["stop_loss"]}
-            assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
-    finally:
-        app.dependency_overrides.clear()
+    with TestClient(app) as client:
+        response = client.post("/api/live/sync")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["auto_resume_precheck"]["trigger_source"] == "api_live_sync_precheck"
+        assert payload["auto_resume_postcheck"]["trigger_source"] == "api_live_sync_postcheck"
+        assert payload["operating_state"] == "PROTECTION_REQUIRED"
+        assert payload["protection_recovery_status"] == "recreating"
+        assert payload["missing_protection_items"] == {"BTCUSDT": ["stop_loss"]}
+        assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
 
 
-def test_live_sync_failure_still_returns_precheck_result(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'live_sync_failure.db'}", future=True)
-    testing_session = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
-
-    def override_get_db():
-        with testing_session() as session:
-            yield session
+def test_live_sync_failure_still_returns_precheck_result(testclient_db_factory, monkeypatch) -> None:
+    testing_session = testclient_db_factory("live_sync_failure.db")
 
     def fake_attempt(db, settings_row, trigger_source="system"):
         return {
@@ -553,36 +521,32 @@ def test_live_sync_failure_still_returns_precheck_result(tmp_path, monkeypatch) 
 
     monkeypatch.setattr("trading_mvp.main.attempt_auto_resume", fake_attempt)
     monkeypatch.setattr("trading_mvp.main.sync_live_state", fail_sync)
-    app.dependency_overrides[get_db] = override_get_db
 
-    try:
-        with testing_session() as session:
-            update_settings(session, _build_live_settings_payload())
-            set_trading_pause(
-                session,
-                True,
-                reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
-                reason_detail={"source": "exchange"},
-                pause_origin="system",
-                auto_resume_after=utcnow_naive() - timedelta(minutes=1),
-                preserve_live_arm=True,
-            )
-            session.commit()
+    with testing_session() as session:
+        update_settings(session, _build_live_settings_payload())
+        set_trading_pause(
+            session,
+            True,
+            reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+            reason_detail={"source": "exchange"},
+            pause_origin="system",
+            auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+            preserve_live_arm=True,
+        )
+        session.commit()
 
-        with TestClient(app) as client:
-            response = client.post("/api/live/sync")
-            assert response.status_code == 400
-            detail = response.json()["detail"]
-            assert detail["auto_resume_precheck"]["symbol_blockers"]["BTCUSDT"] == ["MISSING_PROTECTIVE_ORDERS"]
+    with TestClient(app) as client:
+        response = client.post("/api/live/sync")
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["auto_resume_precheck"]["symbol_blockers"]["BTCUSDT"] == ["MISSING_PROTECTIVE_ORDERS"]
 
-        with testing_session() as session:
-            event = session.scalar(
-                select(AuditEvent)
-                .where(AuditEvent.event_type == "live_sync_failed")
-                .order_by(AuditEvent.id.desc())
-                .limit(1)
-            )
-            assert event is not None
-            assert event.payload["auto_resume_precheck"]["blockers"] == ["MISSING_PROTECTIVE_ORDERS"]
-    finally:
-        app.dependency_overrides.clear()
+    with testing_session() as session:
+        event = session.scalar(
+            select(AuditEvent)
+            .where(AuditEvent.event_type == "live_sync_failed")
+            .order_by(AuditEvent.id.desc())
+            .limit(1)
+        )
+        assert event is not None
+        assert event.payload["auto_resume_precheck"]["blockers"] == ["MISSING_PROTECTIVE_ORDERS"]

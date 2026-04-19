@@ -91,7 +91,7 @@ const labelMap: Record<string, string> = {
   decision_cycle_interval_minutes: "의사결정 주기(분)",
   tracked_symbols: "추적 심볼",
   default_symbol: "기본 심볼",
-  default_timeframe: "기본 타임프레임",
+  default_timeframe: "기본 시장 타임프레임",
   exchange_sync_interval_seconds: "거래소 동기화 주기(초)",
   market_refresh_interval_minutes: "시장 갱신 주기(분)",
   position_management_interval_seconds: "포지션 관리 주기(초)",
@@ -103,7 +103,6 @@ const labelMap: Record<string, string> = {
   decision_cycle_interval_minutes_override: "신규 판단 override",
   ai_call_interval_minutes_override: "AI 최소 호출 override",
   uses_global_defaults: "전역값 사용 여부",
-  estimated_monthly_ai_calls: "예상 월간 AI 호출",
   last_market_refresh_at: "마지막 시장 갱신",
   last_position_management_at: "마지막 포지션 관리",
   last_decision_at: "마지막 신규 판단",
@@ -446,7 +445,6 @@ const priceKeys = new Set([
   "margin_balance",
   "available_balance",
   "equity",
-  "starting_equity",
   "cash_balance",
 ]);
 

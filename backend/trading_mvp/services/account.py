@@ -109,8 +109,8 @@ def _fallback_balance_state(
         wallet_balance = (previous.wallet_balance or previous.cash_balance) + cumulative_delta
         available_balance = (previous.available_balance or previous.cash_balance) + cumulative_delta
     else:
-        wallet_balance = settings_row.starting_equity + net_pnl
-        available_balance = settings_row.starting_equity + net_pnl
+        wallet_balance = 0.0
+        available_balance = 0.0
     cash_balance = available_balance
     equity = wallet_balance + unrealized_pnl
     return {
@@ -123,6 +123,36 @@ def _fallback_balance_state(
 
 def _current_unrealized_pnl(session: Session) -> float:
     return sum(position.unrealized_pnl for position in get_open_positions(session))
+
+
+def is_placeholder_live_snapshot(row: PnLSnapshot | None) -> bool:
+    return row is not None and row.id is None
+
+
+def _build_placeholder_live_snapshot(
+    *,
+    components: LivePnLComponents,
+    unrealized_pnl: float,
+) -> PnLSnapshot:
+    now = utcnow_naive()
+    return PnLSnapshot(
+        snapshot_date=components.snapshot_date,
+        equity=0.0,
+        cash_balance=0.0,
+        wallet_balance=0.0,
+        available_balance=0.0,
+        gross_realized_pnl=components.gross_realized_pnl,
+        fee_total=components.fee_total,
+        funding_total=components.funding_total,
+        net_pnl=components.net_pnl,
+        realized_pnl=components.net_pnl,
+        unrealized_pnl=unrealized_pnl,
+        daily_pnl=components.daily_net_pnl,
+        cumulative_pnl=components.net_pnl,
+        consecutive_losses=components.consecutive_losses,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def _normalize_funding_external_ref(entry: Mapping[str, object]) -> str | None:
@@ -353,7 +383,7 @@ def create_pnl_snapshot(
     if previous is not None:
         cash_balance = previous.cash_balance + realized_delta
     else:
-        cash_balance = settings_row.starting_equity + cumulative_pnl
+        cash_balance = cumulative_pnl
     equity = cash_balance + unrealized_pnl
     row = PnLSnapshot(
         snapshot_date=effective_date,
@@ -398,6 +428,12 @@ def create_exchange_pnl_snapshot(
         unrealized_pnl = _current_unrealized_pnl(session)
         total_margin_balance = 0.0
 
+    if previous is None and account_info is None:
+        return _build_placeholder_live_snapshot(
+            components=components,
+            unrealized_pnl=unrealized_pnl,
+        )
+
     fallback_balances = _fallback_balance_state(
         settings_row=settings_row,
         previous=previous,
@@ -440,9 +476,30 @@ def create_exchange_pnl_snapshot(
     return row
 
 
-def account_snapshot_to_dict(pnl: PnLSnapshot) -> dict[str, float | int | str]:
+def account_snapshot_to_dict(pnl: PnLSnapshot) -> dict[str, float | int | str | None]:
+    if is_placeholder_live_snapshot(pnl):
+        return {
+            "snapshot_date": pnl.snapshot_date.isoformat(),
+            "account_snapshot_available": False,
+            "basis": "live_account_snapshot_unavailable",
+            "note": "Live account snapshot is unavailable until the first successful exchange account sync.",
+            "equity": None,
+            "cash_balance": None,
+            "wallet_balance": None,
+            "available_balance": None,
+            "gross_realized_pnl": pnl.gross_realized_pnl,
+            "fee_total": pnl.fee_total,
+            "funding_total": pnl.funding_total,
+            "net_pnl": pnl.net_pnl,
+            "realized_pnl": pnl.realized_pnl,
+            "unrealized_pnl": pnl.unrealized_pnl,
+            "daily_pnl": pnl.daily_pnl,
+            "cumulative_pnl": pnl.cumulative_pnl,
+            "consecutive_losses": pnl.consecutive_losses,
+        }
     return {
         "snapshot_date": pnl.snapshot_date.isoformat(),
+        "account_snapshot_available": True,
         "equity": pnl.equity,
         "cash_balance": pnl.cash_balance,
         "wallet_balance": pnl.wallet_balance,

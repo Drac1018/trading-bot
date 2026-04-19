@@ -29,7 +29,7 @@ from trading_mvp.schemas import (
     SymbolCadenceOverride,
     SymbolEffectiveCadence,
 )
-from trading_mvp.services.account import get_latest_pnl_snapshot
+from trading_mvp.services.account import get_latest_pnl_snapshot, is_placeholder_live_snapshot
 from trading_mvp.services.adaptive_signal import (
     build_adaptive_signal_context,
     summarize_adaptive_signal_state,
@@ -82,7 +82,6 @@ class EffectiveSymbolSettings:
     ai_backstop_interval_minutes: int
 
 
-MINUTES_PER_30_DAY_MONTH = 30 * 24 * 60
 DISPLAY_MAX_LEVERAGE = 5.0
 DISPLAY_MAX_RISK_PER_TRADE = 0.02
 DISPLAY_MAX_DAILY_LOSS = 0.05
@@ -401,7 +400,6 @@ def get_or_create_settings(session: Session) -> Setting:
         time_stop_profit_floor=defaults.time_stop_profit_floor,
         holding_edge_decay_enabled=defaults.holding_edge_decay_enabled,
         reduce_on_regime_shift_enabled=defaults.reduce_on_regime_shift_enabled,
-        starting_equity=defaults.starting_equity,
         ai_enabled=defaults.ai_enabled,
         ai_provider=defaults.ai_provider,
         ai_model=defaults.openai_model,
@@ -435,8 +433,62 @@ def _account_sync_stale_seconds(settings_row: Setting) -> int:
     return max(300, settings_row.decision_cycle_interval_minutes * 120)
 
 
-def _build_pnl_summary(settings_row: Setting, latest_pnl: PnLSnapshot) -> dict[str, object]:
+def _build_unknown_pnl_summary(latest_pnl: PnLSnapshot | None = None) -> dict[str, object]:
     return {
+        "account_snapshot_available": False,
+        "basis": "live_account_snapshot_unavailable",
+        "basis_note": (
+            "Live account balance and equity stay unknown until the first successful Binance account sync. "
+            "Realized, fee and funding totals still come from the execution ledger plus funding ledger."
+        ),
+        "equity": None,
+        "wallet_balance": None,
+        "available_balance": None,
+        "cash_balance": None,
+        "realized_pnl": latest_pnl.gross_realized_pnl if latest_pnl is not None else 0.0,
+        "fee_total": latest_pnl.fee_total if latest_pnl is not None else 0.0,
+        "funding_total": latest_pnl.funding_total if latest_pnl is not None else 0.0,
+        "net_pnl": latest_pnl.net_pnl if latest_pnl is not None else 0.0,
+        "net_realized_pnl": latest_pnl.net_pnl if latest_pnl is not None else 0.0,
+        "unrealized_pnl": latest_pnl.unrealized_pnl if latest_pnl is not None else 0.0,
+        "daily_pnl": latest_pnl.daily_pnl if latest_pnl is not None else 0.0,
+        "cumulative_pnl": latest_pnl.cumulative_pnl if latest_pnl is not None else 0.0,
+        "consecutive_losses": latest_pnl.consecutive_losses if latest_pnl is not None else 0,
+        "snapshot_time": None,
+        "note": "Live account snapshot is not available yet.",
+    }
+
+
+def _build_unknown_account_sync_summary(
+    settings_row: Setting,
+    latest_pnl: PnLSnapshot | None = None,
+) -> dict[str, object]:
+    return {
+        "account_snapshot_available": False,
+        "status": "unknown",
+        "reconciliation_mode": "unknown",
+        "freshness_seconds": None,
+        "stale_after_seconds": _account_sync_stale_seconds(settings_row),
+        "equity": None,
+        "wallet_balance": None,
+        "available_balance": None,
+        "realized_pnl": latest_pnl.gross_realized_pnl if latest_pnl is not None else 0.0,
+        "fee_total": latest_pnl.fee_total if latest_pnl is not None else 0.0,
+        "funding_total": latest_pnl.funding_total if latest_pnl is not None else 0.0,
+        "net_pnl": latest_pnl.net_pnl if latest_pnl is not None else 0.0,
+        "unrealized_pnl": latest_pnl.unrealized_pnl if latest_pnl is not None else 0.0,
+        "last_synced_at": None,
+        "last_warning_reason_code": None,
+        "last_warning_message": None,
+        "note": "Account sync status is not available until the first successful live snapshot is created.",
+    }
+
+
+def _build_pnl_summary(settings_row: Setting, latest_pnl: PnLSnapshot) -> dict[str, object]:
+    if is_placeholder_live_snapshot(latest_pnl):
+        return _build_unknown_pnl_summary(latest_pnl)
+    return {
+        "account_snapshot_available": True,
         "basis": "live_account_snapshot_preferred",
         "basis_note": (
             "Wallet, available balance and equity prefer the latest Binance account snapshot. "
@@ -464,6 +516,8 @@ def _build_account_sync_summary(
     settings_row: Setting,
     latest_pnl: PnLSnapshot,
 ) -> dict[str, object]:
+    if is_placeholder_live_snapshot(latest_pnl):
+        return _build_unknown_account_sync_summary(settings_row, latest_pnl)
     freshness_seconds = max(int((utcnow_naive() - latest_pnl.created_at).total_seconds()), 0)
     stale_after_seconds = _account_sync_stale_seconds(settings_row)
     latest_warning: SystemHealthEvent | None = None
@@ -504,6 +558,7 @@ def _build_account_sync_summary(
         )
 
     return {
+        "account_snapshot_available": True,
         "status": status,
         "reconciliation_mode": reconciliation_mode,
         "freshness_seconds": freshness_seconds,
@@ -823,10 +878,6 @@ def build_symbol_effective_cadences(
             ai_next_due = last_ai_decision_at + timedelta(minutes=effective.ai_call_interval_minutes)
         else:
             ai_next_due = now
-        trading_interval = max(
-            int(effective.decision_cycle_interval_minutes),
-            int(effective.ai_call_interval_minutes),
-        )
         items.append(
             SymbolEffectiveCadence(
                 symbol=effective.symbol,
@@ -839,7 +890,6 @@ def build_symbol_effective_cadences(
                 ai_call_interval_minutes=effective.ai_call_interval_minutes,
                 ai_backstop_enabled=effective.ai_backstop_enabled,
                 ai_backstop_interval_minutes=effective.ai_backstop_interval_minutes,
-                estimated_monthly_ai_calls=MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1),
                 last_market_refresh_at=last_market_refresh_at,
                 last_position_management_at=position_run_at,
                 last_decision_at=decision_run_at or (decision_agent_run.created_at if decision_agent_run else None),
@@ -1383,24 +1433,7 @@ def build_operational_status_payload(
     elif latest_pnl is not None:
         account_summary = _build_account_sync_summary(current_session, settings_row, latest_pnl)
     else:
-        account_summary = {
-            "status": "unknown",
-            "reconciliation_mode": "unknown",
-            "freshness_seconds": None,
-            "stale_after_seconds": _account_sync_stale_seconds(settings_row),
-            "equity": settings_row.starting_equity,
-            "wallet_balance": settings_row.starting_equity,
-            "available_balance": settings_row.starting_equity,
-            "realized_pnl": 0.0,
-            "fee_total": 0.0,
-            "funding_total": 0.0,
-            "net_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "last_synced_at": None,
-            "last_warning_reason_code": None,
-            "last_warning_message": None,
-            "note": "Account sync status is not available until the first live snapshot is created.",
-        }
+        account_summary = _build_unknown_account_sync_summary(settings_row)
     missing_protection_symbols = (
         [str(item) for item in (missing_protection_symbols_override or []) if item not in {None, ""}]
         if missing_protection_symbols_override is not None
@@ -1529,31 +1562,9 @@ def disarm_live_execution(session: Session) -> Setting:
     return row
 
 
-def estimate_monthly_ai_calls(settings_row: Setting, *, assume_enabled: bool = False) -> tuple[int, dict[str, int]]:
-    breakdown = {
-        "trading_decision": 0,
-        "chief_review": 0,
-    }
-    if settings_row.ai_provider != "openai" or not (assume_enabled or settings_row.ai_enabled):
-        return 0, breakdown
-
-    for effective in get_effective_symbol_schedule(settings_row):
-        if not effective.enabled:
-            continue
-        trading_interval = max(
-            int(effective.decision_cycle_interval_minutes),
-            int(effective.ai_call_interval_minutes),
-        )
-        breakdown["trading_decision"] += MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1)
-        breakdown["chief_review"] += MINUTES_PER_30_DAY_MONTH // max(trading_interval, 1)
-    return sum(breakdown.values()), breakdown
-
-
 def serialize_settings(settings_row: Setting) -> dict[str, object]:
     defaults = get_settings()
     credentials = get_runtime_credentials(settings_row, defaults=defaults)
-    estimated_total, estimated_breakdown = estimate_monthly_ai_calls(settings_row)
-    projected_total, projected_breakdown = estimate_monthly_ai_calls(settings_row, assume_enabled=True)
     current_session = object_session(settings_row)
     usage_metrics: AIUsageMetrics = build_ai_usage_metrics(current_session) if current_session is not None else {
         "recent_ai_calls_24h": 0,
@@ -1587,62 +1598,21 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     exposure_limits = get_exposure_limits(settings_row)
     runtime_state = summarize_runtime_state(settings_row)
     latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
-    pnl_summary = (
-        _build_pnl_summary(settings_row, latest_pnl)
-        if latest_pnl is not None
-        else {
-            "basis": "live_account_snapshot_preferred",
-            "basis_note": (
-                "Wallet, available balance and equity prefer the latest Binance account snapshot. "
-                "Realized, fee and funding totals are reconciled from the execution ledger plus funding ledger."
-            ),
-            "equity": settings_row.starting_equity,
-            "wallet_balance": settings_row.starting_equity,
-            "available_balance": settings_row.starting_equity,
-            "cash_balance": settings_row.starting_equity,
-            "realized_pnl": 0.0,
-            "fee_total": 0.0,
-            "funding_total": 0.0,
-            "net_pnl": 0.0,
-            "net_realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "daily_pnl": 0.0,
-            "cumulative_pnl": 0.0,
-            "consecutive_losses": 0,
-            "snapshot_time": None,
-        }
-    )
+    pnl_summary = _build_pnl_summary(settings_row, latest_pnl) if latest_pnl is not None else _build_unknown_pnl_summary()
     account_sync_summary = (
         _build_account_sync_summary(current_session, settings_row, latest_pnl)
         if latest_pnl is not None
-        else {
-            "status": "unknown",
-            "reconciliation_mode": "unknown",
-            "freshness_seconds": None,
-            "stale_after_seconds": _account_sync_stale_seconds(settings_row),
-            "equity": settings_row.starting_equity,
-            "wallet_balance": settings_row.starting_equity,
-            "available_balance": settings_row.starting_equity,
-            "realized_pnl": 0.0,
-            "fee_total": 0.0,
-            "funding_total": 0.0,
-            "net_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "last_synced_at": None,
-            "last_warning_reason_code": None,
-            "last_warning_message": None,
-            "note": "Account sync status is not available until the first live snapshot is created.",
-        }
+        else _build_unknown_account_sync_summary(settings_row)
     )
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
     market_freshness_summary = _build_market_freshness_summary(current_session, settings_row)
-    if current_session is not None:
+    if current_session is not None and pnl_summary.get("equity") is not None:
         from trading_mvp.services.risk import build_current_exposure_summary
 
         exposure_summary = build_current_exposure_summary(
             current_session,
             settings_row,
-            equity=_coerce_float(pnl_summary.get("equity"), settings_row.starting_equity),
+            equity=_coerce_float(pnl_summary.get("equity"), 0.0),
             reference_symbol=settings_row.default_symbol,
         )
     else:
@@ -1802,7 +1772,6 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         time_stop_profit_floor=settings_row.time_stop_profit_floor,
         holding_edge_decay_enabled=settings_row.holding_edge_decay_enabled,
         reduce_on_regime_shift_enabled=settings_row.reduce_on_regime_shift_enabled,
-        starting_equity=settings_row.starting_equity,
         ai_enabled=settings_row.ai_enabled,
         ai_provider=settings_row.ai_provider,
         ai_model=settings_row.ai_model,
@@ -1817,10 +1786,6 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         openai_api_key_configured=bool(credentials.openai_api_key),
         binance_api_key_configured=bool(credentials.binance_api_key),
         binance_api_secret_configured=bool(credentials.binance_api_secret),
-        estimated_monthly_ai_calls=estimated_total,
-        estimated_monthly_ai_calls_breakdown=estimated_breakdown,
-        projected_monthly_ai_calls_if_enabled=projected_total,
-        projected_monthly_ai_calls_breakdown_if_enabled=projected_breakdown,
         recent_ai_calls_24h=usage_metrics["recent_ai_calls_24h"],
         recent_ai_calls_7d=usage_metrics["recent_ai_calls_7d"],
         recent_ai_successes_24h=usage_metrics["recent_ai_successes_24h"],
@@ -1865,62 +1830,21 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
     exposure_limits = get_exposure_limits(settings_row)
     runtime_state = summarize_runtime_state(settings_row)
     latest_pnl = get_latest_pnl_snapshot(current_session, settings_row) if current_session is not None else None
-    pnl_summary = (
-        _build_pnl_summary(settings_row, latest_pnl)
-        if latest_pnl is not None
-        else {
-            "basis": "live_account_snapshot_preferred",
-            "basis_note": (
-                "Wallet, available balance and equity prefer the latest Binance account snapshot. "
-                "Realized, fee and funding totals are reconciled from the execution ledger plus funding ledger."
-            ),
-            "equity": settings_row.starting_equity,
-            "wallet_balance": settings_row.starting_equity,
-            "available_balance": settings_row.starting_equity,
-            "cash_balance": settings_row.starting_equity,
-            "realized_pnl": 0.0,
-            "fee_total": 0.0,
-            "funding_total": 0.0,
-            "net_pnl": 0.0,
-            "net_realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "daily_pnl": 0.0,
-            "cumulative_pnl": 0.0,
-            "consecutive_losses": 0,
-            "snapshot_time": None,
-        }
-    )
+    pnl_summary = _build_pnl_summary(settings_row, latest_pnl) if latest_pnl is not None else _build_unknown_pnl_summary()
     account_sync_summary = (
         _build_account_sync_summary(current_session, settings_row, latest_pnl)
         if latest_pnl is not None
-        else {
-            "status": "unknown",
-            "reconciliation_mode": "unknown",
-            "freshness_seconds": None,
-            "stale_after_seconds": _account_sync_stale_seconds(settings_row),
-            "equity": settings_row.starting_equity,
-            "wallet_balance": settings_row.starting_equity,
-            "available_balance": settings_row.starting_equity,
-            "realized_pnl": 0.0,
-            "fee_total": 0.0,
-            "funding_total": 0.0,
-            "net_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "last_synced_at": None,
-            "last_warning_reason_code": None,
-            "last_warning_message": None,
-            "note": "Account sync status is not available until the first live snapshot is created.",
-        }
+        else _build_unknown_account_sync_summary(settings_row)
     )
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
     market_freshness_summary = _build_market_freshness_summary(current_session, settings_row)
-    if current_session is not None:
+    if current_session is not None and pnl_summary.get("equity") is not None:
         from trading_mvp.services.risk import build_current_exposure_summary
 
         exposure_summary = build_current_exposure_summary(
             current_session,
             settings_row,
-            equity=_coerce_float(pnl_summary.get("equity"), settings_row.starting_equity),
+            equity=_coerce_float(pnl_summary.get("equity"), 0.0),
             reference_symbol=settings_row.default_symbol,
         )
     else:
@@ -2053,7 +1977,6 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.time_stop_profit_floor = payload.time_stop_profit_floor
     row.holding_edge_decay_enabled = payload.holding_edge_decay_enabled
     row.reduce_on_regime_shift_enabled = payload.reduce_on_regime_shift_enabled
-    row.starting_equity = payload.starting_equity
     row.ai_enabled = payload.ai_enabled
     row.ai_provider = payload.ai_provider
     row.ai_model = payload.ai_model

@@ -240,6 +240,261 @@ class TradingDecisionAgent:
         return "provider_error"
 
     @staticmethod
+    def _unique_reason_codes(*groups: list[str] | tuple[str, ...] | None) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            if not group:
+                continue
+            for code in group:
+                normalized = str(code or "").strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                ordered.append(normalized)
+        return ordered
+
+    @staticmethod
+    def _data_quality_penalty_level(ai_context: AIDecisionContextPacket | None) -> str:
+        if ai_context is None:
+            return "none"
+        grade = ai_context.data_quality.data_quality_grade
+        if grade == "partial":
+            return "light"
+        if grade == "degraded":
+            return "medium"
+        if grade == "unavailable":
+            return "strong"
+        return "none"
+
+    @staticmethod
+    def _minimum_quality_required(
+        route,  # noqa: ANN001
+        *,
+        long_horizon_entry: bool = False,
+    ) -> str | None:
+        if not getattr(route, "allow_new_entry", False):
+            return None
+        if getattr(route, "strategy_engine", "") == "breakout_exception_engine" or getattr(route, "trigger_type", None) == "breakout_exception_event":
+            return "partial_or_better_with_breakout_context"
+        if long_horizon_entry:
+            return "partial_or_better_for_long_horizon_entry"
+        return "partial_or_better"
+
+    @classmethod
+    def _data_quality_block_reason_codes(
+        cls,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        primary_reason_code: str,
+    ) -> list[str]:
+        if ai_context is None:
+            return [primary_reason_code]
+        data_quality = ai_context.data_quality
+        supplemental: list[str] = []
+        if not data_quality.derivatives_available:
+            supplemental.append("DERIVATIVES_CONTEXT_UNAVAILABLE")
+        if not data_quality.orderbook_available:
+            supplemental.append("ORDERBOOK_CONTEXT_UNAVAILABLE")
+        if not data_quality.spread_quality_available:
+            supplemental.append("SPREAD_QUALITY_UNAVAILABLE")
+        if not data_quality.account_state_trustworthy:
+            supplemental.append("ACCOUNT_STATE_UNTRUSTWORTHY")
+        if not data_quality.market_state_trustworthy:
+            supplemental.append("MARKET_STATE_UNTRUSTWORTHY")
+        return cls._unique_reason_codes(
+            [primary_reason_code],
+            list(data_quality.missing_context_flags),
+            list(data_quality.stale_context_flags),
+            supplemental,
+        )
+
+    @classmethod
+    def _quality_constrained_hold_decision(
+        cls,
+        decision: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        provider_status: str,
+        block_reason_code: str,
+        minimum_quality_required: str | None,
+        fail_closed: bool,
+        provider_not_called_due_to_quality: bool,
+        recommended_holding_profile: str = "hold_current",
+        explanation_short: str,
+        explanation_detailed: str,
+    ) -> TradeDecision:
+        current_profile = (
+            str((ai_context.holding_profile if ai_context is not None else None) or decision.holding_profile or HOLDING_PROFILE_SCALP)
+            .strip()
+            .lower()
+            or HOLDING_PROFILE_SCALP
+        )
+        block_codes = cls._data_quality_block_reason_codes(
+            ai_context=ai_context,
+            primary_reason_code=block_reason_code,
+        )
+        quality_fail_closed_codes = ["DATA_QUALITY_FAIL_CLOSED"] if fail_closed else []
+        rationale_codes = cls._unique_reason_codes(
+            list(decision.rationale_codes),
+            block_codes,
+            quality_fail_closed_codes,
+        )
+        fallback_reason_codes = cls._unique_reason_codes(
+            list(decision.fallback_reason_codes),
+            [block_reason_code],
+            quality_fail_closed_codes,
+        )
+        abstain_reason_codes = cls._unique_reason_codes(
+            list(decision.abstain_reason_codes),
+            block_codes,
+            quality_fail_closed_codes,
+        )
+        no_trade_reason_codes = cls._unique_reason_codes(
+            list(decision.no_trade_reason_codes),
+            block_codes,
+            quality_fail_closed_codes,
+        )
+        return decision.model_copy(
+            update={
+                "decision": "hold",
+                "entry_mode": "none",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
+                "invalidation_price": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+                "recommended_holding_profile": recommended_holding_profile,
+                "holding_profile": current_profile,
+                "primary_reason_codes": rationale_codes,
+                "rationale_codes": rationale_codes,
+                "no_trade_reason_codes": no_trade_reason_codes,
+                "abstain_reason_codes": abstain_reason_codes,
+                "should_abstain": True,
+                "bounded_output_applied": True,
+                "fallback_reason_codes": fallback_reason_codes,
+                "fail_closed_applied": fail_closed,
+                "provider_status": provider_status,
+                "data_quality_fail_closed_applied": fail_closed,
+                "data_quality_block_reason_codes": block_codes,
+                "minimum_quality_required": minimum_quality_required,
+                "abstain_due_to_data_quality": True,
+                "quality_penalty_level": cls._data_quality_penalty_level(ai_context),
+                "provider_not_called_due_to_quality": provider_not_called_due_to_quality,
+                "data_quality_penalty_applied": True,
+                "explanation_short": explanation_short,
+                "explanation_detailed": explanation_detailed,
+            }
+        )
+
+    @classmethod
+    def _pre_provider_data_quality_gate(
+        cls,
+        baseline: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        route,  # noqa: ANN001
+    ) -> TradeDecision | None:
+        if ai_context is None or not getattr(route, "allow_new_entry", False):
+            return None
+        grade = ai_context.data_quality.data_quality_grade
+        if grade == "unavailable":
+            return cls._quality_constrained_hold_decision(
+                baseline,
+                ai_context=ai_context,
+                provider_status="quality_blocked",
+                block_reason_code="DATA_QUALITY_UNAVAILABLE_FAIL_CLOSED",
+                minimum_quality_required=cls._minimum_quality_required(route),
+                fail_closed=True,
+                provider_not_called_due_to_quality=True,
+                recommended_holding_profile="hold_current",
+                explanation_short="Data quality blocked a new entry review.",
+                explanation_detailed=(
+                    "The AI provider was not called because the current entry review context is unavailable. "
+                    "The decision was fail-closed to hold before risk approval."
+                ),
+            )
+        if grade == "degraded" and (
+            getattr(route, "strategy_engine", "") == "breakout_exception_engine"
+            or getattr(route, "trigger_type", None) == "breakout_exception_event"
+        ):
+            return cls._quality_constrained_hold_decision(
+                baseline,
+                ai_context=ai_context,
+                provider_status="quality_blocked",
+                block_reason_code="BREAKOUT_QUALITY_INSUFFICIENT",
+                minimum_quality_required=cls._minimum_quality_required(route),
+                fail_closed=True,
+                provider_not_called_due_to_quality=True,
+                recommended_holding_profile="hold_current",
+                explanation_short="Breakout review was blocked by degraded data quality.",
+                explanation_detailed=(
+                    "Breakout-exception entry review requires higher confidence in market quality. "
+                    "The provider was not called and the decision was fail-closed to hold before risk approval."
+                ),
+            )
+        return None
+
+    @classmethod
+    def _apply_post_provider_data_quality_constraints(
+        cls,
+        decision: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        route,  # noqa: ANN001
+        provider_status: str,
+        raw_recommended_profile: str | None,
+    ) -> TradeDecision:
+        if ai_context is None or not getattr(route, "allow_new_entry", False):
+            return decision
+        if decision.decision not in {"long", "short"}:
+            return decision
+        grade = ai_context.data_quality.data_quality_grade
+        normalized_profile = str(raw_recommended_profile or "").strip().lower()
+        if (
+            grade in {"degraded", "unavailable"}
+            and normalized_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}
+        ):
+            return cls._quality_constrained_hold_decision(
+                decision,
+                ai_context=ai_context,
+                provider_status=provider_status,
+                block_reason_code="LONG_HOLDING_PROFILE_QUALITY_INSUFFICIENT",
+                minimum_quality_required=cls._minimum_quality_required(route, long_horizon_entry=True),
+                fail_closed=False,
+                provider_not_called_due_to_quality=False,
+                recommended_holding_profile=HOLDING_PROFILE_SCALP,
+                explanation_short="Long-horizon entry was bounded by data quality.",
+                explanation_detailed=(
+                    "A degraded or unavailable market context cannot justify a new swing or position-style entry. "
+                    "The AI output was normalized to hold before risk approval."
+                ),
+            )
+        return decision
+
+    @classmethod
+    def _data_quality_metadata(
+        cls,
+        decision: TradeDecision,
+        *,
+        ai_context: AIDecisionContextPacket | None,
+        route,  # noqa: ANN001
+    ) -> dict[str, Any]:
+        current_profile = str(decision.recommended_holding_profile or decision.holding_profile or "").strip().lower()
+        return {
+            "data_quality_fail_closed_applied": decision.data_quality_fail_closed_applied,
+            "data_quality_block_reason_codes": list(decision.data_quality_block_reason_codes),
+            "minimum_quality_required": decision.minimum_quality_required
+            or cls._minimum_quality_required(
+                route,
+                long_horizon_entry=current_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION},
+            ),
+            "abstain_due_to_data_quality": decision.abstain_due_to_data_quality,
+            "quality_penalty_level": decision.quality_penalty_level or cls._data_quality_penalty_level(ai_context),
+            "provider_not_called_due_to_quality": decision.provider_not_called_due_to_quality,
+        }
+
+    @staticmethod
     def _route_metadata(route, *, provider_status: str) -> dict[str, Any]:  # noqa: ANN001
         return {
             "trigger_type": route.trigger_type,
@@ -613,6 +868,8 @@ class TradingDecisionAgent:
             update["regime_transition_risk"] = ai_context.composite_regime.transition_risk
         if not decision.data_quality_penalty_applied:
             update["data_quality_penalty_applied"] = ai_context.data_quality.data_quality_grade != "complete"
+        if decision.quality_penalty_level == "none":
+            update["quality_penalty_level"] = self._data_quality_penalty_level(ai_context)
         if not decision.invalidation_reason_codes and decision.decision in {"long", "short"} and decision.invalidation_price is not None:
             update["invalidation_reason_codes"] = ["INVALIDATION_PRICE_BREACH"]
         if decision.decision in {"long", "short"}:
@@ -632,6 +889,7 @@ class TradingDecisionAgent:
         elif decision.decision == "hold" and not decision.should_abstain:
             if ai_context.data_quality.data_quality_grade in {"degraded", "unavailable"} and decision.confidence <= 0.5:
                 update["should_abstain"] = True
+                update["abstain_due_to_data_quality"] = True
         if decision.should_abstain and not decision.abstain_reason_codes:
             update["abstain_reason_codes"] = list(decision.no_trade_reason_codes or decision.primary_reason_codes)
         return decision.model_copy(update=update) if update else decision
@@ -644,6 +902,12 @@ class TradingDecisionAgent:
                 "capital_efficiency_classification": None,
                 "session_prior_classification": None,
                 "time_of_day_prior_classification": None,
+                "session_prior_sample_count": None,
+                "time_of_day_prior_sample_count": None,
+                "session_prior_recency_minutes": None,
+                "time_of_day_prior_recency_minutes": None,
+                "session_time_calibration_reason_codes": [],
+                "session_time_penalty_applied": False,
                 "prior_penalty_level": "none",
                 "prior_reason_codes": [],
                 "sample_threshold_satisfied": {},
@@ -657,6 +921,12 @@ class TradingDecisionAgent:
             "capital_efficiency_classification": prior_context.capital_efficiency_classification,
             "session_prior_classification": prior_context.session_prior_classification,
             "time_of_day_prior_classification": prior_context.time_of_day_prior_classification,
+            "session_prior_sample_count": prior_context.session_prior_sample_count,
+            "time_of_day_prior_sample_count": prior_context.time_of_day_prior_sample_count,
+            "session_prior_recency_minutes": prior_context.session_prior_recency_minutes,
+            "time_of_day_prior_recency_minutes": prior_context.time_of_day_prior_recency_minutes,
+            "session_time_calibration_reason_codes": list(prior_context.session_time_calibration_reason_codes),
+            "session_time_penalty_applied": False,
             "prior_penalty_level": prior_context.prior_penalty_level,
             "prior_reason_codes": list(prior_context.prior_reason_codes),
             "sample_threshold_satisfied": {
@@ -686,6 +956,12 @@ class TradingDecisionAgent:
             "capital_efficiency_classification": prior_context.capital_efficiency_classification,
             "session_prior_classification": prior_context.session_prior_classification,
             "time_of_day_prior_classification": prior_context.time_of_day_prior_classification,
+            "session_prior_sample_count": prior_context.session_prior_sample_count,
+            "time_of_day_prior_sample_count": prior_context.time_of_day_prior_sample_count,
+            "session_prior_recency_minutes": prior_context.session_prior_recency_minutes,
+            "time_of_day_prior_recency_minutes": prior_context.time_of_day_prior_recency_minutes,
+            "session_time_calibration_reason_codes": list(prior_context.session_time_calibration_reason_codes),
+            "session_time_penalty_applied": False,
             "prior_penalty_level": prior_context.prior_penalty_level,
             "prior_reason_codes": list(prior_context.prior_reason_codes),
             "sample_threshold_satisfied": dict(metadata["sample_threshold_satisfied"]),
@@ -698,8 +974,18 @@ class TradingDecisionAgent:
         data_quality_grade = ai_context.data_quality.data_quality_grade
         confidence_delta = 0.0
         abstain_due_to_prior_and_quality = False
+        session_time_penalty_applied = False
         adjustment_codes: list[str] = []
         update = dict(base_update)
+        weak_session_prior = (
+            prior_context.session_sample_threshold_satisfied
+            and prior_context.session_prior_classification == "weak"
+        )
+        weak_time_of_day_prior = (
+            prior_context.time_of_day_sample_threshold_satisfied
+            and prior_context.time_of_day_prior_classification == "weak"
+        )
+        weak_temporal_prior_count = int(weak_session_prior) + int(weak_time_of_day_prior)
 
         if (
             prior_context.engine_sample_threshold_satisfied
@@ -717,12 +1003,30 @@ class TradingDecisionAgent:
         ):
             confidence_delta -= 0.07 if recommended_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION} else 0.03
             adjustment_codes.append("CAPITAL_EFFICIENCY_CONSERVATISM")
-        if prior_context.session_sample_threshold_satisfied and prior_context.session_prior_classification == "weak":
+        if weak_session_prior:
             confidence_delta -= 0.02
             adjustment_codes.append("SESSION_PRIOR_SOFT_PENALTY")
-        if prior_context.time_of_day_sample_threshold_satisfied and prior_context.time_of_day_prior_classification == "weak":
+        if weak_time_of_day_prior:
             confidence_delta -= 0.02
             adjustment_codes.append("TIME_OF_DAY_PRIOR_SOFT_PENALTY")
+        if (
+            weak_temporal_prior_count > 0
+            and data_quality_grade in {"degraded", "unavailable"}
+            and decision.decision in {"long", "short"}
+        ):
+            session_time_penalty_applied = True
+            confidence_delta -= 0.04 if weak_temporal_prior_count == 1 else 0.06
+            if data_quality_grade == "unavailable":
+                confidence_delta -= 0.02
+            adjustment_codes.append("SESSION_TIME_PRIOR_QUALITY_CONSERVATISM")
+            aggressive_context = (
+                ai_context.strategy_engine == "breakout_exception_engine"
+                or recommended_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}
+            )
+            if aggressive_context and (
+                weak_temporal_prior_count == 2 or data_quality_grade == "unavailable"
+            ):
+                abstain_due_to_prior_and_quality = True
 
         if (
             recommended_profile in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}
@@ -777,6 +1081,8 @@ class TradingDecisionAgent:
             update["no_trade_reason_codes"] = combined_no_trade_codes
             update["abstain_reason_codes"] = combined_no_trade_codes
             metadata["abstain_due_to_prior_and_quality"] = True
+        update["session_time_penalty_applied"] = session_time_penalty_applied
+        metadata["session_time_penalty_applied"] = session_time_penalty_applied
         update["confidence_adjustment_applied"] = metadata["confidence_adjustment_applied"]
         update["abstain_due_to_prior_and_quality"] = metadata["abstain_due_to_prior_and_quality"]
         update["prior_reason_codes"] = list(dict.fromkeys([*prior_context.prior_reason_codes, *adjustment_codes]))
@@ -2376,6 +2682,11 @@ class TradingDecisionAgent:
                         "enabled": False,
                         "status": "disabled_for_baseline_old",
                     },
+                    **self._data_quality_metadata(
+                        decision,
+                        ai_context=resolved_ai_context,
+                        route=prompt_route,
+                    ),
                     **prior_metadata,
                 },
             )
@@ -2429,6 +2740,73 @@ class TradingDecisionAgent:
                     "setup_cluster_state": adaptive_adjustment.get("setup_cluster_state"),
                     "suppression_context": adaptive_adjustment.get("suppression_context"),
                     "adaptive_signal_adjustment": adaptive_adjustment,
+                    **self._data_quality_metadata(
+                        decision,
+                        ai_context=resolved_ai_context,
+                        route=prompt_route,
+                    ),
+                    **prior_metadata,
+                },
+            )
+
+        quality_gated_decision = self._pre_provider_data_quality_gate(
+            baseline,
+            ai_context=resolved_ai_context,
+            route=prompt_route,
+        )
+        if quality_gated_decision is not None:
+            decision = self._apply_ai_schema_fields(quality_gated_decision, ai_context=resolved_ai_context)
+            decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
+            decision_agreement = self._build_decision_agreement(
+                baseline,
+                decision,
+                ai_used=False,
+            )
+            return (
+                decision,
+                "deterministic-mock",
+                {
+                    "source": "quality_fail_closed",
+                    "logic_variant": logic_variant,
+                    "decision_agreement": decision_agreement,
+                    "strategy_engine": strategy_engine_selection,
+                    "holding_profile": decision.holding_profile,
+                    "holding_profile_reason": decision.holding_profile_reason,
+                    "holding_profile_context": baseline_holding_profile,
+                    "ai_context": ai_context_payload,
+                    "ai_context_version": (
+                        resolved_ai_context.ai_context_version
+                        if resolved_ai_context is not None
+                        else decision.ai_context_version
+                    ),
+                    **self._route_metadata(prompt_route, provider_status="quality_blocked"),
+                    "allowed_actions": list(prompt_route.allowed_actions),
+                    "forbidden_actions": list(prompt_route.forbidden_actions),
+                    "bounded_output_applied": decision.bounded_output_applied,
+                    "fallback_reason_codes": list(decision.fallback_reason_codes),
+                    "fail_closed_applied": decision.fail_closed_applied,
+                    "should_abstain": decision.should_abstain,
+                    "abstain_reason_codes": list(decision.abstain_reason_codes),
+                    **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
+                    "setup_cluster_state": {"matched": False, "active": False},
+                    "suppression_context": {
+                        "level": "none",
+                        "sources": [],
+                        "reason_codes": [],
+                        "applies_hard_block": False,
+                        "applies_risk_haircut": False,
+                        "applies_soft_bias": False,
+                    },
+                    "adaptive_signal_adjustment": {
+                        "enabled": False,
+                        "status": "quality_fail_closed",
+                        "reason_codes": list(decision.data_quality_block_reason_codes),
+                    },
+                    **self._data_quality_metadata(
+                        decision,
+                        ai_context=resolved_ai_context,
+                        route=prompt_route,
+                    ),
                     **prior_metadata,
                 },
             )
@@ -2527,6 +2905,9 @@ class TradingDecisionAgent:
                 market_snapshot=market_snapshot,
                 features=features,
             )
+            raw_recommended_profile = str(
+                decision.recommended_holding_profile or decision.holding_profile or ""
+            ).strip().lower()
             decision, adaptive_adjustment = self._apply_adaptive_adjustment(
                 decision,
                 risk_context=risk_context,
@@ -2544,6 +2925,13 @@ class TradingDecisionAgent:
                 decision,
                 ai_context=resolved_ai_context,
                 route=prompt_route,
+            )
+            decision = self._apply_post_provider_data_quality_constraints(
+                decision,
+                ai_context=resolved_ai_context,
+                route=prompt_route,
+                provider_status="ok",
+                raw_recommended_profile=raw_recommended_profile,
             )
             bounded_result = bound_trade_decision(
                 decision=decision,
@@ -2586,6 +2974,13 @@ class TradingDecisionAgent:
             metadata["setup_cluster_state"] = adaptive_adjustment.get("setup_cluster_state")
             metadata["suppression_context"] = adaptive_adjustment.get("suppression_context")
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
+            metadata.update(
+                self._data_quality_metadata(
+                    decision,
+                    ai_context=resolved_ai_context,
+                    route=prompt_route,
+                )
+            )
             metadata.update(adjusted_prior_metadata)
             return decision, provider_result.provider, metadata
         except Exception as exc:
@@ -2655,6 +3050,13 @@ class TradingDecisionAgent:
             metadata["setup_cluster_state"] = adaptive_adjustment.get("setup_cluster_state")
             metadata["suppression_context"] = adaptive_adjustment.get("suppression_context")
             metadata["adaptive_signal_adjustment"] = adaptive_adjustment
+            metadata.update(
+                self._data_quality_metadata(
+                    decision,
+                    ai_context=resolved_ai_context,
+                    route=prompt_route,
+                )
+            )
             metadata.update(prior_metadata)
             return decision, "deterministic-mock", metadata
 

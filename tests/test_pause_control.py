@@ -4,7 +4,6 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from sqlalchemy import select
-
 from trading_mvp.models import AuditEvent
 from trading_mvp.schemas import AppSettingsUpdateRequest
 from trading_mvp.services.pause_control import attempt_auto_resume
@@ -33,7 +32,6 @@ def _build_live_settings_payload() -> AppSettingsUpdateRequest:
         max_consecutive_losses=3,
         stale_market_seconds=1800,
         slippage_threshold_pct=0.003,
-        starting_equity=100000.0,
         ai_enabled=True,
         ai_provider="openai",
         ai_model="gpt-4.1-mini",

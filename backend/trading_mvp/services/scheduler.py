@@ -126,6 +126,20 @@ def _cadence_minutes(profile: dict[str, object], key: str, fallback: int) -> int
     return int(value) if isinstance(value, (int, float)) and int(value) > 0 else fallback
 
 
+def _interval_decision_schedule_details(
+    orchestrator: TradingOrchestrator,
+    *,
+    effective: object,
+    cadence_profile: dict[str, object],
+) -> dict[str, object]:
+    return orchestrator.resolve_interval_decision_schedule_details(
+        symbol=effective.symbol,
+        timeframe=effective.timeframe,
+        effective_settings=effective,
+        cadence_profile=cadence_profile,
+    )
+
+
 def _cadence_seconds(profile: dict[str, object], key: str, fallback: int) -> int:
     cadence = profile.get("effective_cadence")
     if not isinstance(cadence, dict):
@@ -579,10 +593,18 @@ def is_interval_decision_due(session: Session, symbol: str | None = None) -> boo
         symbol=effective.symbol,
         timeframe=effective.timeframe,
     )
-    cadence_minutes = _cadence_minutes(
-        cadence_profile,
-        "decision_cycle_interval_minutes",
-        effective.decision_cycle_interval_minutes,
+    schedule_details = _interval_decision_schedule_details(
+        orchestrator,
+        effective=effective,
+        cadence_profile=cadence_profile,
+    )
+    cadence_minutes = int(
+        schedule_details.get("scheduler_interval_minutes")
+        or _cadence_minutes(
+            cadence_profile,
+            "decision_cycle_interval_minutes",
+            effective.decision_cycle_interval_minutes,
+        )
     )
     latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
     return _is_due(latest, timedelta(minutes=cadence_minutes))
@@ -600,10 +622,18 @@ def get_due_interval_decision_symbols(session: Session) -> list[str]:
             symbol=effective.symbol,
             timeframe=effective.timeframe,
         )
-        cadence_minutes = _cadence_minutes(
-            cadence_profile,
-            "decision_cycle_interval_minutes",
-            effective.decision_cycle_interval_minutes,
+        schedule_details = _interval_decision_schedule_details(
+            orchestrator,
+            effective=effective,
+            cadence_profile=cadence_profile,
+        )
+        cadence_minutes = int(
+            schedule_details.get("scheduler_interval_minutes")
+            or _cadence_minutes(
+                cadence_profile,
+                "decision_cycle_interval_minutes",
+                effective.decision_cycle_interval_minutes,
+            )
         )
         latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
         if _is_due(latest, timedelta(minutes=cadence_minutes)):
@@ -637,17 +667,25 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             symbol=effective.symbol,
             timeframe=effective.timeframe,
         )
-        cadence_minutes = _cadence_minutes(
-            cadence_profile,
-            "decision_cycle_interval_minutes",
-            effective.decision_cycle_interval_minutes,
+        schedule_details = _interval_decision_schedule_details(
+            orchestrator,
+            effective=effective,
+            cadence_profile=cadence_profile,
+        )
+        cadence_minutes = int(
+            schedule_details.get("scheduler_interval_minutes")
+            or _cadence_minutes(
+                cadence_profile,
+                "decision_cycle_interval_minutes",
+                effective.decision_cycle_interval_minutes,
+            )
         )
         latest = _latest_symbol_workflow_run(session, INTERVAL_DECISION_WORKFLOW, effective.symbol)
         if not _is_due(latest, timedelta(minutes=cadence_minutes)):
             continue
-        due_effective.append((effective, cadence_profile, cadence_minutes))
+        due_effective.append((effective, cadence_profile, cadence_minutes, schedule_details))
     decision_plan = orchestrator.build_interval_decision_plan(
-        symbols=[effective.symbol for effective, _cadence, _minutes in due_effective],
+        symbols=[effective.symbol for effective, _cadence, _minutes, _details in due_effective],
         triggered_at=utcnow_naive(),
     )
     plan_lookup = {
@@ -655,7 +693,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         for item in decision_plan.get("plans", [])
         if isinstance(item, dict) and item.get("symbol")
     }
-    for effective, cadence_profile, cadence_minutes in due_effective:
+    for effective, cadence_profile, cadence_minutes, schedule_details in due_effective:
         row = _start_scheduler_run(
             session,
             workflow=INTERVAL_DECISION_WORKFLOW,
@@ -673,6 +711,26 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         last_material_review_at = plan.get("last_material_review_at")
         dedupe_reason = str(plan.get("dedupe_reason") or "") or None
         forced_review_reason = str(plan.get("forced_review_reason") or "") or None
+        applied_review_cadence_minutes = plan.get("applied_review_cadence_minutes")
+        review_cadence_source = str(plan.get("review_cadence_source") or "") or None
+        holding_profile_cadence_hint = (
+            dict(plan.get("holding_profile_cadence_hint"))
+            if isinstance(plan.get("holding_profile_cadence_hint"), dict)
+            else dict(schedule_details.get("holding_profile_cadence_hint") or {})
+            if isinstance(schedule_details.get("holding_profile_cadence_hint"), dict)
+            else {}
+        )
+        cadence_fallback_reason = (
+            str(plan.get("cadence_fallback_reason") or "") or None
+        )
+        max_review_age_minutes = plan.get("max_review_age_minutes")
+        cadence_profile_summary = (
+            dict(plan.get("cadence_profile_summary"))
+            if isinstance(plan.get("cadence_profile_summary"), dict)
+            else dict(schedule_details.get("cadence_profile_summary") or {})
+            if isinstance(schedule_details.get("cadence_profile_summary"), dict)
+            else {}
+        )
         fingerprint_changed_fields = (
             list(plan.get("fingerprint_changed_fields"))
             if isinstance(plan.get("fingerprint_changed_fields"), list)
@@ -695,6 +753,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "cadence": cadence_profile,
                         "next_ai_review_due_at": next_ai_review_due_at,
                         "last_material_review_at": last_material_review_at,
+                        "applied_review_cadence_minutes": applied_review_cadence_minutes,
+                        "review_cadence_source": review_cadence_source,
+                        "cadence_fallback_reason": cadence_fallback_reason,
+                        "max_review_age_minutes": max_review_age_minutes,
                     },
                 )
                 results.append(
@@ -718,6 +780,12 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "last_material_review_at": last_material_review_at,
                             "forced_review_reason": None,
                             "last_ai_skip_reason": last_ai_skip_reason or "NO_EVENT",
+                            "applied_review_cadence_minutes": applied_review_cadence_minutes,
+                            "review_cadence_source": review_cadence_source,
+                            "holding_profile_cadence_hint": holding_profile_cadence_hint,
+                            "cadence_fallback_reason": cadence_fallback_reason,
+                            "max_review_age_minutes": max_review_age_minutes,
+                            "cadence_profile_summary": cadence_profile_summary,
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
                         },
@@ -738,6 +806,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "next_ai_review_due_at": next_ai_review_due_at,
                         "dedupe_reason": dedupe_reason,
                         "last_material_review_at": last_material_review_at,
+                        "applied_review_cadence_minutes": applied_review_cadence_minutes,
+                        "review_cadence_source": review_cadence_source,
+                        "cadence_fallback_reason": cadence_fallback_reason,
+                        "max_review_age_minutes": max_review_age_minutes,
                     },
                 )
                 results.append(
@@ -761,6 +833,12 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "last_material_review_at": last_material_review_at,
                             "forced_review_reason": forced_review_reason,
                             "last_ai_skip_reason": last_ai_skip_reason or "TRIGGER_DEDUPED",
+                            "applied_review_cadence_minutes": applied_review_cadence_minutes,
+                            "review_cadence_source": review_cadence_source,
+                            "holding_profile_cadence_hint": holding_profile_cadence_hint,
+                            "cadence_fallback_reason": cadence_fallback_reason,
+                            "max_review_age_minutes": max_review_age_minutes,
+                            "cadence_profile_summary": cadence_profile_summary,
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
                         },
@@ -781,6 +859,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "next_ai_review_due_at": next_ai_review_due_at,
                         "forced_review_reason": forced_review_reason,
                         "last_material_review_at": last_material_review_at,
+                        "applied_review_cadence_minutes": applied_review_cadence_minutes,
+                        "review_cadence_source": review_cadence_source,
+                        "cadence_fallback_reason": cadence_fallback_reason,
+                        "max_review_age_minutes": max_review_age_minutes,
                     },
                 )
             outcome = orchestrator.run_decision_cycle(

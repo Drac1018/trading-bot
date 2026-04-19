@@ -75,7 +75,6 @@ class Setting(TimestampMixin, Base):
     time_stop_profit_floor: Mapped[float] = mapped_column(Float, default=0.15)
     holding_edge_decay_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     reduce_on_regime_shift_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    starting_equity: Mapped[float] = mapped_column(Float, default=100000.0)
     ai_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     ai_provider: Mapped[str] = mapped_column(String(20), default="openai")
     ai_model: Mapped[str] = mapped_column(String(80), default="gpt-4.1-mini")

@@ -2,12 +2,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 from threading import Event
-from time import sleep
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import AuditEvent, Execution, Order, Position, RiskCheck, SchedulerRun
 from trading_mvp.services.dashboard import (
@@ -1065,7 +1061,7 @@ def test_overview_and_positions_include_protection_status(db_session) -> None:
     assert overview.protection_recovery_active is False
     assert overview.missing_protection_symbols == ["BTCUSDT"]
     assert overview.missing_protection_items == {"BTCUSDT": ["take_profit"]}
-    assert overview.pnl_summary["basis"] == "live_account_snapshot_preferred"
+    assert overview.pnl_summary["basis"] == "live_account_snapshot_unavailable"
     assert "status" in overview.account_sync_summary
     assert overview.operational_status.account_sync_summary["status"] == overview.account_sync_summary["status"]
     assert overview.sync_freshness_summary["account"]["stale"] is False
@@ -1245,6 +1241,8 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert "available_balance" in payload.control.pnl_summary
     assert "fee_total" in payload.control.pnl_summary
     assert "funding_total" in payload.control.pnl_summary
+    assert payload.control.pnl_summary["account_snapshot_available"] is False
+    assert payload.control.account_sync_summary["account_snapshot_available"] is False
     assert payload.control.control_status_summary.approval_state == "armed"
     assert payload.control.control_status_summary.approval_window_open is True
     assert payload.control.control_status_summary.rollout_mode == "limited_live"
@@ -1403,189 +1401,153 @@ def test_overview_prioritizes_stale_sync_reasons_in_operational_status(db_sessio
     assert overview.guard_mode_reason_code == "POSITION_STATE_STALE"
 
 
-def test_profitability_dashboard_api_returns_windowed_snapshot(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'profitability_dashboard.db'}", future=True)
-    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_dashboard.db")
 
-    def override_get_db():
-        with TestingSessionLocal() as session:
-            yield session
+    with TestingSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        session.commit()
 
-    app.dependency_overrides[get_db] = override_get_db
-    try:
-        with TestingSessionLocal() as session:
-            _seed_profitability_dashboard_rows(session)
-            session.commit()
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/profitability")
 
-        with TestClient(app) as client:
-            response = client.get("/api/dashboard/profitability")
-
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["windows"][0]["window_label"] == "24h"
-        assert "rationale_winners" in payload["windows"][0]
-        assert "rationale_losers" in payload["windows"][0]
-        assert "execution_windows" in payload
-        assert payload["execution_windows"][0]["worst_profiles"]
-        assert payload["hold_blocked_summary"]["latest_blocked_reasons"] == ["TRADING_PAUSED", "HOLD_DECISION"]
-    finally:
-        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["windows"][0]["window_label"] == "24h"
+    assert "rationale_winners" in payload["windows"][0]
+    assert "rationale_losers" in payload["windows"][0]
+    assert "execution_windows" in payload
+    assert payload["execution_windows"][0]["worst_profiles"]
+    assert payload["hold_blocked_summary"]["latest_blocked_reasons"] == ["TRADING_PAUSED", "HOLD_DECISION"]
 
 
-def test_operator_dashboard_api_returns_operator_flow(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'operator_dashboard.db'}", future=True)
-    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_dashboard.db")
 
-    def override_get_db():
-        with TestingSessionLocal() as session:
-            yield session
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
 
-    app.dependency_overrides[get_db] = override_get_db
-    try:
-        with TestingSessionLocal() as session:
-            _seed_multi_symbol_operator_rows(session)
-            session.commit()
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
 
-        with TestClient(app) as client:
-            response = client.get("/api/dashboard/operator")
-
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["control"]["default_symbol"] == "BTCUSDT"
-        assert payload["control"]["tracked_symbol_count"] == 2
-        assert "wallet_balance" in payload["control"]["pnl_summary"]
-        assert "available_balance" in payload["control"]["pnl_summary"]
-        assert "net_pnl" in payload["control"]["pnl_summary"]
-        assert len(payload["symbols"]) == 2
-        assert "ai_decision" not in payload
-        assert "risk_guard" not in payload
-        assert "execution" not in payload
-        btc = next(item for item in payload["symbols"] if item["symbol"] == "BTCUSDT")
-        eth = next(item for item in payload["symbols"] if item["symbol"] == "ETHUSDT")
-        assert btc["latest_price"] == 70500.0
-        assert btc["ai_decision"]["last_ai_trigger_reason"] == "entry_candidate_event"
-        assert btc["ai_decision"]["trigger_deduped"] is True
-        assert btc["ai_decision"]["last_ai_skip_reason"] == "TRIGGER_DEDUPED"
-        assert btc["candidate_selection"]["assigned_slot"] == "slot_1"
-        assert btc["candidate_selection"]["candidate_weight"] == 0.64
-        assert btc["candidate_selection"]["capacity_reason"] == "mixed_breadth_moderate_capacity"
-        assert btc["risk_guard"]["allowed"] is False
-        assert btc["risk_guard"]["assigned_slot"] == "slot_1"
-        assert btc["risk_guard"]["holding_profile"] == "scalp"
-        assert btc["open_position"]["is_open"] is True
-        assert btc["open_position"]["holding_profile"] == "swing"
-        assert btc["open_position"]["hard_stop_active"] is True
-        assert btc["open_position"]["stop_widening_allowed"] is False
-        assert eth["latest_price"] == 3400.0
-        assert eth["ai_decision"]["next_ai_review_due_at"] is not None
-        assert eth["ai_decision"]["assigned_slot"] == "slot_2"
-        assert eth["ai_decision"]["portfolio_slot_soft_cap_applied"] is True
-        assert eth["risk_guard"]["allowed"] is True
-        assert eth["risk_guard"]["auto_resized_entry"] is True
-        assert eth["risk_guard"]["approved_projected_notional"] == 150000.0
-        assert eth["risk_guard"]["approved_quantity"] == 44.117647
-        assert eth["risk_guard"]["auto_resize_reason"] == "CLAMPED_TO_SINGLE_POSITION_HEADROOM"
-        assert eth["risk_guard"]["portfolio_slot_soft_cap_applied"] is True
-        assert eth["candidate_selection"]["assigned_slot"] == "slot_2"
-        assert eth["candidate_selection"]["candidate_weight"] == 0.42
-        assert eth["execution"]["symbol"] == "ETHUSDT"
-        assert len(payload["audit_events"]) >= 1
-    finally:
-        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["control"]["default_symbol"] == "BTCUSDT"
+    assert payload["control"]["tracked_symbol_count"] == 2
+    assert "wallet_balance" in payload["control"]["pnl_summary"]
+    assert "available_balance" in payload["control"]["pnl_summary"]
+    assert "net_pnl" in payload["control"]["pnl_summary"]
+    assert payload["control"]["pnl_summary"]["account_snapshot_available"] is False
+    assert payload["control"]["account_sync_summary"]["account_snapshot_available"] is False
+    assert len(payload["symbols"]) == 2
+    assert "ai_decision" not in payload
+    assert "risk_guard" not in payload
+    assert "execution" not in payload
+    btc = next(item for item in payload["symbols"] if item["symbol"] == "BTCUSDT")
+    eth = next(item for item in payload["symbols"] if item["symbol"] == "ETHUSDT")
+    assert btc["latest_price"] == 70500.0
+    assert btc["ai_decision"]["last_ai_trigger_reason"] == "entry_candidate_event"
+    assert btc["ai_decision"]["trigger_deduped"] is True
+    assert btc["ai_decision"]["last_ai_skip_reason"] == "TRIGGER_DEDUPED"
+    assert btc["candidate_selection"]["assigned_slot"] == "slot_1"
+    assert btc["candidate_selection"]["candidate_weight"] == 0.64
+    assert btc["candidate_selection"]["capacity_reason"] == "mixed_breadth_moderate_capacity"
+    assert btc["risk_guard"]["allowed"] is False
+    assert btc["risk_guard"]["assigned_slot"] == "slot_1"
+    assert btc["risk_guard"]["holding_profile"] == "scalp"
+    assert btc["open_position"]["is_open"] is True
+    assert btc["open_position"]["holding_profile"] == "swing"
+    assert btc["open_position"]["hard_stop_active"] is True
+    assert btc["open_position"]["stop_widening_allowed"] is False
+    assert eth["latest_price"] == 3400.0
+    assert eth["ai_decision"]["next_ai_review_due_at"] is not None
+    assert eth["ai_decision"]["assigned_slot"] == "slot_2"
+    assert eth["ai_decision"]["portfolio_slot_soft_cap_applied"] is True
+    assert eth["risk_guard"]["allowed"] is True
+    assert eth["risk_guard"]["auto_resized_entry"] is True
+    assert eth["risk_guard"]["approved_projected_notional"] == 150000.0
+    assert eth["risk_guard"]["approved_quantity"] == 44.117647
+    assert eth["risk_guard"]["auto_resize_reason"] == "CLAMPED_TO_SINGLE_POSITION_HEADROOM"
+    assert eth["risk_guard"]["portfolio_slot_soft_cap_applied"] is True
+    assert eth["candidate_selection"]["assigned_slot"] == "slot_2"
+    assert eth["candidate_selection"]["candidate_weight"] == 0.42
+    assert eth["execution"]["symbol"] == "ETHUSDT"
+    assert len(payload["audit_events"]) >= 1
 
 
-def test_overview_api_refreshes_stale_exchange_sync_on_read(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'overview_sync_refresh.db'}", future=True)
-    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+def test_overview_api_refreshes_stale_exchange_sync_on_read(testclient_db_factory, monkeypatch) -> None:
+    TestingSessionLocal = testclient_db_factory("overview_sync_refresh.db")
 
-    def override_get_db():
-        with TestingSessionLocal() as session:
-            yield session
+    with TestingSessionLocal() as session:
+        settings = get_or_create_settings(session)
+        settings.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+        settings.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+        stale_at = utcnow_naive() - timedelta(hours=2)
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_success(settings, scope=scope, synced_at=stale_at)
+        session.commit()
 
-    app.dependency_overrides[get_db] = override_get_db
-    try:
-        with TestingSessionLocal() as session:
-            settings = get_or_create_settings(session)
-            settings.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
-            settings.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
-            stale_at = utcnow_naive() - timedelta(hours=2)
-            for scope in ("account", "positions", "open_orders", "protective_orders"):
-                mark_sync_success(settings, scope=scope, synced_at=stale_at)
-            session.commit()
+    refresh_started = Event()
+    refresh_completed = Event()
+    allow_refresh_commit = Event()
 
-        refresh_completed = Event()
+    def fake_refresh_exchange_sync(session, *, triggered_by: str):
+        refresh_started.set()
+        assert allow_refresh_commit.wait(timeout=2.0) is True
+        refreshed_at = utcnow_naive()
+        settings = get_or_create_settings(session)
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_success(settings, scope=scope, synced_at=refreshed_at)
+        session.commit()
+        refresh_completed.set()
+        return {"workflow": "exchange_sync_cycle", "status": "success", "triggered_by": triggered_by}
 
-        def fake_refresh_exchange_sync(session, *, triggered_by: str):
-            sleep(0.6)
-            refreshed_at = utcnow_naive()
-            settings = get_or_create_settings(session)
-            for scope in ("account", "positions", "open_orders", "protective_orders"):
-                mark_sync_success(settings, scope=scope, synced_at=refreshed_at)
-            session.flush()
-            refresh_completed.set()
-            return {"workflow": "exchange_sync_cycle", "status": "success", "triggered_by": triggered_by}
+    monkeypatch.setattr(
+        "trading_mvp.main.maybe_refresh_exchange_sync_freshness",
+        fake_refresh_exchange_sync,
+    )
+    monkeypatch.setattr("trading_mvp.main.READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS", 0.0)
+    monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_inflight", False)
+    monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_last_started", 0.0)
 
-        monkeypatch.setattr(
-            "trading_mvp.main.maybe_refresh_exchange_sync_freshness",
-            fake_refresh_exchange_sync,
-        )
-        monkeypatch.setattr("trading_mvp.main.READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS", 0.0)
-        monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_inflight", False)
-        monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_last_started", 0.0)
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/overview")
 
-        with TestClient(app) as client:
-            response = client.get("/api/dashboard/overview")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sync_freshness_summary"]["account"]["stale"] is True
+    assert refresh_started.wait(timeout=2.0) is True
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["sync_freshness_summary"]["account"]["stale"] is True
-        assert refresh_completed.wait(timeout=2.0) is True
+    allow_refresh_commit.set()
+    assert refresh_completed.wait(timeout=2.0) is True
 
-        with TestingSessionLocal() as session:
-            refreshed = get_overview(session)
-            assert refreshed.sync_freshness_summary["account"]["stale"] is False
-            assert refreshed.sync_freshness_summary["protective_orders"]["stale"] is False
-    finally:
-        app.dependency_overrides.clear()
+    with TestingSessionLocal() as session:
+        refreshed = get_overview(session)
+        assert refreshed.sync_freshness_summary["account"]["stale"] is False
+        assert refreshed.sync_freshness_summary["protective_orders"]["stale"] is False
 
 
-def test_audit_api_returns_event_category(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'audit_categories.db'}", future=True)
-    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+def test_audit_api_returns_event_category(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("audit_categories.db")
 
-    def override_get_db():
-        with TestingSessionLocal() as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_get_db
-    try:
-        with TestingSessionLocal() as session:
-            session.add(
-                AuditEvent(
-                    event_type="live_execution_rejected",
-                    entity_type="order",
-                    entity_id="1",
-                    severity="warning",
-                    message="Execution rejected.",
-                    payload={},
-                )
+    with TestingSessionLocal() as session:
+        session.add(
+            AuditEvent(
+                event_type="live_execution_rejected",
+                entity_type="order",
+                entity_id="1",
+                severity="warning",
+                message="Execution rejected.",
+                payload={},
             )
-            session.commit()
+        )
+        session.commit()
 
-        with TestClient(app) as client:
-            response = client.get("/api/audit?search=live_execution_rejected&limit=1")
+    with TestClient(app) as client:
+        response = client.get("/api/audit?search=live_execution_rejected&limit=1")
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload[0]["event_type"] == "live_execution_rejected"
-        assert payload[0]["event_category"] == "execution"
-    finally:
-        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload[0]["event_type"] == "live_execution_rejected"
+    assert payload[0]["event_category"] == "execution"

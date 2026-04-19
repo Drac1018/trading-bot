@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.providers import DeterministicMockProvider
@@ -342,6 +341,18 @@ def test_replay_metric_summary_calculates_expectancy_and_mfe_mae() -> None:
     assert summary.average_mae_pct == pytest.approx(0.01666667, abs=1e-8)
     assert summary.best_mfe_pct == 0.05
     assert summary.worst_mae_pct == 0.025
+
+
+def test_replay_metric_summary_uses_zero_baseline_for_equity_points() -> None:
+    accumulator = ReplayAccumulator(
+        decisions=3,
+        closed_trades=2,
+        trade_nets=[-2.0, 5.0],
+    )
+
+    summary = _summarize_metrics(accumulator, equity_points=[-2.0, 3.0, -1.0])
+
+    assert summary.max_drawdown == 4.0
 
 
 def test_replay_parameter_recommendation_returns_fallback_when_data_is_insufficient() -> None:

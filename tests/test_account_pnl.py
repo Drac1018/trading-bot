@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 from trading_mvp.models import Execution, Order, PnLSnapshot
 from trading_mvp.schemas import TradeDecision
 from trading_mvp.services.account import (
+    account_snapshot_to_dict,
     create_exchange_pnl_snapshot,
     get_latest_pnl_snapshot,
 )
@@ -124,9 +125,11 @@ def test_live_snapshot_uses_execution_net_pnl_and_fees(db_session) -> None:
     assert snapshot.realized_pnl == pytest.approx(13.5, rel=1e-9)
     assert snapshot.daily_pnl == pytest.approx(13.5, rel=1e-9)
     assert snapshot.cumulative_pnl == pytest.approx(13.5, rel=1e-9)
-    assert snapshot.cash_balance == pytest.approx(settings_row.starting_equity + 13.5, rel=1e-9)
-    assert snapshot.wallet_balance == pytest.approx(settings_row.starting_equity + 13.5, rel=1e-9)
-    assert snapshot.available_balance == pytest.approx(settings_row.starting_equity + 13.5, rel=1e-9)
+    assert snapshot.id is None
+    assert snapshot.cash_balance == pytest.approx(0.0, rel=1e-9)
+    assert snapshot.wallet_balance == pytest.approx(0.0, rel=1e-9)
+    assert snapshot.available_balance == pytest.approx(0.0, rel=1e-9)
+    assert account_snapshot_to_dict(snapshot)["equity"] is None
 
 
 def test_exchange_snapshot_prefers_live_balances_and_applies_funding_ledger(db_session) -> None:
@@ -220,8 +223,8 @@ def test_get_latest_snapshot_repairs_stale_copied_totals_from_executions(db_sess
     settings_row = get_or_create_settings(db_session)
     stale_row = PnLSnapshot(
         snapshot_date=utcnow_naive().date(),
-        equity=settings_row.starting_equity,
-        cash_balance=settings_row.starting_equity,
+        equity=0.0,
+        cash_balance=0.0,
         realized_pnl=0.0,
         unrealized_pnl=0.0,
         daily_pnl=0.0,
