@@ -81,6 +81,32 @@ MARKET_CONTEXT_SUMMARY_KEYS = (
     "weak_volume",
     "momentum_weakening",
 )
+DERIVATIVES_SUMMARY_KEYS = (
+    "available",
+    "source",
+    "funding_bias",
+    "basis_bias",
+    "taker_flow_alignment",
+    "long_alignment_score",
+    "short_alignment_score",
+    "crowded_long_risk",
+    "crowded_short_risk",
+    "spread_headwind",
+    "spread_stress",
+    "spread_bps",
+)
+EVENT_CONTEXT_SUMMARY_KEYS = (
+    "source_status",
+    "next_event_name",
+    "next_event_at",
+    "next_event_importance",
+    "minutes_to_next_event",
+    "active_risk_window",
+    "event_bias",
+    "is_stale",
+    "is_complete",
+    "affected_assets",
+)
 ADAPTIVE_SIGNAL_SUMMARY_KEYS = (
     "status",
     "active_inputs",
@@ -423,6 +449,31 @@ def _compact_dict(
 
 def _compact_market_context_summary(value: object) -> dict[str, Any]:
     return _compact_dict(value, allowed_keys=MARKET_CONTEXT_SUMMARY_KEYS)
+
+
+def _compact_derivatives_summary(value: object) -> dict[str, Any]:
+    compact = _compact_dict(value, allowed_keys=DERIVATIVES_SUMMARY_KEYS)
+    if compact:
+        return compact
+    return {
+        "available": False,
+        "source": "unavailable",
+        "funding_bias": "unknown",
+        "basis_bias": "unknown",
+        "taker_flow_alignment": "unknown",
+    }
+
+
+def _compact_event_context_summary(value: object) -> dict[str, Any]:
+    compact = _compact_dict(value, allowed_keys=EVENT_CONTEXT_SUMMARY_KEYS)
+    if compact:
+        return compact
+    return {
+        "source_status": "unavailable",
+        "is_stale": False,
+        "is_complete": False,
+        "active_risk_window": False,
+    }
 
 
 def _compact_adaptive_signal_summary(value: object) -> dict[str, Any]:
@@ -1439,6 +1490,19 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
             or ""
         )
         or None,
+        event_risk_acknowledgement=str(
+            payload.get("event_risk_acknowledgement")
+            or metadata.get("event_risk_acknowledgement")
+            or ""
+        )
+        or None,
+        confidence_penalty_reason=str(
+            payload.get("confidence_penalty_reason")
+            or metadata.get("confidence_penalty_reason")
+            or ""
+        )
+        or None,
+        scenario_note=str(payload.get("scenario_note") or metadata.get("scenario_note") or "") or None,
         decision_reference=decision_reference,
         raw_output={},
     )
@@ -1660,6 +1724,66 @@ def _extract_symbol_market_context(
     if market_row is not None and isinstance(market_row.payload, dict):
         return _compact_market_context_summary(market_row.payload.get("regime_summary", {}))
     return {}
+
+
+def _extract_symbol_derivatives_summary(
+    row: AgentRun | None,
+    market_row: MarketSnapshot | None,
+    feature_row: FeatureSnapshot | None,
+) -> dict[str, Any]:
+    if row is not None and isinstance(row.input_payload, dict):
+        ai_context = _as_dict(row.input_payload.get("ai_context", {}))
+        if ai_context:
+            summary = _as_dict(ai_context.get("derivatives_summary", {}))
+            if summary:
+                return _compact_derivatives_summary(summary)
+        feature_layers = _as_dict(row.input_payload.get("feature_layers", {}))
+        if feature_layers:
+            summary = _as_dict(feature_layers.get("derivatives_summary", {}))
+            if summary:
+                return _compact_derivatives_summary(summary)
+        features = _as_dict(row.input_payload.get("features", {}))
+        if features:
+            derivatives = _as_dict(features.get("derivatives", {}))
+            if derivatives:
+                return _compact_derivatives_summary(derivatives)
+    if feature_row is not None and isinstance(feature_row.payload, dict):
+        derivatives = _as_dict(feature_row.payload.get("derivatives", {}))
+        if derivatives:
+            return _compact_derivatives_summary(derivatives)
+    if market_row is not None and isinstance(market_row.payload, dict):
+        return _compact_derivatives_summary(market_row.payload.get("derivatives_context", {}))
+    return _compact_derivatives_summary({})
+
+
+def _extract_symbol_event_context_summary(
+    row: AgentRun | None,
+    market_row: MarketSnapshot | None,
+    feature_row: FeatureSnapshot | None,
+) -> dict[str, Any]:
+    if row is not None and isinstance(row.input_payload, dict):
+        ai_context = _as_dict(row.input_payload.get("ai_context", {}))
+        if ai_context:
+            summary = _as_dict(ai_context.get("event_context_summary", {}))
+            if summary:
+                return _compact_event_context_summary(summary)
+        feature_layers = _as_dict(row.input_payload.get("feature_layers", {}))
+        if feature_layers:
+            summary = _as_dict(feature_layers.get("event_context_summary", {}))
+            if summary:
+                return _compact_event_context_summary(summary)
+        features = _as_dict(row.input_payload.get("features", {}))
+        if features:
+            event_context = _as_dict(features.get("event_context", {}))
+            if event_context:
+                return _compact_event_context_summary(event_context)
+    if feature_row is not None and isinstance(feature_row.payload, dict):
+        event_context = _as_dict(feature_row.payload.get("event_context", {}))
+        if event_context:
+            return _compact_event_context_summary(event_context)
+    if market_row is not None and isinstance(market_row.payload, dict):
+        return _compact_event_context_summary(market_row.payload.get("event_context", {}))
+    return _compact_event_context_summary({})
 
 
 def _extract_latest_candle_time(market_row: MarketSnapshot | None) -> datetime | None:
@@ -2127,6 +2251,8 @@ def _build_operator_symbol_summaries(
         feature_row = latest_features.get(symbol_key)
         market_candle_time = _extract_latest_candle_time(market_row)
         market_context_summary = _extract_symbol_market_context(decision_row, market_row, feature_row)
+        derivatives_summary = _extract_symbol_derivatives_summary(decision_row, market_row, feature_row)
+        event_context_summary = _extract_symbol_event_context_summary(decision_row, market_row, feature_row)
         protection_state = (
             _build_position_protection_state(session, position_row)
             if position_row is not None
@@ -2185,6 +2311,8 @@ def _build_operator_symbol_summaries(
                 feature_input_delay_threshold_minutes=feature_input_delay_threshold_minutes,
                 feature_input_delayed=feature_input_delayed,
                 market_context_summary=market_context_summary,
+                derivatives_summary=derivatives_summary,
+                event_context_summary=event_context_summary,
                 ai_decision=decision_snapshot,
                 pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),
                 risk_guard=_build_risk_snapshot(risk_row),

@@ -7,8 +7,14 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import MarketSnapshot
-from trading_mvp.schemas import DerivativesContextPayload, MarketCandle, MarketSnapshotPayload
+from trading_mvp.schemas import (
+    DerivativesContextPayload,
+    EventContextPayload,
+    MarketCandle,
+    MarketSnapshotPayload,
+)
 from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.event_context import EventContextProvider, build_event_context
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
@@ -249,9 +255,12 @@ def build_market_snapshot(
     binance_testnet_enabled: bool = False,
     stale_threshold_seconds: int = 1800,
     derivatives_context_override: DerivativesContextPayload | None = None,
+    event_context_override: EventContextPayload | None = None,
+    event_context_provider: EventContextProvider | None = None,
 ) -> MarketSnapshotPayload:
+    snapshot: MarketSnapshotPayload
     if upto_index is not None or force_stale:
-        return _build_seed_snapshot(
+        snapshot = _build_seed_snapshot(
             symbol,
             timeframe,
             lookback,
@@ -259,18 +268,29 @@ def build_market_snapshot(
             force_stale,
             derivatives_context=derivatives_context_override,
         )
+    else:
+        if not use_binance:
+            raise RuntimeError("실거래 모드에서는 Binance 실데이터가 꺼져 있으면 시장 스냅샷을 만들 수 없습니다.")
 
-    if not use_binance:
-        raise RuntimeError("실거래 모드에서는 Binance 실데이터가 꺼져 있으면 시장 스냅샷을 만들 수 없습니다.")
-
-    return _build_binance_snapshot(
-        symbol=symbol,
-        timeframe=timeframe,
-        lookback=lookback,
-        testnet_enabled=binance_testnet_enabled,
-        stale_threshold_seconds=stale_threshold_seconds,
-        derivatives_context=derivatives_context_override,
+        snapshot = _build_binance_snapshot(
+            symbol=symbol,
+            timeframe=timeframe,
+            lookback=lookback,
+            testnet_enabled=binance_testnet_enabled,
+            stale_threshold_seconds=stale_threshold_seconds,
+            derivatives_context=derivatives_context_override,
+        )
+    resolved_event_context = (
+        event_context_override.model_copy(deep=True)
+        if event_context_override is not None
+        else build_event_context(
+            symbol=snapshot.symbol,
+            timeframe=snapshot.timeframe,
+            generated_at=snapshot.snapshot_time,
+            provider=event_context_provider,
+        )
     )
+    return snapshot.model_copy(update={"event_context": resolved_event_context})
 
 
 def build_market_context(
@@ -284,6 +304,7 @@ def build_market_context(
     use_binance: bool = False,
     binance_testnet_enabled: bool = False,
     stale_threshold_seconds: int = 1800,
+    event_context_provider: EventContextProvider | None = None,
 ) -> dict[str, MarketSnapshotPayload]:
     timeframes = [base_timeframe, *[item for item in context_timeframes if item != base_timeframe]]
     snapshots: dict[str, MarketSnapshotPayload] = {}
@@ -295,7 +316,23 @@ def build_market_context(
             BinanceClient(testnet_enabled=binance_testnet_enabled, futures_enabled=True),
             symbol,
         )
+    base_snapshot = build_market_snapshot(
+        symbol=symbol,
+        timeframe=base_timeframe,
+        lookback=lookback,
+        upto_index=upto_index,
+        force_stale=force_stale,
+        use_binance=use_binance,
+        binance_testnet_enabled=binance_testnet_enabled,
+        stale_threshold_seconds=stale_threshold_seconds,
+        derivatives_context_override=derivatives_context,
+        event_context_provider=event_context_provider,
+    )
+    snapshots[base_timeframe] = base_snapshot
+    shared_event_context = base_snapshot.event_context.model_copy(deep=True)
     for timeframe in timeframes:
+        if timeframe == base_timeframe:
+            continue
         snapshots[timeframe] = build_market_snapshot(
             symbol=symbol,
             timeframe=timeframe,
@@ -306,6 +343,7 @@ def build_market_context(
             binance_testnet_enabled=binance_testnet_enabled,
             stale_threshold_seconds=stale_threshold_seconds,
             derivatives_context_override=derivatives_context,
+            event_context_override=shared_event_context,
         )
     return snapshots
 
@@ -321,6 +359,7 @@ def build_lead_market_contexts(
     use_binance: bool = False,
     binance_testnet_enabled: bool = False,
     stale_threshold_seconds: int = 1800,
+    event_context_provider: EventContextProvider | None = None,
 ) -> dict[str, dict[str, MarketSnapshotPayload]]:
     contexts: dict[str, dict[str, MarketSnapshotPayload]] = {}
     for symbol in lead_symbols:
@@ -338,6 +377,7 @@ def build_lead_market_contexts(
                 use_binance=use_binance,
                 binance_testnet_enabled=binance_testnet_enabled,
                 stale_threshold_seconds=stale_threshold_seconds,
+                event_context_provider=event_context_provider,
             )
         except RuntimeError:
             continue

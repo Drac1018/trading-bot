@@ -12,9 +12,14 @@ from trading_mvp.schemas import (
     CompositeRegimePacket,
     DataQualityPacket,
     DerivativesContextPayload,
+    DerivativesSummaryPayload,
+    EventContextPayload,
+    EventContextSummaryPayload,
+    LeadLagSummaryPayload,
     MarketCandle,
     MarketSnapshotPayload,
     PreviousThesisDeltaPacket,
+    RegimeSummaryPayload,
     TradeDecision,
 )
 from trading_mvp.services.adaptive_signal import (
@@ -22,7 +27,7 @@ from trading_mvp.services.adaptive_signal import (
     build_adaptive_signal_context,
     compute_adaptive_adjustment,
 )
-from trading_mvp.services.agents import TradingDecisionAgent
+from trading_mvp.services.agents import TradingDecisionAgent, build_trading_decision_input_payload
 from trading_mvp.services.features import compute_features, summarize_universe_breadth
 from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.strategy_engines import select_strategy_engine
@@ -2112,6 +2117,35 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
             "4h": _snapshot("4h", [92, 93.4, 94.9, 96.6, 98.4, 100.1, 102.0, 104.1, 106.4, 108.8, 111.3, 114.0, 116.8, 119.7, 122.7, 125.8]),
         },
     )
+    event_context = EventContextPayload(
+        source_status="fixture",
+        generated_at=bullish_base.snapshot_time,
+        is_stale=False,
+        is_complete=True,
+        next_event_at=bullish_base.snapshot_time + timedelta(minutes=18),
+        next_event_name="US CPI",
+        next_event_importance="high",
+        minutes_to_next_event=18,
+        active_risk_window=True,
+        affected_assets=["BTC", "BTCUSDT"],
+        event_bias="bearish",
+        events=[],
+    )
+    bullish_features = bullish_features.model_copy(
+        update={
+            "event_context": event_context,
+            "lead_lag": bullish_features.lead_lag.model_copy(
+                update={
+                    "available": True,
+                    "leader_bias": "bullish",
+                    "reference_symbols": ["BTCUSDT", "ETHUSDT"],
+                    "bullish_alignment_score": 0.74,
+                    "bearish_alignment_score": 0.24,
+                    "strong_reference_confirmation": True,
+                }
+            ),
+        }
+    )
     ai_context = AIDecisionContextPacket(
         symbol="BTCUSDT",
         timeframe="15m",
@@ -2127,6 +2161,53 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
             persistence_class="established",
             transition_risk="medium",
             regime_reason_codes=["TREND_UP"],
+        ),
+        regime_summary=RegimeSummaryPayload(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="expanded",
+            volume_regime="strong",
+            momentum_state="strengthening",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        derivatives_summary=DerivativesSummaryPayload(
+            available=True,
+            source="binance_public",
+            funding_bias="neutral",
+            basis_bias="neutral",
+            taker_flow_alignment="unknown",
+            long_alignment_score=0.5,
+            short_alignment_score=0.5,
+            crowded_long_risk=False,
+            crowded_short_risk=False,
+            spread_headwind=False,
+            spread_stress=False,
+            oi_expanding_with_price=False,
+            oi_falling_on_breakout=False,
+        ),
+        lead_lag_summary=LeadLagSummaryPayload(
+            available=True,
+            leader_bias="bullish",
+            reference_symbols=["BTCUSDT", "ETHUSDT"],
+            bullish_alignment_score=0.74,
+            bearish_alignment_score=0.24,
+            bullish_breakout_confirmed=False,
+            bearish_breakout_confirmed=False,
+            bullish_pullback_supported=False,
+            bearish_pullback_supported=False,
+            bullish_continuation_supported=False,
+            bearish_continuation_supported=False,
+            strong_reference_confirmation=True,
+            weak_reference_confirmation=False,
+        ),
+        event_context_summary=EventContextSummaryPayload(
+            source_status="fixture",
+            next_event_name="US CPI",
+            next_event_importance="high",
+            minutes_to_next_event=18,
+            active_risk_window=True,
+            event_bias="bearish",
         ),
         data_quality=DataQualityPacket(
             data_quality_grade="partial",
@@ -2189,12 +2270,19 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     )
 
     assert provider_name == "openai"
+    assert captured_payloads[0]["feature_layers"]["regime_summary"]["primary_regime"] == "bullish"
+    assert captured_payloads[0]["feature_layers"]["lead_lag_summary"]["available"] is True
+    assert captured_payloads[0]["feature_layers"]["event_context_summary"]["next_event_name"] == "US CPI"
     assert captured_payloads[0]["ai_context"]["strategy_engine"] == "trend_pullback_engine"
     assert captured_payloads[0]["ai_context"]["holding_profile"] == "swing"
+    assert captured_payloads[0]["ai_context"]["event_context_summary"]["active_risk_window"] is True
     assert captured_payloads[0]["ai_context"]["prior_context"]["engine_prior_classification"] == "strong"
     assert decision.prompt_family_hint == "entry_candidate_event:trend_pullback_engine"
     assert decision.regime_transition_risk == "medium"
     assert decision.data_quality_penalty_applied is True
+    assert decision.event_risk_acknowledgement is None
+    assert decision.confidence_penalty_reason is None
+    assert decision.scenario_note is None
     assert decision.expected_time_to_0_25r_minutes is not None
     assert decision.expected_time_to_0_5r_minutes is not None
     assert decision.expected_mae_r is not None
@@ -2213,6 +2301,81 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert metadata["session_time_penalty_applied"] is False
     assert metadata["allowed_actions"] == ["hold", "long", "short"]
     assert metadata["bounded_output_applied"] is False
+
+
+def test_trading_decision_input_payload_exposes_separated_feature_layers() -> None:
+    base = _snapshot(
+        "15m",
+        [100, 100.4, 100.6, 100.8, 100.7, 101.0, 101.2, 101.1, 101.4, 101.6, 101.8, 102.0, 102.2, 102.1, 102.4, 103.1],
+        volumes=[900, 920, 940, 960, 955, 980, 1000, 1020, 1040, 1060, 1090, 1120, 1150, 1180, 1220, 1260],
+    )
+    features = compute_features(
+        base,
+        {
+            "1h": _snapshot("1h", [98, 98.7, 99.4, 100.1, 100.9, 101.8, 102.7, 103.6, 104.4, 105.2, 106.1, 107.0, 108.0, 109.1, 110.2, 111.4]),
+            "4h": _snapshot("4h", [92, 93.4, 94.9, 96.6, 98.4, 100.1, 102.0, 104.1, 106.4, 108.8, 111.3, 114.0, 116.8, 119.7, 122.7, 125.8]),
+        },
+    )
+    features = features.model_copy(
+        update={
+            "event_context": EventContextPayload(
+                source_status="fixture",
+                generated_at=base.snapshot_time,
+                is_stale=False,
+                is_complete=True,
+                next_event_at=base.snapshot_time + timedelta(minutes=40),
+                next_event_name="FOMC",
+                next_event_importance="high",
+                minutes_to_next_event=40,
+                active_risk_window=True,
+                affected_assets=["BTCUSDT"],
+                event_bias="neutral",
+                events=[],
+            )
+        }
+    )
+
+    payload = build_trading_decision_input_payload(
+        market_snapshot=base,
+        higher_timeframe_context={
+            "1h": _snapshot("1h", [98, 98.7, 99.4, 100.1, 100.9, 101.8, 102.7, 103.6, 104.4, 105.2, 106.1, 107.0, 108.0, 109.1, 110.2, 111.4]),
+            "4h": _snapshot("4h", [92, 93.4, 94.9, 96.6, 98.4, 100.1, 102.0, 104.1, 106.4, 108.8, 111.3, 114.0, 116.8, 119.7, 122.7, 125.8]),
+        },
+        feature_payload=features,
+        risk_context=_risk_context(),
+        decision_reference={"market_snapshot_id": 1},
+    )
+
+    assert payload["features"]["event_context"]["next_event_name"] == "FOMC"
+    assert payload["feature_layers"]["regime_summary"]["primary_regime"] == features.regime.primary_regime
+    assert payload["feature_layers"]["derivatives_summary"]["available"] == features.derivatives.available
+    assert payload["feature_layers"]["lead_lag_summary"]["leader_bias"] == features.lead_lag.leader_bias
+    assert payload["feature_layers"]["event_context_summary"]["next_event_name"] == "FOMC"
+    assert payload["feature_layers"]["event_context_summary"]["active_risk_window"] is True
+
+
+def test_trade_decision_schema_accepts_event_aware_optional_fields() -> None:
+    decision = TradeDecision(
+        decision="hold",
+        confidence=0.41,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_mode="none",
+        holding_profile="scalp",
+        max_holding_minutes=60,
+        risk_pct=0.01,
+        leverage=1.0,
+        rationale_codes=["HIGH_IMPACT_EVENT_NEARBY"],
+        event_risk_acknowledgement="US CPI risk window active",
+        confidence_penalty_reason="HIGH_IMPACT_EVENT_WINDOW_ACTIVE",
+        scenario_note="Wait for post-event repricing before considering a new entry.",
+        explanation_short="event-aware hold",
+        explanation_detailed="The setup is valid structurally but a nearby high-impact event lowers confidence and supports a no-trade posture.",
+    )
+
+    assert decision.event_risk_acknowledgement == "US CPI risk window active"
+    assert decision.confidence_penalty_reason == "HIGH_IMPACT_EVENT_WINDOW_ACTIVE"
+    assert decision.scenario_note == "Wait for post-event repricing before considering a new entry."
 
 
 def test_trading_agent_bounds_degraded_long_horizon_entry_to_hold() -> None:

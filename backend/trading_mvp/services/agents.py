@@ -27,6 +27,12 @@ from trading_mvp.services.adaptive_signal import (
     ADAPTIVE_SETUP_DISABLE_REASON_CODE,
     compute_adaptive_adjustment,
 )
+from trading_mvp.services.ai_context import (
+    build_derivatives_summary,
+    build_event_context_summary,
+    build_lead_lag_summary,
+    build_regime_summary,
+)
 from trading_mvp.services.ai_prompt_routing import (
     bound_trade_decision,
     render_prompt_instructions,
@@ -178,6 +184,12 @@ def build_trading_decision_input_payload(
     ai_trigger: dict[str, Any] | None = None,
     ai_context: AIDecisionContextPacket | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    feature_layers = {
+        "regime_summary": build_regime_summary(features=feature_payload).model_dump(mode="json"),
+        "derivatives_summary": build_derivatives_summary(features=feature_payload).model_dump(mode="json"),
+        "lead_lag_summary": build_lead_lag_summary(features=feature_payload).model_dump(mode="json"),
+        "event_context_summary": build_event_context_summary(features=feature_payload).model_dump(mode="json"),
+    }
     payload = {
         "market_snapshot": market_snapshot.model_dump(mode="json"),
         "market_context": {
@@ -185,6 +197,7 @@ def build_trading_decision_input_payload(
             for context_timeframe, snapshot in higher_timeframe_context.items()
         },
         "features": feature_payload.model_dump(mode="json"),
+        "feature_layers": feature_layers,
         "risk_context": risk_context,
         "decision_reference": decision_reference,
     }
@@ -2825,6 +2838,12 @@ class TradingDecisionAgent:
                 }
                 for candle in market_snapshot.candles[-candle_limit:]
             ]
+            feature_layers = {
+                "regime_summary": build_regime_summary(features=features).model_dump(mode="json"),
+                "derivatives_summary": build_derivatives_summary(features=features).model_dump(mode="json"),
+                "lead_lag_summary": build_lead_lag_summary(features=features).model_dump(mode="json"),
+                "event_context_summary": build_event_context_summary(features=features).model_dump(mode="json"),
+            }
             compact_payload = {
                 "market_snapshot": {
                     "symbol": market_snapshot.symbol,
@@ -2858,6 +2877,7 @@ class TradingDecisionAgent:
                     },
                     "data_quality_flags": features.data_quality_flags,
                 },
+                "feature_layers": feature_layers,
                 "open_positions": [
                     {
                         "side": position.side,

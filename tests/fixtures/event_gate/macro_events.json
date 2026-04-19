@@ -1,0 +1,81 @@
+{
+  "cases": {
+    "btc_pre_high_event_long": {
+      "source_generated_at": "2026-04-20T11:40:00+00:00",
+      "events": [
+        {
+          "event_name": "FOMC",
+          "event_at": "2026-04-20T12:35:00+00:00",
+          "importance": "high",
+          "affected_assets": [
+            "BTCUSDT",
+            "ETHUSDT"
+          ],
+          "event_bias": "neutral"
+        }
+      ]
+    },
+    "eth_post_high_event_short": {
+      "source_generated_at": "2026-04-20T11:20:00+00:00",
+      "events": [
+        {
+          "event_name": "US CPI",
+          "event_at": "2026-04-20T11:45:00+00:00",
+          "importance": "high",
+          "affected_assets": [
+            "ETHUSDT",
+            "BTCUSDT"
+          ],
+          "event_bias": "bearish"
+        }
+      ]
+    },
+    "sol_reduce_during_high_event": {
+      "source_generated_at": "2026-04-20T11:35:00+00:00",
+      "events": [
+        {
+          "event_name": "Powell Speech",
+          "event_at": "2026-04-20T12:10:00+00:00",
+          "importance": "high",
+          "affected_assets": [
+            "SOLUSDT",
+            "BTCUSDT"
+          ],
+          "event_bias": "neutral"
+        }
+      ]
+    },
+    "ada_unavailable_source_long": {
+      "mode": "unavailable"
+    },
+    "doge_stale_source_long": {
+      "source_generated_at": "2026-04-20T07:00:00+00:00",
+      "stale_after_minutes": 60,
+      "events": [
+        {
+          "event_name": "ECB",
+          "event_at": "2026-04-20T15:00:00+00:00",
+          "importance": "medium",
+          "affected_assets": [
+            "DOGEUSDT"
+          ],
+          "event_bias": "neutral"
+        }
+      ]
+    },
+    "xrp_clean_entry_long": {
+      "source_generated_at": "2026-04-20T11:30:00+00:00",
+      "events": [
+        {
+          "event_name": "Token Unlock",
+          "event_at": "2026-04-20T15:30:00+00:00",
+          "importance": "medium",
+          "affected_assets": [
+            "XRPUSDT"
+          ],
+          "event_bias": "neutral"
+        }
+      ]
+    }
+  }
+}

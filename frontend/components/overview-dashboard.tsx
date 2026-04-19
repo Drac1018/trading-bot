@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "../lib/selected-symbol";
+import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshIntervalMs = 15000;
@@ -103,6 +104,9 @@ type OperatorDecisionSnapshot = {
   trigger_deduped: boolean;
   trigger_fingerprint: string | null;
   last_ai_skip_reason: string | null;
+  event_risk_acknowledgement: string | null;
+  confidence_penalty_reason: string | null;
+  scenario_note: string | null;
 };
 
 type OperatorRiskSnapshot = {
@@ -233,6 +237,8 @@ type OperatorSymbolSummary = {
   feature_input_delay_threshold_minutes: number | null;
   feature_input_delayed: boolean;
   market_context_summary: Record<string, unknown>;
+  derivatives_summary: Record<string, unknown>;
+  event_context_summary: Record<string, unknown>;
   ai_decision: OperatorDecisionSnapshot;
   risk_guard: OperatorRiskSnapshot;
   execution: OperatorExecutionSnapshot;
@@ -885,6 +891,43 @@ function valueCard(title: string, value: string, hint: string) {
       <p className="text-xs font-medium text-slate-500">{title}</p>
       <p className="mt-2 text-xl font-semibold text-slate-950">{value}</p>
       <p className="mt-2 text-xs leading-5 text-slate-500">{hint}</p>
+    </div>
+  );
+}
+
+function detailSectionCard(section: ReturnType<typeof buildOperatorDetailSections>[number]) {
+  return (
+    <div key={section.key} className="rounded-2xl border border-slate-200 bg-white p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(section.tone as OperatorDetailTone)}`}>
+          {section.title}
+        </span>
+      </div>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        {section.items.map((item) =>
+          valueCard(item.label, item.value, item.hint),
+        )}
+      </div>
+      {section.alerts.length > 0 ? (
+        <div className="mt-4 space-y-2">
+          {section.alerts.map((alert, index) => (
+            <div
+              key={`${section.key}-alert-${index}`}
+              className={`rounded-2xl px-4 py-3 text-sm ${
+                alert.tone === "danger"
+                  ? "bg-rose-50 text-rose-800"
+                  : alert.tone === "warn"
+                    ? "bg-amber-50 text-amber-900"
+                    : alert.tone === "good"
+                      ? "bg-emerald-50 text-emerald-800"
+                      : "bg-slate-50 text-slate-600"
+              }`}
+            >
+              {alert.text}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1743,6 +1786,7 @@ function SymbolDetailPanel({
   const review = aiReviewSummary(symbol);
   const riskOutcome = riskOutcomeSummary(symbol);
   const executionOutcome = executionOutcomeSummary(symbol);
+  const detailSections = buildOperatorDetailSections(symbol);
 
   return (
     <section className="space-y-6 rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
@@ -1786,6 +1830,10 @@ function SymbolDetailPanel({
               ? `누락 ${symbol.protection_status.missing_components.join(", ")}`
               : "보호 주문 구성 정상",
         )}
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        {detailSections.map((section) => detailSectionCard(section))}
       </div>
 
       <div className="grid gap-4 lg:grid-cols-4">

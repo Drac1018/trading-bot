@@ -1570,6 +1570,137 @@ def test_operator_dashboard_uses_feature_snapshot_market_context_fallback(db_ses
     assert ada.feature_input_delayed is False
 
 
+def test_operator_dashboard_exposes_derivatives_and_event_context_summaries(db_session) -> None:
+    snapshot_time = utcnow_naive() - timedelta(minutes=5)
+    next_event_at = snapshot_time + timedelta(minutes=35)
+
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "ADAUSDT"
+    settings.tracked_symbols = ["ADAUSDT"]
+    settings.default_timeframe = "15m"
+    settings.live_trading_enabled = True
+    settings.manual_live_approval = True
+    settings.live_execution_armed = True
+    settings.live_execution_armed_until = snapshot_time + timedelta(minutes=15)
+    db_session.add(settings)
+    db_session.flush()
+
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings, scope=scope, synced_at=snapshot_time)
+    db_session.add(settings)
+    db_session.flush()
+
+    market = MarketSnapshot(
+        symbol="ADAUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=0.2477,
+        latest_volume=2321802.0,
+        candle_count=60,
+        is_stale=False,
+        is_complete=True,
+        payload={
+            "symbol": "ADAUSDT",
+            "timeframe": "15m",
+            "snapshot_time": snapshot_time.isoformat(),
+            "latest_price": 0.2477,
+            "latest_volume": 2321802.0,
+            "candle_count": 60,
+            "is_stale": False,
+            "is_complete": True,
+            "candles": [],
+            "derivatives_context": {
+                "available": True,
+                "source": "binance_public",
+                "funding_bias": "neutral",
+                "basis_bias": "bullish",
+                "taker_flow_alignment": "bullish",
+                "spread_bps": 4.2,
+                "spread_stress": False,
+            },
+            "event_context": {
+                "source_status": "stub",
+                "generated_at": snapshot_time.isoformat(),
+                "is_stale": False,
+                "is_complete": True,
+                "next_event_at": next_event_at.isoformat(),
+                "next_event_name": "FOMC",
+                "next_event_importance": "high",
+                "minutes_to_next_event": 35,
+                "active_risk_window": False,
+                "affected_assets": ["ADA", "BTC"],
+                "event_bias": "neutral",
+                "events": [],
+            },
+        },
+    )
+    db_session.add(market)
+    db_session.flush()
+    db_session.add(
+        FeatureSnapshot(
+            symbol="ADAUSDT",
+            timeframe="15m",
+            market_snapshot_id=market.id,
+            feature_time=snapshot_time,
+            trend_score=1.2,
+            volatility_pct=0.02,
+            volume_ratio=1.4,
+            drawdown_pct=0.01,
+            rsi=58.0,
+            atr=0.004,
+            payload={
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volatility_regime": "normal",
+                    "volume_regime": "strong",
+                    "momentum_state": "stable",
+                    "weak_volume": False,
+                    "momentum_weakening": False,
+                },
+                "derivatives": {
+                    "available": True,
+                    "source": "binance_public",
+                    "funding_bias": "neutral",
+                    "basis_bias": "bullish",
+                    "taker_flow_alignment": "bullish",
+                    "spread_bps": 3.8,
+                    "spread_stress": False,
+                    "crowded_long_risk": False,
+                    "crowded_short_risk": False,
+                },
+                "event_context": {
+                    "source_status": "stub",
+                    "generated_at": snapshot_time.isoformat(),
+                    "is_stale": False,
+                    "is_complete": True,
+                    "next_event_at": next_event_at.isoformat(),
+                    "next_event_name": "FOMC",
+                    "next_event_importance": "high",
+                    "minutes_to_next_event": 35,
+                    "active_risk_window": False,
+                    "affected_assets": ["ADA", "BTC"],
+                    "event_bias": "neutral",
+                    "events": [],
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+
+    ada = payload.symbols[0]
+    assert ada.derivatives_summary["available"] is True
+    assert ada.derivatives_summary["taker_flow_alignment"] == "bullish"
+    assert ada.derivatives_summary["spread_bps"] == 3.8
+    assert ada.event_context_summary["source_status"] == "stub"
+    assert ada.event_context_summary["next_event_name"] == "FOMC"
+    assert ada.event_context_summary["next_event_importance"] == "high"
+    assert ada.event_context_summary["minutes_to_next_event"] == 35
+    assert ada.event_context_summary["active_risk_window"] is False
+
+
 def test_operator_dashboard_marks_feature_input_delay_after_threshold(db_session) -> None:
     snapshot_time = utcnow_naive() - timedelta(minutes=45)
     candle_time = snapshot_time - timedelta(minutes=15)

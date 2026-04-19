@@ -1,0 +1,243 @@
+{
+  "cases": [
+    {
+      "case_id": "btc_pre_high_event_long",
+      "symbol": "BTCUSDT",
+      "timeframe": "15m",
+      "generated_at": "2026-04-20T12:00:00+00:00",
+      "decision_mode": "entry",
+      "entry_side": "long",
+      "base_series": {
+        "pattern": "trend_up",
+        "count": 60,
+        "start_price": 100.0,
+        "step": 1.2,
+        "wick": 0.4,
+        "volume_start": 1200.0,
+        "volume_step": 18.0
+      },
+      "context_series": {
+        "1h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 96.0,
+          "step": 1.0,
+          "wick": 0.5,
+          "volume_start": 1800.0,
+          "volume_step": 22.0
+        },
+        "4h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 90.0,
+          "step": 1.5,
+          "wick": 0.7,
+          "volume_start": 2400.0,
+          "volume_step": 28.0
+        }
+      },
+      "derivatives_context": {
+        "source": "seed_fallback"
+      }
+    },
+    {
+      "case_id": "eth_post_high_event_short",
+      "symbol": "ETHUSDT",
+      "timeframe": "15m",
+      "generated_at": "2026-04-20T12:00:00+00:00",
+      "decision_mode": "entry",
+      "entry_side": "short",
+      "base_series": {
+        "pattern": "trend_down",
+        "count": 60,
+        "start_price": 190.0,
+        "step": 1.1,
+        "wick": 0.4,
+        "volume_start": 1100.0,
+        "volume_step": 16.0
+      },
+      "context_series": {
+        "1h": {
+          "pattern": "trend_down",
+          "count": 60,
+          "start_price": 196.0,
+          "step": 1.0,
+          "wick": 0.5,
+          "volume_start": 1500.0,
+          "volume_step": 18.0
+        },
+        "4h": {
+          "pattern": "trend_down",
+          "count": 60,
+          "start_price": 210.0,
+          "step": 1.4,
+          "wick": 0.7,
+          "volume_start": 2100.0,
+          "volume_step": 24.0
+        }
+      },
+      "derivatives_context": {
+        "source": "seed_fallback"
+      }
+    },
+    {
+      "case_id": "sol_reduce_during_high_event",
+      "symbol": "SOLUSDT",
+      "timeframe": "15m",
+      "generated_at": "2026-04-20T12:00:00+00:00",
+      "decision_mode": "reduce_only",
+      "base_series": {
+        "pattern": "trend_down",
+        "count": 60,
+        "start_price": 150.0,
+        "step": 0.6,
+        "wick": 0.3,
+        "volume_start": 900.0,
+        "volume_step": 10.0
+      },
+      "context_series": {
+        "1h": {
+          "pattern": "trend_down",
+          "count": 60,
+          "start_price": 158.0,
+          "step": 0.5,
+          "wick": 0.4,
+          "volume_start": 1300.0,
+          "volume_step": 14.0
+        },
+        "4h": {
+          "pattern": "trend_down",
+          "count": 60,
+          "start_price": 166.0,
+          "step": 0.6,
+          "wick": 0.5,
+          "volume_start": 1700.0,
+          "volume_step": 18.0
+        }
+      },
+      "derivatives_context": {
+        "source": "seed_fallback"
+      }
+    },
+    {
+      "case_id": "ada_unavailable_source_long",
+      "symbol": "ADAUSDT",
+      "timeframe": "15m",
+      "generated_at": "2026-04-20T12:00:00+00:00",
+      "decision_mode": "entry",
+      "entry_side": "long",
+      "base_series": {
+        "pattern": "trend_up",
+        "count": 60,
+        "start_price": 50.0,
+        "step": 0.8,
+        "wick": 0.2,
+        "volume_start": 850.0,
+        "volume_step": 12.0
+      },
+      "context_series": {
+        "1h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 48.0,
+          "step": 0.65,
+          "wick": 0.25,
+          "volume_start": 1200.0,
+          "volume_step": 14.0
+        },
+        "4h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 44.0,
+          "step": 0.9,
+          "wick": 0.3,
+          "volume_start": 1500.0,
+          "volume_step": 16.0
+        }
+      },
+      "derivatives_context": {
+        "source": "seed_fallback"
+      }
+    },
+    {
+      "case_id": "doge_stale_source_long",
+      "symbol": "DOGEUSDT",
+      "timeframe": "15m",
+      "generated_at": "2026-04-20T12:00:00+00:00",
+      "decision_mode": "entry",
+      "entry_side": "long",
+      "base_series": {
+        "pattern": "trend_up",
+        "count": 60,
+        "start_price": 20.0,
+        "step": 0.45,
+        "wick": 0.15,
+        "volume_start": 780.0,
+        "volume_step": 10.0
+      },
+      "context_series": {
+        "1h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 19.0,
+          "step": 0.4,
+          "wick": 0.2,
+          "volume_start": 980.0,
+          "volume_step": 12.0
+        },
+        "4h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 18.0,
+          "step": 0.5,
+          "wick": 0.25,
+          "volume_start": 1280.0,
+          "volume_step": 14.0
+        }
+      },
+      "derivatives_context": {
+        "source": "seed_fallback"
+      }
+    },
+    {
+      "case_id": "xrp_clean_entry_long",
+      "symbol": "XRPUSDT",
+      "timeframe": "15m",
+      "generated_at": "2026-04-20T12:00:00+00:00",
+      "decision_mode": "entry",
+      "entry_side": "long",
+      "base_series": {
+        "pattern": "trend_up",
+        "count": 60,
+        "start_price": 30.0,
+        "step": 0.6,
+        "wick": 0.18,
+        "volume_start": 820.0,
+        "volume_step": 11.0
+      },
+      "context_series": {
+        "1h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 28.0,
+          "step": 0.55,
+          "wick": 0.2,
+          "volume_start": 1100.0,
+          "volume_step": 13.0
+        },
+        "4h": {
+          "pattern": "trend_up",
+          "count": 60,
+          "start_price": 26.0,
+          "step": 0.7,
+          "wick": 0.24,
+          "volume_start": 1400.0,
+          "volume_step": 15.0
+        }
+      },
+      "derivatives_context": {
+        "source": "seed_fallback"
+      }
+    }
+  ]
+}

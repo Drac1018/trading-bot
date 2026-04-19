@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -23,6 +23,9 @@ RegimeExecution = Literal["clean", "normal", "stress", "unavailable"]
 PersistenceClass = Literal["early", "established", "extended"]
 TransitionRisk = Literal["low", "medium", "high"]
 DataQualityGrade = Literal["complete", "partial", "degraded", "unavailable"]
+EventSourceStatus = Literal["fixture", "stub", "unavailable", "stale", "incomplete"]
+MacroEventImportance = Literal["low", "medium", "high"]
+EventBias = Literal["bullish", "bearish", "neutral"]
 AITriggerReason = Literal[
     "entry_candidate_event",
     "breakout_exception_event",
@@ -101,6 +104,9 @@ class TradeDecision(StrictBaseModel):
     analytics_excluded_from_entry_stats: bool = False
     prompt_family_hint: str | None = None
     ai_context_version: str = AI_CONTEXT_VERSION
+    event_risk_acknowledgement: str | None = None
+    confidence_penalty_reason: str | None = None
+    scenario_note: str | None = None
     explanation_short: str = Field(min_length=3, max_length=240)
     explanation_detailed: str = Field(min_length=10, max_length=600)
 
@@ -294,6 +300,10 @@ class AIDecisionContextPacket(StrictBaseModel):
     timeframe: str = Field(min_length=1, max_length=20)
     trigger_type: AITriggerReason | None = None
     composite_regime: CompositeRegimePacket
+    regime_summary: RegimeSummaryPayload = Field(default_factory=lambda: RegimeSummaryPayload())
+    derivatives_summary: DerivativesSummaryPayload = Field(default_factory=lambda: DerivativesSummaryPayload())
+    lead_lag_summary: LeadLagSummaryPayload = Field(default_factory=lambda: LeadLagSummaryPayload())
+    event_context_summary: EventContextSummaryPayload = Field(default_factory=lambda: EventContextSummaryPayload())
     data_quality: DataQualityPacket
     previous_thesis: PreviousThesisDeltaPacket = Field(default_factory=PreviousThesisDeltaPacket)
     prior_context: AIPriorContextPacket = Field(default_factory=AIPriorContextPacket)
@@ -1061,6 +1071,9 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     trigger_deduped: bool = False
     trigger_fingerprint: str | None = None
     last_ai_skip_reason: str | None = None
+    event_risk_acknowledgement: str | None = None
+    confidence_penalty_reason: str | None = None
+    scenario_note: str | None = None
     decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
     raw_output: dict[str, Any] = Field(default_factory=dict)
 
@@ -1234,6 +1247,8 @@ class OperatorSymbolSummary(StrictBaseModel):
     feature_input_delay_threshold_minutes: int | None = None
     feature_input_delayed: bool = False
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
+    derivatives_summary: dict[str, Any] = Field(default_factory=dict)
+    event_context_summary: dict[str, Any] = Field(default_factory=dict)
     ai_decision: OperatorDecisionSnapshot = Field(default_factory=OperatorDecisionSnapshot)
     pending_entry_plan: PendingEntryPlanSnapshot = Field(default_factory=PendingEntryPlanSnapshot)
     risk_guard: OperatorRiskSnapshot = Field(default_factory=OperatorRiskSnapshot)
@@ -1469,6 +1484,84 @@ class DerivativesContextPayload(StrictBaseModel):
     spread_stress_score: float | None = Field(default=None, ge=0.0)
 
 
+class MacroEventPayload(StrictBaseModel):
+    event_at: datetime
+    event_name: str
+    importance: MacroEventImportance | None = None
+    affected_assets: list[str] = Field(default_factory=list)
+    event_bias: EventBias | None = None
+    minutes_to_event: int | None = None
+    risk_window_before_minutes: int = Field(default=60, ge=0, le=10080)
+    risk_window_after_minutes: int = Field(default=30, ge=0, le=10080)
+    active_risk_window: bool = False
+
+
+class EventContextPayload(StrictBaseModel):
+    source_status: EventSourceStatus = "unavailable"
+    generated_at: datetime
+    is_stale: bool = False
+    is_complete: bool = False
+    next_event_at: datetime | None = None
+    next_event_name: str | None = None
+    next_event_importance: MacroEventImportance | None = None
+    minutes_to_next_event: int | None = None
+    active_risk_window: bool = False
+    affected_assets: list[str] = Field(default_factory=list)
+    event_bias: EventBias | None = None
+    events: list[MacroEventPayload] = Field(default_factory=list)
+
+
+class RegimeSummaryPayload(StrictBaseModel):
+    primary_regime: Literal["bullish", "bearish", "range", "transition"] = "transition"
+    trend_alignment: Literal["bullish_aligned", "bearish_aligned", "mixed", "range"] = "mixed"
+    volatility_regime: Literal["compressed", "normal", "expanded"] = "normal"
+    volume_regime: Literal["weak", "normal", "strong"] = "normal"
+    momentum_state: Literal["strengthening", "stable", "weakening", "overextended"] = "stable"
+    weak_volume: bool = False
+    momentum_weakening: bool = False
+
+
+class DerivativesSummaryPayload(StrictBaseModel):
+    available: bool = False
+    source: Literal["binance_public", "seed_fallback", "unavailable"] = "unavailable"
+    funding_bias: Literal["long_headwind", "short_headwind", "neutral", "unknown"] = "unknown"
+    basis_bias: Literal["bullish", "bearish", "neutral", "unknown"] = "unknown"
+    taker_flow_alignment: Literal["bullish", "bearish", "neutral", "unknown"] = "unknown"
+    long_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    short_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    crowded_long_risk: bool = False
+    crowded_short_risk: bool = False
+    spread_headwind: bool = False
+    spread_stress: bool = False
+    oi_expanding_with_price: bool = False
+    oi_falling_on_breakout: bool = False
+
+
+class LeadLagSummaryPayload(StrictBaseModel):
+    available: bool = False
+    leader_bias: Literal["bullish", "bearish", "mixed", "neutral", "unknown"] = "unknown"
+    reference_symbols: list[str] = Field(default_factory=list)
+    bullish_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    bearish_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
+    bullish_breakout_confirmed: bool = False
+    bearish_breakout_confirmed: bool = False
+    bullish_pullback_supported: bool = False
+    bearish_pullback_supported: bool = False
+    bullish_continuation_supported: bool = False
+    bearish_continuation_supported: bool = False
+    strong_reference_confirmation: bool = False
+    weak_reference_confirmation: bool = False
+
+
+class EventContextSummaryPayload(StrictBaseModel):
+    source_status: EventSourceStatus = "unavailable"
+    next_event_name: str | None = None
+    next_event_importance: MacroEventImportance | None = None
+    minutes_to_next_event: int | None = None
+    active_risk_window: bool = False
+    event_bias: EventBias | None = None
+
+
 class MarketSnapshotPayload(StrictBaseModel):
     symbol: str
     timeframe: str
@@ -1480,6 +1573,9 @@ class MarketSnapshotPayload(StrictBaseModel):
     is_complete: bool
     candles: list[MarketCandle]
     derivatives_context: DerivativesContextPayload = Field(default_factory=DerivativesContextPayload)
+    event_context: EventContextPayload = Field(
+        default_factory=lambda: EventContextPayload(generated_at=datetime.now(UTC).replace(tzinfo=None))
+    )
 
 
 class TimeframeFeatureContext(StrictBaseModel):
@@ -1656,6 +1752,9 @@ class FeaturePayload(StrictBaseModel):
     pullback_context: PullbackContinuationFeatureContext = Field(default_factory=PullbackContinuationFeatureContext)
     derivatives: DerivativesFeatureContext = Field(default_factory=DerivativesFeatureContext)
     lead_lag: LeadLagFeatureContext = Field(default_factory=LeadLagFeatureContext)
+    event_context: EventContextPayload = Field(
+        default_factory=lambda: EventContextPayload(generated_at=datetime.now(UTC).replace(tzinfo=None))
+    )
     data_quality_flags: list[str] = Field(default_factory=list)
 
 

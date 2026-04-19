@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from trading_mvp.schemas import DerivativesContextPayload, MarketCandle, MarketSnapshotPayload
+from trading_mvp.schemas import (
+    DerivativesContextPayload,
+    EventContextPayload,
+    MarketCandle,
+    MarketSnapshotPayload,
+)
 from trading_mvp.services.ai_context import (
     build_ai_decision_context,
     build_composite_regime_packet,
@@ -357,3 +362,52 @@ def test_selection_context_hard_stop_and_holding_profile_included() -> None:
     assert context.initial_stop_type == "deterministic_hard_stop"
     assert context.selection_context_summary["slot_allocation"]["assigned_slot"] == "slot_1"
     assert context.prompt_family_hint == "open_position_recheck_due:trend_continuation_engine"
+
+
+def test_build_ai_decision_context_includes_separated_feature_layer_summaries() -> None:
+    snapshot, features = _features()
+    event_context = EventContextPayload(
+        source_status="fixture",
+        generated_at=snapshot.snapshot_time,
+        is_stale=False,
+        is_complete=True,
+        next_event_at=snapshot.snapshot_time + timedelta(minutes=25),
+        next_event_name="US CPI",
+        next_event_importance="high",
+        minutes_to_next_event=25,
+        active_risk_window=True,
+        affected_assets=["BTC", "BTCUSDT"],
+        event_bias="bearish",
+        events=[],
+    )
+    features = features.model_copy(update={"event_context": event_context})
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "trend_pullback_engine", "holding_profile": "scalp"},
+        review_trigger={
+            "trigger_reason": "entry_candidate_event",
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "strategy_engine": "trend_pullback_engine",
+            "holding_profile": "scalp",
+            "trigger_fingerprint": "event-layer-summary-test",
+            "last_decision_at": None,
+            "triggered_at": utcnow_naive(),
+        },
+        decision_reference={},
+    )
+
+    assert context.regime_summary.primary_regime == features.regime.primary_regime
+    assert context.regime_summary.trend_alignment == features.regime.trend_alignment
+    assert context.derivatives_summary.available == features.derivatives.available
+    assert context.derivatives_summary.taker_flow_alignment == features.derivatives.taker_flow_alignment
+    assert context.lead_lag_summary.leader_bias == features.lead_lag.leader_bias
+    assert context.event_context_summary.next_event_name == "US CPI"
+    assert context.event_context_summary.next_event_importance == "high"
+    assert context.event_context_summary.minutes_to_next_event == 25
+    assert context.event_context_summary.active_risk_window is True
+    assert context.event_context_summary.source_status == "fixture"
+    assert context.event_context_summary.event_bias == "bearish"

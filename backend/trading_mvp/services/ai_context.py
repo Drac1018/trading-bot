@@ -10,9 +10,13 @@ from trading_mvp.schemas import (
     CompositeRegimePacket,
     DataQualityGrade,
     DataQualityPacket,
+    DerivativesSummaryPayload,
+    EventContextSummaryPayload,
     FeaturePayload,
+    LeadLagSummaryPayload,
     MarketSnapshotPayload,
     PreviousThesisDeltaPacket,
+    RegimeSummaryPayload,
 )
 from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_SCALP,
@@ -366,6 +370,81 @@ def build_data_quality_packet(
     )
 
 
+def build_regime_summary(
+    *,
+    features: FeaturePayload,
+) -> RegimeSummaryPayload:
+    regime = features.regime
+    return RegimeSummaryPayload(
+        primary_regime=regime.primary_regime,
+        trend_alignment=regime.trend_alignment,
+        volatility_regime=regime.volatility_regime,
+        volume_regime=regime.volume_regime,
+        momentum_state=regime.momentum_state,
+        weak_volume=regime.weak_volume,
+        momentum_weakening=regime.momentum_weakening,
+    )
+
+
+def build_derivatives_summary(
+    *,
+    features: FeaturePayload,
+) -> DerivativesSummaryPayload:
+    derivatives = features.derivatives
+    return DerivativesSummaryPayload(
+        available=derivatives.available,
+        source=derivatives.source,
+        funding_bias=derivatives.funding_bias,
+        basis_bias=derivatives.basis_bias,
+        taker_flow_alignment=derivatives.taker_flow_alignment,
+        long_alignment_score=derivatives.long_alignment_score,
+        short_alignment_score=derivatives.short_alignment_score,
+        crowded_long_risk=derivatives.crowded_long_risk,
+        crowded_short_risk=derivatives.crowded_short_risk,
+        spread_headwind=derivatives.spread_headwind,
+        spread_stress=derivatives.spread_stress,
+        oi_expanding_with_price=derivatives.oi_expanding_with_price,
+        oi_falling_on_breakout=derivatives.oi_falling_on_breakout,
+    )
+
+
+def build_lead_lag_summary(
+    *,
+    features: FeaturePayload,
+) -> LeadLagSummaryPayload:
+    lead_lag = features.lead_lag
+    return LeadLagSummaryPayload(
+        available=lead_lag.available,
+        leader_bias=lead_lag.leader_bias,
+        reference_symbols=list(lead_lag.reference_symbols),
+        bullish_alignment_score=lead_lag.bullish_alignment_score,
+        bearish_alignment_score=lead_lag.bearish_alignment_score,
+        bullish_breakout_confirmed=lead_lag.bullish_breakout_confirmed,
+        bearish_breakout_confirmed=lead_lag.bearish_breakout_confirmed,
+        bullish_pullback_supported=lead_lag.bullish_pullback_supported,
+        bearish_pullback_supported=lead_lag.bearish_pullback_supported,
+        bullish_continuation_supported=lead_lag.bullish_continuation_supported,
+        bearish_continuation_supported=lead_lag.bearish_continuation_supported,
+        strong_reference_confirmation=lead_lag.strong_reference_confirmation,
+        weak_reference_confirmation=lead_lag.weak_reference_confirmation,
+    )
+
+
+def build_event_context_summary(
+    *,
+    features: FeaturePayload,
+) -> EventContextSummaryPayload:
+    event_context = features.event_context
+    return EventContextSummaryPayload(
+        source_status=event_context.source_status,
+        next_event_name=event_context.next_event_name,
+        next_event_importance=event_context.next_event_importance,
+        minutes_to_next_event=event_context.minutes_to_next_event,
+        active_risk_window=event_context.active_risk_window,
+        event_bias=event_context.event_bias,
+    )
+
+
 def _previous_ai_context_payload(
     *,
     previous_input_payload: Mapping[str, Any] | None,
@@ -670,6 +749,10 @@ def build_ai_decision_context(
         market_snapshot=market_snapshot,
         features=features,
     )
+    regime_summary = build_regime_summary(features=features)
+    derivatives_summary = build_derivatives_summary(features=features)
+    lead_lag_summary = build_lead_lag_summary(features=features)
+    event_context_summary = build_event_context_summary(features=features)
     data_quality = build_data_quality_packet(
         market_snapshot=market_snapshot,
         features=features,
@@ -763,6 +846,10 @@ def build_ai_decision_context(
         timeframe=market_snapshot.timeframe,
         trigger_type=resolved_review_trigger.trigger_reason if resolved_review_trigger is not None else None,
         composite_regime=composite_regime,
+        regime_summary=regime_summary,
+        derivatives_summary=derivatives_summary,
+        lead_lag_summary=lead_lag_summary,
+        event_context_summary=event_context_summary,
         data_quality=data_quality,
         previous_thesis=previous_thesis,
         strategy_engine=strategy_engine,

@@ -1049,6 +1049,7 @@ def compute_features(
         pullback_context=pullback_context,
         derivatives=derivatives,
         lead_lag=lead_lag,
+        event_context=snapshot.event_context.model_copy(deep=True),
         data_quality_flags=flags,
     )
 
