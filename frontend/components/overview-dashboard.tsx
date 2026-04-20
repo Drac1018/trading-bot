@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "../lib/selected-symbol";
+import { type EventOperatorControlPayload } from "../lib/event-operator-control.js";
 import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -239,6 +240,7 @@ type OperatorSymbolSummary = {
   market_context_summary: Record<string, unknown>;
   derivatives_summary: Record<string, unknown>;
   event_context_summary: Record<string, unknown>;
+  event_operator_control?: EventOperatorControlPayload | null;
   ai_decision: OperatorDecisionSnapshot;
   risk_guard: OperatorRiskSnapshot;
   execution: OperatorExecutionSnapshot;

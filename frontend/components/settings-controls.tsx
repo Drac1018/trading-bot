@@ -3,12 +3,34 @@
 import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
 
 import { AIUsagePanel, type AIUsagePayload } from "./ai-usage-panel";
+import {
+  csvToSymbols,
+  describeAlignmentStatus,
+  describeEffectivePolicyPreview,
+  describeEnforcementMode,
+  describeEventBias,
+  describeImportance,
+  describeRiskState,
+  describeSourceStatus,
+  describeWindowScope,
+  formatUtcTimestamp,
+  isoToUtcInputValue,
+  toneForAlignment,
+  toneForPolicyPreview,
+  toneForSourceStatus,
+  type EventOperatorControlPayload,
+  type ManualNoTradeWindowPayload,
+  utcInputValueToIso,
+} from "../lib/event-operator-control.js";
 import { formatDisplayValue } from "../lib/ui-copy";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기 / 가드", "AI 입력 / 모델", "Binance 연동"] as const;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
+const operatorBiasOptions = ["bullish", "bearish", "neutral", "no_trade", "unknown"] as const;
+const operatorRiskStateOptions = ["risk_on", "risk_off", "neutral", "unknown"] as const;
+const operatorEnforcementModeOptions = ["observe_only", "approval_required", "block_on_conflict", "force_no_trade"] as const;
 
 type RolloutMode = (typeof rolloutModeOptions)[number];
 
@@ -77,6 +99,30 @@ type SettingsCadencePayload = {
   items: SymbolEffectiveCadence[];
 };
 
+type OperatorEventFormState = {
+  operator_bias: "bullish" | "bearish" | "neutral" | "no_trade" | "unknown";
+  operator_risk_state: "risk_on" | "risk_off" | "neutral" | "unknown";
+  applies_to_symbols: string;
+  horizon: string;
+  valid_from: string;
+  valid_to: string;
+  enforcement_mode: "observe_only" | "approval_required" | "block_on_conflict" | "force_no_trade";
+  note: string;
+  created_by: string;
+};
+
+type ManualWindowFormState = {
+  window_id: string | null;
+  scope_type: "global" | "symbols";
+  symbols: string;
+  start_at: string;
+  end_at: string;
+  reason: string;
+  auto_resume: boolean;
+  require_manual_rearm: boolean;
+  created_by: string;
+};
+
 export type SettingsPayload = {
   can_enter_new_position: boolean;
   blocked_reasons: string[];
@@ -117,6 +163,7 @@ export type SettingsPayload = {
   control_status_summary?: ControlStatusSummary | null;
   reconciliation_summary: ReconciliationSummary;
   operator_alert?: Record<string, unknown>;
+  event_operator_control?: EventOperatorControlPayload | null;
   pause_severity: string | null;
   pause_recovery_class: string | null;
   default_symbol: string;
@@ -177,7 +224,7 @@ type FormState = Omit<
   | "live_trading_env_enabled" | "live_execution_armed" | "live_execution_armed_until" | "live_execution_ready"
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
-  | "pause_recovery_class" | "control_status_summary" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
+  | "pause_recovery_class" | "control_status_summary" | "event_operator_control" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured"
 > & {
   openai_api_key: string;
   binance_api_key: string;
@@ -267,6 +314,35 @@ function toFormState(initial: SettingsPayload): FormState {
     clear_openai_api_key: false,
     clear_binance_api_key: false,
     clear_binance_api_secret: false,
+  };
+}
+
+function toOperatorEventFormState(initial: SettingsPayload): OperatorEventFormState {
+  const current = initial.event_operator_control?.operator_event_view;
+  return {
+    operator_bias: current?.operator_bias ?? "unknown",
+    operator_risk_state: current?.operator_risk_state ?? "unknown",
+    applies_to_symbols: current?.applies_to_symbols.join(", ") ?? "",
+    horizon: current?.horizon ?? "",
+    valid_from: isoToUtcInputValue(current?.valid_from),
+    valid_to: isoToUtcInputValue(current?.valid_to),
+    enforcement_mode: current?.enforcement_mode ?? "observe_only",
+    note: current?.note ?? "",
+    created_by: current?.created_by ?? "operator-ui",
+  };
+}
+
+function toManualWindowFormState(window?: ManualNoTradeWindowPayload | null): ManualWindowFormState {
+  return {
+    window_id: window?.window_id ?? null,
+    scope_type: window?.scope.scope_type ?? "global",
+    symbols: window?.scope.symbols.join(", ") ?? "",
+    start_at: isoToUtcInputValue(window?.start_at),
+    end_at: isoToUtcInputValue(window?.end_at),
+    reason: window?.reason ?? "",
+    auto_resume: window?.auto_resume ?? false,
+    require_manual_rearm: window?.require_manual_rearm ?? false,
+    created_by: window?.created_by ?? "operator-ui",
   };
 }
 
@@ -766,6 +842,8 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const [symbolCadences, setSymbolCadences] = useState<SymbolEffectiveCadence[]>([]);
   const [aiUsage, setAiUsage] = useState<AIUsagePayload | null>(null);
   const [form, setForm] = useState<FormState>(() => toFormState(initial));
+  const [operatorEventForm, setOperatorEventForm] = useState<OperatorEventFormState>(() => toOperatorEventFormState(initial));
+  const [manualWindowForm, setManualWindowForm] = useState<ManualWindowFormState>(() => toManualWindowFormState());
   const [message, setMessage] = useState("");
   const [liveSyncResult, setLiveSyncResult] = useState<LiveSyncResult | null>(null);
   const [isPending, startTransition] = useTransition();
@@ -797,6 +875,13 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const positionManagementSummary = state.position_management_summary ?? {};
   const reconciliationSummary = state.reconciliation_summary ?? {};
   const controlSummary = resolveControlStatusSummary(state);
+  const eventOperatorControl = state.event_operator_control ?? null;
+  const eventContext = eventOperatorControl?.event_context ?? null;
+  const aiEventView = eventOperatorControl?.ai_event_view ?? null;
+  const operatorEventView = eventOperatorControl?.operator_event_view ?? null;
+  const alignmentDecision = eventOperatorControl?.alignment_decision ?? null;
+  const manualWindows = eventOperatorControl?.manual_no_trade_windows ?? [];
+  const activeManualWindows = manualWindows.filter((window) => window.is_active);
   const liveArmBlocked = Boolean(controlSummary.live_arm_disabled);
   const liveArmDisableReason = controlSummary.live_arm_disable_reason;
   const operatorAlertMessage =
@@ -834,12 +919,18 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const syncSettings = (next: SettingsPayload) => {
     setState(next);
     setForm(toFormState(next));
+    setOperatorEventForm(toOperatorEventFormState(next));
+    setManualWindowForm(toManualWindowFormState());
     void refreshAuxiliaryData().catch(() => {
       setSymbolCadences([]);
       setAiUsage(null);
     });
   };
   const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((current) => ({ ...current, [key]: value }));
+  const updateOperatorEventField = <K extends keyof OperatorEventFormState>(key: K, value: OperatorEventFormState[K]) =>
+    setOperatorEventForm((current) => ({ ...current, [key]: value }));
+  const updateManualWindowField = <K extends keyof ManualWindowFormState>(key: K, value: ManualWindowFormState[K]) =>
+    setManualWindowForm((current) => ({ ...current, [key]: value }));
   const updateSymbolOverride = (
     symbol: string,
     patch: Partial<SymbolCadenceOverride>,
@@ -925,6 +1016,118 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         .then((result) => { onSuccess?.(result); setMessage(successMessage); })
         .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "요청 처리에 실패했습니다."); });
     });
+  };
+
+  const runPut = (path: string, successMessage: string, body: object, onSuccess?: (data: any) => void) => {
+    startTransition(() => {
+      void requestJson(path, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then((result) => { onSuccess?.(result); setMessage(successMessage); })
+        .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "요청 처리에 실패했습니다."); });
+    });
+  };
+
+  const saveOperatorEventView = () => {
+    const validFrom = utcInputValueToIso(operatorEventForm.valid_from);
+    const validTo = utcInputValueToIso(operatorEventForm.valid_to);
+    if (validFrom && validTo && new Date(validTo).getTime() <= new Date(validFrom).getTime()) {
+      setMessage("operator event view의 valid_to는 valid_from보다 뒤여야 합니다.");
+      return;
+    }
+    runPut(
+      "/api/settings/operator-event-view",
+      "operator event view를 저장했습니다.",
+      {
+        operator_bias: operatorEventForm.operator_bias,
+        operator_risk_state: operatorEventForm.operator_risk_state,
+        applies_to_symbols: csvToSymbols(operatorEventForm.applies_to_symbols),
+        horizon: operatorEventForm.horizon.trim() || null,
+        valid_from: validFrom,
+        valid_to: validTo,
+        enforcement_mode: operatorEventForm.enforcement_mode,
+        note: operatorEventForm.note.trim() || null,
+        created_by: operatorEventForm.created_by.trim() || "operator-ui",
+      },
+      syncSettings,
+    );
+  };
+
+  const clearOperatorEventView = () => {
+    runPost(
+      "/api/settings/operator-event-view/clear",
+      "operator event view를 해제했습니다.",
+      syncSettings,
+      { created_by: operatorEventForm.created_by.trim() || "operator-ui" },
+    );
+  };
+
+  const resetManualWindowForm = () => {
+    setManualWindowForm(toManualWindowFormState());
+  };
+
+  const editManualWindow = (window: ManualNoTradeWindowPayload) => {
+    setManualWindowForm(toManualWindowFormState(window));
+  };
+
+  const saveManualWindow = () => {
+    const startAt = utcInputValueToIso(manualWindowForm.start_at);
+    const endAt = utcInputValueToIso(manualWindowForm.end_at);
+    if (!startAt || !endAt) {
+      setMessage("manual no-trade window의 시작/종료 시각을 UTC 기준으로 입력해야 합니다.");
+      return;
+    }
+    if (new Date(endAt).getTime() <= new Date(startAt).getTime()) {
+      setMessage("manual no-trade window의 end_at은 start_at보다 뒤여야 합니다.");
+      return;
+    }
+    const scopeSymbols = csvToSymbols(manualWindowForm.symbols);
+    if (manualWindowForm.scope_type === "symbols" && scopeSymbols.length === 0) {
+      setMessage("symbols scope를 선택한 경우 최소 1개 심볼이 필요합니다.");
+      return;
+    }
+    const payload = {
+      scope: {
+        scope_type: manualWindowForm.scope_type,
+        symbols: manualWindowForm.scope_type === "symbols" ? scopeSymbols : [],
+      },
+      start_at: startAt,
+      end_at: endAt,
+      reason: manualWindowForm.reason.trim(),
+      auto_resume: manualWindowForm.auto_resume,
+      require_manual_rearm: manualWindowForm.require_manual_rearm,
+      created_by: manualWindowForm.created_by.trim() || "operator-ui",
+    };
+    if (!payload.reason) {
+      setMessage("manual no-trade window reason을 입력해야 합니다.");
+      return;
+    }
+    if (manualWindowForm.window_id) {
+      runPut(
+        `/api/settings/manual-no-trade-windows/${encodeURIComponent(manualWindowForm.window_id)}`,
+        "manual no-trade window를 수정했습니다.",
+        payload,
+        syncSettings,
+      );
+      return;
+    }
+    runPost(
+      "/api/settings/manual-no-trade-windows",
+      "manual no-trade window를 생성했습니다.",
+      syncSettings,
+      payload,
+    );
+  };
+
+  const endManualWindow = (windowId: string) => {
+    runPost(
+      `/api/settings/manual-no-trade-windows/${encodeURIComponent(windowId)}/end`,
+      "manual no-trade window를 종료했습니다.",
+      syncSettings,
+      { created_by: manualWindowForm.created_by.trim() || "operator-ui" },
+    );
   };
 
   return (
@@ -1129,6 +1332,314 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               <Field label="슬리피지 임계값">
                 <input className={inputClass} type="number" min={0.0001} max={0.1} step="0.0001" value={form.slippage_threshold_pct} onChange={(event) => updateField("slippage_threshold_pct", Number(event.target.value))} />
               </Field>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Event / operator preview</h3>
+              <p className="mt-2 text-sm leading-6 text-slate-600">
+                regime와 분리된 event/operator control layer입니다. preview payload는 신규 entry path에서 risk_guard와 같은 shared evaluator semantics를 반영합니다.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <StatusPill tone="neutral">{state.default_symbol}</StatusPill>
+              <StatusPill tone={toneForSourceStatus(eventContext?.source_status)}>{describeSourceStatus(eventContext?.source_status)}</StatusPill>
+              <StatusPill tone={toneForPolicyPreview(eventOperatorControl?.effective_policy_preview)}>risk mirrored</StatusPill>
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-4">
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Upcoming Event Risk</p>
+                  <p className="mt-1 text-sm text-slate-600">소스 상태와 stale/incomplete 여부를 숨기지 않고 그대로 보여줍니다.</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <StatusPill tone={toneForSourceStatus(eventContext?.source_status)}>{describeSourceStatus(eventContext?.source_status)}</StatusPill>
+                  {eventContext?.is_stale ? <StatusPill tone="warn">stale</StatusPill> : null}
+                  {eventContext && !eventContext.is_complete ? <StatusPill tone="warn">incomplete</StatusPill> : null}
+                </div>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">next_event_name</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{eventContext?.next_event_name ?? "unknown"}</p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">next_event_time</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{formatUtcTimestamp(eventContext?.next_event_at)}</p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">minutes_to_next_event</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">
+                    {typeof eventContext?.minutes_to_next_event === "number" ? `${eventContext.minutes_to_next_event}분` : "unknown"}
+                  </p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">importance</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{describeImportance(eventContext?.next_event_importance)}</p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">active_risk_window</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">
+                    {eventContext?.active_risk_window ? "active" : "inactive"}
+                  </p>
+                  <p className="mt-2 text-xs text-slate-500">
+                    {eventContext?.active_risk_window_detail?.event_name ?? eventContext?.summary_note ?? "window detail unavailable"}
+                  </p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">generated_at</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{formatUtcTimestamp(eventContext?.generated_at)}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <p className="text-sm font-semibold text-slate-900">AI Event View</p>
+              <p className="mt-1 text-sm text-slate-600">AI event-aware 출력이 없으면 unknown / unavailable로 명시합니다.</p>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">ai_bias</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{describeEventBias(aiEventView?.ai_bias)}</p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">ai_risk_state</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{describeRiskState(aiEventView?.ai_risk_state)}</p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">ai_confidence</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">
+                    {typeof aiEventView?.ai_confidence === "number" ? aiEventView.ai_confidence.toFixed(2) : "unknown"}
+                  </p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">source_state</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{describeSourceStatus(aiEventView?.source_state)}</p>
+                </div>
+              </div>
+              <div className="mt-3 grid gap-3">
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">scenario_note</p>
+                  <p className="mt-2 text-sm text-slate-800">{aiEventView?.scenario_note ?? "unknown"}</p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">confidence_penalty_reason</p>
+                  <p className="mt-2 text-sm text-slate-800">{aiEventView?.confidence_penalty_reason ?? "unknown"}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Alignment Result</p>
+                  <p className="mt-1 text-sm text-slate-600">enum 기반 preview 계산 결과입니다.</p>
+                </div>
+                <StatusPill tone={toneForAlignment(alignmentDecision?.alignment_status)}>{describeAlignmentStatus(alignmentDecision?.alignment_status)}</StatusPill>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">reason_codes</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">
+                    {alignmentDecision && alignmentDecision.reason_codes.length > 0 ? alignmentDecision.reason_codes.join(", ") : "none"}
+                  </p>
+                </div>
+                <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-500">evaluated_at</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{formatUtcTimestamp(alignmentDecision?.evaluated_at)}</p>
+                </div>
+              </div>
+              <div className="mt-3 rounded-2xl border border-dashed border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                Effective Trading Policy Preview: {describeEffectivePolicyPreview(eventOperatorControl?.effective_policy_preview)}.
+                {" "}신규 entry path에서는 risk_guard가 같은 evaluator semantics를 사용하며, reduce / exit / protective recovery는 계속 exempt입니다.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-5">
+          <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-900">Operator Event View</h3>
+                <p className="mt-2 text-sm leading-6 text-slate-600">
+                  operator view를 저장/수정/해제할 수 있습니다. time input은 모두 UTC 기준입니다.
+                </p>
+              </div>
+              <StatusPill tone="neutral">{describeEnforcementMode(operatorEventView?.enforcement_mode)}</StatusPill>
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-2xl bg-white px-4 py-3">
+                <p className="text-xs text-slate-500">operator_bias</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{describeEventBias(operatorEventView?.operator_bias)}</p>
+              </div>
+              <div className="rounded-2xl bg-white px-4 py-3">
+                <p className="text-xs text-slate-500">operator_risk_state</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">{describeRiskState(operatorEventView?.operator_risk_state)}</p>
+              </div>
+              <div className="rounded-2xl bg-white px-4 py-3">
+                <p className="text-xs text-slate-500">valid_from / valid_to</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {formatUtcTimestamp(operatorEventView?.valid_from)} ~ {formatUtcTimestamp(operatorEventView?.valid_to)}
+                </p>
+              </div>
+              <div className="rounded-2xl bg-white px-4 py-3">
+                <p className="text-xs text-slate-500">applies_to_symbols</p>
+                <p className="mt-2 text-sm font-semibold text-slate-900">
+                  {operatorEventView && operatorEventView.applies_to_symbols.length > 0 ? operatorEventView.applies_to_symbols.join(", ") : "global"}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Field label="operator_bias">
+                <select className={inputClass} value={operatorEventForm.operator_bias} onChange={(event) => updateOperatorEventField("operator_bias", event.target.value as OperatorEventFormState["operator_bias"])}>
+                  {operatorBiasOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                </select>
+              </Field>
+              <Field label="operator_risk_state">
+                <select className={inputClass} value={operatorEventForm.operator_risk_state} onChange={(event) => updateOperatorEventField("operator_risk_state", event.target.value as OperatorEventFormState["operator_risk_state"])}>
+                  {operatorRiskStateOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                </select>
+              </Field>
+              <Field label="applies_to_symbols" hint="비우면 global scope로 처리합니다.">
+                <input className={inputClass} value={operatorEventForm.applies_to_symbols} onChange={(event) => updateOperatorEventField("applies_to_symbols", event.target.value.toUpperCase())} placeholder="BTCUSDT, ETHUSDT" />
+              </Field>
+              <Field label="horizon">
+                <input className={inputClass} value={operatorEventForm.horizon} onChange={(event) => updateOperatorEventField("horizon", event.target.value)} placeholder="macro-week / event-day" />
+              </Field>
+              <Field label="valid_from (UTC)">
+                <input className={inputClass} type="datetime-local" value={operatorEventForm.valid_from} onChange={(event) => updateOperatorEventField("valid_from", event.target.value)} />
+              </Field>
+              <Field label="valid_to (UTC)">
+                <input className={inputClass} type="datetime-local" value={operatorEventForm.valid_to} onChange={(event) => updateOperatorEventField("valid_to", event.target.value)} />
+              </Field>
+              <Field label="enforcement_mode">
+                <select className={inputClass} value={operatorEventForm.enforcement_mode} onChange={(event) => updateOperatorEventField("enforcement_mode", event.target.value as OperatorEventFormState["enforcement_mode"])}>
+                  {operatorEnforcementModeOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                </select>
+              </Field>
+              <Field label="created_by">
+                <input className={inputClass} value={operatorEventForm.created_by} onChange={(event) => updateOperatorEventField("created_by", event.target.value)} />
+              </Field>
+            </div>
+            <div className="mt-4">
+              <Field label="note">
+                <textarea className={inputClass} rows={3} value={operatorEventForm.note} onChange={(event) => updateOperatorEventField("note", event.target.value)} placeholder="event-driven operator bias note" />
+              </Field>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-400" disabled={isPending} onClick={saveOperatorEventView} type="button">
+                {isPending ? "저장 중..." : "operator view 저장"}
+              </button>
+              <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" disabled={isPending} onClick={clearOperatorEventView} type="button">
+                operator view 해제
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-900">Manual No-Trade Window</h3>
+                <p className="mt-2 text-sm leading-6 text-slate-600">
+                  active 계산은 start inclusive / end exclusive입니다. overlapping window는 허용되며 any-active 기준으로 preview에 반영됩니다.
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <StatusPill tone={activeManualWindows.length > 0 ? "danger" : "neutral"}>active {activeManualWindows.length}</StatusPill>
+                <StatusPill tone="neutral">UTC only</StatusPill>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Field label="scope">
+                <select className={inputClass} value={manualWindowForm.scope_type} onChange={(event) => updateManualWindowField("scope_type", event.target.value as ManualWindowFormState["scope_type"])}>
+                  <option value="global">global</option>
+                  <option value="symbols">symbols</option>
+                </select>
+              </Field>
+              <Field label="created_by">
+                <input className={inputClass} value={manualWindowForm.created_by} onChange={(event) => updateManualWindowField("created_by", event.target.value)} />
+              </Field>
+              <Field label="symbols" hint="scope가 symbols일 때만 사용합니다.">
+                <input className={inputClass} value={manualWindowForm.symbols} onChange={(event) => updateManualWindowField("symbols", event.target.value.toUpperCase())} placeholder="BTCUSDT, ETHUSDT" />
+              </Field>
+              <Field label="reason">
+                <input className={inputClass} value={manualWindowForm.reason} onChange={(event) => updateManualWindowField("reason", event.target.value)} placeholder="manual no-trade around macro event" />
+              </Field>
+              <Field label="start_at (UTC)">
+                <input className={inputClass} type="datetime-local" value={manualWindowForm.start_at} onChange={(event) => updateManualWindowField("start_at", event.target.value)} />
+              </Field>
+              <Field label="end_at (UTC)">
+                <input className={inputClass} type="datetime-local" value={manualWindowForm.end_at} onChange={(event) => updateManualWindowField("end_at", event.target.value)} />
+              </Field>
+            </div>
+
+            <div className="mt-4 grid gap-3 md:grid-cols-2">
+              <Toggle checked={manualWindowForm.auto_resume} label="auto_resume 표시" onChange={(value) => updateManualWindowField("auto_resume", value)} />
+              <Toggle checked={manualWindowForm.require_manual_rearm} label="require_manual_rearm 표시" onChange={(value) => updateManualWindowField("require_manual_rearm", value)} />
+            </div>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:bg-slate-400" disabled={isPending} onClick={saveManualWindow} type="button">
+                {manualWindowForm.window_id ? "window 수정" : "window 생성"}
+              </button>
+              <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={resetManualWindowForm} type="button">
+                form 초기화
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              {manualWindows.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-amber-200 px-4 py-4 text-sm text-slate-500">
+                  현재 저장된 manual no-trade window가 없습니다.
+                </div>
+              ) : (
+                manualWindows.map((window) => (
+                  <div key={window.window_id} className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap gap-2">
+                        <StatusPill tone={window.is_active ? "danger" : "neutral"}>{window.is_active ? "active" : "inactive"}</StatusPill>
+                        <StatusPill tone="neutral">{window.window_id}</StatusPill>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button className="rounded-full border border-slate-300 px-3 py-1 text-xs font-semibold text-slate-700" onClick={() => editManualWindow(window)} type="button">수정</button>
+                        <button className="rounded-full border border-rose-200 px-3 py-1 text-xs font-semibold text-rose-700" onClick={() => endManualWindow(window.window_id)} type="button">종료</button>
+                      </div>
+                    </div>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                        <p className="text-xs text-slate-500">scope</p>
+                        <p className="mt-2 text-sm font-semibold text-slate-900">{describeWindowScope(window.scope)}</p>
+                      </div>
+                      <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                        <p className="text-xs text-slate-500">time window</p>
+                        <p className="mt-2 text-sm font-semibold text-slate-900">
+                          {formatUtcTimestamp(window.start_at)} ~ {formatUtcTimestamp(window.end_at)}
+                        </p>
+                      </div>
+                      <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                        <p className="text-xs text-slate-500">reason</p>
+                        <p className="mt-2 text-sm text-slate-800">{window.reason}</p>
+                      </div>
+                      <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                        <p className="text-xs text-slate-500">flags</p>
+                        <p className="mt-2 text-sm text-slate-800">
+                          auto_resume={String(window.auto_resume)} / require_manual_rearm={String(window.require_manual_rearm)}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </div>

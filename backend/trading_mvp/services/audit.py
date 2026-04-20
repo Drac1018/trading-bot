@@ -24,6 +24,25 @@ APPROVAL_TIMELINE_KEYS = (
     "can_enter_new_position",
     "trigger_source",
 )
+EVENT_OPERATOR_CONTROL_TIMELINE_KEYS = (
+    "actor",
+    "symbols",
+    "window_id",
+    "scope",
+    "before",
+    "after",
+    "evaluations",
+    "evaluated_at",
+)
+EVENT_POLICY_TIMELINE_KEYS = (
+    "symbol",
+    "decision",
+    "blocked_reason",
+    "approval_required_reason",
+    "degraded_reason",
+    "policy_source",
+    "survival_path",
+)
 PROTECTION_TIMELINE_KEYS = (
     "symbol",
     "trigger_source",
@@ -112,6 +131,9 @@ def compact_audit_payload(
         )
         if approval_detail:
             compact["approval_detail"] = approval_detail
+        event_control_detail = _compact_payload_dict(source, allowed_keys=EVENT_OPERATOR_CONTROL_TIMELINE_KEYS)
+        if event_control_detail:
+            compact.update(event_control_detail)
         return compact
 
     if category_key == "protection" or event_key.startswith("protection_") or "protective" in event_key:
@@ -150,6 +172,46 @@ def compact_audit_payload(
 
     if category_key == "execution" or event_key.startswith("live_execution"):
         return _compact_payload_dict(source, allowed_keys=EXECUTION_TIMELINE_KEYS)
+
+    if category_key == "risk" or event_key.startswith("event_policy_"):
+        compact = _compact_payload_dict(source, allowed_keys=EVENT_POLICY_TIMELINE_KEYS)
+        evaluated_operator_policy = _compact_payload_dict(
+            source.get("evaluated_operator_policy"),
+            allowed_keys=(
+                "operator_view_active",
+                "matched_window_id",
+                "alignment_status",
+                "enforcement_mode",
+                "reason_codes",
+                "effective_policy_preview",
+                "event_source_status",
+                "event_source_stale",
+                "evaluated_at",
+            ),
+        )
+        if evaluated_operator_policy:
+            compact["evaluated_operator_policy"] = evaluated_operator_policy
+        event_context = _compact_payload_dict(
+            source.get("event_context"),
+            allowed_keys=(
+                "source_status",
+                "is_stale",
+                "is_complete",
+                "next_event_name",
+                "next_event_at",
+            ),
+        )
+        if event_context:
+            compact["event_context"] = event_context
+        if isinstance(source.get("manual_no_trade_windows"), list):
+            window_ids = [
+                str(item.get("window_id"))
+                for item in source.get("manual_no_trade_windows", [])
+                if isinstance(item, dict) and item.get("window_id") not in {None, ""}
+            ]
+            if window_ids:
+                compact["window_ids"] = window_ids
+        return compact
 
     if category_key == "ai_decision":
         compact = _compact_payload_dict(source, allowed_keys=AI_DECISION_TIMELINE_KEYS)

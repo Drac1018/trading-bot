@@ -5,7 +5,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 
-from trading_mvp.schemas import EventBias, EventContextPayload, EventSourceStatus, MacroEventPayload
+from trading_mvp.schemas import (
+    EventBias,
+    EventContextPayload,
+    EventSourceStatus,
+    MacroEventPayload,
+    OperatorActiveRiskWindowPayload,
+    OperatorEventContextPayload,
+    OperatorEventImportance,
+    OperatorEventItemPayload,
+    OperatorEventSourceStatus,
+)
+from trading_mvp.time_utils import ensure_utc_aware, parse_utc_datetime, utcnow_aware
 
 
 def _normalized_assets(values: object) -> list[str]:
@@ -33,6 +44,10 @@ def _parse_datetime(value: object) -> datetime | None:
     return None
 
 
+def _parse_aware_datetime(value: object) -> datetime | None:
+    return parse_utc_datetime(value)
+
+
 def _minutes_until(*, generated_at: datetime, event_at: datetime) -> int:
     return int((event_at - generated_at).total_seconds() // 60)
 
@@ -57,6 +72,16 @@ class EventContextProvider(Protocol):
         timeframe: str,
         generated_at: datetime,
     ) -> EventContextPayload: ...
+
+
+class OperatorEventContextProvider(Protocol):
+    def get_event_context(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        generated_at: datetime,
+    ) -> OperatorEventContextPayload: ...
 
 
 @dataclass(slots=True)
@@ -192,3 +217,202 @@ def build_event_context(
         timeframe=timeframe,
         generated_at=generated_at,
     )
+
+
+def _normalize_operator_source_status(value: object) -> OperatorEventSourceStatus:
+    text = str(value or "").strip().lower()
+    if text in {"fixture", "stub", "available"}:
+        return "available"
+    if text in {"stale", "incomplete", "unavailable", "error"}:
+        return text  # type: ignore[return-value]
+    return "error"
+
+
+def _normalize_operator_importance(value: object) -> OperatorEventImportance:
+    text = str(value or "").strip().lower()
+    if text in {"low", "medium", "high", "critical"}:
+        return text  # type: ignore[return-value]
+    return "unknown"
+
+
+def _normalize_operator_event_items(
+    raw_events: object,
+    *,
+    generated_at: datetime,
+) -> list[OperatorEventItemPayload]:
+    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes)):
+        return []
+    items: list[OperatorEventItemPayload] = []
+    for raw in raw_events:
+        payload = dict(raw) if isinstance(raw, Mapping) else {}
+        event_at = _parse_aware_datetime(payload.get("event_at"))
+        event_name = str(payload.get("event_name") or "").strip()
+        if event_at is None or not event_name:
+            continue
+        minutes_to_event = payload.get("minutes_to_event")
+        if not isinstance(minutes_to_event, int):
+            minutes_to_event = _minutes_until(generated_at=generated_at, event_at=event_at)
+        items.append(
+            OperatorEventItemPayload(
+                event_at=event_at,
+                event_name=event_name,
+                importance=_normalize_operator_importance(payload.get("importance")),
+                affected_assets=_normalized_assets(payload.get("affected_assets")),
+                minutes_to_event=minutes_to_event,
+            )
+        )
+    items.sort(key=lambda item: item.event_at)
+    return items
+
+
+def normalize_operator_event_context(
+    raw_context: Mapping[str, object] | EventContextPayload | None,
+    *,
+    generated_at: datetime | None = None,
+    summary_note: str | None = None,
+) -> OperatorEventContextPayload:
+    source = (
+        raw_context.model_dump(mode="json")
+        if isinstance(raw_context, EventContextPayload)
+        else dict(raw_context or {})
+    )
+    generated_at_value = (
+        _parse_aware_datetime(source.get("generated_at"))
+        or ensure_utc_aware(generated_at)
+        or utcnow_aware()
+    )
+    if not source:
+        return OperatorEventContextPayload(
+            source_status="unavailable",
+            generated_at=generated_at_value,
+            is_stale=False,
+            is_complete=False,
+            active_risk_window=False,
+            active_risk_window_detail=OperatorActiveRiskWindowPayload(
+                is_active=False,
+                summary_note=summary_note or "event context provider unavailable",
+            ),
+            next_event_at=None,
+            next_event_name=None,
+            next_event_importance="unknown",
+            minutes_to_next_event=None,
+            upcoming_events=[],
+            affected_assets=[],
+            summary_note=summary_note or "event context provider unavailable",
+        )
+
+    upcoming_events = _normalize_operator_event_items(
+        source.get("events") or source.get("upcoming_events"),
+        generated_at=generated_at_value,
+    )
+    next_event_at = _parse_aware_datetime(source.get("next_event_at"))
+    next_event_name = str(source.get("next_event_name") or "").strip() or None
+    next_event_importance = _normalize_operator_importance(source.get("next_event_importance"))
+    minutes_to_next_event = source.get("minutes_to_next_event")
+    if not isinstance(minutes_to_next_event, int):
+        minutes_to_next_event = (
+            _minutes_until(generated_at=generated_at_value, event_at=next_event_at)
+            if next_event_at is not None
+            else None
+        )
+    if not upcoming_events and next_event_at is not None and next_event_name is not None:
+        upcoming_events = [
+            OperatorEventItemPayload(
+                event_at=next_event_at,
+                event_name=next_event_name,
+                importance=next_event_importance,
+                affected_assets=_normalized_assets(source.get("affected_assets")),
+                minutes_to_event=minutes_to_next_event,
+            )
+        ]
+
+    active_event = next(
+        (
+            item
+            for item in upcoming_events
+            if item.minutes_to_event is not None and item.minutes_to_event <= 0
+        ),
+        None,
+    )
+    active_risk_window = bool(source.get("active_risk_window"))
+    if not active_risk_window and active_event is not None:
+        active_risk_window = True
+
+    active_window_detail = OperatorActiveRiskWindowPayload(
+        is_active=active_risk_window,
+        event_name=active_event.event_name if active_event is not None else next_event_name,
+        event_importance=active_event.importance if active_event is not None else next_event_importance,
+        start_at=None,
+        end_at=None,
+        affected_assets=(
+            list(active_event.affected_assets)
+            if active_event is not None
+            else _normalized_assets(source.get("affected_assets"))
+        ),
+        summary_note=summary_note,
+    )
+
+    return OperatorEventContextPayload(
+        source_status=_normalize_operator_source_status(source.get("source_status")),
+        generated_at=generated_at_value,
+        is_stale=bool(source.get("is_stale")),
+        is_complete=bool(source.get("is_complete")),
+        active_risk_window=active_risk_window,
+        active_risk_window_detail=active_window_detail,
+        next_event_at=next_event_at,
+        next_event_name=next_event_name,
+        next_event_importance=next_event_importance,
+        minutes_to_next_event=minutes_to_next_event,
+        upcoming_events=upcoming_events,
+        affected_assets=_normalized_assets(source.get("affected_assets")),
+        summary_note=summary_note,
+    )
+
+
+@dataclass(slots=True)
+class StubOperatorEventContextProvider:
+    source_status: OperatorEventSourceStatus = "unavailable"
+    summary_note: str | None = "No operator event source configured."
+
+    def get_event_context(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        generated_at: datetime,
+    ) -> OperatorEventContextPayload:
+        return normalize_operator_event_context(
+            {},
+            generated_at=ensure_utc_aware(generated_at),
+            summary_note=self.summary_note,
+        ).model_copy(update={"source_status": self.source_status})
+
+
+@dataclass(slots=True)
+class FixtureOperatorEventContextProvider:
+    fixtures: Mapping[str, Sequence[Mapping[str, object]]] | None = None
+    source_generated_at: datetime | None = None
+    stale_after_minutes: int = 180
+    summary_note: str | None = "fixture-backed operator event context"
+
+    def get_event_context(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        generated_at: datetime,
+    ) -> OperatorEventContextPayload:
+        payload = FixtureEventContextProvider(
+            fixtures=self.fixtures,
+            source_generated_at=self.source_generated_at,
+            stale_after_minutes=self.stale_after_minutes,
+        ).get_event_context(
+            symbol=symbol,
+            timeframe=timeframe,
+            generated_at=generated_at.replace(tzinfo=None) if generated_at.tzinfo is not None else generated_at,
+        )
+        return normalize_operator_event_context(
+            payload,
+            generated_at=ensure_utc_aware(generated_at),
+            summary_note=self.summary_note,
+        )

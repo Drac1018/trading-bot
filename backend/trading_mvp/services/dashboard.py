@@ -50,6 +50,7 @@ from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
 from trading_mvp.services.settings import (
+    build_event_operator_control_payload,
     build_operational_status_payload,
     get_effective_symbols,
     get_or_create_settings,
@@ -150,6 +151,13 @@ AUDIT_APPROVAL_CONTROL_EVENT_TYPES = {
     "trading_resumed",
     "live_approval_armed",
     "live_approval_disarmed",
+    "operator_event_view_created",
+    "operator_event_view_updated",
+    "operator_event_view_cleared",
+    "manual_no_trade_window_created",
+    "manual_no_trade_window_updated",
+    "manual_no_trade_window_ended",
+    "alignment_evaluated",
     "operating_state_changed",
     "trading_auto_resume_skipped",
     "trading_auto_resume_attempted",
@@ -1607,6 +1615,15 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
         "reason_codes": blocked_reason_codes,
         "blocked_reason_codes": blocked_reason_codes,
         "adjustment_reason_codes": adjustment_reason_codes,
+        "blocked_reason": str(payload.get("blocked_reason") or "") or None,
+        "degraded_reason": str(payload.get("degraded_reason") or "") or None,
+        "approval_required_reason": str(payload.get("approval_required_reason") or "") or None,
+        "policy_source": str(payload.get("policy_source") or "none") or "none",
+        "evaluated_operator_policy": (
+            _as_dict(payload.get("evaluated_operator_policy"))
+            if isinstance(payload.get("evaluated_operator_policy"), dict)
+            else None
+        ),
         "approved_risk_pct": payload.get("approved_risk_pct", row.approved_risk_pct),
         "approved_leverage": payload.get("approved_leverage", row.approved_leverage),
         "raw_projected_notional": payload.get("raw_projected_notional"),
@@ -1653,6 +1670,15 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
         reason_codes=reason_codes,
         blocked_reason_codes=blocked_reason_codes,
         adjustment_reason_codes=adjustment_reason_codes,
+        blocked_reason=str(payload.get("blocked_reason") or "") or None,
+        degraded_reason=str(payload.get("degraded_reason") or "") or None,
+        approval_required_reason=str(payload.get("approval_required_reason") or "") or None,
+        policy_source=str(payload.get("policy_source") or "none") or "none",
+        evaluated_operator_policy=(
+            _as_dict(payload.get("evaluated_operator_policy"))
+            if isinstance(payload.get("evaluated_operator_policy"), dict)
+            else None
+        ),
         approved_risk_pct=_as_float(payload.get("approved_risk_pct"), default=0.0)
         if payload.get("approved_risk_pct") is not None
         else None,
@@ -2253,6 +2279,15 @@ def _build_operator_symbol_summaries(
         market_context_summary = _extract_symbol_market_context(decision_row, market_row, feature_row)
         derivatives_summary = _extract_symbol_derivatives_summary(decision_row, market_row, feature_row)
         event_context_summary = _extract_symbol_event_context_summary(decision_row, market_row, feature_row)
+        event_operator_control = build_event_operator_control_payload(
+            session=session,
+            settings_row=settings_row,
+            symbol=symbol_key,
+            timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
+            decision_row=decision_row,
+            feature_row=feature_row,
+            market_row=market_row,
+        )
         protection_state = (
             _build_position_protection_state(session, position_row)
             if position_row is not None
@@ -2313,6 +2348,7 @@ def _build_operator_symbol_summaries(
                 market_context_summary=market_context_summary,
                 derivatives_summary=derivatives_summary,
                 event_context_summary=event_context_summary,
+                event_operator_control=event_operator_control,
                 ai_decision=decision_snapshot,
                 pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),
                 risk_guard=_build_risk_snapshot(risk_row),

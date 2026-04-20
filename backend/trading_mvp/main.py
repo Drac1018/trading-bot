@@ -16,8 +16,12 @@ from trading_mvp.schemas import (
     BinanceAccountResponse,
     BinanceConnectionTestRequest,
     BinanceLiveTestOrderRequest,
+    ManualNoTradeWindowEndRequest,
+    ManualNoTradeWindowRequest,
     ManualLiveApprovalRequest,
     OpenAIConnectionTestRequest,
+    OperatorEventViewClearRequest,
+    OperatorEventViewRequest,
     ReplayValidationRequest,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
@@ -58,13 +62,18 @@ from trading_mvp.services.scheduler import (
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.settings import (
     arm_live_execution,
+    clear_operator_event_view,
+    create_manual_no_trade_window,
     disarm_live_execution,
+    end_manual_no_trade_window,
     get_or_create_settings,
     serialize_settings_ai_usage,
     serialize_settings_cadences,
     serialize_settings_view,
     set_trading_pause,
+    update_manual_no_trade_window,
     update_settings,
+    upsert_operator_event_view,
 )
 
 READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS = 20.0
@@ -371,6 +380,74 @@ def settings_update(payload: AppSettingsUpdateRequest, db: Session = Depends(get
         message="Application settings updated.",
         payload={"ai_enabled": row.ai_enabled, "binance_market_data_enabled": row.binance_market_data_enabled},
     )
+    db.commit()
+    return serialize_settings_view(row)
+
+
+@app.put("/api/settings/operator-event-view")
+def operator_event_view_upsert(
+    payload: OperatorEventViewRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    row, _changed = upsert_operator_event_view(db, payload)
+    db.commit()
+    return serialize_settings_view(row)
+
+
+@app.post("/api/settings/operator-event-view/clear")
+def operator_event_view_clear(
+    payload: OperatorEventViewClearRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    actor = payload.created_by if payload is not None else "operator-ui"
+    row, _changed = clear_operator_event_view(db, actor=actor)
+    db.commit()
+    return serialize_settings_view(row)
+
+
+@app.post("/api/settings/manual-no-trade-windows")
+def manual_no_trade_window_create(
+    payload: ManualNoTradeWindowRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    row, _window = create_manual_no_trade_window(db, payload)
+    db.commit()
+    return serialize_settings_view(row)
+
+
+@app.put("/api/settings/manual-no-trade-windows/{window_id}")
+def manual_no_trade_window_update(
+    window_id: str,
+    payload: ManualNoTradeWindowRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        row, _window, _changed = update_manual_no_trade_window(db, window_id=window_id, payload=payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    db.commit()
+    return serialize_settings_view(row)
+
+
+@app.post("/api/settings/manual-no-trade-windows/{window_id}/end")
+def manual_no_trade_window_end(
+    window_id: str,
+    payload: ManualNoTradeWindowEndRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        row, _window, _changed = end_manual_no_trade_window(
+            db,
+            window_id=window_id,
+            actor=payload.created_by if payload is not None else "operator-ui",
+            end_at=payload.end_at if payload is not None else None,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     db.commit()
     return serialize_settings_view(row)
 

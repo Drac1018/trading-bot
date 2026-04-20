@@ -12,6 +12,10 @@ def test_openai_trade_decision_schema_marks_all_properties_required() -> None:
     assert schema["additionalProperties"] is False
     assert "default" not in properties["entry_zone_min"]
     assert "null" in {variant["type"] for variant in properties["entry_zone_min"]["anyOf"]}
+    assert "sample_threshold_satisfied" not in properties
+    assert "expected_payoff_efficiency_hint_summary" not in properties
+    assert "sample_threshold_satisfied" not in schema["required"]
+    assert "expected_payoff_efficiency_hint_summary" not in schema["required"]
 
 
 def test_openai_batch_schema_normalizes_nested_object_requirements() -> None:

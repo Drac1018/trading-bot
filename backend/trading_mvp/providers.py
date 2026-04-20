@@ -73,6 +73,14 @@ class OpenAIProvider:
     def _build_strict_json_schema(response_model: type[BaseModel]) -> dict[str, Any]:
         schema = deepcopy(response_model.model_json_schema())
 
+        def is_open_ended_object(node: Any) -> bool:
+            return (
+                isinstance(node, dict)
+                and node.get("type") == "object"
+                and "additionalProperties" in node
+                and "properties" not in node
+            )
+
         def normalize(node: Any) -> Any:
             if isinstance(node, dict):
                 node.pop("default", None)
@@ -82,7 +90,11 @@ class OpenAIProvider:
                     child = node.get(key)
                     if isinstance(child, dict):
                         for nested_key, nested_value in list(child.items()):
-                            child[nested_key] = normalize(nested_value)
+                            normalized_value = normalize(nested_value)
+                            if key == "properties" and is_open_ended_object(normalized_value):
+                                child.pop(nested_key, None)
+                                continue
+                            child[nested_key] = normalized_value
 
                 for key in ("items", "additionalProperties", "contains", "if", "then", "else", "not"):
                     if key in node:

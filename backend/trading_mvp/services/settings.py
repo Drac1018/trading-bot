@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, cast
+from uuid import uuid4
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session, object_session
@@ -21,12 +22,19 @@ from trading_mvp.models import (
     SystemHealthEvent,
 )
 from trading_mvp.schemas import (
+    AIEventViewPayload,
     AppSettingsAIUsageResponse,
     AppSettingsCadenceResponse,
     AppSettingsResponse,
     AppSettingsUpdateRequest,
     AppSettingsViewResponse,
     ControlStatusSummary,
+    EventOperatorControlPayload,
+    ManualNoTradeWindowPayload,
+    ManualNoTradeWindowRequest,
+    OperatorEventContextPayload,
+    OperatorEventViewPayload,
+    OperatorEventViewRequest,
     OperationalStatusPayload,
     RolloutMode,
     SymbolCadenceOverride,
@@ -45,6 +53,13 @@ from trading_mvp.services.ai_usage import (
 )
 from trading_mvp.services.drawdown_state import build_drawdown_state_snapshot
 from trading_mvp.services.execution_policy import summarize_execution_policy
+from trading_mvp.services.event_context import normalize_operator_event_context
+from trading_mvp.services.event_policy import (
+    build_default_operator_event_view,
+    derive_ai_event_view,
+    evaluate_event_policy,
+    no_trade_window_is_active,
+)
 from trading_mvp.services.pause_policy import (
     get_pause_reason_policy,
     pause_reason_allows_auto_resume,
@@ -61,7 +76,8 @@ from trading_mvp.services.runtime_state import (
     summarize_runtime_state,
 )
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
-from trading_mvp.time_utils import utcnow_naive
+from trading_mvp.services.audit import record_audit_event
+from trading_mvp.time_utils import ensure_utc_aware, isoformat_utc, parse_utc_datetime, utcnow_aware, utcnow_naive
 
 
 @dataclass(slots=True)
@@ -106,6 +122,8 @@ RUNTIME_STATE_DETAIL_KEYS = {
     "reconciliation",
     "candidate_selection",
 }
+EVENT_OPERATOR_CONTROL_DETAIL_KEY = "event_operator_control"
+PRESERVED_SETTINGS_DETAIL_KEYS = {*RUNTIME_STATE_DETAIL_KEYS, EVENT_OPERATOR_CONTROL_DETAIL_KEY}
 """
 ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
@@ -354,6 +372,635 @@ def get_effective_symbol_settings(settings_row: Setting, symbol: str) -> Effecti
 
 def get_effective_symbol_schedule(settings_row: Setting) -> list[EffectiveSymbolSettings]:
     return [get_effective_symbol_settings(settings_row, symbol) for symbol in get_effective_symbols(settings_row)]
+
+
+def _event_operator_control_detail(settings_row: Setting) -> dict[str, Any]:
+    detail = dict(settings_row.pause_reason_detail or {})
+    payload = detail.get(EVENT_OPERATOR_CONTROL_DETAIL_KEY)
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _write_event_operator_control_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
+    detail = dict(settings_row.pause_reason_detail or {})
+    detail[EVENT_OPERATOR_CONTROL_DETAIL_KEY] = payload
+    settings_row.pause_reason_detail = detail
+
+
+def _serialize_operator_event_view_payload(view: OperatorEventViewPayload | None) -> dict[str, Any] | None:
+    if view is None:
+        return None
+    return view.model_dump(mode="json")
+
+
+def _deserialize_operator_event_view_payload(settings_row: Setting) -> OperatorEventViewPayload | None:
+    raw = _event_operator_control_detail(settings_row).get("operator_event_view")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return OperatorEventViewPayload.model_validate(raw)
+    except Exception:
+        return None
+
+
+def _deserialize_manual_no_trade_windows(settings_row: Setting) -> list[ManualNoTradeWindowPayload]:
+    raw = _event_operator_control_detail(settings_row).get("manual_no_trade_windows")
+    if not isinstance(raw, list):
+        return []
+    windows: list[ManualNoTradeWindowPayload] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            windows.append(ManualNoTradeWindowPayload.model_validate(item))
+        except Exception:
+            continue
+    windows.sort(
+        key=lambda window: ensure_utc_aware(window.start_at) or utcnow_aware(),
+        reverse=True,
+    )
+    return windows
+
+
+def _serialize_manual_no_trade_windows(
+    windows: list[ManualNoTradeWindowPayload],
+) -> list[dict[str, Any]]:
+    return [window.model_dump(mode="json") for window in windows]
+
+
+def _operator_event_view_logical_payload(view: OperatorEventViewPayload | None) -> dict[str, Any] | None:
+    if view is None:
+        return None
+    return {
+        "operator_bias": view.operator_bias,
+        "operator_risk_state": view.operator_risk_state,
+        "applies_to_symbols": list(view.applies_to_symbols),
+        "horizon": view.horizon,
+        "valid_from": isoformat_utc(view.valid_from),
+        "valid_to": isoformat_utc(view.valid_to),
+        "enforcement_mode": view.enforcement_mode,
+        "note": view.note,
+    }
+
+
+def _manual_window_logical_payload(window: ManualNoTradeWindowPayload) -> dict[str, Any]:
+    return {
+        "scope": window.scope.model_dump(mode="json"),
+        "start_at": isoformat_utc(window.start_at),
+        "end_at": isoformat_utc(window.end_at),
+        "reason": window.reason,
+        "auto_resume": window.auto_resume,
+        "require_manual_rearm": window.require_manual_rearm,
+    }
+
+
+def _latest_symbol_decision(
+    session: Session | None,
+    *,
+    symbol: str,
+    timeframe: str | None = None,
+) -> AgentRun | None:
+    if session is None:
+        return None
+    symbol_key = symbol.upper()
+    for row in session.scalars(
+        select(AgentRun)
+        .where(AgentRun.role == "trading_decision")
+        .order_by(desc(AgentRun.created_at))
+    ):
+        output = row.output_payload if isinstance(row.output_payload, dict) else {}
+        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+        output_symbol = str(output.get("symbol") or "").upper()
+        output_timeframe = str(output.get("timeframe") or "")
+        input_market = input_payload.get("market_snapshot")
+        input_market_timeframe = (
+            str(input_market.get("timeframe") or "")
+            if isinstance(input_market, dict)
+            else ""
+        )
+        if output_symbol != symbol_key:
+            continue
+        if timeframe and output_timeframe not in {"", timeframe} and input_market_timeframe not in {"", timeframe}:
+            continue
+        return row
+    return None
+
+
+def _latest_symbol_feature(
+    session: Session | None,
+    *,
+    symbol: str,
+    timeframe: str | None = None,
+) -> FeatureSnapshot | None:
+    if session is None:
+        return None
+    query = select(FeatureSnapshot).where(FeatureSnapshot.symbol == symbol.upper())
+    if timeframe:
+        query = query.where(FeatureSnapshot.timeframe == timeframe)
+    return session.scalar(query.order_by(desc(FeatureSnapshot.feature_time)).limit(1))
+
+
+def _latest_symbol_market_snapshot(
+    session: Session | None,
+    *,
+    symbol: str,
+    timeframe: str | None = None,
+) -> MarketSnapshot | None:
+    if session is None:
+        return None
+    query = select(MarketSnapshot).where(MarketSnapshot.symbol == symbol.upper())
+    if timeframe:
+        query = query.where(MarketSnapshot.timeframe == timeframe)
+    return session.scalar(query.order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
+
+
+def _extract_raw_event_context(
+    *,
+    decision_row: AgentRun | None,
+    feature_row: FeatureSnapshot | None,
+    market_row: MarketSnapshot | None,
+) -> tuple[dict[str, Any], str | None]:
+    if decision_row is not None and isinstance(decision_row.input_payload, dict):
+        features = decision_row.input_payload.get("features")
+        if isinstance(features, dict) and isinstance(features.get("event_context"), dict):
+            return dict(features.get("event_context") or {}), "latest decision input"
+        market_snapshot = decision_row.input_payload.get("market_snapshot")
+        if isinstance(market_snapshot, dict) and isinstance(market_snapshot.get("event_context"), dict):
+            return dict(market_snapshot.get("event_context") or {}), "decision market snapshot"
+        ai_context = decision_row.input_payload.get("ai_context")
+        if isinstance(ai_context, dict) and isinstance(ai_context.get("event_context_summary"), dict):
+            return dict(ai_context.get("event_context_summary") or {}), "ai context summary"
+        feature_layers = decision_row.input_payload.get("feature_layers")
+        if isinstance(feature_layers, dict) and isinstance(feature_layers.get("event_context_summary"), dict):
+            return dict(feature_layers.get("event_context_summary") or {}), "feature layer summary"
+    if feature_row is not None and isinstance(feature_row.payload, dict) and isinstance(feature_row.payload.get("event_context"), dict):
+        return dict(feature_row.payload.get("event_context") or {}), "feature snapshot"
+    if market_row is not None and isinstance(market_row.payload, dict) and isinstance(market_row.payload.get("event_context"), dict):
+        return dict(market_row.payload.get("event_context") or {}), "market snapshot"
+    return {}, None
+
+
+def _build_operator_event_context_payload(
+    *,
+    session: Session | None,
+    settings_row: Setting,
+    symbol: str,
+    timeframe: str | None = None,
+    decision_row: AgentRun | None = None,
+    feature_row: FeatureSnapshot | None = None,
+    market_row: MarketSnapshot | None = None,
+) -> OperatorEventContextPayload:
+    resolved_decision = decision_row or _latest_symbol_decision(session, symbol=symbol, timeframe=timeframe)
+    resolved_feature = feature_row or _latest_symbol_feature(session, symbol=symbol, timeframe=timeframe)
+    resolved_market = market_row or _latest_symbol_market_snapshot(session, symbol=symbol, timeframe=timeframe)
+    raw_context, context_source = _extract_raw_event_context(
+        decision_row=resolved_decision,
+        feature_row=resolved_feature,
+        market_row=resolved_market,
+    )
+    return normalize_operator_event_context(
+        raw_context,
+        generated_at=utcnow_aware(),
+        summary_note=(
+            f"derived from {context_source}"
+            if context_source is not None
+            else f"no event context available for {symbol.upper()} / {timeframe or settings_row.default_timeframe}"
+        ),
+    )
+
+
+def _build_ai_event_view_payload(
+    *,
+    decision_row: AgentRun | None,
+) -> AIEventViewPayload:
+    if decision_row is None:
+        return AIEventViewPayload(source_state="unavailable")
+    return derive_ai_event_view(
+        output_payload=decision_row.output_payload if isinstance(decision_row.output_payload, dict) else {},
+        metadata_json=decision_row.metadata_json if isinstance(decision_row.metadata_json, dict) else {},
+    )
+
+
+def _windows_for_symbol(
+    windows: list[ManualNoTradeWindowPayload],
+    *,
+    symbol: str,
+    now: datetime,
+) -> list[ManualNoTradeWindowPayload]:
+    results: list[ManualNoTradeWindowPayload] = []
+    for window in windows:
+        results.append(
+            window.model_copy(
+                update={"is_active": no_trade_window_is_active(window, symbol=symbol, now=now)}
+            )
+        )
+    return results
+
+
+def build_event_operator_control_payload(
+    *,
+    session: Session | None,
+    settings_row: Setting,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    decision_row: AgentRun | None = None,
+    feature_row: FeatureSnapshot | None = None,
+    market_row: MarketSnapshot | None = None,
+    ai_event_view: AIEventViewPayload | None = None,
+    evaluated_at: datetime | None = None,
+) -> EventOperatorControlPayload:
+    resolved_symbol = (symbol or settings_row.default_symbol).upper()
+    resolved_timeframe = timeframe or settings_row.default_timeframe
+    evaluation_time = ensure_utc_aware(evaluated_at) or utcnow_aware()
+    operator_event_view = _deserialize_operator_event_view_payload(settings_row) or build_default_operator_event_view()
+    manual_windows = _deserialize_manual_no_trade_windows(settings_row)
+    event_context = _build_operator_event_context_payload(
+        session=session,
+        settings_row=settings_row,
+        symbol=resolved_symbol,
+        timeframe=resolved_timeframe,
+        decision_row=decision_row,
+        feature_row=feature_row,
+        market_row=market_row,
+    )
+    resolved_decision = decision_row or _latest_symbol_decision(
+        session,
+        symbol=resolved_symbol,
+        timeframe=resolved_timeframe,
+    )
+    resolved_ai_event_view = ai_event_view or _build_ai_event_view_payload(decision_row=resolved_decision)
+    symbol_windows = _windows_for_symbol(manual_windows, symbol=resolved_symbol, now=evaluation_time)
+    policy_evaluation = evaluate_event_policy(
+        symbol=resolved_symbol,
+        ai_event_view=resolved_ai_event_view,
+        operator_event_view=operator_event_view,
+        manual_no_trade_windows=symbol_windows,
+        event_source_status=event_context.source_status,
+        event_source_is_stale=event_context.is_stale,
+        evaluated_at=evaluation_time,
+    )
+    return EventOperatorControlPayload(
+        event_context=event_context,
+        ai_event_view=resolved_ai_event_view,
+        operator_event_view=operator_event_view,
+        alignment_decision=policy_evaluation.alignment_decision,
+        evaluated_operator_policy=policy_evaluation.evaluated_operator_policy,
+        blocked_reason=policy_evaluation.blocked_reason,
+        degraded_reason=policy_evaluation.degraded_reason,
+        approval_required_reason=policy_evaluation.approval_required_reason,
+        policy_source=policy_evaluation.policy_source,
+        manual_no_trade_windows=symbol_windows,
+        effective_policy_preview=policy_evaluation.alignment_decision.effective_policy_preview,
+    )
+
+
+def _alignment_audit_payload(
+    *,
+    session: Session,
+    settings_row: Setting,
+    symbols: list[str],
+) -> dict[str, Any]:
+    evaluations: dict[str, Any] = {}
+    for symbol in symbols:
+        payload = build_event_operator_control_payload(
+            session=session,
+            settings_row=settings_row,
+            symbol=symbol,
+        )
+        evaluations[symbol] = {
+            "alignment_status": payload.alignment_decision.alignment_status,
+            "effective_policy_preview": payload.alignment_decision.effective_policy_preview,
+            "reason_codes": list(payload.alignment_decision.reason_codes),
+        }
+    return {
+        "symbols": list(symbols),
+        "evaluations": evaluations,
+        "evaluated_at": isoformat_utc(utcnow_aware()),
+    }
+
+
+def _event_control_scope_symbols(
+    settings_row: Setting,
+    *,
+    applies_to_symbols: list[str] | None = None,
+) -> list[str]:
+    normalized = normalize_symbols(applies_to_symbols or [])
+    if normalized:
+        return normalized
+    return get_effective_symbols(settings_row)
+
+
+def _persist_event_operator_control_state(
+    settings_row: Setting,
+    *,
+    operator_event_view: OperatorEventViewPayload | None,
+    manual_no_trade_windows: list[ManualNoTradeWindowPayload],
+) -> None:
+    payload: dict[str, Any] = {
+        "manual_no_trade_windows": _serialize_manual_no_trade_windows(manual_no_trade_windows),
+    }
+    serialized_view = _serialize_operator_event_view_payload(operator_event_view)
+    if serialized_view is not None:
+        payload["operator_event_view"] = serialized_view
+    _write_event_operator_control_detail(settings_row, payload)
+
+
+def _record_alignment_evaluated(
+    session: Session,
+    settings_row: Setting,
+    *,
+    actor: str,
+    symbols: list[str],
+) -> None:
+    record_audit_event(
+        session,
+        event_type="alignment_evaluated",
+        entity_type="settings",
+        entity_id=str(settings_row.id),
+        message="Operator event alignment preview re-evaluated.",
+        payload={
+            "actor": actor,
+            **_alignment_audit_payload(session=session, settings_row=settings_row, symbols=symbols),
+        },
+    )
+
+
+def upsert_operator_event_view(
+    session: Session,
+    payload: OperatorEventViewRequest,
+) -> tuple[Setting, bool]:
+    row = get_or_create_settings(session)
+    existing_view = _deserialize_operator_event_view_payload(row)
+    logical_before = _operator_event_view_logical_payload(existing_view)
+    next_view = OperatorEventViewPayload(
+        operator_bias=payload.operator_bias,
+        operator_risk_state=payload.operator_risk_state,
+        applies_to_symbols=normalize_symbols(payload.applies_to_symbols),
+        horizon=payload.horizon,
+        valid_from=ensure_utc_aware(payload.valid_from),
+        valid_to=ensure_utc_aware(payload.valid_to),
+        enforcement_mode=payload.enforcement_mode,
+        note=payload.note,
+        created_by=existing_view.created_by if existing_view is not None else payload.created_by,
+        updated_at=utcnow_aware(),
+    )
+    logical_after = _operator_event_view_logical_payload(next_view)
+    if logical_before == logical_after:
+        return row, False
+    windows = _deserialize_manual_no_trade_windows(row)
+    _persist_event_operator_control_state(
+        row,
+        operator_event_view=next_view,
+        manual_no_trade_windows=windows,
+    )
+    session.add(row)
+    session.flush()
+    scope_symbols = _event_control_scope_symbols(row, applies_to_symbols=next_view.applies_to_symbols)
+    record_audit_event(
+        session,
+        event_type="operator_event_view_created" if existing_view is None else "operator_event_view_updated",
+        entity_type="settings",
+        entity_id=str(row.id),
+        message="Operator event view persisted.",
+        payload={
+            "actor": payload.created_by,
+            "symbols": scope_symbols,
+            "before": logical_before,
+            "after": logical_after,
+        },
+    )
+    _record_alignment_evaluated(
+        session,
+        row,
+        actor=payload.created_by,
+        symbols=scope_symbols,
+    )
+    return row, True
+
+
+def clear_operator_event_view(
+    session: Session,
+    *,
+    actor: str = "operator-ui",
+) -> tuple[Setting, bool]:
+    row = get_or_create_settings(session)
+    existing_view = _deserialize_operator_event_view_payload(row)
+    if existing_view is None:
+        return row, False
+    windows = _deserialize_manual_no_trade_windows(row)
+    scope_symbols = _event_control_scope_symbols(row, applies_to_symbols=existing_view.applies_to_symbols)
+    _persist_event_operator_control_state(
+        row,
+        operator_event_view=None,
+        manual_no_trade_windows=windows,
+    )
+    session.add(row)
+    session.flush()
+    record_audit_event(
+        session,
+        event_type="operator_event_view_cleared",
+        entity_type="settings",
+        entity_id=str(row.id),
+        message="Operator event view cleared.",
+        payload={
+            "actor": actor,
+            "symbols": scope_symbols,
+            "before": _operator_event_view_logical_payload(existing_view),
+            "after": None,
+        },
+    )
+    _record_alignment_evaluated(
+        session,
+        row,
+        actor=actor,
+        symbols=scope_symbols,
+    )
+    return row, True
+
+
+def create_manual_no_trade_window(
+    session: Session,
+    payload: ManualNoTradeWindowRequest,
+) -> tuple[Setting, ManualNoTradeWindowPayload]:
+    row = get_or_create_settings(session)
+    windows = _deserialize_manual_no_trade_windows(row)
+    now = utcnow_aware()
+    window = ManualNoTradeWindowPayload(
+        window_id=f"ntw_{uuid4().hex[:16]}",
+        scope=payload.scope,
+        start_at=ensure_utc_aware(payload.start_at),
+        end_at=ensure_utc_aware(payload.end_at),
+        reason=payload.reason,
+        auto_resume=payload.auto_resume,
+        require_manual_rearm=payload.require_manual_rearm,
+        created_by=payload.created_by,
+        updated_at=now,
+        is_active=False,
+    )
+    windows.append(window)
+    windows.sort(key=lambda item: ensure_utc_aware(item.start_at) or now, reverse=True)
+    _persist_event_operator_control_state(
+        row,
+        operator_event_view=_deserialize_operator_event_view_payload(row),
+        manual_no_trade_windows=windows,
+    )
+    session.add(row)
+    session.flush()
+    scope_symbols = (
+        window.scope.symbols
+        if window.scope.scope_type == "symbols" and window.scope.symbols
+        else get_effective_symbols(row)
+    )
+    record_audit_event(
+        session,
+        event_type="manual_no_trade_window_created",
+        entity_type="settings",
+        entity_id=str(row.id),
+        message="Manual no-trade window created.",
+        payload={
+            "actor": payload.created_by,
+            "window_id": window.window_id,
+            "symbols": scope_symbols,
+            "scope": window.scope.model_dump(mode="json"),
+            "before": None,
+            "after": _manual_window_logical_payload(window),
+        },
+    )
+    _record_alignment_evaluated(
+        session,
+        row,
+        actor=payload.created_by,
+        symbols=scope_symbols,
+    )
+    return row, window
+
+
+def update_manual_no_trade_window(
+    session: Session,
+    *,
+    window_id: str,
+    payload: ManualNoTradeWindowRequest,
+) -> tuple[Setting, ManualNoTradeWindowPayload, bool]:
+    row = get_or_create_settings(session)
+    windows = _deserialize_manual_no_trade_windows(row)
+    target_index = next((index for index, item in enumerate(windows) if item.window_id == window_id), None)
+    if target_index is None:
+        raise LookupError(f"manual no-trade window not found: {window_id}")
+    existing = windows[target_index]
+    logical_before = _manual_window_logical_payload(existing)
+    updated = existing.model_copy(
+        update={
+            "scope": payload.scope,
+            "start_at": ensure_utc_aware(payload.start_at),
+            "end_at": ensure_utc_aware(payload.end_at),
+            "reason": payload.reason,
+            "auto_resume": payload.auto_resume,
+            "require_manual_rearm": payload.require_manual_rearm,
+            "updated_at": utcnow_aware(),
+            "is_active": False,
+        }
+    )
+    logical_after = _manual_window_logical_payload(updated)
+    if logical_before == logical_after:
+        return row, existing, False
+    windows[target_index] = updated
+    windows.sort(key=lambda item: ensure_utc_aware(item.start_at) or utcnow_aware(), reverse=True)
+    _persist_event_operator_control_state(
+        row,
+        operator_event_view=_deserialize_operator_event_view_payload(row),
+        manual_no_trade_windows=windows,
+    )
+    session.add(row)
+    session.flush()
+    scope_symbols = (
+        updated.scope.symbols
+        if updated.scope.scope_type == "symbols" and updated.scope.symbols
+        else get_effective_symbols(row)
+    )
+    record_audit_event(
+        session,
+        event_type="manual_no_trade_window_updated",
+        entity_type="settings",
+        entity_id=str(row.id),
+        message="Manual no-trade window updated.",
+        payload={
+            "actor": payload.created_by,
+            "window_id": updated.window_id,
+            "symbols": scope_symbols,
+            "scope": updated.scope.model_dump(mode="json"),
+            "before": logical_before,
+            "after": logical_after,
+        },
+    )
+    _record_alignment_evaluated(
+        session,
+        row,
+        actor=payload.created_by,
+        symbols=scope_symbols,
+    )
+    return row, updated, True
+
+
+def end_manual_no_trade_window(
+    session: Session,
+    *,
+    window_id: str,
+    actor: str = "operator-ui",
+    end_at: datetime | None = None,
+) -> tuple[Setting, ManualNoTradeWindowPayload, bool]:
+    row = get_or_create_settings(session)
+    windows = _deserialize_manual_no_trade_windows(row)
+    target_index = next((index for index, item in enumerate(windows) if item.window_id == window_id), None)
+    if target_index is None:
+        raise LookupError(f"manual no-trade window not found: {window_id}")
+    existing = windows[target_index]
+    resolved_end_at = ensure_utc_aware(end_at) or utcnow_aware()
+    if resolved_end_at <= ensure_utc_aware(existing.start_at):
+        raise ValueError("end_at must be later than start_at")
+    if ensure_utc_aware(existing.end_at) == resolved_end_at:
+        return row, existing, False
+    updated = existing.model_copy(
+        update={
+            "end_at": resolved_end_at,
+            "updated_at": utcnow_aware(),
+            "is_active": False,
+        }
+    )
+    windows[target_index] = updated
+    windows.sort(key=lambda item: ensure_utc_aware(item.start_at) or utcnow_aware(), reverse=True)
+    _persist_event_operator_control_state(
+        row,
+        operator_event_view=_deserialize_operator_event_view_payload(row),
+        manual_no_trade_windows=windows,
+    )
+    session.add(row)
+    session.flush()
+    scope_symbols = (
+        updated.scope.symbols
+        if updated.scope.scope_type == "symbols" and updated.scope.symbols
+        else get_effective_symbols(row)
+    )
+    record_audit_event(
+        session,
+        event_type="manual_no_trade_window_ended",
+        entity_type="settings",
+        entity_id=str(row.id),
+        message="Manual no-trade window ended.",
+        payload={
+            "actor": actor,
+            "window_id": updated.window_id,
+            "symbols": scope_symbols,
+            "scope": updated.scope.model_dump(mode="json"),
+            "before": _manual_window_logical_payload(existing),
+            "after": _manual_window_logical_payload(updated),
+        },
+    )
+    _record_alignment_evaluated(
+        session,
+        row,
+        actor=actor,
+        symbols=scope_symbols,
+    )
+    return row, updated, True
 
 
 def get_or_create_settings(session: Session) -> Setting:
@@ -1720,6 +2367,12 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)
+    event_operator_control = build_event_operator_control_payload(
+        session=current_session,
+        settings_row=settings_row,
+        symbol=settings_row.default_symbol.upper(),
+        timeframe=settings_row.default_timeframe,
+    )
     operational_status = build_operational_status_payload(
         settings_row,
         session=current_session,
@@ -1784,6 +2437,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         exposure_summary=exposure_summary,
         execution_policy_summary=execution_policy_summary,
         market_context_summary=market_context_summary,
+        event_operator_control=event_operator_control,
         adaptive_protection_summary=adaptive_protection_summary,
         adaptive_signal_summary=adaptive_signal_summary,
         position_management_summary=position_management_summary,
@@ -1930,6 +2584,12 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         ),
     )
     position_management_summary = _build_position_management_summary(current_session, settings_row)
+    event_operator_control = build_event_operator_control_payload(
+        session=current_session,
+        settings_row=settings_row,
+        symbol=settings_row.default_symbol.upper(),
+        timeframe=settings_row.default_timeframe,
+    )
     operational_status = build_operational_status_payload(
         settings_row,
         session=current_session,
@@ -1988,6 +2648,7 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         default_symbol=settings_row.default_symbol.upper(),
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
+        event_operator_control=event_operator_control,
         exchange_sync_interval_seconds=settings_row.exchange_sync_interval_seconds,
         market_refresh_interval_minutes=settings_row.market_refresh_interval_minutes,
         position_management_interval_seconds=settings_row.position_management_interval_seconds,
@@ -2143,6 +2804,12 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)
+    event_operator_control = build_event_operator_control_payload(
+        session=current_session,
+        settings_row=settings_row,
+        symbol=settings_row.default_symbol.upper(),
+        timeframe=settings_row.default_timeframe,
+    )
     operational_status = build_operational_status_payload(
         settings_row,
         session=current_session,
@@ -2167,6 +2834,7 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
         "adaptive_protection_summary": adaptive_protection_summary,
         "adaptive_signal_summary": adaptive_signal_summary,
         "position_management_summary": position_management_summary,
+        "event_operator_control": event_operator_control.model_dump(mode="json"),
         "operational_status": operational_status.model_dump(mode="json"),
     }
 
@@ -2268,7 +2936,7 @@ def set_trading_pause(
     existing_detail = dict(row.pause_reason_detail or {})
     preserved_runtime_detail = {
         key: existing_detail[key]
-        for key in RUNTIME_STATE_DETAIL_KEYS
+        for key in PRESERVED_SETTINGS_DETAIL_KEYS
         if key in existing_detail
     }
     if paused:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from trading_mvp.time_utils import ensure_utc_aware, parse_utc_datetime
 
 RolloutMode = Literal["paper", "shadow", "live_dry_run", "limited_live", "full_live"]
 HoldingProfile = Literal["scalp", "swing", "position"]
@@ -26,6 +29,32 @@ DataQualityGrade = Literal["complete", "partial", "degraded", "unavailable"]
 EventSourceStatus = Literal["fixture", "stub", "unavailable", "stale", "incomplete"]
 MacroEventImportance = Literal["low", "medium", "high"]
 EventBias = Literal["bullish", "bearish", "neutral"]
+OperatorEventBias = Literal["bullish", "bearish", "neutral", "no_trade", "unknown"]
+OperatorEventRiskState = Literal["risk_on", "risk_off", "neutral", "unknown"]
+OperatorEventAlignmentStatus = Literal["aligned", "partially_aligned", "conflict", "insufficient_data"]
+OperatorEventEnforcementMode = Literal[
+    "observe_only",
+    "approval_required",
+    "block_on_conflict",
+    "force_no_trade",
+]
+OperatorEventSourceStatus = Literal["available", "stale", "incomplete", "unavailable", "error"]
+OperatorEventImportance = Literal["low", "medium", "high", "critical", "unknown"]
+OperatorEffectivePolicyPreview = Literal[
+    "allow_normal",
+    "allow_with_approval",
+    "block_new_entries",
+    "force_no_trade_window",
+    "insufficient_data",
+]
+OperatorPolicySource = Literal[
+    "manual_no_trade_window",
+    "operator_enforcement_mode",
+    "operator_bias",
+    "alignment_policy",
+    "none",
+]
+AIEventSourceState = Literal["available", "stale", "incomplete", "unavailable", "error", "unknown"]
 AITriggerReason = Literal[
     "entry_candidate_event",
     "breakout_exception_event",
@@ -39,6 +68,32 @@ AI_CONTEXT_VERSION = "2026-04-context-v1"
 
 class StrictBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+def _coerce_aware_datetime(value: object) -> datetime | None:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ValueError("datetime must be ISO-8601 with timezone offset or UTC Z suffix")
+        return ensure_utc_aware(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if re.search(r"(Z|[+-]\d{2}:\d{2})$", text) is None:
+            raise ValueError("datetime must be ISO-8601 with timezone offset or UTC Z suffix")
+    parsed = parse_utc_datetime(value)
+    if parsed is None:
+        raise ValueError("datetime must be ISO-8601 with timezone offset or UTC Z suffix")
+    return parsed
+
+
+def _coerce_required_aware_datetime(value: object) -> datetime:
+    parsed = _coerce_aware_datetime(value)
+    if parsed is None:
+        raise ValueError("datetime is required")
+    return parsed
 
 
 class TradeDecision(StrictBaseModel):
@@ -1125,6 +1180,11 @@ class OperatorRiskSnapshot(StrictBaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     blocked_reason_codes: list[str] = Field(default_factory=list)
     adjustment_reason_codes: list[str] = Field(default_factory=list)
+    blocked_reason: str | None = None
+    degraded_reason: str | None = None
+    approval_required_reason: str | None = None
+    policy_source: OperatorPolicySource = "none"
+    evaluated_operator_policy: EvaluatedOperatorPolicyPayload | None = None
     approved_risk_pct: float | None = None
     approved_leverage: float | None = None
     raw_projected_notional: float | None = None
@@ -1249,6 +1309,7 @@ class OperatorSymbolSummary(StrictBaseModel):
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     derivatives_summary: dict[str, Any] = Field(default_factory=dict)
     event_context_summary: dict[str, Any] = Field(default_factory=dict)
+    event_operator_control: EventOperatorControlPayload | None = None
     ai_decision: OperatorDecisionSnapshot = Field(default_factory=OperatorDecisionSnapshot)
     pending_entry_plan: PendingEntryPlanSnapshot = Field(default_factory=PendingEntryPlanSnapshot)
     risk_guard: OperatorRiskSnapshot = Field(default_factory=OperatorRiskSnapshot)
@@ -1328,6 +1389,11 @@ class RiskCheckResult(StrictBaseModel):
         default_factory=list,
         description="Non-blocking adjustment or approval reasons such as successful auto-resize.",
     )
+    blocked_reason: str | None = None
+    degraded_reason: str | None = None
+    approval_required_reason: str | None = None
+    policy_source: OperatorPolicySource = "none"
+    evaluated_operator_policy: EvaluatedOperatorPolicyPayload | None = None
     reason_details: list[RiskReasonDetail] = Field(default_factory=list)
     approved_risk_pct: float = Field(ge=0.0, le=1.0)
     approved_leverage: float = Field(ge=0.0, le=10.0)
@@ -1509,6 +1575,170 @@ class EventContextPayload(StrictBaseModel):
     affected_assets: list[str] = Field(default_factory=list)
     event_bias: EventBias | None = None
     events: list[MacroEventPayload] = Field(default_factory=list)
+
+
+class OperatorEventItemPayload(StrictBaseModel):
+    event_at: datetime
+    event_name: str
+    importance: OperatorEventImportance = "unknown"
+    affected_assets: list[str] = Field(default_factory=list)
+    minutes_to_event: int | None = None
+
+    _normalize_event_at = field_validator("event_at", mode="before")(_coerce_required_aware_datetime)
+
+
+class OperatorActiveRiskWindowPayload(StrictBaseModel):
+    is_active: bool = False
+    event_name: str | None = None
+    event_importance: OperatorEventImportance = "unknown"
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    affected_assets: list[str] = Field(default_factory=list)
+    summary_note: str | None = None
+
+    _normalize_start_at = field_validator("start_at", mode="before")(_coerce_aware_datetime)
+    _normalize_end_at = field_validator("end_at", mode="before")(_coerce_aware_datetime)
+
+
+class OperatorEventContextPayload(StrictBaseModel):
+    source_status: OperatorEventSourceStatus = "unavailable"
+    generated_at: datetime
+    is_stale: bool = False
+    is_complete: bool = False
+    active_risk_window: bool = False
+    active_risk_window_detail: OperatorActiveRiskWindowPayload | None = None
+    next_event_at: datetime | None = None
+    next_event_name: str | None = None
+    next_event_importance: OperatorEventImportance = "unknown"
+    minutes_to_next_event: int | None = None
+    upcoming_events: list[OperatorEventItemPayload] = Field(default_factory=list)
+    affected_assets: list[str] = Field(default_factory=list)
+    summary_note: str | None = None
+
+    _normalize_generated_at = field_validator("generated_at", mode="before")(_coerce_required_aware_datetime)
+    _normalize_next_event_at = field_validator("next_event_at", mode="before")(_coerce_aware_datetime)
+
+
+class AIEventViewPayload(StrictBaseModel):
+    ai_bias: OperatorEventBias = "unknown"
+    ai_risk_state: OperatorEventRiskState = "unknown"
+    ai_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    scenario_note: str | None = None
+    confidence_penalty_reason: str | None = None
+    source_state: AIEventSourceState = "unknown"
+
+
+class OperatorEventViewPayload(StrictBaseModel):
+    operator_bias: OperatorEventBias = "unknown"
+    operator_risk_state: OperatorEventRiskState = "unknown"
+    applies_to_symbols: list[str] = Field(default_factory=list)
+    horizon: str | None = Field(default=None, min_length=1, max_length=40)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    enforcement_mode: OperatorEventEnforcementMode = "observe_only"
+    note: str | None = None
+    created_by: str = "unknown"
+    updated_at: datetime | None = None
+
+    _normalize_valid_from = field_validator("valid_from", mode="before")(_coerce_aware_datetime)
+    _normalize_valid_to = field_validator("valid_to", mode="before")(_coerce_aware_datetime)
+    _normalize_updated_at = field_validator("updated_at", mode="before")(_coerce_aware_datetime)
+
+    @model_validator(mode="after")
+    def _validate_time_range(self) -> OperatorEventViewPayload:
+        if self.valid_from is not None and self.valid_to is not None and self.valid_to <= self.valid_from:
+            raise ValueError("valid_to must be later than valid_from")
+        return self
+
+
+class ManualNoTradeWindowScopePayload(StrictBaseModel):
+    scope_type: Literal["global", "symbols"] = "global"
+    symbols: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_scope(self) -> ManualNoTradeWindowScopePayload:
+        normalized = []
+        for item in self.symbols:
+            symbol = str(item or "").strip().upper()
+            if symbol and symbol not in normalized:
+                normalized.append(symbol)
+        self.symbols = normalized if self.scope_type == "symbols" else []
+        if self.scope_type == "symbols" and not self.symbols:
+            raise ValueError("symbols scope requires at least one symbol")
+        return self
+
+
+class ManualNoTradeWindowPayload(StrictBaseModel):
+    window_id: str = Field(min_length=8, max_length=64)
+    scope: ManualNoTradeWindowScopePayload = Field(default_factory=ManualNoTradeWindowScopePayload)
+    start_at: datetime
+    end_at: datetime
+    reason: str = Field(min_length=1, max_length=240)
+    auto_resume: bool = False
+    require_manual_rearm: bool = False
+    created_by: str = "unknown"
+    updated_at: datetime | None = None
+    is_active: bool = False
+
+    _normalize_start_at = field_validator("start_at", mode="before")(_coerce_required_aware_datetime)
+    _normalize_end_at = field_validator("end_at", mode="before")(_coerce_required_aware_datetime)
+    _normalize_updated_at = field_validator("updated_at", mode="before")(_coerce_aware_datetime)
+
+    @model_validator(mode="after")
+    def _validate_window_range(self) -> ManualNoTradeWindowPayload:
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be later than start_at")
+        return self
+
+
+class AlignmentDecisionPayload(StrictBaseModel):
+    ai_bias: OperatorEventBias = "unknown"
+    operator_bias: OperatorEventBias = "unknown"
+    ai_risk_state: OperatorEventRiskState = "unknown"
+    operator_risk_state: OperatorEventRiskState = "unknown"
+    alignment_status: OperatorEventAlignmentStatus = "insufficient_data"
+    reason_codes: list[str] = Field(default_factory=list)
+    effective_policy_preview: OperatorEffectivePolicyPreview = "insufficient_data"
+    evaluated_at: datetime
+
+    _normalize_evaluated_at = field_validator("evaluated_at", mode="before")(_coerce_required_aware_datetime)
+
+
+class EvaluatedOperatorPolicyPayload(StrictBaseModel):
+    operator_view_active: bool = False
+    matched_window_id: str | None = Field(default=None, min_length=1, max_length=64)
+    alignment_status: OperatorEventAlignmentStatus = "insufficient_data"
+    enforcement_mode: OperatorEventEnforcementMode = "observe_only"
+    reason_codes: list[str] = Field(default_factory=list)
+    effective_policy_preview: OperatorEffectivePolicyPreview = "insufficient_data"
+    event_source_status: OperatorEventSourceStatus = "unavailable"
+    event_source_stale: bool = False
+    evaluated_at: datetime
+
+    _normalize_evaluated_at = field_validator("evaluated_at", mode="before")(_coerce_required_aware_datetime)
+
+
+class EventPolicyEvaluationPayload(StrictBaseModel):
+    alignment_decision: AlignmentDecisionPayload
+    evaluated_operator_policy: EvaluatedOperatorPolicyPayload
+    blocked_reason: str | None = None
+    degraded_reason: str | None = None
+    approval_required_reason: str | None = None
+    policy_source: OperatorPolicySource = "none"
+
+
+class EventOperatorControlPayload(StrictBaseModel):
+    event_context: OperatorEventContextPayload
+    ai_event_view: AIEventViewPayload
+    operator_event_view: OperatorEventViewPayload
+    alignment_decision: AlignmentDecisionPayload
+    evaluated_operator_policy: EvaluatedOperatorPolicyPayload | None = None
+    blocked_reason: str | None = None
+    degraded_reason: str | None = None
+    approval_required_reason: str | None = None
+    policy_source: OperatorPolicySource = "none"
+    manual_no_trade_windows: list[ManualNoTradeWindowPayload] = Field(default_factory=list)
+    effective_policy_preview: OperatorEffectivePolicyPreview = "insufficient_data"
 
 
 class RegimeSummaryPayload(StrictBaseModel):
@@ -1914,6 +2144,7 @@ class AppSettingsResponse(StrictBaseModel):
     adaptive_protection_summary: dict[str, Any] = Field(default_factory=dict)
     adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
     position_management_summary: dict[str, Any] = Field(default_factory=dict)
+    event_operator_control: EventOperatorControlPayload | None = None
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
@@ -2043,6 +2274,7 @@ class AppSettingsViewResponse(StrictBaseModel):
     reduce_on_regime_shift_enabled: bool
     adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
     position_management_summary: dict[str, Any] = Field(default_factory=dict)
+    event_operator_control: EventOperatorControlPayload | None = None
     ai_enabled: bool
     ai_provider: str
     ai_model: str
@@ -2157,6 +2389,63 @@ class ConnectionTestResponse(StrictBaseModel):
 
 class ManualLiveApprovalRequest(StrictBaseModel):
     minutes: int | None = Field(default=None, ge=0, le=240)
+
+
+class OperatorEventViewRequest(StrictBaseModel):
+    operator_bias: OperatorEventBias = "unknown"
+    operator_risk_state: OperatorEventRiskState = "unknown"
+    applies_to_symbols: list[str] = Field(default_factory=list)
+    horizon: str | None = Field(default=None, min_length=1, max_length=40)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    enforcement_mode: OperatorEventEnforcementMode = "observe_only"
+    note: str | None = None
+    created_by: str = Field(default="operator-ui", min_length=1, max_length=80)
+
+    _normalize_valid_from = field_validator("valid_from", mode="before")(_coerce_aware_datetime)
+    _normalize_valid_to = field_validator("valid_to", mode="before")(_coerce_aware_datetime)
+
+    @model_validator(mode="after")
+    def _validate_time_range(self) -> OperatorEventViewRequest:
+        if self.valid_from is not None and self.valid_to is not None and self.valid_to <= self.valid_from:
+            raise ValueError("valid_to must be later than valid_from")
+        normalized_symbols: list[str] = []
+        for item in self.applies_to_symbols:
+            symbol = str(item or "").strip().upper()
+            if symbol and symbol not in normalized_symbols:
+                normalized_symbols.append(symbol)
+        self.applies_to_symbols = normalized_symbols
+        return self
+
+
+class OperatorEventViewClearRequest(StrictBaseModel):
+    created_by: str = Field(default="operator-ui", min_length=1, max_length=80)
+
+
+class ManualNoTradeWindowRequest(StrictBaseModel):
+    scope: ManualNoTradeWindowScopePayload = Field(default_factory=ManualNoTradeWindowScopePayload)
+    start_at: datetime
+    end_at: datetime
+    reason: str = Field(min_length=1, max_length=240)
+    auto_resume: bool = False
+    require_manual_rearm: bool = False
+    created_by: str = Field(default="operator-ui", min_length=1, max_length=80)
+
+    _normalize_start_at = field_validator("start_at", mode="before")(_coerce_required_aware_datetime)
+    _normalize_end_at = field_validator("end_at", mode="before")(_coerce_required_aware_datetime)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> ManualNoTradeWindowRequest:
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be later than start_at")
+        return self
+
+
+class ManualNoTradeWindowEndRequest(StrictBaseModel):
+    end_at: datetime | None = None
+    created_by: str = Field(default="operator-ui", min_length=1, max_length=80)
+
+    _normalize_end_at = field_validator("end_at", mode="before")(_coerce_aware_datetime)
 
 
 class BinanceLiveTestOrderRequest(StrictBaseModel):

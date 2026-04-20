@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from trading_mvp.config import get_settings
 from trading_mvp.models import Order, RiskCheck, Setting
 from trading_mvp.schemas import (
+    EventOperatorControlPayload,
     MarketSnapshotPayload,
     MetaGateResult,
     RiskCheckResult,
@@ -20,6 +21,7 @@ from trading_mvp.services.account import (
 )
 from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
 from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.event_policy import derive_ai_event_view
 from trading_mvp.services.drawdown_state import (
     STATE_ADJUSTMENT_REASON_CODES,
     build_drawdown_state_snapshot,
@@ -43,7 +45,9 @@ from trading_mvp.services.runtime_state import (
     get_reconciliation_blocking_reason_codes,
     get_reconciliation_detail,
 )
+from trading_mvp.services.audit import record_audit_event
 from trading_mvp.services.settings import (
+    build_event_operator_control_payload,
     get_exposure_limits,
     get_limited_live_max_notional,
     get_rollout_mode,
@@ -51,6 +55,7 @@ from trading_mvp.services.settings import (
     is_live_execution_armed,
     rollout_mode_allows_exchange_submit,
 )
+from trading_mvp.time_utils import utcnow_aware
 
 HARD_MAX_GLOBAL_LEVERAGE = 5.0
 HARD_MAX_RISK_PER_TRADE = 0.02
@@ -68,6 +73,16 @@ MARKET_BLOCKING_REASON_CODES = {
     "incomplete": "MARKET_STATE_INCOMPLETE",
 }
 SURVIVAL_PATH_DECISIONS = {"reduce", "exit"}
+EVENT_POLICY_BLOCK_REASON_CODES = {
+    "manual_no_trade_active",
+    "operator_force_no_trade",
+    "operator_bias_no_trade",
+    "alignment_conflict_block",
+}
+EVENT_POLICY_APPROVAL_REASON_CODES = {
+    "alignment_not_aligned",
+    "alignment_insufficient_data",
+}
 IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES = frozenset({"PENDING_ENTRY_PLAN_TRIGGERED"})
 AUTO_RESIZE_REASON_CODE_MAP = {
     "gross_exposure_headroom_notional": "ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT",
@@ -155,6 +170,52 @@ def validate_decision_schema(payload: dict[str, Any]) -> TradeDecision:
 def is_survival_path_decision(decision: TradeDecision | str) -> bool:
     value = decision.decision if isinstance(decision, TradeDecision) else str(decision)
     return value in SURVIVAL_PATH_DECISIONS
+
+
+def _has_operator_event_override(payload: EventOperatorControlPayload | None) -> bool:
+    if payload is None:
+        return False
+    view = payload.operator_event_view
+    return (
+        bool(payload.manual_no_trade_windows)
+        or view.operator_bias != "unknown"
+        or view.operator_risk_state != "unknown"
+        or bool(view.applies_to_symbols)
+        or view.valid_from is not None
+        or view.valid_to is not None
+        or view.enforcement_mode != "observe_only"
+        or bool(view.note)
+    )
+
+
+def _event_policy_audit_payload(
+    *,
+    decision: TradeDecision,
+    event_control_payload: EventOperatorControlPayload,
+    blocked_reason: str | None,
+    approval_required_reason: str | None,
+    degraded_reason: str | None,
+    policy_source: str,
+    survival_path: str | None = None,
+) -> dict[str, Any]:
+    evaluated_operator_policy = event_control_payload.evaluated_operator_policy
+    return {
+        "symbol": decision.symbol,
+        "decision": decision.decision,
+        "timeframe": decision.timeframe,
+        "blocked_reason": blocked_reason,
+        "approval_required_reason": approval_required_reason,
+        "degraded_reason": degraded_reason,
+        "policy_source": policy_source,
+        "survival_path": survival_path,
+        "event_context": event_control_payload.event_context.model_dump(mode="json"),
+        "operator_event_view": event_control_payload.operator_event_view.model_dump(mode="json"),
+        "manual_no_trade_windows": [window.model_dump(mode="json") for window in event_control_payload.manual_no_trade_windows],
+        "alignment_decision": event_control_payload.alignment_decision.model_dump(mode="json"),
+        "evaluated_operator_policy": (
+            evaluated_operator_policy.model_dump(mode="json") if evaluated_operator_policy is not None else None
+        ),
+    }
 
 
 def _market_freshness_reason_codes(market_snapshot: MarketSnapshotPayload) -> list[str]:
@@ -1283,6 +1344,12 @@ def evaluate_risk(
 ) -> tuple[RiskCheckResult, RiskCheck]:
     blocked_reason_codes: list[str] = []
     adjustment_reason_codes: list[str] = []
+    blocked_reason: str | None = None
+    degraded_reason: str | None = None
+    approval_required_reason: str | None = None
+    policy_source = "none"
+    event_control_payload: EventOperatorControlPayload | None = None
+    evaluated_operator_policy = None
     defaults = get_settings()
     rollout_mode = get_rollout_mode(settings_row)
     live_requested = rollout_mode != "paper"
@@ -1575,6 +1642,30 @@ def evaluate_risk(
             blocked_reason_codes.append("LIVE_APPROVAL_REQUIRED")
     elif enforce_live_readiness and is_entry_decision:
         blocked_reason_codes.append("LIVE_TRADING_DISABLED")
+
+    existing_entry_blockers_before_event_policy = len(blocked_reason_codes) > 0
+    if decision.decision != "hold":
+        event_control_payload = build_event_operator_control_payload(
+            session=session,
+            settings_row=settings_row,
+            symbol=decision.symbol,
+            timeframe=decision.timeframe,
+            ai_event_view=derive_ai_event_view(output_payload=decision.model_dump(mode="json")),
+            evaluated_at=utcnow_aware(),
+        )
+        evaluated_operator_policy = event_control_payload.evaluated_operator_policy
+        policy_source = str(event_control_payload.policy_source or "none") or "none"
+        if event_control_payload.degraded_reason is not None:
+            degraded_reason = event_control_payload.degraded_reason
+        if is_entry_decision and not existing_entry_blockers_before_event_policy:
+            if event_control_payload.blocked_reason in EVENT_POLICY_BLOCK_REASON_CODES:
+                blocked_reason = event_control_payload.blocked_reason
+                blocked_reason_codes.append(blocked_reason)
+                degraded_reason = None
+            elif event_control_payload.approval_required_reason in EVENT_POLICY_APPROVAL_REASON_CODES:
+                approval_required_reason = event_control_payload.approval_required_reason
+                blocked_reason_codes.append(approval_required_reason)
+                degraded_reason = None
 
     non_resizable_entry_blockers_present = _has_non_resizable_entry_blockers(blocked_reason_codes)
     if is_entry_decision:
@@ -1934,6 +2025,21 @@ def evaluate_risk(
             if isinstance(reconciliation_summary, dict)
             else [],
         },
+        "event_policy": {
+            "blocked_reason": blocked_reason,
+            "degraded_reason": degraded_reason,
+            "approval_required_reason": approval_required_reason,
+            "policy_source": policy_source,
+            "evaluated_operator_policy": (
+                evaluated_operator_policy.model_dump(mode="json") if evaluated_operator_policy is not None else None
+            ),
+            "event_context_source_status": (
+                event_control_payload.event_context.source_status if event_control_payload is not None else None
+            ),
+            "event_context_is_stale": (
+                bool(event_control_payload.event_context.is_stale) if event_control_payload is not None else False
+            ),
+        },
     }
     result = RiskCheckResult(
         allowed=allowed,
@@ -1941,6 +2047,11 @@ def evaluate_risk(
         reason_codes=reason_codes,
         blocked_reason_codes=blocked_reason_codes,
         adjustment_reason_codes=adjustment_reason_codes,
+        blocked_reason=blocked_reason,
+        degraded_reason=degraded_reason,
+        approval_required_reason=approval_required_reason,
+        policy_source=policy_source,  # type: ignore[arg-type]
+        evaluated_operator_policy=evaluated_operator_policy,
         approved_risk_pct=approved_risk_pct if allowed else 0.0,
         approved_leverage=approved_leverage if allowed else 0.0,
         raw_projected_notional=raw_projected_notional,
@@ -1975,4 +2086,73 @@ def evaluate_risk(
     )
     session.add(row)
     session.flush()
+    if event_control_payload is not None and evaluated_operator_policy is not None:
+        correlation_ids = {
+            "decision_id": decision_run_id,
+            "snapshot_id": market_snapshot_id,
+            "risk_id": row.id,
+        }
+        audit_payload = _event_policy_audit_payload(
+            decision=decision,
+            event_control_payload=event_control_payload,
+            blocked_reason=blocked_reason,
+            approval_required_reason=approval_required_reason,
+            degraded_reason=degraded_reason,
+            policy_source=policy_source,
+            survival_path=(
+                "protective_recovery"
+                if is_protection_recovery
+                else ("exit" if decision.decision == "exit" else ("reduce_only" if is_survival_path_decision(decision) else None))
+            ),
+        )
+        if is_entry_decision and blocked_reason in EVENT_POLICY_BLOCK_REASON_CODES:
+            record_audit_event(
+                session,
+                event_type="event_policy_blocked_entry",
+                entity_type="risk_check",
+                entity_id=str(row.id),
+                message="Operator event policy blocked a new entry.",
+                severity="warning",
+                payload=audit_payload,
+                correlation_ids=correlation_ids,
+            )
+        elif is_entry_decision and approval_required_reason in EVENT_POLICY_APPROVAL_REASON_CODES:
+            record_audit_event(
+                session,
+                event_type="event_policy_required_approval",
+                entity_type="risk_check",
+                entity_id=str(row.id),
+                message="Operator event policy requires manual approval before a new entry.",
+                severity="warning",
+                payload=audit_payload,
+                correlation_ids=correlation_ids,
+            )
+        elif (
+            is_entry_decision
+            and not existing_entry_blockers_before_event_policy
+            and blocked_reason is None
+            and approval_required_reason is None
+            and event_control_payload.alignment_decision.alignment_status == "insufficient_data"
+        ):
+            record_audit_event(
+                session,
+                event_type="event_policy_skipped_due_to_missing_data",
+                entity_type="risk_check",
+                entity_id=str(row.id),
+                message="Operator event policy did not block the entry because current data is insufficient.",
+                severity="info",
+                payload=audit_payload,
+                correlation_ids=correlation_ids,
+            )
+        elif (is_survival_path_decision(decision) or is_protection_recovery) and _has_operator_event_override(event_control_payload):
+            record_audit_event(
+                session,
+                event_type="event_policy_allowed_survival_path",
+                entity_type="risk_check",
+                entity_id=str(row.id),
+                message="Survival-path action bypassed operator event entry gating.",
+                severity="info",
+                payload=audit_payload,
+                correlation_ids=correlation_ids,
+            )
     return result, row

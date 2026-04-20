@@ -400,6 +400,40 @@
 - cadence는 고정 스케줄 윈도우가 아니라 `decision_cycle_interval_minutes`, `ai_call_interval_minutes`,
   `symbol_cadence_overrides`, `symbol_effective_cadences` 기준으로 해석합니다.
 
+### 2026-04 Event / Operator Control Preview
+
+- `GET /api/settings` now includes additive `event_operator_control`.
+- `event_operator_control` is a separate additive layer from descriptive `market_context_summary`.
+- Preview payload:
+  - `event_context`
+  - `ai_event_view`
+  - `operator_event_view`
+  - `alignment_decision`
+  - `evaluated_operator_policy`
+  - `manual_no_trade_windows`
+  - `effective_policy_preview`
+- `effective_policy_preview` remains a separate preview/status field.
+- Preview strings are not the source of truth; raw payload + deterministic evaluator are the source of truth.
+- 신규 `long / short` entry path에서는 `risk_guard`가 같은 shared evaluator semantics를 사용합니다.
+- `reduce / exit / protection recovery / emergency exit` 생존 경로는 이 gate에 막히지 않습니다.
+
+Write endpoints:
+
+- `PUT /api/settings/operator-event-view`
+- `POST /api/settings/operator-event-view/clear`
+- `POST /api/settings/manual-no-trade-windows`
+- `PUT /api/settings/manual-no-trade-windows/{window_id}`
+- `POST /api/settings/manual-no-trade-windows/{window_id}/end`
+
+Rules:
+
+- datetimes must be timezone-aware ISO-8601 with offset or `Z`
+- stored/evaluated internally in UTC
+- operator event view upserts in existing settings/control persistence
+- manual no-trade window uses stable `window_id`
+- manual window active rule is `start_at <= now < end_at`
+- hard delete is not used
+
 - `operational_status`
   - overview / account / settings가 공통으로 재사용할 표준 운영 상태 payload
   - `rollout_mode`: `paper | shadow | live_dry_run | limited_live | full_live`
@@ -652,7 +686,7 @@ staged rollout semantics:
 - symbol snapshot에는 additive `pending_entry_plan` 필드가 포함될 수 있습니다.
   - 현재 symbol에 `armed` plan이 있으면 `symbol`, `side`, `plan_status`, `entry_mode`, `entry_zone_min`, `entry_zone_max`, `expires_at`, `idempotency_key`, `metadata`가 내려갑니다.
 - `symbols`는 tracked symbol별 최신 snapshot 배열입니다.
-- 각 symbol row는 `symbol`, `timeframe`, `latest_price`, `market_snapshot_time`, `market_candle_time`, `feature_input_delay_minutes`, `feature_input_delay_threshold_minutes`, `feature_input_delayed`, `market_context_summary`, `derivatives_summary`, `event_context_summary`, `ai_decision`, `risk_guard`, `execution`, `open_position`, `protection_status`, `blocked_reasons`, `live_execution_ready`, `stale_flags`, `last_updated_at`, `audit_events`를 포함합니다.
+- 각 symbol row는 `symbol`, `timeframe`, `latest_price`, `market_snapshot_time`, `market_candle_time`, `feature_input_delay_minutes`, `feature_input_delay_threshold_minutes`, `feature_input_delayed`, `market_context_summary`, `derivatives_summary`, `event_context_summary`, `event_operator_control`, `ai_decision`, `risk_guard`, `execution`, `open_position`, `protection_status`, `blocked_reasons`, `live_execution_ready`, `stale_flags`, `last_updated_at`, `audit_events`를 포함합니다.
   - `market_snapshot_time`: 시장 스냅샷 수집 시각
   - `market_candle_time`: 최신 캔들 시각. UI에서는 timeframe 경계 확인용으로 이 값을 우선 노출할 수 있습니다.
   - `stale_flags`는 sync/market stale 외에 `feature_input_missing`을 포함할 수 있습니다. 이 경우 가격 스냅샷은 있어도 market regime / alignment / volatility / volume 요약 입력이 아직 생성되지 않은 상태입니다.
@@ -665,7 +699,11 @@ staged rollout semantics:
   - `open_position`: 기존 포지션 snapshot 외에 `holding_profile`, `holding_profile_reason`, `initial_stop_type`, `ai_stop_management_allowed`, `hard_stop_active`, `stop_widening_allowed`가 additive로 포함될 수 있습니다.
   - `execution.recent_fills`: 최근 fill ladder 요약. `execution_id`, `external_trade_id`, `fill_price`, `fill_quantity`, `fee_paid`, `commission_asset`, `realized_pnl`, `created_at`
   - `protection_status`: 기본 protected/missing 상태 외에 `recovery_status`, `auto_recovery_active`, `failure_count`, `last_error`, `last_transition_at`, `trigger_source`, `lifecycle_state`, `verification_status`, `last_event_type`, `last_event_message`, `last_event_at`
-  - `audit_events`: operator dashboard에서는 raw payload 전체 대신 approval / protection / execution 설명에 필요한 compact payload만 유지합니다.
+- `audit_events`: operator dashboard에서는 raw payload 전체 대신 approval / protection / execution 설명에 필요한 compact payload만 유지합니다.
+- `event_operator_control`
+  - descriptive `market_context_summary`와 별도 additive container입니다.
+  - contains `event_context`, `ai_event_view`, `operator_event_view`, `alignment_decision`, `evaluated_operator_policy`, `manual_no_trade_windows`, `effective_policy_preview`
+  - `effective_policy_preview` is the preview-facing projection of the same shared evaluator used by `risk_guard` for 신규 entry paths
 - 전역 최신 1건 `ai_decision / risk_guard / execution` 필드는 더 이상 대표값으로 내려주지 않습니다.
 
 운영자 메인 화면 전용 snapshot입니다. 같은 흐름의 정보를 한 응답으로 묶어 보여줍니다.
@@ -715,6 +753,26 @@ staged rollout semantics:
     - 실제 신규 진입을 막은 사유만 담습니다.
   - `adjustment_reason_codes`
     - 자동 축소 승인처럼 허용 상태에서 함께 남겨야 하는 조정/승인 사유를 담습니다.
+  - `blocked_reason`
+    - event policy hard gate가 발화한 경우 stable code를 담습니다.
+    - current values: `manual_no_trade_active`, `operator_force_no_trade`, `operator_bias_no_trade`, `alignment_conflict_block`
+  - `approval_required_reason`
+    - event policy가 hard block 대신 approval gate를 요구한 경우 stable code를 담습니다.
+    - current values: `alignment_not_aligned`, `alignment_insufficient_data`
+  - `degraded_reason`
+    - event policy가 block하지는 않았지만 stale / unavailable / outside-valid-window 같은 degraded context를 감지한 경우 대표 reason을 담습니다.
+  - `policy_source`
+    - `manual_no_trade_window | operator_enforcement_mode | operator_bias | alignment_policy | none`
+  - `evaluated_operator_policy`
+    - `operator_view_active`
+    - `matched_window_id`
+    - `alignment_status`
+    - `enforcement_mode`
+    - `reason_codes`
+    - `effective_policy_preview`
+    - `event_source_status`
+    - `event_source_stale`
+    - `evaluated_at`
   - `approved_risk_pct`
   - `approved_leverage`
   - `operating_state`
@@ -817,6 +875,13 @@ staged rollout semantics:
 - `risk_guard`는 신규 `long / short`에 한해 결정론적 entry trigger를 다시 검사합니다.
 - 신규 차단 사유는 `ENTRY_TRIGGER_NOT_MET`, `CHASE_LIMIT_EXCEEDED`, `INVALID_INVALIDATION_PRICE`를 `reason_codes`와 `blocked_reason_codes`로 남깁니다.
 - adaptive setup disable bucket 이 active인 신규 진입은 `UNDERPERFORMING_SETUP_DISABLED`를 추가 blocker로 남깁니다.
+- event/operator control layer가 configured된 경우, 같은 cycle에서 shared evaluator를 다시 실행해 아래를 적용합니다.
+  - active manual no-trade window -> hard block
+  - active operator `force_no_trade` -> hard block
+  - active operator `operator_bias=no_trade` -> hard block
+  - `block_on_conflict + alignment=conflict` -> hard block
+  - `approval_required + alignment!=aligned` -> approval-required deny
+  - `block_on_conflict + insufficient_data` -> auto-block하지 않고 skip audit만 남김
 - `reduce / exit / protection / emergency` 계열은 이 trigger 때문에 막지 않습니다.
 
 ### Pending entry plan lifecycle
@@ -1099,6 +1164,27 @@ staged rollout semantics:
 - `message`
 - `payload`
 - `created_at`
+
+Event/operator control audit events:
+
+- `operator_event_view_created`
+- `operator_event_view_updated`
+- `operator_event_view_cleared`
+- `manual_no_trade_window_created`
+- `manual_no_trade_window_updated`
+- `manual_no_trade_window_ended`
+- `alignment_evaluated`
+
+Compact approval-control payload may include:
+
+- `actor`
+- `symbols`
+- `window_id`
+- `scope`
+- `before`
+- `after`
+- `evaluations`
+- `evaluated_at`
 
 drawdown state transition audit:
 

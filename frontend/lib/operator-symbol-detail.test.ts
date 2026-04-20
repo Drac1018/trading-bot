@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { OperatorDetailSymbolLike } from "./operator-symbol-detail";
+
 type OperatorSymbolDetailModule = typeof import("./operator-symbol-detail");
 
-const operatorSymbolDetailModule = import(new URL("./operator-symbol-detail.ts", import.meta.url).href) as Promise<OperatorSymbolDetailModule>;
+const operatorSymbolDetailModule = import(
+  new URL("./operator-symbol-detail.ts", import.meta.url).href,
+) as Promise<OperatorSymbolDetailModule>;
 
-function buildSymbol(overrides: Record<string, unknown> = {}) {
+function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSymbolLike {
   return {
     market_context_summary: {
       primary_regime: "bullish",
@@ -32,9 +36,72 @@ function buildSymbol(overrides: Record<string, unknown> = {}) {
       next_event_importance: "high",
       minutes_to_next_event: 42,
       active_risk_window: false,
-      event_bias: "neutral",
       is_stale: false,
       is_complete: true,
+    },
+    event_operator_control: {
+      event_context: {
+        source_status: "available",
+        generated_at: "2026-04-20T11:00:00Z",
+        is_stale: false,
+        is_complete: true,
+        active_risk_window: false,
+        active_risk_window_detail: null,
+        next_event_at: "2026-04-20T12:30:00Z",
+        next_event_name: "FOMC",
+        next_event_importance: "high",
+        minutes_to_next_event: 42,
+        upcoming_events: [],
+        affected_assets: ["BTCUSDT"],
+        summary_note: "fixture event context",
+      },
+      ai_event_view: {
+        ai_bias: "bullish",
+        ai_risk_state: "risk_on",
+        ai_confidence: 0.68,
+        scenario_note: "Prefer confirmation after the event before fresh entry.",
+        confidence_penalty_reason: "EVENT_WINDOW_PROXIMITY",
+        source_state: "available",
+      },
+      operator_event_view: {
+        operator_bias: "neutral",
+        operator_risk_state: "neutral",
+        applies_to_symbols: ["BTCUSDT"],
+        horizon: "event-day",
+        valid_from: "2026-04-20T11:00:00Z",
+        valid_to: "2026-04-20T13:00:00Z",
+        enforcement_mode: "approval_required",
+        note: "Wait for event resolution.",
+        created_by: "operator-ui",
+        updated_at: "2026-04-20T11:01:00Z",
+      },
+      alignment_decision: {
+        ai_bias: "bullish",
+        operator_bias: "neutral",
+        ai_risk_state: "risk_on",
+        operator_risk_state: "neutral",
+        alignment_status: "partially_aligned",
+        reason_codes: ["approval_required_preview"],
+        effective_policy_preview: "allow_with_approval",
+        evaluated_at: "2026-04-20T11:02:00Z",
+      },
+      evaluated_operator_policy: {
+        operator_view_active: true,
+        matched_window_id: null,
+        alignment_status: "partially_aligned",
+        enforcement_mode: "approval_required",
+        reason_codes: ["approval_required_preview"],
+        effective_policy_preview: "allow_with_approval",
+        event_source_status: "available",
+        event_source_stale: false,
+        evaluated_at: "2026-04-20T11:02:00Z",
+      },
+      blocked_reason: null,
+      degraded_reason: null,
+      approval_required_reason: "alignment_not_aligned",
+      policy_source: "alignment_policy",
+      manual_no_trade_windows: [],
+      effective_policy_preview: "allow_with_approval",
     },
     ai_decision: {
       decision: "long",
@@ -49,7 +116,11 @@ function buildSymbol(overrides: Record<string, unknown> = {}) {
       operating_state: "TRADABLE",
       approved_risk_pct: 0.01,
       approved_leverage: 2,
-      blocked_reason_codes: ["HIGH_IMPACT_EVENT_WINDOW"],
+      blocked_reason_codes: ["alignment_not_aligned"],
+      blocked_reason: null,
+      degraded_reason: null,
+      approval_required_reason: "alignment_not_aligned",
+      policy_source: "alignment_policy",
     },
     execution: {
       order_id: null,
@@ -59,10 +130,10 @@ function buildSymbol(overrides: Record<string, unknown> = {}) {
     blocked_reasons: [],
     stale_flags: [],
     ...overrides,
-  };
+  } as OperatorDetailSymbolLike;
 }
 
-test("buildOperatorDetailSections exposes the operator sections in stable order", async () => {
+test("buildOperatorDetailSections exposes the additive event/operator sections in stable order", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
 
   const sections = buildOperatorDetailSections(buildSymbol());
@@ -72,47 +143,85 @@ test("buildOperatorDetailSections exposes the operator sections in stable order"
     [
       "current_regime",
       "derivatives_orderbook",
-      "event_risk_context",
-      "ai_event_rationale",
+      "upcoming_event_risk",
+      "ai_event_view",
+      "operator_event_view",
+      "alignment_result",
+      "effective_trading_policy_preview",
+      "manual_no_trade_window",
       "risk_guard_decision",
       "blocked_degraded_reason",
     ],
   );
 });
 
-test("buildOperatorDetailSections keeps blocked_reason visible in the blocked/degraded section", async () => {
+test("buildOperatorDetailSections exposes preview text as mirrored risk semantics", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
 
-  const sections = buildOperatorDetailSections(
-    buildSymbol({
-      risk_guard: {
-        allowed: false,
-        decision: "long",
-        operating_state: "TRADABLE",
-        approved_risk_pct: 0.0,
-        approved_leverage: 0.0,
-        blocked_reason_codes: ["HIGH_IMPACT_EVENT_WINDOW"],
-      },
-    }),
-  );
-  const blockedSection = sections.find((section) => section.key === "blocked_degraded_reason");
+  const sections = buildOperatorDetailSections(buildSymbol());
+  const previewSection = sections.find((section) => section.key === "effective_trading_policy_preview");
 
-  assert.ok(blockedSection);
-  assert.equal(blockedSection.tone, "danger");
-  assert.ok(blockedSection.alerts.some((alert) => alert.text.includes("HIGH_IMPACT_EVENT_WINDOW")));
+  assert.ok(previewSection);
+  assert.equal(previewSection.tone, "warn");
+  assert.ok(previewSection.items.some((item) => item.value === "allow_with_approval"));
+  assert.ok(previewSection.alerts.some((alert) => alert.text.includes("Preview mirrors current risk_guard semantics")));
 });
 
-test("buildOperatorDetailSections shows source unavailable explicitly in event risk context", async () => {
+test("buildOperatorDetailSections shows source unavailable explicitly in upcoming event risk", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
 
   const sections = buildOperatorDetailSections(
     buildSymbol({
-      event_context_summary: {
-        source_status: "unavailable",
-        active_risk_window: false,
-        is_stale: false,
-        is_complete: false,
+      event_operator_control: {
+        event_context: {
+          source_status: "unavailable",
+          generated_at: "2026-04-20T11:00:00Z",
+          is_stale: false,
+          is_complete: false,
+          active_risk_window: false,
+          active_risk_window_detail: null,
+          next_event_at: null,
+          next_event_name: null,
+          next_event_importance: "unknown",
+          minutes_to_next_event: null,
+          upcoming_events: [],
+          affected_assets: [],
+          summary_note: "provider unavailable",
+        },
+        ai_event_view: {
+          ai_bias: "unknown",
+          ai_risk_state: "unknown",
+          ai_confidence: null,
+          scenario_note: null,
+          confidence_penalty_reason: null,
+          source_state: "unavailable",
+        },
+        operator_event_view: {
+          operator_bias: "unknown",
+          operator_risk_state: "unknown",
+          applies_to_symbols: [],
+          horizon: null,
+          valid_from: null,
+          valid_to: null,
+          enforcement_mode: "observe_only",
+          note: null,
+          created_by: "operator-ui",
+          updated_at: null,
+        },
+        alignment_decision: {
+          ai_bias: "unknown",
+          operator_bias: "unknown",
+          ai_risk_state: "unknown",
+          operator_risk_state: "unknown",
+          alignment_status: "insufficient_data",
+          reason_codes: ["ai_unavailable", "operator_unavailable"],
+          effective_policy_preview: "insufficient_data",
+          evaluated_at: "2026-04-20T11:02:00Z",
+        },
+        manual_no_trade_windows: [],
+        effective_policy_preview: "insufficient_data",
       },
+      stale_flags: ["feature_input_missing"],
       risk_guard: {
         allowed: null,
         decision: "hold",
@@ -121,54 +230,62 @@ test("buildOperatorDetailSections shows source unavailable explicitly in event r
         approved_leverage: null,
         blocked_reason_codes: [],
       },
-      ai_decision: {
-        decision: "hold",
-        confidence: 0.42,
-        event_risk_acknowledgement: null,
-        confidence_penalty_reason: null,
-        scenario_note: null,
-      },
-      blocked_reasons: [],
-      stale_flags: ["feature_input_missing"],
     }),
   );
-  const eventSection = sections.find((section) => section.key === "event_risk_context");
-  const degradedSection = sections.find((section) => section.key === "blocked_degraded_reason");
+
+  const eventSection = sections.find((section) => section.key === "upcoming_event_risk");
+  const blockedSection = sections.find((section) => section.key === "blocked_degraded_reason");
 
   assert.ok(eventSection);
-  assert.equal(eventSection.tone, "warn");
-  assert.equal(eventSection.items.find((item) => item.label === "소스 상태")?.value, "소스 없음");
-  assert.ok(degradedSection);
-  assert.ok(degradedSection.alerts.some((alert) => alert.text.includes("이벤트 컨텍스트: 소스 없음")));
+  assert.equal(eventSection.tone, "danger");
+  assert.equal(eventSection.items.find((item) => item.label === "source_status")?.value, "unavailable");
+  assert.ok(blockedSection);
+  assert.ok(blockedSection.alerts.some((alert) => alert.text.includes("event source: unavailable")));
 });
 
-test("buildOperatorDetailSections exposes AI event rationale and stays null-safe", async () => {
+test("buildOperatorDetailSections keeps manual no-trade windows visible with active state", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
 
-  const populatedSections = buildOperatorDetailSections(buildSymbol());
-  const populatedRationale = populatedSections.find((section) => section.key === "ai_event_rationale");
-
-  assert.ok(populatedRationale);
-  assert.equal(populatedRationale.tone, "warn");
-  assert.equal(
-    populatedRationale.items.find((item) => item.value === "EVENT_WINDOW_PROXIMITY")?.value,
-    "EVENT_WINDOW_PROXIMITY",
-  );
-
-  const emptySections = buildOperatorDetailSections(
+  const sections = buildOperatorDetailSections(
     buildSymbol({
-      ai_decision: {
-        decision: "hold",
-        confidence: 0.31,
-        event_risk_acknowledgement: null,
-        confidence_penalty_reason: null,
-        scenario_note: null,
+      event_operator_control: {
+        ...buildSymbol().event_operator_control,
+        manual_no_trade_windows: [
+          {
+            window_id: "ntw_preview",
+            scope: { scope_type: "symbols", symbols: ["BTCUSDT"] },
+            start_at: "2026-04-20T11:30:00Z",
+            end_at: "2026-04-20T13:30:00Z",
+            reason: "manual no-trade around event window",
+            auto_resume: true,
+            require_manual_rearm: false,
+            created_by: "operator-ui",
+            updated_at: "2026-04-20T11:31:00Z",
+            is_active: true,
+          },
+        ],
+        effective_policy_preview: "force_no_trade_window",
+        alignment_decision: {
+          ai_bias: "bullish",
+          operator_bias: "neutral",
+          ai_risk_state: "risk_on",
+          operator_risk_state: "neutral",
+          alignment_status: "partially_aligned",
+          reason_codes: ["manual_no_trade_active"],
+          effective_policy_preview: "force_no_trade_window",
+          evaluated_at: "2026-04-20T11:32:00Z",
+        },
       },
     }),
   );
-  const emptyRationale = emptySections.find((section) => section.key === "ai_event_rationale");
 
-  assert.ok(emptyRationale);
-  assert.equal(emptyRationale.tone, "neutral");
-  assert.ok(emptyRationale.alerts.some((alert) => alert.text.includes("AI event-aware")));
+  const windowSection = sections.find((section) => section.key === "manual_no_trade_window");
+  const previewSection = sections.find((section) => section.key === "effective_trading_policy_preview");
+
+  assert.ok(windowSection);
+  assert.equal(windowSection.tone, "danger");
+  assert.ok(windowSection.alerts.some((alert) => alert.text.includes("manual no-trade around event window")));
+  assert.ok(previewSection);
+  assert.equal(previewSection.tone, "danger");
+  assert.ok(previewSection.items.some((item) => item.value === "force_no_trade_window"));
 });
