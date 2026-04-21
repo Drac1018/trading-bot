@@ -217,6 +217,7 @@ def _build_event_context_payload(
     events.sort(key=lambda item: item.event_at)
     upcoming = next((item for item in events if item.event_at >= normalized_generated_at), None)
     active_events = [item for item in events if item.active_risk_window]
+    summary_event = upcoming if upcoming is not None else active_events[0] if active_events else None
 
     computed_stale = False
     if normalized_source_generated_at is not None:
@@ -248,10 +249,8 @@ def _build_event_context_payload(
             deduped_assets.append(asset)
 
     summary_bias: EventBias | None = None
-    if active_events:
-        summary_bias = active_events[0].event_bias
-    elif upcoming is not None:
-        summary_bias = upcoming.event_bias
+    if summary_event is not None:
+        summary_bias = summary_event.event_bias
 
     summary_enrichment_vendors = _normalize_vendor_list(enrichment_vendors)
     for event in events:
@@ -269,10 +268,10 @@ def _build_event_context_payload(
         generated_at=normalized_generated_at,
         is_stale=final_stale,
         is_complete=final_complete,
-        next_event_at=upcoming.event_at if upcoming is not None else None,
-        next_event_name=upcoming.event_name if upcoming is not None else None,
-        next_event_importance=upcoming.importance if upcoming is not None else None,
-        minutes_to_next_event=upcoming.minutes_to_event if upcoming is not None else None,
+        next_event_at=summary_event.event_at if summary_event is not None else None,
+        next_event_name=summary_event.event_name if summary_event is not None else None,
+        next_event_importance=summary_event.importance if summary_event is not None else None,
+        minutes_to_next_event=summary_event.minutes_to_event if summary_event is not None else None,
         active_risk_window=bool(active_events),
         affected_assets=deduped_assets,
         event_bias=summary_bias,
