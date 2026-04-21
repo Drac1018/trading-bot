@@ -111,9 +111,9 @@ def test_scalp_swing_position_cadence_hint_consumption(db_session, holding_profi
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger"]["trigger_reason"] == "open_position_recheck_due"
-    expected_due_at = last_decision_at + timedelta(minutes=expected_minutes)
-    assert symbol_plan["next_ai_review_due_at"] == expected_due_at.isoformat()
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None
     assert symbol_plan["applied_review_cadence_minutes"] == expected_minutes
     assert symbol_plan["review_cadence_source"] == "holding_profile_cadence_hint"
     assert symbol_plan["holding_profile_cadence_hint"]["holding_profile"] == holding_profile
@@ -220,10 +220,12 @@ def test_invalid_missing_cadence_hint_falls_back_to_effective_ai_cadence(monkeyp
     assert symbol_plan["applied_review_cadence_minutes"] == 9
     assert symbol_plan["review_cadence_source"] == "effective_ai_call_interval_minutes"
     assert symbol_plan["cadence_fallback_reason"] == "HOLDING_PROFILE_CADENCE_HINT_MISSING"
-    assert symbol_plan["next_ai_review_due_at"] == (last_decision_at + timedelta(minutes=9)).isoformat()
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None
 
 
-def test_periodic_backstop_due(monkeypatch, db_session) -> None:
+def test_time_based_backstop_no_longer_triggers_review(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     settings_row.tracked_symbols = ["BTCUSDT"]
@@ -282,7 +284,9 @@ def test_periodic_backstop_due(monkeypatch, db_session) -> None:
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger"]["trigger_reason"] == "periodic_backstop_due"
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None
 
 
 def test_protection_path_not_delayed_by_cadence(db_session) -> None:
@@ -337,7 +341,7 @@ def test_protection_path_not_delayed_by_cadence(db_session) -> None:
     assert get_due_position_management_symbols(db_session) == ["BTCUSDT"]
 
 
-def test_open_position_dedupe_surfaces_reason_fields(monkeypatch, db_session) -> None:
+def test_deduped_entry_trigger_surfaces_reason_fields(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     settings_row.tracked_symbols = ["BTCUSDT"]
@@ -365,12 +369,12 @@ def test_open_position_dedupe_surfaces_reason_fields(monkeypatch, db_session) ->
                     },
                     "selection_context": None,
                     "trigger": {
-                        "trigger_reason": "open_position_recheck_due",
+                        "trigger_reason": "entry_candidate_event",
                         "symbol": "BTCUSDT",
                         "timeframe": "15m",
                         "strategy_engine": "trend_pullback_engine",
                         "holding_profile": "scalp",
-                        "reason_codes": ["OPEN_POSITION_RECHECK_DUE"],
+                        "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
                         "trigger_fingerprint": "same-fingerprint",
                         "fingerprint_basis": {"position_state_bucket": "flat"},
                         "fingerprint_changed_fields": [],
@@ -390,7 +394,7 @@ def test_open_position_dedupe_surfaces_reason_fields(monkeypatch, db_session) ->
                     "last_decision_at": None,
                     "last_ai_invoked_at": (now - timedelta(minutes=15)).isoformat(),
                     "last_material_review_at": (now - timedelta(minutes=15)).isoformat(),
-                    "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                    "next_ai_review_due_at": None,
                     "applied_review_cadence_minutes": 15,
                     "review_cadence_source": "holding_profile_cadence_hint",
                     "holding_profile_cadence_hint": {
@@ -399,7 +403,7 @@ def test_open_position_dedupe_surfaces_reason_fields(monkeypatch, db_session) ->
                     },
                     "max_review_age_minutes": 45,
                     "fingerprint_changed_fields": [],
-                    "dedupe_reason": "OPEN_POSITION_FINGERPRINT_UNCHANGED",
+                    "dedupe_reason": "TRIGGER_FINGERPRINT_UNCHANGED",
                     "forced_review_reason": None,
                     "last_ai_skip_reason": "TRIGGER_DEDUPED",
                 }
@@ -416,15 +420,16 @@ def test_open_position_dedupe_surfaces_reason_fields(monkeypatch, db_session) ->
     outcome = result["results"][0]["outcome"]
 
     assert outcome["ai_review_status"] == "deduped"
-    assert outcome["dedupe_reason"] == "OPEN_POSITION_FINGERPRINT_UNCHANGED"
+    assert outcome["dedupe_reason"] == "TRIGGER_FINGERPRINT_UNCHANGED"
     assert outcome["fingerprint_changed_fields"] == []
     assert outcome["last_material_review_at"] == (now - timedelta(minutes=15)).isoformat()
     assert outcome["forced_review_reason"] is None
     assert outcome["applied_review_cadence_minutes"] == 15
     assert outcome["review_cadence_source"] == "holding_profile_cadence_hint"
+    assert outcome["next_ai_review_due_at"] is None
 
 
-def test_same_fingerprint_dedupe_uses_review_cadence_for_next_due(monkeypatch, db_session) -> None:
+def test_time_based_open_position_review_no_longer_schedules_next_due(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     settings_row.tracked_symbols = ["BTCUSDT"]
@@ -480,7 +485,9 @@ def test_same_fingerprint_dedupe_uses_review_cadence_for_next_due(monkeypatch, d
     )
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger_deduped"] is True
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["trigger_deduped"] is False
     assert symbol_plan["review_cadence_source"] == "holding_profile_cadence_hint"
     assert symbol_plan["applied_review_cadence_minutes"] == 20
-    assert symbol_plan["next_ai_review_due_at"] == (now + timedelta(minutes=20)).isoformat()
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None

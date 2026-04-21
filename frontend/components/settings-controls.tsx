@@ -1,6 +1,8 @@
 ﻿"use client";
 
 import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
+import Link from "next/link";
+import { usePathname, useSearchParams } from "next/navigation";
 
 import { AIUsagePanel, type AIUsagePayload } from "./ai-usage-panel";
 import {
@@ -29,12 +31,16 @@ import {
   type ManualNoTradeWindowPayload,
   utcInputValueToIso,
 } from "../lib/event-operator-control.js";
+import {
+  normalizeSettingsView,
+  settingsViewTabs,
+  type SettingsView,
+} from "../lib/page-config";
 import { buildSettingsEventPreviewSummary } from "../lib/settings-event-preview.js";
 import { formatDisplayValue } from "../lib/ui-copy";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
-const settingsStageLabels = ["실거래 제어", "시장 / 리스크", "운영 주기 / 가드", "AI 입력 / 모델", "외부 이벤트", "Binance 연동"] as const;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
 const operatorBiasOptions = ["bullish", "bearish", "neutral", "no_trade", "unknown"] as const;
 const operatorRiskStateOptions = ["risk_on", "risk_off", "neutral", "unknown"] as const;
@@ -43,6 +49,14 @@ const eventSourceProviderOptions = ["stub", "fred"] as const;
 
 type RolloutMode = (typeof rolloutModeOptions)[number];
 type EventSourceProvider = (typeof eventSourceProviderOptions)[number];
+type FeedbackTone = "neutral" | "good" | "warn" | "danger";
+type FeedbackMessage = { tone: FeedbackTone; text: string };
+type FeedbackKey =
+  | "control_save"
+  | "integration_save"
+  | "live_actions"
+  | "operator_event"
+  | "manual_window";
 
 type ProtectionSyncState = {
   status?: string;
@@ -107,13 +121,6 @@ type ReconciliationSummary = {
 
 type SettingsCadencePayload = {
   items: SymbolEffectiveCadence[];
-};
-
-type ConnectionTestResponse = {
-  ok: boolean;
-  provider: string;
-  message: string;
-  details: Record<string, unknown>;
 };
 
 type OperatorEventFormState = {
@@ -218,6 +225,10 @@ export type SettingsPayload = {
   event_source_timeout_seconds: number | null;
   event_source_default_assets: string[];
   event_source_fred_release_ids: number[];
+  event_source_bls_enrichment_url: string | null;
+  event_source_bls_enrichment_static_params: Record<string, string>;
+  event_source_bea_enrichment_url: string | null;
+  event_source_bea_enrichment_static_params: Record<string, string>;
   openai_api_key_configured: boolean;
   binance_api_key_configured: boolean;
   binance_api_secret_configured: boolean;
@@ -249,6 +260,7 @@ type FormState = Omit<
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
   | "pause_recovery_class" | "control_status_summary" | "event_operator_control" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured" | "event_source_api_key_configured"
   | "event_source_provider" | "event_source_api_url" | "event_source_timeout_seconds" | "event_source_default_assets" | "event_source_fred_release_ids"
+  | "event_source_bls_enrichment_url" | "event_source_bls_enrichment_static_params" | "event_source_bea_enrichment_url" | "event_source_bea_enrichment_static_params"
 > & {
   openai_api_key: string;
   binance_api_key: string;
@@ -258,6 +270,8 @@ type FormState = Omit<
   event_source_timeout_seconds: number | null;
   event_source_default_assets_input: string;
   event_source_fred_release_ids_input: string;
+  event_source_bls_enrichment_url: string;
+  event_source_bea_enrichment_url: string;
   event_source_api_key: string;
   custom_symbols: string;
   clear_openai_api_key: boolean;
@@ -286,6 +300,17 @@ function numberOrNull(value: string) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function hasCadenceCustomization(row: SymbolCadenceOverride) {
+  return (
+    !row.enabled ||
+    Boolean(row.timeframe_override?.trim()) ||
+    row.market_refresh_interval_minutes_override !== null ||
+    row.position_management_interval_seconds_override !== null ||
+    row.decision_cycle_interval_minutes_override !== null ||
+    row.ai_call_interval_minutes_override !== null
+  );
+}
+
 function csvToPositiveIntegers(value: string) {
   const seen = new Set<number>();
   return value
@@ -297,6 +322,13 @@ function csvToPositiveIntegers(value: string) {
       seen.add(item);
       return true;
     });
+}
+
+function describeEnrichmentConfigState(url: string | null | undefined, overrideEnabled: boolean) {
+  if (url && url.trim()) {
+    return "settings URL 사용";
+  }
+  return overrideEnabled ? "미설정 (env fallback 가능)" : "env fallback";
 }
 
 function describeEventSourceProviderOverride(value: SettingsPayload["event_source_provider"]) {
@@ -362,6 +394,8 @@ function toFormState(initial: SettingsPayload): FormState {
     event_source_timeout_seconds: initial.event_source_timeout_seconds,
     event_source_default_assets_input: initial.event_source_default_assets.join(", "),
     event_source_fred_release_ids_input: initial.event_source_fred_release_ids.join(", "),
+    event_source_bls_enrichment_url: initial.event_source_bls_enrichment_url ?? "",
+    event_source_bea_enrichment_url: initial.event_source_bea_enrichment_url ?? "",
     openai_api_key: "",
     binance_api_key: "",
     binance_api_secret: "",
@@ -411,6 +445,23 @@ function StatusPill({ tone = "neutral", children }: { tone?: "neutral" | "good" 
     danger: "border border-rose-200 bg-rose-50 text-rose-800",
   }[tone];
   return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${className}`}>{children}</span>;
+}
+
+function InlineFeedback({ message }: { message?: FeedbackMessage | null }) {
+  if (!message) {
+    return null;
+  }
+  const className = {
+    neutral: "border-slate-200 bg-slate-50 text-slate-700",
+    good: "border-emerald-200 bg-emerald-50 text-emerald-800",
+    warn: "border-amber-200 bg-amber-50 text-amber-900",
+    danger: "border-rose-200 bg-rose-50 text-rose-900",
+  }[message.tone];
+  return (
+    <div aria-live="polite" className={`rounded-2xl border px-4 py-3 text-sm ${className}`} role="status">
+      {message.text}
+    </div>
+  );
 }
 
 function Field(props: { label: string; hint?: string; children: ReactNode }) {
@@ -586,7 +637,7 @@ function ControlStatusPanel({ state }: { state: SettingsPayload }) {
 
   return (
     <div className="mt-4 space-y-4">
-      <div className="grid gap-3 xl:grid-cols-3">
+      <div className="grid gap-3 md:grid-cols-2">
         {cards.map((card) => (
           <div key={card.label} className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="flex items-center justify-between gap-3">
@@ -677,132 +728,177 @@ function SymbolCadenceOverridePanel({
   form: FormState;
   updateSymbolOverride: (symbol: string, patch: Partial<SymbolCadenceOverride>) => void;
 }) {
+  const customizedRows = overrideRows.filter((row) => hasCadenceCustomization(row));
+  const customizedSymbolsSummary =
+    customizedRows.length > 0 ? customizedRows.map((row) => row.symbol).join(", ") : "예외 심볼 없음";
+
   return (
     <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <h3 className="text-lg font-semibold text-slate-900">심볼별 운영 주기 override</h3>
           <StatusPill>{mergedSymbols.length}개 심볼</StatusPill>
+          <StatusPill tone={customizedRows.length > 0 ? "warn" : "neutral"}>
+            예외 적용 {customizedRows.length}개
+          </StatusPill>
         </div>
         <p className="text-sm leading-6 text-slate-600">
-          핵심 심볼은 더 짧게, 보조 심볼은 더 보수적으로 운영할 수 있습니다. 비워 두면 전역 기본값을 그대로 상속합니다.
+          기본 화면에서는 전역 운영 주기를 먼저 보고, 예외 심볼은 필요할 때만 열어 수정합니다. 비워 두면 전역 기본값을 그대로 상속합니다.
         </p>
       </div>
-      <div className="mt-4 grid gap-4 2xl:grid-cols-2">
-        {overrideRows.map((row) => {
-          const effective = effectiveCadenceBySymbol[row.symbol];
-          return (
-            <div key={row.symbol} className="rounded-2xl border border-amber-200 bg-white p-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <p className="text-base font-semibold text-slate-900">{row.symbol}</p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <StatusPill tone={row.enabled ? "good" : "warn"}>
-                      {row.enabled ? "운영 사용" : "운영 제외"}
-                    </StatusPill>
-                    <StatusPill tone={effective?.uses_global_defaults ? "neutral" : "warn"}>
-                      {effective?.uses_global_defaults ? "전역 상속" : "override 적용"}
-                    </StatusPill>
+      <div className="mt-4 grid gap-4 md:grid-cols-2">
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-4">
+          <p className="text-xs text-slate-500">전역 운영 주기 우선</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">
+            시장 {form.market_refresh_interval_minutes}분 / 포지션 {form.position_management_interval_seconds}초 / 재검토 {form.decision_cycle_interval_minutes}분 / AI 기준 {form.ai_call_interval_minutes}분
+          </p>
+          <p className="mt-2 text-sm leading-6 text-slate-600">
+            기본 화면에서는 전역 기본값만 빠르게 확인하고, 예외 심볼은 아래 고급 설정에서만 수정합니다.
+          </p>
+        </div>
+        <div className="rounded-2xl border border-amber-200 bg-white px-4 py-4">
+          <p className="text-xs text-slate-500">예외 심볼 요약</p>
+          <p className="mt-2 text-sm font-semibold text-slate-900">{customizedRows.length}개 심볼에 override 또는 운영 제외 적용</p>
+          <p className="mt-2 text-sm leading-6 text-slate-600">{customizedSymbolsSummary}</p>
+        </div>
+      </div>
+      <details className="mt-4 rounded-2xl border border-dashed border-amber-300 bg-white">
+        <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3 px-4 py-4">
+          <div>
+            <p className="text-sm font-semibold text-slate-900">고급 설정: 심볼별 override 상세</p>
+            <p className="mt-1 text-sm leading-6 text-slate-600">
+              기본 화면 복잡도를 줄이기 위해 상세 입력은 접어 두고, 필요할 때만 펼쳐 수정합니다.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <StatusPill tone={customizedRows.length > 0 ? "warn" : "neutral"}>
+              예외 {customizedRows.length}개
+            </StatusPill>
+            <StatusPill tone="neutral">펼쳐서 수정</StatusPill>
+          </div>
+        </summary>
+        <div className="border-t border-amber-100 px-4 py-4">
+          <div className="grid gap-4 2xl:grid-cols-2">
+            {overrideRows.map((row) => {
+              const effective = effectiveCadenceBySymbol[row.symbol];
+              return (
+                <div key={row.symbol} className="rounded-2xl border border-amber-200 bg-canvas p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="text-base font-semibold text-slate-900">{row.symbol}</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <StatusPill tone={row.enabled ? "good" : "warn"}>
+                          {row.enabled ? "운영 사용" : "운영 제외"}
+                        </StatusPill>
+                        <StatusPill tone={effective?.uses_global_defaults ? "neutral" : "warn"}>
+                          {effective?.uses_global_defaults ? "전역 상속" : "override 적용"}
+                        </StatusPill>
+                      </div>
+                    </div>
+                    <label className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-white px-3 py-2 text-sm font-medium text-slate-700">
+                      <input
+                        checked={row.enabled}
+                        onChange={(event) => updateSymbolOverride(row.symbol, { enabled: event.target.checked })}
+                        type="checkbox"
+                      />
+                      사용
+                    </label>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-2">
+                    <Field label="타임프레임 override" hint="비우면 전역 타임프레임을 사용합니다.">
+                      <input
+                        className={inputClass}
+                        value={row.timeframe_override ?? ""}
+                        onChange={(event) => updateSymbolOverride(row.symbol, { timeframe_override: event.target.value || null })}
+                        placeholder={form.default_timeframe}
+                      />
+                    </Field>
+                    <Field label="시장 갱신(분)" hint={`전역 ${form.market_refresh_interval_minutes}분`}>
+                      <input
+                        className={inputClass}
+                        type="number"
+                        min={1}
+                        max={1440}
+                        value={row.market_refresh_interval_minutes_override ?? ""}
+                        onChange={(event) => updateSymbolOverride(row.symbol, { market_refresh_interval_minutes_override: numberOrNull(event.target.value) })}
+                        placeholder={`${form.market_refresh_interval_minutes}`}
+                      />
+                    </Field>
+                    <Field label="포지션 관리(초)" hint={`전역 ${form.position_management_interval_seconds}초`}>
+                      <input
+                        className={inputClass}
+                        type="number"
+                        min={30}
+                        max={3600}
+                        value={row.position_management_interval_seconds_override ?? ""}
+                        onChange={(event) => updateSymbolOverride(row.symbol, { position_management_interval_seconds_override: numberOrNull(event.target.value) })}
+                        placeholder={`${form.position_management_interval_seconds}`}
+                      />
+                    </Field>
+                    <Field label="재검토 확인 주기(분)" hint={`전역 ${form.decision_cycle_interval_minutes}분 · 주기 cycle이 재검토 이벤트를 확인하는 기준`}>
+                      <input
+                        className={inputClass}
+                        type="number"
+                        min={1}
+                        max={1440}
+                        value={row.decision_cycle_interval_minutes_override ?? ""}
+                        onChange={(event) => updateSymbolOverride(row.symbol, { decision_cycle_interval_minutes_override: numberOrNull(event.target.value) })}
+                        placeholder={`${form.decision_cycle_interval_minutes}`}
+                      />
+                    </Field>
+                    <Field label="AI 기본 검토 간격(분)" hint={`전역 ${form.ai_call_interval_minutes}분 · 열린 포지션 재검토 기준과 수동 재실행 보호에 사용`}>
+                      <input
+                        className={inputClass}
+                        type="number"
+                        min={5}
+                        max={1440}
+                        value={row.ai_call_interval_minutes_override ?? ""}
+                        onChange={(event) => updateSymbolOverride(row.symbol, { ai_call_interval_minutes_override: numberOrNull(event.target.value) })}
+                        placeholder={`${form.ai_call_interval_minutes}`}
+                      />
+                    </Field>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+                    {effective ? (
+                      <div className="space-y-3">
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div><p className="text-xs text-slate-500">타임프레임</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.timeframe}</p></div>
+                          <div><p className="text-xs text-slate-500">시장 갱신</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.market_refresh_interval_minutes}분</p></div>
+                          <div><p className="text-xs text-slate-500">포지션 관리</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.position_management_interval_seconds}초</p></div>
+                          <div><p className="text-xs text-slate-500">재검토 확인 주기</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.decision_cycle_interval_minutes}분</p></div>
+                          <div><p className="text-xs text-slate-500">AI 기본 검토 간격</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.ai_call_interval_minutes}분</p></div>
+                        </div>
+                        <div className="grid gap-3 lg:grid-cols-2">
+                          <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                            <p className="text-xs text-slate-500">마지막 AI 호출 / AI 검토 기준</p>
+                            <p className="mt-2 break-all text-sm font-semibold text-slate-900">{formatDisplayValue(effective.last_ai_decision_at, "last_ai_decision_at")}</p>
+                            <p className="mt-1 break-all text-sm text-slate-700">
+                              이벤트가 생기면 AI 검토를 시도합니다. 이 값은 열린 포지션 재검토 기준과 수동 재실행 보호에 함께 사용됩니다.
+                            </p>
+                          </div>
+                          <div className="rounded-2xl bg-slate-50 px-4 py-3">
+                            <p className="text-xs text-slate-500">최근 사이클 상태</p>
+                            <p className="mt-2 break-all text-sm text-slate-700">시장 갱신 {formatDisplayValue(effective.last_market_refresh_at, "last_market_refresh_at")}</p>
+                            <p className="mt-1 break-all text-sm text-slate-700">포지션 관리 {formatDisplayValue(effective.last_position_management_at, "last_position_management_at")}</p>
+                            <p className="mt-1 break-all text-sm text-slate-700">재검토 확인 {formatDisplayValue(effective.last_decision_at, "last_decision_at")}</p>
+                            <p className="mt-2 break-all text-sm font-semibold text-slate-900">
+                              재검토 확인 주기 {effective.decision_cycle_interval_minutes}분
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-slate-500">저장 후 실제 주기와 마지막 실행 시각이 계산됩니다.</p>
+                    )}
                   </div>
                 </div>
-                <label className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-canvas px-3 py-2 text-sm font-medium text-slate-700">
-                  <input
-                    checked={row.enabled}
-                    onChange={(event) => updateSymbolOverride(row.symbol, { enabled: event.target.checked })}
-                    type="checkbox"
-                  />
-                  사용
-                </label>
-              </div>
-
-              <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <Field label="타임프레임 override" hint="비우면 전역 타임프레임을 사용합니다.">
-                  <input
-                    className={inputClass}
-                    value={row.timeframe_override ?? ""}
-                    onChange={(event) => updateSymbolOverride(row.symbol, { timeframe_override: event.target.value || null })}
-                    placeholder={form.default_timeframe}
-                  />
-                </Field>
-                <Field label="시장 갱신(분)" hint={`전역 ${form.market_refresh_interval_minutes}분`}>
-                  <input
-                    className={inputClass}
-                    type="number"
-                    min={1}
-                    max={1440}
-                    value={row.market_refresh_interval_minutes_override ?? ""}
-                    onChange={(event) => updateSymbolOverride(row.symbol, { market_refresh_interval_minutes_override: numberOrNull(event.target.value) })}
-                    placeholder={`${form.market_refresh_interval_minutes}`}
-                  />
-                </Field>
-                <Field label="포지션 관리(초)" hint={`전역 ${form.position_management_interval_seconds}초`}>
-                  <input
-                    className={inputClass}
-                    type="number"
-                    min={30}
-                    max={3600}
-                    value={row.position_management_interval_seconds_override ?? ""}
-                    onChange={(event) => updateSymbolOverride(row.symbol, { position_management_interval_seconds_override: numberOrNull(event.target.value) })}
-                    placeholder={`${form.position_management_interval_seconds}`}
-                  />
-                </Field>
-                <Field label="의사결정 점검(분)" hint={`전역 ${form.decision_cycle_interval_minutes}분 · 이벤트 기반 재검토 여부 확인 기준`}>
-                  <input
-                    className={inputClass}
-                    type="number"
-                    min={1}
-                    max={1440}
-                    value={row.decision_cycle_interval_minutes_override ?? ""}
-                    onChange={(event) => updateSymbolOverride(row.symbol, { decision_cycle_interval_minutes_override: numberOrNull(event.target.value) })}
-                    placeholder={`${form.decision_cycle_interval_minutes}`}
-                  />
-                </Field>
-                <Field label="AI 재호출 가드(분)" hint={`전역 ${form.ai_call_interval_minutes}분 · 동일 심볼 최소 간격`}>
-                  <input
-                    className={inputClass}
-                    type="number"
-                    min={5}
-                    max={1440}
-                    value={row.ai_call_interval_minutes_override ?? ""}
-                    onChange={(event) => updateSymbolOverride(row.symbol, { ai_call_interval_minutes_override: numberOrNull(event.target.value) })}
-                    placeholder={`${form.ai_call_interval_minutes}`}
-                  />
-                </Field>
-              </div>
-
-              <div className="mt-4 rounded-2xl border border-slate-200 bg-canvas p-4">
-                {effective ? (
-                  <div className="space-y-3">
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-                      <div><p className="text-xs text-slate-500">타임프레임</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.timeframe}</p></div>
-                      <div><p className="text-xs text-slate-500">시장 갱신</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.market_refresh_interval_minutes}분</p></div>
-                      <div><p className="text-xs text-slate-500">포지션 관리</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.position_management_interval_seconds}초</p></div>
-                      <div><p className="text-xs text-slate-500">의사결정 점검</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.decision_cycle_interval_minutes}분</p></div>
-                      <div><p className="text-xs text-slate-500">AI 재호출 가드</p><p className="mt-1 text-sm font-semibold text-slate-900">{effective.ai_call_interval_minutes}분</p></div>
-                    </div>
-                    <div className="grid gap-3 lg:grid-cols-2">
-                      <div className="rounded-2xl bg-white px-4 py-3">
-                        <p className="text-xs text-slate-500">마지막 AI 호출 / 다음 재호출 가능</p>
-                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">{formatDisplayValue(effective.last_ai_decision_at, "last_ai_decision_at")}</p>
-                        <p className="mt-1 break-all text-sm text-slate-700">{formatDisplayValue(effective.next_ai_call_due_at, "next_ai_call_due_at")}</p>
-                      </div>
-                      <div className="rounded-2xl bg-white px-4 py-3">
-                        <p className="text-xs text-slate-500">최근 사이클 / 다음 점검</p>
-                        <p className="mt-2 break-all text-sm text-slate-700">시장 갱신 {formatDisplayValue(effective.last_market_refresh_at, "last_market_refresh_at")}</p>
-                        <p className="mt-1 break-all text-sm text-slate-700">포지션 관리 {formatDisplayValue(effective.last_position_management_at, "last_position_management_at")}</p>
-                        <p className="mt-1 break-all text-sm text-slate-700">의사결정 점검 {formatDisplayValue(effective.last_decision_at, "last_decision_at")}</p>
-                        <p className="mt-2 break-all text-sm font-semibold text-slate-900">다음 점검 예정 {formatDisplayValue(effective.next_decision_due_at, "next_decision_due_at")}</p>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-sm text-slate-500">저장 후 실제 주기와 마지막 실행 시각이 계산됩니다.</p>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </div>
+      </details>
     </div>
   );
 }
@@ -894,17 +990,31 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
   );
 }
 
-export function SettingsControls({ initial }: { initial: SettingsPayload }) {
+export function SettingsControls({
+  initial,
+  initialView = "control",
+}: {
+  initial: SettingsPayload;
+  initialView?: SettingsView;
+}) {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [state, setState] = useState(initial);
   const [symbolCadences, setSymbolCadences] = useState<SymbolEffectiveCadence[]>([]);
   const [aiUsage, setAiUsage] = useState<AIUsagePayload | null>(null);
   const [form, setForm] = useState<FormState>(() => toFormState(initial));
   const [operatorEventForm, setOperatorEventForm] = useState<OperatorEventFormState>(() => toOperatorEventFormState(initial));
   const [manualWindowForm, setManualWindowForm] = useState<ManualWindowFormState>(() => toManualWindowFormState());
-  const [message, setMessage] = useState("");
+  const [feedback, setFeedback] = useState<Partial<Record<FeedbackKey, FeedbackMessage>>>({});
   const [liveSyncResult, setLiveSyncResult] = useState<LiveSyncResult | null>(null);
-  const [eventSourceTestResult, setEventSourceTestResult] = useState<ConnectionTestResponse | null>(null);
   const [isPending, startTransition] = useTransition();
+  const activeView = normalizeSettingsView(searchParams.get("view") ?? initialView);
+  const viewHref = (view: SettingsView) => {
+    const nextParams = new URLSearchParams(searchParams.toString());
+    nextParams.set("view", view);
+    const query = nextParams.toString();
+    return query ? `${pathname}?${query}` : pathname;
+  };
 
   const mergedSymbols = useMemo(() => uniqueSymbols([...form.tracked_symbols, ...form.custom_symbols.split(",")]), [form.custom_symbols, form.tracked_symbols]);
   const overrideRows = useMemo(
@@ -948,18 +1058,8 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
   const alignmentReasonSummary = eventPreviewSummary.alignmentReasonSummary;
   const eventSourceHelp = eventPreviewSummary.eventSourceHelp;
   const eventSourceOverrideEnabled = form.event_source_provider !== "";
-  const eventSourceTestSourceStatus =
-    typeof eventSourceTestResult?.details?.source_status === "string"
-      ? eventSourceTestResult.details.source_status
-      : null;
-  const eventSourceTestNextEventName =
-    typeof eventSourceTestResult?.details?.next_event_name === "string"
-      ? eventSourceTestResult.details.next_event_name
-      : null;
-  const eventSourceTestNextEventAt =
-    typeof eventSourceTestResult?.details?.next_event_at === "string"
-      ? eventSourceTestResult.details.next_event_at
-      : null;
+  const blsEnrichmentConfigState = describeEnrichmentConfigState(form.event_source_bls_enrichment_url, eventSourceOverrideEnabled);
+  const beaEnrichmentConfigState = describeEnrichmentConfigState(form.event_source_bea_enrichment_url, eventSourceOverrideEnabled);
   const liveArmBlocked = Boolean(controlSummary.live_arm_disabled);
   const liveArmDisableReason = controlSummary.live_arm_disable_reason;
   const operatorAlertMessage =
@@ -999,12 +1099,13 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     setForm(toFormState(next));
     setOperatorEventForm(toOperatorEventFormState(next));
     setManualWindowForm(toManualWindowFormState());
-    setEventSourceTestResult(null);
     void refreshAuxiliaryData().catch(() => {
       setSymbolCadences([]);
       setAiUsage(null);
     });
   };
+  const setSectionFeedback = (key: FeedbackKey, tone: FeedbackTone, text: string) =>
+    setFeedback((current) => ({ ...current, [key]: { tone, text } }));
   const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((current) => ({ ...current, [key]: value }));
   const updateOperatorEventField = <K extends keyof OperatorEventFormState>(key: K, value: OperatorEventFormState[K]) =>
     setOperatorEventForm((current) => ({ ...current, [key]: value }));
@@ -1078,6 +1179,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     event_source_timeout_seconds: form.event_source_timeout_seconds,
     event_source_default_assets: uniqueSymbols(form.event_source_default_assets_input.split(",")),
     event_source_fred_release_ids: csvToPositiveIntegers(form.event_source_fred_release_ids_input),
+    event_source_bls_enrichment_url: form.event_source_bls_enrichment_url || null,
+    event_source_bls_enrichment_static_params: {},
+    event_source_bea_enrichment_url: form.event_source_bea_enrichment_url || null,
+    event_source_bea_enrichment_static_params: {},
     openai_api_key: form.openai_api_key || null,
     binance_api_key: form.binance_api_key || null,
     binance_api_secret: form.binance_api_secret || null,
@@ -1088,31 +1193,61 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     clear_event_source_api_key: form.clear_event_source_api_key,
   };
 
-  const save = () => {
+  const save = (feedbackKey: "control_save" | "integration_save") => {
     startTransition(() => {
       void requestJson<SettingsPayload>("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
-        .then((result) => { syncSettings(result); setMessage("설정을 저장했습니다."); })
-        .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "설정 저장에 실패했습니다."); });
+        .then((result) => {
+          syncSettings(result);
+          setSectionFeedback(feedbackKey, "good", "전체 설정을 저장했습니다.");
+        })
+        .catch((error: unknown) => {
+          setSectionFeedback(feedbackKey, "danger", error instanceof Error ? error.message : "설정 저장에 실패했습니다.");
+        });
     });
   };
 
-  const runPost = (path: string, successMessage: string, onSuccess?: (data: any) => void, body?: object) => {
+  const runPost = (
+    path: string,
+    successMessage: string,
+    feedbackKey: "live_actions" | "operator_event" | "manual_window",
+    onSuccess?: (data: any) => void,
+    body?: object,
+  ) => {
     startTransition(() => {
       void requestJson(path, { method: "POST", headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined })
-        .then((result) => { onSuccess?.(result); setMessage(successMessage); })
-        .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "요청 처리에 실패했습니다."); });
+        .then((result) => {
+          onSuccess?.(result);
+          setSectionFeedback(feedbackKey, "good", successMessage);
+        })
+        .catch((error: unknown) => {
+          setSectionFeedback(feedbackKey, "danger", error instanceof Error ? error.message : "요청 처리에 실패했습니다.");
+        });
     });
   };
+  const actionsUseSavedSettings =
+    form.live_approval_window_minutes !== state.live_approval_window_minutes ||
+    form.default_symbol !== state.default_symbol;
 
-  const runPut = (path: string, successMessage: string, body: object, onSuccess?: (data: any) => void) => {
+  const runPut = (
+    path: string,
+    successMessage: string,
+    feedbackKey: "operator_event" | "manual_window",
+    body: object,
+    onSuccess?: (data: any) => void,
+  ) => {
     startTransition(() => {
       void requestJson(path, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       })
-        .then((result) => { onSuccess?.(result); setMessage(successMessage); })
-        .catch((error: unknown) => { setMessage(error instanceof Error ? error.message : "요청 처리에 실패했습니다."); });
+        .then((result) => {
+          onSuccess?.(result);
+          setSectionFeedback(feedbackKey, "good", successMessage);
+        })
+        .catch((error: unknown) => {
+          setSectionFeedback(feedbackKey, "danger", error instanceof Error ? error.message : "요청 처리에 실패했습니다.");
+        });
     });
   };
 
@@ -1120,12 +1255,13 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     const validFrom = utcInputValueToIso(operatorEventForm.valid_from);
     const validTo = utcInputValueToIso(operatorEventForm.valid_to);
     if (validFrom && validTo && new Date(validTo).getTime() <= new Date(validFrom).getTime()) {
-      setMessage("운영자 이벤트 뷰의 종료 시각은 시작 시각보다 뒤여야 합니다.");
+      setSectionFeedback("operator_event", "danger", "운영자 이벤트 뷰의 종료 시각은 시작 시각보다 뒤여야 합니다.");
       return;
     }
     runPut(
       "/api/settings/operator-event-view",
       "운영자 이벤트 뷰를 저장했습니다.",
+      "operator_event",
       {
         operator_bias: operatorEventForm.operator_bias,
         operator_risk_state: operatorEventForm.operator_risk_state,
@@ -1145,6 +1281,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     runPost(
       "/api/settings/operator-event-view/clear",
       "운영자 이벤트 뷰를 해제했습니다.",
+      "operator_event",
       syncSettings,
       { created_by: operatorEventForm.created_by.trim() || "operator-ui" },
     );
@@ -1162,16 +1299,16 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     const startAt = utcInputValueToIso(manualWindowForm.start_at);
     const endAt = utcInputValueToIso(manualWindowForm.end_at);
     if (!startAt || !endAt) {
-      setMessage("수동 노트레이드 윈도우의 시작/종료 시각을 UTC 기준으로 입력해야 합니다.");
+      setSectionFeedback("manual_window", "danger", "수동 노트레이드 윈도우의 시작/종료 시각을 UTC 기준으로 입력해야 합니다.");
       return;
     }
     if (new Date(endAt).getTime() <= new Date(startAt).getTime()) {
-      setMessage("수동 노트레이드 윈도우의 종료 시각은 시작 시각보다 뒤여야 합니다.");
+      setSectionFeedback("manual_window", "danger", "수동 노트레이드 윈도우의 종료 시각은 시작 시각보다 뒤여야 합니다.");
       return;
     }
     const scopeSymbols = csvToSymbols(manualWindowForm.symbols);
     if (manualWindowForm.scope_type === "symbols" && scopeSymbols.length === 0) {
-      setMessage("심볼 지정 범위를 선택한 경우 최소 1개 심볼이 필요합니다.");
+      setSectionFeedback("manual_window", "danger", "심볼 지정 범위를 선택한 경우 최소 1개 심볼이 필요합니다.");
       return;
     }
     const payload = {
@@ -1187,13 +1324,14 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
       created_by: manualWindowForm.created_by.trim() || "operator-ui",
     };
     if (!payload.reason) {
-      setMessage("수동 노트레이드 윈도우 사유를 입력해야 합니다.");
+      setSectionFeedback("manual_window", "danger", "수동 노트레이드 윈도우 사유를 입력해야 합니다.");
       return;
     }
     if (manualWindowForm.window_id) {
       runPut(
         `/api/settings/manual-no-trade-windows/${encodeURIComponent(manualWindowForm.window_id)}`,
         "수동 노트레이드 윈도우를 수정했습니다.",
+        "manual_window",
         payload,
         syncSettings,
       );
@@ -1202,6 +1340,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     runPost(
       "/api/settings/manual-no-trade-windows",
       "수동 노트레이드 윈도우를 생성했습니다.",
+      "manual_window",
       syncSettings,
       payload,
     );
@@ -1211,35 +1350,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
     runPost(
       `/api/settings/manual-no-trade-windows/${encodeURIComponent(windowId)}/end`,
       "수동 노트레이드 윈도우를 종료했습니다.",
+      "manual_window",
       syncSettings,
       { created_by: manualWindowForm.created_by.trim() || "operator-ui" },
     );
-  };
-
-  const testFredConnection = () => {
-    startTransition(() => {
-      void requestJson<ConnectionTestResponse>("/api/settings/test/fred", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          api_key: form.event_source_api_key || null,
-          api_url: form.event_source_api_url || null,
-          timeout_seconds: form.event_source_timeout_seconds,
-          release_ids: csvToPositiveIntegers(form.event_source_fred_release_ids_input),
-          default_assets: uniqueSymbols(form.event_source_default_assets_input.split(",")),
-          symbol: form.default_symbol,
-          timeframe: form.default_timeframe,
-        }),
-      })
-        .then((result) => {
-          setEventSourceTestResult(result);
-          setMessage(result.message);
-        })
-        .catch((error: unknown) => {
-          setEventSourceTestResult(null);
-          setMessage(error instanceof Error ? error.message : "FRED 연결 확인에 실패했습니다.");
-        });
-    });
   };
 
   return (
@@ -1260,15 +1374,27 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
-        {settingsStageLabels.map((label) => (
-          <span key={label} className="rounded-full border border-amber-200 bg-canvas px-3 py-1 text-xs font-semibold text-slate-600">
-            {label}
-          </span>
-        ))}
+      <div className="grid gap-3 sm:grid-cols-2">
+        {settingsViewTabs.map((tab) => {
+          const active = activeView === tab.value;
+          return (
+            <Link
+              key={tab.value}
+              href={viewHref(tab.value)}
+              className={`rounded-[1.5rem] border px-4 py-4 transition ${
+                active
+                  ? "border-slate-900 bg-slate-900 text-white"
+                  : "border-amber-200 bg-canvas text-slate-700 hover:border-amber-300 hover:bg-white"
+              }`}
+            >
+              <p className="text-sm font-semibold">{tab.label}</p>
+              <p className={`mt-2 text-sm leading-6 ${active ? "text-white/80" : "text-slate-500"}`}>{tab.description}</p>
+            </Link>
+          );
+        })}
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2">
         <MetricCard label="운영 모드" value={rolloutModeLabel(form.rollout_mode)} tone="dark" />
         <MetricCard label="기본 심볼 / 타임프레임" value={`${form.default_symbol} / ${form.default_timeframe}`} />
         <MetricCard label="AI 동작 방식" value="이벤트 기반 + 주기 백스톱" tone="warm" />
@@ -1290,90 +1416,143 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         </div>
       ) : null}
 
-      <section className="grid gap-5 xl:grid-cols-2">
-        <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
-          <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
-          <p className="mt-2 text-sm leading-6 text-slate-600">
-            운영 중지, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어를 모았습니다. 아래 상태는
-            백엔드가 내려준 현재 gate 요약이며, 심볼별 세부 흐름은 개요 화면에서 확인합니다.
-          </p>
-            <ControlStatusPanel state={state} />
-            <div className="mt-4 grid gap-4 md:grid-cols-2">
-              <Field label="운영 모드">
-                <select
-                  className={inputClass}
-                  value={form.rollout_mode}
-                  onChange={(event) => {
-                    const nextMode = event.target.value as RolloutMode;
-                    updateField("rollout_mode", nextMode);
-                    updateField("live_trading_enabled", nextMode !== "paper");
-                  }}
-                >
-                  {rolloutModeOptions.map((option) => (
-                    <option key={option} value={option}>{rolloutModeLabel(option)}</option>
-                  ))}
-                </select>
-              </Field>
-              <Field label="승인 유지 시간(분)"><input className={inputClass} min={0} max={240} type="number" value={form.live_approval_window_minutes} onChange={(event) => updateField("live_approval_window_minutes", Number(event.target.value))} /></Field>
-              <Field label="limited live 주문당 최대 notional">
-                <input
-                  className={inputClass}
-                  min={1}
-                  step="1"
-                  type="number"
-                  value={form.limited_live_max_notional ?? 500}
-                  onChange={(event) => updateField("limited_live_max_notional", Number(event.target.value))}
-                />
-              </Field>
-              <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">환경 게이트</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_trading_env_enabled ? "활성" : "비활성"}</p></div>
-              <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3"><p className="text-xs text-slate-500">승인 창 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_execution_armed ? `열림 (${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")})` : "닫힘"}</p></div>
+      <div className={activeView === "control" ? "space-y-5" : "hidden"} aria-hidden={activeView !== "control"}>
+        <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+                운영 중지, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어를 상단 핵심 패널로 모았습니다.
+                아래 상태는 백엔드가 내려준 현재 gate 요약이며, 심볼별 세부 흐름은 개요 화면에서 확인합니다.
+              </p>
             </div>
-            <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <Toggle checked={form.manual_live_approval} label="수동 승인 정책 사용" onChange={(value) => updateField("manual_live_approval", value)} />
+            <div className="flex flex-wrap gap-2">
+              <StatusPill tone={state.trading_paused ? "danger" : "good"}>
+                {state.trading_paused ? "pause 활성" : "운영 중"}
+              </StatusPill>
+              <StatusPill tone={state.live_execution_armed ? "good" : "warn"}>
+                {state.live_execution_armed ? "approval armed" : "approval 닫힘"}
+              </StatusPill>
+              <StatusPill tone={state.live_execution_ready ? "good" : "warn"}>
+                {state.live_execution_ready ? "live ready" : "live guard"}
+              </StatusPill>
+              <StatusPill tone={state.exchange_submit_allowed ? "good" : "neutral"}>
+                {state.exchange_submit_allowed ? "실주문 제출 허용" : "실주문 제출 제한"}
+              </StatusPill>
             </div>
-          <p className="mt-4 text-sm leading-6 text-slate-600">즉시 중지는 신규 진입만 막는 운영 중지입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.</p>
-          <div className="mt-4 flex flex-wrap gap-2">
-            <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/pause", "거래를 일시 중지했습니다.", syncSettings)} type="button">즉시 중지</button>
-            <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/resume", "거래 일시 중지를 해제했습니다.", syncSettings)} type="button">중지 해제</button>
-            <button
-              className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
-              disabled={liveArmBlocked}
-              onClick={() => runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", syncSettings, { minutes: form.live_approval_window_minutes })}
-              type="button"
-            >
-              실거래 승인
-            </button>
-            <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/live/disarm", "실거래 승인 창을 닫았습니다.", syncSettings)} type="button">승인 해제</button>
-            <button
-              className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700"
-              onClick={async () => {
-                try {
-                  setLiveSyncResult(await requestJson<LiveSyncResult>(`/api/live/sync?symbol=${encodeURIComponent(form.default_symbol)}`, { method: "POST" }));
-                  setMessage("거래소 상태와 보호 주문 상태를 동기화했습니다.");
-                } catch (error: unknown) {
-                  if (error instanceof ApiRequestError && error.payload && typeof error.payload === "object") {
-                    const detail = "detail" in error.payload ? (error.payload as { detail?: unknown }).detail : error.payload;
-                    if (detail && typeof detail === "object") {
-                      setLiveSyncResult(detail as LiveSyncResult);
-                    }
-                  }
-                  setMessage(error instanceof Error ? error.message : "거래소 동기화에 실패했습니다.");
-                }
-              }}
-              type="button"
-            >
-              거래소 동기화
-            </button>
           </div>
-          {liveArmBlocked && liveArmDisableReason ? (
-            <p className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
-              실거래 승인 버튼 비활성화 사유: {liveArmDisableReason}
-            </p>
-          ) : null}
-          <LiveSyncPanel result={liveSyncResult} />
-        </div>
+          <ControlStatusPanel state={state} />
+          <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">즉시 실행 액션</p>
+                  <p className="mt-1 text-sm leading-6 text-slate-600">
+                    pause/resume/live arm/sync는 저장된 현재 설정 기준으로만 실행합니다.
+                  </p>
+                </div>
+                <StatusPill tone="neutral">저장값 기준 실행</StatusPill>
+              </div>
+              <p className="mt-4 text-sm leading-6 text-slate-600">
+                즉시 중지는 신규 진입만 막는 운영 중지입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.
+              </p>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/pause", "거래를 일시 중지했습니다.", "live_actions", syncSettings)} type="button">즉시 중지</button>
+                <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={() => runPost("/api/settings/resume", "거래 일시 중지를 해제했습니다.", "live_actions", syncSettings)} type="button">중지 해제</button>
+                <button
+                  className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+                  disabled={liveArmBlocked}
+                  onClick={() => runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", "live_actions", syncSettings, { minutes: state.live_approval_window_minutes })}
+                  type="button"
+                >
+                  실거래 승인
+                </button>
+                <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={() => runPost("/api/settings/live/disarm", "실거래 승인 창을 닫았습니다.", "live_actions", syncSettings)} type="button">승인 해제</button>
+                <button
+                  className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700"
+                  onClick={async () => {
+                    try {
+                      setLiveSyncResult(await requestJson<LiveSyncResult>(`/api/live/sync?symbol=${encodeURIComponent(state.default_symbol)}`, { method: "POST" }));
+                      setSectionFeedback("live_actions", "good", "거래소 상태와 보호 주문 상태를 동기화했습니다.");
+                    } catch (error: unknown) {
+                      if (error instanceof ApiRequestError && error.payload && typeof error.payload === "object") {
+                        const detail = "detail" in error.payload ? (error.payload as { detail?: unknown }).detail : error.payload;
+                        if (detail && typeof detail === "object") {
+                          setLiveSyncResult(detail as LiveSyncResult);
+                        }
+                      }
+                      setSectionFeedback("live_actions", "danger", error instanceof Error ? error.message : "거래소 동기화에 실패했습니다.");
+                    }
+                  }}
+                  type="button"
+                >
+                  거래소 동기화
+                </button>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-slate-500">
+                실거래 승인 시간: 저장값 {state.live_approval_window_minutes}분 / 동기화 심볼: 저장값 {state.default_symbol}
+                {actionsUseSavedSettings ? " / 현재 form 입력과 저장값이 다르면 저장 후 다시 실행하세요." : ""}
+              </p>
+              <div className="mt-3">
+                <InlineFeedback message={feedback.live_actions} />
+              </div>
+              {liveArmBlocked && liveArmDisableReason ? (
+                <p className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+                  실거래 승인 버튼 비활성화 사유: {liveArmDisableReason}
+                </p>
+              ) : null}
+              <LiveSyncPanel result={liveSyncResult} />
+            </div>
 
-        <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+            <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">저장형 운영 기본값</p>
+                  <p className="mt-1 text-sm leading-6 text-slate-600">
+                    운영 모드, 승인 유지 시간, limited live 한도는 저장 후에만 런타임에 반영됩니다.
+                  </p>
+                </div>
+                <StatusPill tone="neutral">저장 후 반영</StatusPill>
+              </div>
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <Field label="운영 모드">
+                  <select
+                    className={inputClass}
+                    value={form.rollout_mode}
+                    onChange={(event) => {
+                      const nextMode = event.target.value as RolloutMode;
+                      updateField("rollout_mode", nextMode);
+                      updateField("live_trading_enabled", nextMode !== "paper");
+                    }}
+                  >
+                    {rolloutModeOptions.map((option) => (
+                      <option key={option} value={option}>{rolloutModeLabel(option)}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="승인 유지 시간(분)"><input className={inputClass} min={0} max={240} type="number" value={form.live_approval_window_minutes} onChange={(event) => updateField("live_approval_window_minutes", Number(event.target.value))} /></Field>
+                <Field label="limited live 주문당 최대 notional">
+                  <input
+                    className={inputClass}
+                    min={1}
+                    step="1"
+                    type="number"
+                    value={form.limited_live_max_notional ?? 500}
+                    onChange={(event) => updateField("limited_live_max_notional", Number(event.target.value))}
+                  />
+                </Field>
+                <div className="rounded-2xl border border-amber-200 bg-canvas px-4 py-3"><p className="text-xs text-slate-500">환경 게이트</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_trading_env_enabled ? "활성" : "비활성"}</p></div>
+                <div className="rounded-2xl border border-amber-200 bg-canvas px-4 py-3"><p className="text-xs text-slate-500">승인 창 상태</p><p className="mt-2 text-sm font-semibold text-slate-900">{state.live_execution_armed ? `열림 (${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")})` : "닫힘"}</p></div>
+              </div>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <Toggle checked={form.manual_live_approval} label="수동 승인 정책 사용" onChange={(value) => updateField("manual_live_approval", value)} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="grid gap-5 xl:grid-cols-2">
+          <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">시장 / 리스크</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
             심볼 구성, 기본 시장 타임프레임, 손실 한도와 같은 전역 입력 기준을 이 영역에서 관리합니다.
@@ -1448,8 +1627,8 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               </Field>
             </div>
           </div>
-        </div>
-      </section>
+          </div>
+        </section>
       <section className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1687,6 +1866,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
                 설정 해제
               </button>
             </div>
+            <div className="mt-3">
+              <InlineFeedback message={feedback.operator_event} />
+            </div>
           </div>
 
           <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
@@ -1740,6 +1922,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
                 입력 지우기
               </button>
             </div>
+            <div className="mt-3">
+              <InlineFeedback message={feedback.manual_window} />
+            </div>
 
             <div className="mt-4 space-y-3">
               {manualWindows.length === 0 ? (
@@ -1792,15 +1977,15 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">운영 주기 기본값</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            거래소 동기화, 시장 갱신, 포지션 관리, 의사결정 점검, AI 재호출 가드의 전역 기본값을 분리해 관리합니다. AI 자체는 고정 15분 정기호출이 아니라 이벤트 기반 + 주기 백스톱으로 동작합니다.
+            거래소 동기화, 시장 갱신, 포지션 관리, 재검토 확인 주기, AI 기본 검토 간격의 전역 기본값을 분리해 관리합니다. AI 자체는 고정 15분 정기호출이 아니라 이벤트 기반 + 주기 백스톱으로 동작합니다.
           </p>
           <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">운영 원칙</p>
             <p className="mt-2 text-sm leading-6 text-slate-700">
-              거래소 동기화는 전역 공용 주기만 사용합니다. 심볼별 override는 시장 갱신, 포지션 관리, 의사결정 점검, AI 재호출 가드에만 적용됩니다.
+              거래소 동기화는 전역 공용 주기만 사용합니다. 심볼별 override는 시장 갱신, 포지션 관리, 재검토 확인 주기, AI 기본 검토 간격에만 적용됩니다.
             </p>
           </div>
-          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
             <Field label="거래소 동기화(초)">
               <input className={inputClass} type="number" min={30} max={3600} value={form.exchange_sync_interval_seconds} onChange={(event) => updateField("exchange_sync_interval_seconds", Number(event.target.value))} />
             </Field>
@@ -1810,10 +1995,10 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <Field label="포지션 관리(초)">
               <input className={inputClass} type="number" min={30} max={3600} value={form.position_management_interval_seconds} onChange={(event) => updateField("position_management_interval_seconds", Number(event.target.value))} />
             </Field>
-              <Field label="의사결정 점검(분)" hint="주기 점검 cycle이 재검토 여부를 확인하는 기본 간격입니다.">
+              <Field label="재검토 확인 주기(분)" hint="주기 cycle이 재검토 이벤트가 있는지 확인하는 기본 간격입니다.">
                 <input className={inputClass} type="number" min={1} value={form.decision_cycle_interval_minutes} onChange={(event) => updateField("decision_cycle_interval_minutes", Number(event.target.value))} />
               </Field>
-              <Field label="AI 재호출 가드(분)" hint="동일 심볼에서 AI를 다시 부를 수 있는 최소 간격입니다.">
+              <Field label="AI 기본 검토 간격(분)" hint="열린 포지션 재검토 기준과 수동 재실행 보호에 사용하는 기본 간격입니다.">
                 <input className={inputClass} type="number" min={5} value={form.ai_call_interval_minutes} onChange={(event) => updateField("ai_call_interval_minutes", Number(event.target.value))} />
               </Field>
           </div>
@@ -1837,7 +2022,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             </div>
 
             <Toggle checked={form.position_management_enabled} label="보수적 포지션 관리 사용" onChange={(value) => updateField("position_management_enabled", value)} />
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <div className="grid gap-3 md:grid-cols-2">
               <Toggle checked={form.break_even_enabled} label="1R 도달 시 본절 이동" onChange={(value) => updateField("break_even_enabled", value)} />
               <Toggle checked={form.atr_trailing_stop_enabled} label="ATR 트레일링 스탑" onChange={(value) => updateField("atr_trailing_stop_enabled", value)} />
               <Toggle checked={form.partial_take_profit_enabled} label="부분 익절" onChange={(value) => updateField("partial_take_profit_enabled", value)} />
@@ -1867,7 +2052,21 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
         form={form}
         updateSymbolOverride={updateSymbolOverride}
       />
-      <section className="grid gap-5 xl:grid-cols-3">
+      <div className="flex flex-col gap-3 rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+        <p className="text-sm text-slate-600">운영 설정 변경은 전체 payload로 함께 저장됩니다. 저장 전까지 즉시 실행 액션에는 반영되지 않습니다.</p>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <button className="rounded-full bg-amber-400 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60" disabled={isPending} onClick={() => save("control_save")} type="button">{isPending ? "저장 중..." : "운영 설정 저장"}</button>
+          <div className="lg:min-w-[18rem]">
+            <InlineFeedback message={feedback.control_save} />
+          </div>
+        </div>
+      </div>
+
+      <AIUsagePanel usage={aiUsage} />
+      </div>
+
+      <div className={activeView === "integration" ? "space-y-5" : "hidden"} aria-hidden={activeView !== "integration"}>
+      <section className="grid gap-5 xl:grid-cols-2">
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">AI 설정</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
@@ -1876,7 +2075,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
           <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">현재 AI 운영 원칙</p>
             <p className="mt-2 text-sm leading-6 text-slate-700">
-              고정 15분 AI 호출이 아니라 트리거 기반으로만 평가를 시도합니다. 위의 의사결정 점검 간격은 주기 review 재검토 계산용이고, AI 재호출 가드는 동일 심볼 과호출을 막는 최소 간격입니다.
+              고정 15분 AI 호출이 아니라 트리거 기반으로만 평가를 시도합니다. 위의 재검토 확인 주기는 주기 cycle이 재검토 이벤트를 찾는 간격이고, AI 기본 검토 간격은 열린 포지션 재검토 기준과 수동 재실행 보호에 사용됩니다.
             </p>
           </div>
           <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -1897,7 +2096,7 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             <div>
               <h3 className="text-lg font-semibold text-slate-900">외부 이벤트 소스</h3>
               <p className="mt-2 text-sm leading-6 text-slate-600">
-                FRED 기반 매크로 이벤트 source를 settings에서 고정하거나, 비워 두고 기존 env fallback을 유지할 수 있습니다. 이 설정은 observe-only event layer에만 반영되며 `risk_guard`를 직접 바꾸지 않습니다.
+                FRED 기반 매크로 일정 source를 settings에서 고정하거나, 비워 두고 기존 env fallback을 유지할 수 있습니다. 아래 BLS/BEA enrichment API는 발표가 지난 이벤트의 actual 값을 보강하는 observe-only layer이며 `risk_guard`를 직접 바꾸지 않습니다.
               </p>
             </div>
             <StatusPill tone={state.event_source_provider === "fred" ? "good" : "neutral"}>
@@ -1912,9 +2111,9 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
             {eventSourceVendor ? (
               <p className="mt-2 text-sm text-slate-700">primary calendar vendor: {describeEventSourceVendor(eventSourceVendor)}</p>
             ) : null}
-            {eventEnrichmentVendors.length > 0 ? (
-              <p className="mt-1 text-sm text-slate-700">post-release enrichment: {describeEnrichmentVendors(eventEnrichmentVendors)}</p>
-            ) : null}
+            <p className="mt-1 text-sm text-slate-700">
+              post-release enrichment: {eventEnrichmentVendors.length > 0 ? describeEnrichmentVendors(eventEnrichmentVendors) : "없음"}
+            </p>
             <p className="mt-2 text-sm leading-6 text-slate-700">{eventSourceHelp}</p>
           </div>
           <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -1987,48 +2186,57 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
               />
             </Field>
           </div>
+          <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">발표 후 actual enrichment API</p>
+                <p className="mt-1 text-sm leading-6 text-slate-600">
+                  FRED가 다음 일정과 리스크 윈도우를 유지하고, BLS/BEA는 발표가 지난 이벤트의 actual/prior 값을 보강합니다. 비워 두면 settings 값 대신 env fallback을 사용합니다.
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <StatusPill tone={form.event_source_bls_enrichment_url ? "good" : "neutral"}>
+                  BLS: {blsEnrichmentConfigState}
+                </StatusPill>
+                <StatusPill tone={form.event_source_bea_enrichment_url ? "good" : "neutral"}>
+                  BEA: {beaEnrichmentConfigState}
+                </StatusPill>
+              </div>
+            </div>
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Field
+                label="BLS enrichment URL"
+                hint="예: CPI/PPI/고용 actual 값을 normalize contract로 돌려주는 wrapper endpoint. series 매핑은 wrapper 내부에서 관리하며, 이 화면에서는 URL만 넣습니다."
+              >
+                <input
+                  className={inputClass}
+                  value={form.event_source_bls_enrichment_url}
+                  onChange={(event) => updateField("event_source_bls_enrichment_url", event.target.value)}
+                  placeholder="https://example.local/bls/releases"
+                />
+              </Field>
+              <Field
+                label="BEA enrichment URL"
+                hint="예: GDP/PCE actual 값을 normalize contract로 돌려주는 wrapper endpoint. dataset/table 매핑은 wrapper 내부에서 관리하며, 이 화면에서는 URL만 넣습니다."
+              >
+                <input
+                  className={inputClass}
+                  value={form.event_source_bea_enrichment_url}
+                  onChange={(event) => updateField("event_source_bea_enrichment_url", event.target.value)}
+                  placeholder="https://example.local/bea/releases"
+                />
+              </Field>
+            </div>
+          </div>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={form.clear_event_source_api_key} onChange={(event) => updateField("clear_event_source_api_key", event.target.checked)} /> 저장된 FRED 키 제거</label>
             <StatusPill tone={state.event_source_api_key_configured ? "good" : "neutral"}>
               {state.event_source_api_key_configured ? "저장된 FRED 키 있음" : "저장된 FRED 키 없음"}
             </StatusPill>
-            <button
-              className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700"
-              disabled={isPending}
-              onClick={testFredConnection}
-              type="button"
-            >
-              FRED 연결 테스트
-            </button>
           </div>
           <p className="mt-3 text-sm leading-6 text-slate-600">
-            연결 테스트는 현재 form 값이 있으면 그 값을 우선 사용하고, 비어 있으면 저장된 key/settings 또는 env fallback으로 확인합니다.
+            실사용에서는 백엔드 스케줄러가 FRED 일정을 읽고 발표 시각이 지난 이벤트에만 BLS/BEA enrichment URL을 자동 호출합니다. 별도 테스트 입력이나 series_id 수동 입력은 사용하지 않으며, legacy static params가 있었다면 다음 저장 시 자동으로 비워집니다.
           </p>
-          {eventSourceTestResult ? (
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-white px-4 py-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <StatusPill tone={eventSourceTestResult.ok ? "good" : eventSourceTestSourceStatus === "unavailable" ? "neutral" : "danger"}>
-                  {eventSourceTestResult.ok ? "연결 확인됨" : "연결 확인 실패"}
-                </StatusPill>
-                {eventSourceTestSourceStatus ? (
-                  <StatusPill tone={toneForSourceStatus(eventSourceTestSourceStatus)}>
-                    {describeSourceStatus(eventSourceTestSourceStatus, { kind: "event_context" })}
-                  </StatusPill>
-                ) : null}
-              </div>
-              <p className="mt-3 text-sm text-slate-800">{eventSourceTestResult.message}</p>
-              <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl bg-slate-50 px-4 py-3">
-                  <p className="text-xs text-slate-500">다음 release</p>
-                  <p className="mt-2 text-sm font-semibold text-slate-900">{eventSourceTestNextEventName ?? "없음"}</p>
-                </div>
-                <div className="rounded-2xl bg-slate-50 px-4 py-3">
-                  <p className="text-xs text-slate-500">발표 시각</p>
-                  <p className="mt-2 text-sm font-semibold text-slate-900">{formatUtcTimestamp(eventSourceTestNextEventAt)}</p>
-                </div>
-              </div>
-            </div>
-          ) : null}
         </div>
 
         <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
@@ -2049,14 +2257,16 @@ export function SettingsControls({ initial }: { initial: SettingsPayload }) {
           </div>
         </div>
       </section>
-
-      <AIUsagePanel usage={aiUsage} />
-
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <p className="text-sm text-slate-600">추적 심볼, 실거래 설정, 운영 주기, 인증 정보 변경은 한 번에 함께 저장됩니다.</p>
-        <button className="rounded-full bg-amber-400 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60" disabled={isPending} onClick={save} type="button">{isPending ? "저장 중..." : "설정 저장"}</button>
+      <div className="flex flex-col gap-3 rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+        <p className="text-sm text-slate-600">연동 설정도 기존 full payload 저장 경로를 그대로 사용합니다. OpenAI/Binance/FRED 키 변경은 저장 후 반영됩니다.</p>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <button className="rounded-full bg-amber-400 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60" disabled={isPending} onClick={() => save("integration_save")} type="button">{isPending ? "저장 중..." : "연동 설정 저장"}</button>
+          <div className="lg:min-w-[18rem]">
+            <InlineFeedback message={feedback.integration_save} />
+          </div>
+        </div>
       </div>
-      {message ? <p className="text-sm text-slate-600">{message}</p> : null}
+      </div>
     </div>
   );
 }

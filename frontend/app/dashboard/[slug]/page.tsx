@@ -13,6 +13,7 @@ import { PageShell } from "../../../components/page-shell";
 import { SettingsControls, type SettingsPayload } from "../../../components/settings-controls";
 import { type OperatorDashboardPayload } from "../../../components/overview-dashboard";
 import { fetchJson } from "../../../lib/api";
+import { normalizeSettingsView } from "../../../lib/page-config";
 import { resolveSelectedSymbol } from "../../../lib/selected-symbol";
 import { dashboardPages } from "../../../lib/page-config";
 
@@ -105,7 +106,12 @@ export default async function DashboardPage({
   } else if (slug === "agents") {
     content = <AgentDebugView agentRows={normalizedSections[0]?.rows ?? []} />;
   } else if (slug === "settings") {
-    content = null;
+    content = settingsPayload ? (
+      <SettingsControls
+        initial={settingsPayload}
+        initialView={normalizeSettingsView(queryValue(query.view))}
+      />
+    ) : null;
   } else {
     content = normalizedSections.map((section) => (
       <DataTable
@@ -120,8 +126,6 @@ export default async function DashboardPage({
   return (
     <div className="space-y-6">
       <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} />
-
-      {settingsPayload ? <SettingsControls initial={settingsPayload} /> : null}
 
       {content}
     </div>

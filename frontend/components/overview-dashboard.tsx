@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { describeAiTriggerReason } from "../lib/decision-timeline";
 import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "../lib/selected-symbol";
 import { type EventOperatorControlPayload } from "../lib/event-operator-control.js";
 import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
@@ -109,6 +110,12 @@ type OperatorDecisionSnapshot = {
   event_risk_acknowledgement: string | null;
   confidence_penalty_reason: string | null;
   scenario_note: string | null;
+  decision_reference?: {
+    display_gap?: boolean | null;
+    display_gap_reason?: string | null;
+    market_snapshot_at?: string | null;
+    market_snapshot_id?: number | null;
+  } | null;
 };
 
 type OperatorRiskSnapshot = {
@@ -209,6 +216,18 @@ type OperatorCandidateSelectionSnapshot = {
   portfolio_slot_soft_cap_applied: boolean;
 };
 
+type OperatorPendingEntryPlanSnapshot = {
+  plan_id: number | null;
+  plan_status: string | null;
+  source_decision_run_id: number | null;
+  entry_mode: string | null;
+  created_at?: string | null;
+  expires_at?: string | null;
+  triggered_at?: string | null;
+  canceled_at?: string | null;
+  canceled_reason?: string | null;
+};
+
 type OperatorProtectionSummary = {
   status: string;
   protected: boolean;
@@ -248,6 +267,7 @@ type OperatorSymbolSummary = {
   open_position: OperatorPositionSummary;
   protection_status: OperatorProtectionSummary;
   candidate_selection: OperatorCandidateSelectionSnapshot;
+  pending_entry_plan?: OperatorPendingEntryPlanSnapshot | null;
   blocked_reasons: string[];
   live_execution_ready: boolean;
   stale_flags: string[];
@@ -409,6 +429,16 @@ function formatDateTime(value: string | null | undefined) {
     minute: "2-digit",
     hour12: false,
   }).format(parsed);
+}
+
+function shortFingerprint(value: string | null | undefined) {
+  if (!value || value === "-") {
+    return "없음";
+  }
+  if (value.length <= 14) {
+    return value;
+  }
+  return `${value.slice(0, 8)}...${value.slice(-4)}`;
 }
 
 function formatFreshnessSeconds(value: number | null | undefined) {
@@ -592,18 +622,11 @@ function executionOutcomeSummary(symbol: OperatorSymbolSummary) {
 }
 
 function translateAiTriggerReason(value: string | null | undefined) {
-  if (!value) {
-    return "-";
+  const presentation = describeAiTriggerReason(value);
+  if (presentation.legacy) {
+    return `과거 정책 기록: ${presentation.label}`;
   }
-  const labels: Record<string, string> = {
-    entry_candidate_event: "신규 진입 후보가 생겨 확인했습니다.",
-    breakout_exception_event: "강한 돌파 예외 상황을 다시 봤습니다.",
-    open_position_recheck_due: "열린 포지션을 다시 확인할 시점입니다.",
-    protection_review_event: "보호 주문 상태를 다시 확인했습니다.",
-    manual_review_event: "운영자 요청으로 다시 확인했습니다.",
-    periodic_backstop_due: "주기 점검 시간이 되어 다시 확인했습니다.",
-  };
-  return labels[value] ?? value;
+  return presentation.label;
 }
 
 function translateAiSkipReason(value: string | null | undefined) {
@@ -622,6 +645,7 @@ function translateAiSkipReason(value: string | null | undefined) {
 }
 
 function aiReviewSummary(symbol: OperatorSymbolSummary) {
+  const triggerPresentation = describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason);
   if (symbol.ai_decision.last_ai_skip_reason === "NO_EVENT") {
     return {
       label: "AI 의견 없음",
@@ -645,7 +669,7 @@ function aiReviewSummary(symbol: OperatorSymbolSummary) {
   }
   if (symbol.ai_decision.last_ai_invoked_at || symbol.ai_decision.provider_name) {
     return {
-      label: "AI 검토 완료",
+      label: triggerPresentation.legacy ? "과거 정책 기록" : "AI 검토 완료",
       detail: translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
       kind: "good" as const,
     };
@@ -1828,6 +1852,7 @@ function SymbolDetailPanel({
   const review = aiReviewSummary(symbol);
   const riskOutcome = riskOutcomeSummary(symbol);
   const executionOutcome = executionOutcomeSummary(symbol);
+  const triggerPresentation = describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason);
   const detailSections = buildOperatorDetailSections(symbol);
 
   return (
@@ -1879,14 +1904,16 @@ function SymbolDetailPanel({
       <div className="grid gap-4 lg:grid-cols-4">
         {valueCard("AI 상태", review.label, review.detail)}
         {valueCard(
-          "AI 호출 또는 생략 이유",
+          triggerPresentation.legacy ? "과거 정책 기록" : "AI 호출 또는 생략 이유",
           translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
-          `미호출 ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
+          triggerPresentation.legacy
+            ? triggerPresentation.hint
+            : `미호출 ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
         )}
         {valueCard(
-          "최근 / 다음 확인",
+          "최근 AI 호출 / 지문",
           formatDateTime(symbol.ai_decision.last_ai_invoked_at),
-          `다음 ${formatDateTime(symbol.ai_decision.next_ai_review_due_at)}`,
+          `지문 ${shortFingerprint(symbol.ai_decision.trigger_fingerprint)}`,
         )}
         {valueCard(
           "배정 슬롯 / 우선순위",
@@ -1937,9 +1964,12 @@ function SymbolDetailPanel({
         {detailList([
           ["AI 제공자", symbol.ai_decision.provider_name ?? "-"],
           ["호출 이벤트", symbol.ai_decision.trigger_event ?? "-"],
-          ["마지막 AI 호출 사유", translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)],
+          [
+            triggerPresentation.legacy ? "과거 정책 기록" : "마지막 AI 호출 사유",
+            translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
+          ],
           ["마지막 AI 미호출 사유", translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)],
-          ["다음 AI 검토 예정", formatDateTime(symbol.ai_decision.next_ai_review_due_at)],
+          ["마지막 AI 호출 시각", formatDateTime(symbol.ai_decision.last_ai_invoked_at)],
           ["배정 슬롯", symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-"],
           [
             "우선순위 가중치",

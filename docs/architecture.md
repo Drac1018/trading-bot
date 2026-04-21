@@ -1,5 +1,32 @@
 # Architecture
 
+## 운영자 표현과 내부 키
+
+- 이 문서는 구조 설명이므로 내부 구현 키를 그대로 사용합니다.
+- 운영자 화면이나 운영 인계에서는 아래처럼 읽으면 됩니다.
+  - `decision_cycle_interval_minutes`
+  - `decision_cycle_interval_minutes_override`
+  - `last_decision_at`
+  - `next_decision_due_at`
+    - 화면 표현: `재검토 확인 주기`
+  - `ai_call_interval_minutes`
+  - `ai_call_interval_minutes_override`
+  - `last_ai_decision_at`
+  - `next_ai_call_due_at`
+    - 화면 표현: `AI 기본 검토 간격`
+  - `strategy_engine`
+    - 화면 표현: `전략 엔진` 또는 `진입 서사 분류`
+  - `trigger_type`
+    - 화면 표현: `검토 이벤트 종류`
+  - `holding_profile`
+    - 화면 표현: `보유 성격`
+    - 값 해석: `scalp = 짧게`, `swing = 중간`, `position = 길게`
+  - `entry_mode`
+    - 화면 표현: `진입 방식`
+  - `intent_family` / `management_action`
+    - 화면 표현: `신규 진입`인지 `관리 / 보호 조치`인지 구분하는 보조 의미
+- 즉, 이 문서에서 cadence, engine, trigger, holding-profile 키를 말하는 부분은 운영자 화면에서는 위 표현으로 대응해 읽으면 됩니다.
+
 ## 2026-04 Live Snapshot Availability
 
 - `starting_equity`는 더 이상 live fallback, settings model/config, replay baseline에 사용되지 않습니다.
@@ -132,6 +159,7 @@
 - The open-position fingerprint intentionally avoids raw noisy values. Material bucket changes reopen AI review; same-basis repeats are deduped.
 - The scheduler due gate now uses the resolved open-position review cadence directly instead of relying only on symbol-level interval cadence. This keeps `scalp / swing / position` cadence hints aligned with the actual revisit timing for `open_position_recheck_due`.
 - Review cadence observability is explicit: `applied_review_cadence_minutes`, `review_cadence_source`, `holding_profile_cadence_hint`, `cadence_fallback_reason`, and `max_review_age_minutes` are persisted alongside trigger metadata.
+- 운영자 화면에서는 이 cadence observability를 `재검토 확인 주기`, `AI 기본 검토 간격`, 재검토 사유/백오프 설명으로 풀어서 읽습니다.
 - A stable fingerprint is not allowed to suppress review forever. Once the max review age is exceeded, the scheduler sets `forced_review_reason=OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED` and allows the review to proceed even if the fingerprint is unchanged.
 - The forced-review ceiling is conservative and bounded by cadence: `min(backstop interval, 3x position review cadence)`.
 - `protection_review_event` is dedupe-exempt so protection/emergency style survival paths are not delayed by unchanged fingerprints.
@@ -152,6 +180,7 @@
 - `risk.py`는 holding profile별 hard/soft gate를 적용하는 최종 허용/차단 관문으로 유지됩니다.
 - `execution.py`는 승인된 intent만 실행하고, deterministic hard stop + exchange-resident protective stop metadata를 position management seed에 넘깁니다.
 - `position_management.py`는 holding profile별 관리 강도만 다르게 적용하며, stop widening은 허용하지 않습니다.
+- 운영자 표현으로는 `holding_profile`을 `보유 성격`으로 읽으면 됩니다.
 
 ## Stop Ownership
 

@@ -1485,7 +1485,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
             _as_datetime(metadata.get("last_ai_invoked_at"))
             or (row.created_at if str(metadata.get("source") or "") == "llm" else None)
         ),
-        next_ai_review_due_at=_as_datetime(metadata.get("next_ai_review_due_at")),
+        next_ai_review_due_at=None,
         trigger_deduped=bool(metadata.get("trigger_deduped", False)),
         trigger_fingerprint=str(
             metadata.get("trigger_fingerprint")
@@ -1530,7 +1530,7 @@ def _interval_review_state_from_scheduler(row: SchedulerRun | None) -> dict[str,
         )
         or None,
         "last_ai_invoked_at": _as_datetime(outcome.get("last_ai_invoked_at")),
-        "next_ai_review_due_at": _as_datetime(outcome.get("next_ai_review_due_at")),
+        "next_ai_review_due_at": None,
         "trigger_deduped": bool(outcome.get("trigger_deduped", False)),
         "trigger_fingerprint": str(
             outcome.get("trigger_fingerprint")
@@ -1555,8 +1555,6 @@ def _overlay_interval_review_state(
         return snapshot
     decision_created_at = decision_row.created_at if decision_row is not None else None
     update: dict[str, Any] = {}
-    if interval_state.get("next_ai_review_due_at") is not None:
-        update["next_ai_review_due_at"] = interval_state["next_ai_review_due_at"]
     if interval_state.get("last_ai_skip_reason") is not None:
         update["last_ai_skip_reason"] = interval_state["last_ai_skip_reason"]
     if bool(interval_state.get("trigger_deduped")):

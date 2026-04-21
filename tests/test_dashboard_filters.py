@@ -1269,7 +1269,7 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
     assert btc.ai_decision.trigger_deduped is True
     assert btc.ai_decision.last_ai_skip_reason == "TRIGGER_DEDUPED"
-    assert btc.ai_decision.next_ai_review_due_at is not None
+    assert btc.ai_decision.next_ai_review_due_at is None
     assert btc.ai_decision.assigned_slot == "slot_1"
     assert btc.ai_decision.candidate_weight == 0.64
     assert btc.ai_decision.capacity_reason == "mixed_breadth_moderate_capacity"
@@ -1317,7 +1317,7 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert eth.ai_decision.raw_output == {}
     assert eth.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
     assert eth.ai_decision.last_ai_invoked_at is not None
-    assert eth.ai_decision.next_ai_review_due_at is not None
+    assert eth.ai_decision.next_ai_review_due_at is None
     assert eth.ai_decision.assigned_slot == "slot_2"
     assert eth.ai_decision.candidate_weight == 0.42
     assert eth.ai_decision.capacity_reason == "mixed_breadth_moderate_capacity"
@@ -1831,7 +1831,7 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert btc["open_position"]["hard_stop_active"] is True
     assert btc["open_position"]["stop_widening_allowed"] is False
     assert eth["latest_price"] == 3400.0
-    assert eth["ai_decision"]["next_ai_review_due_at"] is not None
+    assert eth["ai_decision"]["next_ai_review_due_at"] is None
     assert eth["ai_decision"]["assigned_slot"] == "slot_2"
     assert eth["ai_decision"]["portfolio_slot_soft_cap_applied"] is True
     assert eth["ai_decision"]["event_risk_acknowledgement"] is None

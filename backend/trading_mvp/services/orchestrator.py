@@ -5186,17 +5186,7 @@ class TradingOrchestrator:
                     effective_settings=effective,
                 )
             )
-            position_review_due_at = (
-                last_decision_at + timedelta(minutes=review_interval_minutes)
-                if last_decision_at is not None
-                else None
-            )
-            backstop_due_at = (
-                last_decision_at + timedelta(minutes=effective.ai_backstop_interval_minutes)
-                if effective.ai_backstop_enabled and last_decision_at is not None
-                else None
-            )
-            next_ai_review_due_at = self._next_due_at(position_review_due_at, backstop_due_at)
+            next_ai_review_due_at = None
             trigger_payload: AIReviewTriggerPayload | None = None
             selection_context: dict[str, object] | None = None
             trigger_deduped = False
@@ -5218,7 +5208,6 @@ class TradingOrchestrator:
                 if latest_decision_run is not None and isinstance(latest_decision_run.output_payload, dict)
                 else {}
             )
-            max_review_due_at: datetime | None = None
             max_review_age_minutes = (
                 self._open_position_max_review_age_minutes(
                     review_interval_minutes,
@@ -5244,12 +5233,6 @@ class TradingOrchestrator:
                 elif str(runtime_state.get("operating_state") or "") == PROTECTION_REQUIRED_STATE:
                     trigger_reason = "protection_review_event"
                     reason_codes.append(PROTECTION_REQUIRED_STATE)
-                elif backstop_due_at is not None and backstop_due_at <= generated_at:
-                    trigger_reason = "periodic_backstop_due"
-                    reason_codes.append("PERIODIC_BACKSTOP_DUE")
-                elif position_review_due_at is not None and position_review_due_at <= generated_at:
-                    trigger_reason = "open_position_recheck_due"
-                    reason_codes.append("OPEN_POSITION_RECHECK_DUE")
 
                 if trigger_reason is not None:
                     strategy_engine_name = _strategy_engine_name_from_payload(
@@ -5282,13 +5265,6 @@ class TradingOrchestrator:
                     )
                     fingerprint_reason_codes = list(reason_codes)
                     forced_review_reason: str | None = None
-                    if trigger_reason == "open_position_recheck_due" and last_material_review_at is not None:
-                        max_review_due_at = last_material_review_at + timedelta(
-                            minutes=max_review_age_minutes or review_interval_minutes
-                        )
-                        if max_review_due_at <= generated_at:
-                            forced_review_reason = "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
-                            reason_codes = list(dict.fromkeys(reason_codes + [forced_review_reason]))
                     trigger_payload = self._build_review_trigger_payload(
                         trigger_reason=trigger_reason,
                         symbol=symbol,
@@ -5369,9 +5345,6 @@ class TradingOrchestrator:
                         or str(selection_context.get("entry_mode") or "") == "breakout_confirm"
                         else "entry_candidate_event"
                     )
-                elif backstop_due_at is not None and backstop_due_at <= generated_at:
-                    trigger_reason = "periodic_backstop_due"
-                    reason_codes = list(dict.fromkeys(reason_codes + ["PERIODIC_BACKSTOP_DUE"]))
 
                 if trigger_reason is not None:
                     trigger_payload = self._build_review_trigger_payload(
@@ -5423,33 +5396,18 @@ class TradingOrchestrator:
             if (
                 trigger_payload is not None
                 and trigger_payload.trigger_reason
-                not in {"periodic_backstop_due", "manual_review_event", "protection_review_event"}
+                not in {"manual_review_event", "protection_review_event"}
                 and trigger_payload.forced_review_reason is None
                 and str(latest_trigger_payload.get("trigger_reason") or "") == trigger_payload.trigger_reason
                 and str(latest_trigger_payload.get("trigger_fingerprint") or "") == trigger_payload.trigger_fingerprint
             ):
                 trigger_deduped = True
-                dedupe_reason = (
-                    "OPEN_POSITION_FINGERPRINT_UNCHANGED"
-                    if trigger_payload.trigger_reason == "open_position_recheck_due"
-                    else "TRIGGER_FINGERPRINT_UNCHANGED"
-                )
+                dedupe_reason = "TRIGGER_FINGERPRINT_UNCHANGED"
                 trigger_payload = trigger_payload.model_copy(update={"dedupe_reason": dedupe_reason})
                 last_ai_skip_reason = "TRIGGER_DEDUPED"
 
             if trigger_payload is None:
                 last_ai_skip_reason = "NO_EVENT"
-
-            planned_next_ai_review_due_at = next_ai_review_due_at
-            if trigger_deduped and trigger_payload is not None and trigger_payload.trigger_reason == "open_position_recheck_due":
-                next_recheck_due_at = generated_at + timedelta(minutes=review_interval_minutes)
-                future_due_values = [
-                    value
-                    for value in (next_recheck_due_at, max_review_due_at, backstop_due_at)
-                    if isinstance(value, datetime) and value > generated_at
-                ]
-                if future_due_values:
-                    planned_next_ai_review_due_at = min(future_due_values)
 
             plans.append(
                 {
@@ -5467,8 +5425,8 @@ class TradingOrchestrator:
                         else None
                     ),
                     "next_ai_review_due_at": (
-                        planned_next_ai_review_due_at.isoformat()
-                        if planned_next_ai_review_due_at is not None
+                        next_ai_review_due_at.isoformat()
+                        if next_ai_review_due_at is not None
                         else None
                     ),
                     "applied_review_cadence_minutes": schedule_details.get("applied_review_cadence_minutes"),
@@ -5843,18 +5801,7 @@ class TradingOrchestrator:
             if open_positions
             else None
         )
-        next_ai_review_due_at = utcnow_naive() + timedelta(
-            minutes=(
-                review_interval_minutes
-                if open_positions
-                else effective_settings.ai_backstop_interval_minutes
-                if effective_settings.ai_backstop_enabled
-                else max(
-                    int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]),
-                    1,
-                )
-            )
-        )
+        next_ai_review_due_at = None
         if review_trigger_payload is not None and open_positions:
             review_trigger_payload = review_trigger_payload.model_copy(
                 update={
@@ -5978,7 +5925,11 @@ class TradingOrchestrator:
                 if resolved_last_ai_invoked_at is not None
                 else None
             ),
-            "next_ai_review_due_at": next_ai_review_due_at.isoformat(),
+            "next_ai_review_due_at": (
+                next_ai_review_due_at.isoformat()
+                if next_ai_review_due_at is not None
+                else None
+            ),
             "trigger_deduped": False,
             "trigger_fingerprint": (
                 review_trigger_payload.trigger_fingerprint

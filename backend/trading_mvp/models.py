@@ -93,6 +93,10 @@ class Setting(TimestampMixin, Base):
     event_source_timeout_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     event_source_default_assets: Mapped[list[str]] = mapped_column(JSON, default=list)
     event_source_fred_release_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    event_source_bls_enrichment_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    event_source_bls_enrichment_static_params: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    event_source_bea_enrichment_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    event_source_bea_enrichment_static_params: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     event_source_api_key_encrypted: Mapped[str] = mapped_column(Text, default="")
 
 

@@ -1069,6 +1069,10 @@ def get_or_create_settings(session: Session) -> Setting:
         event_source_timeout_seconds=None,
         event_source_default_assets=[],
         event_source_fred_release_ids=[],
+        event_source_bls_enrichment_url=None,
+        event_source_bls_enrichment_static_params={},
+        event_source_bea_enrichment_url=None,
+        event_source_bea_enrichment_static_params={},
         event_source_api_key_encrypted="",
     )
     session.add(row)
@@ -1133,6 +1137,18 @@ def _normalize_event_source_release_ids(values: object) -> list[int]:
             continue
         if parsed > 0 and parsed not in normalized:
             normalized.append(parsed)
+    return normalized
+
+
+def _normalize_event_source_static_params(values: object) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in values.items():
+        key = str(raw_key or "").strip()
+        value = str(raw_value or "").strip()
+        if key and value:
+            normalized[key] = value
     return normalized
 
 
@@ -2550,6 +2566,18 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         event_source_fred_release_ids=_normalize_event_source_release_ids(
             settings_row.event_source_fred_release_ids
         ),
+        event_source_bls_enrichment_url=_normalize_optional_text(
+            settings_row.event_source_bls_enrichment_url
+        ),
+        event_source_bls_enrichment_static_params=_normalize_event_source_static_params(
+            settings_row.event_source_bls_enrichment_static_params
+        ),
+        event_source_bea_enrichment_url=_normalize_optional_text(
+            settings_row.event_source_bea_enrichment_url
+        ),
+        event_source_bea_enrichment_static_params=_normalize_event_source_static_params(
+            settings_row.event_source_bea_enrichment_static_params
+        ),
         mode=mode,
         openai_api_key_configured=bool(credentials.openai_api_key),
         binance_api_key_configured=bool(credentials.binance_api_key),
@@ -2753,6 +2781,18 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         event_source_default_assets=_normalize_event_source_assets(settings_row.event_source_default_assets),
         event_source_fred_release_ids=_normalize_event_source_release_ids(
             settings_row.event_source_fred_release_ids
+        ),
+        event_source_bls_enrichment_url=_normalize_optional_text(
+            settings_row.event_source_bls_enrichment_url
+        ),
+        event_source_bls_enrichment_static_params=_normalize_event_source_static_params(
+            settings_row.event_source_bls_enrichment_static_params
+        ),
+        event_source_bea_enrichment_url=_normalize_optional_text(
+            settings_row.event_source_bea_enrichment_url
+        ),
+        event_source_bea_enrichment_static_params=_normalize_event_source_static_params(
+            settings_row.event_source_bea_enrichment_static_params
         ),
         openai_api_key_configured=bool(credentials.openai_api_key),
         binance_api_key_configured=bool(credentials.binance_api_key),
@@ -2989,6 +3029,22 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     if "event_source_fred_release_ids" in fields_set:
         row.event_source_fred_release_ids = _normalize_event_source_release_ids(
             payload.event_source_fred_release_ids
+        )
+    if "event_source_bls_enrichment_url" in fields_set:
+        row.event_source_bls_enrichment_url = _normalize_optional_text(
+            payload.event_source_bls_enrichment_url
+        )
+    if "event_source_bls_enrichment_static_params" in fields_set:
+        row.event_source_bls_enrichment_static_params = _normalize_event_source_static_params(
+            payload.event_source_bls_enrichment_static_params
+        )
+    if "event_source_bea_enrichment_url" in fields_set:
+        row.event_source_bea_enrichment_url = _normalize_optional_text(
+            payload.event_source_bea_enrichment_url
+        )
+    if "event_source_bea_enrichment_static_params" in fields_set:
+        row.event_source_bea_enrichment_static_params = _normalize_event_source_static_params(
+            payload.event_source_bea_enrichment_static_params
         )
 
     if payload.clear_openai_api_key:

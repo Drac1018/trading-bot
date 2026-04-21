@@ -66,6 +66,71 @@ def _serialize_release_enrichment_value(value: object) -> object:
     return value
 
 
+def _coerce_numeric_value(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip().replace(",", "")
+    if not text or text in {"--", "(NA)", "NA", "N/A"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _normalize_bls_reference_period(*, year: object, period: object) -> str | None:
+    year_text = str(year or "").strip()
+    period_text = str(period or "").strip().upper()
+    if not year_text:
+        return None
+    if period_text.startswith("M") and len(period_text) == 3:
+        try:
+            month = int(period_text[1:])
+        except ValueError:
+            return None
+        if 1 <= month <= 12:
+            return f"{year_text}-{month:02d}"
+        if month == 13:
+            return year_text
+    if period_text.startswith("Q"):
+        quarter_text = period_text[1:].lstrip("0")
+        if quarter_text in {"1", "2", "3", "4"}:
+            return f"{year_text}-Q{quarter_text}"
+    if period_text.startswith("A"):
+        return year_text
+    return None
+
+
+def _normalize_bea_reference_period(value: object) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    if len(text) == 6 and text[:4].isdigit() and text[4] == "Q" and text[5] in {"1", "2", "3", "4"}:
+        return f"{text[:4]}-Q{text[5]}"
+    if len(text) == 7 and text[:4].isdigit() and text[4] == "M" and text[5:].isdigit():
+        month = int(text[5:])
+        if 1 <= month <= 12:
+            return f"{text[:4]}-{month:02d}"
+    if len(text) == 4 and text.isdigit():
+        return text
+    return None
+
+
+def _normalize_bls_footnotes(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
 def _normalize_release_enrichment_payload(payload: Mapping[str, object]) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for raw_key, raw_value in payload.items():
@@ -167,6 +232,34 @@ class NormalizedReleaseEnrichmentAdapter:
             payload = response.json()
         return payload if isinstance(payload, Mapping) else {}
 
+    def _parse_native_payload(
+        self,
+        payload: Mapping[str, object],
+        *,
+        event_name: str,
+        event_at: datetime,
+    ) -> tuple[dict[str, object], bool]:
+        del payload, event_name, event_at
+        return {}, False
+
+    def _parse_enrichment_payload(
+        self,
+        payload: Mapping[str, object],
+        *,
+        event_name: str,
+        event_at: datetime,
+    ) -> dict[str, object]:
+        native_payload, recognized = self._parse_native_payload(
+            payload,
+            event_name=event_name,
+            event_at=event_at,
+        )
+        if native_payload:
+            return native_payload
+        if recognized:
+            return {}
+        return _normalize_release_enrichment_payload(payload)
+
     def enrich_events(
         self,
         *,
@@ -193,7 +286,11 @@ class NormalizedReleaseEnrichmentAdapter:
             except Exception:
                 enriched_events.append(dict(event))
                 continue
-            normalized_payload = _normalize_release_enrichment_payload(payload)
+            normalized_payload = self._parse_enrichment_payload(
+                payload,
+                event_name=event_name,
+                event_at=event_at,
+            )
             if not normalized_payload:
                 enriched_events.append(dict(event))
                 continue
@@ -218,6 +315,75 @@ class BLSActualReleaseEnrichmentAdapter(NormalizedReleaseEnrichmentAdapter):
         }
     )
 
+    def _parse_native_payload(
+        self,
+        payload: Mapping[str, object],
+        *,
+        event_name: str,
+        event_at: datetime,
+    ) -> tuple[dict[str, object], bool]:
+        del event_name, event_at
+        status = str(payload.get("status") or "").strip().upper()
+        results = payload.get("Results")
+        recognized = bool(status) or isinstance(results, (Mapping, Sequence))
+        if not recognized:
+            return {}, False
+        if status and status != "REQUEST_SUCCEEDED":
+            return {}, True
+
+        series_items: list[Mapping[str, object]] = []
+        if isinstance(results, Mapping):
+            raw_series = results.get("series")
+            if isinstance(raw_series, Sequence) and not isinstance(raw_series, (str, bytes)):
+                series_items.extend(item for item in raw_series if isinstance(item, Mapping))
+        elif isinstance(results, Sequence) and not isinstance(results, (str, bytes)):
+            for item in results:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_series = item.get("series")
+                if isinstance(raw_series, Sequence) and not isinstance(raw_series, (str, bytes)):
+                    series_items.extend(series for series in raw_series if isinstance(series, Mapping))
+
+        for series in series_items:
+            raw_data = series.get("data")
+            if not isinstance(raw_data, Sequence) or isinstance(raw_data, (str, bytes)):
+                continue
+            for item in raw_data:
+                if not isinstance(item, Mapping):
+                    continue
+                parsed: dict[str, object] = {}
+                actual_value = _coerce_numeric_value(item.get("value"))
+                if actual_value is not None:
+                    parsed["actual"] = actual_value
+                reference_period = _normalize_bls_reference_period(
+                    year=item.get("year"),
+                    period=item.get("period"),
+                )
+                if reference_period is not None:
+                    parsed["reference_period"] = reference_period
+                series_id = str(series.get("seriesID") or "").strip()
+                if series_id:
+                    parsed["series_id"] = series_id
+                period = str(item.get("period") or "").strip()
+                if period:
+                    parsed["period"] = period
+                period_name = str(item.get("periodName") or "").strip()
+                if period_name:
+                    parsed["period_name"] = period_name
+                if str(item.get("latest") or "").strip().lower() == "true":
+                    parsed["latest"] = True
+                footnotes = _normalize_bls_footnotes(item.get("footnotes"))
+                if footnotes:
+                    parsed["footnotes"] = footnotes
+                catalog = series.get("catalog")
+                if isinstance(catalog, Mapping):
+                    series_title = str(catalog.get("series_title") or "").strip()
+                    if series_title:
+                        parsed["series_title"] = series_title
+                if parsed:
+                    return parsed, True
+        return {}, True
+
 
 @dataclass(slots=True)
 class BEAActualReleaseEnrichmentAdapter(NormalizedReleaseEnrichmentAdapter):
@@ -228,6 +394,77 @@ class BEAActualReleaseEnrichmentAdapter(NormalizedReleaseEnrichmentAdapter):
             "Personal Consumption Expenditures": "pce",
         }
     )
+
+    def _parse_native_payload(
+        self,
+        payload: Mapping[str, object],
+        *,
+        event_name: str,
+        event_at: datetime,
+    ) -> tuple[dict[str, object], bool]:
+        del event_at
+        bea_api = payload.get("BEAAPI")
+        if not isinstance(bea_api, Mapping):
+            return {}, False
+        results = bea_api.get("Results")
+        if not isinstance(results, Mapping):
+            return {}, True
+        if isinstance(results.get("Error"), Mapping):
+            return {}, True
+        raw_data = results.get("Data")
+        if not isinstance(raw_data, Sequence) or isinstance(raw_data, (str, bytes)):
+            return {}, True
+
+        target_description = str(event_name or "").strip().lower()
+        scored_rows: list[tuple[int, Mapping[str, object]]] = []
+        for item in raw_data:
+            if not isinstance(item, Mapping):
+                continue
+            score = 0
+            description = str(item.get("LineDescription") or item.get("TimeSeriesDescription") or "").strip().lower()
+            if description:
+                score += 1
+                if target_description and target_description in description:
+                    score += 4
+            if _coerce_numeric_value(item.get("DataValue")) is not None:
+                score += 2
+            if _normalize_bea_reference_period(item.get("TimePeriod")) is not None:
+                score += 1
+            scored_rows.append((score, item))
+        if not scored_rows:
+            return {}, True
+
+        scored_rows.sort(
+            key=lambda item: (
+                item[0],
+                str(item[1].get("TimePeriod") or ""),
+            ),
+            reverse=True,
+        )
+        row = scored_rows[0][1]
+        parsed: dict[str, object] = {}
+        actual_value = _coerce_numeric_value(row.get("DataValue"))
+        if actual_value is not None:
+            parsed["actual"] = actual_value
+        reference_period = _normalize_bea_reference_period(row.get("TimePeriod"))
+        if reference_period is not None:
+            parsed["reference_period"] = reference_period
+        for source_key, target_key in (
+            ("TimePeriod", "time_period"),
+            ("LineDescription", "line_description"),
+            ("TableName", "table_name"),
+            ("SeriesCode", "series_code"),
+            ("LineNumber", "line_number"),
+            ("TimeSeriesId", "time_series_id"),
+            ("TimeSeriesDescription", "time_series_description"),
+            ("CL_UNIT", "unit"),
+            ("UNIT_MULT", "unit_mult"),
+            ("NoteRef", "note_ref"),
+        ):
+            value = str(row.get(source_key) or "").strip()
+            if value:
+                parsed[target_key] = value
+        return parsed, True
 
 
 @dataclass(frozen=True, slots=True)

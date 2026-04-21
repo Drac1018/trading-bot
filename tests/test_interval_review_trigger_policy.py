@@ -15,7 +15,7 @@ def _mark_sync_fresh(settings_row) -> None:
         mark_sync_success(settings_row, scope=scope, synced_at=now)
 
 
-def _seed_open_position(
+def _seed_live_position(
     db_session,
     *,
     symbol: str = "BTCUSDT",
@@ -52,7 +52,7 @@ def _seed_decision_run(
     *,
     symbol: str,
     created_at,
-    trigger_reason: str = "open_position_recheck_due",
+    trigger_reason: str = "manual_review_event",
 ) -> AgentRun:
     row = AgentRun(
         role="trading_decision",
@@ -102,7 +102,7 @@ def _seed_decision_run(
                 "timeframe": "15m",
                 "strategy_engine": "trend_pullback_engine",
                 "holding_profile": "scalp",
-                "reason_codes": ["OPEN_POSITION_RECHECK_DUE"],
+                "reason_codes": ["TEST_TRIGGER"],
                 "trigger_fingerprint": "seed-fingerprint",
                 "fingerprint_basis": {},
                 "fingerprint_changed_fields": [],
@@ -121,7 +121,7 @@ def _seed_decision_run(
     return row
 
 
-def _prepare_same_fingerprint_state(
+def _prepare_reference_review_state(
     db_session,
     *,
     created_at,
@@ -135,7 +135,7 @@ def _prepare_same_fingerprint_state(
     db_session.add(settings_row)
     db_session.flush()
 
-    position_row = _seed_open_position(db_session)
+    position_row = _seed_live_position(db_session)
     decision_row = _seed_decision_run(db_session, symbol="BTCUSDT", created_at=created_at)
 
     if protection_runtime_state is not None and monkeypatch is not None:
@@ -149,38 +149,40 @@ def _prepare_same_fingerprint_state(
 
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     trigger = plan["plans"][0]["trigger"]
-    decision_row.metadata_json = {
-        **decision_row.metadata_json,
-        "ai_trigger": {
-            **decision_row.metadata_json["ai_trigger"],
-            **trigger,
-        },
-        "last_material_review_at": created_at.isoformat(),
-    }
+    if isinstance(trigger, dict):
+        decision_row.metadata_json = {
+            **decision_row.metadata_json,
+            "ai_trigger": {
+                **decision_row.metadata_json["ai_trigger"],
+                **trigger,
+            },
+            "last_material_review_at": created_at.isoformat(),
+        }
     db_session.add(decision_row)
     db_session.flush()
     return decision_row, position_row
 
 
-def test_same_state_dedupes(db_session) -> None:
+def test_same_state_does_not_reopen_time_only_review(db_session) -> None:
     created_at = utcnow_naive() - timedelta(minutes=16)
-    _prepare_same_fingerprint_state(db_session, created_at=created_at)
+    _prepare_reference_review_state(db_session, created_at=created_at)
 
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger"]["trigger_reason"] == "open_position_recheck_due"
-    assert symbol_plan["trigger_deduped"] is True
-    assert symbol_plan["dedupe_reason"] == "OPEN_POSITION_FINGERPRINT_UNCHANGED"
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["trigger_deduped"] is False
+    assert symbol_plan["dedupe_reason"] is None
     assert symbol_plan["fingerprint_changed_fields"] == []
-    assert symbol_plan["trigger"]["fingerprint_changed_fields"] == []
     assert symbol_plan["forced_review_reason"] is None
     assert symbol_plan["last_material_review_at"] == created_at.isoformat()
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None
 
 
-def test_material_state_change_rechecks(db_session) -> None:
+def test_material_position_change_does_not_restore_time_only_review(db_session) -> None:
     created_at = utcnow_naive() - timedelta(minutes=16)
-    _, position_row = _prepare_same_fingerprint_state(db_session, created_at=created_at)
+    _, position_row = _prepare_reference_review_state(db_session, created_at=created_at)
     position_row.mark_price = 69320.0
     db_session.add(position_row)
     db_session.flush()
@@ -188,28 +190,30 @@ def test_material_state_change_rechecks(db_session) -> None:
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger"]["trigger_reason"] == "open_position_recheck_due"
+    assert symbol_plan["trigger"] is None
     assert symbol_plan["trigger_deduped"] is False
-    assert "position_state_bucket" in symbol_plan["fingerprint_changed_fields"]
-    assert "position_state_bucket" in symbol_plan["trigger"]["fingerprint_changed_fields"]
+    assert symbol_plan["fingerprint_changed_fields"] == []
     assert symbol_plan["forced_review_reason"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None
 
 
-def test_same_fingerprint_forces_review_after_max_age(db_session) -> None:
+def test_old_review_age_does_not_force_time_only_review(db_session) -> None:
     created_at = utcnow_naive() - timedelta(minutes=50)
-    _prepare_same_fingerprint_state(db_session, created_at=created_at)
+    _prepare_reference_review_state(db_session, created_at=created_at)
 
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger"]["trigger_reason"] == "open_position_recheck_due"
+    assert symbol_plan["trigger"] is None
     assert symbol_plan["trigger_deduped"] is False
-    assert symbol_plan["forced_review_reason"] == "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
-    assert symbol_plan["trigger"]["forced_review_reason"] == "OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED"
+    assert symbol_plan["forced_review_reason"] is None
     assert symbol_plan["fingerprint_changed_fields"] == []
+    assert symbol_plan["last_ai_skip_reason"] == "NO_EVENT"
+    assert symbol_plan["next_ai_review_due_at"] is None
 
 
-def test_protection_review_is_not_delayed_by_dedupe(monkeypatch, db_session) -> None:
+def test_protection_review_still_bypasses_time_only_suppression(monkeypatch, db_session) -> None:
     created_at = utcnow_naive() - timedelta(minutes=16)
     protection_runtime_state = {
         "operating_state": PROTECTION_REQUIRED_STATE,
@@ -217,7 +221,7 @@ def test_protection_review_is_not_delayed_by_dedupe(monkeypatch, db_session) -> 
         "protection_recovery_active": True,
         "missing_protection_symbols": ["BTCUSDT"],
     }
-    _prepare_same_fingerprint_state(
+    _prepare_reference_review_state(
         db_session,
         created_at=created_at,
         monkeypatch=monkeypatch,

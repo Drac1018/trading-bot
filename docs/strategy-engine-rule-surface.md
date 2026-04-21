@@ -3,6 +3,26 @@
 이 문서는 현재 구현 기준의 `strategy_engine` 선택 규칙과 운영 의미를 요약한다.  
 새 정책 제안이 아니라, 현재 코드가 이미 하는 일을 운영자가 빠르게 설명할 수 있게 정리한 참고 문서다.
 
+## 운영자 표현과 내부 키
+
+- 이 문서는 구현 기준 설명이므로 내부 키를 그대로 사용합니다.
+- 운영자 화면이나 운영 보고에서는 아래처럼 읽으면 됩니다.
+  - `strategy_engine`
+    - 화면 표현: `전략 엔진` 또는 `진입 서사 분류`
+  - `trigger_type` / trigger family
+    - 화면 표현: `검토 이벤트 종류`
+  - `holding_profile`
+    - 화면 표현: `보유 성격`
+    - 값 해석: `scalp = 짧게`, `swing = 중간`, `position = 길게`
+  - `entry_mode`
+    - 화면 표현: `진입 방식`
+    - 대표값: `pullback_confirm`, `breakout_confirm`
+  - `allowed_actions` / `forbidden_actions`
+    - 화면 표현: `AI가 제안 가능한 행동 범위`
+  - `intent_family` / `management_action`
+    - 화면 표현: `신규 진입`이 아니라 `관리 / 보호 조치`인지 구분하는 보조 의미
+- 즉, 이 문서에서 `strategy_engine`, `trigger_type`, `holding_profile`, `entry_mode`를 말하는 부분은 운영자 화면에서 각각 `전략 엔진`, `검토 이벤트`, `보유 성격`, `진입 방식`으로 읽으면 됩니다.
+
 기준 소스:
 
 - `backend/trading_mvp/services/strategy_engines/__init__.py`

@@ -279,10 +279,8 @@
 
 - `entry_candidate_event`
 - `breakout_exception_event`
-- `open_position_recheck_due`
 - `protection_review_event`
 - `manual_review_event`
-- `periodic_backstop_due`
 
 ### Settings payload additions
 
@@ -312,7 +310,8 @@
   - `event_risk_acknowledgement`
   - `confidence_penalty_reason`
   - `scenario_note`
-- These fields are sourced from the latest decision metadata and may be overlaid by the latest `interval_decision_cycle` scheduler outcome when the latest scheduler state is newer than the latest decision row.
+- `next_ai_review_due_at` remains in the response shape for compatibility, but current runtime paths leave it `null` instead of advertising a scheduled next review time.
+- The remaining fields are sourced from the latest decision metadata and may be overlaid by the latest `interval_decision_cycle` scheduler outcome when the latest scheduler state is newer than the latest decision row.
 - `event_risk_acknowledgement`, `confidence_penalty_reason`, `scenario_note` are read-only AI rationale fields. They do not override `risk_guard` allow/block precedence or execution state.
 
 ### Analytics / prior filtering
@@ -327,8 +326,7 @@
   - AI invoked
   - no event
   - deduped trigger
-  - periodic backstop due
-- `open_position_recheck_due` outcomes now also carry:
+- trigger metadata may also carry:
   - `fingerprint_changed_fields`
   - `dedupe_reason`
   - `last_material_review_at`
@@ -338,7 +336,6 @@
   - `decision_ai_skipped`
   - `decision_ai_no_event`
   - `decision_ai_deduped`
-  - `decision_ai_backstop_due`
 - `ai_trigger` payload now includes:
   - `fingerprint_basis`
   - `fingerprint_changed_fields`
@@ -351,10 +348,7 @@
   - `cadence_fallback_reason`
   - `max_review_age_minutes`
   - `cadence_profile_summary`
-- `open_position_recheck_due` dedupe is bucketed on stable review context rather than raw noise values. The basis includes `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
-- Same open-position fingerprint is deduped only when the trigger remains materially unchanged. A material bucket change reopens review immediately.
-- Even when the fingerprint is unchanged, open-position review can be forced once the max review age is exceeded. The default forced-review ceiling is conservative: `min(backstop interval, 3x position review cadence)`.
-- The interval scheduler now consumes the same open-position review cadence directly for symbol due-gating. `scalp / swing / position` cadence hints therefore affect both `open_position_recheck_due` generation and when the scheduler revisits that symbol.
+- The interval scheduler still records review-cadence observability fields, but time passage alone no longer generates `open_position_recheck_due` or `periodic_backstop_due` AI triggers.
 - If no trusted holding-profile cadence can be resolved, review cadence falls back conservatively to effective AI cadence and records `review_cadence_source` plus `cadence_fallback_reason` instead of silently treating the missing hint as neutral.
 - `protection_review_event` remains dedupe-exempt so protection recovery is not delayed by unchanged AI review fingerprints.
 
@@ -393,7 +387,6 @@
 - `POST /api/settings/resume`
 - `POST /api/settings/live/arm`
 - `POST /api/settings/live/disarm`
-- `POST /api/settings/test/fred`
 
 ### `GET /api/settings`
 
@@ -405,6 +398,9 @@
 - `schedule_windows`는 더 이상 public settings API나 UI에 노출하지 않습니다.
 - cadence는 고정 스케줄 윈도우가 아니라 `decision_cycle_interval_minutes`, `ai_call_interval_minutes`,
   `symbol_cadence_overrides`, `symbol_effective_cadences` 기준으로 해석합니다.
+- 운영자 UI 용어 매핑:
+  - `decision_cycle_interval_minutes` 계열 필드는 화면에서 `재검토 확인 주기`로 표기합니다.
+  - `ai_call_interval_minutes` 계열 필드는 화면에서 `AI 기본 검토 간격`으로 표기합니다.
 
 ### 2026-04 Event / Operator Control Preview
 
@@ -523,6 +519,10 @@ Rules:
 - `event_source_timeout_seconds`
 - `event_source_default_assets`
 - `event_source_fred_release_ids`
+- `event_source_bls_enrichment_url`
+- `event_source_bls_enrichment_static_params`
+- `event_source_bea_enrichment_url`
+- `event_source_bea_enrichment_static_params`
 - `event_source_api_key_configured`
   - encrypted secret 자체는 응답에 포함하지 않습니다.
   - `true`는 settings 저장값 또는 env fallback key가 현재 런타임에서 사용 가능함을 뜻합니다.
@@ -552,6 +552,12 @@ Rules:
 - `decision_cycle_interval_minutes_override`
 - `ai_call_interval_minutes_override`
 
+- `decision_cycle_interval_minutes_override`
+  - 심볼별 `재검토 확인 주기` override입니다.
+- `ai_call_interval_minutes_override`
+  - 심볼별 `AI 기본 검토 간격` override입니다.
+  - 열린 포지션 재검토 cadence와 수동 재실행 보호 기준에 함께 사용됩니다.
+
 `symbol_effective_cadences` row:
 
 - `symbol`
@@ -570,6 +576,11 @@ Rules:
 - `next_position_management_due_at`
 - `next_decision_due_at`
 - `next_ai_call_due_at`
+
+- 운영자 UI 읽기 기준:
+  - `decision_cycle_interval_minutes`, `last_decision_at`, `next_decision_due_at`는 `재검토 확인 주기`와 그 실행 시각/예정 시각입니다.
+  - `ai_call_interval_minutes`, `last_ai_decision_at`, `next_ai_call_due_at`는 `AI 기본 검토 간격`과 그 기준 시각입니다.
+  - `next_ai_call_due_at`는 마지막 AI 호출 + interval 기준 시각이며, 실제 AI 호출은 이벤트 trigger와 dedupe 결과에 따라 생략될 수 있습니다.
 
 staged rollout semantics:
 
@@ -602,27 +613,15 @@ staged rollout semantics:
   - settings override가 `fred`일 때 우선 적용됩니다.
   - 값이 비어 있으면 동일 키의 env fallback 또는 adapter 기본값을 사용합니다.
 
-### `POST /api/settings/test/fred`
+- `event_source_bls_enrichment_url`, `event_source_bls_enrichment_static_params`
+  - 발표 후 BLS actual value enrichment adapter 설정입니다.
+  - 비어 있으면 동일 키의 env fallback을 사용합니다.
+- `event_source_bea_enrichment_url`, `event_source_bea_enrichment_static_params`
+  - 발표 후 BEA actual value enrichment adapter 설정입니다.
+  - 비어 있으면 동일 키의 env fallback을 사용합니다.
 
-- saved settings를 기본으로 읽되, request body override가 있으면 그 값을 우선 사용합니다.
-- request:
-  - `api_key`
-  - `api_url`
-  - `timeout_seconds`
-  - `release_ids`
-  - `default_assets`
-  - `symbol`
-  - `timeframe`
-- response:
-  - `provider=fred`
-  - `details.source_status`
-  - `details.next_event_name`
-  - `details.next_event_at`
-  - `details.release_ids`
-- 의미:
-  - `external_api`: 연결 및 캘린더 응답 확인
-  - `unavailable`: 연결은 됐지만 예정 release 없음
-  - `incomplete | error`: 운영용 source로 보기엔 불완전
+- 2026-04 practical-only UI ???? settings ????? enrichment URL? ???? test endpoint? ? ?? ???? ????.
+- ?? ? actual enrichment? background scheduler? FRED event context? ???? ? ?? ?????.
 
 ## Dashboard
 
@@ -972,12 +971,15 @@ staged rollout semantics:
   - `cadence.mode`: `idle | watch | active_position | armed_entry_plan | high_priority_recovery`
   - `cadence.reasons`
   - `cadence.skip_reason`
-  - `cadence.effective_cadence.market_refresh_interval_minutes`
-  - `cadence.effective_cadence.position_management_interval_seconds`
-  - `cadence.effective_cadence.decision_cycle_interval_minutes`
-  - `cadence.effective_cadence.ai_call_interval_minutes`
-  - `cadence.effective_cadence.entry_plan_watcher_interval_minutes`
-  - `ai_skipped_reason`: deterministic-only decision path reason when AI inference was intentionally skipped
+- `cadence.effective_cadence.market_refresh_interval_minutes`
+- `cadence.effective_cadence.position_management_interval_seconds`
+- `cadence.effective_cadence.decision_cycle_interval_minutes`
+- `cadence.effective_cadence.ai_call_interval_minutes`
+- `cadence.effective_cadence.entry_plan_watcher_interval_minutes`
+- `ai_skipped_reason`: deterministic-only decision path reason when AI inference was intentionally skipped
+- 운영자 UI에서는 아래처럼 읽습니다.
+  - `cadence.effective_cadence.decision_cycle_interval_minutes` = `재검토 확인 주기`
+  - `cadence.effective_cadence.ai_call_interval_minutes` = `AI 기본 검토 간격`
 
 #### Entry trigger and auto-resize
 

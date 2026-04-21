@@ -4,6 +4,25 @@ export type PageSection = {
   description: string;
 };
 
+export type SettingsView = "control" | "integration";
+
+export const settingsViewTabs: Array<{ value: SettingsView; label: string; description: string }> = [
+  {
+    value: "control",
+    label: "운영 설정",
+    description: "실거래 제어, 리스크, 운영 주기, 이벤트 대응",
+  },
+  {
+    value: "integration",
+    label: "연동 설정",
+    description: "OpenAI, 외부 이벤트 소스, Binance 자격증명",
+  },
+];
+
+export function normalizeSettingsView(value: string | null | undefined): SettingsView {
+  return value === "integration" ? "integration" : "control";
+}
+
 export const dashboardPages: Record<
   string,
   {

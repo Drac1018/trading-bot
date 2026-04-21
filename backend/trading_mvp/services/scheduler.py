@@ -706,7 +706,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         )
         plan = plan_lookup.get(effective.symbol, {})
         trigger_payload = plan.get("trigger") if isinstance(plan.get("trigger"), dict) else None
-        next_ai_review_due_at = plan.get("next_ai_review_due_at")
+        next_ai_review_due_at = None
         last_ai_invoked_at = plan.get("last_ai_invoked_at")
         last_material_review_at = plan.get("last_material_review_at")
         dedupe_reason = str(plan.get("dedupe_reason") or "") or None
@@ -845,26 +845,6 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                     )
                 )
                 continue
-            if str(trigger_payload.get("trigger_reason") or "") == "periodic_backstop_due":
-                record_audit_event(
-                    session,
-                    event_type="decision_ai_backstop_due",
-                    entity_type="symbol",
-                    entity_id=effective.symbol,
-                    severity="info",
-                    message="Periodic AI backstop review is due for this symbol.",
-                    payload={
-                        "symbol": effective.symbol,
-                        "trigger": trigger_payload,
-                        "next_ai_review_due_at": next_ai_review_due_at,
-                        "forced_review_reason": forced_review_reason,
-                        "last_material_review_at": last_material_review_at,
-                        "applied_review_cadence_minutes": applied_review_cadence_minutes,
-                        "review_cadence_source": review_cadence_source,
-                        "cadence_fallback_reason": cadence_fallback_reason,
-                        "max_review_age_minutes": max_review_age_minutes,
-                    },
-                )
             outcome = orchestrator.run_decision_cycle(
                 symbol=effective.symbol,
                 timeframe=effective.timeframe,

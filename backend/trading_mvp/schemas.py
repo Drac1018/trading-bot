@@ -2208,6 +2208,10 @@ class AppSettingsResponse(StrictBaseModel):
     event_source_timeout_seconds: float | None = None
     event_source_default_assets: list[str] = Field(default_factory=list)
     event_source_fred_release_ids: list[int] = Field(default_factory=list)
+    event_source_bls_enrichment_url: str | None = None
+    event_source_bls_enrichment_static_params: dict[str, str] = Field(default_factory=dict)
+    event_source_bea_enrichment_url: str | None = None
+    event_source_bea_enrichment_static_params: dict[str, str] = Field(default_factory=dict)
     mode: str
     openai_api_key_configured: bool
     binance_api_key_configured: bool
@@ -2309,6 +2313,10 @@ class AppSettingsViewResponse(StrictBaseModel):
     event_source_timeout_seconds: float | None = None
     event_source_default_assets: list[str] = Field(default_factory=list)
     event_source_fred_release_ids: list[int] = Field(default_factory=list)
+    event_source_bls_enrichment_url: str | None = None
+    event_source_bls_enrichment_static_params: dict[str, str] = Field(default_factory=dict)
+    event_source_bea_enrichment_url: str | None = None
+    event_source_bea_enrichment_static_params: dict[str, str] = Field(default_factory=dict)
     openai_api_key_configured: bool
     binance_api_key_configured: bool
     binance_api_secret_configured: bool
@@ -2389,6 +2397,10 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     event_source_timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
     event_source_default_assets: list[str] = Field(default_factory=list)
     event_source_fred_release_ids: list[int] = Field(default_factory=list)
+    event_source_bls_enrichment_url: str | None = Field(default=None, max_length=255)
+    event_source_bls_enrichment_static_params: dict[str, str] = Field(default_factory=dict)
+    event_source_bea_enrichment_url: str | None = Field(default=None, max_length=255)
+    event_source_bea_enrichment_static_params: dict[str, str] = Field(default_factory=dict)
     openai_api_key: str | None = None
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
@@ -2408,16 +2420,6 @@ class BinanceConnectionTestRequest(StrictBaseModel):
     api_key: str | None = None
     api_secret: str | None = None
     testnet_enabled: bool = False
-    symbol: str = Field(default="BTCUSDT", min_length=1, max_length=30)
-    timeframe: str = Field(default="15m", min_length=1, max_length=20)
-
-
-class FredConnectionTestRequest(StrictBaseModel):
-    api_key: str | None = None
-    api_url: str | None = Field(default=None, max_length=255)
-    timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
-    release_ids: list[int] = Field(default_factory=list)
-    default_assets: list[str] = Field(default_factory=list)
     symbol: str = Field(default="BTCUSDT", min_length=1, max_length=30)
     timeframe: str = Field(default="15m", min_length=1, max_length=20)
 

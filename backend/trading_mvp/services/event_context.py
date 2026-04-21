@@ -306,6 +306,10 @@ class EventSourceSettingsOverride(Protocol):
     event_source_timeout_seconds: float | None
     event_source_default_assets: Sequence[str]
     event_source_fred_release_ids: Sequence[int]
+    event_source_bls_enrichment_url: str | None
+    event_source_bls_enrichment_static_params: Mapping[str, str]
+    event_source_bea_enrichment_url: str | None
+    event_source_bea_enrichment_static_params: Mapping[str, str]
 
 
 class EventSourceRuntimeCredentials(Protocol):
@@ -630,29 +634,62 @@ def _settings_api_key(credentials: EventSourceRuntimeCredentials | None) -> str 
     return _settings_text(getattr(credentials, "event_source_api_key", None))
 
 
-def _build_post_release_enrichers_from_env(
+def _settings_static_params(
+    settings_row: EventSourceSettingsOverride | None,
+    attribute_name: str,
+) -> dict[str, str]:
+    if settings_row is None:
+        return {}
+    values = getattr(settings_row, attribute_name, None)
+    if not isinstance(values, Mapping):
+        return {}
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in values.items():
+        key = str(raw_key or "").strip()
+        value = str(raw_value or "").strip()
+        if key and value:
+            normalized[key] = value
+    return normalized
+
+
+def _build_post_release_enrichers(
     *,
+    settings_row: EventSourceSettingsOverride | None,
     timeout_seconds: float,
 ) -> tuple[PostReleaseEventEnrichmentAdapter, ...]:
     enrichers: list[PostReleaseEventEnrichmentAdapter] = []
 
-    bls_url = _env_text("TRADING_EVENT_SOURCE_BLS_ENRICHMENT_URL")
+    bls_url = (
+        _settings_text(getattr(settings_row, "event_source_bls_enrichment_url", None))
+        if settings_row is not None
+        else None
+    ) or _env_text("TRADING_EVENT_SOURCE_BLS_ENRICHMENT_URL")
     if bls_url is not None:
         enrichers.append(
             BLSActualReleaseEnrichmentAdapter(
                 base_url=bls_url,
                 timeout_seconds=timeout_seconds,
-                static_params=_env_pairs("TRADING_EVENT_SOURCE_BLS_ENRICHMENT_STATIC_PARAMS"),
+                static_params=(
+                    _settings_static_params(settings_row, "event_source_bls_enrichment_static_params")
+                    or _env_pairs("TRADING_EVENT_SOURCE_BLS_ENRICHMENT_STATIC_PARAMS")
+                ),
             )
         )
 
-    bea_url = _env_text("TRADING_EVENT_SOURCE_BEA_ENRICHMENT_URL")
+    bea_url = (
+        _settings_text(getattr(settings_row, "event_source_bea_enrichment_url", None))
+        if settings_row is not None
+        else None
+    ) or _env_text("TRADING_EVENT_SOURCE_BEA_ENRICHMENT_URL")
     if bea_url is not None:
         enrichers.append(
             BEAActualReleaseEnrichmentAdapter(
                 base_url=bea_url,
                 timeout_seconds=timeout_seconds,
-                static_params=_env_pairs("TRADING_EVENT_SOURCE_BEA_ENRICHMENT_STATIC_PARAMS"),
+                static_params=(
+                    _settings_static_params(settings_row, "event_source_bea_enrichment_static_params")
+                    or _env_pairs("TRADING_EVENT_SOURCE_BEA_ENRICHMENT_STATIC_PARAMS")
+                ),
             )
         )
 
@@ -662,6 +699,7 @@ def _build_post_release_enrichers_from_env(
 def _build_external_provider(
     provider_name: str,
     *,
+    settings_row: EventSourceSettingsOverride | None = None,
     api_key: str | None,
     api_url: str | None,
     timeout_seconds: float,
@@ -678,7 +716,8 @@ def _build_external_provider(
                 timeout_seconds=timeout_seconds,
                 default_assets=default_assets,
                 release_ids=release_ids,
-                post_release_enrichers=_build_post_release_enrichers_from_env(
+                post_release_enrichers=_build_post_release_enrichers(
+                    settings_row=settings_row,
                     timeout_seconds=timeout_seconds,
                 ),
             )
@@ -710,6 +749,7 @@ def resolve_event_context_provider_from_env() -> EventContextProvider:
 
     return _build_external_provider(
         provider_name,
+        settings_row=None,
         api_key=_env_text("TRADING_EVENT_SOURCE_API_KEY"),
         api_url=_env_text("TRADING_EVENT_SOURCE_API_URL"),
         timeout_seconds=_coerce_timeout_seconds(_env_text("TRADING_EVENT_SOURCE_TIMEOUT_SECONDS")),
@@ -731,6 +771,7 @@ def resolve_event_context_provider(
     configured_timeout_seconds = _settings_timeout_seconds(settings_row)
     return _build_external_provider(
         provider_name,
+        settings_row=settings_row,
         api_key=_settings_api_key(credentials) or _env_text("TRADING_EVENT_SOURCE_API_KEY"),
         api_url=_settings_text(getattr(settings_row, "event_source_api_url", None))
         or _env_text("TRADING_EVENT_SOURCE_API_URL"),

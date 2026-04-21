@@ -3,6 +3,14 @@ import Link from "next/link";
 import type { OperatorDashboardPayload } from "./overview-dashboard";
 import { DataTable } from "./data-table";
 import { getSelectedSymbolPolicyHint } from "../lib/selected-symbol";
+import {
+  describeAiTriggerReason,
+  describeHistoricalDecisionGap,
+  summarizeCurrentCycleSelection,
+  summarizeExecutionState,
+  summarizeLastAiRecommendation,
+  summarizeRiskGate,
+} from "../lib/decision-timeline";
 
 type Row = Record<string, unknown>;
 
@@ -221,21 +229,6 @@ function riskSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
   };
 }
 
-function translateAiTriggerReason(value: string | null | undefined) {
-  if (!value) {
-    return "-";
-  }
-  const labels: Record<string, string> = {
-    entry_candidate_event: "신규 진입 후보 이벤트",
-    breakout_exception_event: "브레이크아웃 예외 이벤트",
-    open_position_recheck_due: "오픈 포지션 재검토 도래",
-    protection_review_event: "보호 상태 점검",
-    manual_review_event: "수동 검토",
-    periodic_backstop_due: "주기적 백스탑 검토",
-  };
-  return labels[value] ?? value;
-}
-
 function translateAiSkipReason(value: string | null | undefined) {
   if (!value) {
     return "-";
@@ -252,11 +245,12 @@ function translateAiSkipReason(value: string | null | undefined) {
 }
 
 function aiReviewSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
+  const trigger = describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason);
   if (symbol.ai_decision.last_ai_skip_reason === "NO_EVENT") {
     return { label: "AI 미호출", detail: "검토 이벤트 없음" };
   }
   if (symbol.ai_decision.trigger_deduped || symbol.ai_decision.last_ai_skip_reason === "TRIGGER_DEDUPED") {
-    return { label: "AI 재호출 생략", detail: "동일 상태 중복" };
+    return { label: "AI 재검토 생략", detail: "직전 검토와 변화 없음" };
   }
   if (symbol.ai_decision.last_ai_skip_reason) {
     return {
@@ -266,8 +260,8 @@ function aiReviewSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
   }
   if (symbol.ai_decision.last_ai_invoked_at || symbol.ai_decision.provider_name) {
     return {
-      label: "AI 호출",
-      detail: translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
+      label: trigger.legacy ? "과거 정책 기록" : "AI 호출",
+      detail: trigger.label,
     };
   }
   return { label: "AI 상태 미확정", detail: "-" };
@@ -557,10 +551,15 @@ export function DecisionView({
   const filteredDecisionRows = decisionRows.filter(
     (row) => String(row.symbol ?? "").toUpperCase() === (symbol?.symbol ?? ""),
   );
-  const recommendation = symbol ? decisionSummary(symbol.ai_decision.decision) : null;
-  const riskOutcome = symbol ? riskSummary(symbol) : null;
+  const recommendation = symbol ? summarizeLastAiRecommendation(symbol) : null;
+  const riskOutcome = symbol ? summarizeRiskGate(symbol) : null;
   const review = symbol ? aiReviewSummary(symbol) : null;
-  const execution = symbol ? executionSummary(symbol) : null;
+  const currentCycle = symbol ? summarizeCurrentCycleSelection(symbol) : null;
+  const execution = symbol ? summarizeExecutionState(symbol) : null;
+  const historicalGapNotice = symbol ? describeHistoricalDecisionGap(symbol) : null;
+  const triggerPresentation = symbol
+    ? describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)
+    : null;
   const blockedReasonText = symbol
     ? formatTranslatedCodeList(
         symbol.risk_guard.blocked_reason_codes.length > 0
@@ -568,37 +567,34 @@ export function DecisionView({
           : symbol.blocked_reasons,
       )
     : "-";
-  const slotValue = symbol
-    ? symbol.ai_decision.assigned_slot ??
-      symbol.candidate_selection.assigned_slot ??
-      symbol.risk_guard.assigned_slot ??
-      "-"
+  const aiSlotValue = symbol ? symbol.ai_decision.assigned_slot ?? "-" : "-";
+  const aiCandidateWeightValue = symbol ? symbol.ai_decision.candidate_weight : null;
+  const aiCapacityReasonValue = symbol ? symbol.ai_decision.capacity_reason ?? "-" : "-";
+  const riskSlotValue = symbol ? symbol.risk_guard.assigned_slot ?? "-" : "-";
+  const riskCandidateWeightValue = symbol ? symbol.risk_guard.candidate_weight : null;
+  const riskCapacityReasonValue = symbol ? symbol.risk_guard.capacity_reason ?? "-" : "-";
+  const currentSlotValue = symbol ? symbol.candidate_selection.assigned_slot ?? "-" : "-";
+  const currentCandidateWeightValue = symbol ? symbol.candidate_selection.candidate_weight : null;
+  const currentCapacityReasonValue = symbol ? symbol.candidate_selection.capacity_reason ?? "-" : "-";
+  const currentHoldingProfileValue = symbol ? symbol.candidate_selection.holding_profile ?? "-" : "-";
+  const currentHoldingProfileReasonValue = symbol
+    ? symbol.candidate_selection.holding_profile_reason ?? "-"
     : "-";
-  const candidateWeightValue = symbol
-    ? symbol.ai_decision.candidate_weight ??
-      symbol.candidate_selection.candidate_weight ??
-      symbol.risk_guard.candidate_weight
+  const executionTimestamp = symbol
+    ? symbol.execution.created_at ??
+      symbol.execution.execution_created_at ??
+      symbol.pending_entry_plan?.created_at ??
+      null
     : null;
-  const capacityReasonValue = symbol
-    ? symbol.ai_decision.capacity_reason ??
-      symbol.candidate_selection.capacity_reason ??
-      symbol.risk_guard.capacity_reason ??
-      "-"
-    : "-";
-  const holdingProfileValue = symbol
-    ? symbol.open_position.holding_profile ??
-      symbol.risk_guard.holding_profile ??
-      symbol.ai_decision.holding_profile ??
-      symbol.candidate_selection.holding_profile ??
-      "-"
-    : "-";
-  const holdingProfileReasonValue = symbol
-    ? symbol.open_position.holding_profile_reason ??
-      symbol.risk_guard.holding_profile_reason ??
-      symbol.ai_decision.holding_profile_reason ??
-      symbol.candidate_selection.holding_profile_reason ??
-      "-"
-    : "-";
+  const pendingPlanValue = symbol?.pending_entry_plan?.plan_id
+    ? `#${symbol.pending_entry_plan.plan_id} / ${symbol.pending_entry_plan.plan_status ?? "unknown"}`
+    : "없음";
+  const pendingPlanHint = symbol?.pending_entry_plan?.plan_id
+    ? symbol.pending_entry_plan.entry_mode ?? symbol.pending_entry_plan.canceled_reason ?? "-"
+    : "현재 저장된 진입 대기 플랜이 없습니다.";
+  const decisionTableEmptyDescription = historicalGapNotice
+    ? "저장된 decision row는 없지만 상단 카드에는 마지막 AI 스냅샷이 남아 있을 수 있습니다. 현재 cycle 상태와는 구분해서 보세요."
+    : "선택한 심볼 기준으로 아직 저장된 decision row가 없습니다.";
 
   if (symbol === null) {
     return (
@@ -616,10 +612,10 @@ export function DecisionView({
     <div className="space-y-6">
       <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">의사결정</p>
-        <h2 className="mt-2 text-xl font-semibold text-slate-950">AI 추천, risk 승인, 실제 실행을 분리해서 확인</h2>
+        <h2 className="mt-2 text-xl font-semibold text-slate-950">마지막 AI 추천과 현재 실행 상태를 시간축으로 분리</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          이 탭은 왜 AI가 불렸는지 또는 건너뛰었는지, risk가 무엇을 차단했는지, slot soft cap과 hard stop 상태가 어떤지
-          운영자가 바로 읽도록 구성합니다.
+          마지막 AI 스냅샷, 현재 cycle 선택, 실제 주문/포지션 상태를 같은 레이블로 섞지 않고 나눠서 보여줍니다.
+          risk 통과는 주문 제출 완료가 아니라는 점도 함께 드러내도록 정리했습니다.
         </p>
         <div className="mt-4">
           <SymbolTabs
@@ -631,27 +627,34 @@ export function DecisionView({
         <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           {getSelectedSymbolPolicyHint("single")}
         </div>
-        <div className="mt-5 grid gap-4 lg:grid-cols-6">
-          {metricCard("마지막 평가", formatDateTime(symbol.ai_decision.created_at), "선택 심볼 기준 최신 평가 기록")}
+        <div className="mt-5 grid gap-4 lg:grid-cols-7">
+          {metricCard("마지막 AI 스냅샷", formatDateTime(symbol.ai_decision.created_at), "상단 AI 카드는 과거 스냅샷일 수 있습니다.")}
           {metricCard("AI 검토 상태", review?.label ?? "-", review?.detail ?? "-")}
           {metricCard(
-            "다음 AI 검토",
-            formatDateTime(symbol.ai_decision.next_ai_review_due_at),
-            `사유 ${translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)}`,
+            "마지막 AI 호출",
+            formatDateTime(symbol.ai_decision.last_ai_invoked_at),
+            triggerPresentation?.legacy
+              ? `사유 ${triggerPresentation.label} / 현재 runtime trigger가 아니라 저장된 과거 정책 기록입니다.`
+              : `사유 ${triggerPresentation?.label ?? "-"}`,
           )}
           {metricCard(
-            "시장 요약",
-            String(symbol.market_context_summary.primary_regime ?? "-"),
-            `정렬 ${String(symbol.market_context_summary.trend_alignment ?? "-")}`,
+            "현재 cycle 기준",
+            formatDateTime(operator.generated_at),
+            "현재 대시보드 새로고침 기준으로 candidate selection과 실행 상태를 보여줍니다.",
           )}
-          {metricCard("AI 추천", recommendation?.label ?? "-", recommendation?.detail ?? "-")}
+          {metricCard("마지막 AI 추천", recommendation?.label ?? "-", recommendation?.detail ?? "-")}
+          {metricCard("현재 cycle 선택", currentCycle?.label ?? "-", currentCycle?.detail ?? "-")}
           {metricCard("실제 실행", execution?.label ?? "-", execution?.detail ?? "-")}
         </div>
-        <div className="mt-4 grid gap-4 xl:grid-cols-3">
+        <div className="mt-4 grid gap-4 xl:grid-cols-4">
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
-              <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass("neutral")}`}>
-                AI 추천
+              <span
+                className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
+                  recommendation?.kind ?? "neutral",
+                )}`}
+              >
+                {recommendation?.label ?? "마지막 AI 추천"}
               </span>
               <span className="text-xs text-slate-500">{formatDateTime(symbol.ai_decision.created_at)}</span>
             </div>
@@ -660,6 +663,16 @@ export function DecisionView({
             <p className="mt-3 text-sm leading-6 text-slate-700">
               {symbol.ai_decision.explanation_short ?? "최신 판단 설명이 없습니다."}
             </p>
+            {historicalGapNotice ? (
+              <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+                {historicalGapNotice}
+              </div>
+            ) : null}
+            {triggerPresentation?.legacy ? (
+              <div className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700">
+                {triggerPresentation.hint}
+              </div>
+            ) : null}
             <div className="mt-4 flex flex-wrap gap-2">
               {symbol.ai_decision.rationale_codes.length > 0 ? (
                 symbol.ai_decision.rationale_codes.map((code) => (
@@ -673,19 +686,21 @@ export function DecisionView({
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {metricCard(
-                "AI 호출 사유",
-                translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
-                `건너뜀 ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
+                triggerPresentation?.legacy ? "과거 정책 기록" : "AI 호출 사유",
+                triggerPresentation?.label ?? "-",
+                triggerPresentation?.legacy
+                  ? triggerPresentation.hint
+                  : `건너뜀 ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
               )}
               {metricCard(
                 "AI 호출 시각",
                 formatDateTime(symbol.ai_decision.last_ai_invoked_at),
-                `다음 ${formatDateTime(symbol.ai_decision.next_ai_review_due_at)}`,
+                `지문 ${shortFingerprint(symbol.ai_decision.trigger_fingerprint)}`,
               )}
-              {metricCard("배정 슬롯", slotValue, `가중치 ${candidateWeightValue ?? "-"}`)}
+              {metricCard("AI 기준 슬롯", aiSlotValue, `가중치 ${aiCandidateWeightValue ?? "-"}`)}
               {metricCard(
-                "수용 한도",
-                capacityReasonValue,
+                "AI 기준 수용 한도",
+                aiCapacityReasonValue,
                 symbol.ai_decision.portfolio_slot_soft_cap_applied ? "soft cap 적용" : "soft cap 미적용",
               )}
             </div>
@@ -695,55 +710,106 @@ export function DecisionView({
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
-                  symbol.risk_guard.allowed === null ? "neutral" : symbol.risk_guard.allowed ? "good" : "danger",
+                  riskOutcome?.kind ?? "neutral",
                 )}`}
               >
-                {riskOutcome?.label ?? "risk 평가 없음"}
+                {riskOutcome?.label ?? "리스크 판정 없음"}
               </span>
               <span className="text-xs text-slate-500">{formatDateTime(symbol.risk_guard.created_at)}</span>
             </div>
             <div className="mt-4 space-y-3">
-              {metricCard("risk 차단 사유", blockedReasonText, "최신 risk 판정 기준")}
+              {metricCard("리스크 차단 사유", blockedReasonText, "현재 risk_guard 기준")}
               {metricCard(
-                "후보 슬롯",
-                slotValue,
-                `가중치 ${candidateWeightValue ?? "-"} / ${capacityReasonValue}`,
+                "리스크 기준 슬롯",
+                riskSlotValue,
+                `가중치 ${riskCandidateWeightValue ?? "-"} / ${riskCapacityReasonValue}`,
               )}
               {metricCard(
-                "risk 승인 프로파일",
+                "리스크 승인 프로필",
                 symbol.risk_guard.approved_leverage !== null ? `${symbol.risk_guard.approved_leverage}x` : "-",
-                `허용 risk ${symbol.risk_guard.approved_risk_pct ?? 0}`,
+                `허용 risk ${formatRatio(symbol.risk_guard.approved_risk_pct)}`,
               )}
               {metricCard(
-                "슬롯 soft cap",
+                "리스크 soft cap",
                 symbol.risk_guard.portfolio_slot_soft_cap_applied ? "적용" : "미적용",
-                `수용 한도 ${symbol.risk_guard.capacity_reason ?? capacityReasonValue}`,
+                `수용 한도 ${symbol.risk_guard.capacity_reason ?? riskCapacityReasonValue}`,
               )}
               {metricCard(
                 "차단 코드",
                 formatTranslatedCodeList(symbol.risk_guard.blocked_reason_codes),
-                `원시 코드 ${formatCodeList(symbol.risk_guard.blocked_reason_codes)}`,
+                `원본 코드 ${formatCodeList(symbol.risk_guard.blocked_reason_codes)}`,
+              )}
+            </div>
+            {symbol.risk_guard.allowed === true && symbol.execution.order_id === null ? (
+              <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+                리스크 통과는 주문 제출 완료가 아닙니다. 현재 cycle 선정 여부와 진입 대기 플랜, 실제 주문 상태를 함께 확인하세요.
+              </div>
+            ) : null}
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
+                  currentCycle?.kind ?? "neutral",
+                )}`}
+              >
+                {currentCycle?.label ?? "현재 cycle 선택"}
+              </span>
+              <span className="text-xs text-slate-500">{formatDateTime(operator.generated_at)}</span>
+            </div>
+            <p className="mt-4 text-sm leading-6 text-slate-700">{currentCycle?.detail ?? "-"}</p>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              {metricCard("현재 cycle 슬롯", currentSlotValue, `가중치 ${currentCandidateWeightValue ?? "-"}`)}
+              {metricCard(
+                "현재 cycle 수용 한도",
+                currentCapacityReasonValue,
+                symbol.candidate_selection.portfolio_slot_soft_cap_applied ? "soft cap 적용" : "soft cap 미적용",
+              )}
+              {metricCard("홀딩 프로필", currentHoldingProfileValue, currentHoldingProfileReasonValue)}
+              {metricCard(
+                "현재 시장 요약",
+                String(symbol.market_context_summary.primary_regime ?? "-"),
+                `정렬 ${String(symbol.market_context_summary.trend_alignment ?? "-")}`,
+              )}
+              {metricCard(
+                "candidate 차단 코드",
+                formatTranslatedCodeList(symbol.candidate_selection.blocked_reason_codes),
+                `원본 코드 ${formatCodeList(symbol.candidate_selection.blocked_reason_codes)}`,
+              )}
+              {metricCard(
+                "현재 cycle 사유",
+                symbol.candidate_selection.selected_reason ??
+                  symbol.candidate_selection.rejected_reason ??
+                  symbol.candidate_selection.selection_reason ??
+                  "-",
+                "현재 cycle 기준 선택/미선정 사유",
+                { compact: true },
               )}
             </div>
           </div>
 
           <div className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
-              <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass("neutral")}`}>
-                실행 / 포지션
+              <span
+                className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
+                  execution?.kind ?? "neutral",
+                )}`}
+              >
+                {execution?.label ?? "실제 실행"}
               </span>
-              <span className="text-xs text-slate-500">{formatDateTime(symbol.execution.created_at)}</span>
+              <span className="text-xs text-slate-500">{formatDateTime(executionTimestamp)}</span>
             </div>
             <div className="mt-4 space-y-3">
-              {metricCard("실행 상태", execution?.label ?? "-", execution?.detail ?? "-")}
-              {metricCard("보유 프로필", holdingProfileValue, holdingProfileReasonValue)}
+              {metricCard("실제 실행", execution?.label ?? "-", execution?.detail ?? "-")}
+              {metricCard("진입 대기 플랜", pendingPlanValue, pendingPlanHint, { compact: true })}
               {metricCard("하드 스탑", hardStopLabel(symbol), `stop widening ${stopWideningLabel(symbol)}`)}
               {metricCard(
                 "오픈 포지션",
                 symbol.open_position.is_open ? `${symbol.open_position.side ?? "-"} / ${symbol.open_position.quantity ?? 0}` : "-",
                 symbol.open_position.is_open
                   ? `진입가 ${symbol.open_position.entry_price ?? "-"} / 현재가 ${symbol.open_position.mark_price ?? "-"}`
-                  : "현재 열린 포지션 없음",
+                  : "현재 열린 포지션이 없습니다.",
               )}
             </div>
           </div>
@@ -752,10 +818,10 @@ export function DecisionView({
 
       <DataTable
         title="최근 평가 기록"
-        description="선택 심볼 의사결정"
+        description="저장된 decision row"
         rows={filteredDecisionRows}
-        emptyStateTitle="표시할 평가 기록이 없습니다."
-        emptyStateDescription="선택한 심볼 기준으로 아직 저장된 decision row가 없습니다."
+        emptyStateTitle="최근 평가 기록이 없습니다."
+        emptyStateDescription={decisionTableEmptyDescription}
       />
     </div>
   );
@@ -790,15 +856,18 @@ export function SchedulerView({
       </section>
 
       <section className="rounded-[1.75rem] border border-slate-200 bg-white p-5 shadow-frame sm:p-6">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">AI 검토 일정</p>
-        <h2 className="mt-2 text-xl font-semibold text-slate-950">심볼별 AI 검토 / 건너뜀 상태</h2>
+        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">AI 호출 상태</p>
+        <h2 className="mt-2 text-xl font-semibold text-slate-950">심볼별 AI 호출 / 건너뜀 상태</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          왜 AI가 불렸는지, 왜 안 불렸는지, 중복 지문으로 건너뛰었는지, 다음 검토가 언제인지, soft cap과 차단 코드가 어떤지
+          왜 AI가 불렸는지, 왜 안 불렸는지, 중복 지문으로 건너뛰었는지, soft cap과 차단 코드가 어떤지
           심볼별로 바로 읽을 수 있습니다.
         </p>
         <div className="mt-5 grid gap-4 xl:grid-cols-3">
           {operator.symbols.map((symbol) => {
             const review = aiReviewSummary(symbol);
+            const triggerPresentation = describeAiTriggerReason(
+              symbol.ai_decision.last_ai_trigger_reason,
+            );
             return (
               <div key={symbol.symbol} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
                 <div className="flex items-center justify-between gap-3">
@@ -822,9 +891,9 @@ export function SchedulerView({
                 </div>
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
                   {metricCard(
-                    "검토 사유",
-                    translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
-                    review.detail,
+                    triggerPresentation.legacy ? "과거 정책 기록" : "검토 사유",
+                    triggerPresentation.label,
+                    triggerPresentation.legacy ? triggerPresentation.hint : review.detail,
                     { compact: true },
                   )}
                   {metricCard(
@@ -840,9 +909,9 @@ export function SchedulerView({
                     { compact: true },
                   )}
                   {metricCard(
-                    "다음 검토 예정",
-                    formatDateTime(symbol.ai_decision.next_ai_review_due_at),
-                    `지문 ${shortFingerprint(symbol.ai_decision.trigger_fingerprint)}`,
+                    "트리거 지문",
+                    shortFingerprint(symbol.ai_decision.trigger_fingerprint),
+                    "이벤트 기반 호출에서 동일 지문 재호출 방지에 사용합니다.",
                     { compact: true },
                   )}
                   {metricCard(

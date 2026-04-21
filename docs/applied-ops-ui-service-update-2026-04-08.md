@@ -2,6 +2,18 @@
 
 작성일: 2026-04-08
 
+## 현재 읽는 법
+
+- 이 문서는 2026-04-08 시점의 적용 내역을 기록한 운영 메모입니다.
+- 본문에서는 당시 구현 키와 계산식을 그대로 보존합니다.
+- 현재 운영자 UI에서는 아래처럼 읽습니다.
+  - `decision_cycle_interval_minutes` = `재검토 확인 주기`
+  - `ai_call_interval_minutes` = `AI 기본 검토 간격`
+- 따라서 본문에서 `의사결정 주기`, `AI 호출 간격`, `decision_cycle_interval_minutes`, `ai_call_interval_minutes`를 언급하는 부분은 현재 화면 기준으로는 `재검토 확인 주기`와 `AI 기본 검토 간격`에 대응됩니다.
+- 주의:
+  - 아래 3번 섹션의 월간 호출량 계산은 2026-04-08 당시 설계 스냅샷입니다.
+  - 현재 live-core 범위는 이벤트 기반 review dispatch + `1h` review 기준으로 운영되며, 본문 수치를 현재 운영 기준의 실시간 source-of-truth로 해석하면 안 됩니다.
+
 ## 이번에 적용한 내용
 
 ### 1. 가상거래 / 실거래 로그 분리
@@ -37,6 +49,9 @@
 - 현재 저장 설정 기준:
   - `estimated_monthly_ai_calls`: 현재 실제 설정 상태 기준 예상 호출량
   - `projected_monthly_ai_calls_if_enabled`: 현재 주기 설정 그대로 OpenAI를 켰을 때의 예상 호출량
+- 현재 운영자 UI 표현으로 읽으면:
+  - `decision_cycle_interval_minutes` = `재검토 확인 주기`
+  - `ai_call_interval_minutes` = `AI 기본 검토 간격`
 
 현재 기본값 기준 계산:
 - 현재 실제값: `0회/월`
@@ -50,6 +65,7 @@
 계산 기준:
 - 30일 기준 총 분: `43200분`
 - 거래 의사결정 호출 간격:
+  - 당시 내부 계산 키 기준
   - `max(decision_cycle_interval_minutes, ai_call_interval_minutes)`
   - 현재값: `max(15, 30) = 30분`
   - `43200 / 30 = 1440회`

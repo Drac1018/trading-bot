@@ -1,0 +1,70 @@
+[service]
+listen_host = "0.0.0.0"
+listen_port = 8091
+route_path = "/bls/releases"
+timeout_seconds = 10.0
+
+[bls]
+base_url = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+registration_key_env = "BLS_API_KEY"
+catalog = true
+
+[events.cpi]
+event_names = ["Consumer Price Index"]
+headline_metric = "cpi_yoy_pct"
+actual_unit = "percent"
+reference_period_mode = "monthly"
+
+[events.cpi.series.cpi_nsa]
+series_id = "CUUR0000SA0"
+series_title = "Consumer Price Index for All Urban Consumers: All Items, U.S. city average, not seasonally adjusted"
+transform = "yoy_pct"
+used_for = ["actual", "prior"]
+
+[events.cpi.series.cpi_sa]
+series_id = "CUSR0000SA0"
+series_title = "Consumer Price Index for All Urban Consumers: All Items, U.S. city average, seasonally adjusted"
+transform = "mom_pct"
+used_for = ["mom_actual", "mom_prior"]
+
+[events.ppi]
+event_names = ["Producer Price Index"]
+headline_metric = "ppi_final_demand_mom_pct"
+actual_unit = "percent"
+reference_period_mode = "monthly"
+
+[events.ppi.series.ppi_sa]
+series_id = "WPSFD4"
+series_title = "Producer Price Index by Commodity: Final demand, seasonally adjusted"
+transform = "mom_pct"
+used_for = ["actual", "prior"]
+
+[events.ppi.series.ppi_nsa]
+series_id = "WPUFD4"
+series_title = "Producer Price Index by Commodity: Final demand, not seasonally adjusted"
+transform = "yoy_pct"
+used_for = ["yoy_actual", "yoy_prior"]
+
+[events.employment_situation]
+event_names = ["Employment Situation"]
+headline_metric = "nonfarm_payrolls_change_k"
+actual_unit = "k_jobs"
+reference_period_mode = "monthly"
+
+[events.employment_situation.series.payrolls]
+series_id = "CES0000000001"
+series_title = "All employees, thousands, total nonfarm, seasonally adjusted"
+transform = "mom_abs_diff"
+used_for = ["actual", "prior", "payrolls_actual_k", "payrolls_prior_k"]
+
+[events.employment_situation.series.unemployment_rate]
+series_id = "LNS14000000"
+series_title = "Unemployment rate, seasonally adjusted"
+transform = "latest_value"
+used_for = ["unemployment_rate_actual", "unemployment_rate_prior"]
+
+[events.employment_situation.series.avg_hourly_earnings]
+series_id = "CES0500000003"
+series_title = "Average hourly earnings of all employees, total private, seasonally adjusted"
+transform = "mom_pct"
+used_for = ["avg_hourly_earnings_mom_actual", "avg_hourly_earnings_mom_prior"]

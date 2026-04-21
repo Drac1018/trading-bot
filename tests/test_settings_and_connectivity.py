@@ -20,15 +20,12 @@ from trading_mvp.models import (
 from trading_mvp.schemas import (
     AppSettingsUpdateRequest,
     BinanceConnectionTestRequest,
-    FredConnectionTestRequest,
     OpenAIConnectionTestRequest,
 )
 from trading_mvp.services.connectivity import (
     check_binance_connection,
-    check_fred_connection,
     check_openai_connection,
 )
-from trading_mvp.services.event_context_adapters import ExternalEventFetchPayload
 from trading_mvp.services.runtime_state import mark_sync_success, set_drawdown_state_detail
 from trading_mvp.services.settings import (
     get_or_create_settings,
@@ -101,6 +98,10 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         event_source_timeout_seconds=12.0,
         event_source_default_assets=["BTCUSDT", "ETHUSDT"],
         event_source_fred_release_ids=[10, 101],
+        event_source_bls_enrichment_url="https://bls.settings/releases",
+        event_source_bls_enrichment_static_params={"series_id": "CUUR0000SA0"},
+        event_source_bea_enrichment_url="https://bea.settings/releases",
+        event_source_bea_enrichment_static_params={"dataset": "NIPA"},
         openai_api_key="sk-test-openai",
         binance_api_key="binance-key",
         binance_api_secret="binance-secret",
@@ -128,6 +129,10 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["event_source_timeout_seconds"] == 12.0
     assert serialized["event_source_default_assets"] == ["BTCUSDT", "ETHUSDT"]
     assert serialized["event_source_fred_release_ids"] == [10, 101]
+    assert serialized["event_source_bls_enrichment_url"] == "https://bls.settings/releases"
+    assert serialized["event_source_bls_enrichment_static_params"] == {"series_id": "CUUR0000SA0"}
+    assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
+    assert serialized["event_source_bea_enrichment_static_params"] == {"dataset": "NIPA"}
     assert serialized["event_source_api_key_configured"] is True
     assert serialized["tracked_symbols"] == ["BTCUSDT", "ETHUSDT"]
     assert serialized["exchange_sync_interval_seconds"] == 60
@@ -167,6 +172,10 @@ def test_settings_update_preserves_event_source_fields_when_older_payload_omits_
         "event_source_timeout_seconds",
         "event_source_default_assets",
         "event_source_fred_release_ids",
+        "event_source_bls_enrichment_url",
+        "event_source_bls_enrichment_static_params",
+        "event_source_bea_enrichment_url",
+        "event_source_bea_enrichment_static_params",
         "event_source_api_key",
         "clear_event_source_api_key",
     }:
@@ -179,6 +188,10 @@ def test_settings_update_preserves_event_source_fields_when_older_payload_omits_
     assert updated.event_source_timeout_seconds == 12.0
     assert updated.event_source_default_assets == ["BTCUSDT", "ETHUSDT"]
     assert updated.event_source_fred_release_ids == [10, 101]
+    assert updated.event_source_bls_enrichment_url == "https://bls.settings/releases"
+    assert updated.event_source_bls_enrichment_static_params == {"series_id": "CUUR0000SA0"}
+    assert updated.event_source_bea_enrichment_url == "https://bea.settings/releases"
+    assert updated.event_source_bea_enrichment_static_params == {"dataset": "NIPA"}
     assert updated.event_source_api_key_encrypted == row.event_source_api_key_encrypted
 
 
@@ -194,6 +207,8 @@ def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> No
     assert serialized["default_symbol"] == "BTCUSDT"
     assert serialized["control_status_summary"]["rollout_mode"] == "full_live"
     assert serialized["event_source_provider"] == "fred"
+    assert serialized["event_source_bls_enrichment_url"] == "https://bls.settings/releases"
+    assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
     assert serialized["event_source_api_key_configured"] is True
 
 
@@ -468,86 +483,6 @@ def test_connection_services_return_success_with_patched_clients(db_session, mon
     assert binance_result.ok is True
     assert binance_result.details["symbol"] == "BTCUSDT"
 
-
-def test_fred_connection_service_uses_saved_or_override_settings(db_session, monkeypatch) -> None:
-    row = update_settings(db_session, build_settings_payload())
-
-    monkeypatch.setattr(
-        "trading_mvp.services.connectivity.FredReleaseDatesAdapter.fetch_event_context",
-        lambda self, *, symbol, timeframe, generated_at: ExternalEventFetchPayload(
-            source_status="external_api",
-            events=(
-                {
-                    "event_name": "Consumer Price Index",
-                    "event_at": generated_at + timedelta(minutes=45),
-                    "affected_assets": [symbol],
-                },
-            ),
-            source_generated_at=generated_at,
-            is_complete=True,
-        ),
-    )
-
-    result = check_fred_connection(
-        row,
-        FredConnectionTestRequest(
-            api_key=None,
-            api_url=None,
-            timeout_seconds=None,
-            release_ids=[],
-            default_assets=[],
-            symbol="BTCUSDT",
-            timeframe="15m",
-        ),
-    )
-
-    assert result.ok is True
-    assert result.provider == "fred"
-    assert result.details["source_status"] == "external_api"
-    assert result.details["base_url"] == "https://fred.settings/fred"
-    assert result.details["release_ids"] == [10, 101]
-    assert result.details["next_event_name"] == "Consumer Price Index"
-
-
-def test_fred_connection_service_marks_unavailable_calendar_as_nonfatal(db_session, monkeypatch) -> None:
-    row = update_settings(db_session, build_settings_payload())
-
-    monkeypatch.setattr(
-        "trading_mvp.services.connectivity.FredReleaseDatesAdapter.fetch_event_context",
-        lambda self, *, symbol, timeframe, generated_at: ExternalEventFetchPayload(
-            source_status="unavailable",
-            source_generated_at=generated_at,
-            is_complete=False,
-        ),
-    )
-
-    result = check_fred_connection(
-        row,
-        FredConnectionTestRequest(symbol="BTCUSDT", timeframe="15m"),
-    )
-
-    assert result.ok is True
-    assert result.details["source_status"] == "unavailable"
-
-
-def test_fred_connection_service_requires_api_key(db_session) -> None:
-    row = update_settings(
-        db_session,
-        build_settings_payload().model_copy(
-            update={
-                "event_source_api_key": None,
-                "clear_event_source_api_key": True,
-            }
-        ),
-    )
-
-    result = check_fred_connection(
-        row,
-        FredConnectionTestRequest(symbol="BTCUSDT", timeframe="15m"),
-    )
-
-    assert result.ok is False
-    assert result.message == "FRED API 키가 없습니다."
 
 
 def test_get_or_create_settings_provides_new_defaults(db_session) -> None:
@@ -940,66 +875,6 @@ def test_settings_api_splits_heavy_payloads(testclient_db_factory) -> None:
     assert cadence_response.json()["items"][0]["symbol"] == "BTCUSDT"
     assert usage_response.json()["recent_ai_calls_24h"] == 1
 
-
-def test_fred_connection_test_endpoint_uses_request_overrides(tmp_path, monkeypatch) -> None:
-    test_engine = create_engine(f"sqlite:///{tmp_path / 'fred_connection_test.db'}", future=True)
-    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    Base.metadata.create_all(bind=test_engine)
-    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
-    monkeypatch.setattr("trading_mvp.main._run_background_scheduler_tick", lambda: 0)
-    monkeypatch.setattr("trading_mvp.main._run_background_user_stream_tick", lambda: 0)
-
-    with TestingSessionLocal() as session:
-        update_settings(session, build_settings_payload())
-        session.commit()
-
-    monkeypatch.setattr(
-        "trading_mvp.services.connectivity.FredReleaseDatesAdapter.fetch_event_context",
-        lambda self, *, symbol, timeframe, generated_at: ExternalEventFetchPayload(
-            source_status="external_api",
-            events=(
-                {
-                    "event_name": "FOMC Press Release",
-                    "event_at": generated_at + timedelta(minutes=90),
-                    "affected_assets": [symbol],
-                },
-            ),
-            source_generated_at=generated_at,
-            is_complete=True,
-        ),
-    )
-
-    def override_get_db():
-        with TestingSessionLocal() as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_get_db
-
-    try:
-        with TestClient(app) as client:
-            response = client.post(
-                "/api/settings/test/fred",
-                json={
-                    "api_key": "override-fred-key",
-                    "api_url": "https://fred.override/fred",
-                    "timeout_seconds": 9,
-                    "release_ids": [46, 53],
-                    "default_assets": ["BTCUSDT", "ETHUSDT"],
-                    "symbol": "BTCUSDT",
-                    "timeframe": "15m",
-                },
-            )
-        payload = response.json()
-
-        assert response.status_code == 200
-        assert payload["provider"] == "fred"
-        assert payload["ok"] is True
-        assert payload["details"]["base_url"] == "https://fred.override/fred"
-        assert payload["details"]["release_ids"] == [46, 53]
-        assert payload["details"]["source_status"] == "external_api"
-        assert payload["details"]["next_event_name"] == "FOMC Press Release"
-    finally:
-        app.dependency_overrides.clear()
 
 
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:

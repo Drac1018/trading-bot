@@ -334,6 +334,166 @@ def test_fred_release_dates_adapter_applies_bls_and_bea_post_release_enrichment(
     assert payload.events[1].release_enrichment["bea"]["actual"] == 2.4
 
 
+def test_bls_native_release_enrichment_adapter_parses_vendor_payload() -> None:
+    generated_at = datetime(2026, 2, 10, 14, 0, 0)
+
+    def _bls_fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, params, headers
+        return {
+            "status": "REQUEST_SUCCEEDED",
+            "Results": {
+                "series": [
+                    {
+                        "seriesID": "CUUR0000SA0",
+                        "catalog": {"series_title": "Consumer Price Index for All Urban Consumers"},
+                        "data": [
+                            {
+                                "year": "2026",
+                                "period": "M01",
+                                "periodName": "January",
+                                "value": "3.1",
+                                "latest": "true",
+                                "footnotes": [{"text": "Preliminary"}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+    adapter = BLSActualReleaseEnrichmentAdapter(fetcher=_bls_fetcher)
+    events = adapter.enrich_events(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        events=(
+            {
+                "event_name": "Consumer Price Index",
+                "event_at": datetime(2026, 2, 10, 13, 30, 0),
+            },
+        ),
+    )
+
+    assert events[0]["enrichment_vendors"] == ["bls"]
+    assert events[0]["release_enrichment"]["bls"]["actual"] == 3.1
+    assert events[0]["release_enrichment"]["bls"]["reference_period"] == "2026-01"
+    assert events[0]["release_enrichment"]["bls"]["series_id"] == "CUUR0000SA0"
+    assert events[0]["release_enrichment"]["bls"]["period_name"] == "January"
+    assert events[0]["release_enrichment"]["bls"]["latest"] is True
+
+
+def test_bls_native_release_enrichment_adapter_keeps_partial_fields_when_actual_is_missing() -> None:
+    generated_at = datetime(2026, 2, 10, 14, 0, 0)
+
+    def _bls_fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, params, headers
+        return {
+            "status": "REQUEST_SUCCEEDED",
+            "Results": {
+                "series": [
+                    {
+                        "seriesID": "PCU0000000000000",
+                        "data": [
+                            {
+                                "year": "2026",
+                                "period": "M01",
+                                "periodName": "January",
+                                "value": "--",
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+    adapter = BLSActualReleaseEnrichmentAdapter(fetcher=_bls_fetcher)
+    events = adapter.enrich_events(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        events=(
+            {
+                "event_name": "Producer Price Index",
+                "event_at": datetime(2026, 2, 10, 13, 30, 0),
+            },
+        ),
+    )
+
+    assert events[0]["enrichment_vendors"] == ["bls"]
+    assert "actual" not in events[0]["release_enrichment"]["bls"]
+    assert events[0]["release_enrichment"]["bls"]["reference_period"] == "2026-01"
+    assert events[0]["release_enrichment"]["bls"]["series_id"] == "PCU0000000000000"
+
+
+def test_bea_native_release_enrichment_adapter_parses_vendor_payload() -> None:
+    generated_at = datetime(2026, 2, 10, 14, 0, 0)
+
+    def _bea_fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, params, headers
+        return {
+            "BEAAPI": {
+                "Results": {
+                    "Data": [
+                        {
+                            "TableName": "T10101",
+                            "LineDescription": "Gross domestic product",
+                            "LineNumber": "1",
+                            "SeriesCode": "A191RC",
+                            "TimePeriod": "2025Q4",
+                            "DataValue": "2.4",
+                            "NoteRef": "A",
+                        }
+                    ]
+                }
+            }
+        }
+
+    adapter = BEAActualReleaseEnrichmentAdapter(fetcher=_bea_fetcher)
+    events = adapter.enrich_events(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        events=(
+            {
+                "event_name": "Gross Domestic Product",
+                "event_at": datetime(2026, 2, 10, 13, 30, 0),
+            },
+        ),
+    )
+
+    assert events[0]["enrichment_vendors"] == ["bea"]
+    assert events[0]["release_enrichment"]["bea"]["actual"] == 2.4
+    assert events[0]["release_enrichment"]["bea"]["reference_period"] == "2025-Q4"
+    assert events[0]["release_enrichment"]["bea"]["table_name"] == "T10101"
+    assert events[0]["release_enrichment"]["bea"]["series_code"] == "A191RC"
+
+
+def test_vendor_native_release_enrichment_adapter_falls_back_to_normalized_payload() -> None:
+    generated_at = datetime(2026, 2, 10, 14, 0, 0)
+
+    def _bea_fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, params, headers
+        return {"actual": 2.4, "prior": 2.1, "reference_period": "2025-Q4"}
+
+    adapter = BEAActualReleaseEnrichmentAdapter(fetcher=_bea_fetcher)
+    events = adapter.enrich_events(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        events=(
+            {
+                "event_name": "Gross Domestic Product",
+                "event_at": datetime(2026, 2, 10, 13, 30, 0),
+            },
+        ),
+    )
+
+    assert events[0]["enrichment_vendors"] == ["bea"]
+    assert events[0]["release_enrichment"]["bea"]["actual"] == 2.4
+    assert events[0]["release_enrichment"]["bea"]["prior"] == 2.1
+    assert events[0]["release_enrichment"]["bea"]["reference_period"] == "2025-Q4"
+
+
 def test_resolve_event_context_provider_from_env_supports_fred(monkeypatch) -> None:
     monkeypatch.setenv("TRADING_EVENT_SOURCE_PROVIDER", "fred")
     monkeypatch.setenv("TRADING_EVENT_SOURCE_API_KEY", "fred-demo")
@@ -381,6 +541,10 @@ class _EventSourceSettingsRow:
     event_source_timeout_seconds: float | None = None
     event_source_default_assets: list[str] | tuple[str, ...] = ()
     event_source_fred_release_ids: list[int] | tuple[int, ...] = ()
+    event_source_bls_enrichment_url: str | None = None
+    event_source_bls_enrichment_static_params: dict[str, str] | None = None
+    event_source_bea_enrichment_url: str | None = None
+    event_source_bea_enrichment_static_params: dict[str, str] | None = None
 
 
 @dataclass
@@ -410,6 +574,32 @@ def test_resolve_event_context_provider_prefers_settings_override_for_fred(monke
     assert provider.adapter.timeout_seconds == 18.0
     assert provider.adapter.default_assets == ("BTCUSDT", "ETHUSDT")
     assert provider.adapter.release_ids == (10, 101)
+
+
+def test_resolve_event_context_provider_prefers_settings_enrichment_over_env(monkeypatch) -> None:
+    monkeypatch.setenv("TRADING_EVENT_SOURCE_BLS_ENRICHMENT_URL", "https://bls.env/releases")
+    monkeypatch.setenv("TRADING_EVENT_SOURCE_BEA_ENRICHMENT_URL", "https://bea.env/releases")
+    settings_row = _EventSourceSettingsRow(
+        event_source_provider="fred",
+        event_source_api_url="https://fred.settings/fred",
+        event_source_bls_enrichment_url="https://bls.settings/releases",
+        event_source_bls_enrichment_static_params={"series_id": "CUUR0000SA0"},
+        event_source_bea_enrichment_url="https://bea.settings/releases",
+        event_source_bea_enrichment_static_params={"dataset": "NIPA"},
+    )
+
+    provider = resolve_event_context_provider(
+        settings_row=settings_row,
+        credentials=_EventSourceCredentials(event_source_api_key="fred-settings-key"),
+    )
+
+    assert isinstance(provider, ExternalAPIEventContextProvider)
+    assert isinstance(provider.adapter, FredReleaseDatesAdapter)
+    assert len(provider.adapter.post_release_enrichers) == 2
+    assert provider.adapter.post_release_enrichers[0].base_url == "https://bls.settings/releases"
+    assert provider.adapter.post_release_enrichers[0].static_params == {"series_id": "CUUR0000SA0"}
+    assert provider.adapter.post_release_enrichers[1].base_url == "https://bea.settings/releases"
+    assert provider.adapter.post_release_enrichers[1].static_params == {"dataset": "NIPA"}
 
 
 def test_resolve_event_context_provider_falls_back_to_env_when_settings_override_is_empty(monkeypatch) -> None:

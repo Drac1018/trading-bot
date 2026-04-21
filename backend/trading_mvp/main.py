@@ -16,7 +16,6 @@ from trading_mvp.schemas import (
     BinanceAccountResponse,
     BinanceConnectionTestRequest,
     BinanceLiveTestOrderRequest,
-    FredConnectionTestRequest,
     ManualNoTradeWindowEndRequest,
     ManualNoTradeWindowRequest,
     ManualLiveApprovalRequest,
@@ -29,7 +28,6 @@ from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.binance_account import get_binance_account_snapshot
 from trading_mvp.services.connectivity import (
     check_binance_connection,
-    check_fred_connection,
     check_openai_connection,
 )
 from trading_mvp.services.dashboard import (
@@ -575,33 +573,6 @@ def binance_connection_test(
         db,
         event_type="integration_test",
         entity_type="binance",
-        entity_id=str(settings_row.id),
-        severity="info" if result.ok else "warning",
-        message=result.message,
-        payload=result.details,
-    )
-    db.commit()
-    return result.model_dump(mode="json")
-
-
-@app.post("/api/settings/test/fred")
-def fred_connection_test(
-    payload: FredConnectionTestRequest,
-    db: Session = Depends(get_db),
-) -> dict[str, object]:
-    settings_row = get_or_create_settings(db)
-    result = check_fred_connection(settings_row, payload)
-    record_health_event(
-        db,
-        component="fred",
-        status="ok" if result.ok else "error",
-        message=result.message,
-        payload=result.details,
-    )
-    record_audit_event(
-        db,
-        event_type="integration_test",
-        entity_type="fred",
         entity_id=str(settings_row.id),
         severity="info" if result.ok else "warning",
         message=result.message,

@@ -1,5 +1,21 @@
 # Execution Flow
 
+## 운영자 표현과 내부 키
+
+- 이 문서는 구현 설명이므로 내부 키를 그대로 사용합니다.
+- 운영자 UI에서는 아래처럼 읽습니다.
+  - `decision_cycle_interval_minutes`
+  - `decision_cycle_interval_minutes_override`
+  - `last_decision_at`
+  - `next_decision_due_at`
+    - 화면 표현: `재검토 확인 주기`
+  - `ai_call_interval_minutes`
+  - `ai_call_interval_minutes_override`
+  - `last_ai_decision_at`
+  - `next_ai_call_due_at`
+    - 화면 표현: `AI 기본 검토 간격`
+- 즉, 이 문서에서 `decision_cycle_interval_minutes`를 말하는 부분은 운영자 화면의 `재검토 확인 주기`를, `ai_call_interval_minutes`를 말하는 부분은 `AI 기본 검토 간격`을 뜻합니다.
+
 ## 2026-04 AI Context Plumbing
 
 - `run_decision_cycle()` now builds `ai_context` before calling `TradingDecisionAgent.run(...)`.
@@ -75,7 +91,7 @@
 
 - `holding_profile_cadence_hint.decision_interval_minutes` is now consumed by the scheduler for open-position AI review due checks.
 - Safe fallback behavior:
-  - if the cadence hint is missing, non-numeric, or invalid, the scheduler falls back to the effective symbol `ai_call_interval_minutes`
+  - if the cadence hint is missing, non-numeric, or invalid, the scheduler falls back to the effective symbol `ai_call_interval_minutes` (`AI 기본 검토 간격`)
   - cadence is used only for AI position review timing
   - cadence does not delay `exchange_sync_cycle`
   - cadence does not delay `market_refresh_cycle`
@@ -136,6 +152,7 @@
    - AI 판단, deterministic baseline, `risk_guard`, live execution 담당
    - exchange sync / position management를 매번 강제로 포함하지 않음
    - 심볼별 `decision_cycle_interval_minutes` effective cadence 사용
+   - 운영자 화면에서는 이 값을 `재검토 확인 주기`로 보여줌
 
 ## 전역 기본값 + symbol override
 
@@ -144,14 +161,14 @@
   - `exchange_sync_interval_seconds`
   - `market_refresh_interval_minutes`
   - `position_management_interval_seconds`
-  - `decision_cycle_interval_minutes`
-  - `ai_call_interval_minutes`
+  - `decision_cycle_interval_minutes` (`재검토 확인 주기`)
+  - `ai_call_interval_minutes` (`AI 기본 검토 간격`)
 - 심볼별 override:
   - `timeframe_override`
   - `market_refresh_interval_minutes_override`
   - `position_management_interval_seconds_override`
-  - `decision_cycle_interval_minutes_override`
-  - `ai_call_interval_minutes_override`
+  - `decision_cycle_interval_minutes_override` (`재검토 확인 주기` 개별 설정)
+  - `ai_call_interval_minutes_override` (`AI 기본 검토 간격` 개별 설정)
   - `enabled`
 
 override가 비어 있으면 전역값을 그대로 상속합니다.
