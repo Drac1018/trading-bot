@@ -67,6 +67,7 @@ from trading_mvp.services.execution import (
     execute_live_trade,
     sync_live_state,
 )
+from trading_mvp.services.event_context import EventContextProvider, resolve_event_context_provider
 from trading_mvp.services.features import (
     compute_features,
     persist_feature_snapshot,
@@ -351,6 +352,10 @@ class TradingOrchestrator:
         self.session = session
         self.settings_row = get_or_create_settings(session)
         self.credentials = get_runtime_credentials(self.settings_row)
+        self.event_context_provider: EventContextProvider = resolve_event_context_provider(
+            settings_row=self.settings_row,
+            credentials=self.credentials,
+        )
         provider = build_model_provider(
             ai_provider=self.settings_row.ai_provider,
             ai_enabled=self.settings_row.ai_enabled,
@@ -2664,6 +2669,7 @@ class TradingOrchestrator:
             use_binance=self.settings_row.binance_market_data_enabled,
             binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
             stale_threshold_seconds=self.settings_row.stale_market_seconds,
+            event_context_provider=self.event_context_provider,
         )
         market_row = persist_market_snapshot(self.session, market_snapshot)
         if self.settings_row.ai_enabled:
@@ -2826,6 +2832,7 @@ class TradingOrchestrator:
             use_binance=self.settings_row.binance_market_data_enabled,
             binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
             stale_threshold_seconds=self.settings_row.stale_market_seconds,
+            event_context_provider=self.event_context_provider,
         )
         lead_features: dict[str, FeaturePayload] = {}
         for lead_symbol, context in lead_contexts.items():
@@ -2932,6 +2939,7 @@ class TradingOrchestrator:
             use_binance=self.settings_row.binance_market_data_enabled,
             binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
             stale_threshold_seconds=self.settings_row.stale_market_seconds,
+            event_context_provider=self.event_context_provider,
         )
         market_snapshot = market_context[timeframe]
         higher_timeframe_context = {key: value for key, value in market_context.items() if key != timeframe}
@@ -4069,6 +4077,7 @@ class TradingOrchestrator:
                     use_binance=self.settings_row.binance_market_data_enabled,
                     binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
                     stale_threshold_seconds=self.settings_row.stale_market_seconds,
+                    event_context_provider=self.event_context_provider,
                 )
                 higher_timeframe_context = {
                     tf: payload for tf, payload in market_context.items() if tf != effective_timeframe
@@ -4135,6 +4144,7 @@ class TradingOrchestrator:
             use_binance=self.settings_row.binance_market_data_enabled,
             binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
             stale_threshold_seconds=self.settings_row.stale_market_seconds,
+            event_context_provider=self.event_context_provider,
         )
         higher_timeframe_context = {
             tf: payload for tf, payload in market_context.items() if tf != effective_timeframe
@@ -5544,6 +5554,7 @@ class TradingOrchestrator:
                 use_binance=self.settings_row.binance_market_data_enabled,
                 binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
                 stale_threshold_seconds=self.settings_row.stale_market_seconds,
+                event_context_provider=self.event_context_provider,
             )
         )
         higher_timeframe_context = {

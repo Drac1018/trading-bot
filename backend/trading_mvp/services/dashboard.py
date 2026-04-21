@@ -98,6 +98,7 @@ DERIVATIVES_SUMMARY_KEYS = (
 )
 EVENT_CONTEXT_SUMMARY_KEYS = (
     "source_status",
+    "source_provenance",
     "next_event_name",
     "next_event_at",
     "next_event_importance",

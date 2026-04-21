@@ -56,12 +56,17 @@
 
 ### `event_context_summary`
 
+- `source_provenance`
+- `source_vendor`
+- `enrichment_vendors`
 - `next_event_name`
 - `next_event_importance`
 - `minutes_to_next_event`
 - `active_risk_window`
-- `source_status`
+- `source_status`: `fixture | stub | external_api | stale | incomplete | unavailable | error`
 - `event_bias`
+- `source_vendor=fred`는 primary calendar provider를 뜻합니다.
+- `enrichment_vendors=bls/bea`는 발표 후 actual value enrichment가 붙었음을 뜻합니다.
 - This is a forward-looking event-awareness layer for AI rationale only.
 - It does not override `risk_guard` or grant execution authority.
 
@@ -388,6 +393,7 @@
 - `POST /api/settings/resume`
 - `POST /api/settings/live/arm`
 - `POST /api/settings/live/disarm`
+- `POST /api/settings/test/fred`
 
 ### `GET /api/settings`
 
@@ -412,6 +418,8 @@
   - `evaluated_operator_policy`
   - `manual_no_trade_windows`
   - `effective_policy_preview`
+- `event_context.source_vendor` exposes the primary external calendar vendor when `source_provenance=external_api`.
+- `event_context.enrichment_vendors` exposes post-release actual-value enrichers such as `bls` and `bea`.
 - `effective_policy_preview` remains a separate preview/status field.
 - Preview strings are not the source of truth; raw payload + deterministic evaluator are the source of truth.
 - 신규 `long / short` entry path에서는 `risk_guard`가 같은 shared evaluator semantics를 사용합니다.
@@ -507,6 +515,17 @@ Rules:
   - `hard_stop_active_positions`: deterministic hard stop이 active인 position 수
   - `deterministic_hard_stop_positions`: `initial_stop_type=deterministic_hard_stop` 기준 position 수
   - `stop_widening_forbidden_positions`: `stop_widening_allowed=false` position 수
+- `event_source_provider`
+  - persisted settings override 값입니다.
+  - `null`이면 기존 env fallback을 그대로 사용합니다.
+  - `stub | fred`
+- `event_source_api_url`
+- `event_source_timeout_seconds`
+- `event_source_default_assets`
+- `event_source_fred_release_ids`
+- `event_source_api_key_configured`
+  - encrypted secret 자체는 응답에 포함하지 않습니다.
+  - `true`는 settings 저장값 또는 env fallback key가 현재 런타임에서 사용 가능함을 뜻합니다.
 - `exchange_sync_interval_seconds`
 - `market_refresh_interval_minutes`
 - `position_management_interval_seconds`
@@ -566,6 +585,44 @@ staged rollout semantics:
   - 기존 live submit 경로를 사용합니다.
 
 `live_execution_ready`는 approval / credentials / pause 기준 준비 상태이고, 실제 신규 진입 가능 여부는 `exchange_submit_allowed`와 `can_enter_new_position`를 같이 봐야 합니다.
+
+### `PUT /api/settings`
+
+- event source settings는 additive입니다.
+- `event_source_provider`
+  - `null`: settings override 미사용, 기존 env resolver fallback 유지
+  - `stub`: settings 기준으로 stub provider 고정
+  - `fred`: settings 기준으로 FRED provider 사용
+- `event_source_api_key`
+  - encrypted 저장
+  - 응답에는 내려가지 않고 `event_source_api_key_configured`만 노출됩니다.
+- `clear_event_source_api_key=true`
+  - 저장된 encrypted key를 제거합니다.
+- `event_source_api_url`, `event_source_timeout_seconds`, `event_source_default_assets`, `event_source_fred_release_ids`
+  - settings override가 `fred`일 때 우선 적용됩니다.
+  - 값이 비어 있으면 동일 키의 env fallback 또는 adapter 기본값을 사용합니다.
+
+### `POST /api/settings/test/fred`
+
+- saved settings를 기본으로 읽되, request body override가 있으면 그 값을 우선 사용합니다.
+- request:
+  - `api_key`
+  - `api_url`
+  - `timeout_seconds`
+  - `release_ids`
+  - `default_assets`
+  - `symbol`
+  - `timeframe`
+- response:
+  - `provider=fred`
+  - `details.source_status`
+  - `details.next_event_name`
+  - `details.next_event_at`
+  - `details.release_ids`
+- 의미:
+  - `external_api`: 연결 및 캘린더 응답 확인
+  - `unavailable`: 연결은 됐지만 예정 release 없음
+  - `incomplete | error`: 운영용 source로 보기엔 불완전
 
 ## Dashboard
 
@@ -703,6 +760,8 @@ staged rollout semantics:
 - `event_operator_control`
   - descriptive `market_context_summary`와 별도 additive container입니다.
   - contains `event_context`, `ai_event_view`, `operator_event_view`, `alignment_decision`, `evaluated_operator_policy`, `manual_no_trade_windows`, `effective_policy_preview`
+  - `event_context.source_vendor=fred` means the primary calendar source stayed on FRED.
+  - `event_context.enrichment_vendors=bls/bea` means post-release actual-value enrichment was attached without changing hard gates.
   - `effective_policy_preview` is the preview-facing projection of the same shared evaluator used by `risk_guard` for 신규 entry paths
 - 전역 최신 1건 `ai_decision / risk_guard / execution` 필드는 더 이상 대표값으로 내려주지 않습니다.
 

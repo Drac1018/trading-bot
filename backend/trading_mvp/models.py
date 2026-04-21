@@ -88,6 +88,12 @@ class Setting(TimestampMixin, Base):
     binance_futures_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     binance_api_key_encrypted: Mapped[str] = mapped_column(Text, default="")
     binance_api_secret_encrypted: Mapped[str] = mapped_column(Text, default="")
+    event_source_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    event_source_api_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    event_source_timeout_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    event_source_default_assets: Mapped[list[str]] = mapped_column(JSON, default=list)
+    event_source_fred_release_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    event_source_api_key_encrypted: Mapped[str] = mapped_column(Text, default="")
 
 
 class MarketSnapshot(TimestampMixin, Base):

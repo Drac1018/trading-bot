@@ -1,3 +1,5 @@
+import { lookupRiskReasonCode } from "./risk-reason-copy.js";
+
 const labelMap: Record<string, string> = {
   id: "ID",
   title: "제목",
@@ -56,34 +58,34 @@ const labelMap: Record<string, string> = {
   fee_paid: "수수료",
   slippage_pct: "슬리피지",
   live_trading_enabled: "실거래 사용",
-  rollout_mode: "rollout 모드",
-  exchange_submit_allowed: "거래소 submit 허용",
-  limited_live_max_notional: "limited live 주문당 최대 notional",
-  live_execution_ready: "실주문 준비 상태",
-  trading_paused: "거래 일시 중지",
-  guard_mode_reason_category: "가드 모드 분류",
-  guard_mode_reason_code: "가드 모드 코드",
-  guard_mode_reason_message: "가드 모드 설명",
-  exchange_can_trade: "거래소 주문 가능",
-  app_live_armed: "앱 live arm",
-  approval_window_open: "approval window",
-  paused: "pause",
-  degraded: "degraded",
-  risk_allowed: "risk 허용",
-  blocked_reasons_current_cycle: "현재 cycle 차단 사유",
+  rollout_mode: "실거래 적용 단계",
+  exchange_submit_allowed: "거래소 주문 전송 허용",
+  limited_live_max_notional: "제한된 실거래 최대 주문 금액",
+  live_execution_ready: "실거래 제출 준비 상태",
+  trading_paused: "운영 일시 중지",
+  guard_mode_reason_category: "차단 사유 분류",
+  guard_mode_reason_code: "차단 사유 코드",
+  guard_mode_reason_message: "차단 사유 설명",
+  exchange_can_trade: "거래소 주문 가능 상태",
+  app_live_armed: "앱 실거래 준비",
+  approval_window_open: "실거래 승인 창",
+  paused: "운영 일시 중지",
+  degraded: "안전 모드",
+  risk_allowed: "신규 진입 허용 여부",
+  blocked_reasons_current_cycle: "이번 판단 주기 차단 사유",
   control_status_summary: "제어 상태 요약",
   app_live_execution_ready: "앱 실주문 준비 상태",
   app_trading_paused: "앱 거래 중지",
   app_operating_state: "앱 운영 상태",
-  app_pause_reason_code: "앱 pause 사유",
-  app_pause_origin: "앱 pause 발생 주체",
+  app_pause_reason_code: "앱 중지 사유",
+  app_pause_origin: "앱 중지 주체",
   app_auto_resume_last_blockers: "앱 자동 복구 차단 사유",
   open_positions: "보유 포지션",
   daily_pnl: "일일 손익",
   cumulative_pnl: "누적 손익",
   blocked_reasons: "차단 사유",
-  latest_blocked_reasons: "현재 거래 차단 사유",
-  manual_live_approval: "수동 승인 정책",
+  latest_blocked_reasons: "최근 신규 진입 차단 사유",
+  manual_live_approval: "수동 실거래 승인",
   live_execution_armed_until: "실거래 승인 만료 시각",
   ai_enabled: "AI 사용",
   ai_model: "AI 모델",
@@ -159,7 +161,7 @@ const labelMap: Record<string, string> = {
   pnl_summary: "손익 요약",
   account_sync_summary: "계좌 동기화 요약",
   exposure_summary: "노출 요약",
-  execution_policy_summary: "실행 정책 요약",
+  execution_policy_summary: "주문 반영 요약",
   market_context_summary: "시장 컨텍스트 요약",
   adaptive_protection_summary: "적응형 보호 요약",
   adaptive_signal_summary: "적응형 신호 요약",
@@ -167,16 +169,16 @@ const labelMap: Record<string, string> = {
   basis_note: "기준 설명",
   net_realized_pnl: "순실현 손익",
   account_sync_status: "계좌 동기화 상태",
-  reconciliation_mode: "보정 방식",
-  account_reconciliation_mode: "보정 방식",
-  freshness_seconds: "동기화 최신도",
-  stale_after_seconds: "최신도 기준",
+  reconciliation_mode: "보수적 반영 방식",
+  account_reconciliation_mode: "보수적 반영 방식",
+  freshness_seconds: "마지막 동기화 후 지난 시간",
+  stale_after_seconds: "지연 판단 기준",
   last_synced_at: "마지막 동기화",
   last_warning_reason_code: "마지막 경고 사유",
   last_warning_message: "마지막 경고 메시지",
   metrics: "현재 노출",
   limits: "노출 한도",
-  headroom: "남은 여유",
+  headroom: "추가 진입 여유",
   reference_symbol: "기준 심볼",
   reference_tier: "기준 리스크 티어",
   primary_regime: "주요 레짐",
@@ -211,16 +213,16 @@ const valueMap: Record<string, string> = {
   short: "숏",
   reduce: "축소",
   exit: "청산",
-  paused: "거래 중지",
+  paused: "운영 일시 중지",
   live: "실거래",
-  paper: "paper",
-  shadow: "shadow",
-  live_dry_run: "live dry-run",
-  limited_live: "limited live",
-  full_live: "full live",
-  live_ready: "실주문 가능",
-  live_guarded: "가드 모드",
-  market_data_only: "시장 데이터만 사용",
+  paper: "모의 운영",
+  shadow: "그림자 점검",
+  live_dry_run: "실거래 사전 점검",
+  limited_live: "제한된 실거래",
+  full_live: "실거래 전체 허용",
+  live_ready: "실거래 가능",
+  live_guarded: "진입 제한 모드",
+  market_data_only: "시장 데이터만 수집",
   ai_active: "AI 활성",
   pending: "대기",
   partially_filled: "부분 체결",
@@ -250,7 +252,7 @@ const valueMap: Record<string, string> = {
   error: "오류",
   risk: "리스크",
   execution: "실행",
-  approval_control: "승인/운영제어",
+  approval_control: "승인/운영 제어",
   protection: "보호주문",
   health_system: "헬스/시스템",
   ai_decision: "AI/의사결정",
@@ -274,15 +276,15 @@ const valueMap: Record<string, string> = {
   config_block: "설정 차단",
   portfolio_unsafe: "포트폴리오 위험",
   readiness: "실주문 준비",
-  pause: "운영 pause",
-  risk_block: "리스크 차단",
+  pause: "운영 일시 중지",
+  risk_block: "신규 진입 차단",
   auto_resume: "자동 복구",
   unknown: "미확인",
   TRADABLE: "거래 가능",
   PROTECTION_REQUIRED: "보호 복구 필요",
-  DEGRADED_MANAGE_ONLY: "관리 전용",
+  DEGRADED_MANAGE_ONLY: "신규 진입 보류",
   EMERGENCY_EXIT: "비상 청산",
-  PAUSED: "거래 중지",
+  PAUSED: "운영 일시 중지",
   recreating: "보호 주문 재생성 중",
   restored: "복구 완료",
   manage_only: "관리 전용 유지",
@@ -304,12 +306,12 @@ const valueMap: Record<string, string> = {
   positions_unavailable: "포지션 조회 실패",
   exchange_ledger_truth: "체결 ledger 기준",
   execution_ledger_truth: "체결 ledger 기준",
-  exchange_synced: "거래소 동기화 기준",
-  fallback_reconciled: "보정값 사용 중",
+  exchange_synced: "거래소 기준 동기화 완료",
+  fallback_reconciled: "보수적으로 맞춰 반영",
   stale_snapshot: "스냅샷 지연",
   exchange_confirmed: "거래소 계좌 기준",
   deterministic_delta_fallback: "이전 스냅샷 보정",
-  stale: "지연",
+  stale: "조금 늦음",
   at_limit: "한도 도달",
   near_limit: "한도 근접",
   adaptive_atr_regime_aware: "ATR 레짐 적응형",
@@ -362,8 +364,8 @@ const reasonCodeMap: Record<string, string> = {
   HOLD_DECISION: "현재 판단은 HOLD입니다.",
   LIVE_ENV_DISABLED: "실거래 환경 플래그가 꺼져 있습니다.",
   LIVE_TRADING_DISABLED: "실거래 사용 설정이 꺼져 있습니다.",
-  ROLLOUT_MODE_SHADOW: "shadow rollout 모드라 실제 거래소 submit은 금지됩니다.",
-  ROLLOUT_MODE_LIVE_DRY_RUN: "live dry-run rollout 모드라 실제 거래소 submit은 금지됩니다.",
+  ROLLOUT_MODE_SHADOW: "그림자 점검 단계라 실제 주문은 보내지 않습니다.",
+  ROLLOUT_MODE_LIVE_DRY_RUN: "실거래 사전 점검 단계라 실제 주문은 보내지 않습니다.",
   LIVE_APPROVAL_POLICY_DISABLED: "수동 승인 정책이 꺼져 있습니다.",
   LIVE_APPROVAL_REQUIRED: "실거래 승인 창이 열려 있지 않습니다.",
   LIVE_CREDENTIALS_MISSING: "실거래 API Key 또는 Secret이 없습니다.",
@@ -379,12 +381,12 @@ const reasonCodeMap: Record<string, string> = {
   PROTECTIVE_ORDER_FAILURE: "보호 주문 생성 실패로 자동 복구가 금지됩니다.",
   MISSING_PROTECTIVE_ORDERS: "미보호 포지션이 감지되어 자동 복구가 금지됩니다.",
   PROTECTION_REQUIRED: "미보호 포지션이 감지되어 보호 복구가 우선입니다.",
-  DEGRADED_MANAGE_ONLY: "보호 복구가 반복 실패해 관리 전용 상태로 전환되었습니다.",
+  DEGRADED_MANAGE_ONLY: "보호 복구가 반복 실패해 신규 진입 보류 상태로 전환되었습니다.",
   EMERGENCY_EXIT: "비상 청산 상태가 진행 중이라 신규 진입이 차단됩니다.",
   INVALID_PROTECTION_BRACKETS: "보호 복구용 손절/익절 값이 현재 포지션 방향과 맞지 않습니다.",
   PORTFOLIO_RISK_UNCERTAIN: "포트폴리오 위험 상태를 신뢰할 수 없습니다.",
   ACCOUNT_STATE_INCONSISTENT: "로컬 상태와 거래소 상태가 일치하지 않습니다.",
-  AI_DISABLED: "AI가 비활성이라 배치 실행을 건너뜁니다.",
+  AI_DISABLED: "AI 사용이 꺼져 있어 자동 판단을 건너뜁니다.",
   GROSS_EXPOSURE_LIMIT_REACHED: "총 노출 한도를 초과했습니다.",
   LARGEST_POSITION_LIMIT_REACHED: "최대 단일 포지션 한도를 초과했습니다.",
   DIRECTIONAL_BIAS_LIMIT_REACHED: "방향 편향 한도를 초과했습니다.",
@@ -485,7 +487,7 @@ function humanizeKey(key: string) {
 }
 
 function translateString(value: string) {
-  return reasonCodeMap[value] ?? valueMap[value] ?? value;
+  return lookupRiskReasonCode(value) ?? reasonCodeMap[value] ?? valueMap[value] ?? value;
 }
 
 function formatDateTime(value: string) {
@@ -509,15 +511,15 @@ function formatDateTime(value: string) {
 function formatBoolean(key: string | undefined, value: boolean) {
   if (key === "allowed") return value ? "허용" : "차단";
   if (key === "schema_valid") return value ? "정상" : "실패";
-  if (key === "trading_paused") return value ? "중지" : "운영 중";
-  if (key === "exchange_can_trade") return value ? "주문 가능" : "주문 차단";
-  if (key === "app_live_armed") return value ? "Arm됨" : "Arm 해제";
+  if (key === "trading_paused") return value ? "중지됨" : "운영 중";
+  if (key === "exchange_can_trade") return value ? "가능" : "차단";
+  if (key === "app_live_armed") return value ? "준비됨" : "해제됨";
   if (key === "approval_window_open") return value ? "열림" : "닫힘";
-  if (key === "paused") return value ? "중지" : "운영 중";
-  if (key === "degraded") return value ? "관리 전용" : "정상";
+  if (key === "paused") return value ? "중지됨" : "운영 중";
+  if (key === "degraded") return value ? "신규 진입 보류" : "정상";
   if (key === "risk_allowed") return value ? "허용" : "차단";
   if (key?.endsWith("_configured")) return value ? "설정됨" : "미설정";
-  if (key?.endsWith("_enabled")) return value ? "활성" : "비활성";
+  if (key?.endsWith("_enabled")) return value ? "사용 중" : "꺼짐";
   if (key === "auto_resume_whitelisted" || key === "auto_resume_eligible" || key === "protected") {
     return value ? "예" : "아니오";
   }

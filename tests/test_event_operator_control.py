@@ -154,16 +154,19 @@ def test_event_operator_requests_require_timezone_aware_datetimes() -> None:
 
 
 @pytest.mark.parametrize(
-    ("source_status", "is_stale", "is_complete"),
+    ("source_status", "source_provenance", "source_vendor", "enrichment_vendors", "is_stale", "is_complete"),
     [
-        ("unavailable", False, False),
-        ("stale", True, True),
-        ("incomplete", False, False),
-        ("error", False, False),
+        ("unavailable", "stub", None, [], False, False),
+        ("stale", "fixture", None, [], True, True),
+        ("incomplete", "external_api", "fred", ["bls"], False, False),
+        ("error", "external_api", "fred", [], False, False),
     ],
 )
 def test_normalize_operator_event_context_exposes_source_health(
     source_status: str,
+    source_provenance: str,
+    source_vendor: str | None,
+    enrichment_vendors: list[str],
     is_stale: bool,
     is_complete: bool,
 ) -> None:
@@ -171,6 +174,9 @@ def test_normalize_operator_event_context_exposes_source_health(
     payload = normalize_operator_event_context(
         {
             "source_status": source_status,
+            "source_provenance": source_provenance,
+            "source_vendor": source_vendor,
+            "enrichment_vendors": enrichment_vendors,
             "generated_at": now.isoformat(),
             "is_stale": is_stale,
             "is_complete": is_complete,
@@ -186,8 +192,43 @@ def test_normalize_operator_event_context_exposes_source_health(
     )
 
     assert payload.source_status == source_status
+    assert payload.source_provenance == source_provenance
+    assert payload.source_vendor == source_vendor
+    assert payload.enrichment_vendors == enrichment_vendors
     assert payload.is_stale is is_stale
     assert payload.is_complete is is_complete
+
+
+@pytest.mark.parametrize(("raw_status", "expected_provenance"), [("fixture", "fixture"), ("stub", "stub"), ("external_api", "external_api")])
+def test_normalize_operator_event_context_marks_successful_sources_available(
+    raw_status: str,
+    expected_provenance: str,
+) -> None:
+    now = utcnow_aware()
+    payload = normalize_operator_event_context(
+        {
+            "source_status": raw_status,
+            "source_vendor": "fred" if raw_status == "external_api" else None,
+            "enrichment_vendors": ["bls"] if raw_status == "external_api" else [],
+            "generated_at": now.isoformat(),
+            "is_stale": False,
+            "is_complete": True,
+            "next_event_name": "FOMC",
+            "next_event_at": (now + timedelta(minutes=30)).isoformat(),
+            "next_event_importance": "high",
+            "minutes_to_next_event": 30,
+            "active_risk_window": False,
+            "affected_assets": ["BTCUSDT"],
+        },
+        generated_at=now,
+        summary_note="operator event preview",
+    )
+
+    assert payload.source_status == "available"
+    assert payload.source_provenance == expected_provenance
+    assert payload.source_vendor == ("fred" if raw_status == "external_api" else None)
+    assert payload.enrichment_vendors == (["bls"] if raw_status == "external_api" else [])
+    assert payload.is_complete is True
 
 
 def test_alignment_and_effective_policy_preview_rules() -> None:

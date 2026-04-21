@@ -1,13 +1,22 @@
 import {
+  describeEventSourceProvenance,
   describeAlignmentStatus,
   describeEffectivePolicyPreview,
   describeEnforcementMode,
   describeEventBias,
+  describeEventReasonCode,
   describeImportance,
+  describeManualWindowFlags,
+  describePolicySource,
   describeRiskState,
   describeSourceStatus,
+  describeSourceStatusHelp,
   describeWindowScope,
   formatUtcTimestamp,
+  inferEventSourceProvenance,
+  normalizeSourceStatus,
+  summarizeEntryPolicy,
+  summarizeReasonCodes,
   toneForAlignment,
   toneForPolicyPreview,
   toneForSourceStatus,
@@ -100,7 +109,7 @@ function unique(values: string[]) {
 
 function formatPercent(value: number | null) {
   if (value === null) {
-    return "unknown";
+    return "정보 없음";
   }
   return `${(value * 100).toLocaleString("ko-KR", {
     minimumFractionDigits: 0,
@@ -110,7 +119,7 @@ function formatPercent(value: number | null) {
 
 function formatMaybeNumber(value: number | null, digits = 2) {
   if (value === null) {
-    return "unknown";
+    return "정보 없음";
   }
   return value.toLocaleString("ko-KR", {
     minimumFractionDigits: 0,
@@ -120,20 +129,20 @@ function formatMaybeNumber(value: number | null, digits = 2) {
 
 function formatExecutionState(execution: OperatorDetailSymbolLike["execution"], riskAllowed: boolean | null) {
   if (!execution.order_id) {
-    return riskAllowed === false ? "실행 없음" : "주문 없음";
+    return riskAllowed === false ? "진입 보류" : "주문 없음";
   }
-  return execution.execution_status ?? execution.order_status ?? "pending";
+  return execution.execution_status ?? execution.order_status ?? "진행 중";
 }
 
 function translateFlag(value: string) {
   const labels: Record<string, string> = {
-    account: "account stale",
-    positions: "positions stale",
-    open_orders: "open orders stale",
-    protective_orders: "protective orders stale",
-    market_snapshot: "market snapshot stale",
-    market_snapshot_incomplete: "market snapshot incomplete",
-    feature_input_missing: "feature input missing",
+    account: "계좌 정보가 늦게 들어오고 있습니다.",
+    positions: "포지션 정보가 늦게 들어오고 있습니다.",
+    open_orders: "주문 정보가 늦게 들어오고 있습니다.",
+    protective_orders: "보호 주문 정보가 늦게 들어오고 있습니다.",
+    market_snapshot: "시장 스냅샷이 늦게 갱신되고 있습니다.",
+    market_snapshot_incomplete: "시장 스냅샷 일부가 비어 있습니다.",
+    feature_input_missing: "판단에 필요한 일부 입력이 비어 있습니다.",
   };
   return labels[value] ?? value;
 }
@@ -167,6 +176,35 @@ function fallbackAiRiskState(decision: string | null | undefined) {
   }
 }
 
+function toneForReasonCode(code: string): OperatorDetailTone {
+  switch (code) {
+    case "manual_no_trade_active":
+    case "operator_force_no_trade":
+    case "operator_bias_no_trade":
+    case "alignment_conflict_block":
+      return "danger";
+    case "outside_valid_window":
+    case "alignment_insufficient_data":
+    case "ai_unavailable":
+    case "ai_stale":
+    case "ai_incomplete":
+    case "operator_unavailable":
+    case "event_context_stale":
+    case "event_context_incomplete":
+    case "event_context_unavailable":
+      return "warn";
+    default:
+      return "neutral";
+  }
+}
+
+function boolToKorean(value: boolean | null | undefined) {
+  if (value == null) {
+    return "정보 없음";
+  }
+  return value ? "예" : "아니오";
+}
+
 export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): OperatorDetailSection[] {
   const regime = asRecord(symbol.market_context_summary);
   const derivatives = asRecord(symbol.derivatives_summary);
@@ -176,12 +214,26 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
   const operatorEventView = eventControl?.operator_event_view ?? null;
   const alignmentDecision = eventControl?.alignment_decision ?? null;
   const manualWindows = eventControl?.manual_no_trade_windows ?? [];
+  const activeWindows = manualWindows.filter((window) => window.is_active);
+
   const blockedReasons = unique(
     symbol.risk_guard.blocked_reason_codes.length > 0
       ? symbol.risk_guard.blocked_reason_codes
       : symbol.blocked_reasons,
   );
   const degradedFlags = unique(symbol.stale_flags);
+
+  const rawEventSourceStatus = asString(eventContext.source_status) ?? "unknown";
+  const normalizedEventSourceStatus = normalizeSourceStatus(rawEventSourceStatus);
+  const eventSourceProvenance = inferEventSourceProvenance({
+    source_status: rawEventSourceStatus,
+    source_provenance: asString(eventContext.source_provenance),
+  });
+  const rawAiSourceState = eventControl?.ai_event_view?.source_state ?? "unknown";
+  const rawAlignmentStatus = alignmentDecision?.alignment_status ?? "insufficient_data";
+  const rawEffectivePolicyPreview =
+    eventControl?.effective_policy_preview ?? alignmentDecision?.effective_policy_preview ?? "insufficient_data";
+
   const aiBias = describeEventBias(eventControl?.ai_event_view?.ai_bias ?? fallbackAiBias(symbol.ai_decision.decision));
   const aiRiskState = describeRiskState(
     eventControl?.ai_event_view?.ai_risk_state ?? fallbackAiRiskState(symbol.ai_decision.decision),
@@ -194,159 +246,249 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
     eventControl?.ai_event_view?.scenario_note
     ?? symbol.ai_decision.scenario_note
     ?? symbol.ai_decision.event_risk_acknowledgement
-    ?? "unknown";
+    ?? "정보 없음";
   const aiPenaltyReason =
     eventControl?.ai_event_view?.confidence_penalty_reason
     ?? symbol.ai_decision.confidence_penalty_reason
-    ?? "unknown";
-  const aiSourceState = describeSourceStatus(eventControl?.ai_event_view?.source_state ?? "unknown");
-  const eventSourceStatus = describeSourceStatus(asString(eventContext.source_status));
-  const activeRiskWindow = asBoolean(eventContext.active_risk_window);
-  const nextEventName = asString(eventContext.next_event_name) ?? "unknown";
-  const nextEventTime = formatUtcTimestamp(asString(eventContext.next_event_at));
-  const nextEventImportance = describeImportance(asString(eventContext.next_event_importance));
+    ?? "정보 없음";
+
+  const nextEventName = asString(eventContext.next_event_name) ?? "정보 없음";
   const minutesToNextEvent = asNumber(eventContext.minutes_to_next_event);
-  const effectivePolicyPreview = describeEffectivePolicyPreview(
-    eventControl?.effective_policy_preview ?? alignmentDecision?.effective_policy_preview,
-  );
-  const activeWindows = manualWindows.filter((window) => window.is_active);
-  const riskBlockedReason = symbol.risk_guard.blocked_reason ?? "none";
-  const riskApprovalRequiredReason = symbol.risk_guard.approval_required_reason ?? "none";
-  const riskDegradedReason = symbol.risk_guard.degraded_reason ?? "none";
+  const activeRiskWindow = asBoolean(eventContext.active_risk_window) ?? false;
+
+  const riskBlockedReason = symbol.risk_guard.blocked_reason ?? null;
+  const riskApprovalRequiredReason = symbol.risk_guard.approval_required_reason ?? null;
+  const riskDegradedReason = symbol.risk_guard.degraded_reason ?? null;
   const riskPolicySource = symbol.risk_guard.policy_source ?? "none";
 
+  const policySummary = summarizeEntryPolicy({
+    effectivePolicyPreview: rawEffectivePolicyPreview,
+    blockedReason: riskBlockedReason ?? eventControl?.blocked_reason,
+    approvalRequiredReason: riskApprovalRequiredReason ?? eventControl?.approval_required_reason,
+    policySource: riskPolicySource,
+  });
+
   const blockedAndDegradedAlerts: OperatorDetailAlert[] = [
-    ...blockedReasons.map((code) => ({ tone: "danger" as const, text: `risk 차단: ${code}` })),
-    ...degradedFlags.map((flag) => ({ tone: "warn" as const, text: `상태 저하: ${translateFlag(flag)}` })),
+    ...blockedReasons.map((code) => ({
+      tone: code === riskApprovalRequiredReason ? "warn" as const : "danger" as const,
+      text: describeEventReasonCode(code),
+    })),
+    ...degradedFlags.map((flag) => ({ tone: "warn" as const, text: translateFlag(flag) })),
   ];
-  if (eventSourceStatus !== "available" && eventSourceStatus !== "unknown") {
+
+  if (normalizedEventSourceStatus !== "available" && normalizedEventSourceStatus !== "unknown") {
     blockedAndDegradedAlerts.push({
-      tone: toneForSourceStatus(eventSourceStatus),
-      text: `event source: ${eventSourceStatus}`,
+      tone: toneForSourceStatus(rawEventSourceStatus),
+      text: describeSourceStatusHelp(rawEventSourceStatus, {
+        kind: "event_context",
+        provenance: eventSourceProvenance,
+      }),
     });
   }
-  if (effectivePolicyPreview === "force_no_trade_window" || effectivePolicyPreview === "block_new_entries") {
+  if (riskDegradedReason) {
     blockedAndDegradedAlerts.push({
-      tone: toneForPolicyPreview(effectivePolicyPreview),
-      text: `preview: ${effectivePolicyPreview} (entry semantics mirrored in risk_guard)`,
+      tone: "warn",
+      text: describeEventReasonCode(riskDegradedReason),
     });
-  }
-  if (riskDegradedReason !== "none") {
-    blockedAndDegradedAlerts.push({ tone: "warn", text: `event policy degraded: ${riskDegradedReason}` });
   }
   if (blockedAndDegradedAlerts.length === 0) {
-    blockedAndDegradedAlerts.push({ tone: "neutral", text: "현재 차단/저하 사유 없음" });
+    blockedAndDegradedAlerts.push({ tone: "neutral", text: "현재 막히거나 주의할 상태는 없습니다." });
   }
+
+  const alignmentAlerts =
+    alignmentDecision && alignmentDecision.reason_codes.length > 0
+      ? alignmentDecision.reason_codes.map((code) => ({
+          tone: toneForReasonCode(code),
+          text: describeEventReasonCode(code),
+        }))
+      : [];
 
   return [
     {
       key: "current_regime",
-      title: "Current Regime",
+      title: "현재 레짐",
       tone: "neutral",
       items: [
-        { label: "primary_regime", value: asString(regime.primary_regime) ?? "unknown", hint: "descriptive market regime" },
-        { label: "trend_alignment", value: asString(regime.trend_alignment) ?? "unknown", hint: "방향 정렬 상태" },
-        { label: "volatility_regime", value: asString(regime.volatility_regime) ?? "unknown", hint: "변동성 상태" },
-        { label: "volume_regime", value: asString(regime.volume_regime) ?? "unknown", hint: "거래량 참여도" },
-        { label: "momentum_state", value: asString(regime.momentum_state) ?? "unknown", hint: "모멘텀 상태" },
+        { label: "주요 흐름", value: asString(regime.primary_regime) ?? "정보 없음", hint: "현재 시장 분위기 요약" },
+        { label: "상위 흐름과의 방향", value: asString(regime.trend_alignment) ?? "정보 없음", hint: "큰 흐름과 같은 쪽인지 보여줍니다." },
+        { label: "변동성", value: asString(regime.volatility_regime) ?? "정보 없음", hint: "가격 움직임이 거친지 차분한지 보여줍니다." },
+        { label: "거래량", value: asString(regime.volume_regime) ?? "정보 없음", hint: "시장 참여 강도를 보여줍니다." },
+        { label: "모멘텀", value: asString(regime.momentum_state) ?? "정보 없음", hint: "최근 탄력이 강해지는지 약해지는지 보여줍니다." },
       ],
       alerts: [],
     },
     {
       key: "derivatives_orderbook",
-      title: "Derivatives / Orderbook",
+      title: "파생 / 오더북",
       tone: asBoolean(derivatives.available) ? "neutral" : "warn",
       items: [
-        { label: "available", value: String(asBoolean(derivatives.available) ?? false), hint: `source ${asString(derivatives.source) ?? "unknown"}` },
-        { label: "funding_bias", value: asString(derivatives.funding_bias) ?? "unknown", hint: "funding headwind / tailwind" },
-        { label: "basis_bias", value: asString(derivatives.basis_bias) ?? "unknown", hint: "basis direction" },
-        { label: "taker_flow_alignment", value: asString(derivatives.taker_flow_alignment) ?? "unknown", hint: "taker flow alignment" },
-        { label: "spread_bps", value: asNumber(derivatives.spread_bps) === null ? "unknown" : `${formatMaybeNumber(asNumber(derivatives.spread_bps), 2)}bps`, hint: "spread stress check" },
+        {
+          label: "데이터 상태",
+          value: asBoolean(derivatives.available) ? "정상" : "없음",
+          hint: `데이터 출처: ${asString(derivatives.source) ?? "확인 중"}`,
+        },
+        { label: "펀딩 흐름", value: asString(derivatives.funding_bias) ?? "정보 없음", hint: "롱/숏 쏠림 압력을 간단히 보여줍니다." },
+        { label: "베이시스 흐름", value: asString(derivatives.basis_bias) ?? "정보 없음", hint: "선물 쪽 분위기가 어느 방향인지 보여줍니다." },
+        { label: "체결 흐름", value: asString(derivatives.taker_flow_alignment) ?? "정보 없음", hint: "공격적인 매수/매도 흐름을 요약합니다." },
+        {
+          label: "스프레드",
+          value: asNumber(derivatives.spread_bps) === null ? "정보 없음" : `${formatMaybeNumber(asNumber(derivatives.spread_bps), 2)}bps`,
+          hint: "호가 간격이 넓은지 확인합니다.",
+        },
       ],
       alerts: [],
     },
     {
       key: "upcoming_event_risk",
-      title: "Upcoming Event Risk",
-      tone: activeRiskWindow ? "danger" : toneForSourceStatus(eventSourceStatus),
+      title: "예정 이벤트 리스크",
+      tone: activeRiskWindow ? "danger" : toneForSourceStatus(rawEventSourceStatus),
       items: [
-        { label: "next_event_name", value: nextEventName, hint: "다음 예정 이벤트" },
-        { label: "next_event_time", value: nextEventTime, hint: "UTC" },
-        { label: "minutes_to_next_event", value: minutesToNextEvent === null ? "unknown" : `${minutesToNextEvent}분`, hint: "현재 시각 기준" },
-        { label: "importance", value: nextEventImportance, hint: "event importance" },
-        { label: "active_risk_window", value: activeRiskWindow ? "active" : "inactive", hint: asString(eventContext.summary_note) ?? "window summary" },
-        { label: "source_status", value: eventSourceStatus, hint: `stale=${String(asBoolean(eventContext.is_stale) ?? false)} / complete=${String(asBoolean(eventContext.is_complete) ?? false)}` },
+        { label: "다음 이벤트", value: nextEventName, hint: "가장 가까운 중요 일정입니다." },
+        { label: "이벤트 시각", value: formatUtcTimestamp(asString(eventContext.next_event_at)), hint: "모든 시각은 UTC 기준입니다." },
+        {
+          label: "남은 시간",
+          value: minutesToNextEvent === null ? "정보 없음" : `${minutesToNextEvent}분`,
+          hint: "지금 시각을 기준으로 계산했습니다.",
+        },
+        { label: "중요도", value: describeImportance(asString(eventContext.next_event_importance)), hint: "이 일정이 시장에 줄 수 있는 영향 수준입니다." },
+        {
+          label: "위험 구간",
+          value: activeRiskWindow ? "현재 주의 구간" : "현재는 아님",
+          hint: asString(eventContext.summary_note) ?? "추가 설명 없음",
+        },
+        {
+          label: "데이터 출처",
+          value: describeEventSourceProvenance(eventSourceProvenance),
+          hint: "실제 연결 데이터인지, 샘플/예시 데이터인지 알려줍니다.",
+        },
+        {
+          label: "데이터 상태",
+          value: describeSourceStatus(rawEventSourceStatus, { kind: "event_context" }),
+          hint: `지연 여부: ${boolToKorean(asBoolean(eventContext.is_stale))} / 정보 완전성: ${boolToKorean(asBoolean(eventContext.is_complete))}`,
+        },
       ],
       alerts:
-        eventSourceStatus !== "available" && eventSourceStatus !== "unknown"
-          ? [{ tone: toneForSourceStatus(eventSourceStatus), text: `source status ${eventSourceStatus}` }]
+        normalizedEventSourceStatus !== "available" && normalizedEventSourceStatus !== "unknown"
+          ? [{
+              tone: toneForSourceStatus(rawEventSourceStatus),
+              text: describeSourceStatusHelp(rawEventSourceStatus, {
+                kind: "event_context",
+                provenance: eventSourceProvenance,
+              }),
+            }]
           : [],
     },
     {
       key: "ai_event_view",
-      title: "AI Event View",
-      tone: aiSourceState === "available" ? "neutral" : "warn",
+      title: "AI 이벤트 뷰",
+      tone: rawAiSourceState === "available" ? "neutral" : "warn",
       items: [
-        { label: "ai_bias", value: aiBias, hint: "AI event-aware bias" },
-        { label: "ai_risk_state", value: aiRiskState, hint: "AI event-aware risk state" },
-        { label: "ai_confidence", value: aiConfidence === null ? "unknown" : aiConfidence.toFixed(2), hint: "preview only" },
-        { label: "source_state", value: aiSourceState, hint: "unknown / unavailable is explicit" },
-        { label: "scenario_note", value: aiScenarioNote, hint: "AI scenario note" },
-        { label: "confidence_penalty_reason", value: aiPenaltyReason, hint: "confidence penalty reason" },
+        { label: "AI 방향", value: aiBias, hint: "AI가 이벤트를 감안해 본 방향입니다." },
+        { label: "AI 위험 판단", value: aiRiskState, hint: "AI가 본 현재 위험 수준입니다." },
+        { label: "AI 신뢰도", value: aiConfidence === null ? "정보 없음" : aiConfidence.toFixed(2), hint: "AI 판단 확신도를 숫자로 보여줍니다." },
+        {
+          label: "AI 의견 상태",
+          value: describeSourceStatus(rawAiSourceState, { kind: "ai_event_view" }),
+          hint: "의견이 없거나 비어 있는 경우도 숨기지 않습니다.",
+        },
+        { label: "AI 메모", value: aiScenarioNote, hint: "AI가 남긴 짧은 상황 설명입니다." },
+        { label: "신뢰도 조정 이유", value: aiPenaltyReason, hint: "AI가 신뢰도를 낮춘 이유가 있으면 보여줍니다." },
       ],
       alerts:
-        aiSourceState === "available"
+        rawAiSourceState === "available"
           ? []
-          : [{ tone: "warn", text: "AI event-aware output unavailable, showing explicit unknown values." }],
+          : [{ tone: "warn", text: "AI가 이벤트 관련 의견을 남기지 않았으면 그대로 미설정으로 표시합니다." }],
     },
     {
       key: "operator_event_view",
-      title: "Operator Event View",
+      title: "운영자 이벤트 뷰",
       tone: operatorEventView ? "neutral" : "warn",
       items: [
-        { label: "operator_bias", value: describeEventBias(operatorEventView?.operator_bias), hint: "operator override bias" },
-        { label: "operator_risk_state", value: describeRiskState(operatorEventView?.operator_risk_state), hint: "operator override risk state" },
-        { label: "applies_to_symbols", value: operatorEventView && operatorEventView.applies_to_symbols.length > 0 ? operatorEventView.applies_to_symbols.join(", ") : "global", hint: "empty means global" },
-        { label: "horizon", value: operatorEventView?.horizon ?? "unknown", hint: "operator horizon" },
-        { label: "valid_window", value: `${formatUtcTimestamp(operatorEventView?.valid_from)} ~ ${formatUtcTimestamp(operatorEventView?.valid_to)}`, hint: "UTC" },
-        { label: "enforcement_mode", value: describeEnforcementMode(operatorEventView?.enforcement_mode), hint: operatorEventView?.note ?? "operator note unavailable" },
+        { label: "운영자 방향", value: describeEventBias(operatorEventView?.operator_bias), hint: "운영자가 직접 정한 대응 방향입니다." },
+        { label: "운영자 위험 판단", value: describeRiskState(operatorEventView?.operator_risk_state), hint: "운영자가 본 현재 위험 수준입니다." },
+        {
+          label: "적용 심볼",
+          value: operatorEventView && operatorEventView.applies_to_symbols.length > 0 ? operatorEventView.applies_to_symbols.join(", ") : "전체 심볼",
+          hint: "비워 두면 모든 심볼에 적용됩니다.",
+        },
+        { label: "영향 기간/관점", value: operatorEventView?.horizon ?? "정보 없음", hint: "예: 오늘 이벤트 전후, 이번 주 등으로 적습니다." },
+        {
+          label: "적용 시간",
+          value: `${formatUtcTimestamp(operatorEventView?.valid_from)} ~ ${formatUtcTimestamp(operatorEventView?.valid_to)}`,
+          hint: "모든 시각은 UTC 기준입니다.",
+        },
+        {
+          label: "반영 방식",
+          value: describeEnforcementMode(operatorEventView?.enforcement_mode),
+          hint: operatorEventView?.note ?? "추가 메모 없음",
+        },
       ],
       alerts:
         operatorEventView
           ? []
-          : [{ tone: "warn", text: "Operator event view not configured. Unknown values are expected." }],
+          : [{ tone: "warn", text: "운영자 이벤트 설정이 아직 없습니다. 이 경우 기존 AI와 리스크 기준으로만 움직입니다." }],
     },
     {
       key: "alignment_result",
-      title: "Alignment Result",
-      tone: toneForAlignment(alignmentDecision?.alignment_status),
+      title: "정렬 결과",
+      tone: toneForAlignment(rawAlignmentStatus),
       items: [
-        { label: "alignment_status", value: describeAlignmentStatus(alignmentDecision?.alignment_status), hint: "enum-based alignment" },
-        { label: "reason_codes", value: alignmentDecision && alignmentDecision.reason_codes.length > 0 ? alignmentDecision.reason_codes.join(", ") : "none", hint: "stable reason codes" },
-        { label: "evaluated_at", value: formatUtcTimestamp(alignmentDecision?.evaluated_at), hint: "UTC" },
-        { label: "ai/operator", value: `${aiBias} / ${describeEventBias(alignmentDecision?.operator_bias)}`, hint: `${aiRiskState} / ${describeRiskState(alignmentDecision?.operator_risk_state)}` },
+        { label: "비교 결과", value: describeAlignmentStatus(rawAlignmentStatus), hint: "AI 의견과 운영자 설정을 비교한 결과입니다." },
+        {
+          label: "핵심 이유",
+          value: summarizeReasonCodes(alignmentDecision?.reason_codes),
+          hint: "지금 결과가 나온 이유를 쉬운 문장으로 풉니다.",
+        },
+        { label: "평가 시각", value: formatUtcTimestamp(alignmentDecision?.evaluated_at), hint: "마지막으로 다시 계산한 시각입니다." },
+        {
+          label: "AI / 운영자 방향",
+          value: `${aiBias} / ${describeEventBias(alignmentDecision?.operator_bias)}`,
+          hint: `${aiRiskState} / ${describeRiskState(alignmentDecision?.operator_risk_state)}`,
+        },
       ],
-      alerts: [],
+      alerts: alignmentAlerts,
     },
     {
       key: "effective_trading_policy_preview",
-      title: "Effective Trading Policy Preview",
-      tone: toneForPolicyPreview(effectivePolicyPreview),
+      title: "신규 진입 정책 미리보기",
+      tone: toneForPolicyPreview(rawEffectivePolicyPreview),
       items: [
-        { label: "effective_policy_preview", value: effectivePolicyPreview, hint: "shared event-policy evaluator output" },
-        { label: "enforcement", value: "Entry path mirrored in risk_guard", hint: "reduce / exit / protective recovery remain exempt" },
+        { label: "신규 진입 한 줄 요약", value: policySummary, hint: "운영자가 가장 먼저 보면 되는 요약입니다." },
+        { label: "현재 판단", value: describeEffectivePolicyPreview(rawEffectivePolicyPreview), hint: "지금 신규 진입을 어떻게 다루는지 보여줍니다." },
+        { label: "판단 기준", value: describePolicySource(riskPolicySource), hint: "어떤 근거가 가장 크게 반영됐는지 보여줍니다." },
+        {
+          label: "적용 범위",
+          value: "신규 진입에만 적용",
+          hint: "청산·축소 같은 안전 조치는 계속 허용됩니다.",
+        },
       ],
-      alerts: [{ tone: toneForPolicyPreview(effectivePolicyPreview), text: "Preview mirrors current risk_guard semantics for new entries." }],
+      alerts: [
+        { tone: toneForPolicyPreview(rawEffectivePolicyPreview), text: "실제 신규 진입 판단도 같은 기준을 씁니다." },
+      ],
     },
     {
       key: "manual_no_trade_window",
-      title: "Manual No-Trade Window",
+      title: "수동 노트레이드 윈도우",
       tone: activeWindows.length > 0 ? "danger" : "neutral",
       items: [
-        { label: "active_windows", value: String(activeWindows.length), hint: "any-active => preview force_no_trade_window" },
-        { label: "latest_window_scope", value: manualWindows[0] ? describeWindowScope(manualWindows[0].scope) : "none", hint: manualWindows[0] ? manualWindows[0].window_id : "stored window 없음" },
-        { label: "latest_window_time", value: manualWindows[0] ? `${formatUtcTimestamp(manualWindows[0].start_at)} ~ ${formatUtcTimestamp(manualWindows[0].end_at)}` : "none", hint: "UTC" },
-        { label: "flags", value: manualWindows[0] ? `auto_resume=${String(manualWindows[0].auto_resume)} / require_manual_rearm=${String(manualWindows[0].require_manual_rearm)}` : "none", hint: manualWindows[0]?.reason ?? "window reason unavailable" },
+        { label: "현재 적용 중인 구간 수", value: String(activeWindows.length), hint: "하나라도 활성화되어 있으면 신규 진입 금지에 반영됩니다." },
+        {
+          label: "가장 최근 적용 범위",
+          value: manualWindows[0] ? describeWindowScope(manualWindows[0].scope) : "없음",
+          hint: manualWindows[0] ? `설정 ID: ${manualWindows[0].window_id}` : "저장된 설정 없음",
+        },
+        {
+          label: "가장 최근 적용 시간",
+          value: manualWindows[0] ? `${formatUtcTimestamp(manualWindows[0].start_at)} ~ ${formatUtcTimestamp(manualWindows[0].end_at)}` : "없음",
+          hint: "모든 시각은 UTC 기준입니다.",
+        },
+        {
+          label: "추가 옵션",
+          value: manualWindows[0]
+            ? describeManualWindowFlags(manualWindows[0].auto_resume, manualWindows[0].require_manual_rearm)
+            : "없음",
+          hint: manualWindows[0]?.reason ?? "사유 없음",
+        },
       ],
       alerts:
         activeWindows.length > 0
@@ -354,31 +496,51 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
               tone: "danger" as const,
               text: `${window.window_id}: ${window.reason} (${formatUtcTimestamp(window.start_at)} ~ ${formatUtcTimestamp(window.end_at)})`,
             }))
-          : [{ tone: "neutral", text: "활성 manual no-trade window 없음" }],
+          : [{ tone: "neutral", text: "현재 활성 수동 노트레이드 윈도우가 없습니다." }],
     },
     {
       key: "risk_guard_decision",
-      title: "Risk Guard Decision",
+      title: "리스크 가드 판정",
       tone: symbol.risk_guard.allowed === false ? "danger" : symbol.risk_guard.allowed ? "good" : "neutral",
       items: [
-        { label: "allowed", value: symbol.risk_guard.allowed === null ? "unknown" : symbol.risk_guard.allowed ? "allow" : "block", hint: "risk_guard final gate" },
-        { label: "decision", value: symbol.risk_guard.decision ?? "unknown", hint: symbol.risk_guard.operating_state ?? "operating state unavailable" },
-        { label: "approved_risk_pct", value: formatPercent(symbol.risk_guard.approved_risk_pct), hint: "approved risk percentage" },
-        { label: "approved_leverage", value: symbol.risk_guard.approved_leverage === null ? "unknown" : `${formatMaybeNumber(symbol.risk_guard.approved_leverage, 1)}x`, hint: "approved leverage" },
-        { label: "blocked_reason", value: riskBlockedReason, hint: "event-policy hard block code when present" },
-        { label: "approval_required_reason", value: riskApprovalRequiredReason, hint: "manual approval code when present" },
-        { label: "policy_source", value: riskPolicySource, hint: "source layer that produced the current event policy result" },
-        { label: "execution_state", value: formatExecutionState(symbol.execution, symbol.risk_guard.allowed), hint: "latest execution status" },
+        {
+          label: "최종 결과",
+          value: symbol.risk_guard.allowed === null ? "정보 없음" : symbol.risk_guard.allowed ? "허용" : "차단",
+          hint: "신규 진입 직전에 거치는 마지막 안전 점검 결과입니다.",
+        },
+        { label: "판단 방향", value: symbol.risk_guard.decision ?? "정보 없음", hint: symbol.risk_guard.operating_state ?? "운영 상태 정보 없음" },
+        { label: "허용 위험 비중", value: formatPercent(symbol.risk_guard.approved_risk_pct), hint: "이번 진입에 허용된 최대 위험 비중입니다." },
+        { label: "허용 레버리지", value: symbol.risk_guard.approved_leverage === null ? "정보 없음" : `${formatMaybeNumber(symbol.risk_guard.approved_leverage, 1)}x`, hint: "이번 진입에 허용된 최대 레버리지입니다." },
+        {
+          label: "차단 사유",
+          value: describeEventReasonCode(riskBlockedReason),
+          hint: "신규 진입이 막힌 가장 직접적인 이유입니다.",
+        },
+        {
+          label: "추가 확인 사유",
+          value: describeEventReasonCode(riskApprovalRequiredReason),
+          hint: "한 번 더 확인이 필요한 경우 그 이유를 보여줍니다.",
+        },
+        { label: "판단 기준", value: describePolicySource(riskPolicySource), hint: "어떤 근거가 이번 판단을 이끌었는지 보여줍니다." },
+        { label: "실행 상태", value: formatExecutionState(symbol.execution, symbol.risk_guard.allowed), hint: "최근 주문/실행 상태를 함께 보여줍니다." },
       ],
       alerts: [],
     },
     {
       key: "blocked_degraded_reason",
-      title: "Blocked / Degraded",
+      title: "차단 / 저하 상태",
       tone: blockedReasons.length > 0 ? "danger" : degradedFlags.length > 0 ? "warn" : "neutral",
       items: [
-        { label: "blocked_reason_count", value: String(blockedReasons.length), hint: blockedReasons.length > 0 ? blockedReasons.join(", ") : "blocked reason 없음" },
-        { label: "degraded_flag_count", value: String(degradedFlags.length), hint: degradedFlags.length > 0 ? degradedFlags.map(translateFlag).join(", ") : "degraded flag 없음" },
+        {
+          label: "현재 차단 이유",
+          value: blockedReasons.length > 0 ? blockedReasons.map((code) => describeEventReasonCode(code)).join(" / ") : "없음",
+          hint: "지금 신규 진입을 막고 있는 이유입니다.",
+        },
+        {
+          label: "주의가 필요한 상태",
+          value: degradedFlags.length > 0 ? degradedFlags.map((flag) => translateFlag(flag)).join(" / ") : "없음",
+          hint: "데이터 지연이나 불완전 상태를 함께 보여줍니다.",
+        },
       ],
       alerts: blockedAndDegradedAlerts,
     },

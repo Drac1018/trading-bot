@@ -26,7 +26,9 @@ RegimeExecution = Literal["clean", "normal", "stress", "unavailable"]
 PersistenceClass = Literal["early", "established", "extended"]
 TransitionRisk = Literal["low", "medium", "high"]
 DataQualityGrade = Literal["complete", "partial", "degraded", "unavailable"]
-EventSourceStatus = Literal["fixture", "stub", "unavailable", "stale", "incomplete"]
+EventSourceStatus = Literal["fixture", "stub", "external_api", "unavailable", "stale", "incomplete", "error"]
+EventSourceProvenance = Literal["fixture", "stub", "external_api"]
+EventSourceVendor = Literal["fred", "bls", "bea"]
 MacroEventImportance = Literal["low", "medium", "high"]
 EventBias = Literal["bullish", "bearish", "neutral"]
 OperatorEventBias = Literal["bullish", "bearish", "neutral", "no_trade", "unknown"]
@@ -1560,10 +1562,14 @@ class MacroEventPayload(StrictBaseModel):
     risk_window_before_minutes: int = Field(default=60, ge=0, le=10080)
     risk_window_after_minutes: int = Field(default=30, ge=0, le=10080)
     active_risk_window: bool = False
+    enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
+    release_enrichment: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class EventContextPayload(StrictBaseModel):
     source_status: EventSourceStatus = "unavailable"
+    source_provenance: EventSourceProvenance | None = None
+    source_vendor: EventSourceVendor | None = None
     generated_at: datetime
     is_stale: bool = False
     is_complete: bool = False
@@ -1574,6 +1580,7 @@ class EventContextPayload(StrictBaseModel):
     active_risk_window: bool = False
     affected_assets: list[str] = Field(default_factory=list)
     event_bias: EventBias | None = None
+    enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
     events: list[MacroEventPayload] = Field(default_factory=list)
 
 
@@ -1602,6 +1609,8 @@ class OperatorActiveRiskWindowPayload(StrictBaseModel):
 
 class OperatorEventContextPayload(StrictBaseModel):
     source_status: OperatorEventSourceStatus = "unavailable"
+    source_provenance: EventSourceProvenance | None = None
+    source_vendor: EventSourceVendor | None = None
     generated_at: datetime
     is_stale: bool = False
     is_complete: bool = False
@@ -1613,6 +1622,7 @@ class OperatorEventContextPayload(StrictBaseModel):
     minutes_to_next_event: int | None = None
     upcoming_events: list[OperatorEventItemPayload] = Field(default_factory=list)
     affected_assets: list[str] = Field(default_factory=list)
+    enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
     summary_note: str | None = None
 
     _normalize_generated_at = field_validator("generated_at", mode="before")(_coerce_required_aware_datetime)
@@ -1785,11 +1795,14 @@ class LeadLagSummaryPayload(StrictBaseModel):
 
 class EventContextSummaryPayload(StrictBaseModel):
     source_status: EventSourceStatus = "unavailable"
+    source_provenance: EventSourceProvenance | None = None
+    source_vendor: EventSourceVendor | None = None
     next_event_name: str | None = None
     next_event_importance: MacroEventImportance | None = None
     minutes_to_next_event: int | None = None
     active_risk_window: bool = False
     event_bias: EventBias | None = None
+    enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
 
 
 class MarketSnapshotPayload(StrictBaseModel):
@@ -2190,10 +2203,16 @@ class AppSettingsResponse(StrictBaseModel):
     binance_market_data_enabled: bool
     binance_testnet_enabled: bool
     binance_futures_enabled: bool
+    event_source_provider: Literal["stub", "fred"] | None = None
+    event_source_api_url: str | None = None
+    event_source_timeout_seconds: float | None = None
+    event_source_default_assets: list[str] = Field(default_factory=list)
+    event_source_fred_release_ids: list[int] = Field(default_factory=list)
     mode: str
     openai_api_key_configured: bool
     binance_api_key_configured: bool
     binance_api_secret_configured: bool
+    event_source_api_key_configured: bool
     recent_ai_calls_24h: int
     recent_ai_calls_7d: int
     recent_ai_successes_24h: int
@@ -2285,9 +2304,15 @@ class AppSettingsViewResponse(StrictBaseModel):
     binance_market_data_enabled: bool
     binance_testnet_enabled: bool
     binance_futures_enabled: bool
+    event_source_provider: Literal["stub", "fred"] | None = None
+    event_source_api_url: str | None = None
+    event_source_timeout_seconds: float | None = None
+    event_source_default_assets: list[str] = Field(default_factory=list)
+    event_source_fred_release_ids: list[int] = Field(default_factory=list)
     openai_api_key_configured: bool
     binance_api_key_configured: bool
     binance_api_secret_configured: bool
+    event_source_api_key_configured: bool
 
 
 class AppSettingsCadenceResponse(StrictBaseModel):
@@ -2359,12 +2384,19 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     binance_market_data_enabled: bool
     binance_testnet_enabled: bool
     binance_futures_enabled: bool
+    event_source_provider: Literal["stub", "fred"] | None = None
+    event_source_api_url: str | None = Field(default=None, max_length=255)
+    event_source_timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
+    event_source_default_assets: list[str] = Field(default_factory=list)
+    event_source_fred_release_ids: list[int] = Field(default_factory=list)
     openai_api_key: str | None = None
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
+    event_source_api_key: str | None = None
     clear_openai_api_key: bool = False
     clear_binance_api_key: bool = False
     clear_binance_api_secret: bool = False
+    clear_event_source_api_key: bool = False
 
 
 class OpenAIConnectionTestRequest(StrictBaseModel):
@@ -2376,6 +2408,16 @@ class BinanceConnectionTestRequest(StrictBaseModel):
     api_key: str | None = None
     api_secret: str | None = None
     testnet_enabled: bool = False
+    symbol: str = Field(default="BTCUSDT", min_length=1, max_length=30)
+    timeframe: str = Field(default="15m", min_length=1, max_length=20)
+
+
+class FredConnectionTestRequest(StrictBaseModel):
+    api_key: str | None = None
+    api_url: str | None = Field(default=None, max_length=255)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=120.0)
+    release_ids: list[int] = Field(default_factory=list)
+    default_assets: list[str] = Field(default_factory=list)
     symbol: str = Field(default="BTCUSDT", min_length=1, max_length=30)
     timeframe: str = Field(default="15m", min_length=1, max_length=20)
 

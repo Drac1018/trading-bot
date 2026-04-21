@@ -195,6 +195,7 @@ def compact_audit_payload(
             source.get("event_context"),
             allowed_keys=(
                 "source_status",
+                "source_provenance",
                 "is_stale",
                 "is_complete",
                 "next_event_name",

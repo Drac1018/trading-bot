@@ -4,10 +4,14 @@ import test from "node:test";
 import type { OperatorDetailSymbolLike } from "./operator-symbol-detail";
 
 type OperatorSymbolDetailModule = typeof import("./operator-symbol-detail");
+type EventOperatorControlModule = typeof import("./event-operator-control");
 
 const operatorSymbolDetailModule = import(
   new URL("./operator-symbol-detail.ts", import.meta.url).href,
 ) as Promise<OperatorSymbolDetailModule>;
+const eventOperatorControlModule = import(
+  new URL("./event-operator-control.ts", import.meta.url).href,
+) as Promise<EventOperatorControlModule>;
 
 function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSymbolLike {
   return {
@@ -31,6 +35,7 @@ function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSym
     },
     event_context_summary: {
       source_status: "stub",
+      source_provenance: "stub",
       next_event_name: "FOMC",
       next_event_at: "2026-04-20T12:30:00Z",
       next_event_importance: "high",
@@ -42,6 +47,7 @@ function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSym
     event_operator_control: {
       event_context: {
         source_status: "available",
+        source_provenance: "fixture",
         generated_at: "2026-04-20T11:00:00Z",
         is_stale: false,
         is_complete: true,
@@ -133,10 +139,12 @@ function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSym
   } as OperatorDetailSymbolLike;
 }
 
-test("buildOperatorDetailSections exposes the additive event/operator sections in stable order", async () => {
+test("buildOperatorDetailSections keeps the additive event/operator sections in stable order", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
+  const { describeEventSourceProvenance } = await eventOperatorControlModule;
 
   const sections = buildOperatorDetailSections(buildSymbol());
+  const eventSection = sections.find((section) => section.key === "upcoming_event_risk");
 
   assert.deepEqual(
     sections.map((section) => section.key),
@@ -153,9 +161,28 @@ test("buildOperatorDetailSections exposes the additive event/operator sections i
       "blocked_degraded_reason",
     ],
   );
+  assert.deepEqual(
+    sections.map((section) => section.title),
+    [
+      "현재 레짐",
+      "파생 / 오더북",
+      "예정 이벤트 리스크",
+      "AI 이벤트 뷰",
+      "운영자 이벤트 뷰",
+      "정렬 결과",
+      "신규 진입 정책 미리보기",
+      "수동 노트레이드 윈도우",
+      "리스크 가드 판정",
+      "차단 / 저하 상태",
+    ],
+  );
+  assert.equal(
+    eventSection?.items.find((item) => item.label === "데이터 출처")?.value,
+    describeEventSourceProvenance("fixture"),
+  );
 });
 
-test("buildOperatorDetailSections exposes preview text as mirrored risk semantics", async () => {
+test("buildOperatorDetailSections exposes user-facing preview text", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
 
   const sections = buildOperatorDetailSections(buildSymbol());
@@ -163,18 +190,22 @@ test("buildOperatorDetailSections exposes preview text as mirrored risk semantic
 
   assert.ok(previewSection);
   assert.equal(previewSection.tone, "warn");
-  assert.ok(previewSection.items.some((item) => item.value === "allow_with_approval"));
-  assert.ok(previewSection.alerts.some((alert) => alert.text.includes("Preview mirrors current risk_guard semantics")));
+  assert.ok(previewSection.items.some((item) => item.value === "승인 후 가능"));
+  assert.ok(previewSection.items.some((item) => item.label === "신규 진입 한 줄 요약"));
+  assert.ok(previewSection.alerts.some((alert) => alert.text.includes("실제 신규 진입 판단도 같은 기준")));
 });
 
-test("buildOperatorDetailSections shows source unavailable explicitly in upcoming event risk", async () => {
+test("buildOperatorDetailSections keeps unavailable source visible in plain language", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
+  const { describeEventSourceProvenance, describeSourceStatus, describeSourceStatusHelp } =
+    await eventOperatorControlModule;
 
   const sections = buildOperatorDetailSections(
     buildSymbol({
       event_operator_control: {
         event_context: {
           source_status: "unavailable",
+          source_provenance: "stub",
           generated_at: "2026-04-20T11:00:00Z",
           is_stale: false,
           is_complete: false,
@@ -237,10 +268,26 @@ test("buildOperatorDetailSections shows source unavailable explicitly in upcomin
   const blockedSection = sections.find((section) => section.key === "blocked_degraded_reason");
 
   assert.ok(eventSection);
-  assert.equal(eventSection.tone, "danger");
-  assert.equal(eventSection.items.find((item) => item.label === "source_status")?.value, "unavailable");
+  assert.equal(eventSection.tone, "neutral");
+  assert.equal(
+    eventSection.items.find((item) => item.label === "데이터 상태")?.value,
+    describeSourceStatus("unavailable", { kind: "event_context" }),
+  );
+  assert.equal(
+    eventSection.items.find((item) => item.label === "데이터 출처")?.value,
+    describeEventSourceProvenance("stub"),
+  );
   assert.ok(blockedSection);
-  assert.ok(blockedSection.alerts.some((alert) => alert.text.includes("event source: unavailable")));
+  assert.ok(
+    blockedSection.alerts.some((alert) =>
+      alert.text.includes(
+        describeSourceStatusHelp("unavailable", {
+          kind: "event_context",
+          provenance: "stub",
+        }),
+      ),
+    ),
+  );
 });
 
 test("buildOperatorDetailSections keeps manual no-trade windows visible with active state", async () => {
@@ -287,5 +334,5 @@ test("buildOperatorDetailSections keeps manual no-trade windows visible with act
   assert.ok(windowSection.alerts.some((alert) => alert.text.includes("manual no-trade around event window")));
   assert.ok(previewSection);
   assert.equal(previewSection.tone, "danger");
-  assert.ok(previewSection.items.some((item) => item.value === "force_no_trade_window"));
+  assert.ok(previewSection.items.some((item) => item.value === "신규 진입 금지"));
 });

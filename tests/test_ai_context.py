@@ -368,6 +368,7 @@ def test_build_ai_decision_context_includes_separated_feature_layer_summaries() 
     snapshot, features = _features()
     event_context = EventContextPayload(
         source_status="fixture",
+        source_provenance="fixture",
         generated_at=snapshot.snapshot_time,
         is_stale=False,
         is_complete=True,
@@ -410,4 +411,7 @@ def test_build_ai_decision_context_includes_separated_feature_layer_summaries() 
     assert context.event_context_summary.minutes_to_next_event == 25
     assert context.event_context_summary.active_risk_window is True
     assert context.event_context_summary.source_status == "fixture"
+    assert context.event_context_summary.source_provenance == "fixture"
+    assert context.event_context_summary.source_vendor is None
+    assert context.event_context_summary.enrichment_vendors == []
     assert context.event_context_summary.event_bias == "bearish"

@@ -437,11 +437,14 @@ def build_event_context_summary(
     event_context = features.event_context
     return EventContextSummaryPayload(
         source_status=event_context.source_status,
+        source_provenance=event_context.source_provenance,
+        source_vendor=event_context.source_vendor,
         next_event_name=event_context.next_event_name,
         next_event_importance=event_context.next_event_importance,
         minutes_to_next_event=event_context.minutes_to_next_event,
         active_risk_window=event_context.active_risk_window,
         event_bias=event_context.event_bias,
+        enrichment_vendors=list(event_context.enrichment_vendors),
     )
 
 

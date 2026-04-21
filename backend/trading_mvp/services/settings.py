@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, cast
@@ -85,6 +86,7 @@ class RuntimeCredentials:
     openai_api_key: str
     binance_api_key: str
     binance_api_secret: str
+    event_source_api_key: str
 
 
 @dataclass(slots=True)
@@ -112,6 +114,7 @@ AUTO_RESUME_GRACE_MAX_MINUTES = 15
 DEFAULT_LIMITED_LIVE_MAX_NOTIONAL = 500.0
 DEFAULT_AI_BACKSTOP_ENABLED = True
 DEFAULT_AI_BACKSTOP_INTERVAL_MINUTES = 180
+DEFAULT_EVENT_SOURCE_TIMEOUT_SECONDS = 10.0
 ROLLOUT_MODE_SUBMIT_ENABLED = {"limited_live", "full_live"}
 ROLLOUT_MODE_LIVE_PATH = {"shadow", "live_dry_run", "limited_live", "full_live"}
 RUNTIME_STATE_DETAIL_KEYS = {
@@ -1061,6 +1064,12 @@ def get_or_create_settings(session: Session) -> Setting:
         binance_market_data_enabled=defaults.binance_market_data_enabled,
         binance_testnet_enabled=defaults.binance_testnet_enabled,
         binance_futures_enabled=defaults.binance_futures_enabled,
+        event_source_provider=None,
+        event_source_api_url=None,
+        event_source_timeout_seconds=None,
+        event_source_default_assets=[],
+        event_source_fred_release_ids=[],
+        event_source_api_key_encrypted="",
     )
     session.add(row)
     session.flush()
@@ -1072,15 +1081,59 @@ def get_runtime_credentials(settings_row: Setting, defaults: AppConfig | None = 
     openai_key = decrypt_secret(settings_row.openai_api_key_encrypted, app_defaults.app_secret_seed)
     if not openai_key:
         openai_key = app_defaults.openai_api_key
+    event_source_api_key = decrypt_secret(
+        settings_row.event_source_api_key_encrypted,
+        app_defaults.app_secret_seed,
+    )
+    if not event_source_api_key:
+        event_source_api_key = os.getenv("TRADING_EVENT_SOURCE_API_KEY", "").strip()
     return RuntimeCredentials(
         openai_api_key=openai_key,
         binance_api_key=decrypt_secret(settings_row.binance_api_key_encrypted, app_defaults.app_secret_seed),
         binance_api_secret=decrypt_secret(settings_row.binance_api_secret_encrypted, app_defaults.app_secret_seed),
+        event_source_api_key=event_source_api_key,
     )
 
 
 def _account_sync_stale_seconds(settings_row: Setting) -> int:
     return max(300, settings_row.decision_cycle_interval_minutes * 120)
+
+
+def _normalize_event_source_provider(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if text in {"stub", "fred"}:
+        return text
+    return None
+
+
+def _normalize_optional_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalize_event_source_assets(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    for item in values:
+        text = str(item or "").strip().upper()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _normalize_event_source_release_ids(values: object) -> list[int]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[int] = []
+    for item in values:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0 and parsed not in normalized:
+            normalized.append(parsed)
+    return normalized
 
 
 def _build_unknown_pnl_summary(latest_pnl: PnLSnapshot | None = None) -> dict[str, object]:
@@ -2486,10 +2539,22 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         binance_market_data_enabled=settings_row.binance_market_data_enabled,
         binance_testnet_enabled=settings_row.binance_testnet_enabled,
         binance_futures_enabled=settings_row.binance_futures_enabled,
+        event_source_provider=_normalize_event_source_provider(settings_row.event_source_provider),
+        event_source_api_url=_normalize_optional_text(settings_row.event_source_api_url),
+        event_source_timeout_seconds=(
+            float(settings_row.event_source_timeout_seconds)
+            if settings_row.event_source_timeout_seconds is not None
+            else None
+        ),
+        event_source_default_assets=_normalize_event_source_assets(settings_row.event_source_default_assets),
+        event_source_fred_release_ids=_normalize_event_source_release_ids(
+            settings_row.event_source_fred_release_ids
+        ),
         mode=mode,
         openai_api_key_configured=bool(credentials.openai_api_key),
         binance_api_key_configured=bool(credentials.binance_api_key),
         binance_api_secret_configured=bool(credentials.binance_api_secret),
+        event_source_api_key_configured=bool(credentials.event_source_api_key),
         recent_ai_calls_24h=usage_metrics["recent_ai_calls_24h"],
         recent_ai_calls_7d=usage_metrics["recent_ai_calls_7d"],
         recent_ai_successes_24h=usage_metrics["recent_ai_successes_24h"],
@@ -2678,9 +2743,21 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         binance_market_data_enabled=settings_row.binance_market_data_enabled,
         binance_testnet_enabled=settings_row.binance_testnet_enabled,
         binance_futures_enabled=settings_row.binance_futures_enabled,
+        event_source_provider=_normalize_event_source_provider(settings_row.event_source_provider),
+        event_source_api_url=_normalize_optional_text(settings_row.event_source_api_url),
+        event_source_timeout_seconds=(
+            float(settings_row.event_source_timeout_seconds)
+            if settings_row.event_source_timeout_seconds is not None
+            else None
+        ),
+        event_source_default_assets=_normalize_event_source_assets(settings_row.event_source_default_assets),
+        event_source_fred_release_ids=_normalize_event_source_release_ids(
+            settings_row.event_source_fred_release_ids
+        ),
         openai_api_key_configured=bool(credentials.openai_api_key),
         binance_api_key_configured=bool(credentials.binance_api_key),
         binance_api_secret_configured=bool(credentials.binance_api_secret),
+        event_source_api_key_configured=bool(credentials.event_source_api_key),
     )
     return payload.model_dump(mode="json")
 
@@ -2842,6 +2919,7 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
 def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Setting:
     defaults = get_settings()
     row = get_or_create_settings(session)
+    fields_set = payload.model_fields_set
     tracked_symbols = normalize_symbols(payload.tracked_symbols)
     if payload.default_symbol.upper() not in tracked_symbols:
         tracked_symbols.insert(0, payload.default_symbol.upper())
@@ -2896,6 +2974,22 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.binance_market_data_enabled = payload.binance_market_data_enabled
     row.binance_testnet_enabled = payload.binance_testnet_enabled
     row.binance_futures_enabled = payload.binance_futures_enabled
+    if "event_source_provider" in fields_set:
+        row.event_source_provider = _normalize_event_source_provider(payload.event_source_provider)
+    if "event_source_api_url" in fields_set:
+        row.event_source_api_url = _normalize_optional_text(payload.event_source_api_url)
+    if "event_source_timeout_seconds" in fields_set:
+        row.event_source_timeout_seconds = (
+            float(payload.event_source_timeout_seconds)
+            if payload.event_source_timeout_seconds is not None
+            else None
+        )
+    if "event_source_default_assets" in fields_set:
+        row.event_source_default_assets = _normalize_event_source_assets(payload.event_source_default_assets)
+    if "event_source_fred_release_ids" in fields_set:
+        row.event_source_fred_release_ids = _normalize_event_source_release_ids(
+            payload.event_source_fred_release_ids
+        )
 
     if payload.clear_openai_api_key:
         row.openai_api_key_encrypted = ""
@@ -2911,6 +3005,14 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
         row.binance_api_secret_encrypted = ""
     elif payload.binance_api_secret:
         row.binance_api_secret_encrypted = encrypt_secret(payload.binance_api_secret, defaults.app_secret_seed)
+
+    if payload.clear_event_source_api_key:
+        row.event_source_api_key_encrypted = ""
+    elif payload.event_source_api_key:
+        row.event_source_api_key_encrypted = encrypt_secret(
+            payload.event_source_api_key,
+            defaults.app_secret_seed,
+        )
 
     if not row.live_trading_enabled or not row.manual_live_approval:
         row.live_execution_armed = False

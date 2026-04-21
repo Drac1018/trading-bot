@@ -1,3 +1,5 @@
+import { describeRiskReasonCode } from "./risk-reason-copy.js";
+
 export type OperatorEventBias = "bullish" | "bearish" | "neutral" | "no_trade" | "unknown";
 export type OperatorEventRiskState = "risk_on" | "risk_off" | "neutral" | "unknown";
 export type OperatorEventAlignmentStatus = "aligned" | "partially_aligned" | "conflict" | "insufficient_data";
@@ -6,7 +8,15 @@ export type OperatorEventEnforcementMode =
   | "approval_required"
   | "block_on_conflict"
   | "force_no_trade";
-export type OperatorEventSourceStatus = "available" | "stale" | "incomplete" | "unavailable" | "error";
+export type OperatorEventSourceStatus =
+  | "available"
+  | "fixture"
+  | "stub"
+  | "external_api"
+  | "stale"
+  | "incomplete"
+  | "unavailable"
+  | "error";
 export type OperatorEventImportance = "low" | "medium" | "high" | "critical" | "unknown";
 export type OperatorEffectivePolicyPreview =
   | "allow_normal"
@@ -22,6 +32,9 @@ export type OperatorPolicySource =
   | "none";
 export type AIEventSourceState = OperatorEventSourceStatus | "unknown";
 export type EventControlTone = "good" | "warn" | "danger" | "neutral";
+export type EventSourceDisplayKind = "event_context" | "ai_event_view";
+export type EventSourceProvenance = "external_api" | "fixture" | "stub" | "external" | "disconnected" | "unknown";
+export type EventSourceVendor = "fred" | "bls" | "bea";
 
 export type OperatorEventItemPayload = {
   event_name: string;
@@ -44,6 +57,8 @@ export type OperatorActiveRiskWindowPayload = {
 
 export type OperatorEventContextPayload = {
   source_status: OperatorEventSourceStatus;
+  source_provenance?: EventSourceProvenance | null;
+  source_vendor?: EventSourceVendor | null;
   generated_at: string;
   is_stale: boolean;
   is_complete: boolean;
@@ -55,6 +70,7 @@ export type OperatorEventContextPayload = {
   minutes_to_next_event?: number | null;
   upcoming_events: OperatorEventItemPayload[];
   affected_assets: string[];
+  enrichment_vendors?: EventSourceVendor[];
   summary_note?: string | null;
 };
 
@@ -181,7 +197,7 @@ export function utcInputValueToIso(value: string) {
 export function formatUtcTimestamp(value: string | null | undefined) {
   const parsed = parseTimestamp(value);
   if (!parsed) {
-    return "unknown";
+    return "정보 없음";
   }
   return `${parsed.getUTCFullYear()}-${pad(parsed.getUTCMonth() + 1)}-${pad(parsed.getUTCDate())} ${pad(
     parsed.getUTCHours(),
@@ -189,126 +205,344 @@ export function formatUtcTimestamp(value: string | null | undefined) {
 }
 
 export function describeEventBias(value: string | null | undefined) {
-  switch (value) {
+  const normalizedValue = String(value ?? "").trim().toLowerCase();
+  switch (normalizedValue) {
     case "bullish":
-      return "bullish";
+      return "상승 쪽";
     case "bearish":
-      return "bearish";
+      return "하락 쪽";
     case "neutral":
-      return "neutral";
+      return "중립";
     case "no_trade":
-      return "no_trade";
+      return "신규 진입 안 함";
     default:
-      return "unknown";
+      return "미설정";
   }
 }
 
 export function describeRiskState(value: string | null | undefined) {
   switch (value) {
     case "risk_on":
-      return "risk_on";
+      return "위험 감수 가능";
     case "risk_off":
-      return "risk_off";
+      return "위험 회피";
     case "neutral":
-      return "neutral";
+      return "중립";
     default:
-      return "unknown";
+      return "미설정";
   }
 }
 
 export function describeAlignmentStatus(value: string | null | undefined) {
   switch (value) {
     case "aligned":
-      return "aligned";
+      return "대체로 일치";
     case "partially_aligned":
-      return "partially_aligned";
+      return "일부 차이";
     case "conflict":
-      return "conflict";
+      return "의견 충돌";
     default:
-      return "insufficient_data";
+      return "판단 보류";
   }
 }
 
 export function describeEnforcementMode(value: string | null | undefined) {
   switch (value) {
     case "observe_only":
-      return "observe_only";
+      return "참고만";
     case "approval_required":
-      return "approval_required";
+      return "다르면 한 번 더 확인";
     case "block_on_conflict":
-      return "block_on_conflict";
+      return "충돌하면 신규 진입 중단";
     case "force_no_trade":
-      return "force_no_trade";
+      return "신규 진입 중단";
     default:
-      return "observe_only";
+      return "참고만";
   }
 }
 
-export function describeSourceStatus(value: string | null | undefined) {
-  switch (value) {
+export function inferEventSourceProvenance(
+  value:
+    | Pick<OperatorEventContextPayload, "source_status" | "source_provenance">
+    | Pick<OperatorEventItemPayload, "source_status">
+    | { source_status?: string | null; source_provenance?: string | null }
+    | null
+    | undefined,
+): EventSourceProvenance {
+  const sourceProvenance =
+    value && "source_provenance" in value ? String(value.source_provenance ?? "").trim().toLowerCase() : "";
+  if (sourceProvenance === "external_api" || sourceProvenance === "fixture" || sourceProvenance === "stub") {
+    return sourceProvenance;
+  }
+  const sourceStatus = String(value?.source_status ?? "").trim().toLowerCase();
+  if (sourceStatus === "fixture") {
+    return "fixture";
+  }
+  if (sourceStatus === "stub") {
+    return "stub";
+  }
+  if (sourceStatus === "external_api") {
+    return "external_api";
+  }
+  return "unknown";
+}
+
+export function normalizeSourceStatus(value: string | null | undefined) {
+  switch (String(value ?? "").trim().toLowerCase()) {
     case "available":
+    case "fixture":
+    case "stub":
+    case "external_api":
       return "available";
     case "stale":
-      return "stale";
     case "incomplete":
-      return "incomplete";
     case "unavailable":
-      return "unavailable";
     case "error":
-      return "error";
+      return String(value ?? "").trim().toLowerCase() as "stale" | "incomplete" | "unavailable" | "error";
     default:
       return "unknown";
+  }
+}
+
+export function describeEventSourceProvenance(value: EventSourceProvenance | null | undefined) {
+  switch (value) {
+    case "external_api":
+    case "external":
+      return "external_api";
+    case "fixture":
+      return "fixture";
+    case "stub":
+      return "stub";
+    case "disconnected":
+      return "연결 안 됨";
+    default:
+      return "확인 중";
+  }
+}
+
+export function describeEventSourceVendor(value: EventSourceVendor | null | undefined) {
+  switch (value) {
+    case "fred":
+      return "FRED";
+    case "bls":
+      return "BLS";
+    case "bea":
+      return "BEA";
+    default:
+      return "확인 중";
+  }
+}
+
+export function describeEnrichmentVendors(values: EventSourceVendor[] | null | undefined) {
+  const normalized = Array.from(new Set((values ?? []).filter(Boolean)));
+  return normalized.length > 0 ? normalized.map((value) => describeEventSourceVendor(value)).join(", ") : "없음";
+}
+
+export function describeSourceStatus(
+  value: string | null | undefined,
+  options?: { kind?: EventSourceDisplayKind },
+) {
+  const kind = options?.kind ?? "event_context";
+  const normalizedValue = normalizeSourceStatus(value);
+  switch (normalizedValue) {
+    case "available":
+      return "정상";
+    case "stale":
+      return "조금 늦음";
+    case "incomplete":
+      return "일부 누락";
+    case "unavailable":
+      return kind === "ai_event_view" ? "의견 없음" : "연결 안 됨";
+    case "error":
+      return "확인 오류";
+    default:
+      return kind === "ai_event_view" ? "미설정" : "확인 중";
   }
 }
 
 export function describeImportance(value: string | null | undefined) {
   switch (value) {
     case "low":
-      return "low";
+      return "낮음";
     case "medium":
-      return "medium";
+      return "보통";
     case "high":
-      return "high";
+      return "높음";
     case "critical":
-      return "critical";
+      return "매우 높음";
     default:
-      return "unknown";
+      return "정보 없음";
   }
 }
 
 export function describeEffectivePolicyPreview(value: string | null | undefined) {
   switch (value) {
     case "allow_normal":
-      return "allow_normal";
+      return "평소처럼 가능";
     case "allow_with_approval":
-      return "allow_with_approval";
+      return "승인 후 가능";
     case "block_new_entries":
-      return "block_new_entries";
+      return "신규 진입 보류";
     case "force_no_trade_window":
-      return "force_no_trade_window";
+      return "신규 진입 금지";
     default:
-      return "insufficient_data";
+      return "판단 보류";
   }
 }
 
 export function describeWindowScope(scope: ManualNoTradeWindowScopePayload | null | undefined) {
   if (!scope) {
-    return "global";
+    return "전체 심볼";
   }
   if (scope.scope_type === "symbols") {
-    return scope.symbols.length > 0 ? `symbols: ${scope.symbols.join(", ")}` : "symbols";
+    return scope.symbols.length > 0 ? `선택 심볼: ${scope.symbols.join(", ")}` : "선택 심볼";
   }
-  return "global";
+  return "전체 심볼";
+}
+
+export function describePolicySource(value: string | null | undefined) {
+  switch (value) {
+    case "manual_no_trade_window":
+      return "직접 설정한 진입 중지 시간";
+    case "operator_enforcement_mode":
+      return "운영자 적용 방식";
+    case "operator_bias":
+      return "운영자 방향 설정";
+    case "alignment_policy":
+      return "AI와 운영자 의견 비교";
+    default:
+      return "추가 제한 없음";
+  }
+}
+
+export function describeSourceStatusHelp(
+  value: string | null | undefined,
+  options?: { kind?: EventSourceDisplayKind; provenance?: EventSourceProvenance | null | undefined },
+) {
+  const kind = options?.kind ?? "event_context";
+  const provenance = options?.provenance ?? null;
+  const normalizedValue = normalizeSourceStatus(value);
+  if (kind === "event_context" && provenance === "fixture") {
+    return "현재는 샘플 이벤트 일정으로 보여주고 있습니다. 실제 외부 일정 연동은 아직 연결되지 않았습니다.";
+  }
+  if (kind === "event_context" && provenance === "stub") {
+    return "현재는 임시 예시 데이터를 보여주고 있습니다. 실제 이벤트 데이터를 아직 연결하지 않은 상태입니다.";
+  }
+  switch (value) {
+    case "available":
+      return kind === "ai_event_view"
+        ? "AI가 이벤트 관련 의견을 남겨 두었습니다."
+        : "이벤트 정보를 정상적으로 읽어 왔습니다.";
+    case "fixture":
+      return "현재는 샘플 이벤트 일정으로 보여주고 있습니다. 실제 외부 일정 연동은 아직 연결되지 않았습니다.";
+    case "stub":
+      return "현재는 임시 예시 데이터를 보여주고 있습니다. 실제 이벤트 데이터를 아직 연결하지 않은 상태입니다.";
+    case "stale":
+      return kind === "ai_event_view"
+        ? "AI 의견이 최신 상황보다 조금 늦을 수 있습니다."
+        : "이벤트 정보가 최신 상황보다 조금 늦을 수 있습니다.";
+    case "incomplete":
+      return kind === "ai_event_view"
+        ? "AI 의견에 일부 정보가 비어 있습니다."
+        : "이벤트 정보 중 일부가 비어 있습니다.";
+    case "unavailable":
+      return kind === "ai_event_view"
+        ? "AI가 아직 이벤트 관련 의견을 남기지 않았습니다."
+        : "이벤트 일정 데이터가 아직 연결되지 않았습니다.";
+    case "error":
+      return kind === "ai_event_view"
+        ? "AI 이벤트 의견을 읽는 중 문제가 발생했습니다."
+        : "이벤트 정보를 읽는 중 문제가 발생했습니다.";
+    default:
+      return kind === "ai_event_view"
+        ? "AI 이벤트 의견 상태를 아직 확인하지 못했습니다."
+        : "이벤트 정보 상태를 아직 확인하지 못했습니다.";
+  }
+}
+
+export function describeEventReasonCode(value: string | null | undefined) {
+  switch (value) {
+    case "manual_no_trade_active":
+      return "직접 설정한 신규 진입 중지 시간이 지금 적용 중입니다.";
+    case "operator_no_trade":
+      return "운영자 설정이 신규 진입 안 함으로 되어 있습니다.";
+    case "operator_force_no_trade":
+      return "운영자 설정상 지금은 신규 진입을 멈추도록 되어 있습니다.";
+    case "operator_bias_no_trade":
+      return "운영자 설정의 신규 진입 중지 시간이 현재 시각에 적용됩니다.";
+    case "bias_conflict":
+      return "AI 의견과 운영자 방향이 다릅니다.";
+    case "risk_state_conflict":
+      return "AI와 운영자가 보는 위험 수준이 다릅니다.";
+    case "ai_unavailable":
+      return "AI의 이벤트 의견이 아직 없습니다.";
+    case "ai_stale":
+      return "AI 의견이 최신 상황보다 조금 늦을 수 있습니다.";
+    case "ai_incomplete":
+      return "AI 의견에 일부 정보가 빠져 있습니다.";
+    case "ai_error":
+      return "AI 의견을 읽는 중 문제가 발생했습니다.";
+    case "operator_unavailable":
+      return "운영자 설정이 없거나 현재 심볼에는 적용되지 않습니다.";
+    case "outside_valid_window":
+      return "운영자 설정의 적용 시간이 아직 아니거나 이미 지났습니다.";
+    case "approval_required_preview":
+      return "현재 상태라면 신규 진입 전에 한 번 더 확인하는 것이 좋습니다.";
+    case "block_on_conflict_preview":
+      return "현재 상태라면 의견이 충돌할 때 신규 진입을 멈춥니다.";
+    case "event_context_error":
+      return "이벤트 정보를 읽는 중 문제가 발생했습니다.";
+    case "event_context_stale":
+      return "이벤트 정보가 최신 상황보다 조금 늦습니다.";
+    case "event_context_incomplete":
+      return "이벤트 정보가 일부 비어 있습니다.";
+    case "event_context_unavailable":
+      return "이벤트 정보를 아직 사용할 수 없습니다.";
+    case "alignment_conflict_block":
+      return "AI와 운영자 의견이 충돌해 신규 진입을 멈춥니다.";
+    case "alignment_not_aligned":
+      return "AI와 운영자 의견이 완전히 같지 않아 한 번 더 확인이 필요합니다.";
+    case "alignment_insufficient_data":
+      return "판단에 필요한 정보가 부족해 한 번 더 확인이 필요합니다.";
+    default:
+      return describeRiskReasonCode(value);
+  }
+}
+
+export function describeManualWindowFlags(autoResume: boolean | null | undefined, requireManualRearm: boolean | null | undefined) {
+  const autoResumeLabel = autoResume ? "예" : "아니오";
+  const manualRearmLabel = requireManualRearm ? "예" : "아니오";
+  return `종료 후 자동 복귀: ${autoResumeLabel} / 재개 전 수동 확인: ${manualRearmLabel}`;
+}
+
+export function summarizeReasonCodes(values: string[] | null | undefined) {
+  if (!values || values.length === 0) {
+    return "추가 사유 없음";
+  }
+  return values.map((value) => describeEventReasonCode(value)).join(" / ");
+}
+
+export function summarizeEntryPolicy(params: {
+  effectivePolicyPreview?: string | null;
+  blockedReason?: string | null;
+  approvalRequiredReason?: string | null;
+  policySource?: string | null;
+}) {
+  const policy = describeEffectivePolicyPreview(params.effectivePolicyPreview);
+  const reason = describeEventReasonCode(params.blockedReason ?? params.approvalRequiredReason).replace(/[.。]+$/, "");
+  const source = describePolicySource(params.policySource).replace(/[.。]+$/, "");
+  return `지금 신규 진입은 "${policy}" 상태입니다. 이유: ${reason}. 기준: ${source}.`;
 }
 
 export function toneForSourceStatus(value: string | null | undefined): EventControlTone {
-  switch (value) {
+  switch (normalizeSourceStatus(value)) {
     case "available":
       return "good";
+    case "unavailable":
+      return "neutral";
     case "stale":
     case "incomplete":
       return "warn";
-    case "unavailable":
     case "error":
       return "danger";
     default:
