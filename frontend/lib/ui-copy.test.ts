@@ -28,6 +28,15 @@ test("ui-copy formats boolean and enum values with user-facing wording", async (
   assert.equal(formatDisplayValue("limited_live"), "제한된 실거래");
 });
 
+test("ui-copy explains exchange_can_trade without raw canTrade wording", async () => {
+  const { exchangeCanTradeAccountHint } = await uiCopyModule;
+
+  assert.equal(
+    exchangeCanTradeAccountHint,
+    "거래소 계좌 응답 기준으로 새 주문이 명시적으로 차단됐는지 보여줍니다. canTrade 필드가 없는 선물 응답은 차단으로 간주하지 않으며, 앱 실주문 준비 상태는 별도로 확인해야 합니다.",
+  );
+});
+
 test("ui-copy keeps reason codes meaning-first for operator-facing tables", async () => {
   const { formatDisplayValue } = await uiCopyModule;
 
@@ -38,5 +47,21 @@ test("ui-copy keeps reason codes meaning-first for operator-facing tables", asyn
   assert.equal(
     formatDisplayValue("LIVE_APPROVAL_REQUIRED"),
     "실거래 승인 창이 닫혀 있어 신규 진입 전에 수동 승인이 필요합니다.",
+  );
+});
+
+test("ui-copy exposes active-position suppression fields with operator wording", async () => {
+  const { formatDisplayValue, translateLabel } = await uiCopyModule;
+
+  assert.equal(translateLabel("suppression_active"), "진입 제안 억제");
+  assert.equal(translateLabel("suppression_reason_code"), "진입 제안 억제 사유");
+  assert.equal(translateLabel("allow_same_side_add_on"), "same-side add-on 허용");
+  assert.equal(translateLabel("allowed_add_on_side"), "허용 add-on 방향");
+  assert.equal(formatDisplayValue(true, "suppression_active"), "활성");
+  assert.equal(formatDisplayValue(false, "allow_same_side_add_on"), "불가");
+  assert.equal(formatDisplayValue("LARGEST_POSITION_LIMIT_REACHED"), "심볼 집중도 한도 유지");
+  assert.equal(
+    formatDisplayValue("DETERMINISTIC_BASELINE_DISAGREEMENT"),
+    "결정론적 기준선 불일치 상태 유지",
   );
 });

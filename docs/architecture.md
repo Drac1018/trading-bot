@@ -117,22 +117,28 @@
 - The cycle now has two stages:
   - deterministic pre-AI trigger planning in `orchestrator.build_interval_decision_plan()`
   - selective AI dispatch in `scheduler.run_interval_decision_cycle()`
+- Current runtime source of truth for trigger semantics is `backend/trading_mvp/services/orchestrator.py`, `backend/trading_mvp/services/scheduler.py`, and `docs/api.md`.
 - Entry-side AI review is created only when a deterministic candidate event exists for that symbol.
-- Open-position AI review is created only when position review is due from `holding_profile_cadence_hint`, when protection review requires it, or when a low-frequency periodic backstop becomes due.
+- Open-position AI review is no longer reopened by `open_position_recheck_due` or `periodic_backstop_due`; historical rows may still carry those values as stored legacy semantics.
 - `market_refresh_cycle`, `exchange_sync_cycle`, and `position_management_cycle` keep their existing cadence responsibilities and do not depend on AI availability.
 
 ### Trigger reasons
 
+Current runtime trigger reasons:
+
 - `entry_candidate_event`
 - `breakout_exception_event`
-- `open_position_recheck_due`
 - `protection_review_event`
 - `manual_review_event`
+
+Historical reference only:
+
+- `open_position_recheck_due`
 - `periodic_backstop_due`
 
 ### Trigger payload contract
 
-- Every AI review trigger carries:
+- Every current runtime AI review trigger carries:
   - `symbol`
   - `timeframe`
   - `strategy_engine`
@@ -150,20 +156,19 @@
   - `last_material_review_at`
   - `forced_review_reason`
 - `trigger_fingerprint` is used for debounce/dedupe. If the same symbol repeats with the same materially equivalent trigger fingerprint, the scheduler records a deduped skip instead of reinvoking AI.
-- `open_position_recheck_due` uses a dedicated bucketed fingerprint basis: `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
+- Historical reference: older `open_position_recheck_due` rows used a dedicated bucketed fingerprint basis: `strategy_engine`, `holding_profile`, `hard_stop_active`, `stop_widening_allowed`, regime summary, `data_quality_grade`, `thesis_degrade_detected`, `position_state_bucket`, and `protection_health_summary`.
 - Entry-capable AI routes consume `data_quality` as an AI-layer safety gate before `risk.py`:
   - unavailable quality fail-closes new entry reviews
   - degraded breakout reviews fail-close before provider invocation
   - degraded/unavailable long-horizon entry proposals are bounded back to `hold`
 - Survival paths remain deterministic and are not blocked by these quality gates.
 - The open-position fingerprint intentionally avoids raw noisy values. Material bucket changes reopen AI review; same-basis repeats are deduped.
-- The scheduler due gate now uses the resolved open-position review cadence directly instead of relying only on symbol-level interval cadence. This keeps `scalp / swing / position` cadence hints aligned with the actual revisit timing for `open_position_recheck_due`.
-- Review cadence observability is explicit: `applied_review_cadence_minutes`, `review_cadence_source`, `holding_profile_cadence_hint`, `cadence_fallback_reason`, and `max_review_age_minutes` are persisted alongside trigger metadata.
+- Review cadence observability remains explicit: `applied_review_cadence_minutes`, `review_cadence_source`, `holding_profile_cadence_hint`, `cadence_fallback_reason`, and `max_review_age_minutes` are persisted alongside trigger metadata.
+- In current runtime policy, those cadence fields are observability / compatibility metadata and time passage alone no longer reopens AI review.
 - 운영자 화면에서는 이 cadence observability를 `재검토 확인 주기`, `AI 기본 검토 간격`, 재검토 사유/백오프 설명으로 풀어서 읽습니다.
-- A stable fingerprint is not allowed to suppress review forever. Once the max review age is exceeded, the scheduler sets `forced_review_reason=OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED` and allows the review to proceed even if the fingerprint is unchanged.
-- The forced-review ceiling is conservative and bounded by cadence: `min(backstop interval, 3x position review cadence)`.
+- Historical reference: older runtime used `forced_review_reason=OPEN_POSITION_MAX_REVIEW_AGE_EXCEEDED` to reopen unchanged open-position reviews.
 - `protection_review_event` is dedupe-exempt so protection/emergency style survival paths are not delayed by unchanged fingerprints.
-- `periodic_backstop_due` is the explicit escape hatch for stale-thesis refresh and missed-event recovery. It is a safety backstop, not an entry-frequency booster.
+- Historical reference: `periodic_backstop_due` was the legacy safety backstop for stale-thesis refresh and missed-event recovery. It is not a current runtime trigger.
 
 ### Safety boundary
 
@@ -171,7 +176,7 @@
 - `schemas.py` validates the trigger payload and the resulting decision shape.
 - `risk.py` remains the final deterministic allow/block gate.
 - `execution.py` still executes only approved intents.
-- Survival paths such as `reduce`, `exit`, `reduce_only`, `protection recovery`, and `emergency_exit` remain callable without AI and must not wait for the hybrid review cadence.
+- Survival paths such as `reduce`, `exit`, `reduce_only`, `protection recovery`, and `emergency_exit` remain callable without AI and must not wait for time-based AI review reopening.
 
 ## Holding Profile Split
 

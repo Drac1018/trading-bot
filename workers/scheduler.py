@@ -40,6 +40,23 @@ def _due_windows() -> list[str]:
         return due
 
 
+def _record_scheduler_loop_failure(error: Exception) -> None:
+    # Recovery logging is best-effort only. If the database is still locked,
+    # the scheduler loop must keep running and retry on the next interval.
+    try:
+        with SessionLocal() as session:
+            record_health_event(
+                session,
+                component="scheduler",
+                status="error",
+                message="Scheduler loop recovered from an unexpected error.",
+                payload={"error": str(error)},
+            )
+            session.commit()
+    except Exception:
+        return
+
+
 def main() -> None:
     settings = get_settings()
     interval_seconds = 60
@@ -76,15 +93,7 @@ def main() -> None:
                         run_window(session, window, triggered_by="scheduler-inline")
                     session.commit()
         except Exception as exc:
-            with SessionLocal() as session:
-                record_health_event(
-                    session,
-                    component="scheduler",
-                    status="error",
-                    message="Scheduler loop recovered from an unexpected error.",
-                    payload={"error": str(exc)},
-                )
-                session.commit()
+            _record_scheduler_loop_failure(exc)
         time.sleep(interval_seconds)
 
 

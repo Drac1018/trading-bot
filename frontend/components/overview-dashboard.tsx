@@ -4,6 +4,12 @@ import { useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { describeAiTriggerReason } from "../lib/decision-timeline";
 import { ALL_SYMBOLS, filterSymbolsBySelection, resolveSelectedSymbol } from "../lib/selected-symbol";
+import {
+  getSyncScopeBadge,
+  getSyncScopeReason,
+  translateSyncScopeStatus,
+  type SyncScopeStatus,
+} from "../lib/sync-freshness";
 import { type EventOperatorControlPayload } from "../lib/event-operator-control.js";
 import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
 import { lookupRiskReasonCode } from "../lib/risk-reason-copy.js";
@@ -57,16 +63,6 @@ type AuditEvent = {
   created_at: string;
 };
 
-type SyncScopeStatus = {
-  status?: string;
-  last_sync_at?: string | null;
-  freshness_seconds?: number | null;
-  stale_after_seconds?: number | null;
-  stale?: boolean;
-  incomplete?: boolean;
-  last_failure_reason?: string | null;
-};
-
 type ControlStatusSummary = {
   exchange_can_trade: boolean | null;
   rollout_mode: RolloutMode;
@@ -107,6 +103,10 @@ type OperatorDecisionSnapshot = {
   trigger_deduped: boolean;
   trigger_fingerprint: string | null;
   last_ai_skip_reason: string | null;
+  suppression_active: boolean;
+  suppression_reason_code: string | null;
+  allow_same_side_add_on: boolean;
+  allowed_add_on_side: "long" | "short" | null;
   event_risk_acknowledgement: string | null;
   confidence_penalty_reason: string | null;
   scenario_note: string | null;
@@ -644,6 +644,35 @@ function translateAiSkipReason(value: string | null | undefined) {
   return labels[value] ?? value;
 }
 
+function translateSuppressionActive(value: boolean) {
+  return value ? "활성" : "비활성";
+}
+
+function translateSameSideAddOnAllowance(value: boolean) {
+  return value ? "허용" : "불가";
+}
+
+function suppressionSummary(symbol: OperatorSymbolSummary) {
+  if (!symbol.ai_decision.suppression_active) {
+    if (symbol.ai_decision.allow_same_side_add_on) {
+      return {
+        label: "same-side add-on 예외 허용",
+        detail: symbol.ai_decision.allowed_add_on_side
+          ? `${translateDecision(symbol.ai_decision.allowed_add_on_side)} 방향만 허용`
+          : "same-side add-on만 허용",
+      };
+    }
+    return {
+      label: "진입 제안 억제 없음",
+      detail: "현재 active-position suppress 상태가 없습니다.",
+    };
+  }
+  return {
+    label: "진입 제안 억제 활성",
+    detail: translateReasonCode(symbol.ai_decision.suppression_reason_code),
+  };
+}
+
 function aiReviewSummary(symbol: OperatorSymbolSummary) {
   const triggerPresentation = describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason);
   if (symbol.ai_decision.last_ai_skip_reason === "NO_EVENT") {
@@ -793,6 +822,8 @@ function translateReasonCode(value: string | null | undefined) {
     ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT: "한쪽 방향 쏠림을 줄이기 위해 신규 진입 크기를 줄였습니다.",
     ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "단일 포지션 한도에 맞춰 신규 진입 크기를 줄였습니다.",
     ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "같은 티어 집중도를 낮추기 위해 신규 진입 크기를 줄였습니다.",
+    LARGEST_POSITION_LIMIT_REACHED: "심볼 집중도 한도 유지",
+    DETERMINISTIC_BASELINE_DISAGREEMENT: "결정론적 기준선 불일치 상태 유지",
     ENTRY_SIZE_BELOW_MIN_NOTIONAL: "거래소 최소 주문 금액보다 작습니다.",
     ENTRY_TRIGGER_NOT_MET: "지금은 진입 조건이 아직 맞지 않습니다.",
     CHASE_LIMIT_EXCEEDED: "추격 진입 한도를 넘었습니다.",
@@ -862,22 +893,44 @@ function approvalWindowHint(control: OperatorDashboardPayload["control"], summar
   return "신규 진입 전에 실거래 승인 창을 다시 열어야 합니다.";
 }
 
-function formatAuditValue(value: unknown): string {
+function translateAuditPayloadLabel(value: string): string {
+  const labels: Record<string, string> = {
+    suppression_active: "진입 제안 억제",
+    suppression_reason_code: "진입 제안 억제 사유",
+    allow_same_side_add_on: "same-side add-on 허용",
+    allowed_add_on_side: "허용 add-on 방향",
+  };
+  return labels[value] ?? value;
+}
+
+function formatAuditValue(value: unknown, key?: string): string {
   if (value === null || value === undefined) {
     return "-";
   }
   if (typeof value === "boolean") {
+    if (key === "suppression_active") {
+      return translateSuppressionActive(value);
+    }
+    if (key === "allow_same_side_add_on") {
+      return translateSameSideAddOnAllowance(value);
+    }
     return value ? "예" : "아니오";
   }
   if (typeof value === "number") {
     return Number.isInteger(value) ? String(value) : formatNumber(value, 4);
   }
   if (Array.isArray(value)) {
-    return value.map((item) => formatAuditValue(item)).join(", ");
+    return value.map((item) => formatAuditValue(item, key)).join(", ");
   }
   if (typeof value === "string") {
     if (value.includes("T") && !Number.isNaN(Date.parse(value))) {
       return formatDateTime(value);
+    }
+    if (key === "suppression_reason_code") {
+      return translateReasonCode(value);
+    }
+    if (key === "allowed_add_on_side") {
+      return translateDecision(value);
     }
     return value;
   }
@@ -895,11 +948,11 @@ function auditPayloadRows(payload: Record<string, unknown> | null | undefined): 
     }
     if (typeof value === "object" && !Array.isArray(value)) {
       for (const [nestedKey, nestedValue] of Object.entries(value)) {
-        rows.push([`${key}.${nestedKey}`, formatAuditValue(nestedValue)]);
+        rows.push([`${key}.${translateAuditPayloadLabel(nestedKey)}`, formatAuditValue(nestedValue, nestedKey)]);
       }
       continue;
     }
-    rows.push([key, formatAuditValue(value)]);
+    rows.push([translateAuditPayloadLabel(key), formatAuditValue(value, key)]);
   }
   return rows;
 }
@@ -917,19 +970,6 @@ function formatMarketTiming(symbol: OperatorSymbolSummary) {
     parts.push(`수집 ${formatDateTime(symbol.market_snapshot_time)}`);
   }
   return parts.join(" / ") || "기록 없음";
-}
-
-function syncBadge(scope: SyncScopeStatus | undefined) {
-  if (!scope) {
-    return { label: "미확인", kind: "warn" as const };
-  }
-  if (scope.incomplete) {
-    return { label: "불완전", kind: "danger" as const };
-  }
-  if (scope.stale) {
-    return { label: "조금 늦음", kind: "warn" as const };
-  }
-  return { label: "정상", kind: "good" as const };
 }
 
 function valueCard(title: string, value: string, hint: string) {
@@ -1484,7 +1524,8 @@ function GlobalOperatorSummary({
         <div className="mt-4 grid gap-3 lg:grid-cols-2">
           {syncScopes.map(([key, label]) => {
             const scope = control.sync_freshness_summary[key];
-            const badge = syncBadge(scope);
+            const badge = getSyncScopeBadge(scope);
+            const reason = getSyncScopeReason(scope);
             return (
               <div key={key} className="rounded-2xl bg-slate-50 px-4 py-3">
                 <div className="flex items-center justify-between gap-3">
@@ -1494,10 +1535,11 @@ function GlobalOperatorSummary({
                   </span>
                 </div>
                 <div className="mt-3 space-y-1 text-xs text-slate-600">
+                  <p>현재 상태 {translateSyncScopeStatus(scope)}</p>
                   <p>마지막 동기화 {formatDateTime(scope?.last_sync_at)}</p>
                   <p>지난 시간 {formatFreshnessSeconds(scope?.freshness_seconds ?? null)}</p>
                   <p>지연 기준 {formatFreshnessSeconds(scope?.stale_after_seconds ?? null)}</p>
-                  <p>마지막 실패 {translateReasonCode(scope?.last_failure_reason ?? "-")}</p>
+                  <p>{reason.label} {translateReasonCode(reason.reasonCode ?? "-")}</p>
                 </div>
               </div>
             );
@@ -1853,6 +1895,7 @@ function SymbolDetailPanel({
   const riskOutcome = riskOutcomeSummary(symbol);
   const executionOutcome = executionOutcomeSummary(symbol);
   const triggerPresentation = describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason);
+  const suppression = suppressionSummary(symbol);
   const detailSections = buildOperatorDetailSections(symbol);
 
   return (
@@ -1924,6 +1967,7 @@ function SymbolDetailPanel({
             symbol.ai_decision.capacity_reason ?? symbol.candidate_selection.capacity_reason ?? "-"
           }`,
         )}
+        {valueCard("진입 제안 억제", suppression.label, suppression.detail)}
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1.15fr,0.85fr]">
@@ -1969,6 +2013,10 @@ function SymbolDetailPanel({
             translateAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason),
           ],
           ["마지막 AI 미호출 사유", translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)],
+          ["진입 제안 억제", translateSuppressionActive(symbol.ai_decision.suppression_active)],
+          ["진입 제안 억제 사유", translateReasonCode(symbol.ai_decision.suppression_reason_code)],
+          ["same-side add-on 허용", translateSameSideAddOnAllowance(symbol.ai_decision.allow_same_side_add_on)],
+          ["허용 add-on 방향", translateDecision(symbol.ai_decision.allowed_add_on_side)],
           ["마지막 AI 호출 시각", formatDateTime(symbol.ai_decision.last_ai_invoked_at)],
           ["배정 슬롯", symbol.ai_decision.assigned_slot ?? symbol.candidate_selection.assigned_slot ?? "-"],
           [
@@ -2300,7 +2348,9 @@ function SymbolDetailPanel({
 
 export function OverviewDashboard({ initial }: { initial: OperatorDashboardPayload }) {
   const [payload, setPayload] = useState(initial);
-  const [lastUpdated, setLastUpdated] = useState(() => new Date());
+  const [lastUpdated, setLastUpdated] = useState(() =>
+    new Date(initial.generated_at.endsWith("Z") ? initial.generated_at : `${initial.generated_at}Z`),
+  );
   const [refreshError, setRefreshError] = useState("");
   const [isPending, startTransition] = useTransition();
   const router = useRouter();
@@ -2392,7 +2442,7 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
       <SymbolDetailPanel selectedSymbol={selectedSymbol} symbol={selectedSymbolSummary} />
 
       <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500">
-        <span>마지막 로컬 갱신 {lastUpdated.toLocaleTimeString("ko-KR", { hour12: false })}</span>
+        <span>마지막 로컬 갱신 {lastUpdated.toLocaleTimeString("ko-KR", { hour12: false, timeZone: "Asia/Seoul" })}</span>
         {refreshError ? <span className="text-rose-700">{refreshError}</span> : null}
         {isPending ? <span>심볼 보기 전환 중</span> : null}
       </div>

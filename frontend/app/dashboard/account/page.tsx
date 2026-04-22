@@ -3,7 +3,7 @@ import Link from "next/link";
 import { DataTable } from "../../../components/data-table";
 import { PageShell } from "../../../components/page-shell";
 import { fetchJson } from "../../../lib/api";
-import { formatDisplayValue } from "../../../lib/ui-copy";
+import { exchangeCanTradeAccountHint, formatDisplayValue } from "../../../lib/ui-copy";
 
 type AccountSummary = {
   connected: boolean;
@@ -91,7 +91,7 @@ export default async function BinanceAccountPage() {
       <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
         <div className="flex flex-wrap gap-2">
           <StatusBadge tone={summary.connected ? "good" : "warn"} label={summary.connected ? "거래소 연결됨" : "거래소 연결 안 됨"} />
-          <StatusBadge tone={exchangeCanTrade ? "good" : "warn"} label={`거래소 주문 권한 ${exchangeCanTrade ? "허용" : "제한"}`} />
+          <StatusBadge tone={exchangeCanTrade ? "good" : "warn"} label={`거래소 주문 가능 상태 ${exchangeCanTrade ? "가능" : "차단"}`} />
           <StatusBadge tone={summary.futures_enabled ? "good" : "warn"} label={`Futures ${summary.futures_enabled ? "사용" : "꺼짐"}`} />
           <StatusBadge tone={summary.testnet_enabled ? "neutral" : "good"} label={summary.testnet_enabled ? "Testnet" : "Live Exchange"} />
         </div>
@@ -108,7 +108,11 @@ export default async function BinanceAccountPage() {
           <MetricCard label="거래소 갱신 시각" value={formatDisplayValue(summary.exchange_update_time, "exchange_update_time")} />
           <MetricCard label="열린 포지션 수" value={formatDisplayValue(summary.open_positions, "open_positions")} />
           <MetricCard label="미체결 주문 수" value={formatDisplayValue(summary.open_orders, "open_orders")} />
-          <MetricCard label="거래소 권한" value={formatDisplayValue(exchangeCanTrade, "exchange_can_trade")} hint="Binance 원본 canTrade 값입니다." />
+          <MetricCard
+            label="거래소 주문 가능 상태"
+            value={formatDisplayValue(exchangeCanTrade, "exchange_can_trade")}
+            hint={exchangeCanTradeAccountHint}
+          />
           <MetricCard label="현재 안내" value={summary.connected ? "응답 정상" : "연결 확인 필요"} hint={summary.message} />
         </div>
       </section>

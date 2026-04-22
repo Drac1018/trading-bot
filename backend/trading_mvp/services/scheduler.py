@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import PendingEntryPlan, SchedulerRun
+from trading_mvp.models import MarketSnapshot, PendingEntryPlan, SchedulerRun
 from trading_mvp.services.account import get_open_positions
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.orchestrator import TradingOrchestrator
@@ -16,7 +16,7 @@ from trading_mvp.services.settings import (
     get_effective_symbol_schedule,
     get_or_create_settings,
 )
-from trading_mvp.time_utils import utcnow_naive
+from trading_mvp.time_utils import ensure_utc_aware, parse_utc_datetime, utcnow_naive
 
 WINDOW_HOURS = {"1h": 1}
 
@@ -25,7 +25,19 @@ MARKET_REFRESH_WORKFLOW = "market_refresh_cycle"
 POSITION_MANAGEMENT_WORKFLOW = "position_management_cycle"
 INTERVAL_DECISION_WORKFLOW = "interval_decision_cycle"
 ENTRY_PLAN_WATCHER_WORKFLOW = "entry_plan_watcher_cycle"
+RELEASE_ENRICHMENT_WATCH_WORKFLOW = "release_enrichment_watch_cycle"
 READ_REFRESH_SYNC_DEBOUNCE_SECONDS = 30
+RELEASE_ENRICHMENT_RETRY_SECONDS = 15
+RELEASE_ENRICHMENT_WATCH_WINDOW_SECONDS = 120
+BLS_RELEASE_WATCH_EVENT_NAMES = {
+    "Consumer Price Index",
+    "Producer Price Index",
+    "Employment Situation",
+}
+BEA_RELEASE_WATCH_EVENT_NAMES = {
+    "Gross Domestic Product",
+    "Personal Consumption Expenditures",
+}
 
 
 def _next_window_run(window: str, from_time: datetime | None = None) -> datetime:
@@ -39,6 +51,25 @@ def _symbol_schedule_window(interval_seconds: int | None = None, interval_minute
     if interval_minutes is not None:
         return f"{int(interval_minutes)}m"
     return "unknown"
+
+
+def _active_position_suppression_payload_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    if not {
+        "suppression_active",
+        "suppression_reason_code",
+        "allow_same_side_add_on",
+        "allowed_add_on_side",
+    }.intersection(plan.keys()):
+        return {}
+    allowed_add_on_side = str(plan.get("allowed_add_on_side") or "").lower()
+    return {
+        "suppression_active": bool(plan.get("suppression_active")),
+        "suppression_reason_code": str(plan.get("suppression_reason_code") or "") or None,
+        "allow_same_side_add_on": bool(plan.get("allow_same_side_add_on")),
+        "allowed_add_on_side": (
+            allowed_add_on_side if allowed_add_on_side in {"long", "short"} else None
+        ),
+    }
 
 
 def _latest_workflow_run(session: Session, workflow: str) -> SchedulerRun | None:
@@ -78,13 +109,133 @@ def _is_due(latest: SchedulerRun | None, delta: timedelta) -> bool:
 
 def _coerce_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
-        return value
-    if isinstance(value, str) and value:
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return None
+        normalized = ensure_utc_aware(value)
+        return normalized.replace(tzinfo=None) if normalized is not None else None
+    parsed = parse_utc_datetime(value)
+    if parsed is not None:
+        return parsed.replace(tzinfo=None)
     return None
+
+
+def _latest_symbol_market_snapshot(
+    session: Session,
+    *,
+    symbol: str,
+    timeframe: str,
+) -> MarketSnapshot | None:
+    return session.scalar(
+        select(MarketSnapshot)
+        .where(MarketSnapshot.symbol == symbol.upper(), MarketSnapshot.timeframe == timeframe)
+        .order_by(desc(MarketSnapshot.snapshot_time))
+        .limit(1)
+    )
+
+
+def _extract_market_event_context(market_row: MarketSnapshot | None) -> dict[str, object]:
+    if market_row is None or not isinstance(market_row.payload, dict):
+        return {}
+    payload = market_row.payload.get("event_context")
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _matching_release_event(
+    raw_context: dict[str, object],
+    *,
+    event_name: str,
+    event_at: datetime,
+) -> dict[str, object]:
+    raw_events = raw_context.get("events")
+    if isinstance(raw_events, list):
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                continue
+            raw_event_name = str(raw_event.get("event_name") or "").strip()
+            raw_event_at = _coerce_datetime(raw_event.get("event_at"))
+            if raw_event_name == event_name and raw_event_at == event_at:
+                return dict(raw_event)
+    return {
+        "event_name": event_name,
+        "event_at": event_at.isoformat(),
+        "release_enrichment": raw_context.get("release_enrichment") if isinstance(raw_context.get("release_enrichment"), dict) else {},
+        "enrichment_vendors": raw_context.get("enrichment_vendors") if isinstance(raw_context.get("enrichment_vendors"), list) else [],
+    }
+
+
+def _event_has_vendor_enrichment(event_payload: dict[str, object], *, vendor_name: str) -> bool:
+    release_enrichment = event_payload.get("release_enrichment")
+    if not isinstance(release_enrichment, dict):
+        return False
+    vendor_payload = release_enrichment.get(vendor_name)
+    return isinstance(vendor_payload, dict) and bool(vendor_payload)
+
+
+def _supported_release_watch_event_names(settings_row: object) -> set[str]:
+    names: set[str] = set()
+    if getattr(settings_row, "event_source_bls_enrichment_url", None):
+        names.update(BLS_RELEASE_WATCH_EVENT_NAMES)
+    if getattr(settings_row, "event_source_bea_enrichment_url", None):
+        names.update(BEA_RELEASE_WATCH_EVENT_NAMES)
+    return names
+
+
+def _release_watch_candidate(
+    session: Session,
+    *,
+    settings_row: object,
+    symbol: str,
+    timeframe: str,
+    now: datetime,
+) -> dict[str, object] | None:
+    supported_event_names = _supported_release_watch_event_names(settings_row)
+    if not supported_event_names:
+        return None
+
+    market_row = _latest_symbol_market_snapshot(session, symbol=symbol, timeframe=timeframe)
+    raw_context = _extract_market_event_context(market_row)
+    event_name = str(raw_context.get("next_event_name") or "").strip()
+    event_at = _coerce_datetime(raw_context.get("next_event_at"))
+    if not event_name or event_at is None or event_name not in supported_event_names:
+        return None
+
+    seconds_since_release = (now - event_at).total_seconds()
+    if seconds_since_release < 0 or seconds_since_release > RELEASE_ENRICHMENT_WATCH_WINDOW_SECONDS:
+        return None
+
+    event_payload = _matching_release_event(raw_context, event_name=event_name, event_at=event_at)
+    if (
+        event_name in BLS_RELEASE_WATCH_EVENT_NAMES
+        and getattr(settings_row, "event_source_bls_enrichment_url", None)
+        and _event_has_vendor_enrichment(event_payload, vendor_name="bls")
+    ):
+        return None
+    if (
+        event_name in BEA_RELEASE_WATCH_EVENT_NAMES
+        and getattr(settings_row, "event_source_bea_enrichment_url", None)
+        and _event_has_vendor_enrichment(event_payload, vendor_name="bea")
+    ):
+        return None
+
+    latest_watch = _latest_symbol_workflow_run(session, RELEASE_ENRICHMENT_WATCH_WORKFLOW, symbol)
+    latest_outcome = latest_watch.outcome if latest_watch is not None and isinstance(latest_watch.outcome, dict) else {}
+    latest_event_name = str(latest_outcome.get("event_name") or "").strip()
+    latest_event_at = _coerce_datetime(latest_outcome.get("event_at"))
+    if (
+        latest_watch is not None
+        and latest_watch.next_run_at is not None
+        and latest_watch.next_run_at > now
+        and latest_event_name == event_name
+        and latest_event_at == event_at
+    ):
+        return None
+
+    return {
+        "symbol": symbol.upper(),
+        "timeframe": timeframe,
+        "event_name": event_name,
+        "event_at": event_at,
+        "seconds_since_release": int(seconds_since_release),
+        "snapshot_time": market_row.snapshot_time.isoformat() if market_row is not None else None,
+    }
 
 
 def _sync_summary_needs_refresh(sync_freshness_summary: dict[str, object]) -> bool:
@@ -739,6 +890,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             else []
         )
         last_ai_skip_reason = str(plan.get("last_ai_skip_reason") or "") or None
+        active_position_suppression_payload = _active_position_suppression_payload_from_plan(plan)
         try:
             if trigger_payload is None:
                 record_audit_event(
@@ -757,6 +909,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "review_cadence_source": review_cadence_source,
                         "cadence_fallback_reason": cadence_fallback_reason,
                         "max_review_age_minutes": max_review_age_minutes,
+                        **active_position_suppression_payload,
                     },
                 )
                 results.append(
@@ -810,6 +963,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "review_cadence_source": review_cadence_source,
                         "cadence_fallback_reason": cadence_fallback_reason,
                         "max_review_age_minutes": max_review_age_minutes,
+                        **active_position_suppression_payload,
                     },
                 )
                 results.append(
@@ -914,6 +1068,77 @@ def run_due_entry_plan_watcher_cycle(session: Session) -> dict[str, object] | No
     return run_entry_plan_watcher_cycle(session, triggered_by="scheduler")
 
 
+def run_release_enrichment_watch_cycle(session: Session, triggered_by: str = "scheduler") -> dict[str, object]:
+    settings_row = get_or_create_settings(session)
+    supported_event_names = _supported_release_watch_event_names(settings_row)
+    if not supported_event_names:
+        return {"workflow": RELEASE_ENRICHMENT_WATCH_WORKFLOW, "results": []}
+
+    orchestrator = TradingOrchestrator(session)
+    now = utcnow_naive()
+    results: list[dict[str, object]] = []
+    for effective in get_effective_symbol_schedule(settings_row):
+        if not effective.enabled:
+            continue
+        candidate = _release_watch_candidate(
+            session,
+            settings_row=settings_row,
+            symbol=effective.symbol,
+            timeframe=effective.timeframe,
+            now=now,
+        )
+        if candidate is None:
+            continue
+        row = _start_scheduler_run(
+            session,
+            workflow=RELEASE_ENRICHMENT_WATCH_WORKFLOW,
+            schedule_window=_symbol_schedule_window(interval_seconds=RELEASE_ENRICHMENT_RETRY_SECONDS),
+            triggered_by=triggered_by,
+            symbol=effective.symbol,
+            next_run_at=utcnow_naive() + timedelta(seconds=RELEASE_ENRICHMENT_RETRY_SECONDS),
+        )
+        try:
+            outcome = orchestrator.run_market_refresh_cycle(
+                symbols=[effective.symbol],
+                timeframe=effective.timeframe,
+                trigger_event="release_watch",
+                include_exchange_sync=False,
+                auto_resume_checked=True,
+            )
+            symbol_outcome = outcome["results"][0] if outcome.get("results") else {
+                "symbol": effective.symbol,
+                "status": "no_result",
+            }
+            results.append(
+                _finish_scheduler_run(
+                    session,
+                    row=row,
+                    success=True,
+                    message="Immediate release enrichment watch refreshed market snapshot.",
+                    payload={
+                        **candidate,
+                        "event_at": candidate["event_at"].isoformat(),
+                        "refresh_outcome": symbol_outcome,
+                    },
+                )
+            )
+        except Exception as exc:
+            results.append(
+                _finish_scheduler_run(
+                    session,
+                    row=row,
+                    success=False,
+                    message="Immediate release enrichment watch failed.",
+                    payload={
+                        **candidate,
+                        "event_at": candidate["event_at"].isoformat(),
+                        "error": str(exc),
+                    },
+                )
+            )
+    return {"workflow": RELEASE_ENRICHMENT_WATCH_WORKFLOW, "results": results}
+
+
 def run_due_operational_cycles(session: Session) -> list[dict[str, object]]:
     outputs: list[dict[str, object]] = []
     exchange = run_due_exchange_sync_cycle(session)
@@ -922,6 +1147,9 @@ def run_due_operational_cycles(session: Session) -> list[dict[str, object]]:
     market = run_market_refresh_cycle(session, triggered_by="scheduler")
     if market["results"]:
         outputs.append(market)
+    release_watch = run_release_enrichment_watch_cycle(session, triggered_by="scheduler")
+    if release_watch["results"]:
+        outputs.append(release_watch)
     position_management = run_position_management_cycle(session, triggered_by="scheduler")
     if position_management["results"]:
         outputs.append(position_management)

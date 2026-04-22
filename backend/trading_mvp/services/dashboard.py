@@ -109,6 +109,13 @@ EVENT_CONTEXT_SUMMARY_KEYS = (
     "is_complete",
     "affected_assets",
 )
+EVENT_CONTEXT_VISIBILITY_DEFAULTS = {
+    "source_status": "unavailable",
+    "is_stale": False,
+    "next_event_name": None,
+    "minutes_to_next_event": None,
+    "active_risk_window": False,
+}
 ADAPTIVE_SIGNAL_SUMMARY_KEYS = (
     "status",
     "active_inputs",
@@ -198,15 +205,16 @@ AUDIT_HEALTH_SYSTEM_EVENT_TYPES = {
 }
 
 
+def _serialize_model_row(row: object) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key in row.__table__.columns:  # type: ignore[attr-defined]
+        value = getattr(row, key.name)
+        values[key.name] = value.isoformat() if hasattr(value, "isoformat") else value
+    return values
+
+
 def _serialize_model_list(rows: Sequence[object]) -> list[dict[str, object]]:
-    payloads: list[dict[str, object]] = []
-    for row in rows:
-        values = {}
-        for key in row.__table__.columns:  # type: ignore[attr-defined]
-            value = getattr(row, key.name)
-            values[key.name] = value.isoformat() if hasattr(value, "isoformat") else value
-        payloads.append(values)
-    return payloads
+    return [_serialize_model_row(row) for row in rows]
 
 
 def _build_position_protection_state(session: Session, position: Position) -> dict[str, object]:
@@ -423,6 +431,90 @@ def _as_dict(value: object) -> dict[str, Any]:
     return {str(key): item for key, item in value.items()}
 
 
+def _active_position_suppression_projection(value: object) -> dict[str, object]:
+    source = _as_dict(value)
+    context = _as_dict(source.get("active_position_prompt_route_context")) if source else {}
+    if not context:
+        context = source
+    allowed_add_on_side = str(context.get("allowed_add_on_side") or "").lower()
+    return {
+        "suppression_active": bool(
+            context.get("entry_proposal_suppression_active")
+            or context.get("suppression_active")
+        ),
+        "suppression_reason_code": str(
+            context.get("entry_proposal_suppressed_reason_code")
+            or context.get("suppression_reason_code")
+            or ""
+        )
+        or None,
+        "allow_same_side_add_on": bool(context.get("allow_same_side_add_on")),
+        "allowed_add_on_side": (
+            allowed_add_on_side if allowed_add_on_side in {"long", "short"} else None
+        ),
+    }
+
+
+def _has_active_position_suppression_source(value: object) -> bool:
+    source = _as_dict(value)
+    if not source:
+        return False
+    return bool(
+        "active_position_prompt_route_context" in source
+        or {
+            "suppression_active",
+            "suppression_reason_code",
+            "allow_same_side_add_on",
+            "allowed_add_on_side",
+        }.intersection(source.keys())
+    )
+
+
+def _decision_run_id_from_audit_row(row: dict[str, object]) -> int | None:
+    entity_type = str(row.get("entity_type") or "").lower()
+    entity_id = str(row.get("entity_id") or "").strip()
+    if entity_type in {"agent_run", "decision_run"} and entity_id:
+        try:
+            return int(entity_id)
+        except ValueError:
+            return None
+    payload = _as_dict(row.get("payload"))
+    correlation_decision_id = payload.get("decision_id")
+    if correlation_decision_id in {None, ""}:
+        return None
+    return _as_int(correlation_decision_id, default=0) or None
+
+
+def _decision_run_suppression_context_by_id(
+    session: Session,
+    decision_run_ids: Sequence[int],
+) -> dict[int, dict[str, object]]:
+    if not decision_run_ids:
+        return {}
+    rows = list(
+        session.scalars(
+            select(AgentRun).where(AgentRun.id.in_(list(dict.fromkeys(decision_run_ids))))
+        )
+    )
+    return {
+        row.id: _as_dict(_as_dict(row.metadata_json).get("active_position_prompt_route_context"))
+        for row in rows
+    }
+
+
+def _as_optional_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _as_holding_profile(value: object) -> str | None:
     profile = str(value or "").strip().lower()
     if profile in {"scalp", "swing", "position"}:
@@ -460,6 +552,131 @@ def _compact_market_context_summary(value: object) -> dict[str, Any]:
     return _compact_dict(value, allowed_keys=MARKET_CONTEXT_SUMMARY_KEYS)
 
 
+def _ai_trigger_reason_from_decision_row(row: AgentRun | None) -> str | None:
+    if row is None:
+        return None
+    metadata = _as_dict(row.metadata_json)
+    input_payload = _as_dict(row.input_payload)
+    ai_trigger = _as_dict(metadata.get("ai_trigger"))
+    if not ai_trigger:
+        ai_trigger = _as_dict(input_payload.get("ai_trigger"))
+    return str(
+        metadata.get("last_ai_trigger_reason")
+        or ai_trigger.get("trigger_reason")
+        or ""
+    ) or None
+
+
+def _fallback_ai_trigger_code_summary(codes: list[str]) -> str | None:
+    if not codes:
+        return None
+    code_map = {
+        "TREND_UP": "상승 추세",
+        "TREND_DOWN": "하락 추세",
+        "PULLBACK_ENTRY": "눌림 진입",
+        "PULLBACK_ENTRY_BIAS": "눌림 진입 편향",
+        "RSI_HEALTHY": "RSI 양호",
+        "RSI_WEAK": "RSI 약세",
+        "STRUCTURE_BREAKOUT_UP_EXCEPTION": "상단 돌파 예외",
+        "STRUCTURE_BREAKOUT_DOWN_EXCEPTION": "하단 돌파 예외",
+        "MISSING_PROTECTIVE_ORDERS": "보호 주문 누락",
+        PROTECTION_REQUIRED_STATE: "보호 복구 필요",
+    }
+    summarized = [
+        code_map.get(code, code)
+        for code in codes
+        if code
+    ]
+    unique = list(dict.fromkeys(summarized))
+    return ", ".join(unique[:3]) if unique else None
+
+
+def _entry_trigger_signal_summary(
+    *,
+    features: dict[str, Any],
+    output_payload: dict[str, Any],
+    trigger_reason: str,
+) -> str | None:
+    regime = _as_dict(features.get("regime"))
+    breakout = _as_dict(features.get("breakout"))
+    trend_score = _as_optional_float(features.get("trend_score"))
+    momentum_score = _as_optional_float(features.get("momentum_score"))
+    volume_ratio = _as_optional_float(features.get("volume_ratio"))
+    decision = str(output_payload.get("decision") or "").lower()
+    trend_alignment = str(regime.get("trend_alignment") or "").lower()
+    breakout_up = bool(breakout.get("broke_swing_high")) or str(
+        breakout.get("range_breakout_direction") or ""
+    ).lower() == "up"
+    breakout_down = bool(breakout.get("broke_swing_low")) or str(
+        breakout.get("range_breakout_direction") or ""
+    ).lower() == "down"
+
+    parts: list[str] = []
+    if trigger_reason == "breakout_exception_event" or breakout_up or breakout_down:
+        if breakout_up:
+            parts.append("상단 돌파")
+        elif breakout_down:
+            parts.append("하단 돌파")
+
+    if momentum_score is not None and abs(momentum_score) >= 0.15:
+        parts.append(f"모멘텀 {momentum_score:+.2f}%")
+    elif trend_score is not None and abs(trend_score) >= 0.15:
+        parts.append(f"추세 {trend_score:+.2f}%")
+
+    if volume_ratio is not None:
+        if volume_ratio >= 1.05:
+            parts.append(f"거래량 {volume_ratio:.2f}배")
+        elif volume_ratio <= 0.95:
+            parts.append(f"거래량 {volume_ratio:.2f}배(약세)")
+
+    if trend_alignment == "bullish_aligned":
+        parts.append("상승 정렬")
+    elif trend_alignment == "bearish_aligned":
+        parts.append("하락 정렬")
+    elif decision == "long":
+        parts.append("롱 후보")
+    elif decision == "short":
+        parts.append("숏 후보")
+
+    unique = list(dict.fromkeys(part for part in parts if part))
+    return ", ".join(unique[:3]) if unique else None
+
+
+def _ai_trigger_summary_from_decision_row(row: AgentRun | None) -> str | None:
+    if row is None:
+        return None
+    metadata = _as_dict(row.metadata_json)
+    input_payload = _as_dict(row.input_payload)
+    output_payload = _as_dict(row.output_payload)
+    ai_trigger = _as_dict(metadata.get("ai_trigger"))
+    if not ai_trigger:
+        ai_trigger = _as_dict(input_payload.get("ai_trigger"))
+    trigger_reason = _ai_trigger_reason_from_decision_row(row)
+    if trigger_reason is None:
+        return None
+
+    trigger_reason_codes = _as_string_list(ai_trigger.get("reason_codes"))
+    output_reason_codes = _as_string_list(output_payload.get("rationale_codes"))
+
+    if trigger_reason == "manual_review_event":
+        return "운영자 수동 검토 요청"
+    if trigger_reason == "protection_review_event":
+        return (
+            _fallback_ai_trigger_code_summary(trigger_reason_codes)
+            or "보호 주문/포지션 상태 점검"
+        )
+
+    feature_summary = _entry_trigger_signal_summary(
+        features=_as_dict(input_payload.get("features")),
+        output_payload=output_payload,
+        trigger_reason=trigger_reason,
+    )
+    if feature_summary:
+        return feature_summary
+
+    return _fallback_ai_trigger_code_summary(trigger_reason_codes or output_reason_codes)
+
+
 def _compact_derivatives_summary(value: object) -> dict[str, Any]:
     compact = _compact_dict(value, allowed_keys=DERIVATIVES_SUMMARY_KEYS)
     if compact:
@@ -476,12 +693,12 @@ def _compact_derivatives_summary(value: object) -> dict[str, Any]:
 def _compact_event_context_summary(value: object) -> dict[str, Any]:
     compact = _compact_dict(value, allowed_keys=EVENT_CONTEXT_SUMMARY_KEYS)
     if compact:
+        for key, default in EVENT_CONTEXT_VISIBILITY_DEFAULTS.items():
+            compact.setdefault(key, default)
         return compact
     return {
-        "source_status": "unavailable",
-        "is_stale": False,
+        **EVENT_CONTEXT_VISIBILITY_DEFAULTS,
         "is_complete": False,
-        "active_risk_window": False,
     }
 
 
@@ -1398,6 +1615,9 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         holding_profile_context = _as_dict(selection_context.get("holding_profile_context"))
     decision_reference = _compact_decision_reference(_build_decision_reference(row))
     intent_semantics = infer_intent_semantics(payload, metadata)
+    suppression_projection = _active_position_suppression_projection(
+        metadata.get("active_position_prompt_route_context")
+    )
     holding_profile = (
         _as_holding_profile(selection_context.get("holding_profile"))
         or _as_holding_profile(metadata.get("holding_profile"))
@@ -1499,6 +1719,10 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
             or ""
         )
         or None,
+        suppression_active=bool(suppression_projection.get("suppression_active")),
+        suppression_reason_code=str(suppression_projection.get("suppression_reason_code") or "") or None,
+        allow_same_side_add_on=bool(suppression_projection.get("allow_same_side_add_on")),
+        allowed_add_on_side=str(suppression_projection.get("allowed_add_on_side") or "") or None,
         event_risk_acknowledgement=str(
             payload.get("event_risk_acknowledgement")
             or metadata.get("event_risk_acknowledgement")
@@ -2466,7 +2690,19 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
 
 
 def get_risk_checks(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(limit))))
+    rows = session.execute(
+        select(RiskCheck, AgentRun)
+        .outerjoin(AgentRun, AgentRun.id == RiskCheck.decision_run_id)
+        .order_by(desc(RiskCheck.created_at))
+        .limit(limit)
+    ).all()
+    payloads: list[dict[str, object]] = []
+    for risk_row, decision_row in rows:
+        payload = _serialize_model_row(risk_row)
+        payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(decision_row)
+        payload["ai_trigger_summary"] = _ai_trigger_summary_from_decision_row(decision_row)
+        payloads.append(payload)
+    return payloads
 
 
 def get_agent_runs(session: Session, limit: int = 100) -> list[dict[str, object]]:
@@ -2502,8 +2738,33 @@ def get_audit_timeline(
         )
     statement = statement.order_by(desc(AuditEvent.created_at)).limit(limit)
     rows = _serialize_model_list(list(session.scalars(statement)))
+    suppression_context_by_decision_id = _decision_run_suppression_context_by_id(
+        session,
+        [
+            decision_run_id
+            for row in rows
+            if isinstance(row, dict)
+            for decision_run_id in [_decision_run_id_from_audit_row(row)]
+            if decision_run_id is not None
+        ],
+    )
     for row in rows:
         if isinstance(row, dict):
+            payload = _as_dict(row.get("payload"))
+            payload_has_suppression_source = _has_active_position_suppression_source(payload)
+            decision_run_id = _decision_run_id_from_audit_row(row)
+            fallback_context = suppression_context_by_decision_id.get(decision_run_id)
+            suppression_projection = (
+                _active_position_suppression_projection(payload)
+                if payload_has_suppression_source
+                else _active_position_suppression_projection(fallback_context)
+            )
+            if payload_has_suppression_source or fallback_context:
+                row.update(suppression_projection)
+                row["payload"] = {
+                    **payload,
+                    **suppression_projection,
+                }
             row["event_category"] = classify_audit_event(
                 event_type=str(row.get("event_type") or "unknown"),
                 entity_type=str(row.get("entity_type") or "unknown"),

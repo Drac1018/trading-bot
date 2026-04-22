@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from trading_mvp.models import AgentRun, Position, SchedulerRun
+from sqlalchemy import select
+from trading_mvp.models import AgentRun, MarketSnapshot, Position, SchedulerRun
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.scheduler import (
     get_due_interval_decision_symbols,
     get_due_position_management_symbols,
+    run_release_enrichment_watch_cycle,
     run_interval_decision_cycle,
 )
 from trading_mvp.services.settings import get_or_create_settings
@@ -61,6 +63,59 @@ def _seed_decision_run(
             started_at=created_at,
             completed_at=created_at,
             created_at=created_at,
+        )
+    )
+    db_session.flush()
+
+
+def _seed_market_snapshot(
+    db_session,
+    *,
+    symbol: str,
+    timeframe: str,
+    snapshot_time,
+    event_name: str,
+    event_at,
+    release_enrichment: dict[str, dict[str, object]] | None = None,
+) -> None:
+    enrichment_payload = release_enrichment or {}
+    enrichment_vendors = list(enrichment_payload.keys())
+    db_session.add(
+        MarketSnapshot(
+            symbol=symbol,
+            timeframe=timeframe,
+            snapshot_time=snapshot_time,
+            latest_price=70000.0,
+            latest_volume=1.0,
+            candle_count=60,
+            is_stale=False,
+            is_complete=True,
+            payload={
+                "event_context": {
+                    "source_status": "external_api",
+                    "source_provenance": "external_api",
+                    "source_vendor": "fred",
+                    "generated_at": snapshot_time.isoformat(),
+                    "is_stale": False,
+                    "is_complete": True,
+                    "next_event_at": event_at.isoformat(),
+                    "next_event_name": event_name,
+                    "next_event_importance": "high",
+                    "minutes_to_next_event": int((event_at - snapshot_time).total_seconds() // 60),
+                    "enrichment_vendors": enrichment_vendors,
+                    "events": [
+                        {
+                            "event_at": event_at.isoformat(),
+                            "event_name": event_name,
+                            "importance": "high",
+                            "affected_assets": [symbol],
+                            "minutes_to_event": int((event_at - snapshot_time).total_seconds() // 60),
+                            "enrichment_vendors": enrichment_vendors,
+                            "release_enrichment": enrichment_payload,
+                        }
+                    ],
+                }
+            },
         )
     )
     db_session.flush()
@@ -339,6 +394,99 @@ def test_protection_path_not_delayed_by_cadence(db_session) -> None:
     db_session.flush()
 
     assert get_due_position_management_symbols(db_session) == ["BTCUSDT"]
+
+
+def test_release_enrichment_watch_cycle_refreshes_supported_event(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    settings_row.default_timeframe = "15m"
+    settings_row.event_source_provider = "fred"
+    settings_row.event_source_bls_enrichment_url = "http://127.0.0.1:8091/bls/releases"
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    snapshot_time = now - timedelta(seconds=25)
+    event_at = now - timedelta(seconds=5)
+    _seed_market_snapshot(
+        db_session,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        event_name="Consumer Price Index",
+        event_at=event_at,
+    )
+
+    called: list[dict[str, object]] = []
+
+    def _fake_run_market_refresh_cycle(self, **kwargs):  # noqa: ANN001
+        called.append(dict(kwargs))
+        return {
+            "workflow": "market_refresh_cycle",
+            "results": [
+                {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "status": "market_refresh",
+                    "trigger_event": kwargs.get("trigger_event"),
+                }
+            ],
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_market_refresh_cycle", _fake_run_market_refresh_cycle)
+
+    result = run_release_enrichment_watch_cycle(db_session, triggered_by="scheduler")
+
+    assert len(result["results"]) == 1
+    assert called == [
+        {
+            "symbols": ["BTCUSDT"],
+            "timeframe": "15m",
+            "trigger_event": "release_watch",
+            "include_exchange_sync": False,
+            "auto_resume_checked": True,
+        }
+    ]
+    latest = db_session.scalar(
+        select(SchedulerRun)
+        .where(SchedulerRun.workflow == "release_enrichment_watch_cycle")
+        .order_by(SchedulerRun.created_at.desc())
+        .limit(1)
+    )
+    assert latest is not None
+    assert latest.status == "success"
+    assert latest.outcome["event_name"] == "Consumer Price Index"
+
+
+def test_release_enrichment_watch_cycle_skips_already_enriched_event(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    settings_row.default_timeframe = "15m"
+    settings_row.event_source_provider = "fred"
+    settings_row.event_source_bls_enrichment_url = "http://127.0.0.1:8091/bls/releases"
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    _seed_market_snapshot(
+        db_session,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=now - timedelta(seconds=25),
+        event_name="Consumer Price Index",
+        event_at=now - timedelta(seconds=5),
+        release_enrichment={"bls": {"actual": 3.1, "prior": 2.9}},
+    )
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_market_refresh_cycle",
+        lambda self, **kwargs: pytest.fail("already-enriched event should not trigger immediate refresh"),
+    )
+
+    result = run_release_enrichment_watch_cycle(db_session, triggered_by="scheduler")
+
+    assert result["results"] == []
 
 
 def test_deduped_entry_trigger_surfaces_reason_fields(monkeypatch, db_session) -> None:

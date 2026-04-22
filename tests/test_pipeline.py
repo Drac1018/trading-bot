@@ -61,6 +61,73 @@ def _mark_pipeline_sync_fresh(settings_row) -> None:
         mark_sync_success(settings_row, scope=scope, synced_at=now)
 
 
+def _entry_plan_test_decision() -> TradeDecision:
+    return TradeDecision(
+        decision="long",
+        confidence=0.72,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=69000.0,
+        entry_zone_max=69300.0,
+        entry_mode="pullback_confirm",
+        invalidation_price=68500.0,
+        max_chase_bps=25.0,
+        idea_ttl_minutes=15,
+        stop_loss=68500.0,
+        take_profit=71000.0,
+        max_holding_minutes=180,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["ALIGNED_PULLBACK", "TREND_UP"],
+        explanation_short="pipeline entry-plan test",
+        explanation_detailed="Entry-plan pipeline test uses a deterministic pullback-confirm decision.",
+    )
+
+
+def _patch_entry_plan_decision_flow(monkeypatch, orchestrator: TradingOrchestrator) -> None:
+    def fake_agent_run(*args, **kwargs):
+        return _entry_plan_test_decision(), "deterministic-mock", {}
+
+    def fake_evaluate_risk(session, settings_row, decision, market_snapshot, **kwargs):
+        trigger_waiting = decision.decision in {"long", "short"} and decision.entry_mode != "immediate"
+        blocked_reason_codes = ["ENTRY_TRIGGER_NOT_MET"] if trigger_waiting else []
+        result = RiskCheckResult(
+            allowed=not trigger_waiting,
+            decision=decision.decision,
+            reason_codes=blocked_reason_codes,
+            blocked_reason_codes=blocked_reason_codes,
+            adjustment_reason_codes=[],
+            approved_risk_pct=0.0 if trigger_waiting else float(decision.risk_pct or 0.0),
+            approved_leverage=0.0 if trigger_waiting else float(decision.leverage or 0.0),
+            raw_projected_notional=0.0,
+            approved_notional=0.0,
+            approved_projected_notional=0.0,
+            approved_qty=None,
+            approved_quantity=None,
+            operating_mode="live",
+            effective_leverage_cap=5.0,
+            symbol_risk_tier="btc",
+            exposure_metrics={},
+        )
+        row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=kwargs.get("decision_run_id"),
+            market_snapshot_id=kwargs.get("market_snapshot_id"),
+            allowed=result.allowed,
+            decision=decision.decision,
+            reason_codes=list(result.reason_codes),
+            approved_risk_pct=result.approved_risk_pct,
+            approved_leverage=result.approved_leverage,
+            payload=result.model_dump(mode="json"),
+        )
+        session.add(row)
+        session.flush()
+        return result, row
+
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_agent_run)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_evaluate_risk)
+
+
 def _selection_candidate_row(
     *,
     symbol: str,
@@ -627,6 +694,7 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
 
     orchestrator = TradingOrchestrator(db_session)
+    _patch_entry_plan_decision_flow(monkeypatch, orchestrator)
     result = orchestrator.run_decision_cycle(trigger_event="manual", upto_index=140)
     db_session.commit()
     decision_run = db_session.get(AgentRun, result["decision_run_id"])
@@ -642,7 +710,9 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     assert result["decision_reference"]["market_snapshot_source"] == "refreshed"
     assert result["decision_reference"]["market_snapshot_stale"] is False
     assert result["decision_reference"]["freshness_blocking"] is False
-    assert result["decision_reference"]["account_sync_at"] is not None
+    assert result["decision_reference"]["account_sync_at"] is None
+    assert result["decision_reference"]["account_sync_status"] == "unknown"
+    assert result["decision_reference"]["sync_freshness_summary"]["account"]["stale"] is False
     assert result["decision_reference"]["positions_sync_at"] is not None
     assert decision_run is not None
     assert decision_run.input_payload["decision_reference"]["market_snapshot_id"] == result["market_snapshot_id"]
@@ -684,7 +754,9 @@ def test_historical_replay_never_executes_live(monkeypatch, db_session) -> None:
 
     monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
 
-    result = TradingOrchestrator(db_session).run_decision_cycle(trigger_event="historical_replay", upto_index=140)
+    orchestrator = TradingOrchestrator(db_session)
+    _patch_entry_plan_decision_flow(monkeypatch, orchestrator)
+    result = orchestrator.run_decision_cycle(trigger_event="historical_replay", upto_index=140)
 
     assert result["decision"]["decision"] == "long"
     assert "ENTRY_TRIGGER_NOT_MET" in result["risk_result"]["blocked_reason_codes"]
@@ -2482,6 +2554,239 @@ def test_no_event_no_ai_invocation(monkeypatch, db_session) -> None:
     assert scheduler_run.status == "success"
 
 
+def test_interval_no_event_audit_persists_active_position_suppression(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    snapshot_time = utcnow_naive()
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70120.0,
+        latest_volume=1200.0,
+        candle_count=3,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=2), open=70020.0, high=70080.0, low=69980.0, close=70040.0, volume=1000.0),
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70040.0, high=70110.0, low=70010.0, close=70090.0, volume=1100.0),
+            MarketCandle(timestamp=snapshot_time, open=70090.0, high=70150.0, low=70070.0, close=70120.0, volume=1200.0),
+        ],
+    )
+    feature_payload = FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=0.34,
+        volatility_pct=0.002,
+        volume_ratio=1.08,
+        drawdown_pct=0.001,
+        rsi=58.0,
+        atr=90.0,
+        atr_pct=0.0013,
+        momentum_score=0.22,
+        multi_timeframe={
+            "15m": TimeframeFeatureContext(
+                timeframe="15m",
+                trend_score=0.34,
+                volatility_pct=0.002,
+                volume_ratio=1.08,
+                drawdown_pct=0.001,
+                rsi=58.0,
+                atr=90.0,
+                atr_pct=0.0013,
+                momentum_score=0.22,
+            )
+        },
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime="strong",
+            momentum_state="strengthening",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        data_quality_flags=[],
+    )
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=70120.0,
+            leverage=2.0,
+            stop_loss=69400.0,
+            take_profit=71200.0,
+            realized_pnl=0.0,
+            unrealized_pnl=12.0,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": ["BTCUSDT"],
+            "skipped_symbols": [],
+            "rankings": [_ranking_candidate_payload(symbol="BTCUSDT", strategy_engine="trend_pullback_engine")],
+        },
+    )
+    monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_position_management_context",
+        lambda *args, **kwargs: {
+            "holding_profile": "scalp",
+            "holding_profile_reason": "active_position_test",
+            "hard_stop_active": True,
+            "stop_widening_allowed": False,
+            "current_r_multiple": 0.8,
+            "break_even_eligible": True,
+            "tightened_stop_loss": 70020.0,
+            "reduce_reason_codes": [],
+        },
+    )
+
+    class DummyGate:
+        allowed = True
+        reason = "allowed"
+
+        def as_metadata(self) -> dict[str, object]:
+            return {"allowed": True, "reason": "allowed"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: DummyGate())
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_ai_prior_context",
+        lambda *args, **kwargs: AIPriorContextPacket(),
+    )
+
+    def fake_run(_market_snapshot, _feature_payload, _open_positions, _risk_context, *, use_ai, **kwargs):
+        return (
+            TradeDecision(
+                decision="long",
+                confidence=0.62,
+                symbol="BTCUSDT",
+                timeframe="15m",
+                entry_zone_min=70080.0,
+                entry_zone_max=70100.0,
+                entry_mode="pullback_confirm",
+                invalidation_price=69400.0,
+                max_chase_bps=12.0,
+                idea_ttl_minutes=20,
+                stop_loss=69400.0,
+                take_profit=71200.0,
+                max_holding_minutes=120,
+                risk_pct=0.01,
+                leverage=1.0,
+                rationale_codes=["TEST_ADD_ON"],
+                explanation_short="same-side add-on",
+                explanation_detailed="Test helper tries to reuse the same-side add-on route.",
+            ),
+            "openai",
+            {"source": "llm"},
+        )
+
+    def fake_evaluate_risk(session, settings_row, decision, market_snapshot, **kwargs):
+        blocked = decision.decision == "long"
+        reason_codes = ["LARGEST_POSITION_LIMIT_REACHED"] if blocked else []
+        result = RiskCheckResult(
+            allowed=not blocked,
+            decision=decision.decision,
+            reason_codes=reason_codes,
+            blocked_reason_codes=reason_codes,
+            adjustment_reason_codes=[],
+            approved_risk_pct=0.0 if blocked else float(decision.risk_pct or 0.0),
+            approved_leverage=0.0 if blocked else float(decision.leverage or 0.0),
+            raw_projected_notional=0.0,
+            approved_notional=0.0,
+            approved_projected_notional=0.0,
+            approved_qty=None,
+            approved_quantity=None,
+            operating_mode="hold" if blocked else "live",
+            effective_leverage_cap=5.0,
+            symbol_risk_tier="btc",
+            exposure_metrics={},
+        )
+        row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=kwargs.get("decision_run_id"),
+            market_snapshot_id=kwargs.get("market_snapshot_id"),
+            allowed=result.allowed,
+            decision=decision.decision,
+            reason_codes=list(result.reason_codes),
+            approved_risk_pct=result.approved_risk_pct,
+            approved_leverage=result.approved_leverage,
+            payload=result.model_dump(mode="json"),
+        )
+        session.add(row)
+        session.flush()
+        return result, row
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_evaluate_risk)
+
+    orchestrator = TradingOrchestrator(db_session)
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_run)
+    orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="realtime_cycle",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+    )
+    orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="realtime_cycle",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+    )
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_decision_cycle",
+        lambda self, **kwargs: pytest.fail("no-event interval review must not invoke decision cycle"),
+    )
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    audit_event = db_session.scalar(
+        select(AuditEvent)
+        .where(
+            AuditEvent.event_type == "decision_ai_no_event",
+            AuditEvent.entity_id == "BTCUSDT",
+        )
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+
+    assert result["results"][0]["outcome"]["ai_review_status"] == "no_event"
+    assert audit_event is not None
+    assert audit_event.payload["suppression_active"] is True
+    assert audit_event.payload["suppression_reason_code"] == "LARGEST_POSITION_LIMIT_REACHED"
+    assert audit_event.payload["allow_same_side_add_on"] is False
+    assert audit_event.payload["allowed_add_on_side"] is None
+
+
 def test_run_interval_decision_cycle_marks_failure_instead_of_raising(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
@@ -3817,6 +4122,259 @@ def test_active_position_cadence_prioritizes_management(monkeypatch, db_session)
 
     assert get_due_position_management_symbols(db_session) == ["BTCUSDT"]
     assert is_interval_decision_due(db_session, "BTCUSDT") is False
+
+
+def test_active_position_blocked_add_on_is_suppressed_until_state_changes(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.flush()
+
+    snapshot_time = utcnow_naive()
+    snapshot = MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70120.0,
+        latest_volume=1200.0,
+        candle_count=3,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=2), open=70020.0, high=70080.0, low=69980.0, close=70040.0, volume=1000.0),
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70040.0, high=70110.0, low=70010.0, close=70090.0, volume=1100.0),
+            MarketCandle(timestamp=snapshot_time, open=70090.0, high=70150.0, low=70070.0, close=70120.0, volume=1200.0),
+        ],
+    )
+    feature_payload = FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=0.34,
+        volatility_pct=0.002,
+        volume_ratio=1.08,
+        drawdown_pct=0.001,
+        rsi=58.0,
+        atr=90.0,
+        atr_pct=0.0013,
+        momentum_score=0.22,
+        multi_timeframe={
+            "15m": TimeframeFeatureContext(
+                timeframe="15m",
+                trend_score=0.34,
+                volatility_pct=0.002,
+                volume_ratio=1.08,
+                drawdown_pct=0.001,
+                rsi=58.0,
+                atr=90.0,
+                atr_pct=0.0013,
+                momentum_score=0.22,
+            )
+        },
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime="strong",
+            momentum_state="strengthening",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        data_quality_flags=[],
+    )
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=70120.0,
+            leverage=2.0,
+            stop_loss=69400.0,
+            take_profit=71200.0,
+            realized_pnl=0.0,
+            unrealized_pnl=12.0,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": ["BTCUSDT"],
+            "skipped_symbols": [],
+            "rankings": [_ranking_candidate_payload(symbol="BTCUSDT", strategy_engine="trend_pullback_engine")],
+        },
+    )
+    monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_position_management_context",
+        lambda *args, **kwargs: {
+            "holding_profile": "scalp",
+            "holding_profile_reason": "active_position_test",
+            "hard_stop_active": True,
+            "stop_widening_allowed": False,
+            "current_r_multiple": 0.8,
+            "break_even_eligible": True,
+            "tightened_stop_loss": 70020.0,
+            "reduce_reason_codes": [],
+        },
+    )
+
+    class DummyGate:
+        allowed = True
+        reason = "allowed"
+
+        def as_metadata(self) -> dict[str, object]:
+            return {"allowed": True, "reason": "allowed"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: DummyGate())
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.build_ai_prior_context",
+        lambda *args, **kwargs: AIPriorContextPacket(),
+    )
+
+    captured_ai_contexts: list[dict[str, object]] = []
+
+    def fake_run(_market_snapshot, _feature_payload, _open_positions, _risk_context, *, use_ai, **kwargs):
+        ai_context = kwargs.get("ai_context")
+        if ai_context is not None and hasattr(ai_context, "model_dump"):
+            captured_ai_contexts.append(ai_context.model_dump(mode="json"))
+        return (
+            TradeDecision(
+                decision="long",
+                confidence=0.62,
+                symbol="BTCUSDT",
+                timeframe="15m",
+                entry_zone_min=70080.0,
+                entry_zone_max=70100.0,
+                entry_mode="pullback_confirm",
+                invalidation_price=69400.0,
+                max_chase_bps=12.0,
+                idea_ttl_minutes=20,
+                stop_loss=69400.0,
+                take_profit=71200.0,
+                max_holding_minutes=120,
+                risk_pct=0.01,
+                leverage=1.0,
+                rationale_codes=["TEST_ADD_ON"],
+                explanation_short="same-side add-on",
+                explanation_detailed="Test helper tries to reuse the same-side add-on route.",
+            ),
+            "openai",
+            {"source": "llm", "bounded_output_applied": True},
+        )
+
+    def fake_evaluate_risk(session, settings_row, decision, market_snapshot, **kwargs):
+        blocked = decision.decision == "long"
+        reason_codes = ["LARGEST_POSITION_LIMIT_REACHED"] if blocked else []
+        result = RiskCheckResult(
+            allowed=not blocked,
+            decision=decision.decision,
+            reason_codes=reason_codes,
+            blocked_reason_codes=reason_codes,
+            adjustment_reason_codes=[],
+            approved_risk_pct=0.0 if blocked else float(decision.risk_pct or 0.0),
+            approved_leverage=0.0 if blocked else float(decision.leverage or 0.0),
+            raw_projected_notional=0.0,
+            approved_notional=0.0,
+            approved_projected_notional=0.0,
+            approved_qty=None,
+            approved_quantity=None,
+            operating_mode="hold" if blocked else "live",
+            effective_leverage_cap=5.0,
+            symbol_risk_tier="btc",
+            exposure_metrics={},
+        )
+        row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=kwargs.get("decision_run_id"),
+            market_snapshot_id=kwargs.get("market_snapshot_id"),
+            allowed=result.allowed,
+            decision=decision.decision,
+            reason_codes=list(result.reason_codes),
+            approved_risk_pct=result.approved_risk_pct,
+            approved_leverage=result.approved_leverage,
+            payload=result.model_dump(mode="json"),
+        )
+        session.add(row)
+        session.flush()
+        return result, row
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_evaluate_risk)
+
+    orchestrator = TradingOrchestrator(db_session)
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_run)
+
+    first = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="realtime_cycle",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+    )
+    second = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="realtime_cycle",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+    )
+
+    first_decision_row = db_session.get(AgentRun, first["decision_run_id"])
+    second_decision_row = db_session.get(AgentRun, second["decision_run_id"])
+
+    assert first_decision_row is not None
+    assert second_decision_row is not None
+    assert first["risk_result"]["reason_codes"] == ["LARGEST_POSITION_LIMIT_REACHED"]
+    assert captured_ai_contexts[0]["strategy_engine_context"]["allow_same_side_add_on"] is True
+    assert captured_ai_contexts[0]["strategy_engine_context"]["allowed_add_on_side"] == "long"
+    assert captured_ai_contexts[1]["strategy_engine_context"]["allow_same_side_add_on"] is False
+    assert captured_ai_contexts[1]["strategy_engine_context"]["entry_proposal_suppression_active"] is True
+    assert captured_ai_contexts[1]["strategy_engine_context"]["entry_proposal_suppressed_reason_code"] == "LARGEST_POSITION_LIMIT_REACHED"
+    assert second_decision_row.metadata_json["active_position_prompt_route_context"]["allow_same_side_add_on"] is False
+    assert second_decision_row.metadata_json["active_position_prompt_route_context"]["entry_proposal_suppression_active"] is True
+    second_audit_events = {
+        event.event_type: event
+        for event in db_session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.entity_id == str(second["decision_run_id"]),
+                AuditEvent.event_type.in_(("agent_output", "decision_ai_invoked", "decision_ai_bounded", "decision_cycle_completed")),
+            )
+        )
+    }
+    assert second_audit_events["agent_output"].payload["suppression_active"] is True
+    assert second_audit_events["agent_output"].payload["suppression_reason_code"] == "LARGEST_POSITION_LIMIT_REACHED"
+    assert second_audit_events["agent_output"].payload["allow_same_side_add_on"] is False
+    assert second_audit_events["agent_output"].payload["allowed_add_on_side"] is None
+    assert second_audit_events["decision_ai_invoked"].payload["suppression_active"] is True
+    assert second_audit_events["decision_ai_invoked"].payload["suppression_reason_code"] == "LARGEST_POSITION_LIMIT_REACHED"
+    assert second_audit_events["decision_ai_invoked"].payload["allow_same_side_add_on"] is False
+    assert second_audit_events["decision_ai_invoked"].payload["allowed_add_on_side"] is None
+    assert second_audit_events["decision_ai_bounded"].payload["suppression_active"] is True
+    assert second_audit_events["decision_ai_bounded"].payload["suppression_reason_code"] == "LARGEST_POSITION_LIMIT_REACHED"
+    assert second_audit_events["decision_ai_bounded"].payload["allow_same_side_add_on"] is False
+    assert second_audit_events["decision_ai_bounded"].payload["allowed_add_on_side"] is None
+    assert second_audit_events["decision_cycle_completed"].payload["suppression_active"] is True
+    assert second_audit_events["decision_cycle_completed"].payload["suppression_reason_code"] == "LARGEST_POSITION_LIMIT_REACHED"
+    assert second_audit_events["decision_cycle_completed"].payload["allow_same_side_add_on"] is False
+    assert second_audit_events["decision_cycle_completed"].payload["allowed_add_on_side"] is None
 
 
 def test_run_decision_cycle_skips_ai_in_idle_no_trade_zone(monkeypatch, db_session) -> None:

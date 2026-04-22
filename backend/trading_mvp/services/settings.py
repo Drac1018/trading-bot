@@ -614,7 +614,8 @@ def build_event_operator_control_payload(
     resolved_symbol = (symbol or settings_row.default_symbol).upper()
     resolved_timeframe = timeframe or settings_row.default_timeframe
     evaluation_time = ensure_utc_aware(evaluated_at) or utcnow_aware()
-    operator_event_view = _deserialize_operator_event_view_payload(settings_row) or build_default_operator_event_view()
+    configured_operator_event_view = _deserialize_operator_event_view_payload(settings_row)
+    operator_event_view = configured_operator_event_view or build_default_operator_event_view()
     manual_windows = _deserialize_manual_no_trade_windows(settings_row)
     event_context = _build_operator_event_context_payload(
         session=session,
@@ -645,6 +646,7 @@ def build_event_operator_control_payload(
         event_context=event_context,
         ai_event_view=resolved_ai_event_view,
         operator_event_view=operator_event_view,
+        operator_event_view_configured=configured_operator_event_view is not None,
         alignment_decision=policy_evaluation.alignment_decision,
         evaluated_operator_policy=policy_evaluation.evaluated_operator_policy,
         blocked_reason=policy_evaluation.blocked_reason,
@@ -662,6 +664,13 @@ def _alignment_audit_payload(
     settings_row: Setting,
     symbols: list[str],
 ) -> dict[str, Any]:
+    event_context_keys = (
+        "source_status",
+        "is_stale",
+        "next_event_name",
+        "minutes_to_next_event",
+        "active_risk_window",
+    )
     evaluations: dict[str, Any] = {}
     for symbol in symbols:
         payload = build_event_operator_control_payload(
@@ -669,10 +678,15 @@ def _alignment_audit_payload(
             settings_row=settings_row,
             symbol=symbol,
         )
+        event_context_snapshot = payload.event_context.model_dump(mode="json")
         evaluations[symbol] = {
             "alignment_status": payload.alignment_decision.alignment_status,
             "effective_policy_preview": payload.alignment_decision.effective_policy_preview,
             "reason_codes": list(payload.alignment_decision.reason_codes),
+            "event_context": {
+                key: event_context_snapshot.get(key)
+                for key in event_context_keys
+            },
         }
     return {
         "symbols": list(symbols),

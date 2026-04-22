@@ -1,6 +1,7 @@
 import {
   describeSourceStatusHelp,
   inferEventSourceProvenance,
+  resolveOperatorEventViewConfigured,
   summarizeEntryPolicy,
   summarizeReasonCodes,
   type EventOperatorControlPayload,
@@ -17,12 +18,14 @@ export function buildSettingsEventPreviewSummary(
 ): SettingsEventPreviewSummary {
   const eventContext = eventOperatorControl?.event_context;
   const provenance = inferEventSourceProvenance(eventContext);
+  const operatorViewConfigured = resolveOperatorEventViewConfigured(eventOperatorControl);
   return {
     entryPolicySummary: summarizeEntryPolicy({
       effectivePolicyPreview: eventOperatorControl?.effective_policy_preview,
       blockedReason: eventOperatorControl?.blocked_reason,
       approvalRequiredReason: eventOperatorControl?.approval_required_reason,
       policySource: eventOperatorControl?.policy_source,
+      operatorViewConfigured,
     }),
     alignmentReasonSummary: summarizeReasonCodes(eventOperatorControl?.alignment_decision?.reason_codes),
     eventSourceHelp: describeSourceStatusHelp(eventContext?.source_status, {

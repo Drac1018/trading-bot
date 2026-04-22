@@ -9,7 +9,6 @@ export default defineConfig({
     command: "npm run dev",
     port: 3000,
     reuseExistingServer: true,
-    cwd: __dirname
+    cwd: process.cwd()
   }
 });
-

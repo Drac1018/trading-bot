@@ -142,30 +142,37 @@
 
 ## Trigger Family Notes
 
+Current runtime source of truth for trigger semantics is `backend/trading_mvp/services/orchestrator.py`, `backend/trading_mvp/services/scheduler.py`, and `docs/api.md`.
+
+Current runtime trigger families:
+
 - `entry_candidate_event`
   - entry review 전용
   - `trend_pullback`, `trend_continuation`, `range_mean_reversion`, `breakout_exception`만 의미가 있음
 - `breakout_exception_event`
   - breakout 예외 전용
   - `breakout_exception_engine`만 정상 경로
-- `open_position_recheck_due`
-  - thesis refresh
-  - 신규 entry 금지
 - `protection_review_event`
   - survival path
   - management-only
 - `manual_review_event`
   - open position이 있으면 management review
   - 없으면 entry review 가능
+
+Historical reference only:
+
+- `open_position_recheck_due`
+  - legacy policy의 thesis refresh
+  - 현재 runtime trigger가 아니라 stored historical semantics
 - `periodic_backstop_due`
-  - stale thesis refresh safety net
-  - 빈도 증폭 장치가 아니라 missed-event/backstop 용도
+  - legacy policy의 stale-thesis refresh safety net
+  - 현재 runtime trigger가 아니라 stored historical semantics
 
 ## Holding Profile Overlay
 
 - `scalp`
   - 기본값
-  - 가장 짧은 review cadence
+  - 가장 짧은 review cadence hint
   - breakout exception도 여기만 허용
 - `swing`
   - meta gate와 구조 정렬 요구가 강해짐

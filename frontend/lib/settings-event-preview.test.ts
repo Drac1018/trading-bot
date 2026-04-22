@@ -52,6 +52,7 @@ function buildEventOperatorControl(
       created_by: "operator-ui",
       updated_at: "2026-04-20T11:01:00Z",
     },
+    operator_event_view_configured: true,
     alignment_decision: {
       ai_bias: "bullish",
       operator_bias: "neutral",
@@ -80,7 +81,7 @@ test("buildSettingsEventPreviewSummary returns user-facing summary copy for sett
 
   assert.equal(
     summary.entryPolicySummary,
-    "지금 신규 진입은 \"승인 후 가능\" 상태입니다. 이유: AI와 운영자 의견이 완전히 같지 않아 한 번 더 확인이 필요합니다. 기준: AI와 운영자 의견 비교.",
+    '지금 신규 진입은 "승인 후 가능" 상태입니다. 이유: AI와 운영자 의견이 완전히 같지 않아 한 번 더 확인이 필요합니다. 기준: AI와 운영자 의견 비교.',
   );
   assert.equal(
     summary.alignmentReasonSummary,
@@ -95,7 +96,7 @@ test("buildSettingsEventPreviewSummary returns user-facing summary copy for sett
   );
 });
 
-test("buildSettingsEventPreviewSummary keeps unavailable source and missing alignment visible", async () => {
+test("buildSettingsEventPreviewSummary keeps unconfigured operator state explicit", async () => {
   const { buildSettingsEventPreviewSummary } = await settingsEventPreviewModule;
   const { describeSourceStatusHelp } = await eventOperatorControlModule;
 
@@ -116,6 +117,19 @@ test("buildSettingsEventPreviewSummary keeps unavailable source and missing alig
         affected_assets: [],
         summary_note: "provider unavailable",
       },
+      operator_event_view: {
+        operator_bias: "unknown",
+        operator_risk_state: "unknown",
+        applies_to_symbols: [],
+        horizon: null,
+        valid_from: null,
+        valid_to: null,
+        enforcement_mode: "observe_only",
+        note: null,
+        created_by: "unknown",
+        updated_at: null,
+      },
+      operator_event_view_configured: false,
       alignment_decision: {
         ai_bias: "unknown",
         operator_bias: "unknown",
@@ -134,7 +148,7 @@ test("buildSettingsEventPreviewSummary keeps unavailable source and missing alig
 
   assert.equal(
     summary.entryPolicySummary,
-    "지금 신규 진입은 \"판단 보류\" 상태입니다. 이유: 추가 사유 없음. 기준: 추가 제한 없음.",
+    "운영자가 저장한 이벤트 정책은 없습니다. 현재 엔진은 기본 참고 평가만 수행하며, 이 상태 자체로 신규 진입을 차단하지 않습니다.",
   );
   assert.equal(summary.alignmentReasonSummary, "추가 사유 없음");
   assert.equal(
@@ -143,5 +157,46 @@ test("buildSettingsEventPreviewSummary keeps unavailable source and missing alig
       kind: "event_context",
       provenance: "stub",
     }),
+  );
+});
+
+test("buildSettingsEventPreviewSummary prefers explicit configured flag over fallback shape", async () => {
+  const { buildSettingsEventPreviewSummary } = await settingsEventPreviewModule;
+
+  const summary = buildSettingsEventPreviewSummary(
+    buildEventOperatorControl({
+      operator_event_view: {
+        operator_bias: "unknown",
+        operator_risk_state: "unknown",
+        applies_to_symbols: [],
+        horizon: null,
+        valid_from: null,
+        valid_to: null,
+        enforcement_mode: "observe_only",
+        note: null,
+        created_by: "operator-ui",
+        updated_at: null,
+      },
+      operator_event_view_configured: true,
+      alignment_decision: {
+        ai_bias: "unknown",
+        operator_bias: "unknown",
+        ai_risk_state: "unknown",
+        operator_risk_state: "unknown",
+        alignment_status: "insufficient_data",
+        reason_codes: [],
+        effective_policy_preview: "insufficient_data",
+        evaluated_at: "2026-04-20T11:02:00Z",
+      },
+      effective_policy_preview: "insufficient_data",
+      blocked_reason: null,
+      approval_required_reason: null,
+      policy_source: "none",
+    }),
+  );
+
+  assert.equal(
+    summary.entryPolicySummary,
+    '지금 신규 진입은 "판단 보류" 상태입니다. 이유: 추가 사유 없음. 기준: 추가 제한 없음.',
   );
 });

@@ -1,18 +1,53 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_DATA_DIR = (_PROJECT_ROOT / "data").resolve()
+_DEFAULT_DATABASE_PATH = (_DEFAULT_DATA_DIR / "trading_mvp.db").resolve()
+
+
+def _resolve_project_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (_PROJECT_ROOT / candidate).resolve()
+
+
+def _sqlite_url_from_path(path: Path) -> str:
+    return f"sqlite:///{path.as_posix()}"
+
+
+def _resolve_sqlite_database_url(database_url: str) -> str:
+    try:
+        url = make_url(database_url)
+    except Exception:
+        return database_url
+
+    if not url.drivername.startswith("sqlite"):
+        return database_url
+    if url.database in {None, "", ":memory:"}:
+        return database_url
+
+    return str(url.set(database=_resolve_project_path(url.database).as_posix()))
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(_PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     app_env: str = "development"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     frontend_port: int = 3000
-    database_url: str = "sqlite:///./data/trading_mvp.db"
+    database_url: str = _sqlite_url_from_path(_DEFAULT_DATABASE_PATH)
     redis_url: str = "redis://localhost:6379/0"
     default_symbol: str = "BTCUSDT"
     tracked_symbols: str = "BTCUSDT"
@@ -63,7 +98,11 @@ class Settings(BaseSettings):
     binance_futures_enabled: bool = True
     exchange_recv_window_ms: int = 5000
     next_public_api_base_url: str = "http://localhost:8000"
-    data_dir: Path = Field(default_factory=lambda: Path("data"))
+    data_dir: Path = Field(default_factory=lambda: _DEFAULT_DATA_DIR)
+
+    def model_post_init(self, __context: Any) -> None:
+        self.data_dir = _resolve_project_path(self.data_dir)
+        self.database_url = _resolve_sqlite_database_url(self.database_url)
 
 
 @lru_cache(maxsize=1)

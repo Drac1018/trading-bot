@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sqlalchemy import select
-from trading_mvp.models import PendingEntryPlan
-from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, TradeDecision
+from trading_mvp.models import PendingEntryPlan, RiskCheck
+from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
 from trading_mvp.services.dashboard import get_overview
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
@@ -164,6 +164,25 @@ def _hold_decision() -> TradeDecision:
     )
 
 
+def _build_stubbed_risk_result(decision: TradeDecision) -> RiskCheckResult:
+    trigger_waiting = decision.decision in {"long", "short"} and decision.entry_mode != "immediate"
+    blocked_reason_codes = ["ENTRY_TRIGGER_NOT_MET"] if trigger_waiting else []
+    approved_risk_pct = 0.0 if trigger_waiting else float(decision.risk_pct or 0.0)
+    approved_leverage = 0.0 if trigger_waiting else float(decision.leverage or 0.0)
+    return RiskCheckResult(
+        allowed=not trigger_waiting,
+        decision=decision.decision,  # type: ignore[arg-type]
+        reason_codes=blocked_reason_codes,
+        blocked_reason_codes=blocked_reason_codes,
+        approved_risk_pct=approved_risk_pct,
+        approved_leverage=approved_leverage,
+        operating_mode="live",
+        effective_leverage_cap=5.0,
+        symbol_risk_tier="btc",
+        exposure_metrics={},
+    )
+
+
 def _arm_plan(monkeypatch, db_session, *, snapshot_time=None) -> tuple[TradingOrchestrator, dict[str, object]]:
     _enable_live_settings(db_session)
 
@@ -179,6 +198,33 @@ def _arm_plan(monkeypatch, db_session, *, snapshot_time=None) -> tuple[TradingOr
         "deterministic-mock",
         {},
     )
+    def fake_evaluate_risk(
+        session,
+        settings_row,
+        decision,
+        market_snapshot,
+        decision_run_id=None,
+        market_snapshot_id=None,
+        execution_mode="live",
+        **kwargs,
+    ):
+        risk_result = _build_stubbed_risk_result(decision)
+        risk_row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=decision_run_id,
+            market_snapshot_id=market_snapshot_id,
+            allowed=risk_result.allowed,
+            decision=decision.decision,
+            reason_codes=list(risk_result.reason_codes),
+            approved_risk_pct=risk_result.approved_risk_pct,
+            approved_leverage=risk_result.approved_leverage,
+            payload=risk_result.model_dump(mode="json"),
+        )
+        session.add(risk_row)
+        session.flush()
+        return risk_result, risk_row
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_evaluate_risk)
     monkeypatch.setattr(
         "trading_mvp.services.orchestrator.execute_live_trade",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("entry plans must not execute during decision cycle")),

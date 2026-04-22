@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from time import monotonic
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -16,9 +17,9 @@ from trading_mvp.schemas import (
     BinanceAccountResponse,
     BinanceConnectionTestRequest,
     BinanceLiveTestOrderRequest,
+    ManualLiveApprovalRequest,
     ManualNoTradeWindowEndRequest,
     ManualNoTradeWindowRequest,
-    ManualLiveApprovalRequest,
     OpenAIConnectionTestRequest,
     OperatorEventViewClearRequest,
     OperatorEventViewRequest,
@@ -80,58 +81,145 @@ from trading_mvp.services.settings import (
 )
 
 READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS = 20.0
+LOCAL_DEV_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+_sqlite_background_write_guard = threading.Lock()
 _exchange_sync_read_refresh_guard = threading.Lock()
 _exchange_sync_read_refresh_inflight = False
 _exchange_sync_read_refresh_last_started = 0.0
 
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _background_scheduler_enabled() -> bool:
+    default = engine.dialect.name != "sqlite"
+    return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER", default=default)
+
+
+def _background_user_stream_enabled() -> bool:
+    default = engine.dialect.name != "sqlite"
+    return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM", default=default)
+
+
+@contextmanager
+def _sqlite_write_lock() -> Iterator[None]:
+    if engine.dialect.name != "sqlite":
+        yield
+        return
+    _sqlite_background_write_guard.acquire()
+    try:
+        yield
+    finally:
+        _sqlite_background_write_guard.release()
+
+
 async def _background_scheduler_loop() -> None:
     while True:
-        interval_seconds = await asyncio.to_thread(_run_background_scheduler_tick)
+        interval_seconds = await asyncio.to_thread(
+            _run_background_tick_with_sqlite_guard,
+            _run_background_scheduler_tick,
+            1,
+        )
         await asyncio.sleep(interval_seconds)
 
 
 async def _background_user_stream_loop() -> None:
     while True:
-        sleep_seconds = await asyncio.to_thread(_run_background_user_stream_tick)
+        sleep_seconds = await asyncio.to_thread(
+            _run_background_tick_with_sqlite_guard,
+            _run_background_user_stream_tick,
+            1,
+        )
         await asyncio.sleep(sleep_seconds)
+
+
+def _run_background_tick_with_sqlite_guard(tick: Callable[[], int], blocked_sleep_seconds: int) -> int:
+    if engine.dialect.name != "sqlite":
+        return tick()
+    # SQLite local/test environments cannot tolerate overlapping background writes.
+    # Skip the overlapping tick and retry soon instead of queueing another writer.
+    if not _sqlite_background_write_guard.acquire(blocking=False):
+        return blocked_sleep_seconds
+    try:
+        return tick()
+    finally:
+        _sqlite_background_write_guard.release()
+
+
+def _record_background_loop_failure(
+    session_factory,
+    *,
+    event_type: str,
+    entity_type: str,
+    entity_id: str,
+    severity: str,
+    component: str,
+    message: str,
+    payload: dict[str, object],
+) -> None:
+    # Recovery logging is best-effort only. If SQLite is still locked, the loop
+    # must survive and retry on the next tick rather than crash here.
+    try:
+        with session_factory() as recovery_session:
+            record_audit_event(
+                recovery_session,
+                event_type=event_type,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                severity=severity,
+                message=message,
+                payload=payload,
+            )
+            record_health_event(
+                recovery_session,
+                component=component,
+                status="error",
+                message=message,
+                payload=payload,
+            )
+            recovery_session.commit()
+    except Exception:
+        return
 
 
 def _run_background_scheduler_tick() -> int:
     polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     with polling_session_factory() as session:
-        settings_row = get_or_create_settings(session)
+        interval_seconds = 15
         try:
+            settings_row = get_or_create_settings(session)
+            interval_seconds = max(15, min(int(settings_row.exchange_sync_interval_seconds), 15))
             run_due_operational_cycles(session)
             run_due_windows(session)
             session.commit()
         except Exception as exc:
-            record_audit_event(
-                session,
+            session.rollback()
+            _record_background_loop_failure(
+                polling_session_factory,
                 event_type="background_scheduler_failed",
                 entity_type="scheduler",
                 entity_id="background",
                 severity="error",
-                message="Background scheduler loop failed.",
-                payload={"error": str(exc)},
-            )
-            record_health_event(
-                session,
                 component="scheduler",
-                status="error",
                 message="Background scheduler loop failed.",
                 payload={"error": str(exc)},
             )
-            session.commit()
-        return max(15, min(int(settings_row.exchange_sync_interval_seconds), 30))
+        return interval_seconds
 
 
 def _run_background_user_stream_tick() -> int:
     polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     with polling_session_factory() as session:
-        settings_row = get_or_create_settings(session)
-        tracked_symbols = settings_row.tracked_symbols or [settings_row.default_symbol]
+        sleep_seconds = 5
+        entity_id = "background"
         try:
+            settings_row = get_or_create_settings(session)
+            entity_id = settings_row.default_symbol
+            tracked_symbols = settings_row.tracked_symbols or [settings_row.default_symbol]
             stream_result = poll_live_user_stream(
                 session,
                 settings_row,
@@ -141,42 +229,38 @@ def _run_background_user_stream_tick() -> int:
             session.commit()
             stream_health = str(stream_result.get("stream_health") or "idle")
             if stream_health == "connected":
-                return 1
-            if stream_health == "unavailable":
-                return 10
-            return 5
+                sleep_seconds = 1
+            elif stream_health == "unavailable":
+                sleep_seconds = 10
         except Exception as exc:
-            record_audit_event(
-                session,
+            session.rollback()
+            _record_background_loop_failure(
+                polling_session_factory,
                 event_type="background_user_stream_failed",
                 entity_type="binance",
-                entity_id=settings_row.default_symbol,
+                entity_id=entity_id,
                 severity="warning",
-                message="Background Binance futures user stream loop failed.",
-                payload={"error": str(exc)},
-            )
-            record_health_event(
-                session,
                 component="user_stream",
-                status="error",
                 message="Background Binance futures user stream loop failed.",
                 payload={"error": str(exc)},
             )
-            session.commit()
-            return 5
+        return sleep_seconds
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
-    poll_task = asyncio.create_task(_background_scheduler_loop())
-    user_stream_task = asyncio.create_task(_background_user_stream_loop())
+    tasks: list[asyncio.Task[None]] = []
+    if _background_scheduler_enabled():
+        tasks.append(asyncio.create_task(_background_scheduler_loop()))
+    if _background_user_stream_enabled():
+        tasks.append(asyncio.create_task(_background_user_stream_loop()))
     try:
         yield
     finally:
-        for task in (poll_task, user_stream_task):
+        for task in tasks:
             task.cancel()
-        for task in (poll_task, user_stream_task):
+        for task in tasks:
             with suppress(asyncio.CancelledError):
                 await task
 
@@ -184,7 +268,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Trading MVP API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=LOCAL_DEV_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -224,8 +314,17 @@ def _run_exchange_sync_read_refresh(triggered_by: str) -> None:
             _exchange_sync_read_refresh_inflight = False
 
 
+def _read_trigger_refresh_enabled() -> bool:
+    # SQLite local/test environments are write-contention-prone, so read paths
+    # must not enqueue background sync writes from GET requests.
+    return engine.dialect.name != "sqlite"
+
+
 def _refresh_exchange_sync_for_read(*, triggered_by: str) -> bool:
     global _exchange_sync_read_refresh_inflight, _exchange_sync_read_refresh_last_started
+
+    if not _read_trigger_refresh_enabled():
+        return False
 
     started_at = monotonic()
     with _exchange_sync_read_refresh_guard:
@@ -250,7 +349,8 @@ def health() -> dict[str, object]:
 
 @app.post("/api/system/seed")
 def seed_system(db: Session = Depends(get_db)) -> dict[str, object]:
-    return seed_demo_data(db)
+    with _sqlite_write_lock():
+        return seed_demo_data(db)
 
 
 @app.get("/api/dashboard/overview")
@@ -352,7 +452,6 @@ def alerts(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 
 @app.get("/api/settings")
 def settings_view(db: Session = Depends(get_db)) -> dict[str, object]:
-    _refresh_exchange_sync_for_read(triggered_by="api_settings_view")
     return serialize_settings_view(get_or_create_settings(db))
 
 
@@ -374,17 +473,18 @@ def binance_account(db: Session = Depends(get_db)) -> dict[str, object]:
 
 @app.put("/api/settings")
 def settings_update(payload: AppSettingsUpdateRequest, db: Session = Depends(get_db)) -> dict[str, object]:
-    row = update_settings(db, payload)
-    record_audit_event(
-        db,
-        event_type="settings_updated",
-        entity_type="settings",
-        entity_id=str(row.id),
-        message="Application settings updated.",
-        payload={"ai_enabled": row.ai_enabled, "binance_market_data_enabled": row.binance_market_data_enabled},
-    )
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row = update_settings(db, payload)
+        record_audit_event(
+            db,
+            event_type="settings_updated",
+            entity_type="settings",
+            entity_id=str(row.id),
+            message="Application settings updated.",
+            payload={"ai_enabled": row.ai_enabled, "binance_market_data_enabled": row.binance_market_data_enabled},
+        )
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.put("/api/settings/operator-event-view")
@@ -392,9 +492,10 @@ def operator_event_view_upsert(
     payload: OperatorEventViewRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    row, _changed = upsert_operator_event_view(db, payload)
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row, _changed = upsert_operator_event_view(db, payload)
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/operator-event-view/clear")
@@ -402,10 +503,11 @@ def operator_event_view_clear(
     payload: OperatorEventViewClearRequest | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    actor = payload.created_by if payload is not None else "operator-ui"
-    row, _changed = clear_operator_event_view(db, actor=actor)
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        actor = payload.created_by if payload is not None else "operator-ui"
+        row, _changed = clear_operator_event_view(db, actor=actor)
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/manual-no-trade-windows")
@@ -413,9 +515,10 @@ def manual_no_trade_window_create(
     payload: ManualNoTradeWindowRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    row, _window = create_manual_no_trade_window(db, payload)
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row, _window = create_manual_no_trade_window(db, payload)
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.put("/api/settings/manual-no-trade-windows/{window_id}")
@@ -424,14 +527,15 @@ def manual_no_trade_window_update(
     payload: ManualNoTradeWindowRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    try:
-        row, _window, _changed = update_manual_no_trade_window(db, window_id=window_id, payload=payload)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        try:
+            row, _window, _changed = update_manual_no_trade_window(db, window_id=window_id, payload=payload)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/manual-no-trade-windows/{window_id}/end")
@@ -440,57 +544,60 @@ def manual_no_trade_window_end(
     payload: ManualNoTradeWindowEndRequest | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    try:
-        row, _window, _changed = end_manual_no_trade_window(
-            db,
-            window_id=window_id,
-            actor=payload.created_by if payload is not None else "operator-ui",
-            end_at=payload.end_at if payload is not None else None,
-        )
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        try:
+            row, _window, _changed = end_manual_no_trade_window(
+                db,
+                window_id=window_id,
+                actor=payload.created_by if payload is not None else "operator-ui",
+                end_at=payload.end_at if payload is not None else None,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/pause")
 def pause_trading(db: Session = Depends(get_db)) -> dict[str, object]:
-    row = set_trading_pause(
-        db,
-        True,
-        reason_code="MANUAL_USER_REQUEST",
-        reason_detail={"source": "api"},
-        pause_origin="manual",
-    )
-    record_audit_event(
-        db,
-        event_type="trading_paused",
-        entity_type="settings",
-        entity_id=str(row.id),
-        severity="warning",
-        message="Global trading pause enabled.",
-        payload={"trading_paused": True, "reason_code": row.pause_reason_code, "pause_origin": row.pause_origin},
-    )
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row = set_trading_pause(
+            db,
+            True,
+            reason_code="MANUAL_USER_REQUEST",
+            reason_detail={"source": "api"},
+            pause_origin="manual",
+        )
+        record_audit_event(
+            db,
+            event_type="trading_paused",
+            entity_type="settings",
+            entity_id=str(row.id),
+            severity="warning",
+            message="Global trading pause enabled.",
+            payload={"trading_paused": True, "reason_code": row.pause_reason_code, "pause_origin": row.pause_origin},
+        )
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/resume")
 def resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
-    row = set_trading_pause(db, False)
-    record_audit_event(
-        db,
-        event_type="trading_resumed",
-        entity_type="settings",
-        entity_id=str(row.id),
-        severity="info",
-        message="Global trading pause cleared.",
-        payload={"trading_paused": False},
-    )
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row = set_trading_pause(db, False)
+        record_audit_event(
+            db,
+            event_type="trading_resumed",
+            entity_type="settings",
+            entity_id=str(row.id),
+            severity="info",
+            message="Global trading pause cleared.",
+            payload={"trading_paused": False},
+        )
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/live/arm")
@@ -498,34 +605,36 @@ def arm_live(
     payload: ManualLiveApprovalRequest | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    row = arm_live_execution(db, payload.minutes if payload is not None else None)
-    record_audit_event(
-        db,
-        event_type="live_approval_armed",
-        entity_type="settings",
-        entity_id=str(row.id),
-        severity="warning",
-        message="Manual live execution window armed.",
-        payload={"armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None},
-    )
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row = arm_live_execution(db, payload.minutes if payload is not None else None)
+        record_audit_event(
+            db,
+            event_type="live_approval_armed",
+            entity_type="settings",
+            entity_id=str(row.id),
+            severity="warning",
+            message="Manual live execution window armed.",
+            payload={"armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None},
+        )
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/live/disarm")
 def disarm_live(db: Session = Depends(get_db)) -> dict[str, object]:
-    row = disarm_live_execution(db)
-    record_audit_event(
-        db,
-        event_type="live_approval_disarmed",
-        entity_type="settings",
-        entity_id=str(row.id),
-        severity="info",
-        message="Manual live execution window disarmed.",
-        payload={},
-    )
-    db.commit()
-    return serialize_settings_view(row)
+    with _sqlite_write_lock():
+        row = disarm_live_execution(db)
+        record_audit_event(
+            db,
+            event_type="live_approval_disarmed",
+            entity_type="settings",
+            entity_id=str(row.id),
+            severity="info",
+            message="Manual live execution window disarmed.",
+            payload={},
+        )
+        db.commit()
+        return serialize_settings_view(row)
 
 
 @app.post("/api/settings/test/openai")
@@ -533,26 +642,27 @@ def openai_connection_test(
     payload: OpenAIConnectionTestRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    settings_row = get_or_create_settings(db)
-    result = check_openai_connection(settings_row, payload)
-    record_health_event(
-        db,
-        component="openai",
-        status="ok" if result.ok else "error",
-        message=result.message,
-        payload=result.details,
-    )
-    record_audit_event(
-        db,
-        event_type="integration_test",
-        entity_type="openai",
-        entity_id=str(settings_row.id),
-        severity="info" if result.ok else "warning",
-        message=result.message,
-        payload=result.details,
-    )
-    db.commit()
-    return result.model_dump(mode="json")
+    with _sqlite_write_lock():
+        settings_row = get_or_create_settings(db)
+        result = check_openai_connection(settings_row, payload)
+        record_health_event(
+            db,
+            component="openai",
+            status="ok" if result.ok else "error",
+            message=result.message,
+            payload=result.details,
+        )
+        record_audit_event(
+            db,
+            event_type="integration_test",
+            entity_type="openai",
+            entity_id=str(settings_row.id),
+            severity="info" if result.ok else "warning",
+            message=result.message,
+            payload=result.details,
+        )
+        db.commit()
+        return result.model_dump(mode="json")
 
 
 @app.post("/api/settings/test/binance")
@@ -560,26 +670,27 @@ def binance_connection_test(
     payload: BinanceConnectionTestRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    settings_row = get_or_create_settings(db)
-    result = check_binance_connection(settings_row, payload)
-    record_health_event(
-        db,
-        component="binance",
-        status="ok" if result.ok else "error",
-        message=result.message,
-        payload=result.details,
-    )
-    record_audit_event(
-        db,
-        event_type="integration_test",
-        entity_type="binance",
-        entity_id=str(settings_row.id),
-        severity="info" if result.ok else "warning",
-        message=result.message,
-        payload=result.details,
-    )
-    db.commit()
-    return result.model_dump(mode="json")
+    with _sqlite_write_lock():
+        settings_row = get_or_create_settings(db)
+        result = check_binance_connection(settings_row, payload)
+        record_health_event(
+            db,
+            component="binance",
+            status="ok" if result.ok else "error",
+            message=result.message,
+            payload=result.details,
+        )
+        record_audit_event(
+            db,
+            event_type="integration_test",
+            entity_type="binance",
+            entity_id=str(settings_row.id),
+            severity="info" if result.ok else "warning",
+            message=result.message,
+            payload=result.details,
+        )
+        db.commit()
+        return result.model_dump(mode="json")
 
 
 @app.post("/api/settings/test/binance/live-order")
@@ -587,45 +698,51 @@ def binance_live_order_test(
     payload: BinanceLiveTestOrderRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    settings_row = get_or_create_settings(db)
-    try:
-        result = run_live_test_order(
-            db,
-            settings_row,
-            symbol=payload.symbol,
-            side=payload.side,
-            quantity=payload.quantity,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    db.commit()
-    return result
+    with _sqlite_write_lock():
+        settings_row = get_or_create_settings(db)
+        try:
+            result = run_live_test_order(
+                db,
+                settings_row,
+                symbol=payload.symbol,
+                side=payload.side,
+                quantity=payload.quantity,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        db.commit()
+        return result
 
 
 @app.post("/api/cycles/run")
 def run_cycle(db: Session = Depends(get_db)) -> dict[str, object]:
-    output = TradingOrchestrator(db).run_selected_symbols_cycle(trigger_event="manual")
-    db.commit()
-    return output
+    with _sqlite_write_lock():
+        output = TradingOrchestrator(db).run_selected_symbols_cycle(trigger_event="manual")
+        db.commit()
+        return output
 
 
 @app.post("/api/reviews/{window}")
 def run_review(window: str, db: Session = Depends(get_db)) -> dict[str, object]:
-    if window != "1h":
-        raise HTTPException(status_code=400, detail="Only 1h review window is enabled in current live-core scope.")
-    output = run_window(db, window, triggered_by="manual")
-    db.commit()
-    return output
+    with _sqlite_write_lock():
+        if window != "1h":
+            raise HTTPException(status_code=400, detail="Only 1h review window is enabled in current live-core scope.")
+        output = run_window(db, window, triggered_by="manual")
+        db.commit()
+        return output
 
 
 @app.post("/api/replay/run")
 def run_replay(cycles: int = 5, start_index: int = 120, db: Session = Depends(get_db)) -> dict[str, object]:
-    orchestrator = TradingOrchestrator(db)
-    results: list[dict[str, object]] = []
-    for offset in range(cycles):
-        results.append(orchestrator.run_selected_symbols_cycle(trigger_event="historical_replay", upto_index=start_index + offset))
-    db.commit()
-    return {"cycles": cycles, "results": results}
+    with _sqlite_write_lock():
+        orchestrator = TradingOrchestrator(db)
+        results: list[dict[str, object]] = []
+        for offset in range(cycles):
+            results.append(
+                orchestrator.run_selected_symbols_cycle(trigger_event="historical_replay", upto_index=start_index + offset)
+            )
+        db.commit()
+        return {"cycles": cycles, "results": results}
 
 
 @app.post("/api/replay/validation")
@@ -639,74 +756,75 @@ def replay_validation(
 
 @app.post("/api/live/sync")
 def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
-    settings_row = get_or_create_settings(db)
-    auto_resume_precheck: dict[str, object] | None = None
-    auto_resume_postcheck: dict[str, object] | None = None
-
-    if settings_row.trading_paused:
-        auto_resume_precheck = attempt_auto_resume(
-            db,
-            settings_row,
-            trigger_source="api_live_sync_precheck",
-        )
-        db.flush()
+    with _sqlite_write_lock():
         settings_row = get_or_create_settings(db)
-    try:
-        result = sync_live_state(db, settings_row, symbol=symbol)
-    except Exception as exc:
-        error_payload = {
-            "error": str(exc),
+        auto_resume_precheck: dict[str, object] | None = None
+        auto_resume_postcheck: dict[str, object] | None = None
+
+        if settings_row.trading_paused:
+            auto_resume_precheck = attempt_auto_resume(
+                db,
+                settings_row,
+                trigger_source="api_live_sync_precheck",
+            )
+            db.flush()
+            settings_row = get_or_create_settings(db)
+        try:
+            result = sync_live_state(db, settings_row, symbol=symbol)
+        except Exception as exc:
+            error_payload = {
+                "error": str(exc),
+                "auto_resume_precheck": auto_resume_precheck,
+                "auto_resume_postcheck": auto_resume_postcheck,
+                "auto_resume": auto_resume_precheck,
+            }
+            record_audit_event(
+                db,
+                event_type="live_sync_failed",
+                entity_type="binance",
+                entity_id=symbol or settings_row.default_symbol,
+                severity="warning",
+                message="Live exchange state sync failed.",
+                payload=error_payload,
+            )
+            record_health_event(
+                db,
+                component="live_sync",
+                status="error",
+                message="Live exchange state sync failed.",
+                payload=error_payload,
+            )
+            db.commit()
+            raise HTTPException(status_code=400, detail=error_payload) from exc
+
+        settings_row = get_or_create_settings(db)
+        if auto_resume_precheck is not None or settings_row.trading_paused:
+            auto_resume_postcheck = attempt_auto_resume(
+                db,
+                settings_row,
+                trigger_source="api_live_sync_postcheck",
+            )
+            db.flush()
+            settings_row = get_or_create_settings(db)
+
+        auto_resume = auto_resume_postcheck or auto_resume_precheck
+        payload = {
+            **result,
             "auto_resume_precheck": auto_resume_precheck,
             "auto_resume_postcheck": auto_resume_postcheck,
-            "auto_resume": auto_resume_precheck,
+            "auto_resume": auto_resume,
         }
         record_audit_event(
             db,
-            event_type="live_sync_failed",
+            event_type="live_sync",
             entity_type="binance",
             entity_id=symbol or settings_row.default_symbol,
-            severity="warning",
-            message="Live exchange state sync failed.",
-            payload=error_payload,
-        )
-        record_health_event(
-            db,
-            component="live_sync",
-            status="error",
-            message="Live exchange state sync failed.",
-            payload=error_payload,
+            severity="info",
+            message="Live exchange state synchronized.",
+            payload=payload,
         )
         db.commit()
-        raise HTTPException(status_code=400, detail=error_payload) from exc
-
-    settings_row = get_or_create_settings(db)
-    if auto_resume_precheck is not None or settings_row.trading_paused:
-        auto_resume_postcheck = attempt_auto_resume(
-            db,
-            settings_row,
-            trigger_source="api_live_sync_postcheck",
-        )
-        db.flush()
-        settings_row = get_or_create_settings(db)
-
-    auto_resume = auto_resume_postcheck or auto_resume_precheck
-    payload = {
-        **result,
-        "auto_resume_precheck": auto_resume_precheck,
-        "auto_resume_postcheck": auto_resume_postcheck,
-        "auto_resume": auto_resume,
-    }
-    record_audit_event(
-        db,
-        event_type="live_sync",
-        entity_type="binance",
-        entity_id=symbol or settings_row.default_symbol,
-        severity="info",
-        message="Live exchange state synchronized.",
-        payload=payload,
-    )
-    db.commit()
-    return payload
+        return payload
 
 
 @app.get("/api/performance")

@@ -13,6 +13,20 @@ import {
 } from "../lib/decision-timeline";
 
 type Row = Record<string, unknown>;
+type RiskCheckRow = {
+  id?: number | null;
+  symbol?: string | null;
+  decision_run_id?: number | null;
+  allowed?: boolean | null;
+  decision?: string | null;
+  reason_codes?: string[];
+  approved_risk_pct?: number | null;
+  approved_leverage?: number | null;
+  ai_trigger_reason?: string | null;
+  ai_trigger_summary?: string | null;
+  created_at?: string | null;
+  payload?: Record<string, unknown> | null;
+};
 
 const operatingStateLabelMap: Record<string, string> = {
   TRADABLE: "신규 진입 가능",
@@ -358,6 +372,61 @@ function executionSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
     return { label: "체결 완료", detail: executionStatus };
   }
   return { label: "주문 제출", detail: executionStatus ?? "pending" };
+}
+
+function asRiskCheckRow(row: Row): RiskCheckRow {
+  return {
+    id: typeof row.id === "number" ? row.id : null,
+    symbol: typeof row.symbol === "string" ? row.symbol : null,
+    decision_run_id: typeof row.decision_run_id === "number" ? row.decision_run_id : null,
+    allowed: typeof row.allowed === "boolean" ? row.allowed : null,
+    decision: typeof row.decision === "string" ? row.decision : null,
+    reason_codes: Array.isArray(row.reason_codes)
+      ? row.reason_codes.filter((item): item is string => typeof item === "string")
+      : [],
+    approved_risk_pct: typeof row.approved_risk_pct === "number" ? row.approved_risk_pct : null,
+    approved_leverage: typeof row.approved_leverage === "number" ? row.approved_leverage : null,
+    ai_trigger_reason: typeof row.ai_trigger_reason === "string" ? row.ai_trigger_reason : null,
+    ai_trigger_summary: typeof row.ai_trigger_summary === "string" ? row.ai_trigger_summary : null,
+    created_at: typeof row.created_at === "string" ? row.created_at : null,
+    payload:
+      row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+        ? (row.payload as Record<string, unknown>)
+        : null,
+  };
+}
+
+function riskAllowedPresentation(value: boolean | null | undefined) {
+  if (value === true) {
+    return { label: "risk 통과", hint: "신규 진입 허용", kind: "good" as const };
+  }
+  if (value === false) {
+    return { label: "risk 차단", hint: "신규 진입 차단", kind: "danger" as const };
+  }
+  return { label: "risk 미확정", hint: "허용 여부 미확정", kind: "neutral" as const };
+}
+
+function riskTriggerReasonPresentation(row: RiskCheckRow) {
+  if (row.ai_trigger_reason) {
+    return describeAiTriggerReason(row.ai_trigger_reason).label;
+  }
+  if (row.decision_run_id === null) {
+    return "linked decision 없음";
+  }
+  return "legacy row";
+}
+
+function riskTriggerSummaryPresentation(row: RiskCheckRow) {
+  if (row.ai_trigger_summary && row.ai_trigger_summary.trim().length > 0) {
+    return row.ai_trigger_summary;
+  }
+  if (row.decision_run_id === null) {
+    return "linked decision 없음";
+  }
+  if (row.ai_trigger_reason && row.ai_trigger_reason.trim().length > 0) {
+    return "feature 근거 없음";
+  }
+  return "legacy row";
 }
 
 function SymbolTabs({
@@ -947,6 +1016,127 @@ export function SchedulerView({
         rows={schedulerRows}
         emptyStateTitle="표시할 스케줄러 기록이 없습니다."
         emptyStateDescription="아직 scheduler run이 저장되지 않았습니다."
+      />
+    </div>
+  );
+}
+
+export function RiskView({
+  riskRows,
+  alertRows,
+}: {
+  riskRows: Row[];
+  alertRows: Row[];
+}) {
+  const rows = riskRows.map(asRiskCheckRow);
+
+  return (
+    <div className="space-y-6">
+      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">리스크 점검</p>
+        <h2 className="mt-2 text-xl font-semibold text-slate-950">AI 호출 사유와 risk 결과를 한 카드에서 확인</h2>
+        <p className="mt-2 text-sm leading-6 text-slate-600">
+          왜 AI 검토가 열렸는지, 허용/차단이 어떻게 결정됐는지, 승인 risk와 leverage가 얼마였는지를 먼저 보여줍니다.
+          근거가 부족한 예전 row는 추정하지 않고 legacy 여부를 그대로 드러냅니다.
+        </p>
+      </section>
+
+      <section className="rounded-[1.75rem] border border-slate-200 bg-white p-5 shadow-frame sm:p-6">
+        <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Risk Cards</p>
+            <h2 className="mt-2 text-xl font-semibold text-slate-950">최근 risk check</h2>
+          </div>
+          <div className="w-fit rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
+            {rows.length}건
+          </div>
+        </div>
+
+        {rows.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-amber-300 px-4 py-8 text-sm text-slate-500">
+            <p className="font-semibold text-slate-700">표시할 risk check가 없습니다.</p>
+            <p className="mt-2 leading-6">저장된 risk 판정 row가 아직 없습니다.</p>
+          </div>
+        ) : (
+          <div className="grid gap-4 xl:grid-cols-2">
+            {rows.map((row, index) => {
+              const allowed = riskAllowedPresentation(row.allowed);
+              const triggerReason = riskTriggerReasonPresentation(row);
+              const triggerSummary = riskTriggerSummaryPresentation(row);
+              const symbolLabel = row.symbol ?? `Risk ${index + 1}`;
+              const decisionRunLabel =
+                row.decision_run_id !== null ? `decision #${row.decision_run_id}` : "linked decision 없음";
+
+              return (
+                <article
+                  key={row.id ?? `${row.symbol ?? "risk"}-${row.created_at ?? index}`}
+                  className="rounded-[1.6rem] border border-amber-100 bg-canvas/90 p-4 shadow-sm"
+                >
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <h3 className="text-base font-semibold text-ink">{symbolLabel}</h3>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {formatDateTime(row.created_at)} / {decisionRunLabel}
+                      </p>
+                    </div>
+                    <span
+                      className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(allowed.kind)}`}
+                    >
+                      {allowed.label}
+                    </span>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                    {metricCard("AI 호출 분류", triggerReason, decisionRunLabel, { compact: true })}
+                    {metricCard("AI 호출 요약", triggerSummary, "추정 복원 없이 저장 근거만 표시", { compact: true })}
+                    {metricCard("허용 여부", allowed.label, allowed.hint)}
+                    {metricCard("의사결정", translateDecision(row.decision), "risk 대상 결정")}
+                    {metricCard(
+                      "차단 사유",
+                      formatTranslatedCodeList(row.reason_codes),
+                      `원본 코드 ${formatCodeList(row.reason_codes)}`,
+                      { compact: true },
+                    )}
+                    {metricCard(
+                      "승인 risk / leverage",
+                      `${formatRatio(row.approved_risk_pct)} / ${
+                        row.approved_leverage !== null ? `${formatNumber(row.approved_leverage, 2)}x` : "-"
+                      }`,
+                      "허용된 경우에만 의미 있는 승인 수치",
+                    )}
+                    {metricCard(
+                      "판단 기록 ID",
+                      row.decision_run_id !== null ? String(row.decision_run_id) : "-",
+                      row.decision_run_id !== null ? "연결된 decision row" : "linked decision 없음",
+                    )}
+                    {metricCard("생성 시각", formatDateTime(row.created_at), "risk check row 생성 시각")}
+                  </div>
+
+                  {row.payload ? (
+                    <details className="mt-4 rounded-2xl border border-amber-200 bg-white">
+                      <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-ink">
+                        상세 payload 보기
+                      </summary>
+                      <div className="border-t border-amber-100 px-4 py-4">
+                        <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-2xl bg-slate-900/95 p-4 text-xs leading-6 text-slate-100">
+                          {JSON.stringify(row.payload, null, 2)}
+                        </pre>
+                      </div>
+                    </details>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <DataTable
+        title="운영 알림"
+        description="risk 관련 alert"
+        rows={alertRows}
+        emptyStateTitle="표시할 알림이 없습니다."
+        emptyStateDescription="최근 risk 관련 alert row가 없습니다."
       />
     </div>
   );

@@ -16,6 +16,7 @@ def _ai_context(
     strategy_engine: str,
     holding_profile: str = "scalp",
     data_quality_grade: str = "complete",
+    strategy_engine_context: dict[str, object] | None = None,
 ) -> AIDecisionContextPacket:
     return AIDecisionContextPacket(
         symbol="BTCUSDT",
@@ -45,7 +46,7 @@ def _ai_context(
         ),
         previous_thesis=PreviousThesisDeltaPacket(),
         strategy_engine=strategy_engine,
-        strategy_engine_context={"engine_name": strategy_engine},
+        strategy_engine_context=strategy_engine_context or {"engine_name": strategy_engine},
         holding_profile=holding_profile,  # type: ignore[arg-type]
         hard_stop_active=True,
         stop_widening_allowed=False,
@@ -182,3 +183,36 @@ def test_protection_reduce_engine_forbids_new_entry() -> None:
     assert bounded.decision.decision == "reduce"
     assert bounded.bounded_output_applied is True
     assert "ENGINE_FORBIDS_NEW_ENTRY" in bounded.fallback_reason_codes
+
+
+def test_open_position_route_honors_management_override_and_same_side_add_on_exception() -> None:
+    management_only_context = _ai_context(
+        trigger_type="entry_candidate_event",
+        strategy_engine="trend_pullback_engine",
+        strategy_engine_context={
+            "engine_name": "trend_pullback_engine",
+            "management_only_open_position_route": True,
+        },
+    )
+    management_route = resolve_prompt_route(ai_context=management_only_context, has_open_position=True)
+
+    assert management_route.prompt_family == "open_position_thesis_review"
+    assert management_route.allowed_actions == ("hold", "reduce", "exit")
+    assert management_route.allow_new_entry is False
+
+    add_on_context = _ai_context(
+        trigger_type="entry_candidate_event",
+        strategy_engine="trend_pullback_engine",
+        strategy_engine_context={
+            "engine_name": "trend_pullback_engine",
+            "management_only_open_position_route": True,
+            "allow_same_side_add_on": True,
+            "allowed_add_on_side": "long",
+        },
+    )
+    add_on_route = resolve_prompt_route(ai_context=add_on_context, has_open_position=True)
+
+    assert add_on_route.prompt_family == "open_position_add_on_review"
+    assert add_on_route.allowed_actions == ("hold", "long", "reduce", "exit")
+    assert "short" in add_on_route.forbidden_actions
+    assert add_on_route.allow_new_entry is True

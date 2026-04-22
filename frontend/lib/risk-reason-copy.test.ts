@@ -22,6 +22,14 @@ test("lookupRiskReasonCode translates common risk_guard codes for operator-facin
     lookupRiskReasonCode("PROTECTION_STATE_UNVERIFIED"),
     "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
   );
+  assert.equal(
+    lookupRiskReasonCode("LARGEST_POSITION_LIMIT_REACHED"),
+    "심볼 집중도 한도 유지",
+  );
+  assert.equal(
+    lookupRiskReasonCode("DETERMINISTIC_BASELINE_DISAGREEMENT"),
+    "결정론적 기준선 불일치 상태 유지",
+  );
   assert.equal(describeRiskReasonCode("UNKNOWN_CODE"), "UNKNOWN_CODE");
   assert.equal(describeRiskReasonCode(null), "추가 사유 없음");
 });

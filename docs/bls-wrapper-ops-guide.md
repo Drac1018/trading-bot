@@ -1,5 +1,23 @@
 # BLS Wrapper 운영 가이드
 
+## 운영자 표현과 내부 키
+
+- 이 문서는 wrapper 운영 기준 설명이므로 내부 설정 키를 그대로 사용합니다.
+- 운영자 화면에서는 아래처럼 읽으면 됩니다.
+  - `exchange_sync_interval_seconds`
+    - 화면 표현: `거래소 동기화 주기`
+  - `market_refresh_interval_minutes`
+    - 화면 표현: `시장 갱신 주기`
+  - `decision_cycle_interval_minutes`
+    - 화면 표현: `재검토 확인 주기`
+  - `event_source_provider`
+    - 화면 표현: `Event source provider`
+  - `event_source_bls_enrichment_url`
+    - 화면 표현: `BLS enrichment URL`
+  - `event_source_bea_enrichment_url`
+    - 화면 표현: `BEA enrichment URL`
+- 즉, 이 문서에서 scheduler 주기와 enrichment 설정 키를 말하는 부분은 운영자 화면에서는 위 표현으로 대응해 읽으면 됩니다.
+
 ## 결론
 
 현재 프로젝트에서는 BLS raw API를 앱에서 직접 다루지 말고 wrapper를 통해 운영하는 것이 가장 안전하다.
@@ -9,6 +27,11 @@
 - `event_key -> series_id/series_ids -> normalized payload` 매핑은 wrapper 내부에서 관리한다.
 
 ## 실사용 입력값
+
+운영자가 실제로 볼 단일 문서는 [release-operator-runbook.md](/C:/my-trading-bot/docs/release-operator-runbook.md:1)이다.
+발표 전 운영 절차는 [release-30m-checklist.md](/C:/my-trading-bot/docs/release-30m-checklist.md:1)를 따른다.
+발표 직전 최소 확인판은 [release-5m-final-check.md](/C:/my-trading-bot/docs/release-5m-final-check.md:1)를 따른다.
+발표 직후 장애 대응은 [release-2m-incident-response.md](/C:/my-trading-bot/docs/release-2m-incident-response.md:1)를 따른다.
 
 프런트 설정 화면에서는 아래만 넣는다.
 
@@ -24,12 +47,20 @@
 wrapper 구현 위치:
 
 - [bls_wrapper_app.py](/C:/my-trading-bot/backend/trading_mvp/bls_wrapper_app.py:1)
+- 발표일 일괄 실행/점검 스크립트: [run_release_day.ps1](/C:/my-trading-bot/scripts/run_release_day.ps1:1)
 
 실행 명령:
 
 ```powershell
 $env:BLS_API_KEY="your_bls_registration_key"
 .venv\Scripts\python.exe -m uvicorn trading_mvp.bls_wrapper_app:app --host 127.0.0.1 --port 8091
+```
+
+운영자는 개별 실행보다 아래 명령을 우선 사용하면 된다.
+
+```powershell
+cd C:\my-trading-bot
+powershell -ExecutionPolicy Bypass -File scripts\run_release_day.ps1
 ```
 
 확인 URL:
@@ -47,13 +78,14 @@ $env:BLS_API_KEY="your_bls_registration_key"
 - 백엔드 scheduler가 살아 있어야 한다.
 - scheduler가 market/event context를 갱신할 때 FRED 일정을 다시 읽는다.
 - 발표 시각이 지난 이벤트만 BLS wrapper를 자동 호출한다.
+- 지원 이벤트(CPI/PPI/Employment Situation, GDP/PCE)는 발표 직후 별도 release watch가 즉시 market refresh를 한 번 더 당겨서 actual 반영 지연을 줄인다.
 - 따라서 발표 직후 반영을 원하면 backend scheduler를 미리 켜 두어야 한다.
 
 별도 수동 테스트 입력은 없다. 운영 반영 속도는 사실상 아래 주기에 묶인다.
 
-- `exchange_sync_interval_seconds`
-- `market_refresh_interval_minutes`
-- `decision_cycle_interval_minutes`
+- `exchange_sync_interval_seconds` (`거래소 동기화 주기`)
+- `market_refresh_interval_minutes` (`시장 갱신 주기`)
+- `decision_cycle_interval_minutes` (`재검토 확인 주기`)
 
 ## Wrapper 내부 권장 매핑
 

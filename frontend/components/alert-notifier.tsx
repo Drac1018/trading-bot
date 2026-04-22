@@ -37,17 +37,23 @@ function writeSeenIds(ids: Set<number>) {
 }
 
 export function AlertNotifier() {
-  const [permission, setPermission] = useState<NotificationPermission | "unsupported">(() => {
-    if (typeof window === "undefined" || !("Notification" in window)) {
-      return "unsupported";
-    }
-    return window.Notification.permission;
-  });
+  const [permission, setPermission] = useState<NotificationPermission | "unsupported" | "loading">("loading");
   const [latestAlerts, setLatestAlerts] = useState<AlertRow[]>([]);
   const seenIdsRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     seenIdsRef.current = readSeenIds();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (!("Notification" in window)) {
+      setPermission("unsupported");
+      return;
+    }
+    setPermission(window.Notification.permission);
   }, []);
 
   useEffect(() => {
@@ -111,7 +117,7 @@ export function AlertNotifier() {
     [latestAlerts],
   );
 
-  if (permission === "unsupported") {
+  if (permission === "loading" || permission === "unsupported") {
     return null;
   }
 

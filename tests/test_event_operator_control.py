@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from trading_mvp.main import app
-from trading_mvp.models import AuditEvent, PnLSnapshot, Position
+from trading_mvp.models import AuditEvent, FeatureSnapshot, MarketSnapshot, PnLSnapshot, Position
 from trading_mvp.schemas import (
     AIEventViewPayload,
     ManualNoTradeWindowPayload,
@@ -119,6 +119,70 @@ def _seed_pnl_snapshot(db_session, *, equity: float = 20000.0) -> None:
             updated_at=created_at,
         )
     )
+
+
+def _seed_alignment_event_context_snapshot(
+    db_session,
+    *,
+    symbol: str = "BTCUSDT",
+    timeframe: str = "15m",
+) -> None:
+    snapshot_time = utcnow_naive() - timedelta(minutes=5)
+    next_event_at = snapshot_time + timedelta(minutes=14)
+    event_context = {
+        "source_status": "external_api",
+        "source_vendor": "fred",
+        "generated_at": snapshot_time.isoformat(),
+        "is_stale": False,
+        "is_complete": True,
+        "next_event_at": next_event_at.isoformat(),
+        "next_event_name": "CPI",
+        "next_event_importance": "high",
+        "minutes_to_next_event": 14,
+        "active_risk_window": True,
+        "affected_assets": [symbol],
+        "events": [],
+    }
+    market = MarketSnapshot(
+        symbol=symbol,
+        timeframe=timeframe,
+        snapshot_time=snapshot_time,
+        latest_price=66547.8,
+        latest_volume=1250.0,
+        candle_count=60,
+        is_stale=False,
+        is_complete=True,
+        payload={
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "snapshot_time": snapshot_time.isoformat(),
+            "latest_price": 66547.8,
+            "latest_volume": 1250.0,
+            "candle_count": 60,
+            "is_stale": False,
+            "is_complete": True,
+            "candles": [],
+            "event_context": event_context,
+        },
+    )
+    db_session.add(market)
+    db_session.flush()
+    db_session.add(
+        FeatureSnapshot(
+            symbol=symbol,
+            timeframe=timeframe,
+            market_snapshot_id=market.id,
+            feature_time=snapshot_time,
+            trend_score=1.1,
+            volatility_pct=0.02,
+            volume_ratio=1.2,
+            drawdown_pct=0.01,
+            rsi=56.0,
+            atr=210.0,
+            payload={"event_context": event_context},
+        )
+    )
+    db_session.flush()
 
 
 def test_event_operator_requests_require_timezone_aware_datetimes() -> None:
@@ -328,6 +392,7 @@ def test_manual_window_active_state_is_start_inclusive_end_exclusive() -> None:
 
 def test_event_operator_persistence_round_trip_and_audit(db_session) -> None:
     row = get_or_create_settings(db_session)
+    _seed_alignment_event_context_snapshot(db_session)
 
     operator_request = _operator_event_view_request()
     row, changed = upsert_operator_event_view(db_session, operator_request)
@@ -385,6 +450,13 @@ def test_event_operator_persistence_round_trip_and_audit(db_session) -> None:
     )
     assert compact["actor"] == "operator-ui"
     assert "evaluations" in compact
+    assert compact["evaluations"]["BTCUSDT"]["event_context"] == {
+        "source_status": "available",
+        "is_stale": False,
+        "next_event_name": "CPI",
+        "minutes_to_next_event": 14,
+        "active_risk_window": True,
+    }
 
 
 def test_settings_view_and_operator_dashboard_expose_event_operator_control(db_session) -> None:
@@ -397,12 +469,73 @@ def test_settings_view_and_operator_dashboard_expose_event_operator_control(db_s
     assert settings_payload["default_symbol"] == row.default_symbol.upper()
     assert "event_operator_control" in settings_payload
     assert settings_payload["event_operator_control"]["operator_event_view"]["operator_bias"] == "bearish"
+    assert settings_payload["event_operator_control"]["operator_event_view_configured"] is True
 
     dashboard = get_operator_dashboard(db_session)
     assert dashboard.symbols
     first_symbol = dashboard.symbols[0]
     assert first_symbol.event_operator_control is not None
+    assert first_symbol.event_operator_control.operator_event_view_configured is True
+    assert first_symbol.event_operator_control.event_context.source_status == "unavailable"
+    assert first_symbol.event_operator_control.event_context.is_stale is False
+    assert first_symbol.event_operator_control.event_context.next_event_name is None
+    assert first_symbol.event_operator_control.event_context.minutes_to_next_event is None
+    assert first_symbol.event_operator_control.event_context.active_risk_window is False
     assert first_symbol.market_context_summary is not None
+
+
+def test_event_operator_control_marks_default_view_unconfigured_without_persisted_override(db_session) -> None:
+    row = get_or_create_settings(db_session)
+
+    preview = build_event_operator_control_payload(
+        session=db_session,
+        settings_row=row,
+        symbol=row.default_symbol.upper(),
+        timeframe=row.default_timeframe,
+    )
+    settings_payload = serialize_settings_view(row)
+    dashboard = get_operator_dashboard(db_session)
+
+    assert preview.operator_event_view_configured is False
+    assert preview.operator_event_view.operator_bias == "unknown"
+    assert settings_payload["event_operator_control"]["operator_event_view_configured"] is False
+    assert settings_payload["event_operator_control"]["operator_event_view"]["operator_bias"] == "unknown"
+    assert dashboard.symbols
+    assert dashboard.symbols[0].event_operator_control is not None
+    assert dashboard.symbols[0].event_operator_control.operator_event_view_configured is False
+
+
+def test_risk_audit_compact_payload_keeps_event_context_visibility_fields() -> None:
+    compact = compact_audit_payload(
+        {
+            "symbol": "BTCUSDT",
+            "decision": "hold",
+            "degraded_reason": "event_context_stale",
+            "event_context": {
+                "source_status": "stale",
+                "source_provenance": "external_api",
+                "is_stale": True,
+                "is_complete": True,
+                "next_event_name": "CPI",
+                "next_event_at": "2026-04-22T12:30:00Z",
+                "minutes_to_next_event": 14,
+                "active_risk_window": True,
+            },
+        },
+        event_type="event_policy_evaluated",
+        event_category="risk",
+    )
+
+    assert compact["event_context"] == {
+        "source_status": "stale",
+        "source_provenance": "external_api",
+        "is_stale": True,
+        "is_complete": True,
+        "next_event_name": "CPI",
+        "next_event_at": "2026-04-22T12:30:00Z",
+        "minutes_to_next_event": 14,
+        "active_risk_window": True,
+    }
 
 
 def test_event_operator_control_write_api_and_invalid_time_range(testclient_db_factory) -> None:
@@ -425,6 +558,7 @@ def test_event_operator_control_write_api_and_invalid_time_range(testclient_db_f
         )
         assert operator_response.status_code == 200
         assert operator_response.json()["event_operator_control"]["operator_event_view"]["operator_bias"] == "neutral"
+        assert operator_response.json()["event_operator_control"]["operator_event_view_configured"] is True
 
         invalid_window_response = client.post(
             "/api/settings/manual-no-trade-windows",

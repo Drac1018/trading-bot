@@ -19,6 +19,17 @@ export type AuditRow = Record<string, unknown> & {
   created_at?: string;
 };
 
+export type AuditLegacyReviewPresentation = {
+  badge: string;
+  label: string;
+  hint: string;
+  legacy: true;
+  rawTriggerReason: string;
+};
+
+const legacyReviewTriggerReasons = new Set(["open_position_recheck_due", "periodic_backstop_due"]);
+const maxAuditTriggerTraversalDepth = 6;
+
 export const AUDIT_TAB_ORDER: AuditTab[] = [
   "all",
   "risk",
@@ -96,6 +107,95 @@ const severityOrder: Record<string, number> = {
   warning: 2,
   info: 3
 };
+
+function describeLegacyReviewTriggerReason(
+  value: string,
+): Pick<AuditLegacyReviewPresentation, "label" | "hint"> | null {
+  switch (value) {
+    case "open_position_recheck_due":
+      return {
+        label: "포지션 시간 경과 재검토",
+        hint: "과거 정책 기록입니다. 현재 runtime에서는 시간 경과만으로 AI 검토를 다시 만들지 않습니다.",
+      };
+    case "periodic_backstop_due":
+      return {
+        label: "주기 백스탑 검토",
+        hint: "과거 정책 기록입니다. 현재 runtime에서는 주기 백스탑만으로 AI 검토를 다시 만들지 않습니다.",
+      };
+    default:
+      return null;
+  }
+}
+
+function findLegacyTriggerReason(
+  value: unknown,
+  seen: Set<object>,
+  depth: number,
+): string | null {
+  if (depth > maxAuditTriggerTraversalDepth) {
+    return null;
+  }
+
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  if (seen.has(value)) {
+    return null;
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = findLegacyTriggerReason(item, seen, depth + 1);
+      if (nested) {
+        return nested;
+      }
+    }
+    return null;
+  }
+
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (
+      (key === "trigger_reason" || key === "last_ai_trigger_reason") &&
+      typeof nestedValue === "string" &&
+      legacyReviewTriggerReasons.has(nestedValue)
+    ) {
+      return nestedValue;
+    }
+
+    const nested = findLegacyTriggerReason(nestedValue, seen, depth + 1);
+    if (nested) {
+      return nested;
+    }
+  }
+
+  return null;
+}
+
+export function extractLegacyReviewTriggerReason(row: AuditRow): string | null {
+  return findLegacyTriggerReason(row, new Set<object>(), 0);
+}
+
+export function describeAuditLegacyReview(row: AuditRow): AuditLegacyReviewPresentation | null {
+  const rawTriggerReason = extractLegacyReviewTriggerReason(row);
+  if (!rawTriggerReason) {
+    return null;
+  }
+
+  const presentation = describeLegacyReviewTriggerReason(rawTriggerReason);
+  if (!presentation) {
+    return null;
+  }
+
+  return {
+    badge: "과거 정책 기록",
+    label: presentation.label,
+    hint: presentation.hint,
+    legacy: true,
+    rawTriggerReason,
+  };
+}
 
 export function parseAuditTab(value: string | null | undefined): AuditTab {
   if (!value) {

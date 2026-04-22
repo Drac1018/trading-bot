@@ -3,8 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sqlalchemy import select
-
-from trading_mvp.models import AuditEvent, Order, PendingEntryPlan
+from trading_mvp.models import AuditEvent, Order, PendingEntryPlan, RiskCheck
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
 from trading_mvp.services.execution import execute_live_trade
 from trading_mvp.services.orchestrator import TradingOrchestrator
@@ -77,6 +76,73 @@ def _live_decision(decision: str) -> TradeDecision:
         explanation_short="symbol lock regression",
         explanation_detailed="symbol-scoped execution lock and cycle dedupe regression coverage.",
     )
+
+
+def _entry_plan_test_decision() -> TradeDecision:
+    return TradeDecision(
+        decision="long",
+        confidence=0.72,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=69000.0,
+        entry_zone_max=69300.0,
+        entry_mode="pullback_confirm",
+        invalidation_price=68500.0,
+        max_chase_bps=25.0,
+        idea_ttl_minutes=15,
+        stop_loss=68500.0,
+        take_profit=71000.0,
+        max_holding_minutes=180,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["ALIGNED_PULLBACK", "TREND_UP"],
+        explanation_short="symbol lock entry-plan test",
+        explanation_detailed="Entry-plan idempotency test uses a deterministic pullback-confirm decision.",
+    )
+
+
+def _patch_entry_plan_decision_flow(monkeypatch, orchestrator: TradingOrchestrator) -> None:
+    def fake_agent_run(*args, **kwargs):
+        return _entry_plan_test_decision(), "deterministic-mock", {}
+
+    def fake_evaluate_risk(session, settings_row, decision, market_snapshot, **kwargs):
+        trigger_waiting = decision.decision in {"long", "short"} and decision.entry_mode != "immediate"
+        blocked_reason_codes = ["ENTRY_TRIGGER_NOT_MET"] if trigger_waiting else []
+        result = RiskCheckResult(
+            allowed=not trigger_waiting,
+            decision=decision.decision,
+            reason_codes=blocked_reason_codes,
+            blocked_reason_codes=blocked_reason_codes,
+            adjustment_reason_codes=[],
+            approved_risk_pct=0.0 if trigger_waiting else float(decision.risk_pct or 0.0),
+            approved_leverage=0.0 if trigger_waiting else float(decision.leverage or 0.0),
+            raw_projected_notional=0.0,
+            approved_notional=0.0,
+            approved_projected_notional=0.0,
+            approved_qty=None,
+            approved_quantity=None,
+            operating_mode="live",
+            effective_leverage_cap=5.0,
+            symbol_risk_tier="btc",
+            exposure_metrics={},
+        )
+        row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=kwargs.get("decision_run_id"),
+            market_snapshot_id=kwargs.get("market_snapshot_id"),
+            allowed=result.allowed,
+            decision=decision.decision,
+            reason_codes=list(result.reason_codes),
+            approved_risk_pct=result.approved_risk_pct,
+            approved_leverage=result.approved_leverage,
+            payload=result.model_dump(mode="json"),
+        )
+        session.add(row)
+        session.flush()
+        return result, row
+
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_agent_run)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_evaluate_risk)
 
 
 def _prime_live_settings(db_session) -> None:
@@ -362,8 +428,16 @@ def test_orchestrator_persists_cycle_id_and_snapshot_id_on_entry_plan(monkeypatc
         "run_exchange_sync_cycle",
         lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
     )
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.execute_live_trade",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("entry-plan idempotency test must arm a pending plan instead of executing immediately")
+        ),
+    )
 
-    result = TradingOrchestrator(db_session).run_decision_cycle(trigger_event="manual", upto_index=140)
+    orchestrator = TradingOrchestrator(db_session)
+    _patch_entry_plan_decision_flow(monkeypatch, orchestrator)
+    result = orchestrator.run_decision_cycle(trigger_event="manual", upto_index=140)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
 
     assert plan is not None

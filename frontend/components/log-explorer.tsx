@@ -13,6 +13,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   AUDIT_TAB_CONFIG,
   AUDIT_TAB_ORDER,
+  describeAuditLegacyReview,
   filterAuditRows,
   getAuditEventCategory,
   getAuditTabCounts,
@@ -21,7 +22,7 @@ import {
   type AuditTab,
   type SortMode,
 } from "../lib/audit-log";
-import { formatDisplayValue } from "../lib/ui-copy";
+import { formatDisplayValue, getRowTitle } from "../lib/ui-copy";
 import { DataTable } from "./data-table";
 
 export type { AuditRow } from "../lib/audit-log";
@@ -119,15 +120,42 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
     return [...values];
   }, [categoryRows]);
 
+  const displayRows = useMemo(
+    () =>
+      rows.map((row) => {
+        const legacyReview = describeAuditLegacyReview(row);
+        if (!legacyReview) {
+          return row;
+        }
+
+        return {
+          ...row,
+          policy_badges: [legacyReview.badge],
+          policy_context: legacyReview.label,
+          policy_note: legacyReview.hint,
+        };
+      }),
+    [rows],
+  );
+
   const filteredRows = useMemo(
     () =>
-      filterAuditRows(rows, {
+      filterAuditRows(displayRows, {
         activeTab,
         severityFilter,
         searchFilter: deferredSearch,
         sortMode,
       }),
-    [activeTab, deferredSearch, rows, severityFilter, sortMode],
+    [activeTab, deferredSearch, displayRows, severityFilter, sortMode],
+  );
+
+  const visibleLegacyRows = useMemo(
+    () => filteredRows.filter((row) => describeAuditLegacyReview(row)).length,
+    [filteredRows],
+  );
+  const visibleSuppressedRows = useMemo(
+    () => filteredRows.filter((row) => row.suppression_active === true).length,
+    [filteredRows],
   );
 
   const currentTab = AUDIT_TAB_CONFIG[activeTab];
@@ -262,7 +290,29 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
           rows={filteredRows}
           emptyStateTitle={emptyState.title}
           emptyStateDescription={emptyState.description}
+          rowTitleFormatter={(row, index) => {
+            const legacyReview = describeAuditLegacyReview(row);
+            const baseTitle = getRowTitle(row, index);
+            return legacyReview ? `${baseTitle} · 과거 정책 기록` : baseTitle;
+          }}
+          labelOverrides={{
+            policy_badges: "표시 배지",
+            policy_context: "정책 맥락",
+            policy_note: "해석 메모",
+          }}
         />
+        {visibleSuppressedRows > 0 ? (
+          <div className="rounded-[1.6rem] border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700">
+            `진입 제안 억제`는 `ai_skipped_reason`와 별도 상태입니다. AI가 management-only로 계속 동작하더라도
+            same-side add-on 신규 진입 제안만 별도로 억제될 수 있습니다.
+          </div>
+        ) : null}
+        {visibleLegacyRows > 0 ? (
+          <div className="rounded-[1.6rem] border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm leading-6 text-slate-700">
+            시간 기반 AI review 사유(`open_position_recheck_due`, `periodic_backstop_due`)는 현재 runtime trigger가 아니라
+            저장된 과거 정책 기록으로 분리 표시합니다.
+          </div>
+        ) : null}
       </section>
     </div>
   );

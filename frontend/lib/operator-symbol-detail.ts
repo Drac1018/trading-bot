@@ -15,6 +15,7 @@ import {
   formatUtcTimestamp,
   inferEventSourceProvenance,
   normalizeSourceStatus,
+  resolveOperatorEventViewConfigured,
   summarizeEntryPolicy,
   summarizeReasonCodes,
   toneForAlignment,
@@ -212,6 +213,7 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
   const eventControl = symbol.event_operator_control ?? null;
   const eventContext = asRecord(eventControl?.event_context ?? legacyEventContext);
   const operatorEventView = eventControl?.operator_event_view ?? null;
+  const operatorEventViewConfigured = resolveOperatorEventViewConfigured(eventControl);
   const alignmentDecision = eventControl?.alignment_decision ?? null;
   const manualWindows = eventControl?.manual_no_trade_windows ?? [];
   const activeWindows = manualWindows.filter((window) => window.is_active);
@@ -266,6 +268,7 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
     blockedReason: riskBlockedReason ?? eventControl?.blocked_reason,
     approvalRequiredReason: riskApprovalRequiredReason ?? eventControl?.approval_required_reason,
     policySource: riskPolicySource,
+    operatorViewConfigured: operatorEventViewConfigured,
   });
 
   const blockedAndDegradedAlerts: OperatorDetailAlert[] = [
@@ -402,29 +405,40 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
     {
       key: "operator_event_view",
       title: "운영자 이벤트 뷰",
-      tone: operatorEventView ? "neutral" : "warn",
+      tone: operatorEventViewConfigured ? "neutral" : "warn",
       items: [
         { label: "운영자 방향", value: describeEventBias(operatorEventView?.operator_bias), hint: "운영자가 직접 정한 대응 방향입니다." },
         { label: "운영자 위험 판단", value: describeRiskState(operatorEventView?.operator_risk_state), hint: "운영자가 본 현재 위험 수준입니다." },
         {
           label: "적용 심볼",
-          value: operatorEventView && operatorEventView.applies_to_symbols.length > 0 ? operatorEventView.applies_to_symbols.join(", ") : "전체 심볼",
+          value:
+            operatorEventViewConfigured && operatorEventView && operatorEventView.applies_to_symbols.length > 0
+              ? operatorEventView.applies_to_symbols.join(", ")
+              : "저장된 override 없음",
           hint: "비워 두면 모든 심볼에 적용됩니다.",
         },
-        { label: "영향 기간/관점", value: operatorEventView?.horizon ?? "정보 없음", hint: "예: 오늘 이벤트 전후, 이번 주 등으로 적습니다." },
+        {
+          label: "영향 기간/관점",
+          value: operatorEventViewConfigured ? (operatorEventView?.horizon ?? "정보 없음") : "저장된 override 없음",
+          hint: "예: 오늘 이벤트 전후, 이번 주 등으로 적습니다.",
+        },
         {
           label: "적용 시간",
-          value: `${formatUtcTimestamp(operatorEventView?.valid_from)} ~ ${formatUtcTimestamp(operatorEventView?.valid_to)}`,
+          value: operatorEventViewConfigured
+            ? `${formatUtcTimestamp(operatorEventView?.valid_from)} ~ ${formatUtcTimestamp(operatorEventView?.valid_to)}`
+            : "저장된 시간 범위 없음",
           hint: "모든 시각은 UTC 기준입니다.",
         },
         {
           label: "반영 방식",
-          value: describeEnforcementMode(operatorEventView?.enforcement_mode),
-          hint: operatorEventView?.note ?? "추가 메모 없음",
+          value: operatorEventViewConfigured
+            ? describeEnforcementMode(operatorEventView?.enforcement_mode)
+            : "저장된 override 없음 (기본 참고 평가만 사용)",
+          hint: operatorEventViewConfigured ? (operatorEventView?.note ?? "저장된 메모 없음") : "운영자 이벤트 설정이 아직 없습니다.",
         },
       ],
       alerts:
-        operatorEventView
+        operatorEventViewConfigured
           ? []
           : [{ tone: "warn", text: "운영자 이벤트 설정이 아직 없습니다. 이 경우 기존 AI와 리스크 기준으로만 움직입니다." }],
     },

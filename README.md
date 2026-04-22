@@ -15,6 +15,7 @@
 
 ## 핵심 문서
 
+- [문서 인덱스 / 작성 기준](docs/README.md)
 - [아키텍처](docs/architecture.md)
 - [리스크 정책](docs/risk-policy.md)
 - [실행 흐름](docs/execution-flow.md)

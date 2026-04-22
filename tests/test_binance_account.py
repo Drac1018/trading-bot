@@ -140,3 +140,54 @@ def test_binance_account_snapshot_builds_summary_from_exchange(monkeypatch, db_s
     assert payload.assets[0].asset == "USDT"
     assert payload.positions[0].symbol == "BTCUSDT"
     assert payload.open_orders[0].reduce_only is True
+
+
+def test_binance_account_snapshot_treats_missing_can_trade_as_not_explicitly_blocked(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    db_session.add(settings_row)
+    db_session.flush()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_account_info(self):
+            return {
+                "totalWalletBalance": "1250.5",
+                "availableBalance": "930.25",
+                "totalUnrealizedProfit": "12.75",
+                "totalMarginBalance": "1263.25",
+                "totalPositionInitialMargin": "110.0",
+                "totalOpenOrderInitialMargin": "35.5",
+                "totalMaintMargin": "20.0",
+                "assets": [
+                    {
+                        "asset": "USDT",
+                        "walletBalance": "1250.5",
+                        "availableBalance": "930.25",
+                        "marginBalance": "1263.25",
+                        "unrealizedProfit": "12.75",
+                        "maxWithdrawAmount": "900.0",
+                    }
+                ],
+            }
+
+        def get_position_information(self):
+            return []
+
+        def get_open_orders(self):
+            return []
+
+    monkeypatch.setattr("trading_mvp.services.binance_account.BinanceClient", FakeClient)
+
+    payload = get_binance_account_snapshot(db_session)
+
+    assert payload.summary.connected is True
+    assert payload.summary.can_trade is True
+    assert payload.summary.exchange_can_trade is True
+    assert "omitted canTrade" in payload.summary.message

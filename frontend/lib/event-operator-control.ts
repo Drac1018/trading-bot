@@ -141,6 +141,7 @@ export type EventOperatorControlPayload = {
   event_context: OperatorEventContextPayload;
   ai_event_view: AIEventViewPayload;
   operator_event_view: OperatorEventViewPayload;
+  operator_event_view_configured?: boolean;
   alignment_decision: AlignmentDecisionPayload;
   evaluated_operator_policy?: EvaluatedOperatorPolicyPayload | null;
   blocked_reason?: string | null;
@@ -150,6 +151,41 @@ export type EventOperatorControlPayload = {
   manual_no_trade_windows: ManualNoTradeWindowPayload[];
   effective_policy_preview: OperatorEffectivePolicyPreview;
 };
+
+export function isOperatorEventViewConfigured(
+  value: OperatorEventViewPayload | null | undefined,
+) {
+  if (!value) {
+    return false;
+  }
+
+  return (
+    value.operator_bias !== "unknown" ||
+    value.operator_risk_state !== "unknown" ||
+    value.applies_to_symbols.length > 0 ||
+    Boolean(value.horizon?.trim()) ||
+    Boolean(value.valid_from) ||
+    Boolean(value.valid_to) ||
+    value.enforcement_mode !== "observe_only" ||
+    Boolean(value.note?.trim()) ||
+    (value.updated_at !== null && value.updated_at !== undefined)
+  );
+}
+
+export function resolveOperatorEventViewConfigured(
+  value:
+    | {
+        operator_event_view?: OperatorEventViewPayload | null;
+        operator_event_view_configured?: boolean | null;
+      }
+    | null
+    | undefined,
+) {
+  if (typeof value?.operator_event_view_configured === "boolean") {
+    return value.operator_event_view_configured;
+  }
+  return isOperatorEventViewConfigured(value?.operator_event_view);
+}
 
 function pad(value: number) {
   return String(value).padStart(2, "0");
@@ -527,7 +563,16 @@ export function summarizeEntryPolicy(params: {
   blockedReason?: string | null;
   approvalRequiredReason?: string | null;
   policySource?: string | null;
+  operatorViewConfigured?: boolean | null;
 }) {
+  if (
+    params.operatorViewConfigured === false &&
+    !params.blockedReason &&
+    !params.approvalRequiredReason &&
+    (params.policySource ?? "none") === "none"
+  ) {
+    return "운영자가 저장한 이벤트 정책은 없습니다. 현재 엔진은 기본 참고 평가만 수행하며, 이 상태 자체로 신규 진입을 차단하지 않습니다.";
+  }
   const policy = describeEffectivePolicyPreview(params.effectivePolicyPreview);
   const reason = describeEventReasonCode(params.blockedReason ?? params.approvalRequiredReason).replace(/[.。]+$/, "");
   const source = describePolicySource(params.policySource).replace(/[.。]+$/, "");

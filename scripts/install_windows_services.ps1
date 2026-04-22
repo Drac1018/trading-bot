@@ -1,3 +1,8 @@
+[CmdletBinding()]
+param(
+    [switch]$IncludeScheduler
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -62,6 +67,70 @@ function Write-ServiceConfig {
     return $exePath
 }
 
+function Get-ServiceInstance {
+    param(
+        [string]$Name
+    )
+
+    return Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+}
+
+function Wait-ForServiceState {
+    param(
+        [string]$Name,
+        [string]$DesiredState,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $service = Get-ServiceInstance -Name $Name
+        if ($null -eq $service) {
+            return $DesiredState -eq "Deleted"
+        }
+        if ($service.State -eq $DesiredState) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    return $false
+}
+
+function Remove-ServiceIfPresent {
+    param(
+        [hashtable]$Definition
+    )
+
+    $exePath = Join-Path $serviceRoot "$($Definition.Id).exe"
+    $service = Get-ServiceInstance -Name $Definition.Id
+    if ($null -eq $service) {
+        return
+    }
+
+    if ($service.State -ne "Stopped") {
+        if (Test-Path $exePath) {
+            & $exePath stop | Out-Null
+        } else {
+            Stop-Service -Name $Definition.Id -ErrorAction SilentlyContinue
+        }
+
+        if (-not (Wait-ForServiceState -Name $Definition.Id -DesiredState "Stopped")) {
+            throw "Timed out waiting for service $($Definition.Id) to stop."
+        }
+    }
+
+    if (Test-Path $exePath) {
+        & $exePath uninstall | Out-Null
+    } else {
+        sc.exe delete $Definition.Id | Out-Null
+    }
+
+    if (-not (Wait-ForServiceState -Name $Definition.Id -DesiredState "Deleted")) {
+        throw "Timed out waiting for service $($Definition.Id) to be removed."
+    }
+}
+
 $definitions = @(
     @{
         Id = "TradingMvpBackend"
@@ -83,26 +152,27 @@ $definitions = @(
         Description = "RQ worker for trading jobs"
         Script = "scripts\\run_worker.ps1"
         LogPath = (Join-Path $repoRoot ".logs\\services\\worker")
-    },
-    @{
-        Id = "TradingMvpScheduler"
-        Name = "Trading MVP Scheduler"
-        Description = "Scheduler for interval and review jobs"
-        Script = "scripts\\run_scheduler.ps1"
-        LogPath = (Join-Path $repoRoot ".logs\\services\\scheduler")
     }
 )
+
+$schedulerDefinition = @{
+    Id = "TradingMvpScheduler"
+    Name = "Trading MVP Scheduler"
+    Description = "Scheduler for interval and review jobs"
+    Script = "scripts\\run_scheduler.ps1"
+    LogPath = (Join-Path $repoRoot ".logs\\services\\scheduler")
+}
+
+if ($IncludeScheduler) {
+    $definitions += $schedulerDefinition
+} else {
+    Remove-ServiceIfPresent -Definition $schedulerDefinition
+}
 
 $wrapper = Get-WinSWExecutable
 
 foreach ($definition in $definitions) {
-    $exePath = Join-Path $serviceRoot "$($definition.Id).exe"
-    $service = Get-Service -Name $definition.Id -ErrorAction SilentlyContinue
-    if ($service) {
-        & $exePath stop | Out-Null
-        Start-Sleep -Seconds 2
-        & $exePath uninstall | Out-Null
-    }
+    Remove-ServiceIfPresent -Definition $definition
 
     $exePath = Write-ServiceConfig -Definition $definition -WrapperSource $wrapper
     & $exePath install
@@ -110,4 +180,8 @@ foreach ($definition in $definitions) {
     & $exePath start
 }
 
-Write-Host "Windows services installed and started."
+if ($IncludeScheduler) {
+    Write-Host "Windows services installed and started, including TradingMvpScheduler."
+} else {
+    Write-Host "Windows services installed and started. TradingMvpScheduler is omitted by default."
+}

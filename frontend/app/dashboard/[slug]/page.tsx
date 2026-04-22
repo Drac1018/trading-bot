@@ -5,6 +5,7 @@ import {
   AgentDebugView,
   DecisionView,
   MarketSignalView,
+  RiskView,
   SchedulerView,
 } from "../../../components/dashboard-views";
 import { DataTable } from "../../../components/data-table";
@@ -103,6 +104,13 @@ export default async function DashboardPage({
     );
   } else if (slug === "scheduler" && operatorPayload) {
     content = <SchedulerView operator={operatorPayload} schedulerRows={normalizedSections[0]?.rows ?? []} />;
+  } else if (slug === "risk") {
+    content = (
+      <RiskView
+        riskRows={normalizedSections[0]?.rows ?? []}
+        alertRows={normalizedSections[1]?.rows ?? []}
+      />
+    );
   } else if (slug === "agents") {
     content = <AgentDebugView agentRows={normalizedSections[0]?.rows ?? []} />;
   } else if (slug === "settings") {

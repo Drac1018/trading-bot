@@ -1128,6 +1128,10 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     trigger_deduped: bool = False
     trigger_fingerprint: str | None = None
     last_ai_skip_reason: str | None = None
+    suppression_active: bool = False
+    suppression_reason_code: str | None = None
+    allow_same_side_add_on: bool = False
+    allowed_add_on_side: Literal["long", "short"] | None = None
     event_risk_acknowledgement: str | None = None
     confidence_penalty_reason: str | None = None
     scenario_note: str | None = None
@@ -1741,6 +1745,7 @@ class EventOperatorControlPayload(StrictBaseModel):
     event_context: OperatorEventContextPayload
     ai_event_view: AIEventViewPayload
     operator_event_view: OperatorEventViewPayload
+    operator_event_view_configured: bool = False
     alignment_decision: AlignmentDecisionPayload
     evaluated_operator_policy: EvaluatedOperatorPolicyPayload | None = None
     blocked_reason: str | None = None

@@ -72,3 +72,43 @@ test("filterAuditRows applies tab, severity, search and sort together", async ()
   });
   assert.deepEqual(searched.map((row) => row.event_type), ["risk_blocked"]);
 });
+
+test("describeAuditLegacyReview marks legacy time-based trigger rows separately", async () => {
+  const { describeAuditLegacyReview, extractLegacyReviewTriggerReason } = await auditLogModule;
+
+  const row: AuditRow = {
+    event_category: "ai_decision",
+    event_type: "decision_review_skipped",
+    created_at: "2026-04-15T12:10:00Z",
+    payload: {
+      trigger: {
+        trigger_reason: "periodic_backstop_due",
+      },
+    },
+  };
+
+  assert.equal(extractLegacyReviewTriggerReason(row), "periodic_backstop_due");
+
+  const presentation = describeAuditLegacyReview(row);
+  assert.equal(presentation?.badge, "과거 정책 기록");
+  assert.equal(presentation?.rawTriggerReason, "periodic_backstop_due");
+  assert.equal(presentation?.legacy, true);
+});
+
+test("describeAuditLegacyReview ignores current runtime trigger reasons", async () => {
+  const { describeAuditLegacyReview, extractLegacyReviewTriggerReason } = await auditLogModule;
+
+  const row: AuditRow = {
+    event_category: "ai_decision",
+    event_type: "decision_review_requested",
+    created_at: "2026-04-15T12:11:00Z",
+    metadata_json: {
+      ai_trigger: {
+        trigger_reason: "entry_candidate_event",
+      },
+    },
+  };
+
+  assert.equal(extractLegacyReviewTriggerReason(row), null);
+  assert.equal(describeAuditLegacyReview(row), null);
+});

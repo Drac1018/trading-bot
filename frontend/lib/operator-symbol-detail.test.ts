@@ -81,6 +81,7 @@ function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSym
         created_by: "operator-ui",
         updated_at: "2026-04-20T11:01:00Z",
       },
+      operator_event_view_configured: true,
       alignment_decision: {
         ai_bias: "bullish",
         operator_bias: "neutral",
@@ -236,9 +237,10 @@ test("buildOperatorDetailSections keeps unavailable source visible in plain lang
           valid_to: null,
           enforcement_mode: "observe_only",
           note: null,
-          created_by: "operator-ui",
+          created_by: "unknown",
           updated_at: null,
         },
+        operator_event_view_configured: false,
         alignment_decision: {
           ai_bias: "unknown",
           operator_bias: "unknown",
@@ -265,6 +267,7 @@ test("buildOperatorDetailSections keeps unavailable source visible in plain lang
   );
 
   const eventSection = sections.find((section) => section.key === "upcoming_event_risk");
+  const operatorSection = sections.find((section) => section.key === "operator_event_view");
   const blockedSection = sections.find((section) => section.key === "blocked_degraded_reason");
 
   assert.ok(eventSection);
@@ -276,6 +279,13 @@ test("buildOperatorDetailSections keeps unavailable source visible in plain lang
   assert.equal(
     eventSection.items.find((item) => item.label === "데이터 출처")?.value,
     describeEventSourceProvenance("stub"),
+  );
+  assert.ok(operatorSection);
+  assert.equal(operatorSection.tone, "warn");
+  assert.ok(
+    operatorSection.alerts.some((alert) =>
+      alert.text.includes("운영자 이벤트 설정이 아직 없습니다."),
+    ),
   );
   assert.ok(blockedSection);
   assert.ok(

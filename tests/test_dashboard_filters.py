@@ -438,12 +438,22 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
                 "freshness_blocking": True,
             },
             "features": {
+                "trend_score": 1.48,
+                "volume_ratio": 1.33,
+                "momentum_score": 0.92,
+                "breakout": {
+                    "range_breakout_direction": "up",
+                    "broke_swing_high": True,
+                    "broke_swing_low": False,
+                },
                 "regime": {
                     "primary_regime": "bullish",
                     "trend_alignment": "bullish_aligned",
                     "volatility_regime": "normal",
                     "volume_regime": "strong",
                     "momentum_state": "stable",
+                    "weak_volume": False,
+                    "momentum_weakening": False,
                 }
             }
         },
@@ -462,6 +472,17 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             "source": "llm",
             "holding_profile": "scalp",
             "holding_profile_reason": "scalp_default_intraday_bias",
+            "active_position_prompt_route_context": {
+                "management_only_open_position_route": True,
+                "entry_proposal_suppression_active": True,
+                "entry_proposal_suppressed_reason_code": "LARGEST_POSITION_LIMIT_REACHED",
+                "allow_same_side_add_on": False,
+                "allowed_add_on_side": None,
+            },
+            "active_position_entry_fingerprint_basis": {
+                "position_state_bucket": "winning_protected",
+                "regime_summary": {"primary_regime": "bullish"},
+            },
             "selection_context": {
                 "assigned_slot": "slot_1",
                 "candidate_weight": 0.64,
@@ -531,12 +552,22 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
                 "freshness_blocking": False,
             },
             "features": {
+                "trend_score": 0.88,
+                "volume_ratio": 1.21,
+                "momentum_score": 0.46,
+                "breakout": {
+                    "range_breakout_direction": "none",
+                    "broke_swing_high": False,
+                    "broke_swing_low": False,
+                },
                 "regime": {
                     "primary_regime": "bullish",
                     "trend_alignment": "bullish_aligned",
                     "volatility_regime": "normal",
                     "volume_regime": "normal",
                     "momentum_state": "strengthening",
+                    "weak_volume": False,
+                    "momentum_weakening": False,
                 }
             }
         },
@@ -976,6 +1007,134 @@ def test_audit_filters(db_session) -> None:
     assert filtered[0]["event_category"] == "health_system"
 
 
+def test_audit_timeline_projects_active_position_suppression_without_fingerprint(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    decision_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="btc management-only review",
+        input_payload={},
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+        },
+        metadata_json={
+            "source": "llm",
+            "active_position_prompt_route_context": {
+                "management_only_open_position_route": True,
+                "entry_proposal_suppression_active": True,
+                "entry_proposal_suppressed_reason_code": "DETERMINISTIC_BASELINE_DISAGREEMENT",
+                "allow_same_side_add_on": True,
+                "allowed_add_on_side": "long",
+            },
+            "active_position_entry_fingerprint_basis": {
+                "position_state_bucket": "winning_protected",
+                "regime_summary": {"primary_regime": "bullish"},
+            },
+        },
+        schema_valid=True,
+    )
+    db_session.add(decision_run)
+    db_session.flush()
+    db_session.add(
+        AuditEvent(
+            event_type="decision_ai_skipped",
+            entity_type="decision_run",
+            entity_id=str(decision_run.id),
+            severity="info",
+            message="AI inference skipped.",
+            payload={
+                "symbol": "BTCUSDT",
+                "ai_skipped_reason": "TRIGGER_DEDUPED",
+            },
+        )
+    )
+    db_session.commit()
+
+    rows = get_audit_timeline(db_session, event_type="decision_ai_skipped", limit=1)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_category"] == "ai_decision"
+    assert row["suppression_active"] is True
+    assert row["suppression_reason_code"] == "DETERMINISTIC_BASELINE_DISAGREEMENT"
+    assert row["allow_same_side_add_on"] is True
+    assert row["allowed_add_on_side"] == "long"
+    assert "active_position_entry_fingerprint_basis" not in row
+    assert row["payload"]["suppression_active"] is True
+    assert row["payload"]["suppression_reason_code"] == "DETERMINISTIC_BASELINE_DISAGREEMENT"
+    assert row["payload"]["allow_same_side_add_on"] is True
+    assert row["payload"]["allowed_add_on_side"] == "long"
+    assert "active_position_entry_fingerprint_basis" not in row["payload"]
+
+
+def test_audit_timeline_prefers_payload_suppression_projection_over_join_fallback(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    decision_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="btc management-only review",
+        input_payload={},
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+        },
+        metadata_json={
+            "source": "llm",
+            "active_position_prompt_route_context": {
+                "management_only_open_position_route": True,
+                "entry_proposal_suppression_active": True,
+                "entry_proposal_suppressed_reason_code": "LARGEST_POSITION_LIMIT_REACHED",
+                "allow_same_side_add_on": True,
+                "allowed_add_on_side": "long",
+            },
+        },
+        schema_valid=True,
+    )
+    db_session.add(decision_run)
+    db_session.flush()
+    db_session.add(
+        AuditEvent(
+            event_type="agent_output",
+            entity_type="agent_run",
+            entity_id=str(decision_run.id),
+            severity="info",
+            message="Trading decision generated.",
+            payload={
+                "symbol": "BTCUSDT",
+                "suppression_active": False,
+                "suppression_reason_code": None,
+                "allow_same_side_add_on": False,
+                "allowed_add_on_side": None,
+            },
+        )
+    )
+    db_session.commit()
+
+    rows = get_audit_timeline(db_session, event_type="agent_output", limit=1)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["suppression_active"] is False
+    assert row["suppression_reason_code"] is None
+    assert row["allow_same_side_add_on"] is False
+    assert row["allowed_add_on_side"] is None
+    assert row["payload"]["suppression_active"] is False
+    assert row["payload"]["suppression_reason_code"] is None
+    assert row["payload"]["allow_same_side_add_on"] is False
+    assert row["payload"]["allowed_add_on_side"] is None
+
+
 def test_audit_event_categories_are_deterministic() -> None:
     assert classify_audit_event("risk_check", "risk_check", {}) == "risk"
     assert classify_audit_event("live_limit_partial_fill", "order", {}) == "execution"
@@ -1269,10 +1428,15 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
     assert btc.ai_decision.trigger_deduped is True
     assert btc.ai_decision.last_ai_skip_reason == "TRIGGER_DEDUPED"
+    assert btc.ai_decision.suppression_active is True
+    assert btc.ai_decision.suppression_reason_code == "LARGEST_POSITION_LIMIT_REACHED"
+    assert btc.ai_decision.allow_same_side_add_on is False
+    assert btc.ai_decision.allowed_add_on_side is None
     assert btc.ai_decision.next_ai_review_due_at is None
     assert btc.ai_decision.assigned_slot == "slot_1"
     assert btc.ai_decision.candidate_weight == 0.64
     assert btc.ai_decision.capacity_reason == "mixed_breadth_moderate_capacity"
+    assert "active_position_entry_fingerprint_basis" not in btc.ai_decision.model_dump(mode="json")
     assert btc.risk_guard.allowed is False
     assert btc.risk_guard.raw_payload == {}
     assert btc.risk_guard.assigned_slot == "slot_1"
@@ -1317,6 +1481,10 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert eth.ai_decision.raw_output == {}
     assert eth.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
     assert eth.ai_decision.last_ai_invoked_at is not None
+    assert eth.ai_decision.suppression_active is False
+    assert eth.ai_decision.suppression_reason_code is None
+    assert eth.ai_decision.allow_same_side_add_on is False
+    assert eth.ai_decision.allowed_add_on_side is None
     assert eth.ai_decision.next_ai_review_due_at is None
     assert eth.ai_decision.assigned_slot == "slot_2"
     assert eth.ai_decision.candidate_weight == 0.42
@@ -1698,6 +1866,7 @@ def test_operator_dashboard_exposes_derivatives_and_event_context_summaries(db_s
     assert ada.derivatives_summary["taker_flow_alignment"] == "bullish"
     assert ada.derivatives_summary["spread_bps"] == 3.8
     assert ada.event_context_summary["source_status"] == "stub"
+    assert ada.event_context_summary["is_stale"] is False
     assert ada.event_context_summary["next_event_name"] == "FOMC"
     assert ada.event_context_summary["next_event_importance"] == "high"
     assert ada.event_context_summary["minutes_to_next_event"] == 35
@@ -1849,7 +2018,34 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert len(payload["audit_events"]) >= 1
 
 
-def test_overview_api_refreshes_stale_exchange_sync_on_read(testclient_db_factory, monkeypatch) -> None:
+def test_risk_checks_api_includes_ai_trigger_summary(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("risk_checks_trigger_summary.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/risk/checks")
+
+    assert response.status_code == 200
+    payload = response.json()
+    btc = next(item for item in payload if item["symbol"] == "BTCUSDT")
+    eth = next(item for item in payload if item["symbol"] == "ETHUSDT")
+
+    assert btc["ai_trigger_reason"] == "entry_candidate_event"
+    assert "상단 돌파" in btc["ai_trigger_summary"]
+    assert "거래량" in btc["ai_trigger_summary"]
+
+    assert eth["ai_trigger_reason"] == "entry_candidate_event"
+    assert "모멘텀" in eth["ai_trigger_summary"]
+    assert "거래량" in eth["ai_trigger_summary"]
+
+
+def test_overview_api_does_not_refresh_stale_exchange_sync_on_read_for_sqlite(
+    testclient_db_factory,
+    monkeypatch,
+) -> None:
     TestingSessionLocal = testclient_db_factory("overview_sync_refresh.db")
 
     with TestingSessionLocal() as session:
@@ -1862,18 +2058,8 @@ def test_overview_api_refreshes_stale_exchange_sync_on_read(testclient_db_factor
         session.commit()
 
     refresh_started = Event()
-    refresh_completed = Event()
-    allow_refresh_commit = Event()
-
     def fake_refresh_exchange_sync(session, *, triggered_by: str):
         refresh_started.set()
-        assert allow_refresh_commit.wait(timeout=2.0) is True
-        refreshed_at = utcnow_naive()
-        settings = get_or_create_settings(session)
-        for scope in ("account", "positions", "open_orders", "protective_orders"):
-            mark_sync_success(settings, scope=scope, synced_at=refreshed_at)
-        session.commit()
-        refresh_completed.set()
         return {"workflow": "exchange_sync_cycle", "status": "success", "triggered_by": triggered_by}
 
     monkeypatch.setattr(
@@ -1890,15 +2076,50 @@ def test_overview_api_refreshes_stale_exchange_sync_on_read(testclient_db_factor
     assert response.status_code == 200
     payload = response.json()
     assert payload["sync_freshness_summary"]["account"]["stale"] is True
-    assert refresh_started.wait(timeout=2.0) is True
-
-    allow_refresh_commit.set()
-    assert refresh_completed.wait(timeout=2.0) is True
+    assert refresh_started.wait(timeout=0.2) is False
 
     with TestingSessionLocal() as session:
         refreshed = get_overview(session)
-        assert refreshed.sync_freshness_summary["account"]["stale"] is False
-        assert refreshed.sync_freshness_summary["protective_orders"]["stale"] is False
+        assert refreshed.sync_freshness_summary["account"]["stale"] is True
+        assert refreshed.sync_freshness_summary["protective_orders"]["stale"] is True
+
+
+def test_operator_api_does_not_refresh_stale_exchange_sync_on_read_for_sqlite(
+    testclient_db_factory,
+    monkeypatch,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_sync_refresh.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        settings = get_or_create_settings(session)
+        stale_at = utcnow_naive() - timedelta(hours=2)
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_success(settings, scope=scope, synced_at=stale_at)
+        session.commit()
+
+    refresh_started = Event()
+
+    def fake_refresh_exchange_sync(session, *, triggered_by: str):
+        refresh_started.set()
+        return {"workflow": "exchange_sync_cycle", "status": "success", "triggered_by": triggered_by}
+
+    monkeypatch.setattr(
+        "trading_mvp.main.maybe_refresh_exchange_sync_freshness",
+        fake_refresh_exchange_sync,
+    )
+    monkeypatch.setattr("trading_mvp.main.READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS", 0.0)
+    monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_inflight", False)
+    monkeypatch.setattr("trading_mvp.main._exchange_sync_read_refresh_last_started", 0.0)
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["control"]["sync_freshness_summary"]["account"]["stale"] is True
+    assert payload["control"]["sync_freshness_summary"]["protective_orders"]["stale"] is True
+    assert refresh_started.wait(timeout=0.2) is False
 
 
 def test_audit_api_returns_event_category(testclient_db_factory) -> None:

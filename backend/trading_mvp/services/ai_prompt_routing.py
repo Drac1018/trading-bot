@@ -66,6 +66,21 @@ def _normalized_engine(strategy_engine: str | None) -> str:
     return engine
 
 
+def _active_position_route_override(
+    *,
+    ai_context: AIDecisionContextPacket | None,
+    has_open_position: bool,
+) -> tuple[bool, str | None]:
+    if not has_open_position or ai_context is None:
+        return False, None
+    strategy_engine_context = dict(ai_context.strategy_engine_context or {})
+    management_only = bool(strategy_engine_context.get("management_only_open_position_route"))
+    allowed_add_on_side = str(strategy_engine_context.get("allowed_add_on_side") or "").strip().lower()
+    if bool(strategy_engine_context.get("allow_same_side_add_on")) and allowed_add_on_side in NEW_ENTRY_ACTIONS:
+        return management_only, allowed_add_on_side
+    return management_only, None
+
+
 def _recommended_profiles_for_route(
     *,
     strategy_engine: str,
@@ -91,6 +106,10 @@ def resolve_prompt_route(
     resolved_trigger = str(trigger_type or (ai_context.trigger_type if ai_context is not None else "") or "").strip() or None
     resolved_engine = _normalized_engine(strategy_engine or (ai_context.strategy_engine if ai_context is not None else None))
     current_profile = ai_context.holding_profile if ai_context is not None else None
+    management_only_open_position_route, add_on_side = _active_position_route_override(
+        ai_context=ai_context,
+        has_open_position=has_open_position,
+    )
     allowed_profiles = _recommended_profiles_for_route(
         strategy_engine=resolved_engine,
         trigger_type=resolved_trigger,
@@ -156,6 +175,51 @@ def resolve_prompt_route(
                 "Do not manufacture activity. Prefer hold unless the packet clearly supports action."
             ),
             engine_instruction="Backstop review is a safety net, not a frequency expansion mechanism.",
+        )
+    if management_only_open_position_route and add_on_side in NEW_ENTRY_ACTIONS:
+        forbidden_actions = tuple(
+            action
+            for action in ("long", "short")
+            if action != add_on_side
+        )
+        return PromptRoutePolicy(
+            trigger_type=resolved_trigger,
+            strategy_engine=resolved_engine,
+            prompt_family="open_position_add_on_review",
+            allowed_actions=("hold", add_on_side, "reduce", "exit"),
+            forbidden_actions=forbidden_actions,
+            allow_new_entry=True,
+            allow_reduce_exit=True,
+            allowed_recommended_holding_profiles=allowed_profiles,
+            holding_profile_change_policy="keep_current_or_de_risk_only",
+            stop_management_mode="tighten_only",
+            fail_closed=False,
+            safe_fallback_action="hold",
+            family_instruction=(
+                "This is an open-position management review. "
+                "Only a protected winner-only same-side add-on may use a fresh entry action."
+            ),
+            engine_instruction="Opposite reversal and unprotected add-on ideas remain forbidden while a position is open.",
+        )
+    if management_only_open_position_route:
+        return PromptRoutePolicy(
+            trigger_type=resolved_trigger,
+            strategy_engine=resolved_engine,
+            prompt_family="open_position_thesis_review",
+            allowed_actions=("hold", "reduce", "exit"),
+            forbidden_actions=("long", "short"),
+            allow_new_entry=False,
+            allow_reduce_exit=True,
+            allowed_recommended_holding_profiles=allowed_profiles,
+            holding_profile_change_policy="keep_current_or_de_risk_only",
+            stop_management_mode="tighten_only",
+            fail_closed=False,
+            safe_fallback_action="hold",
+            family_instruction=(
+                "This is an open-position management review. "
+                "Focus on hold, reduce, or exit until state changes materially."
+            ),
+            engine_instruction="Fresh entry ideas are suppressed while an active position remains open.",
         )
     if resolved_engine == "breakout_exception_engine" or resolved_trigger == "breakout_exception_event":
         return PromptRoutePolicy(

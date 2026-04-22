@@ -1,5 +1,19 @@
 # API
 
+## 2026-04 Binance Futures canTrade Fallback
+
+- `GET /api/binance/account`
+  - `summary.exchange_can_trade` / `summary.can_trade` use Binance `canTrade` when the field is present.
+  - When the Futures account payload omits `canTrade`, the snapshot no longer falls back to `false`.
+  - In that case the exchange is treated as "not explicitly blocked" and the operator note is appended to `summary.message`.
+  - Actual app-side submit readiness remains `summary.app_live_execution_ready`.
+
+## 2026-04 Binance Algo Order FINISHED Normalization
+
+- Binance Futures algo order `exchange_status=FINISHED` now normalizes to local `status=expired`.
+- The raw exchange status is still preserved in `exchange_status`.
+- This prevents protective orders from remaining locally `pending` after exchange reconciliation.
+
 ## 2026-04 Live Account Snapshot Unknown Fallback
 
 - `starting_equity`는 live operator/settings payload에서 제거된 상태였고, 이제 settings model/config/update schema/replay baseline에서도 제거되었습니다.
@@ -54,11 +68,20 @@
 - `selection_context_summary`
 - `prompt_family_hint`
 
+Active-position review routing may annotate `strategy_engine_context` with:
+
+- `management_only_open_position_route`
+- `allow_same_side_add_on`
+- `allowed_add_on_side`
+- `entry_proposal_suppression_active`
+- `entry_proposal_suppressed_reason_code`
+
 ### `event_context_summary`
 
 - `source_provenance`
 - `source_vendor`
 - `enrichment_vendors`
+- `is_stale`
 - `next_event_name`
 - `next_event_importance`
 - `minutes_to_next_event`
@@ -410,11 +433,22 @@
   - `event_context`
   - `ai_event_view`
   - `operator_event_view`
+  - `operator_event_view_configured`
   - `alignment_decision`
   - `evaluated_operator_policy`
   - `manual_no_trade_windows`
   - `effective_policy_preview`
+- `operator_event_view_configured` means a persisted operator override exists.
+- `operator_event_view` still falls back to the default observe-only payload when no override is saved.
+- `operator_event_view_configured=false` does not mean a manual no-trade window is inactive. Manual windows are still represented separately in `manual_no_trade_windows`.
+- `event_operator_control.event_context` keeps `source_status`, `is_stale`, `next_event_name`, `minutes_to_next_event`, and `active_risk_window` visible for operator review.
 - `event_context.source_vendor` exposes the primary external calendar vendor when `source_provenance=external_api`.
+
+### 2026-04 Event Context Visibility
+
+- Operator dashboard `event_context_summary` keeps `source_status`, `is_stale`, `next_event_name`, `minutes_to_next_event`, and `active_risk_window` visible even when no hard gate is applied.
+- Compact `risk` audit payloads preserve the same `event_context` fields when event context is present on the recorded row.
+- These fields remain observe-only context. They do not add a new `risk_guard` hard block for entry.
 - `event_context.enrichment_vendors` exposes post-release actual-value enrichers such as `bls` and `bea`.
 - `effective_policy_preview` remains a separate preview/status field.
 - Preview strings are not the source of truth; raw payload + deterministic evaluator are the source of truth.
@@ -756,9 +790,15 @@ staged rollout semantics:
   - `execution.recent_fills`: 최근 fill ladder 요약. `execution_id`, `external_trade_id`, `fill_price`, `fill_quantity`, `fee_paid`, `commission_asset`, `realized_pnl`, `created_at`
   - `protection_status`: 기본 protected/missing 상태 외에 `recovery_status`, `auto_recovery_active`, `failure_count`, `last_error`, `last_transition_at`, `trigger_source`, `lifecycle_state`, `verification_status`, `last_event_type`, `last_event_message`, `last_event_at`
 - `audit_events`: operator dashboard에서는 raw payload 전체 대신 approval / protection / execution 설명에 필요한 compact payload만 유지합니다.
+  - AI decision 계열 compact payload에는 active-position suppress 상태가 additive field로 포함될 수 있습니다.
+  - 공개 필드는 `suppression_active`, `suppression_reason_code`, `allow_same_side_add_on`, `allowed_add_on_side`만 사용합니다.
+  - 현재 decision-run 기준 AI audit row는 suppress 상태 4개를 기록 시점 payload에도 직접 남깁니다.
+  - operator/dashboard projection의 decision-run join은 과거 row 호환을 위한 fallback입니다.
+  - `active_position_entry_fingerprint_basis` 같은 raw fingerprint detail은 operator payload에 직접 노출하지 않습니다.
 - `event_operator_control`
   - descriptive `market_context_summary`와 별도 additive container입니다.
-  - contains `event_context`, `ai_event_view`, `operator_event_view`, `alignment_decision`, `evaluated_operator_policy`, `manual_no_trade_windows`, `effective_policy_preview`
+  - contains `event_context`, `ai_event_view`, `operator_event_view`, `operator_event_view_configured`, `alignment_decision`, `evaluated_operator_policy`, `manual_no_trade_windows`, `effective_policy_preview`
+  - `operator_event_view_configured` only indicates persisted override existence and should not be merged with manual no-trade window state
   - `event_context.source_vendor=fred` means the primary calendar source stayed on FRED.
   - `event_context.enrichment_vendors=bls/bea` means post-release actual-value enrichment was attached without changing hard gates.
   - `effective_policy_preview` is the preview-facing projection of the same shared evaluator used by `risk_guard` for 신규 entry paths
@@ -801,6 +841,11 @@ staged rollout semantics:
   - `provider_name`
   - `trigger_event`
   - `decision_run_id`
+  - active-position suppress projection
+    - `suppression_active`
+    - `suppression_reason_code`
+    - `allow_same_side_add_on`
+    - `allowed_add_on_side`
 - `risk_guard`
   - 최신 결정론적 승인 결과
   - `allowed`
@@ -925,6 +970,23 @@ staged rollout semantics:
     - approval timeline: `approval_state`, `approval_window_open`, `approval_expires_at`, `approval_detail.*`
     - protection timeline: `recovery_status`, `missing_components`, `last_error`, `protection_lifecycle.*`, `verification_detail.*`
     - execution timeline: `order_status`, `submission_state`, `requested_quantity`, `filled_quantity`, `fill_price`, `average_fill_price`, `reason_codes`
+    - AI decision timeline: `suppression_active`, `suppression_reason_code`, `allow_same_side_add_on`, `allowed_add_on_side`
+
+### `GET /api/audit`
+
+감사 로그 탐색용 timeline payload입니다.
+
+- 기본 row 필드
+  - `event_type`, `entity_type`, `entity_id`, `severity`, `message`, `created_at`, `event_category`
+- AI / decision-run 연계 row에는 active-position suppress 상태가 additive top-level field로 projection될 수 있습니다.
+  - `suppression_active`
+  - `suppression_reason_code`
+  - `allow_same_side_add_on`
+  - `allowed_add_on_side`
+- 현재 `agent_output`, `decision_ai_invoked`, `decision_ai_skipped`, `decision_ai_bounded`, `decision_cycle_completed` row는 위 4개 suppress 필드를 write-time payload에도 직접 저장합니다.
+- operator가 자주 보는 interval-review summary row인 `decision_ai_no_event`, `decision_ai_deduped`도 active-position suppress 상태를 계산할 수 있는 경우 같은 4개 필드를 write-time payload에 직접 저장합니다.
+- projection은 payload 우선이며, 과거 row에 한해 decision-run metadata join을 fallback으로 사용합니다.
+- `active_position_entry_fingerprint_basis` 같은 raw fingerprint detail은 `/api/audit`에 직접 노출하지 않습니다.
 
 ### Decision / Risk trigger note
 
@@ -1202,6 +1264,9 @@ staged rollout semantics:
 
 감사 로그 타임라인입니다. 감사 로그 화면의 탭 분류는 각 row의 `event_category`를 기준으로 동작합니다.
 
+- Historical rows may still carry legacy `trigger_reason` / `last_ai_trigger_reason` values such as `open_position_recheck_due` and `periodic_backstop_due`.
+- Those values should be interpreted as stored historical policy records, not current runtime trigger reasons. See `docs/audit-legacy-trigger-policy.md`.
+
 지원 query:
 
 - `event_type`
@@ -1246,6 +1311,7 @@ Compact approval-control payload may include:
 - `after`
 - `evaluations`
 - `evaluated_at`
+- `alignment_evaluated` rows may include `evaluations.<symbol>.event_context` with `source_status`, `is_stale`, `next_event_name`, `minutes_to_next_event`, `active_risk_window`
 
 drawdown state transition audit:
 
@@ -1806,6 +1872,8 @@ Decision metadata and audit payloads can also carry breadth context when the sym
   - `portfolio_weight`
   - `strategy_engine`
   - `strategy_engine_context`
+    - active-position routing flags may include `management_only_open_position_route`, `allow_same_side_add_on`, `allowed_add_on_side`
+    - repeated blocked add-on suppression may include `entry_proposal_suppression_active`, `entry_proposal_suppressed_reason_code`
   - `breadth_score_multiplier`
   - `breadth_score_adjustment`
   - `breadth_hold_bias`
@@ -1822,3 +1890,13 @@ Operational rule:
 - selected entry symbols receive score-weighted `portfolio_weight` values so operators can see which symbols the rotation layer is concentrating on
 - candidate ranking only narrows which symbols enter the decision cycle
 - `risk_guard` still remains the final allow/block gate before execution
+
+## 2026-04 Risk Check AI Trigger Summary
+
+- `GET /api/risk/checks` rows add operator-facing AI trigger fields when `decision_run_id` links to a decision run.
+- `ai_trigger_reason`
+  - raw trigger code from the linked AI review trigger
+  - examples: `entry_candidate_event`, `breakout_exception_event`, `protection_review_event`, `manual_review_event`
+- `ai_trigger_summary`
+  - short operator-facing summary built from decision input `features`, `ai_trigger.reason_codes`, and decision `rationale_codes`
+  - example: `모멘텀 +0.46%, 거래량 1.21배, 상승 정렬`

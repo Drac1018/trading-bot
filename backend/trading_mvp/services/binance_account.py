@@ -67,6 +67,13 @@ def _has_meaningful_balance(*values: float) -> bool:
     return any(abs(value) > 1e-12 for value in values)
 
 
+def _resolve_exchange_trade_permission(account_info: Mapping[str, object]) -> tuple[bool, str | None]:
+    raw_can_trade = account_info.get("canTrade")
+    if raw_can_trade is None:
+        return True, "Binance account response omitted canTrade; treated as not explicitly blocked."
+    return _to_bool(raw_can_trade), None
+
+
 def _build_client(settings_row: Setting) -> BinanceClient:
     credentials = get_runtime_credentials(settings_row)
     return BinanceClient(
@@ -201,6 +208,7 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
             )
         )
     open_orders.sort(key=lambda item: item.update_time or datetime.min, reverse=True)
+    exchange_can_trade, exchange_can_trade_note = _resolve_exchange_trade_permission(account_info)
 
     summary = BinanceAccountSummary(
         connected=True,
@@ -208,8 +216,8 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         testnet_enabled=settings_row.binance_testnet_enabled,
         futures_enabled=settings_row.binance_futures_enabled,
         tracked_symbols=get_effective_symbols(settings_row),
-        can_trade=_to_bool(account_info.get("canTrade", False)),
-        exchange_can_trade=_to_bool(account_info.get("canTrade", False)),
+        can_trade=exchange_can_trade,
+        exchange_can_trade=exchange_can_trade,
         app_live_execution_ready=is_live_execution_ready(settings_row),
         app_trading_paused=settings_row.trading_paused,
         app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
@@ -233,4 +241,6 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         open_orders=len(open_orders),
         exchange_update_time=utcnow_naive(),
     )
+    if exchange_can_trade_note is not None:
+        summary.message = f"{summary.message} {exchange_can_trade_note}"
     return BinanceAccountResponse(summary=summary, assets=assets, positions=positions, open_orders=open_orders)

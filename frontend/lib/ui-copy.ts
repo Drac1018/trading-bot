@@ -20,7 +20,14 @@ const labelMap: Record<string, string> = {
   timeframe: "타임프레임",
   mode: "운영 모드",
   decision: "의사결정",
+  allowed: "허용 여부",
   confidence: "신뢰도",
+  ai_trigger_reason: "AI 호출 분류",
+  ai_trigger_summary: "AI 호출 요약",
+  suppression_active: "진입 제안 억제",
+  suppression_reason_code: "진입 제안 억제 사유",
+  allow_same_side_add_on: "same-side add-on 허용",
+  allowed_add_on_side: "허용 add-on 방향",
   latest_price: "현재가",
   latest_volume: "최근 거래량",
   stop_loss: "손절가",
@@ -257,6 +264,10 @@ const valueMap: Record<string, string> = {
   health_system: "헬스/시스템",
   ai_decision: "AI/의사결정",
   ai: "AI",
+  entry_candidate_event: "진입 후보 이벤트",
+  breakout_exception_event: "브레이크아웃 예외 이벤트",
+  protection_review_event: "보호 상태 점검",
+  manual_review_event: "수동 검토",
   user: "사용자",
   manual_source: "수동",
   "deterministic-mock": "결정론 Mock",
@@ -350,7 +361,7 @@ const reasonCodeMap: Record<string, string> = {
   ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT: "방향 편향 한도에 맞게 진입 수량이 축소되었습니다.",
   ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "최대 단일 포지션 한도에 맞게 진입 수량이 축소되었습니다.",
   ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "동일 티어 집중도 한도에 맞게 진입 수량이 축소되었습니다.",
-  TRADING_PAUSED: "거래가 일시 중지 상태여서 신규 진입이 차단되었습니다.",
+  TRADING_PAUSED: "거래가 일시 중지되어 신규 진입을 차단했습니다.",
   STALE_MARKET_DATA: "시장 데이터가 지연되어 신규 진입이 차단되었습니다.",
   INCOMPLETE_MARKET_DATA: "시장 데이터가 불완전하여 신규 진입이 차단되었습니다.",
   DAILY_LOSS_LIMIT_REACHED: "일일 손실 한도에 도달해 추가 진입이 차단되었습니다.",
@@ -367,7 +378,7 @@ const reasonCodeMap: Record<string, string> = {
   ROLLOUT_MODE_SHADOW: "그림자 점검 단계라 실제 주문은 보내지 않습니다.",
   ROLLOUT_MODE_LIVE_DRY_RUN: "실거래 사전 점검 단계라 실제 주문은 보내지 않습니다.",
   LIVE_APPROVAL_POLICY_DISABLED: "수동 승인 정책이 꺼져 있습니다.",
-  LIVE_APPROVAL_REQUIRED: "실거래 승인 창이 열려 있지 않습니다.",
+  LIVE_APPROVAL_REQUIRED: "실거래 승인 창이 닫혀 있어 신규 진입 전에 수동 승인이 필요합니다.",
   LIVE_CREDENTIALS_MISSING: "실거래 API Key 또는 Secret이 없습니다.",
   EXCHANGE_ACCOUNT_STATE_UNAVAILABLE: "거래소 계좌 상태를 확인할 수 없습니다.",
   EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE: "거래소 또는 네트워크 연결이 일시적으로 불안정합니다.",
@@ -388,7 +399,8 @@ const reasonCodeMap: Record<string, string> = {
   ACCOUNT_STATE_INCONSISTENT: "로컬 상태와 거래소 상태가 일치하지 않습니다.",
   AI_DISABLED: "AI 사용이 꺼져 있어 자동 판단을 건너뜁니다.",
   GROSS_EXPOSURE_LIMIT_REACHED: "총 노출 한도를 초과했습니다.",
-  LARGEST_POSITION_LIMIT_REACHED: "최대 단일 포지션 한도를 초과했습니다.",
+  LARGEST_POSITION_LIMIT_REACHED: "심볼 집중도 한도 유지",
+  DETERMINISTIC_BASELINE_DISAGREEMENT: "결정론적 기준선 불일치 상태 유지",
   DIRECTIONAL_BIAS_LIMIT_REACHED: "방향 편향 한도를 초과했습니다.",
   SAME_TIER_CONCENTRATION_LIMIT_REACHED: "동일 티어 집중도 한도를 초과했습니다.",
   protection_verification_failed: "보호 주문 검증에 실패했습니다.",
@@ -487,7 +499,7 @@ function humanizeKey(key: string) {
 }
 
 function translateString(value: string) {
-  return lookupRiskReasonCode(value) ?? reasonCodeMap[value] ?? valueMap[value] ?? value;
+  return reasonCodeMap[value] ?? lookupRiskReasonCode(value) ?? valueMap[value] ?? value;
 }
 
 function formatDateTime(value: string) {
@@ -510,6 +522,8 @@ function formatDateTime(value: string) {
 
 function formatBoolean(key: string | undefined, value: boolean) {
   if (key === "allowed") return value ? "허용" : "차단";
+  if (key === "suppression_active") return value ? "활성" : "비활성";
+  if (key === "allow_same_side_add_on") return value ? "허용" : "불가";
   if (key === "schema_valid") return value ? "정상" : "실패";
   if (key === "trading_paused") return value ? "중지됨" : "운영 중";
   if (key === "exchange_can_trade") return value ? "가능" : "차단";
@@ -528,6 +542,9 @@ function formatBoolean(key: string | undefined, value: boolean) {
   }
   return value ? "예" : "아니오";
 }
+
+export const exchangeCanTradeAccountHint =
+  "거래소 계좌 응답 기준으로 새 주문이 명시적으로 차단됐는지 보여줍니다. canTrade 필드가 없는 선물 응답은 차단으로 간주하지 않으며, 앱 실주문 준비 상태는 별도로 확인해야 합니다.";
 
 function formatNumber(key: string | undefined, value: number) {
   if (durationKeys.has(key ?? "")) {

@@ -2433,6 +2433,7 @@ def _map_exchange_status(status: str) -> str:
         "REJECTED": "rejected",
         "EXPIRED": "expired",
         "EXPIRED_IN_MATCH": "expired",
+        "FINISHED": "expired",
     }.get(status.upper(), status.lower())
 
 

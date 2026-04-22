@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from math import sqrt
 from uuid import uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
@@ -62,12 +63,12 @@ from trading_mvp.services.drawdown_state import (
     DRAWDOWN_STATE_CONTAINMENT,
     build_drawdown_state_snapshot,
 )
+from trading_mvp.services.event_context import EventContextProvider, resolve_event_context_provider
 from trading_mvp.services.execution import (
     apply_position_management,
     execute_live_trade,
     sync_live_state,
 )
-from trading_mvp.services.event_context import EventContextProvider, resolve_event_context_provider
 from trading_mvp.services.features import (
     compute_features,
     persist_feature_snapshot,
@@ -128,6 +129,10 @@ CADENCE_WATCH_MODE = "watch"
 CADENCE_ACTIVE_POSITION_MODE = "active_position"
 CADENCE_ARMED_ENTRY_PLAN_MODE = "armed_entry_plan"
 CADENCE_HIGH_PRIORITY_RECOVERY_MODE = "high_priority_recovery"
+FINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "cancelled", "rejected", "expired"})
+ACTIVE_POSITION_ENTRY_SUPPRESSION_REASON_CODES = frozenset(
+    {"LARGEST_POSITION_LIMIT_REACHED", "DETERMINISTIC_BASELINE_DISAGREEMENT"}
+)
 ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS = {
     "CHASE_LIMIT_EXCEEDED",
     "ENTRY_TRIGGER_NOT_MET",
@@ -4835,6 +4840,405 @@ class TradingOrchestrator:
             return "protected_widening_allowed"
         return "protected"
 
+    def _latest_risk_check_for_decision_run(
+        self,
+        *,
+        decision_run_id: int | None,
+    ) -> RiskCheck | None:
+        if decision_run_id is None:
+            return None
+        return self.session.scalar(
+            select(RiskCheck)
+            .where(RiskCheck.decision_run_id == decision_run_id)
+            .order_by(desc(RiskCheck.created_at))
+            .limit(1)
+        )
+
+    def _active_symbol_entry_orders(
+        self,
+        *,
+        symbol: str,
+    ) -> list[Order]:
+        return list(
+            self.session.scalars(
+                select(Order)
+                .where(
+                    Order.symbol == symbol.upper(),
+                    Order.mode == "live",
+                    Order.status.notin_(tuple(FINAL_ORDER_STATUSES)),
+                    Order.reduce_only.is_(False),
+                    Order.close_only.is_(False),
+                )
+                .order_by(desc(Order.created_at))
+            )
+        )
+
+    def _build_active_position_entry_fingerprint_basis(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        position_row: Position,
+        feature_payload: FeaturePayload,
+        position_management: dict[str, object],
+        strategy_engine_name: str,
+        holding_profile: str,
+        runtime_state: dict[str, object],
+        sync_freshness_summary: dict[str, object],
+        missing_protection_symbols: set[str],
+        allow_same_side_add_on: bool,
+        allowed_add_on_side: str | None,
+    ) -> dict[str, object]:
+        feature_snapshot_payload = feature_payload.model_dump(mode="json")
+        hard_stop_active = position_management.get("hard_stop_active")
+        if hard_stop_active in {None, ""}:
+            hard_stop_active = getattr(position_row, "stop_loss", None) not in {None, ""}
+        stop_widening_allowed = position_management.get("stop_widening_allowed")
+        if stop_widening_allowed in {None, ""}:
+            stop_widening_allowed = False
+        current_r_multiple = _safe_float(position_management.get("current_r_multiple"), default=None)
+        active_entry_orders = self._active_symbol_entry_orders(symbol=symbol)
+        requested_notional = 0.0
+        for row in active_entry_orders:
+            requested_notional += max(_safe_float(row.requested_quantity, default=0.0) or 0.0, 0.0) * max(
+                _safe_float(row.requested_price, default=0.0) or 0.0,
+                0.0,
+            )
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "strategy_engine": strategy_engine_name or "unspecified_engine",
+            "holding_profile": holding_profile or "scalp",
+            "position_side": str(getattr(position_row, "side", "") or "").lower() or None,
+            "position_quantity": round(_safe_float(getattr(position_row, "quantity", None), default=0.0) or 0.0, 8),
+            "position_state_bucket": self._position_state_bucket(position_row),
+            "regime_summary": self._regime_summary_from_feature_snapshot(
+                feature_snapshot_payload,
+                fallback_summary={},
+            ),
+            "data_quality_grade": self._data_quality_grade_for_review(
+                sync_freshness_summary,
+                fallback_grade="complete",
+            ),
+            "hard_stop_active": bool(hard_stop_active),
+            "stop_widening_allowed": bool(stop_widening_allowed),
+            "current_r_multiple": round(current_r_multiple, 6) if current_r_multiple is not None else None,
+            "protection_health_summary": self._protection_health_summary(
+                symbol=symbol,
+                position_row=position_row,
+                position_management=position_management,
+                runtime_state=runtime_state,
+                missing_protection_symbols=missing_protection_symbols,
+            ),
+            "allow_same_side_add_on": bool(allow_same_side_add_on),
+            "allowed_add_on_side": allowed_add_on_side if allowed_add_on_side in {"long", "short"} else None,
+            "active_entry_order_count": len(active_entry_orders),
+            "active_entry_order_sides": sorted(
+                {
+                    str(getattr(row, "side", "") or "").lower()
+                    for row in active_entry_orders
+                    if str(getattr(row, "side", "") or "").lower()
+                }
+            ),
+            "active_entry_order_statuses": sorted(
+                {
+                    str(getattr(row, "status", "") or "").lower()
+                    for row in active_entry_orders
+                    if str(getattr(row, "status", "") or "").lower()
+                }
+            ),
+            "active_entry_order_requested_notional": round(requested_notional, 6),
+        }
+
+    @staticmethod
+    def _active_position_entry_suppression_reason_code(
+        *,
+        latest_metadata: dict[str, object],
+        latest_risk_row: RiskCheck | None,
+        current_fingerprint_basis: dict[str, object],
+    ) -> str | None:
+        if latest_risk_row is None or bool(latest_risk_row.allowed):
+            return None
+        previous_fingerprint_basis = _as_dict(
+            latest_metadata.get("active_position_entry_fingerprint_basis")
+        )
+        if not previous_fingerprint_basis:
+            return None
+        if TradingOrchestrator._fingerprint_changed_fields(
+            current_fingerprint_basis,
+            previous_fingerprint_basis,
+        ):
+            return None
+        reason_codes = {
+            str(code)
+            for code in list(latest_risk_row.reason_codes or [])
+            if code in ACTIVE_POSITION_ENTRY_SUPPRESSION_REASON_CODES
+        }
+        if "LARGEST_POSITION_LIMIT_REACHED" in reason_codes:
+            return "LARGEST_POSITION_LIMIT_REACHED"
+        if "DETERMINISTIC_BASELINE_DISAGREEMENT" in reason_codes:
+            return "DETERMINISTIC_BASELINE_DISAGREEMENT"
+        return None
+
+    def _build_active_position_prompt_route_context(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        open_positions: list[Position],
+        feature_payload: FeaturePayload,
+        position_management_context: dict[str, object],
+        risk_context: dict[str, object],
+        selection_context: dict[str, object],
+        runtime_state: dict[str, object],
+        latest_decision_run: AgentRun | None,
+        latest_decision_metadata: dict[str, object],
+        latest_decision_output: dict[str, object],
+        review_trigger_payload: AIReviewTriggerPayload | None,
+        decision_reference: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        if not open_positions:
+            return {}, None
+        missing_protection_symbols = {
+            str(item).upper()
+            for item in runtime_state.get("missing_protection_symbols", [])
+            if item
+        }
+        recovery_active = (
+            str(runtime_state.get("operating_state") or "") in {
+                PROTECTION_REQUIRED_STATE,
+                "DEGRADED_MANAGE_ONLY",
+                "EMERGENCY_EXIT",
+            }
+            or symbol.upper() in missing_protection_symbols
+        )
+        position_row = open_positions[0]
+        strategy_engine_name = (
+            str(selection_context.get("strategy_engine") or "")
+            or _strategy_engine_name_from_payload(latest_decision_metadata, latest_decision_output)
+            or "trend_pullback_engine"
+        )
+        holding_profile = (
+            str(selection_context.get("holding_profile") or "")
+            or str(position_management_context.get("holding_profile") or "")
+            or str(latest_decision_metadata.get("holding_profile") or "")
+            or "scalp"
+        )
+        route_context: dict[str, object] = {
+            "management_only_open_position_route": True,
+            "allow_same_side_add_on": False,
+            "allowed_add_on_side": None,
+            "entry_proposal_suppression_active": False,
+            "entry_proposal_suppressed_reason_code": None,
+        }
+        if recovery_active:
+            return route_context, None
+        evaluation_risk_context = dict(risk_context)
+        if selection_context:
+            evaluation_risk_context["selection_context"] = dict(selection_context)
+        long_derivatives = TradingDecisionAgent._derivatives_side_context(feature_payload, side="long")
+        short_derivatives = TradingDecisionAgent._derivatives_side_context(feature_payload, side="short")
+        long_lead_lag = TradingDecisionAgent._lead_lag_side_context(feature_payload, side="long")
+        short_lead_lag = TradingDecisionAgent._lead_lag_side_context(feature_payload, side="short")
+        long_breakout_like = bool(
+            feature_payload.breakout.broke_swing_high
+            or feature_payload.breakout.range_breakout_direction == "up"
+        )
+        short_breakout_like = bool(
+            feature_payload.breakout.broke_swing_low
+            or feature_payload.breakout.range_breakout_direction == "down"
+        )
+        long_lead_lag_blocking = bool(
+            bool(long_lead_lag.get("available"))
+            and (
+                float(long_lead_lag.get("alignment_score", 0.5)) <= 0.32
+                or (
+                    long_breakout_like
+                    and bool(long_lead_lag.get("breakout_ahead"))
+                    and not bool(long_lead_lag.get("breakout_confirmed"))
+                )
+            )
+        )
+        short_lead_lag_blocking = bool(
+            bool(short_lead_lag.get("available"))
+            and (
+                float(short_lead_lag.get("alignment_score", 0.5)) <= 0.32
+                or (
+                    short_breakout_like
+                    and bool(short_lead_lag.get("breakout_ahead"))
+                    and not bool(short_lead_lag.get("breakout_confirmed"))
+                )
+            )
+        )
+        long_derivatives_blocking = bool(
+            bool(long_derivatives.get("entry_filter_blocking"))
+            or (
+                bool(long_derivatives.get("crowding_risk"))
+                and bool(long_derivatives.get("taker_headwind"))
+            )
+            or (
+                bool(long_derivatives.get("funding_headwind"))
+                and bool(long_derivatives.get("taker_headwind"))
+            )
+            or (
+                long_breakout_like
+                and bool(long_derivatives.get("breakout_filter_blocking"))
+            )
+            or float(long_derivatives.get("alignment_score", 0.5)) <= 0.28
+        )
+        short_derivatives_blocking = bool(
+            bool(short_derivatives.get("entry_filter_blocking"))
+            or (
+                bool(short_derivatives.get("crowding_risk"))
+                and bool(short_derivatives.get("taker_headwind"))
+            )
+            or (
+                bool(short_derivatives.get("funding_headwind"))
+                and bool(short_derivatives.get("taker_headwind"))
+            )
+            or (
+                short_breakout_like
+                and bool(short_derivatives.get("breakout_filter_blocking"))
+            )
+            or float(short_derivatives.get("alignment_score", 0.5)) <= 0.28
+        )
+        long_add_on_context = self.trading_agent._add_on_candidate_context(
+            decision_side="long",
+            open_position=position_row,
+            features=feature_payload,
+            risk_context=evaluation_risk_context,
+            position_management_context=position_management_context,
+            derivatives_blocking=long_derivatives_blocking,
+            lead_lag_blocking=long_lead_lag_blocking,
+        )
+        short_add_on_context = self.trading_agent._add_on_candidate_context(
+            decision_side="short",
+            open_position=position_row,
+            features=feature_payload,
+            risk_context=evaluation_risk_context,
+            position_management_context=position_management_context,
+            derivatives_blocking=short_derivatives_blocking,
+            lead_lag_blocking=short_lead_lag_blocking,
+        )
+        allowed_add_on_side: str | None = None
+        if bool(long_add_on_context.get("candidate")) and bool(long_add_on_context.get("allowed")):
+            allowed_add_on_side = "long"
+        elif bool(short_add_on_context.get("candidate")) and bool(short_add_on_context.get("allowed")):
+            allowed_add_on_side = "short"
+        route_context["allow_same_side_add_on"] = bool(allowed_add_on_side)
+        route_context["allowed_add_on_side"] = allowed_add_on_side
+        sync_freshness_summary = _as_dict(decision_reference.get("sync_freshness_summary"))
+        fingerprint_basis = self._build_active_position_entry_fingerprint_basis(
+            symbol=symbol,
+            timeframe=timeframe,
+            position_row=position_row,
+            feature_payload=feature_payload,
+            position_management=position_management_context,
+            strategy_engine_name=strategy_engine_name,
+            holding_profile=holding_profile,
+            runtime_state=runtime_state,
+            sync_freshness_summary=sync_freshness_summary,
+            missing_protection_symbols=missing_protection_symbols,
+            allow_same_side_add_on=bool(allowed_add_on_side),
+            allowed_add_on_side=allowed_add_on_side,
+        )
+        if review_trigger_payload is None:
+            suppression_reason_code = self._active_position_entry_suppression_reason_code(
+                latest_metadata=latest_decision_metadata,
+                latest_risk_row=self._latest_risk_check_for_decision_run(
+                    decision_run_id=latest_decision_run.id if latest_decision_run is not None else None,
+                ),
+                current_fingerprint_basis=fingerprint_basis,
+            )
+            if suppression_reason_code is not None:
+                route_context["allow_same_side_add_on"] = False
+                route_context["allowed_add_on_side"] = None
+                route_context["entry_proposal_suppression_active"] = True
+                route_context["entry_proposal_suppressed_reason_code"] = suppression_reason_code
+        return route_context, fingerprint_basis
+
+    @staticmethod
+    def _active_position_suppression_audit_payload(route_context: dict[str, object] | None) -> dict[str, object]:
+        context = _as_dict(route_context)
+        if not context:
+            return {}
+        allowed_add_on_side = str(context.get("allowed_add_on_side") or "").lower()
+        return {
+            "suppression_active": bool(context.get("entry_proposal_suppression_active")),
+            "suppression_reason_code": str(context.get("entry_proposal_suppressed_reason_code") or "") or None,
+            "allow_same_side_add_on": bool(context.get("allow_same_side_add_on")),
+            "allowed_add_on_side": (
+                allowed_add_on_side if allowed_add_on_side in {"long", "short"} else None
+            ),
+        }
+
+    def _interval_plan_active_position_suppression_payload(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        open_positions: list[Position],
+        latest_decision_run: AgentRun | None,
+        latest_decision_metadata: dict[str, object],
+        latest_decision_output: dict[str, object],
+        runtime_state: dict[str, object],
+        sync_freshness_summary: dict[str, object],
+        upto_index: int | None,
+        force_stale: bool,
+    ) -> dict[str, object]:
+        if not open_positions:
+            return {}
+        fallback_payload = self._active_position_suppression_audit_payload(
+            _as_dict(latest_decision_metadata.get("active_position_prompt_route_context"))
+        )
+        if fallback_payload:
+            return fallback_payload
+        latest_feature_snapshot = self._latest_feature_snapshot_payload(
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        if not latest_feature_snapshot:
+            return fallback_payload
+        try:
+            feature_payload = FeaturePayload.model_validate(latest_feature_snapshot)
+        except ValidationError:
+            return fallback_payload
+        selection_context = self._default_selection_context_for_symbol(
+            symbol=symbol,
+            timeframe=timeframe,
+            upto_index=upto_index,
+            force_stale=force_stale,
+        )
+        if not isinstance(selection_context, dict):
+            selection_context = {}
+        position_management_context = build_position_management_context(
+            open_positions[0],
+            feature_payload=feature_payload,
+            settings_row=self.settings_row,
+        )
+        route_context, _fingerprint_basis = self._build_active_position_prompt_route_context(
+            symbol=symbol,
+            timeframe=timeframe,
+            open_positions=open_positions,
+            feature_payload=feature_payload,
+            position_management_context=position_management_context,
+            risk_context=(
+                {"selection_context": dict(selection_context)}
+                if selection_context
+                else {}
+            ),
+            selection_context=dict(selection_context),
+            runtime_state=runtime_state,
+            latest_decision_run=latest_decision_run,
+            latest_decision_metadata=latest_decision_metadata,
+            latest_decision_output=latest_decision_output,
+            review_trigger_payload=None,
+            decision_reference={
+                "sync_freshness_summary": dict(sync_freshness_summary or {}),
+            },
+        )
+        return self._active_position_suppression_audit_payload(route_context)
+
     @staticmethod
     def _previous_open_position_fingerprint_basis(
         *,
@@ -5208,6 +5612,18 @@ class TradingOrchestrator:
                 if latest_decision_run is not None and isinstance(latest_decision_run.output_payload, dict)
                 else {}
             )
+            active_position_suppression_payload = self._interval_plan_active_position_suppression_payload(
+                symbol=symbol,
+                timeframe=effective_timeframe,
+                open_positions=open_positions,
+                latest_decision_run=latest_decision_run,
+                latest_decision_metadata=latest_metadata,
+                latest_decision_output=latest_output_payload,
+                runtime_state=runtime_state,
+                sync_freshness_summary=sync_freshness_summary,
+                upto_index=upto_index,
+                force_stale=force_stale,
+            )
             max_review_age_minutes = (
                 self._open_position_max_review_age_minutes(
                     review_interval_minutes,
@@ -5451,6 +5867,7 @@ class TradingOrchestrator:
                         else None
                     ),
                     "last_ai_skip_reason": last_ai_skip_reason,
+                    **active_position_suppression_payload,
                 }
             )
         return {
@@ -5773,6 +6190,36 @@ class TradingOrchestrator:
                     "open_position": bool(open_positions),
                 },
             )
+        active_position_prompt_route_context: dict[str, object] = {}
+        active_position_entry_fingerprint_basis: dict[str, object] | None = None
+        if open_positions:
+            active_position_prompt_route_context, active_position_entry_fingerprint_basis = (
+                self._build_active_position_prompt_route_context(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    open_positions=open_positions,
+                    feature_payload=feature_payload,
+                    position_management_context=position_management_context,
+                    risk_context=risk_context,
+                    selection_context=effective_selection_context,
+                    runtime_state=runtime_state,
+                    latest_decision_run=latest_decision_run,
+                    latest_decision_metadata=latest_decision_metadata,
+                    latest_decision_output=latest_decision_output,
+                    review_trigger_payload=review_trigger_payload,
+                    decision_reference=decision_reference,
+                )
+            )
+            if active_position_prompt_route_context:
+                merged_strategy_engine_context = {
+                    **_as_dict(effective_selection_context.get("strategy_engine_context")),
+                    **active_position_prompt_route_context,
+                }
+                effective_selection_context = {
+                    **effective_selection_context,
+                    "strategy_engine_context": merged_strategy_engine_context,
+                }
+                risk_context["selection_context"] = dict(effective_selection_context)
         schedule_details = self.resolve_interval_decision_schedule_details(
             symbol=symbol,
             timeframe=timeframe,
@@ -5911,6 +6358,8 @@ class TradingOrchestrator:
                 universe_breadth=effective_selection_context.get("universe_breadth") if effective_selection_context else None,
             ),
             "selection_context": effective_selection_context or None,
+            "active_position_prompt_route_context": active_position_prompt_route_context or None,
+            "active_position_entry_fingerprint_basis": active_position_entry_fingerprint_basis,
             "slot_allocation": (
                 dict(effective_selection_context.get("slot_allocation"))
                 if isinstance(effective_selection_context.get("slot_allocation"), dict)
@@ -6021,6 +6470,9 @@ class TradingOrchestrator:
             snapshot_id=market_row.id,
             decision_id=decision_run.id,
         )
+        active_position_suppression_payload = self._active_position_suppression_audit_payload(
+            active_position_prompt_route_context
+        )
         record_audit_event(
             self.session,
             event_type="agent_output",
@@ -6082,6 +6534,7 @@ class TradingOrchestrator:
                 "management_action": decision_metadata.get("management_action"),
                 "legacy_semantics_preserved": decision_metadata.get("legacy_semantics_preserved"),
                 "analytics_excluded_from_entry_stats": decision_metadata.get("analytics_excluded_from_entry_stats"),
+                **active_position_suppression_payload,
             },
             correlation_ids=decision_correlation_ids,
         )
@@ -6105,6 +6558,7 @@ class TradingOrchestrator:
                     "review_cadence_source": decision_metadata.get("review_cadence_source"),
                     "cadence_fallback_reason": decision_metadata.get("cadence_fallback_reason"),
                     "max_review_age_minutes": decision_metadata.get("max_review_age_minutes"),
+                    **active_position_suppression_payload,
                 },
                 correlation_ids=decision_correlation_ids,
             )
@@ -6133,6 +6587,7 @@ class TradingOrchestrator:
                     "max_review_age_minutes": decision_metadata.get("max_review_age_minutes"),
                     "intent_family": decision_metadata.get("intent_family"),
                     "management_action": decision_metadata.get("management_action"),
+                    **active_position_suppression_payload,
                 },
                 correlation_ids=decision_correlation_ids,
             )
@@ -6160,6 +6615,7 @@ class TradingOrchestrator:
                     "provider_not_called_due_to_quality": decision_metadata.get("provider_not_called_due_to_quality"),
                     "should_abstain": decision_metadata.get("should_abstain"),
                     "abstain_reason_codes": decision_metadata.get("abstain_reason_codes"),
+                    **active_position_suppression_payload,
                 },
                 correlation_ids=decision_correlation_ids,
             )
@@ -6399,6 +6855,26 @@ class TradingOrchestrator:
             provider_name=chief_provider_name,
             metadata_json=chief_metadata,
         )
+        record_audit_event(
+            self.session,
+            event_type="decision_cycle_completed",
+            entity_type="decision_run",
+            entity_id=str(decision_run.id),
+            severity="info",
+            message="Decision cycle completed.",
+            payload={
+                "symbol": symbol,
+                "trigger_event": trigger_event,
+                "decision": decision.decision,
+                "status": "entry_plan_armed" if armed_entry_plan is not None else "completed",
+                "risk_allowed": risk_result.allowed,
+                "risk_reason_codes": list(risk_result.reason_codes or []),
+                "ai_skipped_reason": ai_skipped_reason,
+                **active_position_suppression_payload,
+            },
+            correlation_ids=decision_correlation_ids,
+        )
+        self.session.flush()
         return {
             "symbol": symbol,
             "cycle_id": cycle_id,

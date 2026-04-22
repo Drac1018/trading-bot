@@ -76,23 +76,22 @@
 
 ## 2026-04 Hybrid AI Review Dispatch
 
+- Current runtime source of truth for trigger semantics is `backend/trading_mvp/services/orchestrator.py`, `backend/trading_mvp/services/scheduler.py`, and `docs/api.md`.
 - `interval_decision_cycle` now plans review triggers before any AI call.
 - The deterministic planner reuses candidate ranking, derivatives veto, meta gate, and slot allocation to decide whether a symbol has a real review event.
 - New-entry review is dispatched only for event-bearing candidate symbols.
-- Open-position review is dispatched only when one of the following is true:
-  - `open_position_recheck_due`
-  - `protection_review_event`
-  - `periodic_backstop_due`
+- Open-position review is no longer reopened by `open_position_recheck_due` or `periodic_backstop_due`.
+- `protection_review_event` remains a valid survival-path review reason.
 - If no event exists, the scheduler writes a `decision_ai_no_event` audit row and skips the AI call entirely.
 - If the same trigger fingerprint repeats, the scheduler writes `decision_ai_deduped` and skips the AI call.
-- If the periodic backstop becomes due, the scheduler writes `decision_ai_backstop_due` and allows a limited review even without a fresh entry candidate event.
+- Historical reference only: older rows may still contain `open_position_recheck_due`, `periodic_backstop_due`, and `decision_ai_backstop_due` from the legacy time-based review policy.
 
 ## 2026-04 Position Review Cadence
 
-- `holding_profile_cadence_hint.decision_interval_minutes` is now consumed by the scheduler for open-position AI review due checks.
+- `holding_profile_cadence_hint.decision_interval_minutes` remains useful as observability / compatibility metadata, but time passage alone no longer schedules AI review in current runtime policy.
 - Safe fallback behavior:
-  - if the cadence hint is missing, non-numeric, or invalid, the scheduler falls back to the effective symbol `ai_call_interval_minutes` (`AI 기본 검토 간격`)
-  - cadence is used only for AI position review timing
+  - older scheduler paths used the effective symbol `ai_call_interval_minutes` (`AI 기본 검토 간격`) as a fallback for position-review cadence checks
+  - current runtime keeps the cadence fields for observability and explanation
   - cadence does not delay `exchange_sync_cycle`
   - cadence does not delay `market_refresh_cycle`
   - cadence does not delay deterministic protection or emergency handling

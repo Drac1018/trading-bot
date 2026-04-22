@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from threading import Event, Thread
 from time import perf_counter, sleep
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+import trading_mvp.main as main_module
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import (
@@ -876,6 +878,44 @@ def test_settings_api_splits_heavy_payloads(testclient_db_factory) -> None:
     assert usage_response.json()["recent_ai_calls_24h"] == 1
 
 
+def test_settings_endpoint_allows_loopback_origin_without_port(testclient_db_factory) -> None:
+    testclient_db_factory("settings_loopback_cors.db")
+
+    with TestClient(app) as client:
+        response = client.options(
+            "/api/settings",
+            headers={
+                "Origin": "http://127.0.0.1",
+                "Access-Control-Request-Method": "PUT",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1"
+
+
+def test_settings_view_does_not_trigger_exchange_sync_read_refresh(testclient_db_factory, monkeypatch) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_view_no_read_refresh.db")
+
+    with TestingSessionLocal() as session:
+        update_settings(session, build_settings_payload())
+        session.commit()
+
+    refresh_triggers: list[str] = []
+
+    def record_trigger(*, triggered_by: str) -> bool:
+        refresh_triggers.append(triggered_by)
+        return True
+
+    monkeypatch.setattr("trading_mvp.main._refresh_exchange_sync_for_read", record_trigger)
+
+    with TestClient(app) as client:
+        response = client.get("/api/settings")
+
+    assert response.status_code == 200
+    assert refresh_triggers == []
+
+
 
 def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'settings_api.db'}", future=True)
@@ -970,6 +1010,73 @@ def test_health_endpoint_is_not_blocked_by_slow_background_ticks(tmp_path, monke
         assert elapsed < 3.2
     finally:
         app.dependency_overrides.clear()
+
+
+def test_sqlite_background_ticks_share_single_writer_gate(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'background_tick_guard.db'}", future=True)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    first_entered = Event()
+    second_entered = Event()
+    release_first = Event()
+    execution_order: list[str] = []
+    results: dict[str, int] = {}
+
+    def scheduler_tick() -> int:
+        execution_order.append("scheduler:start")
+        first_entered.set()
+        assert release_first.wait(1.0)
+        execution_order.append("scheduler:end")
+        return 15
+
+    def user_stream_tick() -> int:
+        execution_order.append("user_stream:start")
+        second_entered.set()
+        execution_order.append("user_stream:end")
+        return 5
+
+    def run_scheduler() -> None:
+        results["scheduler"] = main_module._run_background_tick_with_sqlite_guard(scheduler_tick, 1)
+
+    def run_user_stream() -> None:
+        results["user_stream"] = main_module._run_background_tick_with_sqlite_guard(user_stream_tick, 1)
+
+    scheduler_thread = Thread(
+        target=run_scheduler,
+        daemon=True,
+    )
+    user_stream_thread = Thread(
+        target=run_user_stream,
+        daemon=True,
+    )
+
+    scheduler_thread.start()
+    assert first_entered.wait(1.0)
+
+    user_stream_thread.start()
+    user_stream_thread.join(timeout=0.5)
+    assert not second_entered.is_set()
+    assert not user_stream_thread.is_alive()
+    assert results["user_stream"] == 1
+
+    release_first.set()
+    scheduler_thread.join(timeout=1.0)
+
+    assert not scheduler_thread.is_alive()
+    assert results["scheduler"] == 15
+    assert execution_order == [
+        "scheduler:start",
+        "scheduler:end",
+    ]
+
+    assert main_module._run_background_tick_with_sqlite_guard(user_stream_tick, 1) == 5
+    assert second_entered.is_set()
+    assert execution_order == [
+        "scheduler:start",
+        "scheduler:end",
+        "user_stream:start",
+        "user_stream:end",
+    ]
 
 
 def test_review_api_rejects_out_of_scope_windows(tmp_path, monkeypatch) -> None:
