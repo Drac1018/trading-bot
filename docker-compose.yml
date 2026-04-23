@@ -22,6 +22,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://trading:trading@postgres:5432/trading_mvp
       REDIS_URL: redis://redis:6379/0
+      TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER: "true"
+      TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM: "true"
       LIVE_TRADING_ENABLED: "false"
       TRACKED_SYMBOLS: BTCUSDT,ETHUSDT,SOLUSDT
       MANUAL_LIVE_APPROVAL: "false"
@@ -48,7 +50,11 @@ services:
       - backend
       - redis
 
+  # Backend owns operational cadence by default. Keep the legacy scheduler
+  # opt-in only to avoid duplicate periodic cycles in Docker.
   scheduler:
+    profiles:
+      - manual-scheduler
     build:
       context: .
       dockerfile: infra/worker.Dockerfile

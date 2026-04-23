@@ -22,6 +22,15 @@
 - [API](docs/api.md)
 - [Codex 초안 / 자동 resume](docs/codex-drafts-and-auto-resume.md)
 
+## 운영 DB 기준
+
+- Windows 서비스 / 운영 기본 DB는 PostgreSQL이다. `.env`에 `DATABASE_URL=postgresql+psycopg://...`가 없으면 서비스 설치 스크립트가 중단된다.
+- SQLite는 단일 프로세스 로컬 개발 / 테스트 전용으로만 사용한다.
+- `python -m trading_mvp.migrate`와 `alembic upgrade head`는 schema-only 경로다. 기존 SQLite 데이터를 PostgreSQL로 옮기지 않는다.
+- SQLite -> PostgreSQL 데이터 이관은 pause 상태에서 수행하는 별도 one-shot 작업으로 취급한다. rollback 기준점은 기존 SQLite DB 백업이다.
+- 기존 암호화된 설정값을 유지해 이관할 경우 `APP_SECRET_SEED`는 그대로 유지해야 한다.
+- `docker compose up` 기본 토폴로지에서는 backend가 operational cadence를 소유한다. legacy `scheduler` 서비스는 중복 주기 실행을 막기 위해 opt-in profile로만 둔다.
+
 ## 현재 리스크 기준
 
 - BTC 최대 `5x`

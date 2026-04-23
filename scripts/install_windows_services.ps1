@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$IncludeScheduler
+    [switch]$IncludeScheduler,
+    [switch]$AllowSqliteDatabase
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,6 +9,58 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $serviceRoot = Join-Path $repoRoot ".services"
 $winswRoot = Join-Path $repoRoot ".tools\\winsw"
+
+function Get-DotEnvValue {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -Path $Path) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) {
+            continue
+        }
+
+        $pair = $trimmed -split "=", 2
+        if ($pair.Count -ne 2) {
+            continue
+        }
+        if ($pair[0].Trim() -ne $Name) {
+            continue
+        }
+
+        return $pair[1].Trim()
+    }
+
+    return $null
+}
+
+function Test-ServiceDatabaseConfiguration {
+    $envPath = Join-Path $repoRoot ".env"
+    $databaseUrl = Get-DotEnvValue -Path $envPath -Name "DATABASE_URL"
+
+    if ([string]::IsNullOrWhiteSpace($databaseUrl)) {
+        throw "DATABASE_URL is not set in $envPath. Windows services would silently fall back to SQLite via trading_mvp.config. Set a PostgreSQL URL before installing services."
+    }
+
+    if ($databaseUrl -like "sqlite*") {
+        if (-not $AllowSqliteDatabase) {
+            throw "DATABASE_URL in $envPath points to SQLite. Windows service installs must use PostgreSQL for operational use. Re-run with -AllowSqliteDatabase only for explicit local/dev use."
+        }
+
+        Write-Warning "DATABASE_URL in $envPath points to SQLite. Continuing only because -AllowSqliteDatabase was supplied."
+        return
+    }
+
+    if ($databaseUrl -notlike "postgresql*") {
+        Write-Warning "DATABASE_URL in $envPath does not look like a PostgreSQL URL: $databaseUrl"
+    }
+}
 
 function Get-WinSWExecutable {
     New-Item -ItemType Directory -Force -Path $winswRoot | Out-Null
@@ -169,6 +222,7 @@ if ($IncludeScheduler) {
     Remove-ServiceIfPresent -Definition $schedulerDefinition
 }
 
+Test-ServiceDatabaseConfiguration
 $wrapper = Get-WinSWExecutable
 
 foreach ($definition in $definitions) {
@@ -183,5 +237,5 @@ foreach ($definition in $definitions) {
 if ($IncludeScheduler) {
     Write-Host "Windows services installed and started, including TradingMvpScheduler."
 } else {
-    Write-Host "Windows services installed and started. TradingMvpScheduler is omitted by default."
+    Write-Host "Windows services installed and started. TradingMvpScheduler is omitted by default because backend owns operational cadence in the current service topology."
 }
