@@ -74,9 +74,12 @@ export type OperatorDetailSymbolLike = {
     approved_risk_pct: number | null;
     approved_leverage: number | null;
     blocked_reason_codes: string[];
+    degraded_reason_codes?: string[];
+    protection_reason_codes?: string[];
     blocked_reason?: string | null;
     degraded_reason?: string | null;
     approval_required_reason?: string | null;
+    survival_path?: string | null;
     policy_source?: string | null;
   };
   execution: {
@@ -224,6 +227,11 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
       : symbol.blocked_reasons,
   );
   const degradedFlags = unique(symbol.stale_flags);
+  const degradedReasons = unique([
+    ...(symbol.risk_guard.degraded_reason_codes ?? []),
+    ...(symbol.risk_guard.degraded_reason ? [symbol.risk_guard.degraded_reason] : []),
+  ]);
+  const protectionReasons = unique(symbol.risk_guard.protection_reason_codes ?? []);
 
   const rawEventSourceStatus = asString(eventContext.source_status) ?? "unknown";
   const normalizedEventSourceStatus = normalizeSourceStatus(rawEventSourceStatus);
@@ -276,6 +284,8 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
       tone: code === riskApprovalRequiredReason ? "warn" as const : "danger" as const,
       text: describeEventReasonCode(code),
     })),
+    ...degradedReasons.map((code) => ({ tone: "warn" as const, text: describeEventReasonCode(code) })),
+    ...protectionReasons.map((code) => ({ tone: "warn" as const, text: describeEventReasonCode(code) })),
     ...degradedFlags.map((flag) => ({ tone: "warn" as const, text: translateFlag(flag) })),
   ];
 
@@ -543,7 +553,11 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
     {
       key: "blocked_degraded_reason",
       title: "차단 / 저하 상태",
-      tone: blockedReasons.length > 0 ? "danger" : degradedFlags.length > 0 ? "warn" : "neutral",
+      tone: blockedReasons.length > 0
+        ? "danger"
+        : degradedReasons.length > 0 || protectionReasons.length > 0 || degradedFlags.length > 0
+          ? "warn"
+          : "neutral",
       items: [
         {
           label: "현재 차단 이유",
@@ -552,8 +566,21 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
         },
         {
           label: "주의가 필요한 상태",
-          value: degradedFlags.length > 0 ? degradedFlags.map((flag) => translateFlag(flag)).join(" / ") : "없음",
-          hint: "데이터 지연이나 불완전 상태를 함께 보여줍니다.",
+          value:
+            degradedReasons.length > 0
+              ? degradedReasons.map((code) => describeEventReasonCode(code)).join(" / ")
+              : degradedFlags.length > 0
+                ? degradedFlags.map((flag) => translateFlag(flag)).join(" / ")
+                : "없음",
+          hint: "운영 상태 저하, 데이터 지연, 불완전 상태를 함께 보여줍니다.",
+        },
+        {
+          label: "보호/미해결 주문 사유",
+          value:
+            protectionReasons.length > 0
+              ? protectionReasons.map((code) => describeEventReasonCode(code)).join(" / ")
+              : "없음",
+          hint: "보호 복구와 미해결 제출 가드처럼 신규 진입과 별도인 안전 경로입니다.",
         },
       ],
       alerts: blockedAndDegradedAlerts,

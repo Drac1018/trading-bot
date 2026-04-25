@@ -7,7 +7,12 @@ from trading_mvp.schemas import (
     ConnectionTestResponse,
     OpenAIConnectionTestRequest,
 )
-from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.binance import BinanceClient, classify_binance_rest_exception
+from trading_mvp.services.runtime_state import (
+    get_binance_rest_detail,
+    record_binance_rest_issue,
+    record_binance_rest_success,
+)
 from trading_mvp.services.settings import get_runtime_credentials
 
 
@@ -56,7 +61,13 @@ def check_binance_connection(
         futures_enabled=True,
     )
     try:
-        details = client.test_connection(symbol=request.symbol, timeframe=request.timeframe)
+        with client:
+            details = client.test_connection(symbol=request.symbol, timeframe=request.timeframe)
+        details["binance_rest_summary"] = record_binance_rest_success(
+            settings_row,
+            source="connection_test",
+            detail={"base_url": client.base_url},
+        )
         return ConnectionTestResponse(
             ok=True,
             provider="binance",
@@ -64,11 +75,32 @@ def check_binance_connection(
             details=details,
         )
     except Exception as exc:
+        classification = classify_binance_rest_exception(exc)
+        rest_summary = record_binance_rest_issue(
+            settings_row,
+            reason_code=str(classification["reason_code"]),
+            source="connection_test",
+            error=str(exc),
+            failure_type=str(classification.get("failure_type") or "request_error"),
+            http_status=classification.get("http_status"),  # type: ignore[arg-type]
+            api_code=classification.get("api_code"),  # type: ignore[arg-type]
+            mutating_request=bool(classification.get("mutating_request", False)),
+            transport_error=bool(classification.get("transport_error", False)),
+            server_error=bool(classification.get("server_error", False)),
+            rate_limited=bool(classification.get("rate_limited", False)),
+            detail={"base_url": client.base_url},
+        )
         return ConnectionTestResponse(
             ok=False,
             provider="binance",
             message="Binance 연결 확인에 실패했습니다.",
-            details={"error": str(exc), "base_url": client.base_url},
+            details={
+                "error": str(exc),
+                "base_url": client.base_url,
+                "binance_rest_summary": get_binance_rest_detail(settings_row),
+                "binance_rest_failure": classification,
+                "binance_rest_recorded": rest_summary,
+            },
         )
 
 

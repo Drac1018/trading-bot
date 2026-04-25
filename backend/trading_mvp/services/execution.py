@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timedelta
 from hashlib import sha1
@@ -90,6 +91,8 @@ from trading_mvp.services.runtime_state import (
     mark_execution_lock,
     mark_sync_issue,
     mark_sync_success,
+    record_binance_rest_issue,
+    record_binance_rest_success,
     replace_user_stream_detail,
     set_reconciliation_detail,
     set_unresolved_submission_guard,
@@ -111,6 +114,7 @@ FINAL_ORDER_STATUSES = {"filled", "canceled", "rejected", "expired"}
 AUTO_RESUME_DELAY_MINUTES = 5
 PROTECTIVE_ORDER_TYPES = ("STOP_MARKET", "TAKE_PROFIT_MARKET")
 PROTECTION_RETRY_ATTEMPTS = 2
+PROTECTION_VERIFY_DEADLINE_SECONDS = 30
 PROTECTION_VERIFY_FETCH_ATTEMPTS = 2
 PROTECTION_VERIFY_FAILED_REASON_CODE = "PROTECTION_VERIFY_FAILED"
 PROTECTION_VERIFY_BLOCKING_INTENT_TYPES = {"entry", "scale_in"}
@@ -218,6 +222,15 @@ def _resolve_sync_symbols(settings_row: Setting, symbol: str | None) -> list[str
         effective.symbol
         for effective in get_effective_symbol_schedule(settings_row)
         if effective.enabled
+    ]
+
+
+def _symbol_payloads(payloads: list[dict[str, object]], symbol: str) -> list[dict[str, object]]:
+    symbol_upper = symbol.upper()
+    return [
+        dict(item)
+        for item in payloads
+        if str(item.get("symbol") or "").upper() == symbol_upper
     ]
 
 
@@ -585,6 +598,41 @@ def _apply_exchange_order_state(
     row.close_only = _to_bool(exchange_order.get("closePosition"), default=close_only_fallback)
 
 
+def _optional_int(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_binance_request_error_hook(settings_row: Setting) -> Callable[[dict[str, object]], None]:
+    def _hook(event: dict[str, object]) -> None:
+        record_binance_rest_issue(
+            settings_row,
+            reason_code=str(event.get("reason_code") or "BINANCE_REST_REQUEST_FAILED"),
+            source=f"binance_client:{event.get('endpoint_category') or 'unknown'}",
+            error=str(event.get("exception") or event.get("failure_type") or "Binance request failed"),
+            failure_type=str(event.get("failure_type") or event.get("error_type") or "request_error"),
+            http_status=_optional_int(event.get("http_status") or event.get("status_code")),
+            api_code=_optional_int(event.get("api_code")),
+            mutating_request=bool(event.get("mutating_request", False)),
+            transport_error=bool(event.get("transport_error", False)),
+            server_error=bool(event.get("server_error", False)),
+            rate_limited=bool(event.get("rate_limited", False)),
+            detail={
+                "method": event.get("method"),
+                "path": event.get("path"),
+                "endpoint_category": event.get("endpoint_category"),
+                "attempt": event.get("attempt"),
+                "attempts": event.get("attempts"),
+            },
+        )
+
+    return _hook
+
+
 def _build_client(settings_row: Setting) -> BinanceClient:
     credentials = get_runtime_credentials(settings_row)
     defaults = get_settings()
@@ -594,6 +642,7 @@ def _build_client(settings_row: Setting) -> BinanceClient:
         testnet_enabled=settings_row.binance_testnet_enabled,
         futures_enabled=settings_row.binance_futures_enabled,
         recv_window_ms=defaults.exchange_recv_window_ms,
+        request_error_hook=_build_binance_request_error_hook(settings_row),
     )
 
 
@@ -1435,6 +1484,29 @@ def _build_protection_state(
     }
 
 
+def _build_unverified_protection_state(
+    position: Position | None,
+    *,
+    reason_code: str,
+    detail: str,
+    deadline_at: datetime | None = None,
+) -> dict[str, object]:
+    return {
+        "status": "unverified",
+        "protected": False,
+        "has_stop_loss": False,
+        "has_take_profit": False,
+        "protective_order_count": 0,
+        "protective_order_ids": [],
+        "missing_components": ["protective_orders"] if position is not None and position.quantity > 0 else [],
+        "verification_status": "unverified",
+        "blocked_reason_code": reason_code,
+        "blocked_reason": detail,
+        "verification_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
+        "exchange_position_side": _position_metadata_side(position),
+    }
+
+
 def _get_string_list(payload: dict[str, object], key: str) -> list[str]:
     value = payload.get(key)
     if not isinstance(value, list):
@@ -1605,9 +1677,15 @@ def _set_symbol_protection_verify_block(
 ) -> None:
     normalized_symbol = symbol.upper()
     blocks = _get_protection_verify_blocks(settings_row)
+    reason_code = str(protection_state.get("blocked_reason_code") or PROTECTION_VERIFY_FAILED_REASON_CODE)
     blocks[normalized_symbol] = {
         "status": "verify_failed",
         "blocked": True,
+        "reason_code": reason_code,
+        "blocked_reason_code": reason_code,
+        "blocked_reason": detail,
+        "verification_status": str(protection_state.get("verification_status") or "verify_failed"),
+        "verification_deadline_at": protection_state.get("verification_deadline_at"),
         "trigger_source": trigger_source,
         "blocked_at": utcnow_naive().isoformat(),
         "last_error": detail,
@@ -1890,6 +1968,11 @@ def _record_sync_success(
     status: str = "synced",
 ) -> None:
     mark_sync_success(settings_row, scope=scope, detail=detail, status=status)
+    record_binance_rest_success(
+        settings_row,
+        source=f"sync:{scope}",
+        detail={"scope": scope},
+    )
     session.add(settings_row)
     session.flush()
 
@@ -2972,6 +3055,8 @@ def _submit_exchange_order(
     time_in_force: str | None = None,
     client_order_id: str | None = None,
 ) -> dict[str, object]:
+    if not client_order_id:
+        raise RuntimeError("Live order submissions require client_order_id for reconciliation.")
     if price is None and time_in_force is None:
         return client.new_order(
             symbol=symbol,
@@ -3116,112 +3201,12 @@ def _safe_submit_order(
         )
         return client_order_id, reconciled_response, submit_request, submission_tracking
 
-    submit_attempt_count += 1
-    try:
-        retry_response = _submit_exchange_order(
-            client,
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            quantity=quantity,
-            price=price,
-            stop_price=stop_price,
-            reduce_only=reduce_only,
-            close_position=close_position,
-            response_type=response_type,
-            time_in_force=time_in_force,
-            client_order_id=client_order_id,
-        )
-        submission_tracking = _build_submission_tracking(
-            submission_state="reconciled",
-            client_order_id=client_order_id,
-            submit_attempt_count=submit_attempt_count,
-            last_submit_error=last_submit_error,
-            safe_retry_used=True,
-            recovered_via="safe_retry_ack",
-        )
-        return client_order_id, retry_response, submit_request, submission_tracking
-    except BinanceAPIError as exc:
-        if _is_duplicate_client_order_id_error(exc):
-            try:
-                reconciled_response = _reconcile_unknown_submission(
-                    client,
-                    symbol=symbol,
-                    order_type=order_type,
-                    client_order_id=client_order_id,
-                )
-            except Exception as lookup_exc:
-                raise OrderSubmissionUnknownError(
-                    client_order_id=client_order_id,
-                    submit_request=submit_request,
-                    submit_attempt_count=submit_attempt_count,
-                    last_submit_error=last_submit_error or _stringify_submit_error(lookup_exc),
-                    safe_retry_used=True,
-                ) from lookup_exc
-            if reconciled_response is not None:
-                submission_tracking = _build_submission_tracking(
-                    submission_state="reconciled",
-                    client_order_id=client_order_id,
-                    submit_attempt_count=submit_attempt_count,
-                    last_submit_error=last_submit_error,
-                    safe_retry_used=True,
-                    recovered_via="duplicate_client_order_id_lookup",
-                )
-                return client_order_id, reconciled_response, submit_request, submission_tracking
-            raise OrderSubmissionUnknownError(
-                client_order_id=client_order_id,
-                submit_request=submit_request,
-                submit_attempt_count=submit_attempt_count,
-                last_submit_error=last_submit_error or _stringify_submit_error(exc),
-                safe_retry_used=True,
-            ) from exc
-        submission_tracking = _build_submission_tracking(
-            submission_state="failed",
-            client_order_id=client_order_id,
-            submit_attempt_count=submit_attempt_count,
-            last_submit_error=last_submit_error or _stringify_submit_error(exc),
-            safe_retry_used=True,
-        )
-        raise _annotate_submission_exception(
-            exc,
-            client_order_id=client_order_id,
-            submit_request=submit_request,
-            submission_tracking=submission_tracking,
-        ) from exc
-    except (httpx.TimeoutException, httpx.TransportError) as exc:
-        last_submit_error = _stringify_submit_error(exc)
-        try:
-            reconciled_response = _reconcile_unknown_submission(
-                client,
-                symbol=symbol,
-                order_type=order_type,
-                client_order_id=client_order_id,
-            )
-        except Exception as lookup_exc:
-            raise OrderSubmissionUnknownError(
-                client_order_id=client_order_id,
-                submit_request=submit_request,
-                submit_attempt_count=submit_attempt_count,
-                last_submit_error=last_submit_error or _stringify_submit_error(lookup_exc),
-                safe_retry_used=True,
-            ) from lookup_exc
-        if reconciled_response is not None:
-            submission_tracking = _build_submission_tracking(
-                submission_state="reconciled",
-                client_order_id=client_order_id,
-                submit_attempt_count=submit_attempt_count,
-                last_submit_error=last_submit_error,
-                safe_retry_used=True,
-                recovered_via="post_retry_lookup",
-            )
-            return client_order_id, reconciled_response, submit_request, submission_tracking
-        raise OrderSubmissionUnknownError(
-            client_order_id=client_order_id,
-            submit_request=submit_request,
-            submit_attempt_count=submit_attempt_count,
-            last_submit_error=last_submit_error,
-            safe_retry_used=True,
-        ) from exc
+    raise OrderSubmissionUnknownError(
+        client_order_id=client_order_id,
+        submit_request=submit_request,
+        submit_attempt_count=submit_attempt_count,
+        last_submit_error=last_submit_error,
+    )
 
 
 def _record_submission_recovery_event(
@@ -3526,11 +3511,12 @@ def sync_live_positions(
     symbol: str,
     client: BinanceClient | None = None,
     open_orders: list[dict[str, object]] | None = None,
+    remote_positions: list[dict[str, object]] | None = None,
     position_mode: str = POSITION_MODE_ONE_WAY,
 ) -> dict[str, object]:
     client = client or _build_client(settings_row)
     open_orders = open_orders if open_orders is not None else client.get_open_orders(symbol)
-    remote_positions = client.get_position_information(symbol)
+    remote_positions = remote_positions if remote_positions is not None else client.get_position_information(symbol)
     mapping = _resolve_remote_position_mapping(remote_positions)
     local = get_open_position(session, symbol)
     order_position_sides = _symbol_order_position_sides(open_orders)
@@ -4545,7 +4531,113 @@ def _ensure_protected_position(
         risk_id=risk_row.id if risk_row is not None else None,
         execution_id=parent_order.id if parent_order is not None else None,
     )
-    open_orders = client.get_open_orders(symbol)
+    verification_deadline_at = utcnow_naive() + timedelta(seconds=PROTECTION_VERIFY_DEADLINE_SECONDS)
+    try:
+        open_orders = client.get_open_orders(symbol)
+    except Exception as exc:
+        exchange_reason_code = _classify_exchange_state_error(exc, "PROTECTION_STATE_UNVERIFIED")
+        detail = f"Protective order verification unavailable: {exc}"
+        protection_state = _build_unverified_protection_state(
+            position,
+            reason_code="PROTECTION_STATE_UNVERIFIED",
+            detail=detail,
+            deadline_at=verification_deadline_at,
+        )
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="protective_orders",
+            status="failed",
+            reason_code="PROTECTION_STATE_UNVERIFIED",
+            detail={
+                "symbol": symbol,
+                "exchange_reason_code": exchange_reason_code,
+                "error": str(exc),
+                "verification_deadline_at": verification_deadline_at.isoformat(),
+            },
+        )
+        set_symbol_protection_state(
+            session,
+            settings_row,
+            symbol=symbol,
+            state=PROTECTION_REQUIRED_STATE,
+            trigger_source=f"{trigger_source}:verification_unavailable",
+            missing_components=_get_string_list(protection_state, "missing_components"),
+            auto_recovery_active=True,
+            recovery_status="verification_unavailable",
+            last_error=detail,
+        )
+        _transition_protection_lifecycle(
+            session,
+            lifecycle=protection_lifecycle,
+            parent_order=parent_order,
+            state="verify_failed",
+            transition_reason="protective_verification_unavailable",
+            detail={
+                "error": detail,
+                "reason_code": "PROTECTION_STATE_UNVERIFIED",
+                "exchange_reason_code": exchange_reason_code,
+                "verification_deadline_at": verification_deadline_at.isoformat(),
+                "protection_state": protection_state,
+            },
+            verification_detail={
+                "error": detail,
+                "reason_code": "PROTECTION_STATE_UNVERIFIED",
+                "exchange_reason_code": exchange_reason_code,
+                "verification_deadline_at": verification_deadline_at.isoformat(),
+                "protection_state": protection_state,
+            },
+            correlation_ids=protection_correlation_ids,
+        )
+        _set_symbol_protection_verify_block(
+            session,
+            settings_row,
+            symbol=symbol,
+            trigger_source=trigger_source,
+            detail=detail,
+            protection_state=protection_state,
+            created_order_ids=[],
+            protection_lifecycle=protection_lifecycle,
+        )
+        emergency_result = _emergency_close_position(
+            session,
+            settings_row,
+            client,
+            symbol=symbol,
+            position=position,
+            reason=f"{trigger_source}:PROTECTION_STATE_UNVERIFIED",
+            protection_state=protection_state,
+            correlation_ids=protection_correlation_ids,
+        )
+        _pause_for_protection_failure(
+            session,
+            settings_row,
+            reason_code="PROTECTION_STATE_UNVERIFIED",
+            symbol=symbol,
+            position=position,
+            protective_state=protection_state,
+            detail=detail,
+            emergency_result=emergency_result,
+            correlation_ids=protection_correlation_ids,
+        )
+        if emergency_result.get("status") != "completed":
+            mark_manage_only_state(
+                session,
+                settings_row,
+                symbol=symbol,
+                trigger_source=f"{trigger_source}:verification_unavailable_emergency_failed",
+                missing_components=_get_string_list(protection_state, "missing_components"),
+                last_error=detail,
+                emergency_action=emergency_result,
+            )
+        return {
+            "status": "emergency_exit",
+            "protection_state": protection_state,
+            "created_order_ids": [],
+            "emergency_action": emergency_result,
+            "error": detail,
+            "protection_lifecycle": _protection_lifecycle_payload(protection_lifecycle),
+        }
     protection_state = _build_protection_state(position, open_orders)
     if protection_state["status"] == "protected":
         _clear_symbol_protection_verify_block(
@@ -4926,6 +5018,17 @@ def sync_live_state(
     unprotected_positions: list[str] = []
     emergency_actions_taken: list[dict[str, object]] = []
     guarded_symbols = list(symbols) if mode_guard_reason_code is not None else []
+    bulk_open_orders: list[dict[str, object]] | None = None
+    bulk_remote_positions: list[dict[str, object]] | None = None
+    if len(symbols) > 1:
+        try:
+            bulk_open_orders = client.get_open_orders()
+        except Exception:
+            bulk_open_orders = None
+        try:
+            bulk_remote_positions = client.get_position_information()
+        except Exception:
+            bulk_remote_positions = None
     for item_symbol in symbols:
         live_orders = [
             order
@@ -5030,7 +5133,11 @@ def sync_live_state(
         else:
             synced_orders += _count_symbol_order_stream_events(stream_events, symbol=item_symbol)
         try:
-            open_orders = client.get_open_orders(item_symbol)
+            open_orders = (
+                _symbol_payloads(bulk_open_orders, item_symbol)
+                if bulk_open_orders is not None
+                else client.get_open_orders(item_symbol)
+            )
             _record_sync_success(
                 session,
                 settings_row,
@@ -5070,6 +5177,11 @@ def sync_live_state(
                 symbol=item_symbol,
                 client=client,
                 open_orders=open_orders,
+                remote_positions=(
+                    _symbol_payloads(bulk_remote_positions, item_symbol)
+                    if bulk_remote_positions is not None
+                    else None
+                ),
                 position_mode=position_mode,
             )
         except Exception as exc:

@@ -2481,6 +2481,43 @@ def test_run_exchange_sync_cycle_marks_scopes_skipped_when_credentials_missing(d
     assert settings_row.pause_reason_detail["exchange_sync"]["account"]["last_skip_reason"] == "LIVE_CREDENTIALS_MISSING"
 
 
+def test_rank_candidate_symbols_fallback_truncates_long_errors(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+    orchestrator = TradingOrchestrator(db_session)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_sync_drawdown_state",
+        lambda now=None: {
+            "current_drawdown_state": "normal",
+            "entered_at": None,
+            "transition_reason": "stable_normal",
+            "policy_adjustments": {},
+        },
+    )
+    monkeypatch.setattr(orchestrator, "_build_lead_market_features", lambda **kwargs: {})
+
+    def fail_candidate(**kwargs):
+        raise RuntimeError("candidate failure " + ("x" * 1200))
+
+    monkeypatch.setattr(orchestrator, "_build_selection_candidate", fail_candidate)
+
+    result = orchestrator._rank_candidate_symbols(
+        decision_symbols=["BTCUSDT"],
+        timeframe="15m",
+        upto_index=None,
+        force_stale=False,
+    )
+
+    candidate = result["rankings"][0]["candidate"]
+    assert candidate["rationale_codes"] == ["CANDIDATE_SELECTION_FALLBACK"]
+    assert len(candidate["explanation_detailed"]) <= 600
+
+
 def test_scheduler_exchange_sync_cycle_records_workflow(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")

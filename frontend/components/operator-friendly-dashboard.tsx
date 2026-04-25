@@ -168,7 +168,17 @@ function nestedNumber(source: Record<string, unknown>, path: string[]) {
 
 function controlBlockers(control: OperatorDashboardPayload["control"]) {
   const currentCycle = control.control_status_summary?.blocked_reasons_current_cycle ?? [];
-  return unique([...currentCycle, ...control.latest_blocked_reasons, ...control.auto_resume_last_blockers]);
+  const explicitBlockers = control.control_status_summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? [];
+  const degraded = control.control_status_summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? [];
+  const protection = control.control_status_summary?.protection_reason_codes ?? control.protection_reason_codes ?? [];
+  return unique([
+    ...explicitBlockers,
+    ...currentCycle,
+    ...degraded,
+    ...protection,
+    ...control.latest_blocked_reasons,
+    ...control.auto_resume_last_blockers,
+  ]);
 }
 
 function importantBlockers(control: OperatorDashboardPayload["control"]) {
@@ -265,6 +275,19 @@ function syncSummary(control: OperatorDashboardPayload["control"]) {
     return { label: "갱신 중", tone: "warn" as const };
   }
   return { label: "정상", tone: "safe" as const };
+}
+
+function entryPermissionStatus(control: OperatorDashboardPayload["control"]) {
+  if (control.trading_paused) {
+    return { label: "보류", tone: "neutral" as const };
+  }
+  if (needsSyncCatchUp(control)) {
+    return { label: "갱신 중", tone: "warn" as const };
+  }
+  if (importantBlockers(control).length > 0) {
+    return { label: "차단", tone: "danger" as const };
+  }
+  return { label: "허용", tone: "safe" as const };
 }
 
 function syncActionTitle(status: string) {
@@ -699,6 +722,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   const state = mainState(operator);
   const protection = protectionLabel(operator.control);
   const sync = syncSummary(operator.control);
+  const entryPermission = entryPermissionStatus(operator.control);
   const actions = useMemo(() => buildActionItems(operator), [operator]);
   const remainingActions = actions.filter((item) => !checkedIds.includes(item.id));
   const audits = recentAuditEvents(operator);
@@ -789,8 +813,8 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                   },
                   {
                     label: "신규 진입",
-                    value: operator.control.can_enter_new_position ? "허용" : "차단",
-                    tone: operator.control.can_enter_new_position ? "safe" as const : state.tone,
+                    value: entryPermission.label,
+                    tone: entryPermission.tone,
                   },
                   { label: "보호주문 상태", value: protection.label, tone: protection.tone },
                   { label: "계좌/주문 동기화", value: sync.label, tone: sync.tone },
@@ -866,7 +890,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                   ))}
                 </div>
                 <div className="mt-5 space-y-2">
-                  <ProgressBar value={operator.control.can_enter_new_position ? 72 : 46} />
+                  <ProgressBar value={entryPermission.tone === "safe" ? 72 : entryPermission.tone === "warn" ? 58 : 46} />
                   <p className="text-sm leading-6 text-slate-600">
                     보호주문, 동기화, 승인 상태를 통과해야 새 포지션을 열 수 있습니다.
                   </p>

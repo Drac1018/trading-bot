@@ -67,6 +67,7 @@ from trading_mvp.services.performance_reporting import build_signal_performance_
 from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.scheduler import (
     maybe_refresh_exchange_sync_freshness,
+    run_due_exchange_sync_cycle,
     run_due_operational_cycles,
     run_due_windows,
     run_window,
@@ -149,6 +150,16 @@ async def _background_scheduler_loop() -> None:
         await asyncio.sleep(interval_seconds)
 
 
+async def _background_exchange_sync_loop() -> None:
+    while True:
+        interval_seconds = await asyncio.to_thread(
+            _run_background_tick_with_sqlite_guard,
+            _run_background_exchange_sync_tick,
+            1,
+        )
+        await asyncio.sleep(interval_seconds)
+
+
 async def _background_user_stream_loop() -> None:
     while True:
         sleep_seconds = await asyncio.to_thread(
@@ -210,15 +221,20 @@ def _record_background_loop_failure(
 
 def _run_background_scheduler_tick() -> int:
     polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    interval_seconds = 15
     with polling_session_factory() as session:
-        interval_seconds = 15
         try:
             settings_row = get_or_create_settings(session)
             interval_seconds = max(15, min(int(settings_row.exchange_sync_interval_seconds), 15))
             if _manual_pause_active(settings_row):
                 session.rollback()
                 return interval_seconds
-            run_due_operational_cycles(session)
+            run_due_operational_cycles(
+                session,
+                include_exchange_sync=False,
+                commit_between=True,
+                continue_on_error=True,
+            )
             run_due_windows(session)
             session.commit()
         except Exception as exc:
@@ -231,6 +247,33 @@ def _run_background_scheduler_tick() -> int:
                 severity="error",
                 component="scheduler",
                 message="Background scheduler loop failed.",
+                payload={"error": str(exc)},
+            )
+        return interval_seconds
+
+
+def _run_background_exchange_sync_tick() -> int:
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    with polling_session_factory() as session:
+        interval_seconds = 15
+        try:
+            settings_row = get_or_create_settings(session)
+            interval_seconds = max(15, min(int(settings_row.exchange_sync_interval_seconds), 15))
+            if _manual_pause_active(settings_row):
+                session.rollback()
+                return interval_seconds
+            run_due_exchange_sync_cycle(session)
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            _record_background_loop_failure(
+                polling_session_factory,
+                event_type="background_exchange_sync_failed",
+                entity_type="scheduler",
+                entity_id="exchange_sync",
+                severity="error",
+                component="exchange_sync",
+                message="Background exchange sync loop failed.",
                 payload={"error": str(exc)},
             )
         return interval_seconds
@@ -280,6 +323,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
     tasks: list[asyncio.Task[None]] = []
     if _background_scheduler_enabled():
+        tasks.append(asyncio.create_task(_background_exchange_sync_loop()))
         tasks.append(asyncio.create_task(_background_scheduler_loop()))
     if _background_user_stream_enabled():
         tasks.append(asyncio.create_task(_background_user_stream_loop()))

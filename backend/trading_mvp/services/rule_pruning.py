@@ -276,15 +276,6 @@ def _classify_metrics(
     if protective_rule and hold_rate >= 0.6 and failure_cluster_hit_rate >= FAILURE_CLUSTER_KEEP_THRESHOLD:
         reasons.extend(["PROTECTIVE_RULE", "FAILURE_CLUSTER_CAPTURE"])
         return "keep", reasons, "retain_and_monitor"
-    if expectancy > 0 and net_pnl_after_fees > 0:
-        reasons.extend(["POSITIVE_EXPECTANCY", "POSITIVE_NET_PNL"])
-        if avg_signed_slippage_bps >= ADVERSE_SIGNED_SLIPPAGE_THRESHOLD:
-            reasons.append("ADVERSE_SLIPPAGE_NEEDS_TUNING")
-            return "simplify", reasons, "tighten_thresholds"
-        if late_trigger_ratio > LATE_TRIGGER_KILL_THRESHOLD:
-            reasons.append("LATE_TRIGGER_ELEVATED")
-            return "simplify", reasons, "confirm_quality_revisit"
-        return "keep", reasons, "retain_and_monitor"
     if (
         traded_decisions >= MIN_CLASSIFICATION_SAMPLE
         and expectancy <= 0
@@ -303,6 +294,15 @@ def _classify_metrics(
             reasons.append("FAILURE_CLUSTER_HEAVY")
         reasons.extend(["NEGATIVE_EXPECTANCY", "NEGATIVE_NET_PNL"])
         return "kill", reasons, "ablation_candidate"
+    if expectancy > 0 and net_pnl_after_fees > 0:
+        reasons.extend(["POSITIVE_EXPECTANCY", "POSITIVE_NET_PNL"])
+        if avg_signed_slippage_bps >= ADVERSE_SIGNED_SLIPPAGE_THRESHOLD:
+            reasons.append("ADVERSE_SLIPPAGE_NEEDS_TUNING")
+            return "simplify", reasons, "tighten_thresholds"
+        if late_trigger_ratio > LATE_TRIGGER_KILL_THRESHOLD:
+            reasons.append("LATE_TRIGGER_ELEVATED")
+            return "simplify", reasons, "confirm_quality_revisit"
+        return "keep", reasons, "retain_and_monitor"
     reasons.append("MIXED_SIGNAL")
     return "simplify", reasons, "simplify_thresholds"
 

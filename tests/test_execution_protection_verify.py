@@ -282,6 +282,18 @@ class ProtectionVerifyFailureClient(ProtectionVerifySuccessClient):
         raise RuntimeError("verify lookup missing")
 
 
+class ProtectionVerifyUnavailableClient(ProtectionVerifySuccessClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_order_calls = 0
+
+    def get_open_orders(self, symbol: str):
+        self.open_order_calls += 1
+        if self.open_order_calls >= 4:
+            raise RuntimeError("binance open orders unavailable")
+        return []
+
+
 class EntryBlockedAfterVerifyFailureClient(ProtectionVerifySuccessClient):
     pass
 
@@ -365,4 +377,54 @@ def test_protection_verify_failed_blocks_followup_entry_for_same_symbol(monkeypa
     assert second_result["status"] == "blocked"
     assert second_result["reason_codes"] == ["PROTECTION_VERIFY_FAILED"]
     assert second_result["protection_verify_block"]["status"] == "verify_failed"
+    assert blocked_client.new_order_calls == 0
+
+
+def test_protection_verify_unavailable_marks_unverified_and_blocks_followup_entry(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    unavailable_client = ProtectionVerifyUnavailableClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: unavailable_client)
+
+    first_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=5,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    settings_row = get_or_create_settings(db_session)
+    assert first_result["status"] == "emergency_exit"
+    assert first_result["protective_state"]["status"] == "unverified"
+    assert "protection_recovery" in settings_row.pause_reason_detail, (
+        first_result,
+        settings_row.pause_reason_detail,
+    )
+    verify_block = settings_row.pause_reason_detail["protection_recovery"]["verification_blocks"]["BTCUSDT"]
+
+    blocked_client = EntryBlockedAfterVerifyFailureClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: blocked_client)
+    second_result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=6,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert first_result["protective_state"]["protected"] is False
+    assert first_result["protection_lifecycle"]["state"] == "verify_failed"
+    assert first_result["emergency_action"]["status"] == "failed"
+    assert settings_row.pause_reason_detail["operating_state"] == "DEGRADED_MANAGE_ONLY"
+    assert unavailable_client.new_order_calls == 2
+    assert unavailable_client.fetch_calls == []
+    assert verify_block["status"] == "verify_failed"
+    assert verify_block["blocked_reason_code"] == "PROTECTION_STATE_UNVERIFIED"
+    assert verify_block["protection_state"]["status"] == "unverified"
+    assert second_result["status"] == "blocked"
+    assert second_result["reason_codes"] == ["PROTECTION_VERIFY_FAILED"]
+    assert second_result["protection_verify_block"]["blocked_reason_code"] == "PROTECTION_STATE_UNVERIFIED"
     assert blocked_client.new_order_calls == 0

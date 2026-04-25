@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, Literal
+
+from sqlalchemy import inspect
+from sqlalchemy.orm import object_session
+from sqlalchemy.orm.attributes import flag_modified
 
 from trading_mvp.models import Setting
 from trading_mvp.time_utils import utcnow_naive
@@ -33,6 +38,50 @@ ENTRY_BLOCKING_OPERATING_STATES: set[str] = {
     EMERGENCY_EXIT_STATE,
     PAUSED_STATE,
 }
+PROTECTION_REASON_CODE_PREFIXES = ("PROTECTION_", "PROTECTIVE_", "UNRESOLVED_SUBMISSION_")
+PROTECTION_REASON_CODES = {
+    PROTECTION_REQUIRED_STATE,
+    DEGRADED_MANAGE_ONLY_STATE,
+    EMERGENCY_EXIT_STATE,
+    "MISSING_PROTECTIVE_ORDERS",
+    "PROTECTIVE_ORDER_FAILURE",
+    "PROTECTION_STATE_UNVERIFIED",
+    "INVALID_PROTECTION_BRACKETS",
+    "UNRESOLVED_SUBMISSION_GUARD_ACTIVE",
+    "UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED",
+    "LIVE_ORDER_SUBMISSION_UNKNOWN",
+}
+DEGRADED_REASON_CODES = {
+    PROTECTION_REQUIRED_STATE,
+    DEGRADED_MANAGE_ONLY_STATE,
+    EMERGENCY_EXIT_STATE,
+    PAUSED_STATE,
+    "TRADING_PAUSED",
+    "MANUAL_USER_REQUEST",
+    "ACCOUNT_STATE_STALE",
+    "POSITION_STATE_STALE",
+    "OPEN_ORDERS_STATE_STALE",
+    "PROTECTION_STATE_UNVERIFIED",
+    "USER_STREAM_LISTEN_KEY_ROTATION_PENDING",
+    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+    "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+    "TEMPORARY_SYNC_FAILURE",
+    "EXCHANGE_POSITION_SYNC_FAILED",
+    "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+    "EXCHANGE_POSITION_MODE_UNCLEAR",
+    "EXCHANGE_POSITION_MODE_MISMATCH",
+    "UNRESOLVED_SUBMISSION_GUARD_ACTIVE",
+    "UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED",
+    "BINANCE_REST_CIRCUIT_OPEN",
+    "BINANCE_REST_RECOVERING_SYNC_STALE",
+    "BINANCE_REST_RECOVERING_SYNC_REQUIRED",
+    "BINANCE_REST_TRANSPORT_ERROR",
+    "BINANCE_REST_SERVER_ERROR",
+    "BINANCE_REST_RATE_LIMITED",
+    "BINANCE_REST_MUTATING_ORDER_FAILED",
+    "DAILY_LOSS_LIMIT_REACHED",
+    "MAX_CONSECUTIVE_LOSSES_REACHED",
+}
 PROTECTION_RECOVERY_THRESHOLD = 2
 SYNC_STATE_DETAIL_KEY = "exchange_sync"
 EXECUTION_GUARD_DETAIL_KEY = "execution_guard"
@@ -40,6 +89,7 @@ USER_STREAM_DETAIL_KEY = "user_stream"
 RECONCILIATION_DETAIL_KEY = "reconciliation"
 CANDIDATE_SELECTION_DETAIL_KEY = "candidate_selection"
 DRAWDOWN_STATE_DETAIL_KEY = "drawdown_state"
+BINANCE_REST_DETAIL_KEY = "binance_rest"
 MAX_EXECUTION_DEDUPE_RECORDS = 128
 SYNC_SCOPES: tuple[str, ...] = (
     "account",
@@ -48,10 +98,135 @@ SYNC_SCOPES: tuple[str, ...] = (
     "protective_orders",
 )
 SYNC_SCOPE_STATUSES = {"unknown", "synced", "failed", "incomplete", "skipped"}
+BINANCE_REST_STATUSES = {"ok", "degraded", "unavailable", "recovering"}
+BINANCE_REST_CIRCUIT_STATES = {"closed", "open", "recovering"}
+BINANCE_REST_CIRCUIT_OPEN_REASON_CODE = "BINANCE_REST_CIRCUIT_OPEN"
+BINANCE_REST_RECOVERING_SYNC_STALE_REASON_CODE = "BINANCE_REST_RECOVERING_SYNC_STALE"
+BINANCE_REST_RECOVERING_REASON_CODE = "BINANCE_REST_RECOVERING_SYNC_REQUIRED"
+BINANCE_REST_TRANSPORT_ERROR_REASON_CODE = "BINANCE_REST_TRANSPORT_ERROR"
+BINANCE_REST_SERVER_ERROR_REASON_CODE = "BINANCE_REST_SERVER_ERROR"
+BINANCE_REST_RATE_LIMIT_REASON_CODE = "BINANCE_REST_RATE_LIMITED"
+BINANCE_REST_MUTATING_FAILURE_REASON_CODE = "BINANCE_REST_MUTATING_ORDER_FAILED"
+BINANCE_REST_RECENT_FAILURE_LIMIT = 10
+BINANCE_REST_TRANSPORT_OPEN_THRESHOLD = 2
+EXCHANGE_CONNECTIVITY_DEGRADED_REASON_CODES = {
+    "ACCOUNT_STATE_STALE",
+    "POSITION_STATE_STALE",
+    "OPEN_ORDERS_STATE_STALE",
+    "PROTECTION_STATE_UNVERIFIED",
+    "USER_STREAM_LISTEN_KEY_ROTATION_PENDING",
+    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+    "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
+    "TEMPORARY_SYNC_FAILURE",
+    "EXCHANGE_POSITION_SYNC_FAILED",
+    "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+    "EXCHANGE_POSITION_MODE_UNCLEAR",
+    "EXCHANGE_POSITION_MODE_MISMATCH",
+    "UNRESOLVED_SUBMISSION_GUARD_ACTIVE",
+    "UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED",
+    BINANCE_REST_CIRCUIT_OPEN_REASON_CODE,
+    BINANCE_REST_RECOVERING_SYNC_STALE_REASON_CODE,
+    BINANCE_REST_RECOVERING_REASON_CODE,
+    BINANCE_REST_TRANSPORT_ERROR_REASON_CODE,
+    BINANCE_REST_SERVER_ERROR_REASON_CODE,
+    BINANCE_REST_RATE_LIMIT_REASON_CODE,
+    BINANCE_REST_MUTATING_FAILURE_REASON_CODE,
+}
 
 
 def _as_dict(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _unique_reason_codes(*groups: Iterable[Any] | None) -> list[str]:
+    reason_codes: list[str] = []
+    for group in groups:
+        if group is None:
+            continue
+        for item in group:
+            code = str(item or "").strip()
+            if code and code not in reason_codes:
+                reason_codes.append(code)
+    return reason_codes
+
+
+def reason_code_is_protection_related(reason_code: object) -> bool:
+    code = str(reason_code or "").strip()
+    return (
+        code in PROTECTION_REASON_CODES
+        or code.startswith(PROTECTION_REASON_CODE_PREFIXES)
+        or "PROTECTIVE" in code
+    )
+
+
+def derive_degraded_reason_codes(
+    reason_codes: Iterable[Any] | None = None,
+    *,
+    operating_state: object | None = None,
+    degraded_reason: object | None = None,
+) -> list[str]:
+    codes = _unique_reason_codes([degraded_reason] if degraded_reason else [])
+    state_code = str(operating_state or "").strip()
+    if state_code in ENTRY_BLOCKING_OPERATING_STATES:
+        codes = _unique_reason_codes(codes, [state_code])
+    for code in _unique_reason_codes(reason_codes):
+        if code in DEGRADED_REASON_CODES or code.startswith("DRAWDOWN_STATE_"):
+            codes = _unique_reason_codes(codes, [code])
+    return codes
+
+
+def derive_protection_reason_codes(
+    reason_codes: Iterable[Any] | None = None,
+    *,
+    operating_state: object | None = None,
+    missing_protection_symbols: Iterable[Any] | None = None,
+    missing_protection_items: dict[str, list[str]] | None = None,
+) -> list[str]:
+    codes: list[str] = []
+    state_code = str(operating_state or "").strip()
+    if state_code in {PROTECTION_REQUIRED_STATE, DEGRADED_MANAGE_ONLY_STATE, EMERGENCY_EXIT_STATE}:
+        codes = _unique_reason_codes(codes, [state_code])
+    if _unique_reason_codes(missing_protection_symbols) or any(missing_protection_items or {}):
+        codes = _unique_reason_codes(codes, ["MISSING_PROTECTIVE_ORDERS"])
+    protection_codes = [code for code in _unique_reason_codes(reason_codes) if reason_code_is_protection_related(code)]
+    return _unique_reason_codes(codes, protection_codes)
+
+
+def resolve_exchange_connectivity_state(
+    exchange_can_trade: bool | None,
+    *,
+    reason_codes: Iterable[Any] | None = None,
+    user_stream_summary: dict[str, Any] | None = None,
+    reconciliation_summary: dict[str, Any] | None = None,
+) -> str:
+    if exchange_can_trade is False:
+        return "blocked"
+
+    reason_set = set(_unique_reason_codes(reason_codes))
+    user_stream = _as_dict(user_stream_summary)
+    reconciliation = _as_dict(reconciliation_summary)
+    rest_connectivity = _as_dict(reconciliation.get("rest_connectivity"))
+    if reason_set & EXCHANGE_CONNECTIVITY_DEGRADED_REASON_CODES:
+        return "degraded"
+    if user_stream:
+        stream_source = str(user_stream.get("stream_source") or "").strip()
+        rotate_status = str(user_stream.get("listen_key_rotate_status") or "").strip()
+        last_error = str(user_stream.get("last_error") or "").strip()
+        if stream_source == "rest_polling_fallback" and (
+            rotate_status in {"pending", "failed"}
+            or last_error in {"LISTEN_KEY_EXPIRED", "USER_STREAM_LISTEN_KEY_ROTATE_FAILED"}
+        ):
+            return "degraded"
+    if bool(reconciliation.get("mode_guard_active")) or bool(reconciliation.get("unresolved_submission_badge")):
+        return "degraded"
+    if rest_connectivity:
+        rest_status = str(rest_connectivity.get("status") or "ok")
+        rest_circuit_state = str(rest_connectivity.get("circuit_state") or "closed")
+        if rest_status != "ok" or rest_circuit_state != "closed":
+            return "degraded"
+    if exchange_can_trade is True:
+        return "tradable"
+    return "unknown"
 
 
 def _as_symbol_map(value: object) -> dict[str, dict[str, Any]]:
@@ -125,6 +300,42 @@ def normalize_operating_state(value: object) -> OperatingState:
 
 def get_runtime_detail(settings_row: Setting) -> dict[str, Any]:
     return _as_dict(settings_row.pause_reason_detail)
+
+
+def _runtime_detail_for_write(settings_row: Setting, *, lock: bool = True) -> dict[str, Any]:
+    session = object_session(settings_row)
+    if session is not None and settings_row.id is not None:
+        state = inspect(settings_row)
+        if not state.attrs.pause_reason_detail.history.has_changes():
+            with session.no_autoflush:
+                if lock:
+                    session.refresh(
+                        settings_row,
+                        attribute_names=["pause_reason_detail"],
+                        with_for_update=True,
+                    )
+                else:
+                    session.refresh(settings_row, attribute_names=["pause_reason_detail"])
+    return get_runtime_detail(settings_row)
+
+
+def _write_runtime_detail(settings_row: Setting, runtime_detail: dict[str, Any]) -> None:
+    settings_row.pause_reason_detail = runtime_detail
+    flag_modified(settings_row, "pause_reason_detail")
+
+
+def write_runtime_detail_key(settings_row: Setting, key: str, payload: Any) -> None:
+    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail[key] = payload
+    _write_runtime_detail(settings_row, runtime_detail)
+
+
+def runtime_detail_for_update(settings_row: Setting, *, lock: bool = True) -> dict[str, Any]:
+    return _runtime_detail_for_write(settings_row, lock=lock)
+
+
+def write_runtime_detail(settings_row: Setting, runtime_detail: dict[str, Any]) -> None:
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def get_sync_state_detail(settings_row: Setting) -> dict[str, dict[str, Any]]:
@@ -224,7 +435,7 @@ def set_user_stream_detail(
     listen_key_rotate_status: str | None = None,
     listen_key_rotate_error: str | None = None,
 ) -> None:
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     payload = get_user_stream_detail(settings_row)
     if status is not None:
         payload["status"] = status
@@ -273,13 +484,13 @@ def set_user_stream_detail(
     if listen_key_rotate_error is not None:
         payload["listen_key_rotate_error"] = listen_key_rotate_error
     runtime_detail[USER_STREAM_DETAIL_KEY] = payload
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def replace_user_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     runtime_detail[USER_STREAM_DETAIL_KEY] = dict(payload)
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def should_use_rest_order_reconciliation(
@@ -374,7 +585,7 @@ def set_reconciliation_detail(
     unresolved_submission_symbols: list[str] | None = None,
     unresolved_submissions: list[dict[str, Any]] | None = None,
 ) -> None:
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     payload = get_reconciliation_detail(settings_row)
     if status is not None:
         payload["status"] = status
@@ -423,7 +634,7 @@ def set_reconciliation_detail(
     if unresolved_submissions is not None:
         payload["unresolved_submissions"] = [dict(item) for item in unresolved_submissions if isinstance(item, dict)]
     runtime_detail[RECONCILIATION_DETAIL_KEY] = payload
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def get_reconciliation_blocking_reason_codes(settings_row: Setting) -> list[str]:
@@ -436,6 +647,234 @@ def get_reconciliation_blocking_reason_codes(settings_row: Setting) -> list[str]
     if bool(summary.get("unresolved_submission_badge")):
         reason_codes.append("UNRESOLVED_SUBMISSION_GUARD_ACTIVE")
     return reason_codes
+
+
+def _normalize_binance_rest_status(value: object) -> str:
+    status = str(value or "ok").strip().lower()
+    return status if status in BINANCE_REST_STATUSES else "ok"
+
+
+def _normalize_binance_rest_circuit_state(value: object) -> str:
+    circuit_state = str(value or "closed").strip().lower()
+    return circuit_state if circuit_state in BINANCE_REST_CIRCUIT_STATES else "closed"
+
+
+def _binance_rest_sync_fresh(
+    settings_row: Setting,
+    *,
+    now: datetime | None = None,
+    sync_freshness_summary: dict[str, Any] | None = None,
+) -> bool:
+    summary = sync_freshness_summary or build_sync_freshness_summary(settings_row, now=now)
+    for scope in SYNC_SCOPES:
+        scope_summary = summary.get(scope)
+        if not isinstance(scope_summary, dict):
+            return False
+        if bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
+            return False
+        status = str(scope_summary.get("status") or scope_summary.get("raw_status") or "")
+        if status != "synced":
+            return False
+    return True
+
+
+def get_binance_rest_detail(
+    settings_row: Setting,
+    *,
+    now: datetime | None = None,
+    sync_freshness_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    detail = get_runtime_detail(settings_row)
+    payload = _as_dict(detail.get(BINANCE_REST_DETAIL_KEY))
+    status = _normalize_binance_rest_status(payload.get("status"))
+    circuit_state = _normalize_binance_rest_circuit_state(payload.get("circuit_state"))
+    if status == "unavailable":
+        circuit_state = "open"
+    elif status == "recovering":
+        circuit_state = "recovering"
+    sync_fresh = _binance_rest_sync_fresh(
+        settings_row,
+        now=now,
+        sync_freshness_summary=sync_freshness_summary,
+    )
+    entry_block_reason_code: str | None = None
+    if circuit_state == "open":
+        entry_block_reason_code = BINANCE_REST_CIRCUIT_OPEN_REASON_CODE
+    elif circuit_state == "recovering" and not sync_fresh:
+        entry_block_reason_code = BINANCE_REST_RECOVERING_SYNC_STALE_REASON_CODE
+    recent_failures = [
+        dict(item)
+        for item in payload.get("recent_failures", [])
+        if isinstance(item, dict)
+    ][:BINANCE_REST_RECENT_FAILURE_LIMIT]
+    return {
+        "status": status,
+        "circuit_state": circuit_state,
+        "reason_code": str(payload.get("reason_code") or "") or None,
+        "entry_block_reason_code": entry_block_reason_code,
+        "new_entries_blocked": entry_block_reason_code is not None,
+        "sync_fresh_required": circuit_state == "recovering",
+        "sync_fresh": sync_fresh,
+        "source": str(payload.get("source") or "") or None,
+        "last_observed_at": _serialize_datetime(_coerce_datetime(payload.get("last_observed_at"))),
+        "last_success_at": _serialize_datetime(_coerce_datetime(payload.get("last_success_at"))),
+        "last_failure_at": _serialize_datetime(_coerce_datetime(payload.get("last_failure_at"))),
+        "last_failure_type": str(payload.get("last_failure_type") or "") or None,
+        "last_error": str(payload.get("last_error") or "") or None,
+        "last_http_status": _coerce_int(payload.get("last_http_status"), 0) or None,
+        "last_api_code": _coerce_int(payload.get("last_api_code"), 0) or None,
+        "consecutive_failures": _coerce_int(payload.get("consecutive_failures"), 0),
+        "consecutive_transport_failures": _coerce_int(payload.get("consecutive_transport_failures"), 0),
+        "transport_error_count": _coerce_int(payload.get("transport_error_count"), 0),
+        "server_error_count": _coerce_int(payload.get("server_error_count"), 0),
+        "rate_limit_count": _coerce_int(payload.get("rate_limit_count"), 0),
+        "mutating_failure_count": _coerce_int(payload.get("mutating_failure_count"), 0),
+        "recent_failures": recent_failures,
+    }
+
+
+def get_binance_rest_entry_block_reason_code(
+    settings_row: Setting,
+    *,
+    now: datetime | None = None,
+    sync_freshness_summary: dict[str, Any] | None = None,
+) -> str | None:
+    summary = get_binance_rest_detail(
+        settings_row,
+        now=now,
+        sync_freshness_summary=sync_freshness_summary,
+    )
+    return str(summary.get("entry_block_reason_code") or "") or None
+
+
+def _write_binance_rest_detail(settings_row: Setting, payload: dict[str, Any]) -> dict[str, Any]:
+    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail[BINANCE_REST_DETAIL_KEY] = payload
+    _write_runtime_detail(settings_row, runtime_detail)
+    return get_binance_rest_detail(settings_row)
+
+
+def record_binance_rest_success(
+    settings_row: Setting,
+    *,
+    source: str,
+    observed_at: datetime | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = observed_at or utcnow_naive()
+    previous = get_binance_rest_detail(settings_row)
+    was_open = str(previous.get("circuit_state") or "") in {"open", "recovering"} or str(previous.get("status") or "") == "unavailable"
+    sync_fresh = _binance_rest_sync_fresh(settings_row, now=now)
+    status = "ok"
+    circuit_state = "closed"
+    reason_code: str | None = None
+    if was_open and not sync_fresh:
+        status = "recovering"
+        circuit_state = "recovering"
+        reason_code = BINANCE_REST_RECOVERING_REASON_CODE
+    payload = {
+        **_as_dict(detail),
+        "status": status,
+        "circuit_state": circuit_state,
+        "reason_code": reason_code,
+        "source": source,
+        "last_observed_at": now.isoformat(),
+        "last_success_at": now.isoformat(),
+        "last_failure_at": previous.get("last_failure_at"),
+        "last_failure_type": previous.get("last_failure_type"),
+        "last_error": None,
+        "last_http_status": None,
+        "last_api_code": None,
+        "consecutive_failures": 0,
+        "consecutive_transport_failures": 0,
+        "transport_error_count": _coerce_int(previous.get("transport_error_count"), 0),
+        "server_error_count": _coerce_int(previous.get("server_error_count"), 0),
+        "rate_limit_count": _coerce_int(previous.get("rate_limit_count"), 0),
+        "mutating_failure_count": _coerce_int(previous.get("mutating_failure_count"), 0),
+        "recent_failures": [
+            dict(item)
+            for item in previous.get("recent_failures", [])
+            if isinstance(item, dict)
+        ][:BINANCE_REST_RECENT_FAILURE_LIMIT],
+    }
+    return _write_binance_rest_detail(settings_row, payload)
+
+
+def record_binance_rest_issue(
+    settings_row: Setting,
+    *,
+    reason_code: str,
+    source: str,
+    observed_at: datetime | None = None,
+    error: str | None = None,
+    failure_type: str | None = None,
+    http_status: int | None = None,
+    api_code: int | None = None,
+    mutating_request: bool = False,
+    transport_error: bool = False,
+    server_error: bool = False,
+    rate_limited: bool = False,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = observed_at or utcnow_naive()
+    previous = get_binance_rest_detail(settings_row)
+    consecutive_failures = _coerce_int(previous.get("consecutive_failures"), 0) + 1
+    consecutive_transport_failures = (
+        _coerce_int(previous.get("consecutive_transport_failures"), 0) + 1
+        if transport_error
+        else 0
+    )
+    opens_circuit = (
+        mutating_request
+        or server_error
+        or rate_limited
+        or consecutive_transport_failures >= BINANCE_REST_TRANSPORT_OPEN_THRESHOLD
+    )
+    status = "unavailable" if opens_circuit else "degraded"
+    circuit_state = "open" if opens_circuit else "closed"
+    failure_record = {
+        "observed_at": now.isoformat(),
+        "reason_code": reason_code,
+        "source": source,
+        "failure_type": failure_type,
+        "http_status": http_status,
+        "api_code": api_code,
+        "mutating_request": bool(mutating_request),
+        "transport_error": bool(transport_error),
+        "server_error": bool(server_error),
+        "rate_limited": bool(rate_limited),
+        "error": error,
+    }
+    recent_failures = [
+        failure_record,
+        *[
+            dict(item)
+            for item in previous.get("recent_failures", [])
+            if isinstance(item, dict)
+        ],
+    ][:BINANCE_REST_RECENT_FAILURE_LIMIT]
+    payload = {
+        **_as_dict(detail),
+        "status": status,
+        "circuit_state": circuit_state,
+        "reason_code": reason_code,
+        "source": source,
+        "last_observed_at": now.isoformat(),
+        "last_success_at": previous.get("last_success_at"),
+        "last_failure_at": now.isoformat(),
+        "last_failure_type": failure_type,
+        "last_error": error,
+        "last_http_status": http_status,
+        "last_api_code": api_code,
+        "consecutive_failures": consecutive_failures,
+        "consecutive_transport_failures": consecutive_transport_failures,
+        "transport_error_count": _coerce_int(previous.get("transport_error_count"), 0) + int(transport_error),
+        "server_error_count": _coerce_int(previous.get("server_error_count"), 0) + int(server_error),
+        "rate_limit_count": _coerce_int(previous.get("rate_limit_count"), 0) + int(rate_limited),
+        "mutating_failure_count": _coerce_int(previous.get("mutating_failure_count"), 0) + int(mutating_request),
+        "recent_failures": recent_failures,
+    }
+    return _write_binance_rest_detail(settings_row, payload)
 
 
 def get_candidate_selection_detail(settings_row: Setting) -> dict[str, Any]:
@@ -481,7 +920,7 @@ def set_candidate_selection_detail(
     skipped_symbols: list[str] | None = None,
     rankings: list[dict[str, Any]] | None = None,
 ) -> None:
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     payload = get_candidate_selection_detail(settings_row)
     if generated_at is not None:
         payload["generated_at"] = generated_at.isoformat()
@@ -516,7 +955,7 @@ def set_candidate_selection_detail(
     if rankings is not None:
         payload["rankings"] = [dict(item) for item in rankings if isinstance(item, dict)]
     runtime_detail[CANDIDATE_SELECTION_DETAIL_KEY] = payload
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def get_drawdown_state_detail(settings_row: Setting) -> dict[str, Any]:
@@ -541,9 +980,9 @@ def get_drawdown_state_detail(settings_row: Setting) -> dict[str, Any]:
 
 
 def set_drawdown_state_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     runtime_detail[DRAWDOWN_STATE_DETAIL_KEY] = dict(payload)
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def _write_execution_guard_detail(
@@ -553,13 +992,13 @@ def _write_execution_guard_detail(
     dedupe_records: dict[str, dict[str, Any]],
     unresolved_submission_guards: dict[str, dict[str, Any]],
 ) -> None:
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     runtime_detail[EXECUTION_GUARD_DETAIL_KEY] = {
         "symbol_locks": symbol_locks,
         "dedupe_records": _prune_execution_dedupe_records(dedupe_records),
         "unresolved_submission_guards": unresolved_submission_guards,
     }
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def build_execution_dedupe_key(*, cycle_id: str, symbol: str, action: str) -> str:
@@ -758,7 +1197,7 @@ def mark_sync_success(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     sync_detail = get_sync_state_detail(settings_row)
     now = synced_at or utcnow_naive()
     scope_detail = {
@@ -780,7 +1219,7 @@ def mark_sync_success(
         scope_detail.update(detail)
     sync_detail[scope] = scope_detail
     runtime_detail[SYNC_STATE_DETAIL_KEY] = sync_detail
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def mark_sync_issue(
@@ -795,7 +1234,7 @@ def mark_sync_issue(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     sync_detail = get_sync_state_detail(settings_row)
     now = observed_at or utcnow_naive()
     scope_detail = {
@@ -816,7 +1255,7 @@ def mark_sync_issue(
         scope_detail.update(detail)
     sync_detail[scope] = scope_detail
     runtime_detail[SYNC_STATE_DETAIL_KEY] = sync_detail
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def mark_sync_skipped(
@@ -830,7 +1269,7 @@ def mark_sync_skipped(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = get_runtime_detail(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row)
     sync_detail = get_sync_state_detail(settings_row)
     now = observed_at or utcnow_naive()
     scope_detail = {
@@ -848,7 +1287,7 @@ def mark_sync_skipped(
         scope_detail.update(detail)
     sync_detail[scope] = scope_detail
     runtime_detail[SYNC_STATE_DETAIL_KEY] = sync_detail
-    settings_row.pause_reason_detail = runtime_detail
+    _write_runtime_detail(settings_row, runtime_detail)
 
 
 def _display_sync_status(raw_status: str, *, stale: bool) -> str:
@@ -946,6 +1385,7 @@ def get_protection_recovery_detail(settings_row: Setting) -> dict[str, Any]:
     detail = get_runtime_detail(settings_row)
     recovery = _as_dict(detail.get("protection_recovery"))
     recovery["symbol_states"] = _as_symbol_map(recovery.get("symbol_states"))
+    recovery["verification_blocks"] = _as_symbol_map(recovery.get("verification_blocks"))
     recovery["missing_symbols"] = [str(item) for item in recovery.get("missing_symbols", []) if item]
     recovery["missing_items"] = {
         str(key): [str(item) for item in value]
@@ -967,9 +1407,15 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
     user_stream_summary = get_user_stream_detail(settings_row)
     reconciliation_summary = get_reconciliation_detail(settings_row)
+    binance_rest_summary = get_binance_rest_detail(
+        settings_row,
+        sync_freshness_summary=sync_freshness_summary,
+    )
+    reconciliation_summary["rest_connectivity"] = binance_rest_summary
     candidate_selection_summary = get_candidate_selection_detail(settings_row)
     drawdown_state_summary = get_drawdown_state_detail(settings_row)
     symbol_states = _as_symbol_map(recovery.get("symbol_states"))
+    verification_blocks = _as_symbol_map(recovery.get("verification_blocks"))
     failure_count = 0
     for item in symbol_states.values():
         try:
@@ -989,6 +1435,12 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
             if isinstance(value, list)
         },
         "protection_recovery_symbols": symbol_states,
+        "protection_verification_blocks": verification_blocks,
+        "protection_verification_blocked_symbols": [
+            str(symbol)
+            for symbol, payload in verification_blocks.items()
+            if bool(payload.get("blocked", False))
+        ],
         "protection_recovery_last_error": (
             str(recovery.get("last_error"))
             if recovery.get("last_error") not in {None, ""}
@@ -1001,6 +1453,7 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
         ),
         "user_stream_summary": user_stream_summary,
         "reconciliation_summary": reconciliation_summary,
+        "binance_rest_summary": binance_rest_summary,
         "candidate_selection_summary": candidate_selection_summary,
         "drawdown_state_summary": drawdown_state_summary,
         "last_account_sync_at": sync_freshness_summary["account"]["last_sync_at"],

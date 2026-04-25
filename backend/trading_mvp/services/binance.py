@@ -5,10 +5,11 @@ import hashlib
 import hmac
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from urllib.parse import urlencode
 
 import httpx
@@ -18,14 +19,123 @@ from trading_mvp.schemas import MarketCandle
 
 JsonDict = dict[str, Any]
 ALGO_ORDER_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", "TRAILING_STOP_MARKET"}
+ORDER_SUBMISSION_PATHS = {"/fapi/v1/order", "/fapi/v1/algoOrder"}
+BINANCE_TRANSIENT_API_CODES = {-1001, -1007}
+BINANCE_RATE_LIMIT_API_CODES = {-1003, -1015}
+RequestErrorHook = Callable[[dict[str, object]], None]
+
+
+class HttpClient(Protocol):
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, str | int | float | bool] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        ...
 
 
 class BinanceAPIError(RuntimeError):
-    def __init__(self, code: object, message: object, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        code: object,
+        message: object,
+        *,
+        status_code: int | None = None,
+        request_method: str | None = None,
+        request_path: str | None = None,
+    ) -> None:
         self.code = int(code) if isinstance(code, (int, float)) else None
         self.status_code = status_code
+        self.request_method = request_method
+        self.request_path = request_path
         self.api_message = str(message or "Unknown Binance error")
         super().__init__(f"Binance error {self.code}: {self.api_message}" if self.code is not None else self.api_message)
+
+
+def _request_from_exception(exc: BaseException) -> Any | None:
+    try:
+        return getattr(exc, "request", None)
+    except RuntimeError:
+        return None
+
+
+def classify_binance_rest_exception(
+    exc: BaseException,
+    *,
+    method: str | None = None,
+    path: str | None = None,
+    mutating_request: bool | None = None,
+) -> dict[str, object]:
+    request = _request_from_exception(exc)
+    request_method = (
+        method
+        or getattr(exc, "request_method", None)
+        or getattr(request, "method", None)
+        or ""
+    )
+    request_path = (
+        path
+        or getattr(exc, "request_path", None)
+        or getattr(getattr(request, "url", None), "path", None)
+        or ""
+    )
+    method_upper = str(request_method or "").upper()
+    path_value = str(request_path or "")
+    is_mutating = (
+        bool(mutating_request)
+        if mutating_request is not None
+        else method_upper in {"POST", "PUT", "DELETE"} and path_value in ORDER_SUBMISSION_PATHS
+    )
+    http_status: int | None = None
+    api_code: int | None = None
+    if isinstance(exc, BinanceAPIError):
+        http_status = exc.status_code
+        api_code = exc.code
+    elif isinstance(exc, httpx.HTTPStatusError):
+        http_status = exc.response.status_code
+        try:
+            payload = exc.response.json()
+        except ValueError:
+            payload = {}
+        if isinstance(payload, Mapping):
+            raw_code = payload.get("code")
+            if isinstance(raw_code, (int, float)):
+                api_code = int(raw_code)
+    transport_error = isinstance(exc, (httpx.TimeoutException, httpx.TransportError)) and not isinstance(exc, httpx.HTTPStatusError)
+    rate_limited = api_code in BINANCE_RATE_LIMIT_API_CODES or http_status in {418, 429}
+    server_error = http_status is not None and 500 <= http_status <= 599
+    transient_api = api_code in BINANCE_TRANSIENT_API_CODES
+    if rate_limited:
+        reason_code = "BINANCE_REST_RATE_LIMITED"
+        failure_type = "rate_limit"
+    elif server_error:
+        reason_code = "BINANCE_REST_SERVER_ERROR"
+        failure_type = "server_error"
+    elif transport_error or transient_api:
+        reason_code = "BINANCE_REST_TRANSPORT_ERROR"
+        failure_type = "transport_error"
+        transport_error = True
+    elif is_mutating:
+        reason_code = "BINANCE_REST_MUTATING_ORDER_FAILED"
+        failure_type = "mutating_order_failure"
+    else:
+        reason_code = "BINANCE_REST_REQUEST_FAILED"
+        failure_type = "request_error"
+    return {
+        "reason_code": reason_code,
+        "failure_type": failure_type,
+        "http_status": http_status,
+        "api_code": api_code,
+        "mutating_request": is_mutating,
+        "transport_error": transport_error,
+        "server_error": server_error,
+        "rate_limited": rate_limited,
+        "method": method_upper or None,
+        "path": path_value or None,
+    }
 
 
 class BinanceClient:
@@ -39,6 +149,8 @@ class BinanceClient:
         timeout_seconds: float = 10.0,
         recv_window_ms: int = 5000,
         max_get_attempts: int | None = None,
+        http_client: HttpClient | None = None,
+        request_error_hook: RequestErrorHook | None = None,
     ) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
@@ -49,10 +161,108 @@ class BinanceClient:
         self.max_get_attempts = max_get_attempts
         self._server_time_offset_ms: int | None = None
         self._timestamp_safety_margin_ms = 250
+        self._http_client = http_client
+        self._owns_http_client = http_client is None
+        self.request_error_hook = request_error_hook
         if futures_enabled:
             self.base_url = "https://testnet.binancefuture.com" if testnet_enabled else "https://fapi.binance.com"
         else:
             self.base_url = "https://testnet.binance.vision" if testnet_enabled else "https://api.binance.com"
+
+    def __enter__(self) -> BinanceClient:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
+
+    def close(self) -> None:
+        if not self._owns_http_client or self._http_client is None:
+            return
+        close = getattr(self._http_client, "close", None)
+        if callable(close):
+            close()
+        self._http_client = None
+
+    def _get_http_client(self) -> HttpClient:
+        if self._http_client is None:
+            self._http_client = httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds)
+            self._owns_http_client = True
+        return self._http_client
+
+    @staticmethod
+    def _endpoint_category(
+        method_upper: str,
+        path: str,
+        *,
+        signed: bool = False,
+        api_key_only: bool = False,
+    ) -> str:
+        path_lower = path.lower()
+        if signed and method_upper == "POST" and path in ORDER_SUBMISSION_PATHS:
+            return "order_submission"
+        if "listenkey" in path_lower:
+            return "user_stream"
+        if path_lower.endswith("/time"):
+            return "time"
+        if "order" in path_lower:
+            return "order_management"
+        if signed:
+            return "account"
+        if api_key_only:
+            return "api_key"
+        return "market_data"
+
+    def _record_request_error(
+        self,
+        exc: httpx.TimeoutException | httpx.TransportError | httpx.HTTPStatusError,
+        *,
+        method_upper: str,
+        path: str,
+        endpoint_category: str,
+        attempt: int,
+        attempts: int,
+    ) -> None:
+        if self.request_error_hook is None:
+            return
+        if isinstance(exc, httpx.TimeoutException):
+            error_type = "timeout"
+        elif isinstance(exc, httpx.HTTPStatusError):
+            error_type = "status"
+        else:
+            error_type = "transport"
+        event: dict[str, object] = {
+            "event": "binance_request_error",
+            "method": method_upper,
+            "path": path,
+            "endpoint_category": endpoint_category,
+            "error_type": error_type,
+            "exception": type(exc).__name__,
+            "attempt": attempt,
+            "attempts": attempts,
+        }
+        event.update(
+            {
+                key: value
+                for key, value in classify_binance_rest_exception(
+                    exc,
+                    method=method_upper,
+                    path=path,
+                    mutating_request=endpoint_category == "order_submission",
+                ).items()
+                if value is not None
+            }
+        )
+        if isinstance(exc, httpx.HTTPStatusError):
+            event["status_code"] = exc.response.status_code
+        try:
+            self.request_error_hook(event)
+        except Exception:
+            return
 
     def _sign(self, query: str) -> str:
         return hmac.new(
@@ -72,6 +282,13 @@ class BinanceClient:
         retryable: bool | None = None,
     ) -> dict[str, object] | list[object]:
         method_upper = method.upper()
+        is_order_submission = signed and method_upper == "POST" and path in ORDER_SUBMISSION_PATHS
+        endpoint_category = self._endpoint_category(
+            method_upper,
+            path,
+            signed=signed,
+            api_key_only=api_key_only,
+        )
         attempts = 3 if (retryable if retryable is not None else method_upper == "GET") else 1
         if signed:
             attempts = max(attempts, 2)
@@ -96,13 +313,20 @@ class BinanceClient:
                 query = urlencode(query_params)
                 query_params["signature"] = self._sign(query)
             try:
-                with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as client:
-                    response = client.request(method, path, params=query_params, headers=headers)
-                    response.raise_for_status()
-                    payload = cast(dict[str, object] | list[object], response.json())
-                    return payload
+                response = self._get_http_client().request(method, path, params=query_params, headers=headers)
+                response.raise_for_status()
+                payload = cast(dict[str, object] | list[object], response.json())
+                return payload
             except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_error = exc
+                self._record_request_error(
+                    exc,
+                    method_upper=method_upper,
+                    path=path,
+                    endpoint_category=endpoint_category,
+                    attempt=attempt + 1,
+                    attempts=attempts,
+                )
                 if isinstance(exc, httpx.HTTPStatusError):
                     try:
                         error_payload = exc.response.json()
@@ -116,7 +340,15 @@ class BinanceClient:
                             time_sync_attempted = True
                             continue
                         if code is not None or message:
-                            raise BinanceAPIError(code, message, status_code=exc.response.status_code) from exc
+                            raise BinanceAPIError(
+                                code,
+                                message,
+                                status_code=exc.response.status_code,
+                                request_method=method_upper,
+                                request_path=path,
+                            ) from exc
+                if is_order_submission:
+                    raise
                 if attempt == attempts - 1:
                     raise
                 time.sleep(0.35 * (attempt + 1))
@@ -126,10 +358,9 @@ class BinanceClient:
         return "/fapi/v1/time" if self.futures_enabled else "/api/v3/time"
 
     def _fetch_server_time_ms(self) -> int:
-        with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as client:
-            response = client.request("GET", self._server_time_path())
-            response.raise_for_status()
-            payload = cast(dict[str, object], response.json())
+        payload = self._request("GET", self._server_time_path(), retryable=False)
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("Unexpected Binance server time response.")
         server_time = payload.get("serverTime")
         if not isinstance(server_time, int | float):
             raise RuntimeError("Unexpected Binance server time response.")
@@ -591,6 +822,8 @@ class BinanceClient:
         working_type: str = "MARK_PRICE",
         time_in_force: str | None = None,
     ) -> dict[str, object]:
+        if not client_order_id:
+            raise ValueError("Binance live order submissions require client_order_id for reconciliation.")
         if self.futures_enabled and self._is_algo_order_type(order_type):
             algo_params: dict[str, str | int | float | bool] = {
                 "algoType": "CONDITIONAL",

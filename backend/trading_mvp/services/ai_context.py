@@ -13,6 +13,7 @@ from trading_mvp.schemas import (
     DerivativesSummaryPayload,
     EventContextSummaryPayload,
     FeaturePayload,
+    LeadContextStatus,
     LeadLagSummaryPayload,
     MarketSnapshotPayload,
     PreviousThesisDeltaPacket,
@@ -89,6 +90,28 @@ def _unique_codes(*groups: list[str]) -> list[str]:
             ordered.append(code)
             seen.add(code)
     return ordered
+
+
+def _lead_context_status(*, available: bool, missing_symbols: list[str]) -> LeadContextStatus:
+    if not available:
+        return "unavailable"
+    if missing_symbols:
+        return "partial"
+    return "ok"
+
+
+def _lead_context_reason_codes(
+    *,
+    status: LeadContextStatus,
+    missing_symbols: list[str],
+) -> list[str]:
+    reason_codes: list[str] = []
+    if status == "unavailable":
+        reason_codes.append("LEAD_CONTEXT_UNAVAILABLE")
+    elif status == "partial":
+        reason_codes.append("LEAD_CONTEXT_PARTIAL")
+    reason_codes.extend(f"LEAD_CONTEXT_MISSING_{symbol}" for symbol in missing_symbols)
+    return _unique_codes(reason_codes)
 
 
 def _review_trigger_payload(
@@ -265,6 +288,18 @@ def build_composite_regime_packet(
         reason_codes.append(f"DERIVATIVES_{derivatives_regime.upper()}")
     if execution_regime != "unavailable":
         reason_codes.append(f"EXECUTION_{execution_regime.upper()}")
+    lead_context_missing_symbols = list(lead_lag.missing_reference_symbols)
+    lead_context_status = _lead_context_status(
+        available=bool(lead_lag.available),
+        missing_symbols=lead_context_missing_symbols,
+    )
+    if lead_context_status != "ok":
+        reason_codes.extend(
+            _lead_context_reason_codes(
+                status=lead_context_status,
+                missing_symbols=lead_context_missing_symbols,
+            )
+        )
     if lead_lag.strong_reference_confirmation:
         reason_codes.append("LEAD_LAG_STRONG_CONFIRMATION")
     if features.regime.weak_volume:
@@ -318,6 +353,15 @@ def build_data_quality_packet(
         missing_flags.append("market_snapshot_incomplete")
     if market_snapshot.is_stale:
         stale_flags.append("market_snapshot_stale")
+    lead_context_missing_symbols = list(features.lead_lag.missing_reference_symbols)
+    lead_context_status = _lead_context_status(
+        available=bool(features.lead_lag.available),
+        missing_symbols=lead_context_missing_symbols,
+    )
+    if lead_context_status == "unavailable":
+        missing_flags.append("lead_context_unavailable")
+    elif lead_context_status == "partial":
+        missing_flags.append("lead_context_partial")
 
     account_state_trustworthy = True
     for scope in ("account", "positions", "open_orders", "protective_orders"):
@@ -413,10 +457,21 @@ def build_lead_lag_summary(
     features: FeaturePayload,
 ) -> LeadLagSummaryPayload:
     lead_lag = features.lead_lag
+    missing_symbols = list(lead_lag.missing_reference_symbols)
+    lead_context_status = _lead_context_status(
+        available=bool(lead_lag.available),
+        missing_symbols=missing_symbols,
+    )
     return LeadLagSummaryPayload(
         available=lead_lag.available,
+        lead_context_status=lead_context_status,
         leader_bias=lead_lag.leader_bias,
         reference_symbols=list(lead_lag.reference_symbols),
+        missing_reference_symbols=missing_symbols,
+        reason_codes=_lead_context_reason_codes(
+            status=lead_context_status,
+            missing_symbols=missing_symbols,
+        ),
         bullish_alignment_score=lead_lag.bullish_alignment_score,
         bearish_alignment_score=lead_lag.bearish_alignment_score,
         bullish_breakout_confirmed=lead_lag.bullish_breakout_confirmed,

@@ -38,6 +38,19 @@ const sharedRiskReasonMap: Record<string, string> = {
   TEMPORARY_SYNC_FAILURE: "거래소 상태 동기화 중 일시적인 오류가 발생했습니다.",
   EXCHANGE_POSITION_SYNC_FAILED: "거래소 포지션 상태를 동기화하지 못했습니다.",
   EXCHANGE_OPEN_ORDERS_SYNC_FAILED: "거래소 미체결 주문 상태를 동기화하지 못했습니다.",
+  UNRESOLVED_SUBMISSION_GUARD_ACTIVE: "결과가 확인되지 않은 주문 제출이 있어 신규 진입을 차단했습니다.",
+  UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED: "미해결 주문 제출 확인 시간이 초과되어 신규 진입을 차단했습니다.",
+  LIVE_ORDER_SUBMISSION_UNKNOWN: "주문 제출 결과가 불명확해 신규 진입을 차단했습니다.",
+  BINANCE_REST_CIRCUIT_OPEN: "Binance REST 회로가 열려 거래소 상태 확인을 제한합니다.",
+  BINANCE_REST_RECOVERING_SYNC_STALE: "Binance REST 복구 중이며 동기화 상태가 아직 오래되었습니다.",
+  BINANCE_REST_RECOVERING_SYNC_REQUIRED: "Binance REST 복구 후 거래소 상태 재동기화가 필요합니다.",
+  BINANCE_REST_TRANSPORT_ERROR: "Binance REST 전송 오류가 감지되었습니다.",
+  BINANCE_REST_SERVER_ERROR: "Binance REST 서버 오류가 감지되었습니다.",
+  BINANCE_REST_RATE_LIMITED: "Binance REST rate limit으로 요청이 제한되었습니다.",
+  BINANCE_REST_MUTATING_ORDER_FAILED: "Binance REST 주문 변경 요청이 실패했습니다.",
+  DRAWDOWN_STATE_CAUTION: "손실/드로다운 주의 상태라 진입 크기를 보수적으로 제한합니다.",
+  DRAWDOWN_STATE_CONTAINMENT: "드로다운 억제 상태라 신규 진입을 더 강하게 제한합니다.",
+  DRAWDOWN_STATE_RECOVERY: "회복 상태라 신규 진입 리스크를 낮춰 운용합니다.",
 };
 
 export function lookupRiskReasonCode(value: string | null | undefined) {

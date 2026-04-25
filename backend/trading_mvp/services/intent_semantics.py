@@ -7,7 +7,10 @@ PROTECTION_REASON_CODES = {
     "PROTECTION_REQUIRED",
     "PROTECTION_RECOVERY",
     "PROTECTION_RESTORE",
+    "RESTORE_PROTECTION",
 }
+SURVIVAL_PATH_DECISIONS = frozenset({"reduce", "exit"})
+SURVIVAL_PATH_INTENT_TYPES = frozenset({"protection", "reduce_only", "emergency_exit"})
 TIGHTEN_MANAGEMENT_ACTIONS = {
     "tighten_stop",
     "trail_stop",
@@ -17,7 +20,7 @@ TIGHTEN_MANAGEMENT_ACTIONS = {
 
 
 def _as_dict(value: object) -> dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _as_list(value: object) -> list[str]:
@@ -85,6 +88,36 @@ def _position_management_payload(metadata: Mapping[str, Any] | None) -> dict[str
     if isinstance(meta.get("position_management_action"), dict):
         return _as_dict(meta.get("position_management_action"))
     return {}
+
+
+def _decision_payload(decision: object) -> dict[str, Any]:
+    if isinstance(decision, str):
+        return {"decision": decision}
+    if isinstance(decision, Mapping):
+        return dict(decision)
+    model_dump = getattr(decision, "model_dump", None)
+    if callable(model_dump):
+        try:
+            payload = model_dump(mode="json")
+        except TypeError:
+            payload = model_dump()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    payload: dict[str, Any] = {}
+    for key in (
+        "decision",
+        "action",
+        "intent_family",
+        "management_action",
+        "intent_type",
+        "rationale_codes",
+        "primary_reason_codes",
+    ):
+        if hasattr(decision, key):
+            value = getattr(decision, key)
+            if value is not None and value != "":
+                payload[key] = value
+    return payload
 
 
 def infer_intent_semantics(
@@ -167,6 +200,30 @@ def infer_intent_semantics(
         "legacy_semantics_preserved": legacy_semantics_preserved,
         "analytics_excluded_from_entry_stats": analytics_excluded_from_entry_stats,
     }
+
+
+def is_survival_path_intent(
+    decision: object,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    payload = _decision_payload(decision)
+    decision_value = str(payload.get("decision") or payload.get("action") or "").strip().lower()
+    intent_type = str(payload.get("intent_type") or "").strip().lower()
+    if decision_value in SURVIVAL_PATH_DECISIONS or decision_value == "emergency_exit":
+        return True
+    if intent_type in SURVIVAL_PATH_INTENT_TYPES:
+        return True
+
+    semantics = infer_intent_semantics(payload, metadata)
+    intent_family = str(semantics.get("intent_family") or "").strip().lower()
+    management_action = str(semantics.get("management_action") or "").strip().lower()
+    if management_action == "restore_protection":
+        return True
+    if management_action == "reduce_only":
+        return decision_value in {"", "reduce"} or intent_type == "reduce_only"
+    if management_action == "exit_only":
+        return decision_value in {"", "exit"} or intent_type == "emergency_exit"
+    return intent_family == "exit"
 
 
 def is_entry_intent(

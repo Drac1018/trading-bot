@@ -21,6 +21,8 @@ def test_overview_latest_risk_passthrough_adds_snapshot_cycle_and_as_of(db_sessi
         "reason_codes": ["ENTRY_TRIGGER_NOT_MET", "SLIPPAGE_THRESHOLD_EXCEEDED"],
         "blocked_reason_codes": ["ENTRY_TRIGGER_NOT_MET", "SLIPPAGE_THRESHOLD_EXCEEDED"],
         "adjustment_reason_codes": [],
+        "degraded_reason_codes": [],
+        "protection_reason_codes": [],
         "approved_risk_pct": 0.0,
         "approved_leverage": 0.0,
         "raw_projected_notional": 32100.5,
@@ -31,6 +33,16 @@ def test_overview_latest_risk_passthrough_adds_snapshot_cycle_and_as_of(db_sessi
             "headroom": {"limiting_headroom_notional": 1234.5},
             "requested_exposure_limit_codes": ["ENTRY_TRIGGER_NOT_MET"],
             "final_exposure_limit_codes": ["ENTRY_TRIGGER_NOT_MET"],
+            "lead_market_context": {
+                "lead_context_status": "partial",
+                "missing_lead_symbols": ["ETHUSDT"],
+                "reason_codes": ["LEAD_CONTEXT_PARTIAL", "LEAD_CONTEXT_MISSING_ETHUSDT"],
+            },
+            "binance_rest_summary": {
+                "status": "unavailable",
+                "circuit_state": "open",
+                "entry_block_reason_code": "BINANCE_REST_CIRCUIT_OPEN",
+            },
         },
     }
     risk_row = RiskCheck(
@@ -55,10 +67,13 @@ def test_overview_latest_risk_passthrough_adds_snapshot_cycle_and_as_of(db_sessi
     assert overview.latest_risk is not None
     assert overview.latest_risk["reason_codes"] == ["ENTRY_TRIGGER_NOT_MET", "SLIPPAGE_THRESHOLD_EXCEEDED"]
     assert overview.latest_risk["blocked_reason_codes"] == ["ENTRY_TRIGGER_NOT_MET", "SLIPPAGE_THRESHOLD_EXCEEDED"]
+    assert overview.latest_risk["degraded_reason_codes"] == []
+    assert overview.latest_risk["protection_reason_codes"] == []
     assert overview.latest_risk["approved_projected_notional"] == 0.0
     assert overview.latest_risk["approved_quantity"] is None
     assert overview.latest_risk["exposure_headroom_snapshot"] == {"limiting_headroom_notional": 1234.5}
     assert overview.latest_risk["debug_payload"] == risk_payload["debug_payload"]
+    assert overview.latest_risk["debug_payload"]["lead_market_context"]["lead_context_status"] == "partial"
     assert overview.latest_risk["snapshot_id"] == 654
     assert overview.latest_risk["cycle_id"] == "321"
     assert overview.latest_risk["as_of"] == as_of
@@ -77,6 +92,9 @@ def test_operator_dashboard_risk_guard_passthroughs_current_cycle_result_without
         "reason_codes": [],
         "blocked_reason_codes": [],
         "adjustment_reason_codes": ["ENTRY_AUTO_RESIZED", "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT"],
+        "degraded_reason_codes": ["PROTECTION_REQUIRED"],
+        "protection_reason_codes": ["PROTECTION_REQUIRED", "MISSING_PROTECTIVE_ORDERS"],
+        "survival_path": "protective_recovery",
         "approved_risk_pct": 0.004321,
         "approved_leverage": 1.25,
         "raw_projected_notional": 100000.123456,
@@ -95,6 +113,11 @@ def test_operator_dashboard_risk_guard_passthroughs_current_cycle_result_without
             "headroom": {"directional_headroom_notional": 40000.456789},
             "requested_exposure_limit_codes": ["DIRECTIONAL_BIAS_LIMIT_REACHED"],
             "final_exposure_limit_codes": [],
+            "lead_market_context": {
+                "lead_context_status": "unavailable",
+                "missing_lead_symbols": ["BTCUSDT", "ETHUSDT"],
+                "reason_codes": ["LEAD_CONTEXT_UNAVAILABLE"],
+            },
         },
         "snapshot_id": 777,
         "cycle_id": "cycle-777",
@@ -121,12 +144,16 @@ def test_operator_dashboard_risk_guard_passthroughs_current_cycle_result_without
     assert btc.risk_guard.reason_codes == []
     assert btc.risk_guard.blocked_reason_codes == []
     assert btc.risk_guard.adjustment_reason_codes == ["ENTRY_AUTO_RESIZED", "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT"]
+    assert btc.risk_guard.degraded_reason_codes == ["PROTECTION_REQUIRED"]
+    assert btc.risk_guard.protection_reason_codes == ["PROTECTION_REQUIRED", "MISSING_PROTECTIVE_ORDERS"]
+    assert btc.risk_guard.survival_path == "protective_recovery"
     assert btc.risk_guard.approved_risk_pct == 0.004321
     assert btc.risk_guard.approved_leverage == 1.25
     assert btc.risk_guard.approved_projected_notional == 40000.456789
     assert btc.risk_guard.approved_quantity == 0.617283
     assert btc.risk_guard.exposure_headroom_snapshot == risk_payload["exposure_headroom_snapshot"]
     assert btc.risk_guard.debug_payload == risk_payload["debug_payload"]
+    assert btc.risk_guard.debug_payload["lead_market_context"]["lead_context_status"] == "unavailable"
     assert btc.risk_guard.snapshot_id == 777
     assert btc.risk_guard.cycle_id == "cycle-777"
     assert btc.risk_guard.as_of == as_of
@@ -135,3 +162,4 @@ def test_operator_dashboard_risk_guard_passthroughs_current_cycle_result_without
     assert btc.risk_guard.current_cycle_result["snapshot_id"] == 777
     assert btc.risk_guard.current_cycle_result["cycle_id"] == "cycle-777"
     assert btc.risk_guard.current_cycle_result["as_of"] == as_of
+    assert btc.risk_guard.current_cycle_result["survival_path"] == "protective_recovery"

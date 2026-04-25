@@ -19,6 +19,12 @@ from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
 LEAD_MARKET_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+LEAD_CONTEXT_OK = "ok"
+LEAD_CONTEXT_PARTIAL = "partial"
+LEAD_CONTEXT_UNAVAILABLE = "unavailable"
+LEAD_CONTEXT_PARTIAL_REASON_CODE = "LEAD_CONTEXT_PARTIAL"
+LEAD_CONTEXT_UNAVAILABLE_REASON_CODE = "LEAD_CONTEXT_UNAVAILABLE"
+LEAD_CONTEXT_BUILD_FAILED_REASON_CODE = "LEAD_CONTEXT_BUILD_FAILED"
 
 DERIVATIVES_CONTEXT_FIELDS = (
     "open_interest",
@@ -31,6 +37,75 @@ DERIVATIVES_CONTEXT_FIELDS = (
     "spread_bps",
     "spread_stress_score",
 )
+
+
+class LeadMarketContexts(dict[str, dict[str, MarketSnapshotPayload]]):
+    def __init__(
+        self,
+        values: dict[str, dict[str, MarketSnapshotPayload]] | None = None,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(values or {})
+        self.metadata = metadata or {}
+
+    @property
+    def lead_context_status(self) -> str:
+        return str(self.metadata.get("lead_context_status") or LEAD_CONTEXT_UNAVAILABLE)
+
+    @property
+    def missing_lead_symbols(self) -> list[str]:
+        value = self.metadata.get("missing_lead_symbols")
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    @property
+    def reason_codes(self) -> list[str]:
+        value = self.metadata.get("reason_codes")
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        ordered.append(item)
+        seen.add(item)
+    return ordered
+
+
+def _lead_market_context_metadata(
+    *,
+    requested_symbols: list[str],
+    available_symbols: list[str],
+    failed_symbols: list[str],
+) -> dict[str, object]:
+    missing_symbols = [symbol for symbol in requested_symbols if symbol not in available_symbols]
+    if not requested_symbols or not missing_symbols:
+        status = LEAD_CONTEXT_OK
+    elif not available_symbols:
+        status = LEAD_CONTEXT_UNAVAILABLE
+    else:
+        status = LEAD_CONTEXT_PARTIAL
+
+    reason_codes: list[str] = []
+    if status == LEAD_CONTEXT_PARTIAL:
+        reason_codes.append(LEAD_CONTEXT_PARTIAL_REASON_CODE)
+    elif status == LEAD_CONTEXT_UNAVAILABLE:
+        reason_codes.append(LEAD_CONTEXT_UNAVAILABLE_REASON_CODE)
+    if failed_symbols:
+        reason_codes.append(LEAD_CONTEXT_BUILD_FAILED_REASON_CODE)
+    reason_codes.extend(f"LEAD_CONTEXT_MISSING_{symbol}" for symbol in missing_symbols)
+
+    return {
+        "lead_context_status": status,
+        "missing_lead_symbols": missing_symbols,
+        "available_lead_symbols": available_symbols,
+        "failed_lead_symbols": failed_symbols,
+        "reason_codes": _unique_strings(reason_codes),
+    }
 
 
 def timeframe_to_minutes(timeframe: str) -> int:
@@ -360,12 +435,16 @@ def build_lead_market_contexts(
     binance_testnet_enabled: bool = False,
     stale_threshold_seconds: int = 1800,
     event_context_provider: EventContextProvider | None = None,
-) -> dict[str, dict[str, MarketSnapshotPayload]]:
+) -> LeadMarketContexts:
     contexts: dict[str, dict[str, MarketSnapshotPayload]] = {}
+    requested_symbols: list[str] = []
+    failed_symbols: list[str] = []
     for symbol in lead_symbols:
         symbol_key = str(symbol or "").upper()
         if not symbol_key:
             continue
+        if symbol_key not in requested_symbols:
+            requested_symbols.append(symbol_key)
         try:
             contexts[symbol_key] = build_market_context(
                 symbol=symbol_key,
@@ -380,8 +459,17 @@ def build_lead_market_contexts(
                 event_context_provider=event_context_provider,
             )
         except RuntimeError:
+            failed_symbols.append(symbol_key)
             continue
-    return contexts
+    available_symbols = [symbol for symbol in requested_symbols if symbol in contexts]
+    return LeadMarketContexts(
+        contexts,
+        metadata=_lead_market_context_metadata(
+            requested_symbols=requested_symbols,
+            available_symbols=available_symbols,
+            failed_symbols=_unique_strings(failed_symbols),
+        ),
+    )
 
 
 def persist_market_snapshot(session: Session, snapshot: MarketSnapshotPayload) -> MarketSnapshot:

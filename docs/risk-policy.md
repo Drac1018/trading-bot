@@ -16,6 +16,8 @@
 
 - account / positions / open orders / protection 상태가 stale 또는 incomplete인 경우
 - pause, degraded, approval 미충족 상태인 경우
+- `operating_state`가 `PROTECTION_REQUIRED`, `DEGRADED_MANAGE_ONLY`, `EMERGENCY_EXIT`, `PAUSED`인 경우
+- unresolved submission guard가 남아 있어 직전 주문 제출 결과가 아직 거래소와 대조되지 않은 경우
 - 계좌, 시장, 포지션 상태를 신뢰할 수 없는 경우
 - 보호주문 상태를 검증할 수 없는 경우
 
@@ -91,6 +93,14 @@ stale / incomplete / protection 검증 실패 관련 reason code:
 - `POSITION_STATE_STALE`
 - `OPEN_ORDERS_STATE_STALE`
 - `PROTECTION_STATE_UNVERIFIED`
+- `MARKET_STATE_STALE`
+- `MARKET_STATE_INCOMPLETE`
+- `PROTECTION_REQUIRED`
+- `DEGRADED_MANAGE_ONLY`
+- `EMERGENCY_EXIT`
+- `UNRESOLVED_SUBMISSION_GUARD_ACTIVE`
+- `PROTECTION_VERIFY_FAILED`
+- `EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE`
 - `UNDERPERFORMING_SETUP_DISABLED`
   - 최근 실거래 bucket 성과가 충분히 나빠 adaptive setup disable가 active일 때 신규 진입만 차단합니다.
   - `reduce`, `exit`, `reduce_only`, `protection recovery`, `emergency_exit`는 이 code 때문에 막지 않습니다.
@@ -105,6 +115,16 @@ stale / incomplete / protection 검증 실패 관련 reason code:
 - 보호주문 복구
 - `emergency_exit`
 
+단, 보호주문 복구는 단순히 `intent_family=protection` 또는 `management_action=restore_protection`가 붙었다고 자동 허용되지 않습니다. 실제 코드 기준으로는 열린 포지션이 있고, 현재 운영 상태가 `PROTECTION_REQUIRED` 또는 `DEGRADED_MANAGE_ONLY`이며, 같은 방향의 `long` / `short` 복구 의도와 `stop_loss` / `take_profit`이 함께 있을 때만 survival path로 취급합니다. 이 조건을 만족하지 못한 보호 복구 형태의 `long` / `short`는 신규 진입처럼 freshness / protection / market blocker를 그대로 받습니다.
+
+## Binance API 장애와 상태 전이
+
+- Binance 계정, 포지션, 오픈오더, 보호주문 조회가 실패하면 해당 sync scope가 `failed` 또는 `incomplete`로 기록되고 신규 진입은 stale / incomplete reason code로 차단됩니다.
+- timeout, transport error, 일부 일시적 Binance API code는 `EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE`로 분류됩니다.
+- 주문 제출 timeout처럼 제출 여부를 확정할 수 없는 경우 execution은 `LIVE_ORDER_SUBMISSION_UNKNOWN`을 남기고 unresolved submission guard를 세웁니다. guard가 남아 있으면 다음 같은 symbol / direction 신규 진입은 거래소 호출 전에 `UNRESOLVED_SUBMISSION_GUARD_ACTIVE`로 차단됩니다.
+- protective order 생성 후 검증이 실패하면 `PROTECTION_VERIFY_FAILED` block이 남고, 새 entry / scale-in 실행은 막습니다. 보호 복구가 반복 실패하면 `DEGRADED_MANAGE_ONLY`로 내려가고, 필요 시 emergency exit 경로가 별도로 시도됩니다.
+- 운영자 화면에서는 이 상태를 `operating_state`, `guard_mode_reason_code`, `guard_mode_reason_message`, `sync_freshness_summary`, `reconciliation_summary`로 확인합니다.
+
 ## Holding Profile Risk Overlay
 
 - `scalp`는 기본 신규 진입 프로필입니다.
@@ -112,6 +132,8 @@ stale / incomplete / protection 검증 실패 관련 reason code:
 - `position`은 `meta_gate=pass`가 필요하고, strong higher timeframe alignment, breadth not weak, positive lead-lag, positive relative strength, severe derivatives headwind 없음이 모두 필요합니다.
 - `breakout_confirm` 신규 진입은 기본적으로 scalp 전용으로 유지하며, 장기 holding profile에서는 별도 예외를 열지 않습니다.
 - holding profile soft cap은 하드 리스크 한도 위에만 추가 적용되며, stale sync / protection / approval / daily loss 같은 하드 차단을 우회하지 않습니다.
+
+Lead-lag context가 `unavailable`이면 신규 진입을 직접 완화하지 않습니다. 현재 구현은 candidate score와 AI context payload에 보수적으로 반영하고, `position` holding profile에서는 positive lead-lag가 없으면 `HOLDING_PROFILE_POSITION_LEAD_LAG_MISMATCH`로 막습니다. 일부 lead reference만 있는 partial 상태는 남은 reference로 점수를 계산하지만, 이를 강한 확인 근거로 과장하지 않습니다.
 
 ## Hard Stop Policy
 

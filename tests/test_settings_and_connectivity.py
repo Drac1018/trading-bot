@@ -4,10 +4,11 @@ from datetime import timedelta
 from threading import Event, Thread
 from time import perf_counter, sleep
 
+import httpx
+import trading_mvp.main as main_module
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-import trading_mvp.main as main_module
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import (
@@ -28,7 +29,12 @@ from trading_mvp.services.connectivity import (
     check_binance_connection,
     check_openai_connection,
 )
-from trading_mvp.services.runtime_state import mark_sync_success, set_drawdown_state_detail
+from trading_mvp.services.runtime_state import (
+    get_binance_rest_detail,
+    mark_sync_success,
+    record_binance_rest_issue,
+    set_drawdown_state_detail,
+)
 from trading_mvp.services.settings import (
     get_or_create_settings,
     serialize_settings,
@@ -316,6 +322,60 @@ def test_serialize_settings_exposes_drawdown_operating_layer(db_session) -> None
     assert serialized["operational_status"]["control_status_summary"]["drawdown_policy_adjustments"]["breakout_exception_allowed"] is False
 
 
+def test_serialize_settings_exposes_binance_rest_circuit_separately_from_unresolved_submission(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.live_execution_armed = True
+    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=10)
+    now = utcnow_naive()
+    mark_sync_success(row, scope="account", synced_at=now, detail={"exchange_can_trade": True})
+    mark_sync_success(row, scope="positions", synced_at=now)
+    mark_sync_success(row, scope="open_orders", synced_at=now)
+    mark_sync_success(row, scope="protective_orders", synced_at=now)
+    db_session.add(
+        MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=now,
+            latest_price=71000.0,
+            latest_volume=1250.0,
+            candle_count=96,
+            is_stale=False,
+            is_complete=True,
+            payload={},
+        )
+    )
+    record_binance_rest_issue(
+        row,
+        reason_code="BINANCE_REST_TRANSPORT_ERROR",
+        source="test",
+        error="connect timeout",
+        failure_type="transport_error",
+        transport_error=True,
+    )
+    record_binance_rest_issue(
+        row,
+        reason_code="BINANCE_REST_TRANSPORT_ERROR",
+        source="test",
+        error="connect timeout",
+        failure_type="transport_error",
+        transport_error=True,
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+    rest_summary = serialized["reconciliation_summary"]["rest_connectivity"]
+
+    assert serialized["can_enter_new_position"] is False
+    assert serialized["guard_mode_reason_code"] == "BINANCE_REST_CIRCUIT_OPEN"
+    assert "BINANCE_REST_CIRCUIT_OPEN" in serialized["blocked_reasons"]
+    assert rest_summary["status"] == "unavailable"
+    assert rest_summary["circuit_state"] == "open"
+    assert rest_summary["entry_block_reason_code"] == "BINANCE_REST_CIRCUIT_OPEN"
+    assert serialized["reconciliation_summary"]["unresolved_submission_badge"] is False
+    assert serialized["reconciliation_summary"]["unresolved_submission_count"] == 0
+    assert serialized["operational_status"]["control_status_summary"]["exchange_connectivity_state"] == "degraded"
+
+
 def test_should_call_openai_respects_manual_and_replay(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
 
@@ -484,6 +544,38 @@ def test_connection_services_return_success_with_patched_clients(db_session, mon
     assert openai_result.ok is True
     assert binance_result.ok is True
     assert binance_result.details["symbol"] == "BTCUSDT"
+    assert binance_result.details["binance_rest_summary"]["status"] == "ok"
+
+
+def test_binance_connection_failure_records_rest_transport_state(db_session, monkeypatch) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    def raise_transport_error(self, symbol, timeframe):
+        raise httpx.ConnectTimeout("connect timeout")
+
+    monkeypatch.setattr(
+        "trading_mvp.services.binance.BinanceClient.test_connection",
+        raise_transport_error,
+    )
+
+    result = check_binance_connection(
+        row,
+        BinanceConnectionTestRequest(
+            api_key=None,
+            api_secret=None,
+            testnet_enabled=True,
+            symbol="BTCUSDT",
+            timeframe="15m",
+        ),
+    )
+
+    rest_summary = get_binance_rest_detail(row)
+
+    assert result.ok is False
+    assert rest_summary["status"] == "degraded"
+    assert rest_summary["reason_code"] == "BINANCE_REST_TRANSPORT_ERROR"
+    assert result.details["binance_rest_failure"]["reason_code"] == "BINANCE_REST_TRANSPORT_ERROR"
+    assert result.details["binance_rest_summary"]["reason_code"] == "BINANCE_REST_TRANSPORT_ERROR"
 
 
 

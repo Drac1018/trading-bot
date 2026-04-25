@@ -23,6 +23,8 @@ export type DecisionTimelineSymbolLike = {
   risk_guard: {
     allowed: boolean | null;
     decision: string | null;
+    survival_path?: string | null;
+    blocked_reason_codes?: string[];
     auto_resized_entry: boolean;
     adjustment_reason_codes: string[];
   };
@@ -234,6 +236,7 @@ export function summarizeLastAiRecommendation(symbol: DecisionTimelineSymbolLike
 
 export function summarizeRiskGate(symbol: DecisionTimelineSymbolLike): DecisionTimelineSummary {
   const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+  const survivalPath = symbol.risk_guard.survival_path;
   const autoResized =
     symbol.risk_guard.auto_resized_entry && symbol.risk_guard.adjustment_reason_codes.length > 0;
   if (symbol.risk_guard.allowed === null) {
@@ -244,10 +247,10 @@ export function summarizeRiskGate(symbol: DecisionTimelineSymbolLike): DecisionT
     };
   }
   if (symbol.risk_guard.allowed) {
-    if (isSurvivalDecision(decision)) {
+    if (survivalPath || isSurvivalDecision(decision)) {
       return {
-        label: "리스크 통과",
-        detail: translateDecision(decision),
+        label: survivalPath === "protective_recovery" ? "보호 복구 허용" : "생존 경로 허용",
+        detail: "신규 진입 허용이 아니라 기존 포지션 관리 경로입니다.",
         kind: "good",
       };
     }
@@ -264,16 +267,16 @@ export function summarizeRiskGate(symbol: DecisionTimelineSymbolLike): DecisionT
       kind: "neutral",
     };
   }
-  if (isSurvivalDecision(decision)) {
+  if (survivalPath || isSurvivalDecision(decision)) {
     return {
       label: "생존 경로도 차단",
-      detail: translateDecision(decision),
+      detail: symbol.risk_guard.blocked_reason_codes?.[0] ?? translateDecision(decision),
       kind: "danger",
     };
   }
   return {
     label: "리스크 차단",
-    detail: translateDecision(decision),
+    detail: symbol.risk_guard.blocked_reason_codes?.[0] ?? translateDecision(decision),
     kind: "danger",
   };
 }

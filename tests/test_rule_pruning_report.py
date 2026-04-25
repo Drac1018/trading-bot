@@ -4,7 +4,12 @@ from datetime import timedelta
 
 from trading_mvp.models import AgentRun, Execution, Order
 from trading_mvp.services.orchestrator import TradingOrchestrator
-from trading_mvp.services.rule_pruning import build_keep_kill_report
+from trading_mvp.services.rule_pruning import (
+    ADVERSE_SIGNED_SLIPPAGE_THRESHOLD,
+    FAILURE_CLUSTER_KEEP_THRESHOLD,
+    _classify_metrics,
+    build_keep_kill_report,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -116,6 +121,60 @@ def _seed_pruning_decision(
         db_session.flush()
 
     return decision_row
+
+
+def test_classify_metrics_kills_negative_pnl_with_adverse_execution() -> None:
+    classification, reasons, recommendation = _classify_metrics(
+        sample_size=4,
+        traded_decisions=4,
+        expectancy=-2.5,
+        net_pnl_after_fees=-10.0,
+        avg_signed_slippage_bps=ADVERSE_SIGNED_SLIPPAGE_THRESHOLD,
+        hold_rate=0.0,
+        late_trigger_ratio=0.0,
+        failure_cluster_hit_rate=0.0,
+    )
+
+    assert classification == "kill"
+    assert recommendation == "ablation_candidate"
+    assert "ADVERSE_SIGNED_SLIPPAGE" in reasons
+    assert "NEGATIVE_EXPECTANCY" in reasons
+    assert "NEGATIVE_NET_PNL" in reasons
+
+
+def test_classify_metrics_keeps_insufficient_negative_sample_out_of_kill() -> None:
+    classification, reasons, recommendation = _classify_metrics(
+        sample_size=3,
+        traded_decisions=3,
+        expectancy=-2.5,
+        net_pnl_after_fees=-7.5,
+        avg_signed_slippage_bps=ADVERSE_SIGNED_SLIPPAGE_THRESHOLD,
+        hold_rate=0.0,
+        late_trigger_ratio=1.0,
+        failure_cluster_hit_rate=1.0,
+    )
+
+    assert classification == "simplify"
+    assert reasons == ["INSUFFICIENT_SAMPLE"]
+    assert recommendation == "collect_more_data"
+
+
+def test_classify_metrics_preserves_protective_rule_exception() -> None:
+    classification, reasons, recommendation = _classify_metrics(
+        sample_size=5,
+        traded_decisions=5,
+        expectancy=-2.5,
+        net_pnl_after_fees=-12.5,
+        avg_signed_slippage_bps=0.0,
+        hold_rate=0.6,
+        late_trigger_ratio=0.0,
+        failure_cluster_hit_rate=FAILURE_CLUSTER_KEEP_THRESHOLD,
+        protective_rule=True,
+    )
+
+    assert classification == "keep"
+    assert reasons == ["PROTECTIVE_RULE", "FAILURE_CLUSTER_CAPTURE"]
+    assert recommendation == "retain_and_monitor"
 
 
 def test_build_keep_kill_report_classifies_keep_kill_and_simplify(db_session) -> None:

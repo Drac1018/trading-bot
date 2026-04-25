@@ -33,10 +33,10 @@ from trading_mvp.schemas import (
     EventOperatorControlPayload,
     ManualNoTradeWindowPayload,
     ManualNoTradeWindowRequest,
+    OperationalStatusPayload,
     OperatorEventContextPayload,
     OperatorEventViewPayload,
     OperatorEventViewRequest,
-    OperationalStatusPayload,
     RolloutMode,
     SymbolCadenceOverride,
     SymbolEffectiveCadence,
@@ -52,8 +52,8 @@ from trading_mvp.services.ai_usage import (
     get_openai_call_gate,
     manual_ai_guard_minutes,
 )
+from trading_mvp.services.audit import record_audit_event
 from trading_mvp.services.drawdown_state import build_drawdown_state_snapshot
-from trading_mvp.services.execution_policy import summarize_execution_policy
 from trading_mvp.services.event_context import normalize_operator_event_context
 from trading_mvp.services.event_policy import (
     build_default_operator_event_view,
@@ -61,6 +61,7 @@ from trading_mvp.services.event_policy import (
     evaluate_event_policy,
     no_trade_window_is_active,
 )
+from trading_mvp.services.execution_policy import summarize_execution_policy
 from trading_mvp.services.pause_policy import (
     get_pause_reason_policy,
     pause_reason_allows_auto_resume,
@@ -72,13 +73,15 @@ from trading_mvp.services.runtime_state import (
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    derive_degraded_reason_codes,
+    derive_protection_reason_codes,
     get_drawdown_state_detail,
     get_sync_state_detail,
+    resolve_exchange_connectivity_state,
     summarize_runtime_state,
 )
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
-from trading_mvp.services.audit import record_audit_event
-from trading_mvp.time_utils import ensure_utc_aware, isoformat_utc, parse_utc_datetime, utcnow_aware, utcnow_naive
+from trading_mvp.time_utils import ensure_utc_aware, isoformat_utc, utcnow_aware, utcnow_naive
 
 
 @dataclass(slots=True)
@@ -125,6 +128,7 @@ RUNTIME_STATE_DETAIL_KEYS = {
     "user_stream",
     "reconciliation",
     "candidate_selection",
+    "binance_rest",
 }
 EVENT_OPERATOR_CONTROL_DETAIL_KEY = "event_operator_control"
 PRESERVED_SETTINGS_DETAIL_KEYS = {*RUNTIME_STATE_DETAIL_KEYS, EVENT_OPERATOR_CONTROL_DETAIL_KEY}
@@ -156,6 +160,8 @@ SYNC_SCOPE_GUARD_REASON_CODES = {
     "protective_orders": "PROTECTION_STATE_UNVERIFIED",
 }
 STALE_FIRST_REASON_PRIORITY = {
+    "BINANCE_REST_CIRCUIT_OPEN": -3,
+    "BINANCE_REST_RECOVERING_SYNC_STALE": -2,
     "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": -1,
     "ACCOUNT_STATE_STALE": 0,
     "POSITION_STATE_STALE": 1,
@@ -201,6 +207,8 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
     "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": "listen key 재등록이 완료되지 않아 신규 진입을 차단하고 REST fallback으로 운용 중입니다.",
+    "BINANCE_REST_CIRCUIT_OPEN": "Binance REST/API circuit is open, so new entries are blocked.",
+    "BINANCE_REST_RECOVERING_SYNC_STALE": "Binance REST/API is recovering; account, position, open-order, and protection sync must be fresh before new entries resume.",
     "EXCHANGE_POSITION_MODE_UNCLEAR": "거래소 포지션 모드를 확인하지 못해 신규 진입을 차단합니다.",
     "EXCHANGE_POSITION_MODE_MISMATCH": "거래소 Hedge mode가 현재 one-way 로컬 해석과 충돌해 신규 진입을 차단합니다.",
 }
@@ -1488,13 +1496,24 @@ def _build_position_management_summary(
     }
 
 
+def _risk_blocked_reason_codes_from_row(latest_risk: RiskCheck) -> list[str]:
+    payload = latest_risk.payload if isinstance(latest_risk.payload, dict) else {}
+    if isinstance(payload.get("blocked_reason_codes"), list):
+        raw_reason_codes = payload.get("blocked_reason_codes", [])
+    elif isinstance(payload.get("reason_codes"), list):
+        raw_reason_codes = payload.get("reason_codes", [])
+    else:
+        raw_reason_codes = latest_risk.reason_codes
+    return [str(item) for item in raw_reason_codes if item not in {None, ""}]
+
+
 def get_latest_blocked_reasons(session: Session | None) -> list[str]:
     if session is None:
         return []
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
     if latest_risk is None or latest_risk.allowed:
         return []
-    return [str(item) for item in latest_risk.reason_codes if item not in {None, ""}]
+    return _prioritize_blocked_reasons(_risk_blocked_reason_codes_from_row(latest_risk))
 
 
 def get_latest_risk_gate_status(session: Session | None) -> tuple[bool | None, list[str]]:
@@ -1503,9 +1522,7 @@ def get_latest_risk_gate_status(session: Session | None) -> tuple[bool | None, l
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
     if latest_risk is None:
         return None, []
-    payload = latest_risk.payload if isinstance(latest_risk.payload, dict) else {}
-    raw_reason_codes = payload.get("reason_codes", []) if isinstance(payload.get("reason_codes", []), list) else latest_risk.reason_codes
-    reason_codes = [str(item) for item in raw_reason_codes if item not in {None, ""}]
+    reason_codes = _risk_blocked_reason_codes_from_row(latest_risk)
     return bool(latest_risk.allowed), _prioritize_blocked_reasons(reason_codes)
 
 
@@ -1912,8 +1929,21 @@ def _derive_user_stream_blocking_reasons(user_stream_summary: dict[str, object])
     return []
 
 
+def _derive_binance_rest_blocking_reasons(binance_rest_summary: dict[str, object]) -> list[str]:
+    if not isinstance(binance_rest_summary, dict):
+        return []
+    reason_code = str(binance_rest_summary.get("entry_block_reason_code") or "").strip()
+    if bool(binance_rest_summary.get("new_entries_blocked")) and reason_code:
+        return [reason_code]
+    return []
+
+
 def _user_stream_blocks_new_entries(user_stream_summary: dict[str, object]) -> bool:
     return bool(_derive_user_stream_blocking_reasons(user_stream_summary))
+
+
+def _binance_rest_blocks_new_entries(binance_rest_summary: dict[str, object]) -> bool:
+    return bool(_derive_binance_rest_blocking_reasons(binance_rest_summary))
 
 
 def _reconciliation_blocks_new_entries(reconciliation_summary: dict[str, object]) -> bool:
@@ -1963,10 +1993,12 @@ def derive_guard_mode_reason(
     sync_blocked_reasons = _derive_sync_blocking_reasons(sync_freshness_summary or {})
     market_blocked_reasons = _derive_market_blocking_reasons(market_freshness_summary or {})
     user_stream_blocked_reasons = _derive_user_stream_blocking_reasons(dict(runtime.get("user_stream_summary") or {}))
+    binance_rest_blocked_reasons = _derive_binance_rest_blocking_reasons(dict(runtime.get("binance_rest_summary") or {}))
     blocked_reasons = _prioritize_blocked_reasons(
         sync_blocked_reasons
         + market_blocked_reasons
         + user_stream_blocked_reasons
+        + binance_rest_blocked_reasons
         + [str(item) for item in (latest_blocked_reasons or []) if item]
     )
     auto_resume_blockers = [str(item) for item in (auto_resume_last_blockers or []) if item]
@@ -2105,6 +2137,10 @@ def _build_control_status_summary(
     *,
     operating_state: str,
     current_cycle_blocked_reasons: list[str],
+    blocked_reason_codes: list[str],
+    degraded_reason_codes: list[str],
+    protection_reason_codes: list[str],
+    exchange_connectivity_state: str,
     risk_allowed: bool | None,
     reconciliation_summary: dict[str, object],
     drawdown_state_summary: dict[str, object],
@@ -2122,6 +2158,7 @@ def _build_control_status_summary(
     )
     return ControlStatusSummary(
         exchange_can_trade=exchange_can_trade,
+        exchange_connectivity_state=exchange_connectivity_state,
         rollout_mode=rollout_mode,
         exchange_submit_allowed=rollout_mode_allows_exchange_submit(settings_row),
         limited_live_max_notional=(
@@ -2139,6 +2176,9 @@ def _build_control_status_summary(
         },
         risk_allowed=resolved_risk_allowed,
         blocked_reasons_current_cycle=_prioritize_blocked_reasons(current_cycle_blocked_reasons),
+        blocked_reason_codes=_prioritize_blocked_reasons(blocked_reason_codes),
+        degraded_reason_codes=_prioritize_blocked_reasons(degraded_reason_codes),
+        protection_reason_codes=_prioritize_blocked_reasons(protection_reason_codes),
         approval_control_blocked_reasons=approval_control_blocked_reasons,
         live_arm_disabled=bool(one_way_reason_message),
         live_arm_disable_reason_code=one_way_reason_code,
@@ -2188,10 +2228,14 @@ def build_operational_status_payload(
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     user_stream_summary = dict(runtime.get("user_stream_summary") or {})
+    binance_rest_summary = dict(runtime.get("binance_rest_summary") or {})
+    if binance_rest_summary:
+        reconciliation_summary["rest_connectivity"] = binance_rest_summary
     inject_freshness_blockers = not settings_row.trading_paused
     sync_blocked_reasons = _derive_sync_blocking_reasons(sync_summary) if inject_freshness_blockers else []
     market_blocked_reasons = _derive_market_blocking_reasons(market_summary) if inject_freshness_blockers else []
     user_stream_blocked_reasons = _derive_user_stream_blocking_reasons(user_stream_summary) if inject_freshness_blockers else []
+    binance_rest_blocked_reasons = _derive_binance_rest_blocking_reasons(binance_rest_summary) if inject_freshness_blockers else []
     reconciliation_blocked_reasons = (
         _derive_reconciliation_blocking_reasons(reconciliation_summary) if inject_freshness_blockers else []
     )
@@ -2199,6 +2243,7 @@ def build_operational_status_payload(
         sync_blocked_reasons
         + market_blocked_reasons
         + user_stream_blocked_reasons
+        + binance_rest_blocked_reasons
         + reconciliation_blocked_reasons
         + [
             str(item)
@@ -2214,6 +2259,7 @@ def build_operational_status_payload(
         sync_blocked_reasons
         + market_blocked_reasons
         + user_stream_blocked_reasons
+        + binance_rest_blocked_reasons
         + reconciliation_blocked_reasons
         + (current_cycle_blocked_reasons or recent_blocked_reasons)
     )
@@ -2263,14 +2309,43 @@ def build_operational_status_payload(
         and not _sync_blocks_new_entries(sync_summary)
         and not _market_blocks_new_entries(market_summary)
         and not _user_stream_blocks_new_entries(user_stream_summary)
+        and not _binance_rest_blocks_new_entries(binance_rest_summary)
         and not _reconciliation_blocks_new_entries(reconciliation_summary)
     )
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
     one_way_reason_code, one_way_reason_message = _one_way_requirement_reason_payload(reconciliation_summary)
+    reason_code_basis = _prioritize_blocked_reasons(
+        current_blocked_reasons
+        + recent_blocked_reasons
+        + auto_resume_last_blockers
+        + ([one_way_reason_code] if one_way_reason_code else [])
+        + ([guard_mode_reason["guard_mode_reason_code"]] if guard_mode_reason["guard_mode_reason_code"] else [])
+    )
+    degraded_reason_codes = derive_degraded_reason_codes(
+        reason_code_basis,
+        operating_state=operating_state,
+    )
+    protection_reason_codes = derive_protection_reason_codes(
+        reason_code_basis,
+        operating_state=operating_state,
+        missing_protection_symbols=missing_protection_symbols,
+        missing_protection_items=missing_protection_items,
+    )
+    exchange_can_trade = _coerce_optional_bool(get_sync_state_detail(settings_row).get("account", {}).get("exchange_can_trade"))
+    exchange_connectivity_state = resolve_exchange_connectivity_state(
+        exchange_can_trade,
+        reason_codes=reason_code_basis,
+        user_stream_summary=user_stream_summary,
+        reconciliation_summary=reconciliation_summary,
+    )
     control_status_summary = _build_control_status_summary(
         settings_row,
         operating_state=operating_state,
         current_cycle_blocked_reasons=current_cycle_blocked_reasons,
+        blocked_reason_codes=current_blocked_reasons,
+        degraded_reason_codes=degraded_reason_codes,
+        protection_reason_codes=protection_reason_codes,
+        exchange_connectivity_state=exchange_connectivity_state,
         risk_allowed=risk_allowed,
         reconciliation_summary=reconciliation_summary,
         drawdown_state_summary=drawdown_state_summary,
@@ -2293,6 +2368,7 @@ def build_operational_status_payload(
         limited_live_max_notional=(
             get_limited_live_max_notional(settings_row) if rollout_mode == "limited_live" else None
         ),
+        exchange_connectivity_state=exchange_connectivity_state,
         live_trading_env_enabled=app_defaults.live_trading_env_enabled,
         live_execution_ready=live_execution_ready,
         trading_paused=settings_row.trading_paused,
@@ -2313,6 +2389,9 @@ def build_operational_status_payload(
         pause_severity=pause_reason_severity(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         pause_recovery_class=pause_reason_recovery_class(settings_row.pause_reason_code) if settings_row.trading_paused else None,
         blocked_reasons=current_blocked_reasons,
+        blocked_reason_codes=current_blocked_reasons,
+        degraded_reason_codes=degraded_reason_codes,
+        protection_reason_codes=protection_reason_codes,
         latest_blocked_reasons=recent_blocked_reasons,
         account_sync_summary=account_summary,
         sync_freshness_summary=sync_summary,
@@ -2969,6 +3048,7 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
         "account_sync_summary": account_sync_summary,
         "sync_freshness_summary": sync_freshness_summary,
         "market_freshness_summary": market_freshness_summary,
+        "binance_rest_summary": operational_status.reconciliation_summary.get("rest_connectivity", {}),
         "exposure_summary": exposure_summary,
         "execution_policy_summary": execution_policy_summary,
         "market_context_summary": market_context_summary,

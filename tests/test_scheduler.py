@@ -4,13 +4,14 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
-from trading_mvp.models import AgentRun, MarketSnapshot, Position, SchedulerRun
+from trading_mvp.models import AgentRun, MarketSnapshot, Position, SchedulerRun, SystemHealthEvent
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.scheduler import (
     get_due_interval_decision_symbols,
     get_due_position_management_symbols,
     run_release_enrichment_watch_cycle,
+    run_due_operational_cycles,
     run_interval_decision_cycle,
 )
 from trading_mvp.services.settings import get_or_create_settings
@@ -119,6 +120,40 @@ def _seed_market_snapshot(
         )
     )
     db_session.flush()
+
+
+def test_run_due_operational_cycles_isolates_background_workflow_failure(monkeypatch, db_session) -> None:
+    calls: list[str] = []
+
+    def fail_market_refresh(session, triggered_by="scheduler"):
+        calls.append("market")
+        raise RuntimeError("market failed")
+
+    def run_position_management(session, triggered_by="scheduler"):
+        calls.append("position_management")
+        return {"workflow": "position_management_cycle", "results": [{"status": "ok"}]}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_market_refresh_cycle", fail_market_refresh)
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.run_release_enrichment_watch_cycle",
+        lambda session, triggered_by="scheduler": {"workflow": "release_enrichment_watch_cycle", "results": []},
+    )
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_position_management_cycle", run_position_management)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_entry_plan_watcher_cycle", lambda session: None)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_interval_decision_cycle", lambda session: None)
+
+    result = run_due_operational_cycles(
+        db_session,
+        include_exchange_sync=False,
+        commit_between=True,
+        continue_on_error=True,
+    )
+
+    health_event = db_session.scalar(select(SystemHealthEvent).order_by(SystemHealthEvent.id.desc()).limit(1))
+    assert calls == ["market", "position_management"]
+    assert result == [{"workflow": "position_management_cycle", "results": [{"status": "ok"}]}]
+    assert health_event is not None
+    assert health_event.payload["workflow"] == "market_refresh_cycle"
 
 
 @pytest.mark.parametrize(

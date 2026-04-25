@@ -3684,6 +3684,9 @@ class TradingOrchestrator:
                     )
                 )
             except Exception as exc:
+                fallback_reason = " ".join(str(exc).split())
+                if len(fallback_reason) > 420:
+                    fallback_reason = f"{fallback_reason[:417]}..."
                 fallback_candidate = TradeDecisionCandidate(
                     candidate_id=f"{symbol}:{effective_timeframe}:fallback",
                     scenario="hold",
@@ -3700,7 +3703,10 @@ class TradingOrchestrator:
                     leverage=1.0,
                     rationale_codes=["CANDIDATE_SELECTION_FALLBACK"],
                     explanation_short="후보 선별 fallback",
-                    explanation_detailed=f"Candidate selection fell back because market context collection failed: {exc}",
+                    explanation_detailed=(
+                        "Candidate selection fell back because market context collection failed: "
+                        f"{fallback_reason}"
+                    ),
                 )
                 candidate_rows.append(
                     {
@@ -4369,6 +4375,13 @@ class TradingOrchestrator:
                     snapshot_id=market_row.id,
                     decision_id=plan.source_decision_run_id,
                 )
+                source_decision_metadata = (
+                    source_decision_run.metadata_json
+                    if isinstance(source_decision_run.metadata_json, dict)
+                    else {}
+                )
+                source_ai_context = _as_dict(source_decision_metadata.get("ai_context"))
+                source_lead_market_context = _as_dict(source_ai_context.get("lead_lag_summary"))
                 risk_result, risk_row = evaluate_risk(
                     self.session,
                     self.settings_row,
@@ -4377,6 +4390,7 @@ class TradingOrchestrator:
                     decision_run_id=plan.source_decision_run_id,
                     market_snapshot_id=market_row.id,
                     execution_mode="live",
+                    decision_context={"lead_market_context": source_lead_market_context},
                 )
                 risk_correlation_ids = normalize_correlation_ids(correlation_ids, risk_id=risk_row.id)
                 record_audit_event(
@@ -6752,6 +6766,7 @@ class TradingOrchestrator:
                 "meta_gate": decision_metadata.get("meta_gate"),
                 "slot_allocation": decision_metadata.get("slot_allocation"),
                 "holding_profile_context": decision_metadata.get("holding_profile_context"),
+                "lead_market_context": _as_dict(ai_context_payload.get("lead_lag_summary")),
             },
         )
         risk_correlation_ids = normalize_correlation_ids(

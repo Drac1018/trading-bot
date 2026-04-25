@@ -50,6 +50,13 @@ const reasonCodeLabelMap: Record<string, string> = {
   POSITION_STATE_STALE: "포지션 상태 stale",
   OPEN_ORDERS_STATE_STALE: "오더 상태 stale",
   PROTECTION_STATE_UNVERIFIED: "보호 주문 검증 불가",
+  UNRESOLVED_SUBMISSION_GUARD_ACTIVE: "미해결 주문 제출 가드",
+  UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED: "미해결 주문 확인 초과",
+  LIVE_ORDER_SUBMISSION_UNKNOWN: "주문 제출 결과 불명확",
+  BINANCE_REST_CIRCUIT_OPEN: "Binance REST 회로 열림",
+  DRAWDOWN_STATE_CAUTION: "드로다운 주의",
+  DRAWDOWN_STATE_CONTAINMENT: "드로다운 억제",
+  DRAWDOWN_STATE_RECOVERY: "드로다운 회복",
 };
 
 const schedulerStatusLabelMap: Record<string, string> = {

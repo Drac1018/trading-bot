@@ -8,7 +8,11 @@ from trading_mvp.models import PnLSnapshot, Position
 from trading_mvp.schemas import TradeDecision
 from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
 from trading_mvp.services.market_data import build_market_snapshot
-from trading_mvp.services.risk import evaluate_risk, validate_decision_schema
+from trading_mvp.services.risk import (
+    evaluate_risk,
+    is_survival_path_decision,
+    validate_decision_schema,
+)
 from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
@@ -77,6 +81,22 @@ def _entry_decision(
         explanation_short="entry trigger test",
         explanation_detailed="Deterministic entry trigger regression test.",
     )
+
+
+def test_survival_path_predicate_accepts_reduce_only_management_action() -> None:
+    entry = _entry_decision().model_copy(
+        update={"intent_family": "entry", "management_action": "none"}
+    )
+    reduce_only = _entry_decision(decision="reduce").model_copy(
+        update={
+            "intent_family": "management",
+            "management_action": "reduce_only",
+            "rationale_codes": ["POSITION_MANAGEMENT_EDGE_DECAY"],
+        }
+    )
+
+    assert is_survival_path_decision(entry) is False
+    assert is_survival_path_decision(reduce_only) is True
 
 
 def _decision_context(
@@ -1132,6 +1152,50 @@ def test_reduce_and_exit_remain_allowed_under_exposure_limits(db_session) -> Non
     assert exit_result.allowed is True
     assert "GROSS_EXPOSURE_LIMIT_REACHED" not in reduce_result.reason_codes
     assert "DIRECTIONAL_BIAS_LIMIT_REACHED" not in exit_result.reason_codes
+
+
+def test_alt_entry_blocks_when_lead_context_unavailable_but_reduce_survives(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("SOLUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="SOLUSDT",
+        entry_zone_min=snapshot.latest_price * 0.999,
+        entry_zone_max=snapshot.latest_price * 1.001,
+        stop_loss=snapshot.latest_price * 0.97,
+        take_profit=snapshot.latest_price * 1.04,
+        max_chase_bps=100.0,
+    )
+    lead_context = {
+        "lead_context_status": "unavailable",
+        "missing_lead_symbols": ["BTCUSDT", "ETHUSDT"],
+        "reason_codes": ["LEAD_CONTEXT_UNAVAILABLE"],
+    }
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={"lead_market_context": lead_context},
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision.model_copy(update={"decision": "reduce", "entry_mode": "none", "max_chase_bps": None}),
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={"lead_market_context": lead_context},
+    )
+
+    assert entry_result.allowed is False
+    assert "ALT_ENTRY_LEAD_CONTEXT_UNAVAILABLE" in entry_result.reason_codes
+    assert entry_result.debug_payload["lead_market_context"]["lead_context_status"] == "unavailable"
+    assert reduce_result.allowed is True
+    assert "ALT_ENTRY_LEAD_CONTEXT_UNAVAILABLE" not in reduce_result.reason_codes
 
 
 def test_live_entry_keeps_existing_path_when_sync_state_is_fresh(db_session) -> None:

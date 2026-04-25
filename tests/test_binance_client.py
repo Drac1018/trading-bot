@@ -47,6 +47,8 @@ def test_signed_requests_use_epoch_timestamp(monkeypatch) -> None:
 
 
 def test_http_error_exposes_binance_code_and_message(monkeypatch) -> None:
+    events: list[dict[str, object]] = []
+
     class ErrorResponse:
         def __init__(self) -> None:
             self.text = '{"code":-1021,"msg":"Timestamp outside recvWindow"}'
@@ -88,11 +90,16 @@ def test_http_error_exposes_binance_code_and_message(monkeypatch) -> None:
     monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
 
     with pytest.raises(RuntimeError, match="Binance error -1021: Timestamp outside recvWindow"):
-        BinanceClient(api_key="key", api_secret="secret").get_account_info()
+        BinanceClient(api_key="key", api_secret="secret", request_error_hook=events.append).get_account_info()
+
+    assert events[0]["endpoint_category"] == "account"
+    assert events[0]["error_type"] == "status"
+    assert events[0]["status_code"] == 400
 
 
 def test_get_retry_attempts_can_be_capped(monkeypatch) -> None:
     calls = 0
+    events: list[dict[str, object]] = []
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -112,9 +119,167 @@ def test_get_retry_attempts_can_be_capped(monkeypatch) -> None:
     monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
 
     with pytest.raises(httpx.TransportError, match="network timeout"):
-        BinanceClient(max_get_attempts=1).fetch_klines("BTCUSDT", "1m", limit=2)
+        BinanceClient(max_get_attempts=1, request_error_hook=events.append).fetch_klines("BTCUSDT", "1m", limit=2)
 
     assert calls == 1
+    assert len(events) == 1
+    assert events[0]["event"] == "binance_request_error"
+    assert events[0]["method"] == "GET"
+    assert events[0]["path"] == "/fapi/v1/klines"
+    assert events[0]["endpoint_category"] == "market_data"
+    assert events[0]["error_type"] == "transport"
+    assert events[0]["exception"] == "TransportError"
+    assert events[0]["attempt"] == 1
+    assert events[0]["attempts"] == 1
+
+
+def test_injected_http_client_handles_requests_without_owning_lifecycle() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json={})
+
+    http_client = httpx.Client(
+        base_url="https://fapi.binance.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        client = BinanceClient(http_client=http_client)
+        assert client.ping() == {}
+        client.close()
+        assert http_client.is_closed is False
+    finally:
+        http_client.close()
+
+    assert requests == [("GET", "/fapi/v1/ping")]
+
+
+def test_default_http_client_is_lazy_reused_and_closeable(monkeypatch) -> None:
+    instances: list[Any] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            self.requests: list[str] = []
+            instances.append(self)
+
+        def request(self, method, path, params=None, headers=None):
+            self.requests.append(path)
+            return FakeResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    client = BinanceClient()
+
+    assert instances == []
+    client.ping()
+    client.ping()
+
+    assert len(instances) == 1
+    assert instances[0].requests == ["/fapi/v1/ping", "/fapi/v1/ping"]
+
+    client.close()
+
+    assert instances[0].closed is True
+
+
+def test_context_manager_closes_owned_http_client(monkeypatch) -> None:
+    instances: list[Any] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            instances.append(self)
+
+        def request(self, method, path, params=None, headers=None):
+            return FakeResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    with BinanceClient() as client:
+        client.ping()
+
+    assert instances[0].closed is True
+
+
+def test_new_order_requires_client_order_id() -> None:
+    with pytest.raises(ValueError, match="client_order_id"):
+        BinanceClient(api_key="key", api_secret="secret").new_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=0.002,
+        )
+
+
+@pytest.mark.parametrize(
+    ("order_type", "expected_path", "order_kwargs"),
+    [
+        ("MARKET", "/fapi/v1/order", {"quantity": 0.002}),
+        ("STOP_MARKET", "/fapi/v1/algoOrder", {"stop_price": 69000.0, "close_position": True}),
+    ],
+)
+def test_order_submission_timeout_is_not_blind_retried(monkeypatch, order_type, expected_path, order_kwargs) -> None:
+    requested_paths: list[str] = []
+    events: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def request(self, method, path, params=None, headers=None):
+            requested_paths.append(path)
+            raise httpx.ReadTimeout("submit timed out")
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    with pytest.raises(httpx.ReadTimeout, match="submit timed out"):
+        BinanceClient(api_key="key", api_secret="secret", request_error_hook=events.append).new_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type=order_type,
+            client_order_id="mvp-client-1",
+            **order_kwargs,
+        )
+
+    assert requested_paths == [expected_path]
+    assert len(events) == 1
+    assert events[0]["event"] == "binance_request_error"
+    assert events[0]["method"] == "POST"
+    assert events[0]["path"] == expected_path
+    assert events[0]["endpoint_category"] == "order_submission"
+    assert events[0]["error_type"] == "timeout"
+    assert events[0]["exception"] == "ReadTimeout"
+    assert events[0]["attempt"] == 1
+    assert events[0]["attempts"] == 2
+    assert events[0]["mutating_request"] is True
 
 
 def test_timestamp_error_resyncs_with_server_time(monkeypatch) -> None:

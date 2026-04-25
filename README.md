@@ -45,9 +45,13 @@
 - 일일 손실 한도 `5%`
 - 연속 손실 `3회` 이후 신규 진입 보수 제한
 - 계좌/시장 상태 불확실 시 신규 진입 차단
+- 보호주문 미검증, 운영 상태 degraded/manage-only, unresolved submission guard가 있으면 신규 진입 차단
+- Binance API 일시 장애는 sync freshness / guard mode reason code로 드러내고, 이전 캐시나 로컬 동기화 상태를 최신 원본처럼 표시하지 않음
+- lead-lag context unavailable/partial은 신규 진입 근거를 강화하지 않으며, data quality가 unavailable이면 신규 진입 AI review는 hold로 fail-close
 - AI보다 결정론적 정책이 항상 우선
 
 `max_leverage`, `max_risk_per_trade`, `max_daily_loss`는 운영 상한값이지만, 런타임에서는 위 하드 정책을 넘을 수 없습니다.
+`reduce`, `exit`, 검증된 보호주문 복구, emergency exit 같은 survival path는 신규 진입 허용과 별도로 취급합니다.
 
 ## 최소 검증 명령
 

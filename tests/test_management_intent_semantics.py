@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from trading_mvp.models import AgentRun, Execution, Order, Position
 from trading_mvp.services.capital_efficiency import build_capital_efficiency_report
-from trading_mvp.services.intent_semantics import infer_intent_semantics
+from trading_mvp.services.intent_semantics import infer_intent_semantics, is_survival_path_intent
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -204,3 +204,32 @@ def test_reduce_and_exit_intents_keep_non_entry_management_semantics() -> None:
     assert exit_semantics["intent_family"] == "exit"
     assert exit_semantics["management_action"] == "exit_only"
     assert exit_semantics["analytics_excluded_from_entry_stats"] is True
+
+
+def test_survival_path_predicate_uses_intent_semantics_beyond_decision_text() -> None:
+    plain_entry = {
+        "decision": "long",
+        "intent_family": "entry",
+        "management_action": "none",
+        "rationale_codes": ["PULLBACK_ENTRY_BIAS"],
+    }
+    protection_restore = {
+        "decision": "long",
+        "intent_family": "protection",
+        "management_action": "restore_protection",
+        "rationale_codes": ["PROTECTION_REQUIRED", "PROTECTION_RESTORE"],
+    }
+    reduce_only = {
+        "intent_family": "management",
+        "management_action": "reduce_only",
+        "rationale_codes": ["POSITION_MANAGEMENT_EDGE_DECAY"],
+    }
+    emergency_exit = {
+        "action": "exit",
+        "intent_type": "emergency_exit",
+    }
+
+    assert is_survival_path_intent(plain_entry) is False
+    assert is_survival_path_intent(protection_restore) is True
+    assert is_survival_path_intent(reduce_only) is True
+    assert is_survival_path_intent(emergency_exit) is True

@@ -65,6 +65,7 @@ type AuditEvent = {
 
 type ControlStatusSummary = {
   exchange_can_trade: boolean | null;
+  exchange_connectivity_state: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;
   limited_live_max_notional: number | null;
@@ -76,6 +77,9 @@ type ControlStatusSummary = {
   degraded: boolean;
   risk_allowed: boolean | null;
   blocked_reasons_current_cycle: string[];
+  blocked_reason_codes: string[];
+  degraded_reason_codes: string[];
+  protection_reason_codes: string[];
 };
 
 type OperatorDecisionSnapshot = {
@@ -97,6 +101,8 @@ type OperatorDecisionSnapshot = {
   candidate_weight: number | null;
   capacity_reason: string | null;
   portfolio_slot_soft_cap_applied: boolean;
+  intent_family: string | null;
+  management_action: string | null;
   last_ai_trigger_reason: string | null;
   last_ai_invoked_at: string | null;
   next_ai_review_due_at: string | null;
@@ -130,6 +136,13 @@ type OperatorRiskSnapshot = {
   reason_codes: string[];
   blocked_reason_codes: string[];
   adjustment_reason_codes: string[];
+  degraded_reason_codes: string[];
+  protection_reason_codes: string[];
+  blocked_reason: string | null;
+  degraded_reason: string | null;
+  approval_required_reason: string | null;
+  survival_path: string | null;
+  exchange_connectivity_state: string | null;
   approved_risk_pct: number | null;
   approved_leverage: number | null;
   raw_projected_notional: number | null;
@@ -283,6 +296,7 @@ export type OperatorDashboardPayload = {
     rollout_mode: RolloutMode;
     exchange_submit_allowed: boolean;
     limited_live_max_notional: number | null;
+    exchange_connectivity_state: string;
     default_symbol: string;
     default_timeframe: string;
     tracked_symbols: string[];
@@ -299,6 +313,9 @@ export type OperatorDashboardPayload = {
     auto_resume_status: string;
     auto_resume_eligible: boolean;
     auto_resume_after: string | null;
+    blocked_reason_codes: string[];
+    degraded_reason_codes: string[];
+    protection_reason_codes: string[];
     auto_resume_last_blockers: string[];
     latest_blocked_reasons: string[];
     control_status_summary?: ControlStatusSummary | null;
@@ -498,16 +515,30 @@ function isSurvivalDecision(value: string | null | undefined) {
   return value === "reduce" || value === "exit";
 }
 
-function recommendationSummary(decision: string | null | undefined) {
-  if (isEntryDecision(decision)) {
+function isSurvivalManagementAction(value: string | null | undefined) {
+  return value === "reduce_only" || value === "exit_only" || value === "restore_protection";
+}
+
+function isSurvivalPath(symbol: OperatorSymbolSummary) {
+  return Boolean(symbol.risk_guard.survival_path) || isSurvivalDecision(symbol.risk_guard.decision);
+}
+
+function recommendationSummary(decision: string | null | undefined, managementAction?: string | null) {
+  if (managementAction === "restore_protection") {
     return {
-      label: "신규 진입 의견",
+      label: "보호 복구 의견",
+      detail: "신규 진입이 아니라 기존 포지션 보호 경로입니다.",
+    };
+  }
+  if (isSurvivalDecision(decision) || isSurvivalManagementAction(managementAction)) {
+    return {
+      label: "정리/축소 의견",
       detail: translateDecision(decision),
     };
   }
-  if (isSurvivalDecision(decision)) {
+  if (isEntryDecision(decision)) {
     return {
-      label: "정리/축소 의견",
+      label: "신규 진입 의견",
       detail: translateDecision(decision),
     };
   }
@@ -526,6 +557,7 @@ function recommendationSummary(decision: string | null | undefined) {
 function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
   const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
   const adjustmentReasons = filteredAdjustmentReasons(symbol);
+  const blockedReasons = filteredBlockedReasons(symbol);
   if (symbol.risk_guard.allowed === null) {
     return {
       label: "판단 대기",
@@ -534,10 +566,10 @@ function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
     };
   }
   if (symbol.risk_guard.allowed) {
-    if (isSurvivalDecision(decision)) {
+    if (isSurvivalPath(symbol)) {
       return {
-        label: "정리/축소 허용",
-        detail: translateDecision(decision),
+        label: symbol.risk_guard.survival_path === "protective_recovery" ? "보호 복구 허용" : "생존 경로 허용",
+        detail: "신규 진입 허용이 아니라 기존 포지션 관리 경로입니다.",
         kind: "good" as const,
       };
     }
@@ -561,16 +593,16 @@ function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
       kind: "neutral" as const,
     };
   }
-  if (isSurvivalDecision(decision)) {
+  if (isSurvivalPath(symbol)) {
     return {
-      label: "정리/축소도 보류",
-      detail: translateDecision(decision),
+      label: "생존 경로도 차단",
+      detail: blockedReasons[0] ? translateReasonCode(blockedReasons[0]) : translateDecision(decision),
       kind: "danger" as const,
     };
   }
   return {
     label: "신규 진입 차단",
-    detail: translateDecision(decision),
+    detail: blockedReasons[0] ? translateReasonCode(blockedReasons[0]) : translateDecision(decision),
     kind: "danger" as const,
   };
 }
@@ -578,8 +610,8 @@ function riskOutcomeSummary(symbol: OperatorSymbolSummary) {
 function executionOutcomeSummary(symbol: OperatorSymbolSummary) {
   const decision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
   const executionStatus = symbol.execution.execution_status ?? symbol.execution.order_status;
-  const flowLabel = isSurvivalDecision(decision)
-    ? "정리/축소"
+  const flowLabel = isSurvivalPath(symbol)
+    ? "생존 경로"
     : isEntryDecision(decision)
       ? "신규 진입"
       : "주문";
@@ -729,6 +761,16 @@ function translateAccountSyncStatus(value: string | null | undefined) {
     return "-";
   }
   return accountSyncStatusLabelMap[value] ?? value;
+}
+
+function translateExchangeConnectivityState(value: string | null | undefined) {
+  const labels: Record<string, string> = {
+    tradable: "거래 가능",
+    degraded: "연결/동기화 주의",
+    blocked: "거래소 차단",
+    unknown: "확인 전",
+  };
+  return labels[value ?? "unknown"] ?? String(value ?? "unknown");
 }
 
 function translateSchedulerStatus(value: string | null | undefined) {
@@ -1063,6 +1105,8 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
   const summary = control.control_status_summary;
   return {
     exchange_can_trade: summary?.exchange_can_trade ?? null,
+    exchange_connectivity_state:
+      summary?.exchange_connectivity_state ?? control.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? control.rollout_mode,
     exchange_submit_allowed: summary?.exchange_submit_allowed ?? control.exchange_submit_allowed,
     limited_live_max_notional: summary?.limited_live_max_notional ?? control.limited_live_max_notional,
@@ -1075,6 +1119,11 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
     risk_allowed: summary?.risk_allowed ?? null,
     blocked_reasons_current_cycle: dedupeReasons(
       summary?.blocked_reasons_current_cycle ?? control.latest_blocked_reasons,
+    ),
+    blocked_reason_codes: dedupeReasons(summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? []),
+    degraded_reason_codes: dedupeReasons(summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? []),
+    protection_reason_codes: dedupeReasons(
+      summary?.protection_reason_codes ?? control.protection_reason_codes ?? [],
     ),
   };
 }
@@ -1105,24 +1154,25 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
     },
     {
       title: "거래소 주문 가능 상태",
-      value:
-        summary.exchange_can_trade === null
-          ? "미확인"
-          : summary.exchange_can_trade
-            ? "가능"
-            : "차단",
+      value: translateExchangeConnectivityState(summary.exchange_connectivity_state),
       hint:
-        summary.exchange_can_trade === null
+        summary.exchange_connectivity_state === "degraded"
+          ? summary.degraded_reason_codes[0]
+            ? translateReasonCode(summary.degraded_reason_codes[0])
+            : "거래소 연결 또는 동기화 상태를 다시 확인해야 합니다."
+          : summary.exchange_can_trade === null
           ? "최근 계좌 동기화에서 거래소 주문 가능 여부를 아직 확인하지 못했습니다."
           : summary.exchange_can_trade
             ? "거래소 계좌 상태 기준으로 새 주문을 보낼 수 있습니다."
             : "거래소 계좌 상태 기준으로 새 주문이 막혀 있습니다.",
       kind:
-        summary.exchange_can_trade === null
-          ? ("neutral" as const)
-          : summary.exchange_can_trade
-            ? ("good" as const)
-            : ("danger" as const),
+        summary.exchange_connectivity_state === "blocked"
+          ? ("danger" as const)
+          : summary.exchange_connectivity_state === "degraded"
+            ? ("warn" as const)
+            : summary.exchange_connectivity_state === "tradable"
+              ? ("good" as const)
+              : ("neutral" as const),
     },
     {
       title: "앱 실거래 준비",
@@ -1194,11 +1244,26 @@ function filteredBlockedReasons(symbol: OperatorSymbolSummary) {
     symbol.risk_guard.blocked_reason_codes.length > 0
       ? symbol.risk_guard.blocked_reason_codes
       : symbol.blocked_reasons;
-  return source.filter((item, index, array) => array.indexOf(item) === index);
+  return dedupeReasons([
+    ...source,
+    ...(symbol.risk_guard.blocked_reason ? [symbol.risk_guard.blocked_reason] : []),
+    ...(symbol.risk_guard.approval_required_reason ? [symbol.risk_guard.approval_required_reason] : []),
+  ]);
 }
 
 function filteredAdjustmentReasons(symbol: OperatorSymbolSummary) {
   return symbol.risk_guard.adjustment_reason_codes.filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function filteredDegradedReasons(symbol: OperatorSymbolSummary) {
+  return dedupeReasons([
+    ...symbol.risk_guard.degraded_reason_codes,
+    ...(symbol.risk_guard.degraded_reason ? [symbol.risk_guard.degraded_reason] : []),
+  ]);
+}
+
+function filteredProtectionReasons(symbol: OperatorSymbolSummary) {
+  return dedupeReasons(symbol.risk_guard.protection_reason_codes);
 }
 
 function accountSnapshotCard(control: OperatorDashboardPayload["control"]) {
@@ -1350,7 +1415,9 @@ function GlobalOperatorSummary({
     ["open_orders", "오더"],
     ["protective_orders", "보호 주문"],
   ] as const;
-  const focusRecommendation = focusSymbol ? recommendationSummary(focusSymbol.ai_decision.decision) : null;
+  const focusRecommendation = focusSymbol
+    ? recommendationSummary(focusSymbol.ai_decision.decision, focusSymbol.ai_decision.management_action)
+    : null;
   const focusRiskOutcome = focusSymbol ? riskOutcomeSummary(focusSymbol) : null;
   const focusExecutionOutcome = focusSymbol ? executionOutcomeSummary(focusSymbol) : null;
   const recentGlobalAuditEvents = globalAuditEvents.slice(0, 3);
@@ -1481,6 +1548,16 @@ function GlobalOperatorSummary({
               recordBoolean(control.account_sync_summary, "account_snapshot_available") ? "실계좌 반영" : "없음",
             ],
             ["계좌 동기화 상태", translateAccountSyncStatus(recordString(control.account_sync_summary, "status"))],
+            ["거래소 연결 상태", translateExchangeConnectivityState(controlSummary.exchange_connectivity_state)],
+            [
+              "상태/보호 사유",
+              [...controlSummary.degraded_reason_codes, ...controlSummary.protection_reason_codes].length > 0
+                ? [...controlSummary.degraded_reason_codes, ...controlSummary.protection_reason_codes]
+                    .filter((code, index, array) => array.indexOf(code) === index)
+                    .map(translateReasonCode)
+                    .join(", ")
+                : "-",
+            ],
             ["계좌 요약 기준", translateAccountSummaryBasis(recordString(control.pnl_summary, "basis"))],
           ].map(([label, value], index) => (
             <div
@@ -1764,7 +1841,7 @@ function SymbolStatusBoard({
           <tbody>
             {visibleSymbols.map((item) => {
               const blockedReasons = filteredBlockedReasons(item);
-              const recommendation = recommendationSummary(item.ai_decision.decision);
+              const recommendation = recommendationSummary(item.ai_decision.decision, item.ai_decision.management_action);
               const review = aiReviewSummary(item);
               const riskOutcome = riskOutcomeSummary(item);
               const executionOutcome = executionOutcomeSummary(item);
@@ -1888,9 +1965,11 @@ function SymbolDetailPanel({
   }
 
   const blockedReasons = filteredBlockedReasons(symbol);
+  const degradedReasons = filteredDegradedReasons(symbol);
+  const protectionReasons = filteredProtectionReasons(symbol);
   const adjustmentReasons = filteredAdjustmentReasons(symbol);
   const autoResized = symbol.risk_guard.auto_resized_entry;
-  const recommendation = recommendationSummary(symbol.ai_decision.decision);
+  const recommendation = recommendationSummary(symbol.ai_decision.decision, symbol.ai_decision.management_action);
   const review = aiReviewSummary(symbol);
   const riskOutcome = riskOutcomeSummary(symbol);
   const executionOutcome = executionOutcomeSummary(symbol);
@@ -2063,6 +2142,18 @@ function SymbolDetailPanel({
                   {translateReasonCode(code)}
                 </div>
               ))}
+            </div>
+          ) : null}
+          {degradedReasons.length > 0 || protectionReasons.length > 0 ? (
+            <div className="mt-4 space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">상태/보호 사유</p>
+              {[...degradedReasons, ...protectionReasons]
+                .filter((code, index, array) => array.indexOf(code) === index)
+                .map((code) => (
+                  <div key={code} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                    {translateReasonCode(code)}
+                  </div>
+                ))}
             </div>
           ) : null}
         </div>

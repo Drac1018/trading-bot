@@ -1359,6 +1359,68 @@ class MultiSymbolSyncClient(StreamPrimarySyncClient):
         raise AssertionError(f"unexpected symbol: {symbol}")
 
 
+class BulkMultiSymbolSyncClient(StreamPrimarySyncClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_order_symbols: list[str | None] = []
+        self.position_symbols: list[str | None] = []
+
+    def get_position_mode(self):
+        return {"mode": "one_way", "dual_side_position": False}
+
+    def get_open_orders(self, symbol: str | None = None):
+        self.open_order_symbols.append(symbol)
+        if symbol is not None:
+            raise AssertionError("multi-symbol sync should use account-wide open order fetch")
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "orderId": "btc-stop-1",
+                "clientOrderId": "btc-stop-1",
+                "type": "STOP_MARKET",
+                "closePosition": "true",
+                "reduceOnly": "true",
+                "stopPrice": "69000",
+                "positionSide": "BOTH",
+                "status": "NEW",
+            },
+            {
+                "symbol": "BTCUSDT",
+                "orderId": "btc-tp-1",
+                "clientOrderId": "btc-tp-1",
+                "type": "TAKE_PROFIT_MARKET",
+                "closePosition": "true",
+                "reduceOnly": "true",
+                "stopPrice": "72000",
+                "positionSide": "BOTH",
+                "status": "NEW",
+            },
+        ]
+
+    def get_position_information(self, symbol: str | None = None):
+        self.position_symbols.append(symbol)
+        if symbol is not None:
+            raise AssertionError("multi-symbol sync should use account-wide position fetch")
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "positionAmt": "0.01",
+                "entryPrice": "70000",
+                "markPrice": "70100",
+                "leverage": "2",
+                "positionSide": "BOTH",
+            },
+            {
+                "symbol": "ETHUSDT",
+                "positionAmt": "0.02",
+                "entryPrice": "3000",
+                "markPrice": "3010",
+                "leverage": "2",
+                "positionSide": "BOTH",
+            },
+        ]
+
+
 class HedgeModeSyncClient(StreamPrimarySyncClient):
     def get_position_mode(self):
         return {"mode": "hedge", "dual_side_position": True}
@@ -2809,6 +2871,32 @@ def test_sync_live_state_reconciles_enabled_symbols_only_and_records_one_way_map
     assert position.metadata_json["exchange_position_mode"] == "one_way"
 
 
+def test_sync_live_state_prefetches_bulk_exchange_state_for_multi_symbol_sync(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+    settings_row.symbol_cadence_overrides = [{"symbol": "ETHUSDT", "enabled": False}]
+    db_session.flush()
+
+    client = BulkMultiSymbolSyncClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: _connected_user_stream_payload(),
+    )
+
+    result = sync_live_state(db_session, settings_row)
+
+    assert result["symbols"] == ["BTCUSDT", "XRPUSDT"]
+    assert client.open_order_symbols == [None]
+    assert client.position_symbols == [None]
+    assert result["symbol_reconciliation"]["BTCUSDT"]["open_order_count"] == 2
+    assert result["symbol_reconciliation"]["BTCUSDT"]["position_status"] == "open"
+    assert result["symbol_reconciliation"]["XRPUSDT"]["open_order_count"] == 0
+    assert result["symbol_reconciliation"]["XRPUSDT"]["position_status"] == "flat"
+    assert "ETHUSDT" not in result["symbol_reconciliation"]
+
+
 def test_sync_live_state_marks_hedge_mode_guard_and_exposes_runtime_summary(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     settings_row = get_or_create_settings(db_session)
@@ -3129,7 +3217,7 @@ def test_execute_live_trade_recovers_timeout_submission_when_exchange_lookup_fin
     assert any(event.entity_id == str(order.id) for event in events)
 
 
-def test_execute_live_trade_safe_retries_after_timeout_when_order_is_absent(monkeypatch, db_session) -> None:
+def test_execute_live_trade_does_not_retry_timeout_when_order_lookup_is_absent(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     db_session.add(
         Position(
@@ -3162,20 +3250,22 @@ def test_execute_live_trade_safe_retries_after_timeout_when_order_is_absent(monk
     )
     db_session.flush()
 
-    order = db_session.scalar(select(Order).where(Order.external_order_id == "timeout-retry-1"))
+    order = db_session.scalar(select(Order).where(Order.client_order_id == client.submitted_client_order_ids[0]))
 
-    assert result["status"] == "filled"
-    assert client.submit_calls == 2
+    assert result["status"] == "submission_unknown"
+    assert result["reason_codes"] == ["LIVE_ORDER_SUBMISSION_UNKNOWN"]
+    assert client.submit_calls == 1
     assert client.lookup_calls == 1
     assert len({item for item in client.submitted_client_order_ids if item}) == 1
     assert order is not None
-    assert order.metadata_json["submission_tracking"]["submission_state"] == "reconciled"
-    assert order.metadata_json["submission_tracking"]["submit_attempt_count"] == 2
-    assert order.metadata_json["submission_tracking"]["safe_retry_used"] is True
-    assert order.metadata_json["submission_tracking"]["recovered_via"] == "safe_retry_ack"
+    assert order.external_order_id is None
+    assert order.exchange_status == "SUBMIT_UNKNOWN"
+    assert order.metadata_json["submission_tracking"]["submission_state"] == "submit_unknown"
+    assert order.metadata_json["submission_tracking"]["submit_attempt_count"] == 1
+    assert "safe_retry_used" not in order.metadata_json["submission_tracking"]
 
 
-def test_execute_live_trade_dedupes_duplicate_retry_with_same_client_order_id(monkeypatch, db_session) -> None:
+def test_execute_live_trade_does_not_submit_second_order_after_timeout(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     db_session.add(
         Position(
@@ -3208,17 +3298,19 @@ def test_execute_live_trade_dedupes_duplicate_retry_with_same_client_order_id(mo
     )
     db_session.flush()
 
-    order = db_session.scalar(select(Order).where(Order.external_order_id == "timeout-duplicate-restored-1"))
+    order = db_session.scalar(select(Order).where(Order.client_order_id == client.submitted_client_order_ids[0]))
 
-    assert result["status"] == "filled"
-    assert client.submit_calls == 2
-    assert client.lookup_calls == 2
+    assert result["status"] == "submission_unknown"
+    assert result["reason_codes"] == ["LIVE_ORDER_SUBMISSION_UNKNOWN"]
+    assert client.submit_calls == 1
+    assert client.lookup_calls == 1
     assert len({item for item in client.submitted_client_order_ids if item}) == 1
     assert order is not None
-    assert order.metadata_json["submission_tracking"]["submission_state"] == "reconciled"
-    assert order.metadata_json["submission_tracking"]["submit_attempt_count"] == 2
-    assert order.metadata_json["submission_tracking"]["safe_retry_used"] is True
-    assert order.metadata_json["submission_tracking"]["recovered_via"] == "duplicate_client_order_id_lookup"
+    assert order.external_order_id is None
+    assert order.exchange_status == "SUBMIT_UNKNOWN"
+    assert order.metadata_json["submission_tracking"]["submission_state"] == "submit_unknown"
+    assert order.metadata_json["submission_tracking"]["submit_attempt_count"] == 1
+    assert "safe_retry_used" not in order.metadata_json["submission_tracking"]
 
 
 def test_execute_live_trade_marks_timeout_submission_unknown_and_emits_audit(monkeypatch, db_session) -> None:
@@ -3260,15 +3352,15 @@ def test_execute_live_trade_marks_timeout_submission_unknown_and_emits_audit(mon
 
     assert result["status"] == "submission_unknown"
     assert result["reason_codes"] == ["LIVE_ORDER_SUBMISSION_UNKNOWN"]
-    assert client.submit_calls == 2
-    assert client.lookup_calls == 2
+    assert client.submit_calls == 1
+    assert client.lookup_calls == 1
     assert len({item for item in client.submitted_client_order_ids if item}) == 1
     assert order is not None
     assert order.status == "pending"
     assert order.exchange_status == "SUBMIT_UNKNOWN"
     assert order.metadata_json["submission_tracking"]["submission_state"] == "submit_unknown"
-    assert order.metadata_json["submission_tracking"]["submit_attempt_count"] == 2
-    assert order.metadata_json["submission_tracking"]["safe_retry_used"] is True
+    assert order.metadata_json["submission_tracking"]["submit_attempt_count"] == 1
+    assert "safe_retry_used" not in order.metadata_json["submission_tracking"]
     assert any(event.entity_id == str(order.id) for event in audit_events)
     assert any(event.status == "warning" for event in health_events)
 
@@ -3287,6 +3379,8 @@ def test_background_reconcile_restores_submission_unknown_order(monkeypatch, db_
         risk_result=_risk_result("long"),
     )
     assert unknown_result["status"] == "submission_unknown"
+    assert client.submit_calls == 1
+    assert client.lookup_calls == 1
     client.recover_on_lookup = True
 
     sync_result = sync_live_state(db_session, get_or_create_settings(db_session), symbol="BTCUSDT")
@@ -3312,6 +3406,8 @@ def test_submission_unknown_deadline_exceeded_blocks_symbol_entry(monkeypatch, d
         risk_result=_risk_result("long"),
     )
     assert unknown_result["status"] == "submission_unknown"
+    assert client.submit_calls == 1
+    assert client.lookup_calls == 1
 
     row = db_session.scalar(select(Order).where(Order.client_order_id == unknown_result["client_order_id"]))
     assert row is not None
@@ -3350,6 +3446,8 @@ def test_unresolved_submission_blocks_same_symbol_entry_before_exchange_call(mon
         risk_result=_risk_result("long"),
     )
     assert first["status"] == "submission_unknown"
+    assert client.submit_calls == 1
+    assert client.lookup_calls == 1
 
     def _unexpected_client(*args, **kwargs):
         raise AssertionError("blocked path must not build exchange client")

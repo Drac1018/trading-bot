@@ -3,12 +3,16 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-
 from trading_mvp.models import Position
 from trading_mvp.schemas import TradeDecision
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import evaluate_risk
-from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
+from trading_mvp.services.runtime_state import (
+    mark_sync_issue,
+    mark_sync_success,
+    record_binance_rest_issue,
+    record_binance_rest_success,
+)
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
@@ -68,6 +72,14 @@ def _mark_mixed_stale_and_incomplete_state(settings_row) -> None:
     )
 
 
+def _mark_fresh_sync_state(settings_row) -> None:
+    now = utcnow_naive()
+    mark_sync_success(settings_row, scope="account", synced_at=now, detail={"exchange_can_trade": True})
+    mark_sync_success(settings_row, scope="positions", synced_at=now)
+    mark_sync_success(settings_row, scope="open_orders", synced_at=now)
+    mark_sync_success(settings_row, scope="protective_orders", synced_at=now)
+
+
 def _incomplete_snapshot():
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
     return snapshot.model_copy(update={"is_complete": False})
@@ -76,6 +88,20 @@ def _incomplete_snapshot():
 def _stale_and_incomplete_snapshot():
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140, force_stale=True)
     return snapshot.model_copy(update={"is_complete": False})
+
+
+def _triggered_entry_decision(snapshot) -> TradeDecision:
+    price = snapshot.latest_price
+    return _entry_decision().model_copy(
+        update={
+            "entry_zone_min": price * 0.999,
+            "entry_zone_max": price * 1.001,
+            "entry_mode": "pullback_confirm",
+            "invalidation_price": price * 0.98,
+            "stop_loss": price * 0.99,
+            "take_profit": price * 1.02,
+        }
+    )
 
 
 def test_entry_returns_fixed_reason_codes_for_stale_and_incomplete_state(db_session) -> None:
@@ -110,6 +136,105 @@ def test_entry_blocks_stale_market_with_fixed_reason_code(db_session) -> None:
     )
 
     assert result.allowed is False
+    assert "MARKET_STATE_STALE" in result.reason_codes
+
+
+def test_binance_rest_circuit_open_blocks_entries_but_not_survival_paths(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _prime_live_ready(settings_row)
+    _mark_fresh_sync_state(settings_row)
+    record_binance_rest_issue(
+        settings_row,
+        reason_code="BINANCE_REST_MUTATING_ORDER_FAILED",
+        source="test",
+        error="order submit failed",
+        failure_type="mutating_order_failure",
+        mutating_request=True,
+    )
+    db_session.flush()
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        _triggered_entry_decision(snapshot),
+        snapshot,
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        _entry_decision(decision="reduce"),
+        snapshot,
+    )
+
+    assert entry_result.allowed is False
+    assert "BINANCE_REST_CIRCUIT_OPEN" in entry_result.reason_codes
+    assert reduce_result.allowed is True
+    assert "BINANCE_REST_CIRCUIT_OPEN" not in reduce_result.reason_codes
+
+
+def test_binance_rest_recovering_requires_fresh_sync_before_entry_resume(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _prime_live_ready(settings_row)
+    record_binance_rest_issue(
+        settings_row,
+        reason_code="BINANCE_REST_SERVER_ERROR",
+        source="test",
+        error="server error",
+        failure_type="server_error",
+        server_error=True,
+    )
+    record_binance_rest_success(settings_row, source="test_recovery_probe")
+    db_session.flush()
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    recovering_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        _triggered_entry_decision(snapshot),
+        snapshot,
+    )
+
+    _mark_fresh_sync_state(settings_row)
+    record_binance_rest_success(settings_row, source="test_recovery_probe")
+    db_session.flush()
+    recovered_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        _triggered_entry_decision(snapshot),
+        snapshot,
+    )
+
+    assert recovering_result.allowed is False
+    assert "BINANCE_REST_RECOVERING_SYNC_STALE" in recovering_result.reason_codes
+    assert "BINANCE_REST_RECOVERING_SYNC_STALE" not in recovered_result.reason_codes
+    assert "BINANCE_REST_CIRCUIT_OPEN" not in recovered_result.reason_codes
+
+
+def test_unvalidated_protection_restore_intent_still_blocks_as_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _prime_live_ready(settings_row)
+    _mark_mixed_stale_and_incomplete_state(settings_row)
+    db_session.flush()
+
+    decision = _entry_decision().model_copy(
+        update={
+            "intent_family": "protection",
+            "management_action": "restore_protection",
+            "rationale_codes": ["PROTECTION_REQUIRED", "PROTECTION_RESTORE"],
+        }
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        _stale_and_incomplete_snapshot(),
+    )
+
+    assert result.allowed is False
+    assert "ACCOUNT_STATE_STALE" in result.reason_codes
+    assert "PROTECTION_STATE_UNVERIFIED" in result.reason_codes
     assert "MARKET_STATE_STALE" in result.reason_codes
 
 
@@ -174,6 +299,9 @@ def test_protective_recovery_ignores_freshness_blockers(db_session) -> None:
                 "entry_zone_max": 70050.0,
                 "stop_loss": 69000.0,
                 "take_profit": 72000.0,
+                "intent_family": "protection",
+                "management_action": "restore_protection",
+                "rationale_codes": ["PROTECTION_REQUIRED", "PROTECTION_RESTORE"],
             }
         ),
         _stale_and_incomplete_snapshot(),
@@ -181,4 +309,3 @@ def test_protective_recovery_ignores_freshness_blockers(db_session) -> None:
 
     assert result.allowed is True
     assert FRESHNESS_REASON_CODES.isdisjoint(result.reason_codes)
-

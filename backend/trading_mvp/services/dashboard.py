@@ -48,7 +48,12 @@ from trading_mvp.schemas import (
 from trading_mvp.services.audit import compact_audit_payload
 from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.performance_reporting import build_signal_performance_report
-from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, summarize_runtime_state
+from trading_mvp.services.runtime_state import (
+    PROTECTION_REQUIRED_STATE,
+    derive_degraded_reason_codes,
+    derive_protection_reason_codes,
+    summarize_runtime_state,
+)
 from trading_mvp.services.settings import (
     build_event_operator_control_payload,
     build_operational_status_payload,
@@ -172,6 +177,8 @@ RISK_COMPACT_PAYLOAD_KEYS = (
     "blocked_reason",
     "blocked_reason_codes",
     "adjustment_reason_codes",
+    "degraded_reason_codes",
+    "protection_reason_codes",
     "reason_details",
     "approved_risk_pct",
     "approved_leverage",
@@ -185,7 +192,9 @@ RISK_COMPACT_PAYLOAD_KEYS = (
     "operating_state",
     "operating_mode",
     "degraded_reason",
+    "survival_path",
     "policy_source",
+    "exchange_connectivity_state",
     "evaluated_operator_policy",
     "sync_freshness_summary",
     "exposure_headroom_snapshot",
@@ -929,6 +938,19 @@ def _compact_risk_debug_payload(value: object) -> dict[str, Any]:
     )
     if holding_profile:
         compact["holding_profile"] = holding_profile
+    lead_market_context = _compact_dict(
+        source.get("lead_market_context"),
+        allowed_keys=(
+            "lead_context_status",
+            "missing_lead_symbols",
+            "reason_codes",
+        ),
+    )
+    if lead_market_context:
+        compact["lead_market_context"] = lead_market_context
+    binance_rest_summary = _as_dict(source.get("binance_rest_summary"))
+    if binance_rest_summary:
+        compact["binance_rest_summary"] = binance_rest_summary
     sync_timestamps = _compact_dict(source.get("sync_timestamps"))
     if sync_timestamps:
         compact["sync_timestamps"] = sync_timestamps
@@ -2016,6 +2038,25 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
     payload = dict(row.payload) if isinstance(row.payload, dict) else {}
     blocked_reason_codes = _risk_reason_codes_from_row(row)
     adjustment_reason_codes = _risk_adjustment_reason_codes_from_row(row)
+    operating_state = str(payload.get("operating_state") or "") or None
+    degraded_reason = str(payload.get("degraded_reason") or "") or None
+    degraded_reason_codes = (
+        _as_string_list(payload.get("degraded_reason_codes"))
+        if isinstance(payload.get("degraded_reason_codes"), list)
+        else derive_degraded_reason_codes(
+            blocked_reason_codes,
+            operating_state=operating_state,
+            degraded_reason=degraded_reason,
+        )
+    )
+    protection_reason_codes = (
+        _as_string_list(payload.get("protection_reason_codes"))
+        if isinstance(payload.get("protection_reason_codes"), list)
+        else derive_protection_reason_codes(
+            blocked_reason_codes,
+            operating_state=operating_state,
+        )
+    )
     approved_quantity_source = (
         payload.get("approved_quantity")
         if payload.get("approved_quantity") is not None
@@ -2033,9 +2074,13 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
         "blocked_reason_codes": blocked_reason_codes,
         "adjustment_reason_codes": adjustment_reason_codes,
         "blocked_reason": str(payload.get("blocked_reason") or "") or None,
-        "degraded_reason": str(payload.get("degraded_reason") or "") or None,
+        "degraded_reason": degraded_reason,
+        "degraded_reason_codes": degraded_reason_codes,
+        "protection_reason_codes": protection_reason_codes,
         "approval_required_reason": str(payload.get("approval_required_reason") or "") or None,
+        "survival_path": str(payload.get("survival_path") or "") or None,
         "policy_source": str(payload.get("policy_source") or "none") or "none",
+        "exchange_connectivity_state": str(payload.get("exchange_connectivity_state") or "") or None,
         "evaluated_operator_policy": (
             _as_dict(payload.get("evaluated_operator_policy"))
             if isinstance(payload.get("evaluated_operator_policy"), dict)
@@ -2050,7 +2095,7 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
         "size_adjustment_ratio": payload.get("size_adjustment_ratio"),
         "auto_resize_reason": payload.get("auto_resize_reason"),
         "snapshot_id": payload.get("snapshot_id", row.market_snapshot_id),
-        "operating_state": payload.get("operating_state"),
+        "operating_state": operating_state,
         "exposure_headroom_snapshot": exposure_headroom_snapshot,
         "debug_payload": _compact_risk_debug_payload(payload.get("debug_payload", {})),
     }
@@ -2070,6 +2115,8 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     reason_codes = _as_string_list(payload.get("reason_codes", []))
     blocked_reason_codes = _as_string_list(payload.get("blocked_reason_codes", []))
     adjustment_reason_codes = _as_string_list(payload.get("adjustment_reason_codes", []))
+    degraded_reason_codes = _as_string_list(payload.get("degraded_reason_codes", []))
+    protection_reason_codes = _as_string_list(payload.get("protection_reason_codes", []))
     debug_payload = _as_dict(payload.get("debug_payload", {}))
     slot_allocation = _as_dict(debug_payload.get("slot_allocation"))
     holding_profile = _as_dict(debug_payload.get("holding_profile"))
@@ -2087,9 +2134,13 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
         reason_codes=reason_codes,
         blocked_reason_codes=blocked_reason_codes,
         adjustment_reason_codes=adjustment_reason_codes,
+        degraded_reason_codes=degraded_reason_codes,
+        protection_reason_codes=protection_reason_codes,
         blocked_reason=str(payload.get("blocked_reason") or "") or None,
         degraded_reason=str(payload.get("degraded_reason") or "") or None,
         approval_required_reason=str(payload.get("approval_required_reason") or "") or None,
+        survival_path=str(payload.get("survival_path") or "") or None,
+        exchange_connectivity_state=str(payload.get("exchange_connectivity_state") or "") or None,
         policy_source=str(payload.get("policy_source") or "none") or "none",
         evaluated_operator_policy=(
             _as_dict(payload.get("evaluated_operator_policy"))
@@ -2337,18 +2388,40 @@ def _build_protection_snapshot(
     protection_state: dict[str, object],
     *,
     recovery_state: dict[str, object] | None = None,
+    verification_block: dict[str, object] | None = None,
     latest_event: AuditTimelineEntry | None = None,
 ) -> OperatorProtectionSummary:
     recovery_payload = recovery_state if isinstance(recovery_state, dict) else {}
+    verification_payload = verification_block if isinstance(verification_block, dict) else {}
     latest_event_payload = latest_event.payload if latest_event is not None else {}
+    lifecycle_payload = _as_dict(verification_payload.get("protection_lifecycle"))
     lifecycle_state = str(
-        latest_event_payload.get("to_state")
+        lifecycle_payload.get("state")
+        or latest_event_payload.get("to_state")
         or latest_event_payload.get("state")
         or latest_event_payload.get("status")
         or ""
     ) or None
+    blocked_reason_code = str(
+        verification_payload.get("blocked_reason_code")
+        or verification_payload.get("reason_code")
+        or protection_state.get("blocked_reason_code")
+        or ""
+    ) or None
+    blocked_reason = str(
+        verification_payload.get("blocked_reason")
+        or verification_payload.get("last_error")
+        or protection_state.get("blocked_reason")
+        or ""
+    ) or None
     verification_status = None
-    if str(latest_event.event_type if latest_event is not None else "").lower() == "protection_verification_failed":
+    if verification_payload:
+        verification_status = str(
+            verification_payload.get("verification_status")
+            or verification_payload.get("status")
+            or "verify_failed"
+        )
+    elif str(latest_event.event_type if latest_event is not None else "").lower() == "protection_verification_failed":
         verification_status = "verify_failed"
     elif lifecycle_state in {"verified", "placed", "requested", "verify_failed"}:
         verification_status = lifecycle_state
@@ -2376,6 +2449,12 @@ def _build_protection_snapshot(
         trigger_source=str(recovery_payload.get("trigger_source") or "") or None,
         lifecycle_state=lifecycle_state,
         verification_status=verification_status,
+        blocked_reason_code=blocked_reason_code,
+        blocked_reason=blocked_reason,
+        verification_deadline_at=_as_datetime(
+            verification_payload.get("verification_deadline_at")
+            or protection_state.get("verification_deadline_at")
+        ),
         last_event_type=latest_event.event_type if latest_event is not None else None,
         last_event_message=latest_event.message if latest_event is not None else None,
         last_event_at=latest_event.created_at if latest_event is not None else None,
@@ -2443,7 +2522,7 @@ def _latest_rows_by_symbol(
     timestamp_column: Any,
     *conditions: Any,
 ) -> dict[str, Any]:
-    symbol_column = getattr(model, "symbol")
+    symbol_column = model.symbol
     rows: dict[str, Any] = {}
     for symbol in symbols:
         row = session.scalar(
@@ -2607,6 +2686,11 @@ def _build_operator_symbol_summaries(
     protection_recovery_symbols = {
         str(key).upper(): dict(value)
         for key, value in (runtime_summary.get("protection_recovery_symbols") or {}).items()
+        if isinstance(value, dict)
+    }
+    protection_verification_blocks = {
+        str(key).upper(): dict(value)
+        for key, value in (runtime_summary.get("protection_verification_blocks") or {}).items()
         if isinstance(value, dict)
     }
     latest_markets: dict[str, MarketSnapshot] = _latest_rows_by_symbol(
@@ -2811,6 +2895,7 @@ def _build_operator_symbol_summaries(
                 protection_status=_build_protection_snapshot(
                     protection_state,
                     recovery_state=protection_recovery_symbols.get(symbol_key),
+                    verification_block=protection_verification_blocks.get(symbol_key),
                     latest_event=latest_protection_event_by_symbol.get(symbol_key),
                 ),
                 blocked_reasons=_risk_reason_codes_from_row(risk_row),
@@ -2860,6 +2945,7 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
             rollout_mode=overview.operational_status.rollout_mode,
             exchange_submit_allowed=overview.operational_status.exchange_submit_allowed,
             limited_live_max_notional=overview.operational_status.limited_live_max_notional,
+            exchange_connectivity_state=overview.operational_status.exchange_connectivity_state,
             default_symbol=overview.symbol,
             default_timeframe=overview.timeframe,
             tracked_symbols=overview.tracked_symbols,
@@ -2880,6 +2966,9 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
             auto_resume_eligible=overview.operational_status.auto_resume_eligible,
             auto_resume_after=overview.operational_status.auto_resume_after,
             blocked_reasons=overview.operational_status.blocked_reasons,
+            blocked_reason_codes=overview.operational_status.blocked_reason_codes,
+            degraded_reason_codes=overview.operational_status.degraded_reason_codes,
+            protection_reason_codes=overview.operational_status.protection_reason_codes,
             auto_resume_last_blockers=overview.operational_status.auto_resume_last_blockers,
             latest_blocked_reasons=overview.operational_status.latest_blocked_reasons,
             market_freshness_summary=overview.operational_status.market_freshness_summary,

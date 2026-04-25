@@ -36,11 +36,16 @@ from trading_mvp.services.holding_profile import (
     resolve_holding_profile_management_policy,
     resolve_holding_profile_risk_policy,
 )
+from trading_mvp.services.intent_semantics import is_survival_path_intent
 from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
+    derive_degraded_reason_codes,
+    derive_protection_reason_codes,
+    get_binance_rest_detail,
+    get_binance_rest_entry_block_reason_code,
     get_drawdown_state_detail,
     get_operating_state,
     get_reconciliation_blocking_reason_codes,
@@ -61,6 +66,7 @@ HARD_MAX_GLOBAL_LEVERAGE = 5.0
 HARD_MAX_RISK_PER_TRADE = 0.02
 HARD_MAX_DAILY_LOSS = 0.05
 BTC_SYMBOLS = {"BTCUSDT"}
+LEAD_MARKET_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 MAJOR_ALT_SYMBOLS = {"ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"}
 SYNC_BLOCKING_REASON_CODES = {
     "account": "ACCOUNT_STATE_STALE",
@@ -72,7 +78,6 @@ MARKET_BLOCKING_REASON_CODES = {
     "stale": "MARKET_STATE_STALE",
     "incomplete": "MARKET_STATE_INCOMPLETE",
 }
-SURVIVAL_PATH_DECISIONS = {"reduce", "exit"}
 EVENT_POLICY_BLOCK_REASON_CODES = {
     "manual_no_trade_active",
     "operator_force_no_trade",
@@ -135,6 +140,7 @@ ADD_ON_BREADTH_VETO_REASON_CODE = "ADD_ON_BREADTH_VETO"
 ADD_ON_LEAD_LAG_VETO_REASON_CODE = "ADD_ON_LEAD_LAG_VETO"
 ADD_ON_DERIVATIVES_VETO_REASON_CODE = "ADD_ON_DERIVATIVES_VETO"
 ADD_ON_SPREAD_HEADWIND_REASON_CODE = "ADD_ON_SPREAD_HEADWIND"
+ALT_ENTRY_LEAD_CONTEXT_UNAVAILABLE_REASON_CODE = "ALT_ENTRY_LEAD_CONTEXT_UNAVAILABLE"
 ADD_ON_RISK_DOWNSIZED_REASON_CODE = "ADD_ON_RISK_DOWNSIZED"
 ADD_ON_SPREAD_HEADWIND_BPS = 7.0
 ADD_ON_RISK_MULTIPLIER = 0.7
@@ -171,8 +177,20 @@ def validate_decision_schema(payload: dict[str, Any]) -> TradeDecision:
 
 
 def is_survival_path_decision(decision: TradeDecision | str) -> bool:
-    value = decision.decision if isinstance(decision, TradeDecision) else str(decision)
-    return value in SURVIVAL_PATH_DECISIONS
+    return is_survival_path_intent(decision)
+
+
+def _survival_path_label(decision: TradeDecision, *, is_protection_recovery: bool) -> str | None:
+    if is_protection_recovery:
+        return "protective_recovery"
+    if not is_survival_path_intent(decision):
+        return None
+    management_action = str(decision.management_action or "").strip().lower()
+    if decision.decision == "exit" or management_action == "exit_only":
+        return "exit"
+    if decision.decision == "reduce" or management_action == "reduce_only":
+        return "reduce_only"
+    return None
 
 
 def _has_operator_event_override(payload: EventOperatorControlPayload | None) -> bool:
@@ -278,6 +296,63 @@ def _optional_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_dict(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in {None, ""}]
+
+
+def _lead_context_payload(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    context = _as_dict(decision_context)
+    for key in ("lead_market_context", "lead_context", "lead_lag_summary"):
+        payload = _as_dict(context.get(key))
+        if payload:
+            return payload
+    ai_context = _as_dict(context.get("ai_context"))
+    payload = _as_dict(ai_context.get("lead_lag_summary"))
+    if payload:
+        return payload
+    selection_context = _as_dict(context.get("selection_context"))
+    candidate_payload = _as_dict(selection_context.get("candidate"))
+    return _as_dict(candidate_payload.get("lead_lag_summary"))
+
+
+def _lead_market_context_state(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _lead_context_payload(decision_context)
+    missing_symbols = _as_string_list(
+        payload.get("missing_lead_symbols")
+        if "missing_lead_symbols" in payload
+        else payload.get("missing_reference_symbols")
+    )
+    status = str(payload.get("lead_context_status") or "").strip().lower()
+    if status not in {"ok", "partial", "unavailable"}:
+        if payload.get("available") is False:
+            status = "unavailable"
+        elif missing_symbols:
+            status = "partial"
+        else:
+            status = "ok"
+    reason_codes = _as_string_list(payload.get("reason_codes"))
+    if status == "unavailable":
+        reason_codes.append("LEAD_CONTEXT_UNAVAILABLE")
+    elif status == "partial":
+        reason_codes.append("LEAD_CONTEXT_PARTIAL")
+    reason_codes.extend(f"LEAD_CONTEXT_MISSING_{symbol}" for symbol in missing_symbols)
+    return {
+        "lead_context_status": status,
+        "missing_lead_symbols": list(dict.fromkeys(missing_symbols)),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+    }
+
+
+def _is_non_lead_alt_symbol(symbol: str) -> bool:
+    return str(symbol or "").upper() not in LEAD_MARKET_SYMBOLS
 
 
 def _decision_agreement_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
@@ -1416,6 +1491,7 @@ def evaluate_risk(
         else resolve_holding_profile_risk_policy(holding_profile_name)
     )
     slot_allocation = _slot_allocation_context(decision_context)
+    lead_market_context = _lead_market_context_state(decision_context)
     drawdown_policy = (
         dict(drawdown_state.get("policy_adjustments") or {})
         if isinstance(drawdown_state.get("policy_adjustments"), dict)
@@ -1427,6 +1503,7 @@ def evaluate_risk(
         and existing_position is not None
         and _decision_matches_position_side(existing_position.side, decision.decision)
     )
+    survival_path_label = _survival_path_label(decision, is_protection_recovery=is_protection_recovery)
     add_on = _add_on_context(
         decision=decision,
         market_snapshot=market_snapshot,
@@ -1509,6 +1586,10 @@ def evaluate_risk(
         resized_exposure_metrics = requested_exposure_metrics
         exposure_metrics = requested_exposure_metrics
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
+    binance_rest_summary = get_binance_rest_detail(
+        settings_row,
+        sync_freshness_summary=sync_freshness_summary,
+    )
 
     if settings_row.trading_paused and is_entry_decision:
         blocked_reason_codes.append("TRADING_PAUSED")
@@ -1521,6 +1602,12 @@ def evaluate_risk(
         blocked_reason_codes.append(EMERGENCY_EXIT_STATE)
     if is_entry_decision:
         blocked_reason_codes.extend(_market_freshness_reason_codes(market_snapshot))
+    if (
+        is_entry_decision
+        and _is_non_lead_alt_symbol(decision.symbol)
+        and lead_market_context["lead_context_status"] == "unavailable"
+    ):
+        blocked_reason_codes.append(ALT_ENTRY_LEAD_CONTEXT_UNAVAILABLE_REASON_CODE)
     if is_entry_decision and latest_pnl.daily_pnl < 0 and abs(latest_pnl.daily_pnl) / max(latest_pnl.equity, 1.0) >= effective_daily_loss_cap:
         blocked_reason_codes.append("DAILY_LOSS_LIMIT_REACHED")
     if latest_pnl.consecutive_losses >= settings_row.max_consecutive_losses and is_entry_decision:
@@ -1604,6 +1691,12 @@ def evaluate_risk(
             blocked_reason_codes.append(ADD_ON_SPREAD_HEADWIND_REASON_CODE)
     if is_entry_decision and live_requested:
         blocked_reason_codes.extend(_sync_freshness_reason_codes(sync_freshness_summary))
+        binance_rest_block_reason = get_binance_rest_entry_block_reason_code(
+            settings_row,
+            sync_freshness_summary=sync_freshness_summary,
+        )
+        if binance_rest_block_reason is not None:
+            blocked_reason_codes.append(binance_rest_block_reason)
     if is_entry_decision and live_requested:
         blocked_reason_codes.extend(get_reconciliation_blocking_reason_codes(settings_row))
     if is_entry_decision and requested_exchange_reason_code is not None:
@@ -1999,6 +2092,7 @@ def evaluate_risk(
             "drawdown_state": drawdown_state_code,
             "same_side_pyramiding": same_side_pyramiding,
         },
+        "lead_market_context": lead_market_context,
         "suppression_context": suppression_context,
         "setup_cluster_state": setup_cluster_state,
         "adaptive_setup_disable": {
@@ -2009,6 +2103,7 @@ def evaluate_risk(
                 else None
             ),
         },
+        "binance_rest_summary": binance_rest_summary,
         "sync_timestamps": sync_timestamp_debug,
         "market_derivatives_context": market_snapshot.derivatives_context.model_dump(mode="json"),
         "reconciliation_state": {
@@ -2039,15 +2134,27 @@ def evaluate_risk(
             ),
         },
     }
+    degraded_reason_codes = derive_degraded_reason_codes(
+        blocked_reason_codes,
+        operating_state=operating_state,
+        degraded_reason=degraded_reason,
+    )
+    protection_reason_codes = derive_protection_reason_codes(
+        blocked_reason_codes,
+        operating_state=operating_state,
+    )
     result = RiskCheckResult(
         allowed=allowed,
         decision=decision.decision,
         reason_codes=reason_codes,
         blocked_reason_codes=blocked_reason_codes,
         adjustment_reason_codes=adjustment_reason_codes,
+        degraded_reason_codes=degraded_reason_codes,
+        protection_reason_codes=protection_reason_codes,
         blocked_reason=blocked_reason,
         degraded_reason=degraded_reason,
         approval_required_reason=approval_required_reason,
+        survival_path=survival_path_label,
         policy_source=policy_source,  # type: ignore[arg-type]
         evaluated_operator_policy=evaluated_operator_policy,
         approved_risk_pct=approved_risk_pct if allowed else 0.0,
@@ -2097,11 +2204,7 @@ def evaluate_risk(
             approval_required_reason=approval_required_reason,
             degraded_reason=degraded_reason,
             policy_source=policy_source,
-            survival_path=(
-                "protective_recovery"
-                if is_protection_recovery
-                else ("exit" if decision.decision == "exit" else ("reduce_only" if is_survival_path_decision(decision) else None))
-            ),
+            survival_path=survival_path_label,
         )
         if is_entry_decision and blocked_reason in EVENT_POLICY_BLOCK_REASON_CODES:
             record_audit_event(
@@ -2142,7 +2245,7 @@ def evaluate_risk(
                 payload=audit_payload,
                 correlation_ids=correlation_ids,
             )
-        elif (is_survival_path_decision(decision) or is_protection_recovery) and _has_operator_event_override(event_control_payload):
+        elif survival_path_label is not None and _has_operator_event_override(event_control_payload):
             record_audit_event(
                 session,
                 event_type="event_policy_allowed_survival_path",

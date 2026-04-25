@@ -25,6 +25,21 @@
     - 화면 표현: `진입 방식`
   - `intent_family` / `management_action`
     - 화면 표현: `신규 진입`인지 `관리 / 보호 조치`인지 구분하는 보조 의미
+  - `operating_state`
+    - 화면 표현: `운영 상태`
+    - 값 해석: `TRADABLE = 신규 진입 가능`, `PROTECTION_REQUIRED = 보호 주문 확인 우선`, `DEGRADED_MANAGE_ONLY = 신규 진입 보류`, `EMERGENCY_EXIT = 비상 청산 중`, `PAUSED = 운영 일시 중지`
+  - `guard_mode_reason_code` / `guard_mode_reason_message`
+    - 화면 표현: `신규 진입 차단 사유` 또는 `가드 모드 사유`
+  - `can_enter_new_position`
+    - 화면 표현: `신규 진입`
+  - `sync_freshness_summary`
+    - 화면 표현: `거래소 동기화 상태`
+  - `reconciliation_summary.unresolved_submission_badge`
+    - 화면 표현: `미확정 주문 대조 필요`
+  - `data_quality.data_quality_grade`
+    - 화면 표현: `AI 입력 데이터 품질`
+  - `lead_lag_summary`
+    - 화면 표현: `선도시장 확인`
 - 즉, 이 문서에서 cadence, engine, trigger, holding-profile 키를 말하는 부분은 운영자 화면에서는 위 표현으로 대응해 읽으면 됩니다.
 
 ## 2026-04 Live Snapshot Availability
@@ -47,6 +62,8 @@
   - previous thesis snapshot + delta
   - strategy engine / holding profile / slot / hard-stop context
 - This is an input-structure change only. It does not move execution authority out of `risk.py` and `execution.py`.
+- Lead-lag context is a reference layer, not a hard risk bypass. If BTC/ETH lead context is unavailable, features expose `LEAD_LAG_CONTEXT_UNAVAILABLE` and lead-lag scoring falls back to neutral behavior; if only part of the reference set is present, the remaining references are used with `missing_reference_symbols` visible in payloads.
+- New-entry-capable AI routes still require usable data quality. `data_quality=unavailable` fail-closes the review to `hold`; degraded breakout reviews are also fail-closed before provider invocation. Survival paths remain outside this entry-quality blocker.
 
 ## 2026-04 Historical Prior Context
 
@@ -88,6 +105,21 @@
   - `risk.py` still makes the final deterministic allow/block decision
   - `execution.py` still consumes only approved intents
   - no new execution action type was introduced in this ticket
+
+## 2026-04 Runtime Guard And Survival Boundary
+
+- `runtime_state.py` owns the operating-state vocabulary:
+  - `TRADABLE`
+  - `PROTECTION_REQUIRED`
+  - `DEGRADED_MANAGE_ONLY`
+  - `EMERGENCY_EXIT`
+  - `PAUSED`
+- `PROTECTION_REQUIRED`, `DEGRADED_MANAGE_ONLY`, `EMERGENCY_EXIT`, and `PAUSED` block new entries. They do not automatically block survival paths.
+- Survival paths are limited to `reduce`, `exit`, `reduce_only`, validated protection recovery, and emergency exit handling.
+- A protection restore shaped as `long` / `short` is treated as survival only when it matches an existing same-side position while the runtime state is `PROTECTION_REQUIRED` or `DEGRADED_MANAGE_ONLY` and includes protective brackets. Otherwise it remains a new-entry-like path and receives the normal freshness/protection blockers.
+- `UNRESOLVED_SUBMISSION_GUARD_ACTIVE` is a reconciliation guard. It means a previous live order submission returned unknown and must be reconciled before another same-symbol entry is allowed.
+- `PROTECTION_VERIFY_FAILED` blocks entry / scale-in execution for the affected symbol until the verification block is cleared.
+- Operator-facing status comes from `operating_state`, `guard_mode_reason_code`, `guard_mode_reason_message`, `blocked_reasons`, `latest_blocked_reasons`, `sync_freshness_summary`, and `reconciliation_summary`; frontend code should not infer a separate status model.
 
 ## 2026-04 Prompt Routing And Fail-Closed
 

@@ -390,6 +390,7 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     : null;
   return {
     exchange_can_trade: summary?.exchange_can_trade ?? null,
+    exchange_connectivity_state: summary?.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? state.rollout_mode,
     exchange_submit_allowed: summary?.exchange_submit_allowed ?? state.exchange_submit_allowed,
     limited_live_max_notional: summary?.limited_live_max_notional ?? state.limited_live_max_notional,
@@ -401,6 +402,9 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     blocked_reasons_current_cycle: dedupeReasons(
       summary?.blocked_reasons_current_cycle ?? state.latest_blocked_reasons,
     ),
+    blocked_reason_codes: dedupeReasons(summary?.blocked_reason_codes ?? state.blocked_reasons),
+    degraded_reason_codes: dedupeReasons(summary?.degraded_reason_codes ?? []),
+    protection_reason_codes: dedupeReasons(summary?.protection_reason_codes ?? []),
     approval_control_blocked_reasons: dedupeReasons(
       summary?.approval_control_blocked_reasons ?? state.blocked_reasons,
     ),

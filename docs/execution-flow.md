@@ -14,7 +14,15 @@
   - `last_ai_decision_at`
   - `next_ai_call_due_at`
     - 화면 표현: `AI 기본 검토 간격`
-- 즉, 이 문서에서 `decision_cycle_interval_minutes`를 말하는 부분은 운영자 화면의 `재검토 확인 주기`를, `ai_call_interval_minutes`를 말하는 부분은 `AI 기본 검토 간격`을 뜻합니다.
+  - `operating_state`
+    - 화면 표현: `운영 상태`
+  - `guard_mode_reason_code` / `guard_mode_reason_message`
+    - 화면 표현: `신규 진입 차단 사유` 또는 `가드 모드 사유`
+  - `sync_freshness_summary`
+    - 화면 표현: `거래소 동기화 상태`
+  - `reconciliation_summary.unresolved_submission_badge`
+    - 화면 표현: `미확정 주문 대조 필요`
+- 즉, 이 문서에서 `decision_cycle_interval_minutes`를 말하는 부분은 운영자 화면의 `재검토 확인 주기`를, `ai_call_interval_minutes`를 말하는 부분은 `AI 기본 검토 간격`을 뜻합니다. Runtime guard 관련 키는 운영자 dashboard의 운영 상태와 차단 사유로 대응해 읽습니다.
 
 ## 2026-04 AI Context Plumbing
 
@@ -70,9 +78,19 @@
   - degraded/unavailable long-horizon entry proposal => bounded to `hold` with abstain metadata
 - On protection/reduce/emergency-style routes, provider failure falls back to deterministic management behavior and does not block survival handling.
 - Protection/reduce/exit/emergency/recovery survival paths are not blocked by these data-quality entry rules.
+- Lead-lag context unavailable or partial is not a new hard risk bypass. It can lower candidate evidence; separately, `data_quality=unavailable` fail-closes new-entry-capable AI review to `hold`, and degraded breakout review also fail-closes before provider invocation.
 - Historical priors do not block survival handling. `reduce`, `exit`, protection recovery, and other deterministic management paths ignore prior penalties for execution purposes.
 - `risk.py` still receives only the normalized decision. `execution.py` still receives only intents approved by `risk.py`.
 - Historical analytics / prior builders now exclude non-entry intent rows from entry stats so management/protection behavior does not contaminate entry expectancy or payoff timing.
+
+## 2026-04 Binance API 장애와 Reconciliation Guard
+
+- `exchange_sync_cycle`는 계좌, 포지션, 오픈오더, 보호주문 상태를 동기화하는 cycle입니다. 이 cycle 자체는 AI 호출이나 신규 진입 판단을 하지 않습니다.
+- Binance 계정 / 포지션 / 오픈오더 조회가 실패하면 sync scope에 실패 상태와 reason code가 남습니다. 신규 진입 risk path는 이를 `ACCOUNT_STATE_STALE`, `POSITION_STATE_STALE`, `OPEN_ORDERS_STATE_STALE`, `PROTECTION_STATE_UNVERIFIED` 같은 freshness blocker로 봅니다.
+- timeout, transport error, Binance 일시 장애 계열 code는 `EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE`로 분류됩니다. Post-order resync에서 이 장애가 나면 system pause와 guard mode reason이 같이 기록될 수 있습니다.
+- 주문 제출 결과가 timeout/transport failure로 확정되지 않으면 execution은 `LIVE_ORDER_SUBMISSION_UNKNOWN`을 반환하고 unresolved submission guard를 저장합니다.
+- unresolved submission guard가 active이면 같은 symbol / direction 신규 진입은 거래소 호출 전에 `UNRESOLVED_SUBMISSION_GUARD_ACTIVE` 또는 deadline 초과 시 `UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED`로 막힙니다.
+- 보호주문 생성 후 검증이 실패하면 `PROTECTION_VERIFY_FAILED` verification block이 남고, entry / scale-in 실행은 차단됩니다. 이미 열린 포지션에 대한 protection recovery, reduce, exit, emergency exit는 별도 survival path로 처리합니다.
 
 ## 2026-04 Hybrid AI Review Dispatch
 

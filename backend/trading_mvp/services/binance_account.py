@@ -29,6 +29,7 @@ from trading_mvp.services.settings import (
     is_live_execution_ready,
     serialize_settings_view,
 )
+from trading_mvp.services.runtime_state import write_runtime_detail_key
 from trading_mvp.time_utils import utcnow_naive
 
 FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "finished"}
@@ -92,10 +93,8 @@ def _account_cache_detail(settings_row: Setting) -> dict[str, Any]:
 
 
 def _write_account_cache_detail(settings_row: Setting, cache: Mapping[str, object]) -> dict[str, Any]:
-    detail = _settings_detail(settings_row)
     normalized_cache = dict(cache)
-    detail[ACCOUNT_CACHE_DETAIL_KEY] = normalized_cache
-    settings_row.pause_reason_detail = detail
+    write_runtime_detail_key(settings_row, ACCOUNT_CACHE_DETAIL_KEY, normalized_cache)
     return normalized_cache
 
 

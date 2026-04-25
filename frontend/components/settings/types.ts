@@ -54,6 +54,7 @@ export type SymbolEffectiveCadence = {
 
 export type ControlStatusSummary = {
   exchange_can_trade: boolean | null;
+  exchange_connectivity_state?: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;
   limited_live_max_notional: number | null;
@@ -63,6 +64,9 @@ export type ControlStatusSummary = {
   degraded: boolean;
   risk_allowed: boolean | null;
   blocked_reasons_current_cycle: string[];
+  blocked_reason_codes?: string[];
+  degraded_reason_codes?: string[];
+  protection_reason_codes?: string[];
   approval_control_blocked_reasons?: string[];
   live_arm_disabled?: boolean;
   live_arm_disable_reason_code?: string | null;

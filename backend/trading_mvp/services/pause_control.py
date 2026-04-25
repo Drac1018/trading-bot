@@ -26,7 +26,9 @@ from trading_mvp.services.runtime_state import (
     mark_sync_issue,
     mark_sync_skipped,
     mark_sync_success,
+    runtime_detail_for_update,
     summarize_runtime_state,
+    write_runtime_detail,
 )
 from trading_mvp.services.settings import (
     get_effective_symbols,
@@ -62,7 +64,7 @@ def _write_runtime_state(
     symbol_states: dict[str, dict[str, Any]],
     last_error: str | None = None,
 ) -> None:
-    detail = dict(settings_row.pause_reason_detail or {})
+    detail = runtime_detail_for_update(settings_row)
     existing_recovery = dict(detail.get("protection_recovery") or {})
     detail["operating_state"] = operating_state
     detail["protection_recovery"] = {
@@ -96,7 +98,7 @@ def _write_runtime_state(
             if bool(value.get("missing_components"))
         },
     }
-    settings_row.pause_reason_detail = detail
+    write_runtime_detail(settings_row, detail)
     session.add(settings_row)
     session.flush()
 
@@ -319,7 +321,7 @@ def _write_auto_resume_state(
     approval_state: str,
     approval_detail: dict[str, object],
 ) -> None:
-    detail = dict(settings_row.pause_reason_detail or {})
+    detail = runtime_detail_for_update(settings_row)
     detail["auto_resume"] = {
         "status": status,
         "blockers": blockers,
@@ -333,7 +335,7 @@ def _write_auto_resume_state(
         "approval_state": approval_state,
         "approval_detail": approval_detail,
     }
-    settings_row.pause_reason_detail = detail
+    write_runtime_detail(settings_row, detail)
     session.add(settings_row)
     session.flush()
 

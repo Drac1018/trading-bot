@@ -1163,25 +1163,56 @@ def run_release_enrichment_watch_cycle(session: Session, triggered_by: str = "sc
     return {"workflow": RELEASE_ENRICHMENT_WATCH_WORKFLOW, "results": results}
 
 
-def run_due_operational_cycles(session: Session) -> list[dict[str, object]]:
+def run_due_operational_cycles(
+    session: Session,
+    *,
+    include_exchange_sync: bool = True,
+    commit_between: bool = False,
+    continue_on_error: bool = False,
+) -> list[dict[str, object]]:
     outputs: list[dict[str, object]] = []
-    exchange = run_due_exchange_sync_cycle(session)
-    if exchange is not None:
-        outputs.append(exchange)
-    market = run_market_refresh_cycle(session, triggered_by="scheduler")
-    if market["results"]:
+
+    def run_step(workflow: str, action) -> object | None:
+        try:
+            result = action()
+            if commit_between:
+                session.commit()
+            return result
+        except Exception as exc:
+            session.rollback()
+            if not continue_on_error:
+                raise
+            try:
+                record_health_event(
+                    session,
+                    component="scheduler",
+                    status="error",
+                    message="Background scheduler workflow failed.",
+                    payload={"workflow": workflow, "error": str(exc)},
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+            return None
+
+    if include_exchange_sync:
+        exchange = run_step(EXCHANGE_SYNC_WORKFLOW, lambda: run_due_exchange_sync_cycle(session))
+        if exchange is not None:
+            outputs.append(exchange)  # type: ignore[arg-type]
+    market = run_step(MARKET_REFRESH_WORKFLOW, lambda: run_market_refresh_cycle(session, triggered_by="scheduler"))
+    if isinstance(market, dict) and market["results"]:
         outputs.append(market)
-    release_watch = run_release_enrichment_watch_cycle(session, triggered_by="scheduler")
-    if release_watch["results"]:
+    release_watch = run_step(RELEASE_ENRICHMENT_WATCH_WORKFLOW, lambda: run_release_enrichment_watch_cycle(session, triggered_by="scheduler"))
+    if isinstance(release_watch, dict) and release_watch["results"]:
         outputs.append(release_watch)
-    position_management = run_position_management_cycle(session, triggered_by="scheduler")
-    if position_management["results"]:
+    position_management = run_step(POSITION_MANAGEMENT_WORKFLOW, lambda: run_position_management_cycle(session, triggered_by="scheduler"))
+    if isinstance(position_management, dict) and position_management["results"]:
         outputs.append(position_management)
-    entry_plan_watcher = run_due_entry_plan_watcher_cycle(session)
-    if entry_plan_watcher is not None and entry_plan_watcher.get("results"):
+    entry_plan_watcher = run_step(ENTRY_PLAN_WATCHER_WORKFLOW, lambda: run_due_entry_plan_watcher_cycle(session))
+    if isinstance(entry_plan_watcher, dict) and entry_plan_watcher.get("results"):
         outputs.append(entry_plan_watcher)
-    decisions = run_due_interval_decision_cycle(session)
-    if decisions is not None and decisions.get("results"):
+    decisions = run_step(INTERVAL_DECISION_WORKFLOW, lambda: run_due_interval_decision_cycle(session))
+    if isinstance(decisions, dict) and decisions.get("results"):
         outputs.append(decisions)
     return outputs
 

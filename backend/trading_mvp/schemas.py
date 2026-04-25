@@ -26,6 +26,7 @@ RegimeExecution = Literal["clean", "normal", "stress", "unavailable"]
 PersistenceClass = Literal["early", "established", "extended"]
 TransitionRisk = Literal["low", "medium", "high"]
 DataQualityGrade = Literal["complete", "partial", "degraded", "unavailable"]
+LeadContextStatus = Literal["ok", "partial", "unavailable"]
 EventSourceStatus = Literal["fixture", "stub", "external_api", "unavailable", "stale", "incomplete", "error"]
 EventSourceProvenance = Literal["fixture", "stub", "external_api"]
 EventSourceVendor = Literal["fred", "bls", "bea"]
@@ -155,8 +156,14 @@ class TradeDecision(StrictBaseModel):
     confidence_adjustment_applied: bool = False
     abstain_due_to_prior_and_quality: bool = False
     expected_payoff_efficiency_hint_summary: dict[str, float | None] = Field(default_factory=dict)
-    intent_family: IntentFamily = "unknown"
-    management_action: ManagementAction = "none"
+    intent_family: IntentFamily = Field(
+        default="unknown",
+        description="Intent semantics used to separate risk-adding entry from management, protection, and exit paths.",
+    )
+    management_action: ManagementAction = Field(
+        default="none",
+        description="Non-entry management semantics; reduce_only, exit_only, and restore_protection are survival-path actions.",
+    )
     legacy_semantics_preserved: bool = False
     analytics_excluded_from_entry_stats: bool = False
     prompt_family_hint: str | None = None
@@ -957,6 +964,7 @@ class DashboardProfitabilityResponse(StrictBaseModel):
 
 class ControlStatusSummary(StrictBaseModel):
     exchange_can_trade: bool | None = None
+    exchange_connectivity_state: str = "unknown"
     rollout_mode: RolloutMode = "paper"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
@@ -968,6 +976,9 @@ class ControlStatusSummary(StrictBaseModel):
     degraded: bool = False
     risk_allowed: bool | None = None
     blocked_reasons_current_cycle: list[str] = Field(default_factory=list)
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    degraded_reason_codes: list[str] = Field(default_factory=list)
+    protection_reason_codes: list[str] = Field(default_factory=list)
     approval_control_blocked_reasons: list[str] = Field(default_factory=list)
     live_arm_disabled: bool = False
     live_arm_disable_reason_code: str | None = None
@@ -983,6 +994,7 @@ class OperationalStatusPayload(StrictBaseModel):
     rollout_mode: RolloutMode = "paper"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
+    exchange_connectivity_state: str = "unknown"
     live_trading_env_enabled: bool = False
     live_execution_ready: bool = False
     trading_paused: bool = False
@@ -1003,6 +1015,9 @@ class OperationalStatusPayload(StrictBaseModel):
     pause_severity: str | None = None
     pause_recovery_class: str | None = None
     blocked_reasons: list[str] = Field(default_factory=list)
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    degraded_reason_codes: list[str] = Field(default_factory=list)
+    protection_reason_codes: list[str] = Field(default_factory=list)
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
@@ -1051,6 +1066,7 @@ class OperatorControlState(StrictBaseModel):
     rollout_mode: RolloutMode = "paper"
     exchange_submit_allowed: bool = False
     limited_live_max_notional: float | None = None
+    exchange_connectivity_state: str = "unknown"
     default_symbol: str
     default_timeframe: str
     tracked_symbols: list[str] = Field(default_factory=list)
@@ -1071,6 +1087,9 @@ class OperatorControlState(StrictBaseModel):
     auto_resume_eligible: bool = False
     auto_resume_after: datetime | None = None
     blocked_reasons: list[str] = Field(default_factory=list)
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    degraded_reason_codes: list[str] = Field(default_factory=list)
+    protection_reason_codes: list[str] = Field(default_factory=list)
     auto_resume_last_blockers: list[str] = Field(default_factory=list)
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
@@ -1186,9 +1205,13 @@ class OperatorRiskSnapshot(StrictBaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     blocked_reason_codes: list[str] = Field(default_factory=list)
     adjustment_reason_codes: list[str] = Field(default_factory=list)
+    degraded_reason_codes: list[str] = Field(default_factory=list)
+    protection_reason_codes: list[str] = Field(default_factory=list)
     blocked_reason: str | None = None
     degraded_reason: str | None = None
     approval_required_reason: str | None = None
+    survival_path: str | None = None
+    exchange_connectivity_state: str | None = None
     policy_source: OperatorPolicySource = "none"
     evaluated_operator_policy: EvaluatedOperatorPolicyPayload | None = None
     approved_risk_pct: float | None = None
@@ -1298,6 +1321,9 @@ class OperatorProtectionSummary(StrictBaseModel):
     trigger_source: str | None = None
     lifecycle_state: str | None = None
     verification_status: str | None = None
+    blocked_reason_code: str | None = None
+    blocked_reason: str | None = None
+    verification_deadline_at: datetime | None = None
     last_event_type: str | None = None
     last_event_message: str | None = None
     last_event_at: datetime | None = None
@@ -1395,9 +1421,12 @@ class RiskCheckResult(StrictBaseModel):
         default_factory=list,
         description="Non-blocking adjustment or approval reasons such as successful auto-resize.",
     )
+    degraded_reason_codes: list[str] = Field(default_factory=list)
+    protection_reason_codes: list[str] = Field(default_factory=list)
     blocked_reason: str | None = None
     degraded_reason: str | None = None
     approval_required_reason: str | None = None
+    survival_path: str | None = None
     policy_source: OperatorPolicySource = "none"
     evaluated_operator_policy: EvaluatedOperatorPolicyPayload | None = None
     reason_details: list[RiskReasonDetail] = Field(default_factory=list)
@@ -1489,7 +1518,9 @@ class ProtectionLifecycleSnapshot(StrictBaseModel):
 class ExecutionIntent(StrictBaseModel):
     symbol: str
     action: Literal["long", "short", "reduce", "exit"]
-    intent_type: Literal["entry", "scale_in", "protection", "reduce_only", "emergency_exit"]
+    intent_type: Literal["entry", "scale_in", "protection", "reduce_only", "emergency_exit"] = Field(
+        description="entry and scale_in add exposure; protection, reduce_only, and emergency_exit are survival-path intents.",
+    )
     quantity: float = Field(gt=0.0)
     requested_price: float = Field(gt=0.0)
     entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
@@ -1502,8 +1533,8 @@ class ExecutionIntent(StrictBaseModel):
     take_profit: float | None = None
     leverage: float = Field(gt=0.0, le=10.0)
     mode: Literal["live"]
-    reduce_only: bool = False
-    close_only: bool = False
+    reduce_only: bool = Field(default=False, description="Exchange reduce-only flag for survival-path exposure reduction.")
+    close_only: bool = Field(default=False, description="Exchange close-only flag for full exit or emergency-exit paths.")
 
 
 class AgentRunRecord(StrictBaseModel):
@@ -1784,8 +1815,11 @@ class DerivativesSummaryPayload(StrictBaseModel):
 
 class LeadLagSummaryPayload(StrictBaseModel):
     available: bool = False
+    lead_context_status: LeadContextStatus = "unavailable"
     leader_bias: Literal["bullish", "bearish", "mixed", "neutral", "unknown"] = "unknown"
     reference_symbols: list[str] = Field(default_factory=list)
+    missing_reference_symbols: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
     bullish_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
     bearish_alignment_score: float = Field(ge=0.0, le=1.0, default=0.5)
     bullish_breakout_confirmed: bool = False

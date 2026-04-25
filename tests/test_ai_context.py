@@ -8,6 +8,7 @@ from trading_mvp.schemas import (
     MarketCandle,
     MarketSnapshotPayload,
 )
+from trading_mvp.services import market_data
 from trading_mvp.services.ai_context import (
     build_ai_decision_context,
     build_composite_regime_packet,
@@ -108,6 +109,52 @@ def _features():
             "data_quality_flags": [],
         }
     )
+
+
+def test_build_lead_market_contexts_records_runtime_failures(monkeypatch) -> None:
+    def fail_build_market_context(**_kwargs):
+        raise RuntimeError("lead market unavailable")
+
+    monkeypatch.setattr(market_data, "build_market_context", fail_build_market_context)
+
+    contexts = market_data.build_lead_market_contexts("15m")
+
+    assert contexts == {}
+    assert contexts.lead_context_status == "unavailable"
+    assert contexts.missing_lead_symbols == ["BTCUSDT", "ETHUSDT"]
+    assert "LEAD_CONTEXT_UNAVAILABLE" in contexts.reason_codes
+    assert "LEAD_CONTEXT_BUILD_FAILED" in contexts.reason_codes
+
+
+def test_ai_context_exposes_unavailable_lead_context_status() -> None:
+    snapshot, features = _features()
+    features = features.model_copy(
+        update={
+            "lead_lag": features.lead_lag.model_copy(
+                update={
+                    "available": False,
+                    "reference_symbols": [],
+                    "missing_reference_symbols": ["BTCUSDT", "ETHUSDT"],
+                    "strong_reference_confirmation": False,
+                    "weak_reference_confirmation": False,
+                }
+            )
+        }
+    )
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "trend_pullback_engine", "holding_profile": "scalp"},
+        decision_reference={},
+    )
+
+    assert context.lead_lag_summary.lead_context_status == "unavailable"
+    assert context.lead_lag_summary.missing_reference_symbols == ["BTCUSDT", "ETHUSDT"]
+    assert "LEAD_CONTEXT_UNAVAILABLE" in context.lead_lag_summary.reason_codes
+    assert "lead_context_unavailable" in context.data_quality.missing_context_flags
+    assert "LEAD_CONTEXT_UNAVAILABLE" in context.composite_regime.regime_reason_codes
 
 
 def test_composite_regime_packet_generation() -> None:
