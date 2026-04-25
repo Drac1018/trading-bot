@@ -2999,6 +2999,48 @@ def test_sync_live_state_recreates_missing_protection_and_logs(monkeypatch, db_s
     assert any(event.event_type == "protection_recreate_attempted" for event in events)
 
 
+def test_sync_live_state_can_defer_missing_protection_recovery(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=70100.0,
+            leverage=2.0,
+            stop_loss=69000.0,
+            take_profit=72000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=1.0,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+    client = UnprotectedSyncClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    result = sync_live_state(
+        db_session,
+        get_or_create_settings(db_session),
+        symbol="BTCUSDT",
+        allow_protection_recovery=False,
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    serialized = serialize_settings(get_or_create_settings(db_session))
+
+    assert "BTCUSDT" in result["unprotected_positions"]
+    assert result["symbol_protection_state"]["BTCUSDT"]["status"] == "missing"
+    assert client.orders == []
+    assert serialized["sync_freshness_summary"]["account"]["stale"] is False
+    assert serialized["sync_freshness_summary"]["protective_orders"]["incomplete"] is True
+    assert any(event.event_type == "protection_recovery_deferred" for event in events)
+    assert not any(event.event_type == "protection_recreate_attempted" for event in events)
+
+
 def test_manual_pause_still_allows_exit_management_path(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     db_session.add(

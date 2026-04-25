@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pytest
-
 from trading_mvp.models import AgentRun, MarketSnapshot, Order, PnLSnapshot, Position, RiskCheck
 from trading_mvp.schemas import TradeDecision
 from trading_mvp.services.dashboard import get_operator_dashboard, get_overview
@@ -19,6 +18,28 @@ def _mark_all_sync_scopes_fresh(settings_row) -> None:
     now = utcnow_naive()
     for scope in ("account", "positions", "open_orders", "protective_orders"):
         mark_sync_success(settings_row, scope=scope, synced_at=now)
+
+
+def _seed_account_equity(db_session, equity: float = 100000.0) -> PnLSnapshot:
+    row = PnLSnapshot(
+        snapshot_date=utcnow_naive().date(),
+        equity=equity,
+        cash_balance=equity,
+        wallet_balance=equity,
+        available_balance=equity,
+        gross_realized_pnl=0.0,
+        fee_total=0.0,
+        funding_total=0.0,
+        net_pnl=0.0,
+        realized_pnl=0.0,
+        unrealized_pnl=0.0,
+        daily_pnl=0.0,
+        cumulative_pnl=0.0,
+        consecutive_losses=0,
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
 
 
 def _entry_decision(
@@ -52,7 +73,7 @@ def _entry_decision(
         max_holding_minutes=120,
         risk_pct=risk_pct,
         leverage=leverage,
-        rationale_codes=["TEST"],
+        rationale_codes=["TEST", "PENDING_ENTRY_PLAN_TRIGGERED"],
         explanation_short="risk guard regression",
         explanation_detailed="Regression coverage for entry trigger and headroom debug behaviour.",
     )
@@ -60,6 +81,7 @@ def _entry_decision(
 
 def _seed_live_ready_settings(db_session):
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.live_trading_enabled = True
     settings_row.manual_live_approval = True
     settings_row.live_execution_armed = True
@@ -124,6 +146,7 @@ class _RiskFilterClient:
 
 def test_auto_resize_rechecks_directional_and_single_position_limits(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.max_largest_position_pct = 1.5
     settings_row.max_directional_bias_pct = 2.0
     db_session.add_all(
@@ -139,6 +162,7 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
                 leverage=2.0,
                 stop_loss=63000.0,
                 take_profit=68000.0,
+                unrealized_pnl=1000.0,
             ),
             Position(
                 symbol="ETHUSDT",
@@ -175,6 +199,14 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
         decision,
         snapshot,
         execution_mode="historical_replay",
+        decision_context={
+            "add_on_context": {
+                "current_r_multiple": 1.2,
+                "protected_r_multiple": 0.0,
+                "protective_stop_ready": True,
+                "trend_alignment_ok": True,
+            }
+        },
     )
     overview = get_overview(db_session)
     payload = get_operator_dashboard(db_session)
@@ -186,9 +218,10 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
     assert result.blocked_reason_codes == []
     assert "ENTRY_AUTO_RESIZED" in result.adjustment_reason_codes
     assert "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT" in result.adjustment_reason_codes
+    assert "ADD_ON_RISK_DOWNSIZED" in result.adjustment_reason_codes
     assert "DIRECTIONAL_BIAS_LIMIT_REACHED" not in result.reason_codes
     assert "LARGEST_POSITION_LIMIT_REACHED" not in result.reason_codes
-    assert result.approved_projected_notional == pytest.approx(40000.0, abs=5.0)
+    assert result.approved_projected_notional == pytest.approx(31200.0, abs=5.0)
     assert overview.blocked_reasons == []
     assert overview.latest_blocked_reasons == []
     assert btc.blocked_reasons == []
@@ -196,10 +229,11 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
     assert btc.risk_guard.blocked_reason_codes == []
     assert "ENTRY_AUTO_RESIZED" in btc.risk_guard.adjustment_reason_codes
     assert "ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT" in btc.risk_guard.adjustment_reason_codes
+    assert "ADD_ON_RISK_DOWNSIZED" in btc.risk_guard.adjustment_reason_codes
     assert result.debug_payload["current_symbol_notional"] == pytest.approx(100000.03, abs=5.0)
     assert result.debug_payload["current_directional_notional"] == pytest.approx(160000.03, abs=5.0)
-    assert result.debug_payload["projected_symbol_notional"] == pytest.approx(140000.03, abs=5.0)
-    assert result.debug_payload["projected_directional_notional"] == pytest.approx(200000.03, abs=5.0)
+    assert result.debug_payload["projected_symbol_notional"] == pytest.approx(131200.03, abs=5.0)
+    assert result.debug_payload["projected_directional_notional"] == pytest.approx(191200.03, abs=5.0)
     assert set(result.debug_payload["requested_exposure_limit_codes"]) == {
         "DIRECTIONAL_BIAS_LIMIT_REACHED",
         "LARGEST_POSITION_LIMIT_REACHED",
@@ -211,6 +245,7 @@ def test_auto_resize_rechecks_directional_and_single_position_limits(db_session)
 
 def test_headroom_auto_resize_blocks_when_exchange_min_notional_cannot_be_met(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.max_directional_bias_pct = 0.64
     db_session.add(
         Position(
@@ -262,6 +297,7 @@ def test_headroom_auto_resize_blocks_when_exchange_min_notional_cannot_be_met(db
 
 def test_entry_is_blocked_when_exchange_min_qty_cannot_be_met(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
     decision = _entry_decision(
         symbol="BTCUSDT",
@@ -332,6 +368,7 @@ def test_entry_trigger_failure_exposes_trigger_debug_payload(db_session) -> None
 
 def test_open_order_reserved_notional_excludes_reduce_only_and_protective_orders(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     db_session.add_all(
         [
             Order(
@@ -379,6 +416,22 @@ def test_open_order_reserved_notional_excludes_reduce_only_and_protective_orders
                 reason_codes=[],
                 metadata_json={},
             ),
+            Order(
+                symbol="ETHUSDT",
+                side="buy",
+                order_type="limit",
+                mode="live",
+                status="pending",
+                exchange_status="FINISHED",
+                requested_quantity=0.1,
+                requested_price=65000.0,
+                filled_quantity=0.0,
+                average_fill_price=0.0,
+                reduce_only=False,
+                close_only=False,
+                reason_codes=[],
+                metadata_json={},
+            ),
         ]
     )
     db_session.flush()
@@ -403,7 +456,7 @@ def test_open_order_reserved_notional_excludes_reduce_only_and_protective_orders
         execution_mode="historical_replay",
     )
 
-    entry_order = db_session.query(Order).filter(Order.side == "buy").one()
+    entry_order = db_session.query(Order).filter(Order.symbol == "BTCUSDT", Order.side == "buy").one()
     entry_order.status = "canceled"
     db_session.add(entry_order)
     db_session.flush()
@@ -458,7 +511,7 @@ def test_stale_sync_reason_keeps_sync_timestamps_in_debug_payload(db_session) ->
 
 
 def test_dashboard_prefers_blocked_reason_codes_from_latest_risk_payload(db_session) -> None:
-    settings_row = get_or_create_settings(db_session)
+    get_or_create_settings(db_session)
     now = utcnow_naive()
     db_session.add(
         PnLSnapshot(
@@ -553,8 +606,7 @@ def test_dashboard_prefers_blocked_reason_codes_from_latest_risk_payload(db_sess
 
 
 def test_dashboard_falls_back_to_legacy_payload_reason_codes_when_blocked_field_missing(db_session) -> None:
-    settings_row = get_or_create_settings(db_session)
-    now = utcnow_naive()
+    get_or_create_settings(db_session)
     db_session.add(
         PnLSnapshot(
             snapshot_date=date.today(),

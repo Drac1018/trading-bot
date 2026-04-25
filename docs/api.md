@@ -676,6 +676,36 @@ staged rollout semantics:
 - `GET /api/audit`
 - `GET /api/alerts`
 
+### `GET /api/decisions`
+
+운영 UI가 최근 의사결정 목록을 빠르게 렌더링할 수 있도록 선택적 `compact` query를 지원합니다.
+
+- `limit`: 반환 row 수. 서버는 과도한 값은 내부 상한으로 제한합니다.
+- `compact=true`
+  - top-level `symbol`, `timeframe`, `decision`, `confidence`, `confidence_band`, `recommended_holding_profile`, `ai_trigger_reason`, `ai_trigger_summary`를 추가로 노출합니다.
+  - `input_payload`, `output_payload`, `metadata_json`은 운영 화면에서 바로 읽는 핵심 필드만 유지합니다.
+  - 원본 raw decision payload 의미는 바꾸지 않습니다. raw 확인이 필요하면 `compact`를 생략합니다.
+
+### `GET /api/agents`
+
+운영 UI가 최근 agent 실행 목록을 빠르게 렌더링할 수 있도록 선택적 `compact` query를 지원합니다.
+
+- `limit`: 반환 row 수. 서버는 과도한 값은 내부 상한으로 제한합니다.
+- `compact=true`
+  - `input_payload`, `output_payload`, `metadata_json`에서 운영 확인에 필요한 핵심 필드만 유지합니다.
+  - raw feature blob, prompt/debug fingerprint 같은 큰 payload는 제외합니다.
+  - 원본 raw agent payload 확인이 필요하면 `compact`를 생략합니다.
+
+### `GET /api/risk/checks`
+
+운영 UI가 최근 risk check 목록을 빠르게 렌더링할 수 있도록 선택적 `compact` query를 지원합니다.
+
+- `limit`: 반환 row 수. 서버는 과도한 값은 내부 상한으로 제한합니다.
+- `compact=true`
+  - top-level risk 결과와 AI trigger 요약은 유지합니다.
+  - `payload.debug_payload`, `payload.exposure_metrics` 같은 큰 내부 디버그 blob은 제외합니다.
+  - 원본 raw risk payload 확인이 필요하면 `compact`를 생략합니다.
+
 
 ### `GET /api/performance`
 
@@ -1343,9 +1373,32 @@ drawdown state transition audit:
 
 ## Binance Account
 
+- `GET /api/binance/account/local`
+- `GET /api/binance/account/cache`
+- `POST /api/binance/account/refresh`
 - `GET /api/binance/account`
 
 Binance 원본 권한과 앱 내부 실주문 readiness를 분리해서 보여줍니다.
+
+- `/api/binance/account/local`
+  - Binance API를 호출하지 않습니다.
+  - 최신 로컬 account/PnL snapshot, live position, live open order row만 읽어서 반환합니다.
+- `/api/binance/account/cache`
+  - 계정 화면의 기본 진입 경로입니다.
+  - 성공한 Binance 원본 캐시가 있으면 `source=cached_live`와 함께 캐시 payload를 반환합니다.
+  - 원본 캐시가 없으면 Binance API를 호출하지 않고 `/api/binance/account/local`과 같은 로컬 기준 payload를 `source=local`로 반환합니다.
+  - `status`, `requested_at`, `started_at`, `refreshed_at`, `last_error`, `duration_ms`로 캐시 갱신 상태를 함께 내려줍니다.
+- `/api/binance/account/refresh`
+  - Binance 원본 조회를 백그라운드 캐시 갱신 작업으로 요청합니다.
+  - HTTP 응답은 현재 캐시/로컬 payload를 즉시 반환하고, 원본 API 응답 완료를 기다리지 않습니다.
+  - 같은 프로세스에서 이미 갱신 중이면 새 원본 조회를 중복 실행하지 않고 `status=already_running`을 반환합니다.
+  - 계정 원본 조회 전용 제한값:
+    - `TRADING_MVP_BINANCE_ACCOUNT_READ_TIMEOUT_SECONDS` 기본값 `5.0`
+    - `TRADING_MVP_BINANCE_ACCOUNT_READ_MAX_GET_ATTEMPTS` 기본값 `2`
+  - 따라서 Binance 원본 API 지연은 백그라운드 작업 안에 남지만, 계정 캐시 갱신은 운영 화면 기본 표시/SSR을 막지 않습니다.
+- `/api/binance/account`
+  - Binance 원본 계정, 포지션, 미체결 주문 API를 직접 조회합니다.
+  - 원본 확인이 필요할 때 진단용으로 직접 사용할 수 있습니다.
 
 - `exchange_can_trade`
 - `app_live_execution_ready`

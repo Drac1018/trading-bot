@@ -20,12 +20,13 @@ from trading_mvp.services.account import (
     get_open_positions,
 )
 from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
+from trading_mvp.services.audit import record_audit_event
 from trading_mvp.services.binance import BinanceClient
-from trading_mvp.services.event_policy import derive_ai_event_view
 from trading_mvp.services.drawdown_state import (
     STATE_ADJUSTMENT_REASON_CODES,
     build_drawdown_state_snapshot,
 )
+from trading_mvp.services.event_policy import derive_ai_event_view
 from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_POSITION,
     HOLDING_PROFILE_SCALP,
@@ -45,7 +46,6 @@ from trading_mvp.services.runtime_state import (
     get_reconciliation_blocking_reason_codes,
     get_reconciliation_detail,
 )
-from trading_mvp.services.audit import record_audit_event
 from trading_mvp.services.settings import (
     build_event_operator_control_payload,
     get_exposure_limits,
@@ -154,7 +154,10 @@ HOLDING_PROFILE_POSITION_LEAD_LAG_MISMATCH_REASON_CODE = "HOLDING_PROFILE_POSITI
 HOLDING_PROFILE_POSITION_RELATIVE_STRENGTH_WEAK_REASON_CODE = "HOLDING_PROFILE_POSITION_RELATIVE_STRENGTH_WEAK"
 HOLDING_PROFILE_POSITION_DERIVATIVES_HEADWIND_REASON_CODE = "HOLDING_PROFILE_POSITION_DERIVATIVES_HEADWIND"
 HOLDING_PROFILE_BREAKOUT_SCALP_ONLY_REASON_CODE = "HOLDING_PROFILE_BREAKOUT_SCALP_ONLY"
-FINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "cancelled", "rejected", "expired"})
+FINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "cancelled", "rejected", "expired", "finished"})
+FINAL_EXCHANGE_ORDER_STATUSES = frozenset(
+    {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "FINISHED"}
+)
 PROTECTIVE_ORDER_TYPE_PREFIXES = ("stop", "take_profit", "trailing_stop")
 EXPOSURE_LIMIT_REASON_SPECS = (
     ("gross_exposure_pct_equity", "gross_exposure_pct", "GROSS_EXPOSURE_LIMIT_REACHED"),
@@ -1076,6 +1079,8 @@ def _is_exposure_reserving_order(order: Order) -> bool:
         return False
     if str(order.status or "").strip().lower() in FINAL_ORDER_STATUSES:
         return False
+    if str(order.exchange_status or "").strip().upper() in FINAL_EXCHANGE_ORDER_STATUSES:
+        return False
     if order.reduce_only or order.close_only:
         return False
     if _is_protective_order_type(order.order_type):
@@ -1119,14 +1124,7 @@ def _build_exposure_metrics(
     projected_notional: float = 0.0,
 ) -> dict[str, float]:
     positions = get_open_positions(session)
-    active_orders = list(
-        session.scalars(
-            select(Order).where(
-                Order.mode == "live",
-                Order.status.notin_(tuple(FINAL_ORDER_STATUSES)),
-            )
-        )
-    )
+    active_orders = list(session.scalars(select(Order).where(Order.mode == "live")))
     decision_tier = get_symbol_risk_tier(decision_symbol)
     total_notional = 0.0
     long_notional = 0.0

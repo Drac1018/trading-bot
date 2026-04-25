@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import type { ReactNode } from "react";
 
@@ -7,7 +7,7 @@ export type FeedbackMessage = { tone: FeedbackTone; text: string };
 export type StatusTone = FeedbackTone;
 
 export const inputClass =
-  "w-full rounded-2xl border border-amber-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-amber-400";
+  "w-full rounded-md border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100";
 
 export function StatusPill({
   tone = "neutral",
@@ -22,7 +22,7 @@ export function StatusPill({
     warn: "border border-amber-200 bg-amber-50 text-amber-800",
     danger: "border border-rose-200 bg-rose-50 text-rose-800",
   }[tone];
-  return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${className}`}>{children}</span>;
+  return <span className={`rounded-md px-3 py-1 text-xs font-semibold ${className}`}>{children}</span>;
 }
 
 export function InlineFeedback({ message }: { message?: FeedbackMessage | null }) {
@@ -36,7 +36,7 @@ export function InlineFeedback({ message }: { message?: FeedbackMessage | null }
     danger: "border-rose-200 bg-rose-50 text-rose-900",
   }[message.tone];
   return (
-    <div aria-live="polite" className={`rounded-2xl border px-4 py-3 text-sm ${className}`} role="status">
+    <div aria-live="polite" className={`rounded-md border px-4 py-3 text-sm ${className}`} role="status">
       {message.text}
     </div>
   );
@@ -70,9 +70,10 @@ export function Toggle({
   onChange: (value: boolean) => void;
 }) {
   return (
-    <label className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-white px-4 py-3">
+    <label className="flex items-center gap-3 rounded-md border border-slate-200 bg-white px-4 py-3">
       <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
       <span className="text-sm font-medium text-slate-900">{label}</span>
     </label>
   );
 }
+

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
+import os
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import Setting
+from trading_mvp.models import Order, PnLSnapshot, Position, Setting
 from trading_mvp.schemas import (
     BinanceAccountAsset,
     BinanceAccountPosition,
@@ -14,6 +18,7 @@ from trading_mvp.schemas import (
     BinanceAccountSummary,
     BinanceOpenOrderSummary,
 )
+from trading_mvp.services.account import account_snapshot_to_dict, create_exchange_pnl_snapshot
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.settings import (
     derive_guard_mode_reason,
@@ -25,6 +30,137 @@ from trading_mvp.services.settings import (
     serialize_settings_view,
 )
 from trading_mvp.time_utils import utcnow_naive
+
+FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "finished"}
+FINAL_EXCHANGE_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "FINISHED"}
+ACCOUNT_CACHE_DETAIL_KEY = "binance_account_cache"
+DEFAULT_ACCOUNT_READ_TIMEOUT_SECONDS = 5.0
+DEFAULT_ACCOUNT_READ_MAX_GET_ATTEMPTS = 2
+
+
+def _env_float(name: str, *, default: float, minimum: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+def _account_read_timeout_seconds() -> float:
+    return _env_float(
+        "TRADING_MVP_BINANCE_ACCOUNT_READ_TIMEOUT_SECONDS",
+        default=DEFAULT_ACCOUNT_READ_TIMEOUT_SECONDS,
+        minimum=1.0,
+    )
+
+
+def _account_read_max_get_attempts() -> int:
+    return _env_int(
+        "TRADING_MVP_BINANCE_ACCOUNT_READ_MAX_GET_ATTEMPTS",
+        default=DEFAULT_ACCOUNT_READ_MAX_GET_ATTEMPTS,
+        minimum=1,
+    )
+
+
+def _iso_now() -> str:
+    return utcnow_naive().isoformat()
+
+
+def _settings_detail(settings_row: Setting) -> dict[str, Any]:
+    detail = settings_row.pause_reason_detail
+    return dict(detail) if isinstance(detail, dict) else {}
+
+
+def _account_cache_detail(settings_row: Setting) -> dict[str, Any]:
+    detail = _settings_detail(settings_row)
+    cache = detail.get(ACCOUNT_CACHE_DETAIL_KEY)
+    return dict(cache) if isinstance(cache, dict) else {}
+
+
+def _write_account_cache_detail(settings_row: Setting, cache: Mapping[str, object]) -> dict[str, Any]:
+    detail = _settings_detail(settings_row)
+    normalized_cache = dict(cache)
+    detail[ACCOUNT_CACHE_DETAIL_KEY] = normalized_cache
+    settings_row.pause_reason_detail = detail
+    return normalized_cache
+
+
+def _response_to_cache_payload(payload: BinanceAccountResponse) -> dict[str, object]:
+    payload_dict = payload.model_dump(mode="json")
+    summary = payload_dict.get("summary")
+    if isinstance(summary, dict):
+        summary["message"] = (
+            "연동된 Binance 계정 정보를 불러왔습니다."
+            if payload.summary.connected
+            else "Binance 원본 계정 정보를 불러오지 못했습니다."
+        )
+    return payload_dict
+
+
+def _account_info_from_response(payload: BinanceAccountResponse) -> dict[str, object]:
+    summary = payload.summary
+    return {
+        "totalWalletBalance": summary.total_wallet_balance,
+        "availableBalance": summary.available_balance,
+        "totalUnrealizedProfit": summary.total_unrealized_profit,
+        "totalMarginBalance": summary.total_margin_balance,
+    }
+
+
+def _cache_status(cache: Mapping[str, object], *, has_payload: bool) -> str:
+    status = str(cache.get("status") or "")
+    if status:
+        return status
+    return "ready" if has_payload else "empty"
+
+
+def _cache_response(
+    session: Session,
+    settings_row: Setting,
+    *,
+    cache: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    cache_payload = dict(cache) if cache is not None else _account_cache_detail(settings_row)
+    cached_account = cache_payload.get("payload")
+    has_cached_account = isinstance(cached_account, dict)
+
+    if has_cached_account:
+        payload = copy.deepcopy(cached_account)
+        source = "cached_live"
+        default_message = "캐시된 Binance 원본 계정 정보를 표시합니다."
+    else:
+        payload = get_local_binance_account_snapshot(session).model_dump(mode="json")
+        source = "local"
+        default_message = "아직 캐시된 원본 응답이 없어 최근 로컬 동기화 기준으로 표시합니다."
+        summary = payload.get("summary")
+        if isinstance(summary, dict):
+            summary["message"] = default_message
+
+    return {
+        "status": _cache_status(cache_payload, has_payload=has_cached_account),
+        "source": source,
+        "message": str(cache_payload.get("message") or default_message),
+        "requested_at": cache_payload.get("requested_at"),
+        "started_at": cache_payload.get("started_at"),
+        "refreshed_at": cache_payload.get("refreshed_at"),
+        "last_error": cache_payload.get("last_error"),
+        "duration_ms": cache_payload.get("duration_ms"),
+        "payload": payload,
+    }
 
 
 def _to_float(value: Any) -> float:
@@ -74,19 +210,30 @@ def _resolve_exchange_trade_permission(account_info: Mapping[str, object]) -> tu
     return _to_bool(raw_can_trade), None
 
 
-def _build_client(settings_row: Setting) -> BinanceClient:
+def _build_client(
+    settings_row: Setting,
+    *,
+    timeout_seconds: float | None = None,
+    max_get_attempts: int | None = None,
+) -> BinanceClient:
     credentials = get_runtime_credentials(settings_row)
     return BinanceClient(
         api_key=credentials.binance_api_key,
         api_secret=credentials.binance_api_secret,
         testnet_enabled=settings_row.binance_testnet_enabled,
         futures_enabled=settings_row.binance_futures_enabled,
+        timeout_seconds=timeout_seconds if timeout_seconds is not None else 10.0,
+        max_get_attempts=max_get_attempts,
     )
 
 
-def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
-    settings_row = get_or_create_settings(session)
-    credentials = get_runtime_credentials(settings_row)
+def _build_base_summary(
+    session: Session,
+    settings_row: Setting,
+    *,
+    connected: bool,
+    message: str,
+) -> BinanceAccountSummary:
     settings_payload = serialize_settings_view(settings_row)
     latest_blocked_reasons = get_latest_blocked_reasons(session)
     auto_resume_last_blockers = [str(item) for item in settings_payload.get("auto_resume_last_blockers", []) if item]
@@ -95,9 +242,9 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         latest_blocked_reasons=latest_blocked_reasons,
         auto_resume_last_blockers=auto_resume_last_blockers,
     )
-    base_summary = BinanceAccountSummary(
-        connected=False,
-        message="바이낸스 API 키가 설정되지 않았습니다.",
+    return BinanceAccountSummary(
+        connected=connected,
+        message=message,
         testnet_enabled=settings_row.binance_testnet_enabled,
         futures_enabled=settings_row.binance_futures_enabled,
         tracked_symbols=get_effective_symbols(settings_row),
@@ -114,14 +261,243 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         exchange_update_time=utcnow_naive(),
     )
 
+
+def get_local_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
+    settings_row = get_or_create_settings(session)
+    credentials = get_runtime_credentials(settings_row)
+    snapshot_row = session.scalars(
+        select(PnLSnapshot).order_by(desc(PnLSnapshot.snapshot_date), desc(PnLSnapshot.created_at)).limit(1)
+    ).first()
+    snapshot = account_snapshot_to_dict(snapshot_row) if snapshot_row is not None else {}
+    snapshot_available = bool(snapshot.get("account_snapshot_available"))
+    connected = bool(credentials.binance_api_key and credentials.binance_api_secret)
+
+    summary = _build_base_summary(
+        session,
+        settings_row,
+        connected=connected,
+        message=(
+            "최근 로컬 계정 동기화 기준입니다. Binance 원본 응답은 새로고침 버튼으로 별도 조회합니다."
+            if snapshot_available
+            else "아직 성공한 로컬 계정 동기화가 없습니다. Binance 원본 조회 또는 동기화 상태를 확인하세요."
+        ),
+    ).model_copy(
+        update={
+            "total_wallet_balance": _to_float(snapshot.get("wallet_balance")),
+            "available_balance": _to_float(snapshot.get("available_balance")),
+            "total_unrealized_profit": _to_float(snapshot.get("unrealized_pnl")),
+            "total_margin_balance": _to_float(snapshot.get("equity")),
+            "asset_count": 1 if snapshot_available else 0,
+            "exchange_update_time": utcnow_naive(),
+        }
+    )
+
+    positions = [
+        BinanceAccountPosition(
+            symbol=row.symbol,
+            position_side="short" if str(row.side).lower() == "short" else "long",
+            position_amt=row.quantity,
+            entry_price=row.entry_price,
+            mark_price=row.mark_price,
+            leverage=row.leverage,
+            unrealized_profit=row.unrealized_pnl,
+            notional=abs(row.mark_price * row.quantity),
+            margin_type=str((row.metadata_json or {}).get("margin_type") or ""),
+        )
+        for row in session.scalars(
+            select(Position)
+            .where(Position.mode == "live", Position.status == "open", Position.quantity > 0)
+            .order_by(desc(Position.updated_at), desc(Position.created_at))
+            .limit(50)
+        )
+    ]
+
+    open_orders = [
+        BinanceOpenOrderSummary(
+            symbol=row.symbol,
+            side=row.side,
+            type=row.order_type,
+            status=row.status,
+            price=row.requested_price,
+            orig_qty=row.requested_quantity,
+            executed_qty=row.filled_quantity,
+            reduce_only=row.reduce_only,
+            close_position=row.close_only,
+            update_time=row.updated_at,
+        )
+        for row in session.scalars(
+            select(Order)
+            .where(
+                Order.mode == "live",
+                func.lower(func.coalesce(Order.status, "")).notin_(tuple(FINAL_ORDER_STATUSES)),
+                func.upper(func.coalesce(Order.exchange_status, "")).notin_(tuple(FINAL_EXCHANGE_ORDER_STATUSES)),
+            )
+            .order_by(desc(Order.updated_at), desc(Order.created_at))
+            .limit(50)
+        )
+    ]
+
+    assets = []
+    if snapshot_available:
+        assets.append(
+            BinanceAccountAsset(
+                asset="USDT",
+                wallet_balance=_to_float(snapshot.get("wallet_balance")),
+                available_balance=_to_float(snapshot.get("available_balance")),
+                margin_balance=_to_float(snapshot.get("equity")),
+                unrealized_profit=_to_float(snapshot.get("unrealized_pnl")),
+            )
+        )
+
+    summary = summary.model_copy(update={"open_positions": len(positions), "open_orders": len(open_orders)})
+    return BinanceAccountResponse(summary=summary, assets=assets, positions=positions, open_orders=open_orders)
+
+
+def get_cached_binance_account_snapshot(session: Session) -> dict[str, object]:
+    settings_row = get_or_create_settings(session)
+    return _cache_response(session, settings_row)
+
+
+def mark_binance_account_refresh_requested(
+    session: Session,
+    *,
+    already_running: bool = False,
+) -> dict[str, object]:
+    settings_row = get_or_create_settings(session)
+    cache = _account_cache_detail(settings_row)
+    status = "already_running" if already_running else "queued"
+    message = (
+        "이미 Binance 원본 계정 캐시 갱신이 진행 중입니다."
+        if already_running
+        else "Binance 원본 계정 캐시 갱신을 요청했습니다."
+    )
+    cache.update(
+        {
+            "status": status,
+            "source": cache.get("source") or "cached_live",
+            "requested_at": _iso_now(),
+            "last_error": None,
+            "message": message,
+        }
+    )
+    normalized_cache = _write_account_cache_detail(settings_row, cache)
+    session.add(settings_row)
+    session.flush()
+    return _cache_response(session, settings_row, cache=normalized_cache)
+
+
+def mark_binance_account_refresh_started(session: Session) -> None:
+    settings_row = get_or_create_settings(session)
+    cache = _account_cache_detail(settings_row)
+    cache.update(
+        {
+            "status": "refreshing",
+            "source": cache.get("source") or "cached_live",
+            "started_at": _iso_now(),
+            "last_error": None,
+            "message": "Binance 원본 계정 캐시를 갱신 중입니다.",
+        }
+    )
+    _write_account_cache_detail(settings_row, cache)
+    session.add(settings_row)
+    session.flush()
+
+
+def store_binance_account_cache_result(
+    session: Session,
+    payload: BinanceAccountResponse,
+    *,
+    duration_ms: float,
+) -> dict[str, object]:
+    settings_row = get_or_create_settings(session)
+    cache = _account_cache_detail(settings_row)
+    refreshed_at = _iso_now()
+    cache.update(
+        {
+            "status": "ready",
+            "source": "cached_live",
+            "payload": _response_to_cache_payload(payload),
+            "refreshed_at": refreshed_at,
+            "duration_ms": round(duration_ms, 1),
+            "last_error": None,
+            "message": "Binance 원본 계정 캐시를 갱신했습니다.",
+        }
+    )
+    normalized_cache = _write_account_cache_detail(settings_row, cache)
+    if payload.summary.connected:
+        create_exchange_pnl_snapshot(session, settings_row, _account_info_from_response(payload))
+    session.add(settings_row)
+    session.flush()
+    return _cache_response(session, settings_row, cache=normalized_cache)
+
+
+def store_binance_account_cache_failure(
+    session: Session,
+    error: str,
+    *,
+    duration_ms: float | None = None,
+) -> dict[str, object]:
+    settings_row = get_or_create_settings(session)
+    cache = _account_cache_detail(settings_row)
+    cache.update(
+        {
+            "status": "failed",
+            "source": cache.get("source") or "cached_live",
+            "duration_ms": round(duration_ms, 1) if duration_ms is not None else cache.get("duration_ms"),
+            "last_error": error,
+            "message": "Binance 원본 계정 캐시 갱신에 실패했습니다. 이전 캐시나 로컬 동기화 기준을 계속 표시합니다.",
+        }
+    )
+    normalized_cache = _write_account_cache_detail(settings_row, cache)
+    session.add(settings_row)
+    session.flush()
+    return _cache_response(session, settings_row, cache=normalized_cache)
+
+
+def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
+    settings_row = get_or_create_settings(session)
+    credentials = get_runtime_credentials(settings_row)
+    base_summary = _build_base_summary(
+        session,
+        settings_row,
+        connected=False,
+        message="바이낸스 API 키가 설정되지 않았습니다.",
+    )
+
+    base_summary = base_summary.model_copy(update={"message": "Binance API 키가 설정되지 않았습니다."})
+
     if not credentials.binance_api_key or not credentials.binance_api_secret:
         return BinanceAccountResponse(summary=base_summary)
 
+    timeout_seconds = _account_read_timeout_seconds()
+    max_get_attempts = _account_read_max_get_attempts()
+
     try:
-        client = _build_client(settings_row)
-        account_info = client.get_account_info()
-        positions_raw = client.get_position_information()
-        open_orders_raw = client.get_open_orders()
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="binance-account-read") as executor:
+            account_future = executor.submit(
+                _build_client(
+                    settings_row,
+                    timeout_seconds=timeout_seconds,
+                    max_get_attempts=max_get_attempts,
+                ).get_account_info
+            )
+            positions_future = executor.submit(
+                _build_client(
+                    settings_row,
+                    timeout_seconds=timeout_seconds,
+                    max_get_attempts=max_get_attempts,
+                ).get_position_information
+            )
+            open_orders_future = executor.submit(
+                _build_client(
+                    settings_row,
+                    timeout_seconds=timeout_seconds,
+                    max_get_attempts=max_get_attempts,
+                ).get_open_orders
+            )
+            account_info = account_future.result()
+            positions_raw = positions_future.result()
+            open_orders_raw = open_orders_future.result()
     except Exception as exc:
         return BinanceAccountResponse(
             summary=base_summary.model_copy(
@@ -210,36 +586,28 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
     open_orders.sort(key=lambda item: item.update_time or datetime.min, reverse=True)
     exchange_can_trade, exchange_can_trade_note = _resolve_exchange_trade_permission(account_info)
 
-    summary = BinanceAccountSummary(
+    summary = _build_base_summary(
+        session,
+        settings_row,
         connected=True,
         message="연동된 바이낸스 계정 정보를 불러왔습니다.",
-        testnet_enabled=settings_row.binance_testnet_enabled,
-        futures_enabled=settings_row.binance_futures_enabled,
-        tracked_symbols=get_effective_symbols(settings_row),
-        can_trade=exchange_can_trade,
-        exchange_can_trade=exchange_can_trade,
-        app_live_execution_ready=is_live_execution_ready(settings_row),
-        app_trading_paused=settings_row.trading_paused,
-        app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
-        app_pause_reason_code=str(settings_payload.get("pause_reason_code") or "") or None,
-        app_pause_origin=str(settings_payload.get("pause_origin") or "") or None,
-        app_auto_resume_last_blockers=auto_resume_last_blockers,
-        guard_mode_reason_category=guard_mode_reason["guard_mode_reason_category"],
-        guard_mode_reason_code=guard_mode_reason["guard_mode_reason_code"],
-        guard_mode_reason_message=guard_mode_reason["guard_mode_reason_message"],
-        latest_blocked_reasons=latest_blocked_reasons,
-        fee_tier=_to_int(account_info.get("feeTier")),
-        total_wallet_balance=_to_float(account_info.get("totalWalletBalance")),
-        available_balance=_to_float(account_info.get("availableBalance")),
-        total_unrealized_profit=_to_float(account_info.get("totalUnrealizedProfit")),
-        total_margin_balance=_to_float(account_info.get("totalMarginBalance")),
-        total_position_initial_margin=_to_float(account_info.get("totalPositionInitialMargin")),
-        total_open_order_initial_margin=_to_float(account_info.get("totalOpenOrderInitialMargin")),
-        total_maint_margin=_to_float(account_info.get("totalMaintMargin")),
-        asset_count=len(assets),
-        open_positions=len(positions),
-        open_orders=len(open_orders),
-        exchange_update_time=utcnow_naive(),
+    ).model_copy(
+        update={
+            "can_trade": exchange_can_trade,
+            "exchange_can_trade": exchange_can_trade,
+            "fee_tier": _to_int(account_info.get("feeTier")),
+            "total_wallet_balance": _to_float(account_info.get("totalWalletBalance")),
+            "available_balance": _to_float(account_info.get("availableBalance")),
+            "total_unrealized_profit": _to_float(account_info.get("totalUnrealizedProfit")),
+            "total_margin_balance": _to_float(account_info.get("totalMarginBalance")),
+            "total_position_initial_margin": _to_float(account_info.get("totalPositionInitialMargin")),
+            "total_open_order_initial_margin": _to_float(account_info.get("totalOpenOrderInitialMargin")),
+            "total_maint_margin": _to_float(account_info.get("totalMaintMargin")),
+            "asset_count": len(assets),
+            "open_positions": len(positions),
+            "open_orders": len(open_orders),
+            "exchange_update_time": utcnow_naive(),
+        }
     )
     if exchange_can_trade_note is not None:
         summary.message = f"{summary.message} {exchange_can_trade_note}"

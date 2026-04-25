@@ -1646,9 +1646,9 @@ function GlobalOperatorSummary({
                   최근 전역 감사 이벤트가 없습니다.
                 </div>
               ) : (
-                recentGlobalAuditEvents.map((event) => (
+                recentGlobalAuditEvents.map((event, index) => (
                   <div
-                    key={`${event.event_type}-${event.entity_id}-${event.created_at}`}
+                    key={`${event.event_type}-${event.entity_id}-${event.created_at}-${index}`}
                     className="rounded-2xl bg-white px-4 py-3"
                   >
                     <div className="flex flex-wrap items-center gap-2">
@@ -2304,9 +2304,9 @@ function SymbolDetailPanel({
               {symbol.symbol} 기준 최근 감사 기록이 없습니다.
             </div>
           ) : (
-            symbol.audit_events.map((event) => (
+            symbol.audit_events.map((event, index) => (
               <div
-                key={`${event.event_type}-${event.entity_id}-${event.created_at}`}
+                key={`${event.event_type}-${event.entity_id}-${event.created_at}-${index}`}
                 className="rounded-2xl bg-slate-50 px-4 py-3"
               >
                 <div className="flex flex-wrap items-center gap-2">

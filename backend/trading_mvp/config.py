@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from sqlalchemy.engine import make_url
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_DIR = (_PROJECT_ROOT / "data").resolve()
 _DEFAULT_DATABASE_PATH = (_DEFAULT_DATA_DIR / "trading_mvp.db").resolve()
+_DEFAULT_POSTGRES_DATABASE_URL = "postgresql+psycopg://trading:trading@127.0.0.1:5432/trading_mvp"
 
 
 def _resolve_project_path(path: str | Path) -> Path:
@@ -36,6 +38,50 @@ def _resolve_sqlite_database_url(database_url: str) -> str:
     return str(url.set(database=_resolve_project_path(url.database).as_posix()))
 
 
+def _explicit_flag(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        value = _read_dotenv_value(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_dotenv_value(name: str) -> str | None:
+    dotenv_path = _PROJECT_ROOT / ".env"
+    if not dotenv_path.exists():
+        return None
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#") or "=" not in trimmed:
+            continue
+        key, value = trimmed.split("=", 1)
+        if key.strip() == name:
+            return value.strip().strip('"').strip("'")
+    return None
+
+
+def get_explicit_database_url() -> str | None:
+    value = os.getenv("DATABASE_URL")
+    if value and value.strip():
+        return value.strip()
+    return _read_dotenv_value("DATABASE_URL")
+
+
+def require_runtime_database_url(context: str) -> str:
+    database_url = get_explicit_database_url()
+    if not database_url:
+        raise RuntimeError(
+            f"DATABASE_URL is required for {context}. "
+            "Set a PostgreSQL URL, or explicitly opt in to SQLite for local/dev use."
+        )
+    database_url = _resolve_sqlite_database_url(database_url)
+    if database_url.startswith("sqlite") and not _explicit_flag("TRADING_MVP_ALLOW_SQLITE"):
+        raise RuntimeError(
+            f"DATABASE_URL points to SQLite for {context}. "
+            "Set TRADING_MVP_ALLOW_SQLITE=1 only for explicit local/dev use."
+        )
+    return database_url
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / ".env"),
@@ -47,7 +93,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     frontend_port: int = 3000
-    database_url: str = _sqlite_url_from_path(_DEFAULT_DATABASE_PATH)
+    database_url: str = _DEFAULT_POSTGRES_DATABASE_URL
     redis_url: str = "redis://localhost:6379/0"
     default_symbol: str = "BTCUSDT"
     tracked_symbols: str = "BTCUSDT"

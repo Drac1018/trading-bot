@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
-from hashlib import sha1
-from threading import Lock
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
+from hashlib import sha1
 from math import floor
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -44,8 +44,8 @@ from trading_mvp.services.audit import (
 )
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
 from trading_mvp.services.binance_user_stream import (
-    BinanceUserStreamListener,
     USER_STREAM_FALLBACK_SOURCE,
+    BinanceUserStreamListener,
     build_user_stream_state,
     normalize_user_stream_event,
 )
@@ -64,8 +64,8 @@ from trading_mvp.services.position_management import (
     PARTIAL_TAKE_PROFIT_FRACTION,
     build_position_management_context,
     mark_partial_take_profit_taken,
-    record_add_on_metadata,
     mark_time_stop_action,
+    record_add_on_metadata,
     seed_position_management_metadata,
     store_position_management_context,
 )
@@ -78,21 +78,21 @@ from trading_mvp.services.runtime_state import (
     TRADABLE_STATE,
     build_execution_dedupe_key,
     build_sync_freshness_summary,
-    clear_unresolved_submission_guard,
     clear_execution_lock,
-    get_reconciliation_detail,
-    get_user_stream_detail,
+    clear_unresolved_submission_guard,
     get_execution_dedupe_record,
-    get_unresolved_submission_guard,
     get_operating_state,
     get_protection_recovery_detail,
+    get_reconciliation_detail,
+    get_unresolved_submission_guard,
+    get_user_stream_detail,
     list_unresolved_submission_guards,
     mark_execution_lock,
     mark_sync_issue,
     mark_sync_success,
     replace_user_stream_detail,
-    set_unresolved_submission_guard,
     set_reconciliation_detail,
+    set_unresolved_submission_guard,
     set_user_stream_detail,
     should_use_rest_order_reconciliation,
     store_execution_dedupe_record,
@@ -1679,7 +1679,7 @@ def _verify_created_protective_orders(
             continue
         verified_payload: dict[str, object] | None = None
         verification_error: str | None = None
-        for attempt in range(1, PROTECTION_VERIFY_FETCH_ATTEMPTS + 1):
+        for _attempt in range(1, PROTECTION_VERIFY_FETCH_ATTEMPTS + 1):
             try:
                 payload = _fetch_exchange_order(
                     client,
@@ -2924,7 +2924,7 @@ def _build_deterministic_client_order_id(
 ) -> str | None:
     if not seed:
         return None
-    digest = sha1(f"{seed}:{suffix}".encode("utf-8")).hexdigest()[:24]
+    digest = sha1(f"{seed}:{suffix}".encode()).hexdigest()[:24]
     return f"mvp-{digest}"
 
 
@@ -2951,9 +2951,9 @@ def _annotate_submission_exception(
     submit_request: dict[str, Any],
     submission_tracking: dict[str, Any],
 ) -> Exception:
-    setattr(exc, "client_order_id", client_order_id)
-    setattr(exc, "submit_request", dict(submit_request))
-    setattr(exc, "submission_tracking", dict(submission_tracking))
+    exc.client_order_id = client_order_id
+    exc.submit_request = dict(submit_request)
+    exc.submission_tracking = dict(submission_tracking)
     return exc
 
 
@@ -3066,7 +3066,6 @@ def _safe_submit_order(
     stop_price = submit_request.get("stop_price")
     client_order_id = client_order_id or f"mvp-{uuid4().hex[:24]}"
     submit_attempt_count = 1
-    safe_retry_used = False
     last_submit_error: str | None = None
     try:
         response = _submit_exchange_order(
@@ -3117,7 +3116,6 @@ def _safe_submit_order(
         )
         return client_order_id, reconciled_response, submit_request, submission_tracking
 
-    safe_retry_used = True
     submit_attempt_count += 1
     try:
         retry_response = _submit_exchange_order(
@@ -3189,7 +3187,7 @@ def _safe_submit_order(
             client_order_id=client_order_id,
             submit_request=submit_request,
             submission_tracking=submission_tracking,
-        )
+        ) from exc
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         last_submit_error = _stringify_submit_error(exc)
         try:
@@ -4845,7 +4843,13 @@ def _ensure_protected_position(
     }
 
 
-def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | None = None) -> dict[str, object]:
+def sync_live_state(
+    session: Session,
+    settings_row: Setting,
+    *,
+    symbol: str | None = None,
+    allow_protection_recovery: bool = True,
+) -> dict[str, object]:
     client = _build_client(settings_row)
     symbols = _resolve_sync_symbols(settings_row, symbol)
     stream_poll = poll_live_user_stream(
@@ -5131,37 +5135,52 @@ def sync_live_state(session: Session, settings_row: Setting, *, symbol: str | No
                 detail={"symbol": item_symbol, "missing_components": protection_state.get("missing_components", [])},
             )
             unprotected_positions.append(item_symbol)
-            protection_result = _ensure_protected_position(
-                session,
-                settings_row,
-                client,
-                symbol=item_symbol,
-                position=position,
-                stop_loss=position.stop_loss if position is not None else None,
-                take_profit=position.take_profit if position is not None else None,
-                decision_run_id=None,
-                risk_row=None,
-                parent_order=None,
-                trigger_source="sync_live_state",
-                pause_reason_code="MISSING_PROTECTIVE_ORDERS",
-            )
-            symbol_protection_state[item_symbol] = protection_result["protection_state"]  # type: ignore[assignment]
-            if protection_result.get("emergency_action") is not None:
-                emergency_actions_taken.append(
-                    {
-                        "symbol": item_symbol,
-                        "action": protection_result.get("status"),
-                        "result": protection_result["emergency_action"],
-                    }
-                )
-            else:
-                _record_sync_success(
+            if allow_protection_recovery:
+                protection_result = _ensure_protected_position(
                     session,
                     settings_row,
-                    scope="protective_orders",
-                    detail={
+                    client,
+                    symbol=item_symbol,
+                    position=position,
+                    stop_loss=position.stop_loss if position is not None else None,
+                    take_profit=position.take_profit if position is not None else None,
+                    decision_run_id=None,
+                    risk_row=None,
+                    parent_order=None,
+                    trigger_source="sync_live_state",
+                    pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+                )
+                symbol_protection_state[item_symbol] = protection_result["protection_state"]  # type: ignore[assignment]
+                if protection_result.get("emergency_action") is not None:
+                    emergency_actions_taken.append(
+                        {
+                            "symbol": item_symbol,
+                            "action": protection_result.get("status"),
+                            "result": protection_result["emergency_action"],
+                        }
+                    )
+                else:
+                    _record_sync_success(
+                        session,
+                        settings_row,
+                        scope="protective_orders",
+                        detail={
+                            "symbol": item_symbol,
+                            "status": protection_result["protection_state"].get("status", "protected"),
+                        },
+                    )
+            else:
+                record_audit_event(
+                    session,
+                    event_type="protection_recovery_deferred",
+                    entity_type="position",
+                    entity_id=str(position.id if position is not None else item_symbol),
+                    severity="critical",
+                    message="Protection recovery was deferred by verify-only live sync.",
+                    payload={
                         "symbol": item_symbol,
-                        "status": protection_result["protection_state"].get("status", "protected"),
+                        "trigger_source": "sync_live_state",
+                        "protective_state": protection_state,
                     },
                 )
         elif not symbol_guard_active:
@@ -6145,7 +6164,7 @@ def _execute_live_trade_body(
             quantity=requested_quantity,
             reference_price=intent.requested_price,
             approved_notional=approved_notional_cap,
-            enforce_min_notional=not (decision.decision == "exit"),
+            enforce_min_notional=decision.decision != "exit",
             close_position=False,
         )
     except PreTradeExchangeFilterError as exc:

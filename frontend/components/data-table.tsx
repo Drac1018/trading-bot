@@ -23,7 +23,7 @@ function renderValue(value: unknown, key?: string) {
         {items.map((item, index) => (
           <span
             key={`${item}-${index}`}
-            className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-900"
+            className="rounded-md border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-medium text-blue-800"
           >
             {item}
           </span>
@@ -34,7 +34,7 @@ function renderValue(value: unknown, key?: string) {
 
   if (typeof value === "object") {
     return (
-      <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-2xl bg-slate-900/95 p-4 text-xs leading-6 text-slate-100">
+      <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-slate-950 p-4 text-xs leading-6 text-slate-100">
         {JSON.stringify(normalizeDisplayValue(value, key), null, 2)}
       </pre>
     );
@@ -67,52 +67,52 @@ export function DataTable({
   const getLabel = (column: string) => labelOverrides?.[column] ?? translateLabel(column);
 
   return (
-    <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+    <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">{description}</p>
-          <h2 className="font-display text-2xl text-ink sm:text-[2rem]">{title}</h2>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">{description}</p>
+          <h2 className="mt-1 text-xl font-semibold text-slate-950 sm:text-2xl">{title}</h2>
         </div>
-        <div className="w-fit rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
+        <div className="w-fit rounded-md bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
           {rows.length}건
         </div>
       </div>
 
       {rows.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-amber-300 px-4 py-8 text-sm text-slate-500">
+        <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
           <p className="font-semibold text-slate-700">{emptyStateTitle ?? "표시할 데이터가 없습니다."}</p>
           <p className="mt-2 leading-6">{emptyStateDescription ?? "현재 조건에 맞는 항목이 아직 없습니다."}</p>
         </div>
       ) : (
         <div className="grid gap-4 2xl:grid-cols-2">
           {rows.map((row, index) => (
-            <article key={rowKeys[index]} className="rounded-[1.6rem] border border-amber-100 bg-canvas/90 p-4 shadow-sm">
+            <article key={rowKeys[index]} className="rounded-lg border border-slate-200 bg-slate-50 p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
-                  <h3 className="text-base font-semibold text-ink">
+                  <h3 className="text-base font-semibold text-slate-950">
                     {rowTitleFormatter ? rowTitleFormatter(row, index) : defaultGetRowTitle(row, index)}
                   </h3>
                   <p className="mt-1 text-xs text-slate-500">항목 #{index + 1}</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {typeof row.status === "string" ? (
-                    <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                    <span className="rounded-md bg-white px-3 py-1 text-xs font-medium text-slate-600">
                       {formatDisplayValue(row.status, "status")}
                     </span>
                   ) : null}
                   {typeof row.provider_name === "string" ? (
-                    <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                    <span className="rounded-md bg-white px-3 py-1 text-xs font-medium text-slate-600">
                       {formatDisplayValue(row.provider_name, "provider_name")}
                     </span>
                   ) : null}
                   {typeof row.mode === "string" ? (
-                    <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600">
+                    <span className="rounded-md bg-white px-3 py-1 text-xs font-medium text-slate-600">
                       {formatDisplayValue(row.mode, "mode")}
                     </span>
                   ) : null}
                   {typeof row.protected === "boolean" ? (
                     <span
-                      className={`rounded-full px-3 py-1 text-xs font-medium ${
+                      className={`rounded-md px-3 py-1 text-xs font-medium ${
                         row.protected ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"
                       }`}
                     >
@@ -124,24 +124,24 @@ export function DataTable({
 
               <dl className="mt-4 grid gap-3 md:grid-cols-2">
                 {primary.map((column) => (
-                  <div key={column} className="rounded-2xl border border-amber-100 bg-white px-4 py-3">
-                    <dt className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                  <div key={column} className="rounded-md border border-slate-200 bg-white px-4 py-3">
+                    <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">
                       {getLabel(column)}
                     </dt>
-                    <dd className="mt-2 min-w-0 text-sm leading-6 text-ink">{renderValue(row[column], column)}</dd>
+                    <dd className="mt-2 min-w-0 text-sm leading-6 text-slate-900">{renderValue(row[column], column)}</dd>
                   </div>
                 ))}
               </dl>
 
               {detail.length > 0 ? (
-                <details className="mt-4 rounded-2xl border border-amber-200 bg-white">
-                  <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-ink">
+                <details className="mt-4 rounded-md border border-slate-200 bg-white">
+                  <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-slate-950">
                     상세 payload 보기
                   </summary>
-                  <div className="space-y-4 border-t border-amber-100 px-4 py-4">
+                  <div className="space-y-4 border-t border-slate-200 px-4 py-4">
                     {detail.map((column) => (
                       <div key={column} className="space-y-2">
-                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
                           {getLabel(column)}
                         </p>
                         {renderValue(row[column], column)}

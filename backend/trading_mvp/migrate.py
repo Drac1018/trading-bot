@@ -5,7 +5,7 @@ import sys
 
 from sqlalchemy import create_engine, inspect, text
 
-from trading_mvp.config import get_settings
+from trading_mvp.config import require_runtime_database_url
 
 APP_TABLES = {
     "users",
@@ -29,8 +29,8 @@ INITIAL_REVISION = "855703716928"
 
 
 def main() -> None:
-    settings = get_settings()
-    engine = create_engine(settings.database_url, future=True)
+    database_url = require_runtime_database_url("migration command")
+    engine = create_engine(database_url, future=True)
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
     version_rows = 0

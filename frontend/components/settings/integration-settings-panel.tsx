@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { Field, InlineFeedback, StatusPill, Toggle, inputClass, type FeedbackMessage } from "./form-primitives";
 import { type EventSourceProvider } from "./types";
@@ -77,13 +77,13 @@ export function IntegrationSettingsPanel({
   return (
     <div className="space-y-5">
       <section className="grid gap-5 xl:grid-cols-2">
-        <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">AI 설정</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
             여기서는 제공자, 모델, 입력 길이, 온도만 조정합니다. 호출 타이밍은 위 운영 주기 섹션에서 관리하고,
             신규 진입은 이벤트 기반 + 행동 바운딩 + 실패 시 차단 경로를 따릅니다.
           </p>
-          <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
+          <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">현재 AI 운영 원칙</p>
             <p className="mt-2 text-sm leading-6 text-slate-700">
               고정 15분 AI 호출이 아니라 트리거 기반으로만 평가를 시도합니다. 위의 재검토 확인 주기는 주기 cycle이
@@ -150,7 +150,7 @@ export function IntegrationSettingsPanel({
           </div>
         </div>
 
-        <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 className="text-lg font-semibold text-slate-900">외부 이벤트 소스</h3>
@@ -164,7 +164,7 @@ export function IntegrationSettingsPanel({
               {eventSourceProviderLabel}
             </StatusPill>
           </div>
-          <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-3">
+          <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">현재 런타임 event source</p>
             <p className="mt-2 text-sm font-semibold text-slate-900">{eventSourceProvenanceLabel}</p>
             {eventSourceVendorLabel ? (
@@ -179,7 +179,7 @@ export function IntegrationSettingsPanel({
               label="settings 값 우선 사용"
               onChange={(value) => onFieldChange("event_source_provider", value ? (form.event_source_provider || "stub") : "")}
             />
-            <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3">
+            <div className="rounded-md border border-slate-200 bg-white px-4 py-3">
               <p className="text-xs text-slate-500">적용 방식</p>
               <p className="mt-2 text-sm font-semibold text-slate-900">
                 {eventSourceOverrideEnabled ? "저장된 settings 값 우선" : "env fallback 또는 stub"}
@@ -254,7 +254,7 @@ export function IntegrationSettingsPanel({
               />
             </Field>
           </div>
-          <div className="mt-4 rounded-2xl border border-amber-200 bg-white px-4 py-4">
+          <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-sm font-semibold text-slate-900">발표 후 actual enrichment API</p>
@@ -317,7 +317,7 @@ export function IntegrationSettingsPanel({
           </p>
         </div>
 
-        <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
           <h3 className="text-lg font-semibold text-slate-900">Binance 연동</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
             시세 사용 여부, 선물 / 테스트넷 경로, API 자격증명을 관리합니다. 실제 계좌 상태 확인은 위 실거래 제어의
@@ -379,7 +379,7 @@ export function IntegrationSettingsPanel({
         </div>
       </section>
 
-      <div className="flex flex-col gap-3 rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+      <div className="flex flex-col gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
         <p className="text-sm text-slate-600">
           연동 설정도 기존 full payload 저장 경로를 그대로 사용합니다. OpenAI/Binance/FRED 키 변경은 저장 후
           반영됩니다.
@@ -401,3 +401,4 @@ export function IntegrationSettingsPanel({
     </div>
   );
 }
+

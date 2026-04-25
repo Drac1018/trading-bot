@@ -25,15 +25,15 @@ const config: Config = {
         ]
       },
       colors: {
-        canvas: "#f5efe3",
+        canvas: "#f7f9fc",
         ink: "#1d2939",
         signal: "#0f766e",
         risk: "#b42318",
-        gold: "#b69231",
-        panel: "#fffaf1"
+        gold: "#2563eb",
+        panel: "#ffffff"
       },
       boxShadow: {
-        frame: "0 18px 60px rgba(29, 41, 57, 0.08)"
+        frame: "0 14px 40px rgba(15, 23, 42, 0.08)"
       }
     }
   },

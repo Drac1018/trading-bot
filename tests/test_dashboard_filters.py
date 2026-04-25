@@ -2018,6 +2018,76 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert len(payload["audit_events"]) >= 1
 
 
+def test_decisions_api_compact_returns_operator_fields_without_raw_features(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("decisions_compact.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/decisions?limit=12&compact=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    btc = next(item for item in payload if item["symbol"] == "BTCUSDT")
+
+    assert btc["decision"] == "long"
+    assert btc["timeframe"] == "15m"
+    assert btc["ai_trigger_reason"] == "entry_candidate_event"
+    assert "features" not in btc["input_payload"]
+    assert "decision" in btc["output_payload"]
+    assert "input_payload" in btc
+
+
+def test_agents_api_compact_omits_raw_agent_payloads(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("agents_compact.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/agents?limit=12&compact=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    btc = next(item for item in payload if item["summary"] == "btc blocked long")
+
+    assert btc["payload_mode"] == "compact"
+    assert btc["role"] == "trading_decision"
+    assert btc["provider_name"] == "openai"
+    assert btc["status"] == "completed"
+    assert btc["output_payload"]["symbol"] == "BTCUSDT"
+    assert btc["output_payload"]["decision"] == "long"
+    assert "features" not in btc["input_payload"]
+    assert "market_snapshot" not in btc["input_payload"]
+    assert "event_risk_acknowledgement" not in btc["output_payload"]
+    assert "active_position_prompt_route_context" in btc["metadata_json"]
+    assert "active_position_entry_fingerprint_basis" not in btc["metadata_json"]
+
+
+def test_risk_checks_api_compact_omits_debug_payload(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("risk_checks_compact.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/risk/checks?limit=12&compact=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    btc = next(item for item in payload if item["symbol"] == "BTCUSDT")
+
+    assert btc["payload_mode"] == "compact"
+    assert btc["payload"]["allowed"] is False
+    assert btc["payload"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert "debug_payload" not in btc["payload"]
+    assert "exposure_metrics" not in btc["payload"]
+
+
 def test_risk_checks_api_includes_ai_trigger_summary(testclient_db_factory) -> None:
     TestingSessionLocal = testclient_db_factory("risk_checks_trigger_summary.db")
 

@@ -91,6 +91,32 @@ def test_http_error_exposes_binance_code_and_message(monkeypatch) -> None:
         BinanceClient(api_key="key", api_secret="secret").get_account_info()
 
 
+def test_get_retry_attempts_can_be_capped(monkeypatch) -> None:
+    calls = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def request(self, method, path, params=None, headers=None):
+            nonlocal calls
+            calls += 1
+            raise httpx.TransportError("network timeout")
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    with pytest.raises(httpx.TransportError, match="network timeout"):
+        BinanceClient(max_get_attempts=1).fetch_klines("BTCUSDT", "1m", limit=2)
+
+    assert calls == 1
+
+
 def test_timestamp_error_resyncs_with_server_time(monkeypatch) -> None:
     captured_account_timestamps: list[int] = []
     calls = {"account": 0}

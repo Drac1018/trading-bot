@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { Field, InlineFeedback, StatusPill, Toggle, inputClass, type FeedbackMessage } from "./form-primitives";
 import { formatDisplayValue } from "../../lib/ui-copy";
@@ -176,7 +176,7 @@ function ControlStatusPanel({
     <div className="mt-4 space-y-4">
       <div className="grid gap-3 md:grid-cols-2">
         {cards.map((card) => (
-          <div key={card.label} className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div key={card.label} className="rounded-md border border-slate-200 bg-white p-4">
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs font-medium text-slate-500">{card.label}</p>
               <StatusPill tone={card.tone}>{card.value}</StatusPill>
@@ -186,7 +186,7 @@ function ControlStatusPanel({
         ))}
       </div>
 
-      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+      <div className="rounded-md border border-slate-200 bg-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-sm font-semibold text-slate-900">현재 cycle 차단 사유</p>
@@ -218,7 +218,7 @@ function ControlStatusPanel({
         ) : null}
       </div>
 
-      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+      <div className="rounded-md border border-slate-200 bg-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-sm font-semibold text-slate-900">approval control summary</p>
@@ -258,7 +258,7 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
     protectionEntries.some(([, state]) => !state.protected);
 
   return (
-    <div className="mt-3 space-y-3 rounded-2xl border border-amber-200 bg-white p-4">
+    <div className="mt-3 space-y-3 rounded-md border border-slate-200 bg-white p-4">
       <div className="flex flex-wrap gap-2">
         <StatusPill>동기화 심볼 {result.symbols?.join(", ") ?? "-"}</StatusPill>
         <StatusPill>주문 {result.synced_orders ?? 0}</StatusPill>
@@ -267,7 +267,7 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
           <StatusPill>자산 {formatDisplayValue(result.equity, "equity")}</StatusPill>
         ) : null}
       </div>
-      <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
+      <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
         이 결과는 방금 실행한 거래소 동기화와 보호 주문 확인 결과입니다. 실거래 준비 상태, 운영 중지, 가드 모드,
         차단 사유 해석은 개요 화면을 기준으로 확인합니다.
       </div>
@@ -284,7 +284,7 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
               : "포지션과 보호 주문 기준으로 추가 조치가 필요하지 않습니다."}
           </p>
         </div>
-        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3">
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3">
           <p className="text-xs text-slate-500">누락 보호 항목</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{missingProtectionText}</p>
         </div>
@@ -292,7 +292,7 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
       {protectionEntries.length > 0 ? (
         <div className="grid gap-3 md:grid-cols-2">
           {protectionEntries.map(([symbol, state]) => (
-            <div key={symbol} className="rounded-2xl bg-canvas px-4 py-3">
+            <div key={symbol} className="rounded-md bg-slate-50 px-4 py-3">
               <div className="flex flex-wrap items-center gap-2">
                 <StatusPill>{symbol}</StatusPill>
                 <StatusPill tone={state.protected ? "good" : "danger"}>
@@ -323,7 +323,7 @@ function LiveSyncPanel({ result }: { result: LiveSyncResult | null }) {
         </div>
       ) : null}
       {(result.emergency_actions_taken?.length ?? 0) > 0 ? (
-        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           <p className="font-semibold">비상 조치 발생</p>
           <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">
             {JSON.stringify(result.emergency_actions_taken, null, 2)}
@@ -366,7 +366,7 @@ export function LiveControlPanel({
   onFieldChange: (field: keyof LiveControlForm, value: LiveControlForm[keyof LiveControlForm]) => void;
 }) {
   return (
-    <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+    <section className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
         <div>
           <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
@@ -394,7 +394,7 @@ export function LiveControlPanel({
       <ControlStatusPanel state={state} summary={summary} />
 
       <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="rounded-md border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-slate-900">즉시 실행 액션</p>
@@ -444,7 +444,7 @@ export function LiveControlPanel({
           <LiveSyncPanel result={liveSyncResult} />
         </div>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="rounded-md border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-slate-900">저장형 운영 기본값</p>
@@ -488,13 +488,13 @@ export function LiveControlPanel({
                 onChange={(event) => onFieldChange("limited_live_max_notional", Number(event.target.value))}
               />
             </Field>
-            <div className="rounded-2xl border border-amber-200 bg-canvas px-4 py-3">
+            <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
               <p className="text-xs text-slate-500">환경 게이트</p>
               <p className="mt-2 text-sm font-semibold text-slate-900">
                 {state.live_trading_env_enabled ? "활성" : "비활성"}
               </p>
             </div>
-            <div className="rounded-2xl border border-amber-200 bg-canvas px-4 py-3">
+            <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
               <p className="text-xs text-slate-500">승인 창 상태</p>
               <p className="mt-2 text-sm font-semibold text-slate-900">
                 {state.live_execution_armed
@@ -515,3 +515,5 @@ export function LiveControlPanel({
     </section>
   );
 }
+
+

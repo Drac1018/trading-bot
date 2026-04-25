@@ -21,6 +21,28 @@ def _mark_all_sync_scopes_fresh(settings_row) -> None:
         mark_sync_success(settings_row, scope=scope, synced_at=now)
 
 
+def _seed_account_equity(db_session, equity: float = 100000.0) -> PnLSnapshot:
+    row = PnLSnapshot(
+        snapshot_date=utcnow_naive().date(),
+        equity=equity,
+        cash_balance=equity,
+        wallet_balance=equity,
+        available_balance=equity,
+        gross_realized_pnl=0.0,
+        fee_total=0.0,
+        funding_total=0.0,
+        net_pnl=0.0,
+        realized_pnl=0.0,
+        unrealized_pnl=0.0,
+        daily_pnl=0.0,
+        cumulative_pnl=0.0,
+        consecutive_losses=0,
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
 def _entry_decision(
     *,
     symbol: str = "BTCUSDT",
@@ -742,6 +764,7 @@ def test_risk_blocks_same_tier_concentration_limit_for_new_entry(db_session) -> 
 
 def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_limit(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.max_largest_position_pct = 1.5
     settings_row.live_trading_enabled = True
     settings_row.manual_live_approval = True
@@ -827,6 +850,7 @@ def test_stale_sync_keeps_entry_blocked_without_auto_resize(db_session) -> None:
 
 def test_entry_is_clamped_to_directional_headroom_when_that_is_smallest(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.max_gross_exposure_pct = 1.5
     settings_row.max_directional_bias_pct = 0.6
     settings_row.max_largest_position_pct = 1.5
@@ -1112,6 +1136,7 @@ def test_reduce_and_exit_remain_allowed_under_exposure_limits(db_session) -> Non
 
 def test_live_entry_keeps_existing_path_when_sync_state_is_fresh(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.live_trading_enabled = True
     settings_row.manual_live_approval = True
     settings_row.live_execution_armed = True
@@ -1629,6 +1654,7 @@ def test_setup_cluster_disable_blocks_new_entry_but_not_reduce_path(db_session) 
 
 def test_recent_performance_soft_bias_does_not_block_entry_but_is_exposed_in_debug_payload(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
@@ -1668,6 +1694,7 @@ def test_recent_performance_soft_bias_does_not_block_entry_but_is_exposed_in_deb
 
 def test_full_agreement_keeps_entry_size_and_leverage(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
@@ -1714,6 +1741,7 @@ def test_full_agreement_keeps_entry_size_and_leverage(db_session) -> None:
 
 def test_partial_agreement_reduces_entry_size_and_risk_budget(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
@@ -1807,6 +1835,7 @@ def test_disagreement_blocks_new_entry_but_not_survival_path(db_session) -> None
 
 def test_meta_gate_soft_pass_downsizes_entry_without_blocking(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
@@ -1898,6 +1927,7 @@ def test_meta_gate_reject_blocks_new_entry_but_not_survival_path(db_session) -> 
 
 def test_holding_profile_swing_downsizes_entry_when_meta_gate_passes(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
@@ -2122,6 +2152,7 @@ def test_holding_profile_blocks_do_not_apply_to_survival_paths(db_session) -> No
 
 def test_portfolio_slot_soft_cap_downsizes_medium_conviction_entry(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
     snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)

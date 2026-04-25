@@ -491,6 +491,59 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, 
         assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
 
 
+def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypatch) -> None:
+    testing_session = testclient_db_factory("live_sync_verify_only.db")
+
+    call_order: list[str] = []
+
+    def fake_attempt(db, settings_row, trigger_source="system"):
+        call_order.append(trigger_source)
+        return {"status": "resumed"}
+
+    def fake_sync(db, settings_row, *, symbol=None, allow_protection_recovery=True):
+        call_order.append(f"sync:{allow_protection_recovery}")
+        return {
+            "symbols": ["BTCUSDT"],
+            "synced_orders": 0,
+            "synced_positions": 0,
+            "equity": 100.0,
+            "operating_state": "PAUSED",
+            "protection_recovery_status": "restored",
+            "protection_recovery_active": False,
+            "missing_protection_symbols": [],
+            "missing_protection_items": {},
+            "symbol_protection_state": {},
+            "unprotected_positions": [],
+            "emergency_actions_taken": [],
+        }
+
+    monkeypatch.setattr("trading_mvp.main.attempt_auto_resume", fake_attempt)
+    monkeypatch.setattr("trading_mvp.main.sync_live_state", fake_sync)
+
+    with testing_session() as session:
+        update_settings(session, _build_live_settings_payload())
+        set_trading_pause(
+            session,
+            True,
+            reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+            reason_detail={"source": "exchange"},
+            pause_origin="system",
+            auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+            preserve_live_arm=True,
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.post("/api/live/sync?allow_protection_recovery=false")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["allow_protection_recovery"] is False
+        assert payload["auto_resume_precheck"] is None
+        assert payload["auto_resume_postcheck"] is None
+        assert payload["auto_resume"] is None
+        assert call_order == ["sync:False"]
+
+
 def test_live_sync_failure_still_returns_precheck_result(testclient_db_factory, monkeypatch) -> None:
     testing_session = testclient_db_factory("live_sync_failure.db")
 

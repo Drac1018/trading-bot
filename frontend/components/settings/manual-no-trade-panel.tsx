@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import {
   describeManualWindowFlags,
@@ -81,7 +81,7 @@ export function ManualNoTradePanel({
   const summaryReason = summaryWindow?.reason ?? "현재 저장된 수동 노트레이드 윈도우가 없습니다.";
 
   return (
-    <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+    <section className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold text-slate-900">수동 노트레이드 윈도우</h3>
@@ -99,25 +99,25 @@ export function ManualNoTradePanel({
       </div>
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">현재 활성 수</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{activeManualWindows.length}개</p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">가장 가까운 시간</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{summaryTime}</p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">적용 범위</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{summaryScope}</p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">핵심 사유</p>
           <p className="mt-2 text-sm text-slate-800">{summaryReason}</p>
         </div>
       </div>
 
-      <details className="mt-4 rounded-2xl border border-dashed border-amber-300 bg-white">
+      <details className="mt-4 rounded-md border border-dashed border-slate-300 bg-white">
         <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3 px-4 py-4">
           <div>
             <p className="text-sm font-semibold text-slate-900">상세 입력 / 전체 목록</p>
@@ -128,7 +128,7 @@ export function ManualNoTradePanel({
           <StatusPill tone="neutral">펼쳐서 수정</StatusPill>
         </summary>
 
-        <div className="border-t border-amber-100 px-4 py-4">
+        <div className="border-t border-slate-200 px-4 py-4">
           <div className="grid gap-4 md:grid-cols-2">
             <Field label="적용 범위">
               <select
@@ -220,12 +220,12 @@ export function ManualNoTradePanel({
 
           <div className="mt-4 space-y-3">
             {manualWindows.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-amber-200 px-4 py-4 text-sm text-slate-500">
+              <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-500">
                 현재 저장된 수동 노트레이드 윈도우가 없습니다.
               </div>
             ) : (
               manualWindows.map((window) => (
-                <div key={window.window_id} className="rounded-2xl border border-slate-200 bg-canvas p-4">
+                <div key={window.window_id} className="rounded-md border border-slate-200 bg-slate-50 p-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="flex flex-wrap gap-2">
                       <StatusPill tone={window.is_active ? "danger" : "neutral"}>
@@ -252,23 +252,23 @@ export function ManualNoTradePanel({
                   </div>
 
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-2xl bg-white px-4 py-3">
+                    <div className="rounded-md bg-white px-4 py-3">
                       <p className="text-xs text-slate-500">적용 범위</p>
                       <p className="mt-2 text-sm font-semibold text-slate-900">
                         {describeWindowScope(window.scope)}
                       </p>
                     </div>
-                    <div className="rounded-2xl bg-white px-4 py-3">
+                    <div className="rounded-md bg-white px-4 py-3">
                       <p className="text-xs text-slate-500">적용 시간</p>
                       <p className="mt-2 text-sm font-semibold text-slate-900">
                         {formatUtcTimestamp(window.start_at)} ~ {formatUtcTimestamp(window.end_at)}
                       </p>
                     </div>
-                    <div className="rounded-2xl bg-white px-4 py-3">
+                    <div className="rounded-md bg-white px-4 py-3">
                       <p className="text-xs text-slate-500">사유</p>
                       <p className="mt-2 text-sm text-slate-800">{window.reason}</p>
                     </div>
-                    <div className="rounded-2xl bg-white px-4 py-3">
+                    <div className="rounded-md bg-white px-4 py-3">
                       <p className="text-xs text-slate-500">부가 플래그</p>
                       <p className="mt-2 text-sm text-slate-800">
                         {describeManualWindowFlags(window.auto_resume, window.require_manual_rearm)}
@@ -284,3 +284,5 @@ export function ManualNoTradePanel({
     </section>
   );
 }
+
+

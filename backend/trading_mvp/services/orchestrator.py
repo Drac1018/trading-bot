@@ -2686,6 +2686,9 @@ class TradingOrchestrator:
                 message="Market snapshot collected.",
                 payload={"symbol": symbol, "timeframe": timeframe},
             )
+        # Market snapshots are followed by additional context/exchange reads; commit
+        # the observed fact first so safety-control writes are not blocked.
+        self.session.commit()
         return market_snapshot, market_row
 
     def _recent_symbol_decisions(self, symbol: str, *, limit: int = 8) -> list[AgentRun]:

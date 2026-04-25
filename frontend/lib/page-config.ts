@@ -39,12 +39,12 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "시장 스냅샷",
-        endpoint: "/api/market/snapshots",
+        endpoint: "/api/market/snapshots?limit=20",
         description: "거래소에서 수집한 최신 시장 입력입니다.",
       },
       {
         title: "신호 입력",
-        endpoint: "/api/market/features",
+        endpoint: "/api/market/features?limit=20",
         description: "추세, 변동성, 거래량, RSI, ATR 등 계산된 입력 feature입니다.",
       },
     ],
@@ -56,7 +56,7 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "의사결정 기록",
-        endpoint: "/api/decisions",
+        endpoint: "/api/decisions?limit=12&compact=true",
         description: "최근 저장된 trading decision 결과입니다.",
       },
     ],
@@ -68,7 +68,7 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "포지션 목록",
-        endpoint: "/api/positions",
+        endpoint: "/api/positions?limit=20",
         description: "실거래 기준 열린 포지션만 표시합니다.",
       },
     ],
@@ -80,12 +80,12 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "실거래 주문",
-        endpoint: "/api/orders",
+        endpoint: "/api/orders?limit=20",
         description: "주문 상태, 외부 주문 ID, 보호 주문 연관 관계를 표시합니다.",
       },
       {
         title: "실거래 체결",
-        endpoint: "/api/executions",
+        endpoint: "/api/executions?limit=20",
         description: "부분 체결을 포함한 실제 execution ledger입니다.",
       },
     ],
@@ -97,25 +97,25 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "리스크 체크",
-        endpoint: "/api/risk/checks",
-        description: "허용 여부와 reason code를 확인합니다.",
+        endpoint: "/api/risk/checks?limit=12&compact=true",
+        description: "허용 여부, 차단 사유, 승인 risk만 먼저 확인합니다.",
       },
       {
         title: "알림",
-        endpoint: "/api/alerts",
+        endpoint: "/api/alerts?limit=20",
         description: "운영 중 즉시 확인이 필요한 경고와 안내입니다.",
       },
     ],
   },
   agents: {
-    title: "에이전트 디버그",
-    eyebrow: "Debug Only",
-    description: "운영 핵심 화면이 아닌 raw agent/provider/payload 디버그 정보만 확인합니다.",
+    title: "에이전트 실행",
+    eyebrow: "AI 처리 기록",
+    description: "최근 AI 실행 결과를 운영 확인에 필요한 필드만 요약해서 봅니다.",
     sections: [
       {
         title: "에이전트 실행 기록",
-        endpoint: "/api/agents",
-        description: "최근 agent run의 raw metadata와 payload입니다.",
+        endpoint: "/api/agents?limit=12&compact=true",
+        description: "원본 payload 전체가 아니라 판단, 상태, 소요 시간 중심의 요약입니다.",
       },
     ],
   },
@@ -126,7 +126,7 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "스케쥴러 실행 기록",
-        endpoint: "/api/scheduler",
+        endpoint: "/api/scheduler?limit=20",
         description: "주기별 실행 결과와 다음 실행 예정 시각입니다.",
       },
     ],
@@ -138,7 +138,7 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "감사 타임라인",
-        endpoint: "/api/audit",
+        endpoint: "/api/audit?limit=30",
         description: "운영 감사 로그입니다.",
       },
     ],

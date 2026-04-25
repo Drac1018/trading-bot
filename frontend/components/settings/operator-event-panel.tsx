@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import {
   describeEnforcementMode,
@@ -81,7 +81,7 @@ export function OperatorEventPanel({
     : "운영자가 저장한 메모 없음";
 
   return (
-    <section className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+    <section className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold text-slate-900">운영자 이벤트 뷰</h3>
@@ -102,37 +102,37 @@ export function OperatorEventPanel({
       </div>
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">운영자 방향</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">
             {describeEventBias(operatorEventViewConfigured ? operatorEventView?.operator_bias : "unknown")}
           </p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">운영자 리스크 상태</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">
             {describeRiskState(operatorEventViewConfigured ? operatorEventView?.operator_risk_state : "unknown")}
           </p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">적용 심볼</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{appliesToSymbols}</p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">유효 시간</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{validWindow}</p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">반영 방식</p>
           <p className="mt-2 text-sm font-semibold text-slate-900">{enforcementMode}</p>
         </div>
-        <div className="rounded-2xl bg-white px-4 py-3">
+        <div className="rounded-md bg-white px-4 py-3">
           <p className="text-xs text-slate-500">메모 요약</p>
           <p className="mt-2 text-sm text-slate-800">{noteSummary}</p>
         </div>
       </div>
 
-      <details className="mt-4 rounded-2xl border border-dashed border-amber-300 bg-white">
+      <details className="mt-4 rounded-md border border-dashed border-slate-300 bg-white">
         <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3 px-4 py-4">
           <div>
             <p className="text-sm font-semibold text-slate-900">상세 입력</p>
@@ -143,7 +143,7 @@ export function OperatorEventPanel({
           <StatusPill tone="neutral">펼쳐서 수정</StatusPill>
         </summary>
 
-        <div className="border-t border-amber-100 px-4 py-4">
+        <div className="border-t border-slate-200 px-4 py-4">
           <div className="grid gap-4 md:grid-cols-2">
             <Field label="운영자 방향">
               <select
@@ -279,3 +279,4 @@ export function OperatorEventPanel({
     </section>
   );
 }
+

@@ -354,9 +354,9 @@ function toManualWindowFormState(window?: ManualNoTradeWindowPayload | null): Ma
 }
 
 function MetricCard({ label, value, tone = "default" }: { label: string; value: string; tone?: "default" | "dark" | "warm" }) {
-  if (tone === "dark") return <div className="rounded-[1.5rem] bg-slate-950 px-4 py-4 text-white"><p className="text-xs uppercase tracking-[0.24em] text-white/60">{label}</p><p className="mt-2 text-xl font-semibold">{value}</p></div>;
-  if (tone === "warm") return <div className="rounded-[1.5rem] border border-amber-200 bg-amber-50 px-4 py-4"><p className="text-xs uppercase tracking-[0.24em] text-amber-900">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
-  return <div className="rounded-[1.5rem] border border-slate-200 bg-white px-4 py-4"><p className="text-xs uppercase tracking-[0.24em] text-slate-500">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
+  if (tone === "dark") return <div className="rounded-md bg-slate-950 px-4 py-4 text-white"><p className="text-xs uppercase tracking-[0.2em] text-white/60">{label}</p><p className="mt-2 text-xl font-semibold">{value}</p></div>;
+  if (tone === "warm") return <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-4"><p className="text-xs uppercase tracking-[0.2em] text-blue-900">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
+  return <div className="rounded-md border border-slate-200 bg-white px-4 py-4"><p className="text-xs uppercase tracking-[0.2em] text-slate-500">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
 }
 
 function dedupeReasons(values: string[]) {
@@ -778,7 +778,7 @@ export function SettingsControls({
   };
 
   return (
-    <div className="space-y-5 rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+    <div className="space-y-5 rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">실거래 설정</p>
@@ -802,10 +802,10 @@ export function SettingsControls({
             <Link
               key={tab.value}
               href={viewHref(tab.value)}
-              className={`rounded-[1.5rem] border px-4 py-4 transition ${
+              className={`rounded-md border px-4 py-4 transition ${
                 active
-                  ? "border-slate-900 bg-slate-900 text-white"
-                  : "border-amber-200 bg-canvas text-slate-700 hover:border-amber-300 hover:bg-white"
+                  ? "border-blue-600 bg-blue-600 text-white"
+                  : "border-slate-200 bg-slate-50 text-slate-700 hover:border-blue-200 hover:bg-blue-50"
               }`}
             >
               <p className="text-sm font-semibold">{tab.label}</p>

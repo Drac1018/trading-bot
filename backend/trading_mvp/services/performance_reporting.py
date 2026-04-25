@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -20,6 +21,12 @@ from trading_mvp.schemas import (
     StructuredCompetitorNotesResponse,
 )
 from trading_mvp.time_utils import utcnow_naive
+
+DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
+    ("24h", 24),
+    ("7d", 24 * 7),
+    ("30d", 24 * 30),
+)
 
 
 @dataclass(slots=True)
@@ -877,11 +884,18 @@ def build_signal_performance_report(
     *,
     window_hours: int = 24,
     limit: int = 12,
+    window_specs: Sequence[tuple[str, int]] | None = None,
 ) -> SignalPerformanceReportResponse:
+    selected_window_specs = tuple(window_specs or DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS)
     windows = [
-        _build_window_report(session, window_label="24h", window_hours=24, aggregate_limit=limit, decision_limit=limit),
-        _build_window_report(session, window_label="7d", window_hours=24 * 7, aggregate_limit=limit, decision_limit=limit),
-        _build_window_report(session, window_label="30d", window_hours=24 * 30, aggregate_limit=limit, decision_limit=limit),
+        _build_window_report(
+            session,
+            window_label=window_label,
+            window_hours=window_hour_count,
+            aggregate_limit=limit,
+            decision_limit=limit,
+        )
+        for window_label, window_hour_count in selected_window_specs
     ]
     primary_window = next((item for item in windows if item.window_hours == window_hours), windows[0])
     items = [

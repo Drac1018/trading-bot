@@ -38,6 +38,7 @@ class BinanceClient:
         futures_enabled: bool = True,
         timeout_seconds: float = 10.0,
         recv_window_ms: int = 5000,
+        max_get_attempts: int | None = None,
     ) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
@@ -45,6 +46,7 @@ class BinanceClient:
         self.futures_enabled = futures_enabled
         self.timeout_seconds = timeout_seconds
         self.recv_window_ms = recv_window_ms
+        self.max_get_attempts = max_get_attempts
         self._server_time_offset_ms: int | None = None
         self._timestamp_safety_margin_ms = 250
         if futures_enabled:
@@ -69,9 +71,12 @@ class BinanceClient:
         api_key_only: bool = False,
         retryable: bool | None = None,
     ) -> dict[str, object] | list[object]:
-        attempts = 3 if (retryable if retryable is not None else method.upper() == "GET") else 1
+        method_upper = method.upper()
+        attempts = 3 if (retryable if retryable is not None else method_upper == "GET") else 1
         if signed:
             attempts = max(attempts, 2)
+        if method_upper == "GET" and self.max_get_attempts is not None:
+            attempts = min(attempts, max(1, int(self.max_get_attempts)))
         last_error: Exception | None = None
         time_sync_attempted = False
         for attempt in range(attempts):

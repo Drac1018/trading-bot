@@ -1,0 +1,4 @@
+Local PostgreSQL is already accepting connections on 127.0.0.1:5432.
+INFO:     127.0.0.1:55180 - "GET /api/alerts?limit=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55182 - "GET /api/alerts?limit=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55179 - "GET /api/dashboard/operator HTTP/1.1" 200 OK

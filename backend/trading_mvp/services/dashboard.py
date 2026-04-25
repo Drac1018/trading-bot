@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -58,7 +58,8 @@ from trading_mvp.services.settings import (
 )
 from trading_mvp.time_utils import utcnow_naive
 
-FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired"}
+FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "finished"}
+FINAL_EXCHANGE_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "FINISHED"}
 PROTECTIVE_ORDER_TYPES = {"stop_market", "take_profit_market"}
 AUDIT_CATEGORY_RISK = "risk"
 AUDIT_CATEGORY_EXECUTION = "execution"
@@ -69,8 +70,10 @@ AUDIT_CATEGORY_AI_DECISION = "ai_decision"
 OPERATOR_AUDIT_LIMIT = 4
 SYMBOL_AUDIT_LIMIT = 3
 OPERATOR_PERFORMANCE_WINDOW_LIMIT = 1
+OPERATOR_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (("24h", 24),)
 OPERATOR_PERFORMANCE_ENTRY_LIMIT = 3
 OPERATOR_EXECUTION_PROFILE_LIMIT = 2
+OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 RECENT_FILL_LIMIT = 4
 
 MARKET_CONTEXT_SUMMARY_KEYS = (
@@ -116,6 +119,114 @@ EVENT_CONTEXT_VISIBILITY_DEFAULTS = {
     "minutes_to_next_event": None,
     "active_risk_window": False,
 }
+DECISION_COMPACT_OUTPUT_KEYS = (
+    "symbol",
+    "timeframe",
+    "decision",
+    "confidence",
+    "confidence_band",
+    "recommended_holding_profile",
+    "intent_family",
+    "management_action",
+    "primary_reason_codes",
+    "no_trade_reason_codes",
+    "abstain_reason_codes",
+    "fallback_reason_codes",
+    "provider_status",
+    "explanation_short",
+)
+DECISION_COMPACT_TRIGGER_KEYS = (
+    "trigger_reason",
+    "symbol",
+    "timeframe",
+    "strategy_engine",
+    "holding_profile",
+    "assigned_slot",
+    "candidate_weight",
+    "reason_codes",
+    "dedupe_reason",
+    "applied_review_cadence_minutes",
+    "review_cadence_source",
+    "triggered_at",
+)
+DECISION_COMPACT_REFERENCE_KEYS = (
+    "market_snapshot_id",
+    "feature_snapshot_id",
+    "sync_freshness_summary",
+)
+DECISION_COMPACT_METADATA_KEYS = (
+    "provider",
+    "model",
+    "duration_ms",
+    "schema_valid",
+    "last_ai_trigger_reason",
+    "last_ai_invoked_at",
+    "last_ai_skip_reason",
+    "trigger_deduped",
+    "trigger_fingerprint",
+)
+RISK_COMPACT_PAYLOAD_KEYS = (
+    "allowed",
+    "decision",
+    "reason_codes",
+    "blocked_reason",
+    "blocked_reason_codes",
+    "adjustment_reason_codes",
+    "reason_details",
+    "approved_risk_pct",
+    "approved_leverage",
+    "approved_quantity",
+    "approved_qty",
+    "approved_notional",
+    "approved_projected_notional",
+    "auto_resized_entry",
+    "auto_resize_reason",
+    "approval_required_reason",
+    "operating_state",
+    "operating_mode",
+    "degraded_reason",
+    "policy_source",
+    "evaluated_operator_policy",
+    "sync_freshness_summary",
+    "exposure_headroom_snapshot",
+)
+AGENT_COMPACT_INPUT_KEYS = (
+    "symbol",
+    "timeframe",
+    "ai_trigger",
+    "decision_reference",
+    "event_context",
+    "manual_review",
+)
+AGENT_COMPACT_OUTPUT_KEYS = (
+    "symbol",
+    "timeframe",
+    "decision",
+    "confidence",
+    "confidence_band",
+    "recommended_holding_profile",
+    "intent_family",
+    "management_action",
+    "primary_reason_codes",
+    "no_trade_reason_codes",
+    "abstain_reason_codes",
+    "rationale_codes",
+    "provider_status",
+    "explanation_short",
+    "items",
+)
+AGENT_COMPACT_METADATA_KEYS = (
+    "provider",
+    "model",
+    "duration_ms",
+    "schema_valid",
+    "last_ai_trigger_reason",
+    "last_ai_invoked_at",
+    "last_ai_skip_reason",
+    "trigger_deduped",
+    "trigger_fingerprint",
+    "active_position_prompt_route_context",
+)
 ADAPTIVE_SIGNAL_SUMMARY_KEYS = (
     "status",
     "active_inputs",
@@ -237,7 +348,8 @@ def _build_position_protection_state(session: Session, position: Position) -> di
             select(Order).where(
                 Order.mode == "live",
                 Order.symbol == position.symbol,
-                Order.status.notin_(FINAL_ORDER_STATUSES),
+                func.lower(func.coalesce(Order.status, "")).notin_(tuple(FINAL_ORDER_STATUSES)),
+                func.upper(func.coalesce(Order.exchange_status, "")).notin_(tuple(FINAL_EXCHANGE_ORDER_STATUSES)),
             )
         )
     )
@@ -550,6 +662,65 @@ def _compact_dict(
 
 def _compact_market_context_summary(value: object) -> dict[str, Any]:
     return _compact_dict(value, allowed_keys=MARKET_CONTEXT_SUMMARY_KEYS)
+
+
+def _attach_decision_summary_fields(payload: dict[str, object]) -> dict[str, object]:
+    output_payload = _as_dict(payload.get("output_payload"))
+    input_payload = _as_dict(payload.get("input_payload"))
+    ai_trigger = _as_dict(input_payload.get("ai_trigger"))
+
+    payload["symbol"] = str(output_payload.get("symbol") or ai_trigger.get("symbol") or "") or None
+    payload["timeframe"] = str(output_payload.get("timeframe") or ai_trigger.get("timeframe") or "") or None
+    payload["decision"] = str(output_payload.get("decision") or "") or None
+    payload["confidence"] = output_payload.get("confidence")
+    payload["confidence_band"] = output_payload.get("confidence_band")
+    payload["recommended_holding_profile"] = output_payload.get("recommended_holding_profile")
+    return payload
+
+
+def _compact_decision_row(row: AgentRun) -> dict[str, object]:
+    payload = _serialize_model_row(row)
+    input_payload = _as_dict(payload.get("input_payload"))
+    compact_input: dict[str, Any] = {}
+
+    ai_trigger = _compact_dict(input_payload.get("ai_trigger"), allowed_keys=DECISION_COMPACT_TRIGGER_KEYS)
+    if ai_trigger:
+        compact_input["ai_trigger"] = ai_trigger
+    decision_reference = _compact_dict(
+        input_payload.get("decision_reference"),
+        allowed_keys=DECISION_COMPACT_REFERENCE_KEYS,
+    )
+    if decision_reference:
+        compact_input["decision_reference"] = decision_reference
+
+    payload["input_payload"] = compact_input
+    payload["output_payload"] = _compact_dict(
+        payload.get("output_payload"),
+        allowed_keys=DECISION_COMPACT_OUTPUT_KEYS,
+    )
+    payload["metadata_json"] = _compact_dict(
+        payload.get("metadata_json"),
+        allowed_keys=DECISION_COMPACT_METADATA_KEYS,
+    )
+    return payload
+
+
+def _compact_agent_run_row(row: AgentRun) -> dict[str, object]:
+    payload = _serialize_model_row(row)
+    payload["input_payload"] = _compact_dict(
+        payload.get("input_payload"),
+        allowed_keys=AGENT_COMPACT_INPUT_KEYS,
+    )
+    payload["output_payload"] = _compact_dict(
+        payload.get("output_payload"),
+        allowed_keys=AGENT_COMPACT_OUTPUT_KEYS,
+    )
+    payload["metadata_json"] = _compact_dict(
+        payload.get("metadata_json"),
+        allowed_keys=AGENT_COMPACT_METADATA_KEYS,
+    )
+    payload["payload_mode"] = "compact"
+    return payload
 
 
 def _ai_trigger_reason_from_decision_row(row: AgentRun | None) -> str | None:
@@ -1089,8 +1260,23 @@ def get_feature_snapshots(session: Session, limit: int = 50) -> list[dict[str, o
     return _serialize_model_list(list(session.scalars(select(FeatureSnapshot).order_by(desc(FeatureSnapshot.feature_time)).limit(limit))))
 
 
-def get_decisions(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(limit))))
+def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at))
+            .limit(limit)
+        )
+    )
+    payloads: list[dict[str, object]] = []
+    for row in rows:
+        payload = _compact_decision_row(row) if compact else _serialize_model_row(row)
+        _attach_decision_summary_fields(payload)
+        payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(row)
+        payload["ai_trigger_summary"] = _ai_trigger_summary_from_decision_row(row)
+        payloads.append(payload)
+    return payloads
 
 
 def get_positions(session: Session, limit: int = 50) -> list[dict[str, object]]:
@@ -1522,9 +1708,17 @@ def _top_execution_profiles(window_payload: dict[str, object], *, limit: int = 5
     )[:limit]
 
 
-def get_profitability_dashboard(session: Session) -> DashboardProfitabilityResponse:
-    overview = get_overview(session)
-    performance_report = build_signal_performance_report(session)
+def get_profitability_dashboard(
+    session: Session,
+    *,
+    overview: OverviewResponse | None = None,
+    performance_window_specs: Sequence[tuple[str, int]] | None = None,
+) -> DashboardProfitabilityResponse:
+    overview = overview or get_overview(session)
+    performance_report = build_signal_performance_report(
+        session,
+        window_specs=performance_window_specs,
+    )
     execution_report = get_execution_quality_report(session)
 
     windows = [
@@ -2242,6 +2436,52 @@ def _latest_timestamp(*timestamps: datetime | None) -> datetime | None:
     return max(values) if values else None
 
 
+def _latest_rows_by_symbol(
+    session: Session,
+    model: type[Any],
+    symbols: Sequence[str],
+    timestamp_column: Any,
+    *conditions: Any,
+) -> dict[str, Any]:
+    symbol_column = getattr(model, "symbol")
+    rows: dict[str, Any] = {}
+    for symbol in symbols:
+        row = session.scalar(
+            select(model)
+            .where(symbol_column == symbol, *conditions)
+            .order_by(desc(timestamp_column))
+            .limit(1)
+        )
+        if row is not None:
+            rows[str(symbol).upper()] = row
+    return rows
+
+
+def _latest_rows_by_extracted_symbol(
+    session: Session,
+    statement: Any,
+    symbols: Sequence[str],
+    symbol_for_row: Callable[[Any], str | None],
+) -> dict[str, Any]:
+    symbol_set = {symbol.upper() for symbol in symbols}
+    rows: dict[str, Any] = {}
+
+    def consume(result: Sequence[Any]) -> bool:
+        for row in result:
+            symbol = symbol_for_row(row)
+            if symbol in symbol_set and symbol not in rows:
+                rows[symbol] = row
+            if len(rows) == len(symbol_set):
+                return True
+        return False
+
+    limited_rows = list(session.scalars(statement.limit(OPERATOR_RECENT_ROW_SCAN_LIMIT)))
+    if consume(limited_rows) or len(limited_rows) < OPERATOR_RECENT_ROW_SCAN_LIMIT:
+        return rows
+    consume(list(session.scalars(statement.offset(OPERATOR_RECENT_ROW_SCAN_LIMIT))))
+    return rows
+
+
 def _parse_timeframe_minutes(value: str | None) -> int | None:
     if not value:
         return None
@@ -2369,44 +2609,35 @@ def _build_operator_symbol_summaries(
         for key, value in (runtime_summary.get("protection_recovery_symbols") or {}).items()
         if isinstance(value, dict)
     }
-    latest_markets: dict[str, MarketSnapshot] = {}
-    for row in session.scalars(
-        select(MarketSnapshot)
-        .where(MarketSnapshot.symbol.in_(symbol_keys))
-        .order_by(desc(MarketSnapshot.snapshot_time))
-    ):
-        symbol = row.symbol.upper()
-        latest_markets.setdefault(symbol, row)
+    latest_markets: dict[str, MarketSnapshot] = _latest_rows_by_symbol(
+        session,
+        MarketSnapshot,
+        symbol_keys,
+        MarketSnapshot.snapshot_time,
+    )
 
-    latest_features: dict[str, FeatureSnapshot] = {}
-    for row in session.scalars(
-        select(FeatureSnapshot)
-        .where(FeatureSnapshot.symbol.in_(symbol_keys))
-        .order_by(desc(FeatureSnapshot.feature_time))
-    ):
-        symbol = row.symbol.upper()
-        latest_features.setdefault(symbol, row)
+    latest_features: dict[str, FeatureSnapshot] = _latest_rows_by_symbol(
+        session,
+        FeatureSnapshot,
+        symbol_keys,
+        FeatureSnapshot.feature_time,
+    )
 
-    latest_decisions: dict[str, AgentRun] = {}
-    for row in session.scalars(
+    latest_decisions: dict[str, AgentRun] = _latest_rows_by_extracted_symbol(
+        session,
         select(AgentRun)
         .where(AgentRun.role == "trading_decision")
-        .order_by(desc(AgentRun.created_at))
-    ):
-        symbol = _decision_symbol(row)
-        if symbol in symbol_keys and symbol not in latest_decisions:
-            latest_decisions[symbol] = row
-        if len(latest_decisions) == len(symbol_keys):
-            break
+        .order_by(desc(AgentRun.created_at)),
+        symbol_keys,
+        _decision_symbol,
+    )
 
-    latest_risks: dict[str, RiskCheck] = {}
-    for row in session.scalars(
-        select(RiskCheck)
-        .where(RiskCheck.symbol.in_(symbol_keys))
-        .order_by(desc(RiskCheck.created_at))
-    ):
-        symbol = row.symbol.upper()
-        latest_risks.setdefault(symbol, row)
+    latest_risks: dict[str, RiskCheck] = _latest_rows_by_symbol(
+        session,
+        RiskCheck,
+        symbol_keys,
+        RiskCheck.created_at,
+    )
 
     active_entry_plans: dict[str, PendingEntryPlan] = {}
     for row in session.scalars(
@@ -2417,27 +2648,22 @@ def _build_operator_symbol_summaries(
         symbol = row.symbol.upper()
         active_entry_plans.setdefault(symbol, row)
 
-    latest_orders: dict[str, Order] = {}
-    for row in session.scalars(
-        select(Order)
-        .where(Order.mode == "live", Order.symbol.in_(symbol_keys))
-        .order_by(desc(Order.created_at))
-    ):
-        symbol = row.symbol.upper()
-        latest_orders.setdefault(symbol, row)
+    latest_orders: dict[str, Order] = _latest_rows_by_symbol(
+        session,
+        Order,
+        symbol_keys,
+        Order.created_at,
+        Order.mode == "live",
+    )
 
-    latest_interval_reviews: dict[str, SchedulerRun] = {}
-    for row in session.scalars(
+    latest_interval_reviews: dict[str, SchedulerRun] = _latest_rows_by_extracted_symbol(
+        session,
         select(SchedulerRun)
         .where(SchedulerRun.workflow == "interval_decision_cycle")
-        .order_by(desc(SchedulerRun.created_at))
-    ):
-        outcome = row.outcome if isinstance(row.outcome, dict) else {}
-        symbol = str(outcome.get("symbol") or "").upper()
-        if symbol in symbol_keys and symbol not in latest_interval_reviews:
-            latest_interval_reviews[symbol] = row
-        if len(latest_interval_reviews) == len(symbol_keys):
-            break
+        .order_by(desc(SchedulerRun.created_at)),
+        symbol_keys,
+        lambda row: str((row.outcome if isinstance(row.outcome, dict) else {}).get("symbol") or "").upper(),
+    )
 
     latest_executions_by_order_id: dict[int, Execution] = {}
     recent_executions_by_symbol: dict[str, list[Execution]] = defaultdict(list)
@@ -2603,7 +2829,11 @@ def _build_operator_symbol_summaries(
 
 def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
     overview = get_overview(session)
-    profitability = get_profitability_dashboard(session)
+    profitability = get_profitability_dashboard(
+        session,
+        overview=overview,
+        performance_window_specs=OPERATOR_PERFORMANCE_WINDOW_SPECS,
+    )
     latest_scheduler = session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
     symbol_summaries = _build_operator_symbol_summaries(
         session,
@@ -2689,7 +2919,7 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
     )
 
 
-def get_risk_checks(session: Session, limit: int = 50) -> list[dict[str, object]]:
+def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
     rows = session.execute(
         select(RiskCheck, AgentRun)
         .outerjoin(AgentRun, AgentRun.id == RiskCheck.decision_run_id)
@@ -2701,12 +2931,18 @@ def get_risk_checks(session: Session, limit: int = 50) -> list[dict[str, object]
         payload = _serialize_model_row(risk_row)
         payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(decision_row)
         payload["ai_trigger_summary"] = _ai_trigger_summary_from_decision_row(decision_row)
+        if compact:
+            payload["payload"] = _compact_dict(payload.get("payload"), allowed_keys=RISK_COMPACT_PAYLOAD_KEYS)
+            payload["payload_mode"] = "compact"
         payloads.append(payload)
     return payloads
 
 
-def get_agent_runs(session: Session, limit: int = 100) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(AgentRun).order_by(desc(AgentRun.created_at)).limit(limit))))
+def get_agent_runs(session: Session, limit: int = 100, *, compact: bool = False) -> list[dict[str, object]]:
+    rows = list(session.scalars(select(AgentRun).order_by(desc(AgentRun.created_at)).limit(limit)))
+    if compact:
+        return [_compact_agent_run_row(row) for row in rows]
+    return _serialize_model_list(rows)
 
 
 def get_scheduler_runs(session: Session, limit: int = 50) -> list[dict[str, object]]:

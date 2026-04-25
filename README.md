@@ -21,15 +21,20 @@
 - [실행 흐름](docs/execution-flow.md)
 - [API](docs/api.md)
 - [Codex 초안 / 자동 resume](docs/codex-drafts-and-auto-resume.md)
+- [SQLite -> PostgreSQL migration checklist](docs/sqlite-to-postgresql-one-shot-migration-checklist.md)
 
 ## 운영 DB 기준
 
-- Windows 서비스 / 운영 기본 DB는 PostgreSQL이다. `.env`에 `DATABASE_URL=postgresql+psycopg://...`가 없으면 서비스 설치 스크립트가 중단된다.
-- SQLite는 단일 프로세스 로컬 개발 / 테스트 전용으로만 사용한다.
-- `python -m trading_mvp.migrate`와 `alembic upgrade head`는 schema-only 경로다. 기존 SQLite 데이터를 PostgreSQL로 옮기지 않는다.
-- SQLite -> PostgreSQL 데이터 이관은 pause 상태에서 수행하는 별도 one-shot 작업으로 취급한다. rollback 기준점은 기존 SQLite DB 백업이다.
-- 기존 암호화된 설정값을 유지해 이관할 경우 `APP_SECRET_SEED`는 그대로 유지해야 한다.
-- `docker compose up` 기본 토폴로지에서는 backend가 operational cadence를 소유한다. legacy `scheduler` 서비스는 중복 주기 실행을 막기 위해 opt-in profile로만 둔다.
+- 운영 / 서비스 기본 DB는 PostgreSQL이다.
+- `backend/trading_mvp/config.py`, `alembic.ini`, `.env.example` 는 모두 `postgresql+psycopg://...` 기준으로 정렬한다.
+- `scripts/run_backend.ps1`, `scripts/run_worker.ps1`, `scripts/run_scheduler.ps1` 는 `DATABASE_URL` 이 없으면 SQLite로 조용히 fallback 하지 않고 즉시 중단한다.
+- `uvicorn trading_mvp.main:app`, `python -m trading_mvp.cli`, `python -m trading_mvp.migrate`, `python workers/worker.py`, `python workers/scheduler.py` 같은 직실행 경로도 `DATABASE_URL` 명시를 요구한다.
+- SQLite는 단일 프로세스 로컬 개발 / 테스트 전용이다.
+- SQLite를 쓰려면 환경변수 또는 `.env` 에 `DATABASE_URL=sqlite://...` 와 `TRADING_MVP_ALLOW_SQLITE=1` 을 함께 명시해야 한다.
+- `python -m trading_mvp.migrate` 와 `alembic upgrade head` 는 schema-only 경로이며, 기존 SQLite 데이터를 PostgreSQL로 자동 이전하지 않는다.
+- SQLite -> PostgreSQL 데이터 이전은 pause 상태에서 수행하는 별도 one-shot 작업으로 취급한다. rollback 기준은 기존 SQLite DB 백업 유지다.
+- 기존 암호화된 설정값을 유지하며 이전하는 경우 `APP_SECRET_SEED` 는 동일하게 유지해야 한다.
+- `docker compose up` 기본 토폴로지에서는 backend 가 operational cadence 를 소유한다. legacy `scheduler` 서비스는 중복 주기 실행을 막기 위해 opt-in profile 로만 둔다.
 
 ## 현재 리스크 기준
 

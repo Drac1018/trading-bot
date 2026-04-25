@@ -12,6 +12,8 @@
 - [API](api.md)
 - [전략 엔진 규칙 표면](strategy-engine-rule-surface.md)
 - [BLS Wrapper 운영 가이드](bls-wrapper-ops-guide.md)
+- [SQLite -> PostgreSQL One-Shot Migration Checklist](sqlite-to-postgresql-one-shot-migration-checklist.md)
+- [SQLite -> PostgreSQL Migration Work Log](sqlite-to-postgresql-migration-work-log.md)
 - [발표 운영 최종 런북](release-operator-runbook.md)
 - [발표 30분 전 운영 체크리스트](release-30m-checklist.md)
 - [발표 5분 전 최종 점검표](release-5m-final-check.md)

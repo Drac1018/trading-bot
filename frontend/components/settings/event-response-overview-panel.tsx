@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import {
   describeAlignmentStatus,
@@ -71,7 +71,7 @@ export function EventResponseOverviewPanel({
     (policySource ?? "none") === "none";
 
   return (
-    <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+    <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold text-slate-900">이벤트 대응 현황</h3>
@@ -92,14 +92,14 @@ export function EventResponseOverviewPanel({
         </div>
       </div>
 
-      <div className="mt-4 rounded-2xl border border-slate-200 bg-white px-4 py-4">
+      <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-4">
         <p className="text-xs text-slate-500">신규 진입 1줄 요약</p>
         <p className="mt-2 text-sm font-semibold text-slate-900">{entryPolicySummary}</p>
         <p className="mt-2 text-xs text-slate-500">데이터 안내: {eventSourceHelp}</p>
       </div>
 
       <div className="mt-4 space-y-4">
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="rounded-md border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-slate-900">예정 이벤트 리스크</p>
@@ -150,7 +150,7 @@ export function EventResponseOverviewPanel({
           </div>
         </div>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="rounded-md border border-slate-200 bg-white p-4">
           <p className="text-sm font-semibold text-slate-900">AI 이벤트 뷰</p>
           <p className="mt-1 text-sm text-slate-600">AI가 이벤트 관련 의견을 남기지 않았으면 그대로 "미설정"으로 표시합니다.</p>
           <div className="mt-3 flex flex-wrap gap-2">
@@ -192,7 +192,7 @@ export function EventResponseOverviewPanel({
           </div>
         </div>
 
-        <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="rounded-md border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-slate-900">정렬 결과</p>
@@ -233,3 +233,4 @@ export function EventResponseOverviewPanel({
     </div>
   );
 }
+

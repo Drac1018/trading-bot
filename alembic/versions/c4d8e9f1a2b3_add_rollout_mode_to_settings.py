@@ -7,16 +7,16 @@ Create Date: 2026-04-17 17:40:00.000000
 
 from __future__ import annotations
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
 
+from alembic import op
 
 revision: str = "c4d8e9f1a2b3"
-down_revision: Union[str, Sequence[str], None] = "b3e7a1c2d4f6"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = "b3e7a1c2d4f6"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -28,7 +28,7 @@ def upgrade() -> None:
 
     op.execute(
         "UPDATE settings "
-        "SET rollout_mode = CASE WHEN live_trading_enabled = 1 THEN 'full_live' ELSE 'paper' END"
+        "SET rollout_mode = CASE WHEN live_trading_enabled THEN 'full_live' ELSE 'paper' END"
     )
 
     with op.batch_alter_table("settings", schema=None) as batch_op:

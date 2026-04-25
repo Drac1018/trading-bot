@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { usePathname } from "next/navigation";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const pollMs = 15000;
@@ -37,6 +38,7 @@ function writeSeenIds(ids: Set<number>) {
 }
 
 export function AlertNotifier() {
+  const pathname = usePathname();
   const [permission, setPermission] = useState<NotificationPermission | "unsupported" | "loading">("loading");
   const [latestAlerts, setLatestAlerts] = useState<AlertRow[]>([]);
   const seenIdsRef = useRef<Set<number>>(new Set());
@@ -117,14 +119,14 @@ export function AlertNotifier() {
     [latestAlerts],
   );
 
-  if (permission === "loading" || permission === "unsupported") {
+  if (pathname === "/ui-example" || permission === "loading" || permission === "unsupported") {
     return null;
   }
 
   return (
-    <div className="fixed bottom-4 right-4 z-40 max-w-xs rounded-2xl border border-amber-200/80 bg-white/95 p-4 shadow-frame backdrop-blur">
+    <div className="fixed bottom-4 right-4 z-40 hidden max-w-xs rounded-lg border border-slate-200 bg-white/95 p-4 shadow-sm backdrop-blur sm:block">
       <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">거래 알림</p>
-      <p className="mt-2 text-sm font-semibold text-ink">
+      <p className="mt-2 text-sm font-semibold text-slate-950">
         {permission === "granted"
           ? unreadCount > 0
             ? `새 알림 ${unreadCount}건`
@@ -138,7 +140,7 @@ export function AlertNotifier() {
       </p>
       {permission === "default" ? (
         <button
-          className="mt-3 rounded-full bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-900"
+          className="mt-3 rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white"
           onClick={async () => {
             if (typeof window === "undefined" || !("Notification" in window)) {
               return;

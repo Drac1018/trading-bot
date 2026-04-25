@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { Field, inputClass } from "./form-primitives";
 
@@ -30,7 +30,7 @@ export function MarketRiskPanel({
 }) {
   return (
     <section className="grid gap-5 xl:grid-cols-2">
-      <div className="rounded-[1.75rem] border border-amber-100 bg-canvas/80 p-4 sm:p-5">
+      <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
         <h3 className="text-lg font-semibold text-slate-900">시장 / 리스크</h3>
         <p className="mt-2 text-sm leading-6 text-slate-600">
           심볼 구성, 기본 시장 타임프레임, 손실 한도와 같은 전역 입력 기준을 이 영역에서 관리합니다.
@@ -59,7 +59,7 @@ export function MarketRiskPanel({
                   <button
                     key={symbol}
                     className={`rounded-full px-4 py-2 text-sm font-semibold ${
-                      active ? "bg-amber-400 text-slate-900" : "border border-amber-200 bg-white text-slate-700"
+                      active ? "bg-amber-400 text-slate-900" : "border border-slate-200 bg-white text-slate-700"
                     }`}
                     onClick={() => onToggleTrackedSymbol(symbol)}
                     type="button"
@@ -80,7 +80,7 @@ export function MarketRiskPanel({
             />
           </Field>
 
-          <div className="rounded-2xl border border-amber-200 bg-white px-4 py-3">
+          <div className="rounded-md border border-slate-200 bg-white px-4 py-3">
             <p className="text-xs text-slate-500">현재 심볼 집합</p>
             <p className="mt-2 text-sm font-semibold text-slate-900">{mergedSymbols.join(", ")}</p>
           </div>
@@ -162,3 +162,4 @@ export function MarketRiskPanel({
     </section>
   );
 }
+

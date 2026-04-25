@@ -362,12 +362,15 @@ def _finish_scheduler_run(
             payload=payload,
         )
     session.flush()
-    return {
+    result = {
         "scheduler_run_id": row.id,
         "workflow": row.workflow,
         "status": row.status,
         "outcome": payload,
     }
+    for key, value in payload.items():
+        result.setdefault(key, value)
+    return result
 
 
 def run_window(session: Session, window: str, triggered_by: str = "manual") -> dict[str, object]:
@@ -436,17 +439,19 @@ def is_exchange_sync_due(session: Session) -> bool:
 def run_exchange_sync_cycle(session: Session, triggered_by: str = "scheduler") -> dict[str, object]:
     settings_row = get_or_create_settings(session)
     interval_seconds = int(settings_row.exchange_sync_interval_seconds)
-    row = _start_scheduler_run(
-        session,
-        workflow=EXCHANGE_SYNC_WORKFLOW,
-        schedule_window=_symbol_schedule_window(interval_seconds=interval_seconds),
-        triggered_by=triggered_by,
-        next_run_at=utcnow_naive() + timedelta(seconds=interval_seconds),
-    )
+    schedule_window = _symbol_schedule_window(interval_seconds=interval_seconds)
+    next_run_at = utcnow_naive() + timedelta(seconds=interval_seconds)
     try:
         orchestrator = TradingOrchestrator(session)
         outcome = orchestrator.run_exchange_sync_cycle(trigger_event=triggered_by)
     except Exception as exc:
+        row = _start_scheduler_run(
+            session,
+            workflow=EXCHANGE_SYNC_WORKFLOW,
+            schedule_window=schedule_window,
+            triggered_by=triggered_by,
+            next_run_at=next_run_at,
+        )
         return _finish_scheduler_run(
             session,
             row=row,
@@ -455,6 +460,13 @@ def run_exchange_sync_cycle(session: Session, triggered_by: str = "scheduler") -
             payload={"error": str(exc)},
         )
     success = str(outcome.get("status")) != "error"
+    row = _start_scheduler_run(
+        session,
+        workflow=EXCHANGE_SYNC_WORKFLOW,
+        schedule_window=schedule_window,
+        triggered_by=triggered_by,
+        next_run_at=next_run_at,
+    )
     return _finish_scheduler_run(
         session,
         row=row,
@@ -470,6 +482,8 @@ def maybe_refresh_exchange_sync_freshness(
     triggered_by: str = "api_read",
 ) -> dict[str, Any] | None:
     settings_row = get_or_create_settings(session)
+    if triggered_by.startswith("api_") and settings_row.trading_paused:
+        return None
     if not settings_row.binance_api_key_encrypted or not settings_row.binance_api_secret_encrypted:
         return None
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
@@ -524,14 +538,8 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
         latest = _latest_symbol_workflow_run(session, MARKET_REFRESH_WORKFLOW, effective.symbol)
         if not _is_due(latest, timedelta(minutes=cadence_minutes)):
             continue
-        row = _start_scheduler_run(
-            session,
-            workflow=MARKET_REFRESH_WORKFLOW,
-            schedule_window=_symbol_schedule_window(interval_minutes=cadence_minutes),
-            triggered_by=triggered_by,
-            symbol=effective.symbol,
-            next_run_at=utcnow_naive() + timedelta(minutes=cadence_minutes),
-        )
+        schedule_window = _symbol_schedule_window(interval_minutes=cadence_minutes)
+        next_run_at = utcnow_naive() + timedelta(minutes=cadence_minutes)
         try:
             cycle = orchestrator.run_market_refresh_cycle(
                 symbols=[effective.symbol],
@@ -541,6 +549,14 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
                 auto_resume_checked=True,
             )
             symbol_outcome = cycle["results"][0]
+            row = _start_scheduler_run(
+                session,
+                workflow=MARKET_REFRESH_WORKFLOW,
+                schedule_window=schedule_window,
+                triggered_by=triggered_by,
+                symbol=effective.symbol,
+                next_run_at=next_run_at,
+            )
             results.append(
                 _finish_scheduler_run(
                     session,
@@ -551,6 +567,14 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
                 )
             )
         except Exception as exc:
+            row = _start_scheduler_run(
+                session,
+                workflow=MARKET_REFRESH_WORKFLOW,
+                schedule_window=schedule_window,
+                triggered_by=triggered_by,
+                symbol=effective.symbol,
+                next_run_at=next_run_at,
+            )
             results.append(
                 _finish_scheduler_run(
                     session,

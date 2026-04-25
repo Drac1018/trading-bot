@@ -4,10 +4,11 @@ import sys
 import time
 
 from redis import Redis
-from trading_mvp.config import get_settings
+from trading_mvp.config import get_settings, require_runtime_database_url
 
 
 def main() -> None:
+    require_runtime_database_url("worker startup")
     settings = get_settings()
     if sys.platform == "win32":
         while True:

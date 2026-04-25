@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("DATABASE_URL", "sqlite:///./data/pytest_bootstrap.db")
+os.environ.setdefault("TRADING_MVP_ALLOW_SQLITE", "1")
+os.environ.setdefault("LIVE_TRADING_ENV_ENABLED", "true")
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker

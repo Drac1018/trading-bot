@@ -2524,6 +2524,30 @@ def test_maybe_refresh_exchange_sync_freshness_runs_when_sync_is_stale(monkeypat
     assert calls == ["api_dashboard_overview"]
 
 
+def test_maybe_refresh_exchange_sync_freshness_skips_api_refresh_when_paused(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.trading_paused = True
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    stale_at = utcnow_naive() - timedelta(hours=2)
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings_row, scope=scope, synced_at=stale_at)
+    db_session.flush()
+
+    calls: list[str] = []
+
+    def fake_run_exchange_sync_cycle(session, triggered_by="scheduler"):
+        calls.append(triggered_by)
+        return {"workflow": "exchange_sync_cycle", "status": "success"}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_exchange_sync_cycle", fake_run_exchange_sync_cycle)
+
+    result = maybe_refresh_exchange_sync_freshness(db_session, triggered_by="api_dashboard_overview")
+
+    assert result is None
+    assert calls == []
+
+
 def test_no_event_no_ai_invocation(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
@@ -3813,27 +3837,14 @@ def test_scheduler_market_refresh_cycle_runs_without_ai_or_new_entry(monkeypatch
     settings_row.tracked_symbols = ["BTCUSDT"]
     db_session.flush()
 
-    snapshot = MarketSnapshotPayload(
-        symbol="BTCUSDT",
-        timeframe="15m",
-        snapshot_time=utcnow_naive(),
-        latest_price=70100.0,
-        latest_volume=1000.0,
-        candle_count=1,
-        is_stale=False,
-        is_complete=True,
-        candles=[
-            MarketCandle(
-                timestamp=utcnow_naive(),
-                open=70000.0,
-                high=70200.0,
-                low=69900.0,
-                close=70100.0,
-                volume=1000.0,
-            )
-        ],
-    )
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    higher_timeframe_context = {
+        "15m": snapshot,
+        "1h": build_market_snapshot("BTCUSDT", "1h", upto_index=140),
+        "4h": build_market_snapshot("BTCUSDT", "4h", upto_index=140),
+    }
     monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_snapshot", lambda **kwargs: snapshot)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.build_market_context", lambda **kwargs: higher_timeframe_context)
 
     result = run_market_refresh_cycle(db_session, triggered_by="scheduler")
 

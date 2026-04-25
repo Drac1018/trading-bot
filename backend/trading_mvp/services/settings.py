@@ -115,6 +115,7 @@ DEFAULT_LIMITED_LIVE_MAX_NOTIONAL = 500.0
 DEFAULT_AI_BACKSTOP_ENABLED = True
 DEFAULT_AI_BACKSTOP_INTERVAL_MINUTES = 180
 DEFAULT_EVENT_SOURCE_TIMEOUT_SECONDS = 10.0
+LATEST_SYMBOL_DECISION_SCAN_LIMIT = 100
 ROLLOUT_MODE_SUBMIT_ENABLED = {"limited_live", "full_live"}
 ROLLOUT_MODE_LIVE_PATH = {"shadow", "live_dry_run", "limited_live", "full_live"}
 RUNTIME_STATE_DETAIL_KEYS = {
@@ -465,27 +466,36 @@ def _latest_symbol_decision(
     if session is None:
         return None
     symbol_key = symbol.upper()
-    for row in session.scalars(
+    statement = (
         select(AgentRun)
         .where(AgentRun.role == "trading_decision")
         .order_by(desc(AgentRun.created_at))
-    ):
-        output = row.output_payload if isinstance(row.output_payload, dict) else {}
-        input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
-        output_symbol = str(output.get("symbol") or "").upper()
-        output_timeframe = str(output.get("timeframe") or "")
-        input_market = input_payload.get("market_snapshot")
-        input_market_timeframe = (
-            str(input_market.get("timeframe") or "")
-            if isinstance(input_market, dict)
-            else ""
-        )
-        if output_symbol != symbol_key:
-            continue
-        if timeframe and output_timeframe not in {"", timeframe} and input_market_timeframe not in {"", timeframe}:
-            continue
-        return row
-    return None
+    )
+
+    def match(rows: list[AgentRun]) -> AgentRun | None:
+        for row in rows:
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
+            output_symbol = str(output.get("symbol") or "").upper()
+            output_timeframe = str(output.get("timeframe") or "")
+            input_market = input_payload.get("market_snapshot")
+            input_market_timeframe = (
+                str(input_market.get("timeframe") or "")
+                if isinstance(input_market, dict)
+                else ""
+            )
+            if output_symbol != symbol_key:
+                continue
+            if timeframe and output_timeframe not in {"", timeframe} and input_market_timeframe not in {"", timeframe}:
+                continue
+            return row
+        return None
+
+    limited_rows = list(session.scalars(statement.limit(LATEST_SYMBOL_DECISION_SCAN_LIMIT)))
+    matched = match(limited_rows)
+    if matched is not None or len(limited_rows) < LATEST_SYMBOL_DECISION_SCAN_LIMIT:
+        return matched
+    return match(list(session.scalars(statement.offset(LATEST_SYMBOL_DECISION_SCAN_LIMIT))))
 
 
 def _latest_symbol_feature(
@@ -617,19 +627,19 @@ def build_event_operator_control_payload(
     configured_operator_event_view = _deserialize_operator_event_view_payload(settings_row)
     operator_event_view = configured_operator_event_view or build_default_operator_event_view()
     manual_windows = _deserialize_manual_no_trade_windows(settings_row)
+    resolved_decision = decision_row or _latest_symbol_decision(
+        session,
+        symbol=resolved_symbol,
+        timeframe=resolved_timeframe,
+    )
     event_context = _build_operator_event_context_payload(
         session=session,
         settings_row=settings_row,
         symbol=resolved_symbol,
         timeframe=resolved_timeframe,
-        decision_row=decision_row,
+        decision_row=resolved_decision,
         feature_row=feature_row,
         market_row=market_row,
-    )
-    resolved_decision = decision_row or _latest_symbol_decision(
-        session,
-        symbol=resolved_symbol,
-        timeframe=resolved_timeframe,
     )
     resolved_ai_event_view = ai_event_view or _build_ai_event_view_payload(decision_row=resolved_decision)
     symbol_windows = _windows_for_symbol(manual_windows, symbol=resolved_symbol, now=evaluation_time)

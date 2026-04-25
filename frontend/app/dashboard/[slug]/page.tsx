@@ -44,10 +44,15 @@ export default async function DashboardPage({
 
   // Audit uses the shared explorer component with audit-only data.
   if (slug === "audit") {
-    const auditRows = await fetchJson<AuditRow[]>("/api/audit?limit=100");
+    const auditRows = await fetchJson<AuditRow[]>("/api/audit?limit=30");
     const initialTab = typeof query.tab === "string" ? query.tab : "all";
 
-    return <LogExplorer initialRows={auditRows} initialTab={initialTab} initialLimit={100} />;
+    return (
+      <div className="space-y-6">
+        <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} />
+        <LogExplorer initialRows={auditRows} initialTab={initialTab} initialLimit={30} />
+      </div>
+    );
   }
 
   const settingsPayload = slug === "settings" ? await fetchJson<SettingsPayload>("/api/settings") : null;

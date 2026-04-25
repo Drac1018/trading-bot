@@ -29,9 +29,9 @@ export type { AuditRow } from "../lib/audit-log";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshMs = 20000;
-const limitOptions = [50, 100, 200] as const;
+const limitOptions = [30, 50, 100] as const;
 const inputClass =
-  "w-full rounded-2xl border border-amber-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-amber-400";
+  "w-full rounded-md border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100";
 
 export type LogExplorerProps = {
   initialRows: AuditRow[];
@@ -59,10 +59,12 @@ function updateTabQuery(pathname: string, searchParams: URLSearchParams, nextTab
   return queryString ? `${pathname}?${queryString}` : pathname;
 }
 
-export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 100 }: LogExplorerProps) {
+export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 30 }: LogExplorerProps) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const queryTab = searchParams.get("tab");
+  const didHydrateTab = useRef(false);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const [rows, setRows] = useState<AuditRow[]>(initialRows);
@@ -74,8 +76,12 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
   const deferredSearch = useDeferredValue(searchFilter);
 
   useEffect(() => {
-    setActiveTab(parseAuditTab(searchParams.get("tab")));
-  }, [searchParams]);
+    if (!didHydrateTab.current) {
+      didHydrateTab.current = true;
+      return;
+    }
+    setActiveTab(parseAuditTab(queryTab));
+  }, [queryTab]);
 
   useEffect(() => {
     let active = true;
@@ -201,9 +207,9 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
 
   return (
     <div className="space-y-6">
-      <section className="rounded-[2rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">Audit Explorer</p>
-        <h2 className="mt-2 text-2xl font-semibold text-ink">감사 이벤트 탐색</h2>
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Audit Explorer</p>
+        <h2 className="mt-2 text-2xl font-semibold text-slate-950">감사 이벤트 탐색</h2>
         <p className="mt-3 text-sm leading-7 text-slate-600">
           리스크, 실행, 승인/운영제어, 보호주문, 헬스/시스템, AI/의사결정 이벤트를 같은 규칙으로 탐색합니다.
         </p>
@@ -220,8 +226,8 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
                 id={`audit-tab-${tab}`}
                 aria-selected={selected}
                 aria-controls={panelId}
-                className={`rounded-full px-4 py-2 text-sm font-semibold ${
-                  selected ? "bg-amber-400 text-slate-900" : "border border-amber-200 bg-white text-slate-700"
+                className={`rounded-md px-4 py-2 text-sm font-semibold ${
+                  selected ? "bg-blue-600 text-white" : "border border-slate-200 bg-white text-slate-700"
                 }`}
                 onClick={() => selectTab(tab)}
                 onKeyDown={(event) => handleTabKeyDown(event, index)}
@@ -237,7 +243,7 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
       </section>
 
       <section id={panelId} aria-labelledby={`audit-tab-${activeTab}`} className="space-y-6" role="tabpanel">
-        <section className="rounded-[1.8rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame">
+        <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
           <div className="grid gap-3 lg:grid-cols-4">
             <input
               aria-label="감사 로그 검색"
@@ -302,13 +308,13 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 10
           }}
         />
         {visibleSuppressedRows > 0 ? (
-          <div className="rounded-[1.6rem] border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700">
+          <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700">
             `진입 제안 억제`는 `ai_skipped_reason`와 별도 상태입니다. AI가 management-only로 계속 동작하더라도
             same-side add-on 신규 진입 제안만 별도로 억제될 수 있습니다.
           </div>
         ) : null}
         {visibleLegacyRows > 0 ? (
-          <div className="rounded-[1.6rem] border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm leading-6 text-slate-700">
+          <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-sm leading-6 text-slate-700">
             시간 기반 AI review 사유(`open_position_recheck_due`, `periodic_backstop_due`)는 현재 runtime trigger가 아니라
             저장된 과거 정책 기록으로 분리 표시합니다.
           </div>

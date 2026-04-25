@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 export type AIUsagePayload = {
   recent_ai_calls_24h: number;
@@ -38,7 +38,7 @@ function MetricCard({
   hint: string;
 }) {
   return (
-    <div className="rounded-[1.4rem] border border-amber-200 bg-white px-4 py-4">
+    <div className="rounded-md border border-slate-200 bg-white px-4 py-4">
       <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">{label}</p>
       <p className="mt-2 text-2xl font-semibold text-slate-900">{value}</p>
       <p className="mt-2 text-sm leading-6 text-slate-600">{hint}</p>
@@ -58,7 +58,7 @@ function BreakdownTable({
   const roles = Array.from(new Set([...Object.keys(calls), ...Object.keys(failures)]));
 
   return (
-    <div className="rounded-[1.4rem] border border-amber-200 bg-white px-4 py-4">
+    <div className="rounded-md border border-slate-200 bg-white px-4 py-4">
       <p className="text-sm font-semibold text-slate-900">{title}</p>
       {roles.length === 0 ? (
         <p className="mt-3 text-sm text-slate-500">아직 집계된 AI 호출 기록이 없습니다.</p>
@@ -67,7 +67,7 @@ function BreakdownTable({
           {roles.map((role) => (
             <div
               key={role}
-              className="flex items-center justify-between rounded-2xl bg-canvas px-4 py-3 text-sm text-slate-700"
+              className="flex items-center justify-between rounded-md bg-slate-50 px-4 py-3 text-sm text-slate-700"
             >
               <div>
                 <p className="font-semibold text-slate-900">{roleLabels[role] ?? role}</p>
@@ -85,7 +85,7 @@ function BreakdownTable({
 export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
   if (usage === null) {
     return (
-      <section className="space-y-5 rounded-[1.9rem] border border-amber-200/70 bg-canvas/70 p-4 sm:p-5">
+      <section className="space-y-5 rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">AI 사용 관측</p>
           <h3 className="mt-2 text-xl font-semibold text-slate-900">실제 호출 기록 기준 모니터링</h3>
@@ -93,7 +93,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
             최근 AI 호출 집계를 불러오는 중입니다. 설정 본문은 먼저 표시하고, 사용량 통계는 분리 로드합니다.
           </p>
         </div>
-        <div className="rounded-[1.4rem] border border-dashed border-amber-300 bg-white px-4 py-6 text-sm text-slate-500">
+        <div className="rounded-md border border-dashed border-slate-300 bg-white px-4 py-6 text-sm text-slate-500">
           AI 사용량을 불러오는 중입니다.
         </div>
       </section>
@@ -105,7 +105,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
   const observedBreakdown = Object.entries(usage.observed_monthly_ai_calls_projection_breakdown);
 
   return (
-    <section className="space-y-5 rounded-[1.9rem] border border-amber-200/70 bg-canvas/70 p-4 sm:p-5">
+    <section className="space-y-5 rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">AI 사용 관측</p>
@@ -171,7 +171,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
       </div>
 
       <div className="grid gap-5 xl:grid-cols-2">
-        <div className="rounded-[1.4rem] border border-amber-200 bg-white px-4 py-4">
+        <div className="rounded-md border border-slate-200 bg-white px-4 py-4">
           <p className="text-sm font-semibold text-slate-900">최근 실패 사유</p>
           {usage.recent_ai_failure_reasons.length === 0 ? (
             <p className="mt-3 text-sm text-slate-500">최근 7일 기준 실패 사유가 없습니다.</p>
@@ -180,7 +180,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
               {usage.recent_ai_failure_reasons.map((reason) => (
                 <span
                   key={reason}
-                  className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-slate-700"
+                  className="rounded-md border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-slate-700"
                 >
                   {reason}
                 </span>
@@ -189,7 +189,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
           )}
         </div>
 
-        <div className="rounded-[1.4rem] border border-amber-200 bg-white px-4 py-4">
+        <div className="rounded-md border border-slate-200 bg-white px-4 py-4">
           <p className="text-sm font-semibold text-slate-900">관측 월간 환산 역할 분포</p>
           {observedBreakdown.length === 0 ? (
             <p className="mt-3 text-sm text-slate-500">최근 관측 기록 기준으로 환산한 역할별 호출 분포가 없습니다.</p>
@@ -198,7 +198,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
               {observedBreakdown.map(([role, count]) => (
                 <div
                   key={role}
-                  className="grid gap-2 rounded-2xl bg-canvas px-4 py-3 text-sm text-slate-700 sm:grid-cols-[1fr_auto]"
+                  className="grid gap-2 rounded-md bg-slate-50 px-4 py-3 text-sm text-slate-700 sm:grid-cols-[1fr_auto]"
                 >
                   <p className="font-semibold text-slate-900">{roleLabels[role] ?? role}</p>
                   <p>{formatNumber(count)}회</p>
@@ -211,3 +211,4 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
     </section>
   );
 }
+

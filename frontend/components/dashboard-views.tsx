@@ -1,4 +1,4 @@
-import Link from "next/link";
+﻿import Link from "next/link";
 
 import type { OperatorDashboardPayload } from "./overview-dashboard";
 import { DataTable } from "./data-table";
@@ -132,7 +132,7 @@ function badgeClass(kind: "good" | "warn" | "danger" | "neutral") {
 function metricCard(title: string, value: string, hint: string, options?: { compact?: boolean }) {
   const compact = options?.compact ?? false;
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+    <div className="rounded-md border border-slate-200 bg-white p-4">
       <p className="text-xs font-medium text-slate-500">{title}</p>
       <p
         className={`mt-2 font-semibold text-slate-950 ${
@@ -453,8 +453,8 @@ function SymbolTabs({
             href={href}
             className={`rounded-full border px-4 py-2 text-sm font-semibold transition ${
               active
-                ? "border-slate-900 bg-slate-900 text-white"
-                : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+                ? "border-blue-600 bg-blue-600 text-white"
+                : "border-slate-200 bg-white text-slate-700 hover:border-blue-200 hover:bg-blue-50"
             }`}
           >
             {symbol === "ALL" ? "전체" : symbol}
@@ -503,7 +503,7 @@ export function MarketSignalView({
 
   return (
     <div className="space-y-6">
-      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">시장 / 신호</p>
         <h2 className="mt-2 text-xl font-semibold text-slate-950">시장 입력과 신호 입력만 분리해서 확인</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
@@ -522,7 +522,7 @@ export function MarketSignalView({
             const featureInputMissing = symbol.stale_flags.includes("feature_input_missing");
             const featureInputDelayed = symbol.feature_input_delayed;
             return (
-            <div key={symbol.symbol} className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div key={symbol.symbol} className="rounded-md border border-slate-200 bg-white p-4">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <h3 className="text-lg font-semibold text-slate-950">{symbol.symbol}</h3>
@@ -679,7 +679,7 @@ export function DecisionView({
 
   return (
     <div className="space-y-6">
-      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">의사결정</p>
         <h2 className="mt-2 text-xl font-semibold text-slate-950">마지막 AI 추천과 현재 실행 상태를 시간축으로 분리</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
@@ -693,7 +693,7 @@ export function DecisionView({
             selectedSymbol={symbol.symbol}
           />
         </div>
-        <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           {getSelectedSymbolPolicyHint("single")}
         </div>
         <div className="mt-5 grid gap-4 lg:grid-cols-7">
@@ -716,7 +716,7 @@ export function DecisionView({
           {metricCard("실제 실행", execution?.label ?? "-", execution?.detail ?? "-")}
         </div>
         <div className="mt-4 grid gap-4 xl:grid-cols-4">
-          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div className="rounded-md border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
@@ -733,7 +733,7 @@ export function DecisionView({
               {symbol.ai_decision.explanation_short ?? "최신 판단 설명이 없습니다."}
             </p>
             {historicalGapNotice ? (
-              <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+              <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
                 {historicalGapNotice}
               </div>
             ) : null}
@@ -775,7 +775,7 @@ export function DecisionView({
             </div>
           </div>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div className="rounded-md border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
@@ -810,13 +810,13 @@ export function DecisionView({
               )}
             </div>
             {symbol.risk_guard.allowed === true && symbol.execution.order_id === null ? (
-              <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+              <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
                 리스크 통과는 주문 제출 완료가 아닙니다. 현재 cycle 선정 여부와 진입 대기 플랜, 실제 주문 상태를 함께 확인하세요.
               </div>
             ) : null}
           </div>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div className="rounded-md border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
@@ -858,7 +858,7 @@ export function DecisionView({
             </div>
           </div>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div className="rounded-md border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
@@ -905,7 +905,7 @@ export function SchedulerView({
 }) {
   return (
     <div className="space-y-6">
-      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">스케줄러</p>
         <h2 className="mt-2 text-xl font-semibold text-slate-950">주기와 검토 예정 상태 확인</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
@@ -924,7 +924,7 @@ export function SchedulerView({
         </div>
       </section>
 
-      <section className="rounded-[1.75rem] border border-slate-200 bg-white p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">AI 호출 상태</p>
         <h2 className="mt-2 text-xl font-semibold text-slate-950">심볼별 AI 호출 / 건너뜀 상태</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
@@ -938,7 +938,7 @@ export function SchedulerView({
               symbol.ai_decision.last_ai_trigger_reason,
             );
             return (
-              <div key={symbol.symbol} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+              <div key={symbol.symbol} className="rounded-md border border-slate-200 bg-slate-50 p-4">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <h3 className="text-base font-semibold text-slate-950">{symbol.symbol}</h3>
@@ -1032,7 +1032,7 @@ export function RiskView({
 
   return (
     <div className="space-y-6">
-      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">리스크 점검</p>
         <h2 className="mt-2 text-xl font-semibold text-slate-950">AI 호출 사유와 risk 결과를 한 카드에서 확인</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
@@ -1041,19 +1041,19 @@ export function RiskView({
         </p>
       </section>
 
-      <section className="rounded-[1.75rem] border border-slate-200 bg-white p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Risk Cards</p>
             <h2 className="mt-2 text-xl font-semibold text-slate-950">최근 risk check</h2>
           </div>
-          <div className="w-fit rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
+          <div className="w-fit rounded-md bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
             {rows.length}건
           </div>
         </div>
 
         {rows.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-amber-300 px-4 py-8 text-sm text-slate-500">
+          <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
             <p className="font-semibold text-slate-700">표시할 risk check가 없습니다.</p>
             <p className="mt-2 leading-6">저장된 risk 판정 row가 아직 없습니다.</p>
           </div>
@@ -1070,7 +1070,7 @@ export function RiskView({
               return (
                 <article
                   key={row.id ?? `${row.symbol ?? "risk"}-${row.created_at ?? index}`}
-                  className="rounded-[1.6rem] border border-amber-100 bg-canvas/90 p-4 shadow-sm"
+                  className="rounded-lg border border-slate-200 bg-slate-50 p-4"
                 >
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                     <div className="min-w-0">
@@ -1113,12 +1113,12 @@ export function RiskView({
                   </div>
 
                   {row.payload ? (
-                    <details className="mt-4 rounded-2xl border border-amber-200 bg-white">
+                    <details className="mt-4 rounded-md border border-slate-200 bg-white">
                       <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-ink">
                         상세 payload 보기
                       </summary>
-                      <div className="border-t border-amber-100 px-4 py-4">
-                        <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-2xl bg-slate-900/95 p-4 text-xs leading-6 text-slate-100">
+                      <div className="border-t border-slate-200 px-4 py-4">
+                        <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-slate-950 p-4 text-xs leading-6 text-slate-100">
                           {JSON.stringify(row.payload, null, 2)}
                         </pre>
                       </div>
@@ -1145,17 +1145,17 @@ export function RiskView({
 export function AgentDebugView({ agentRows }: { agentRows: Row[] }) {
   return (
     <div className="space-y-6">
-      <section className="rounded-[1.75rem] border border-amber-200/70 bg-white/90 p-5 shadow-frame sm:p-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">에이전트</p>
-        <h2 className="mt-2 text-xl font-semibold text-slate-950">디버그 / 고급 정보</h2>
+        <h2 className="mt-2 text-xl font-semibold text-slate-950">최근 AI 실행 요약</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          이 탭은 운영 핵심 판단 화면이 아닙니다. raw provider, role, payload, schema validation 같은 디버그성 정보만 확인합니다.
+          실행 상태, 모델, 판단 결과, 핵심 payload만 확인합니다. 세부 판단 흐름은 의사결정 탭을 기준으로 봅니다.
         </p>
       </section>
 
       <DataTable
         title="에이전트 실행 기록"
-        description="디버그 / raw metadata"
+        description="AI 실행 요약"
         rows={agentRows}
         emptyStateTitle="표시할 에이전트 실행 기록이 없습니다."
         emptyStateDescription="저장된 agent run이 아직 없습니다."
@@ -1163,3 +1163,4 @@ export function AgentDebugView({ agentRows }: { agentRows: Row[] }) {
     </div>
   );
 }
+

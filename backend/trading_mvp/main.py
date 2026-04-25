@@ -26,7 +26,15 @@ from trading_mvp.schemas import (
     ReplayValidationRequest,
 )
 from trading_mvp.services.audit import record_audit_event, record_health_event
-from trading_mvp.services.binance_account import get_binance_account_snapshot
+from trading_mvp.services.binance_account import (
+    get_binance_account_snapshot,
+    get_cached_binance_account_snapshot,
+    get_local_binance_account_snapshot,
+    mark_binance_account_refresh_requested,
+    mark_binance_account_refresh_started,
+    store_binance_account_cache_failure,
+    store_binance_account_cache_result,
+)
 from trading_mvp.services.connectivity import (
     check_binance_connection,
     check_openai_connection,
@@ -82,10 +90,20 @@ from trading_mvp.services.settings import (
 
 READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS = 20.0
 LOCAL_DEV_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+MAX_LIST_LIMIT = 200
 _sqlite_background_write_guard = threading.Lock()
 _exchange_sync_read_refresh_guard = threading.Lock()
+_binance_account_cache_refresh_guard = threading.Lock()
 _exchange_sync_read_refresh_inflight = False
 _exchange_sync_read_refresh_last_started = 0.0
+
+
+def _bounded_limit(value: int, *, default: int = 50, maximum: int = MAX_LIST_LIMIT) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(normalized, maximum))
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -103,6 +121,10 @@ def _background_scheduler_enabled() -> bool:
 def _background_user_stream_enabled() -> bool:
     default = engine.dialect.name != "sqlite"
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM", default=default)
+
+
+def _manual_pause_active(settings_row) -> bool:
+    return bool(settings_row.trading_paused) and settings_row.pause_origin == "manual"
 
 
 @contextmanager
@@ -193,6 +215,9 @@ def _run_background_scheduler_tick() -> int:
         try:
             settings_row = get_or_create_settings(session)
             interval_seconds = max(15, min(int(settings_row.exchange_sync_interval_seconds), 15))
+            if _manual_pause_active(settings_row):
+                session.rollback()
+                return interval_seconds
             run_due_operational_cycles(session)
             run_due_windows(session)
             session.commit()
@@ -218,6 +243,9 @@ def _run_background_user_stream_tick() -> int:
         entity_id = "background"
         try:
             settings_row = get_or_create_settings(session)
+            if _manual_pause_active(settings_row):
+                session.rollback()
+                return sleep_seconds
             entity_id = settings_row.default_symbol
             tracked_symbols = settings_row.tracked_symbols or [settings_row.default_symbol]
             stream_result = poll_live_user_stream(
@@ -342,6 +370,73 @@ def _refresh_exchange_sync_for_read(*, triggered_by: str) -> bool:
     ).start()
     return True
 
+
+def _run_binance_account_cache_refresh() -> None:
+    started_at = monotonic()
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    try:
+        with polling_session_factory() as session, _sqlite_write_lock():
+            mark_binance_account_refresh_started(session)
+            session.commit()
+
+        with polling_session_factory() as read_session:
+            payload: BinanceAccountResponse = get_binance_account_snapshot(read_session)
+
+        duration_ms = (monotonic() - started_at) * 1000
+        with polling_session_factory() as session, _sqlite_write_lock():
+            if payload.summary.connected:
+                store_binance_account_cache_result(session, payload, duration_ms=duration_ms)
+                record_audit_event(
+                    session,
+                    event_type="binance_account_cache_refreshed",
+                    entity_type="binance",
+                    entity_id="account",
+                    message="Binance account cache refreshed.",
+                    payload={
+                        "duration_ms": round(duration_ms, 1),
+                        "asset_count": payload.summary.asset_count,
+                        "open_positions": payload.summary.open_positions,
+                        "open_orders": payload.summary.open_orders,
+                    },
+                )
+            else:
+                failure_message = "Binance 원본 계정 캐시를 갱신하지 못했습니다."
+                store_binance_account_cache_failure(
+                    session,
+                    failure_message,
+                    duration_ms=duration_ms,
+                )
+                record_audit_event(
+                    session,
+                    event_type="binance_account_cache_refresh_failed",
+                    entity_type="binance",
+                    entity_id="account",
+                    severity="warning",
+                    message="Binance account cache refresh failed.",
+                    payload={"duration_ms": round(duration_ms, 1), "error": failure_message},
+                )
+            session.commit()
+    except Exception as exc:
+        duration_ms = (monotonic() - started_at) * 1000
+        try:
+            with polling_session_factory() as session, _sqlite_write_lock():
+                store_binance_account_cache_failure(session, str(exc), duration_ms=duration_ms)
+                record_audit_event(
+                    session,
+                    event_type="binance_account_cache_refresh_failed",
+                    entity_type="binance",
+                    entity_id="account",
+                    severity="warning",
+                    message="Binance account cache refresh failed.",
+                    payload={"duration_ms": round(duration_ms, 1), "error": str(exc)},
+                )
+                session.commit()
+        except Exception:
+            return
+    finally:
+        _binance_account_cache_refresh_guard.release()
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return {"status": "ok", "mode": "service_ready", "database": "ready"}
@@ -371,23 +466,23 @@ def dashboard_profitability(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.get("/api/market/snapshots")
-def market_snapshots(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_market_snapshots(db)
+def market_snapshots(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_market_snapshots(db, limit=_bounded_limit(limit))
 
 
 @app.get("/api/market/features")
-def feature_snapshots(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_feature_snapshots(db)
+def feature_snapshots(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_feature_snapshots(db, limit=_bounded_limit(limit))
 
 
 @app.get("/api/decisions")
-def decisions(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_decisions(db)
+def decisions(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_decisions(db, limit=_bounded_limit(limit), compact=compact)
 
 
 @app.get("/api/positions")
-def positions(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_positions(db)
+def positions(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_positions(db, limit=_bounded_limit(limit))
 
 
 @app.get("/api/orders")
@@ -399,7 +494,7 @@ def orders(
     limit: int = 50,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    return get_orders(db, mode=mode, symbol=symbol, status=status, search=search, limit=limit)
+    return get_orders(db, mode=mode, symbol=symbol, status=status, search=search, limit=_bounded_limit(limit))
 
 
 @app.get("/api/executions")
@@ -411,7 +506,7 @@ def executions(
     limit: int = 50,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    return get_executions(db, mode=mode, symbol=symbol, status=status, search=search, limit=limit)
+    return get_executions(db, mode=mode, symbol=symbol, status=status, search=search, limit=_bounded_limit(limit))
 
 
 @app.get("/api/executions/report")
@@ -420,18 +515,18 @@ def execution_quality_report(db: Session = Depends(get_db)) -> dict[str, object]
 
 
 @app.get("/api/risk/checks")
-def risk_checks(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_risk_checks(db)
+def risk_checks(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_risk_checks(db, limit=_bounded_limit(limit), compact=compact)
 
 
 @app.get("/api/agents")
-def agents(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_agent_runs(db)
+def agents(limit: int = 100, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_agent_runs(db, limit=_bounded_limit(limit, default=100), compact=compact)
 
 
 @app.get("/api/scheduler")
-def scheduler(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_scheduler_runs(db)
+def scheduler(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_scheduler_runs(db, limit=_bounded_limit(limit))
 
 
 @app.get("/api/audit")
@@ -442,12 +537,12 @@ def audit(
     limit: int = 100,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    return get_audit_timeline(db, event_type=event_type, severity=severity, search=search, limit=limit)
+    return get_audit_timeline(db, event_type=event_type, severity=severity, search=search, limit=_bounded_limit(limit, default=100))
 
 
 @app.get("/api/alerts")
-def alerts(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_alerts(db)
+def alerts(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_alerts(db, limit=_bounded_limit(limit))
 
 
 @app.get("/api/settings")
@@ -469,6 +564,42 @@ def settings_ai_usage(db: Session = Depends(get_db)) -> dict[str, object]:
 def binance_account(db: Session = Depends(get_db)) -> dict[str, object]:
     payload: BinanceAccountResponse = get_binance_account_snapshot(db)
     return payload.model_dump(mode="json")
+
+
+@app.get("/api/binance/account/local")
+def binance_account_local(db: Session = Depends(get_db)) -> dict[str, object]:
+    payload: BinanceAccountResponse = get_local_binance_account_snapshot(db)
+    return payload.model_dump(mode="json")
+
+
+@app.get("/api/binance/account/cache")
+def binance_account_cache(db: Session = Depends(get_db)) -> dict[str, object]:
+    return get_cached_binance_account_snapshot(db)
+
+
+@app.post("/api/binance/account/refresh")
+def binance_account_refresh(db: Session = Depends(get_db)) -> dict[str, object]:
+    acquired = _binance_account_cache_refresh_guard.acquire(blocking=False)
+    try:
+        with _sqlite_write_lock():
+            payload = mark_binance_account_refresh_requested(db, already_running=not acquired)
+            db.commit()
+    except Exception:
+        if acquired:
+            _binance_account_cache_refresh_guard.release()
+        raise
+
+    if acquired:
+        try:
+            threading.Thread(
+                target=_run_binance_account_cache_refresh,
+                daemon=True,
+                name="binance-account-cache-refresh",
+            ).start()
+        except Exception:
+            _binance_account_cache_refresh_guard.release()
+            raise
+    return payload
 
 
 @app.put("/api/settings")
@@ -755,13 +886,17 @@ def replay_validation(
 
 
 @app.post("/api/live/sync")
-def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
+def live_sync(
+    symbol: str | None = None,
+    allow_protection_recovery: bool = True,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         settings_row = get_or_create_settings(db)
         auto_resume_precheck: dict[str, object] | None = None
         auto_resume_postcheck: dict[str, object] | None = None
 
-        if settings_row.trading_paused:
+        if allow_protection_recovery and settings_row.trading_paused:
             auto_resume_precheck = attempt_auto_resume(
                 db,
                 settings_row,
@@ -770,7 +905,15 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
             db.flush()
             settings_row = get_or_create_settings(db)
         try:
-            result = sync_live_state(db, settings_row, symbol=symbol)
+            if allow_protection_recovery:
+                result = sync_live_state(db, settings_row, symbol=symbol)
+            else:
+                result = sync_live_state(
+                    db,
+                    settings_row,
+                    symbol=symbol,
+                    allow_protection_recovery=False,
+                )
         except Exception as exc:
             error_payload = {
                 "error": str(exc),
@@ -798,7 +941,7 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
             raise HTTPException(status_code=400, detail=error_payload) from exc
 
         settings_row = get_or_create_settings(db)
-        if auto_resume_precheck is not None or settings_row.trading_paused:
+        if allow_protection_recovery and (auto_resume_precheck is not None or settings_row.trading_paused):
             auto_resume_postcheck = attempt_auto_resume(
                 db,
                 settings_row,
@@ -810,6 +953,7 @@ def live_sync(symbol: str | None = None, db: Session = Depends(get_db)) -> dict[
         auto_resume = auto_resume_postcheck or auto_resume_precheck
         payload = {
             **result,
+            "allow_protection_recovery": allow_protection_recovery,
             "auto_resume_precheck": auto_resume_precheck,
             "auto_resume_postcheck": auto_resume_postcheck,
             "auto_resume": auto_resume,
