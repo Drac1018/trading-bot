@@ -1335,6 +1335,73 @@ def test_trading_agent_emits_decision_agreement_levels_for_ai_output() -> None:
     assert disagreement_metadata["decision_agreement"]["direction_match"] is False
 
 
+def test_strategy_engine_selected_entry_is_used_for_ai_agreement_when_baseline_holds() -> None:
+    baseline = TradeDecision(
+        decision="hold",
+        confidence=0.52,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=None,
+        entry_zone_max=None,
+        entry_mode="none",
+        invalidation_price=None,
+        max_chase_bps=None,
+        idea_ttl_minutes=None,
+        stop_loss=None,
+        take_profit=None,
+        max_holding_minutes=120,
+        risk_pct=0.005,
+        leverage=1.0,
+        rationale_codes=["NO_EDGE"],
+        explanation_short="baseline hold",
+        explanation_detailed="Raw deterministic baseline is too conservative for this selected engine.",
+    )
+    ai_decision = TradeDecision(
+        decision="short",
+        confidence=0.61,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=77605.0,
+        entry_zone_max=77761.0,
+        entry_mode="pullback_confirm",
+        invalidation_price=77877.0,
+        max_chase_bps=4.0,
+        idea_ttl_minutes=10,
+        stop_loss=77837.0,
+        take_profit=77333.0,
+        max_holding_minutes=90,
+        risk_pct=0.02,
+        leverage=2.0,
+        rationale_codes=["ENGINE_TREND_CONTINUATION_ENGINE"],
+        explanation_short="selected short",
+        explanation_detailed="AI output aligns with the selected trend continuation engine.",
+    )
+    strategy_engine_selection = {
+        "selected_engine": {
+            "engine_name": "trend_continuation_engine",
+            "decision_hint": "short",
+            "entry_mode": "pullback_confirm",
+            "eligible": True,
+        }
+    }
+
+    agreement_baseline, baseline_source = TradingDecisionAgent._agreement_baseline_from_strategy_engine(
+        baseline,
+        strategy_engine_selection,
+    )
+    agreement = TradingDecisionAgent._build_decision_agreement(
+        agreement_baseline,
+        ai_decision,
+        ai_used=True,
+    )
+
+    assert baseline_source == "strategy_engine_selection"
+    assert agreement["baseline_decision"] == "short"
+    assert agreement["baseline_entry_mode"] == "pullback_confirm"
+    assert agreement["level"] == "full_agreement"
+    assert agreement["direction_match"] is True
+
+
 def test_trading_agent_holds_when_matching_setup_cluster_is_active() -> None:
     bullish_base = _snapshot(
         "15m",

@@ -1635,6 +1635,41 @@ class TradingDecisionAgent:
         }
 
     @staticmethod
+    def _agreement_baseline_from_strategy_engine(
+        baseline: TradeDecision,
+        strategy_engine_selection: dict[str, Any],
+    ) -> tuple[TradeDecision, str]:
+        selected_engine = (
+            dict(strategy_engine_selection.get("selected_engine"))
+            if isinstance(strategy_engine_selection.get("selected_engine"), dict)
+            else {}
+        )
+        decision_hint = str(selected_engine.get("decision_hint") or "").strip().lower()
+        if (
+            baseline.decision != "hold"
+            or not bool(selected_engine.get("eligible", False))
+            or decision_hint not in {"long", "short"}
+        ):
+            return baseline, "deterministic_baseline"
+
+        entry_mode = str(selected_engine.get("entry_mode") or "pullback_confirm").strip().lower()
+        engine_name = str(selected_engine.get("engine_name") or "").strip().upper()
+        engine_reason_code = f"ENGINE_{engine_name}" if engine_name else None
+        rationale_codes = list(baseline.rationale_codes)
+        if engine_reason_code:
+            rationale_codes.append(engine_reason_code)
+        return (
+            baseline.model_copy(
+                update={
+                    "decision": decision_hint,
+                    "entry_mode": entry_mode,
+                    "rationale_codes": list(dict.fromkeys(rationale_codes)),
+                }
+            ),
+            "strategy_engine_selection",
+        )
+
+    @staticmethod
     def _resolve_setup_cluster_state(
         risk_context: dict[str, Any],
         decision: TradeDecision,
@@ -2964,11 +2999,16 @@ class TradingDecisionAgent:
                 provider_status="ok",
             )
             decision = bounded_result.decision
-            decision_agreement = self._build_decision_agreement(
+            agreement_baseline, agreement_baseline_source = self._agreement_baseline_from_strategy_engine(
                 baseline,
+                strategy_engine_selection,
+            )
+            decision_agreement = self._build_decision_agreement(
+                agreement_baseline,
                 decision,
                 ai_used=True,
             )
+            decision_agreement["baseline_source"] = agreement_baseline_source
             metadata = _provider_metadata(provider_result, source="llm")
             metadata["logic_variant"] = logic_variant
             metadata["decision_agreement"] = decision_agreement
