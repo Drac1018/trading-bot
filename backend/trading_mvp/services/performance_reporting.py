@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import AgentRun, CompetitorNote, Execution, Order, PnLSnapshot, Position, RiskCheck
+from trading_mvp.models import AgentRun, AuditEvent, CompetitorNote, Execution, Order, PnLSnapshot, Position, RiskCheck
 from trading_mvp.schemas import (
+    AIBaselineComparisonBucket,
+    AIBaselineComparisonSummary,
+    AIUsageTelemetrySummary,
     DecisionPerformanceEntry,
     FeatureFlagPerformanceEntry,
+    LimitedLiveReadinessReport,
     PerformanceAggregateEntry,
     PerformanceWindowReport,
     PerformanceWindowSummary,
@@ -20,6 +24,7 @@ from trading_mvp.schemas import (
     StructuredCompetitorNote,
     StructuredCompetitorNotesResponse,
 )
+from trading_mvp.services.ai_usage import build_ai_telemetry_summary, count_ai_deduped_events
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
@@ -106,10 +111,73 @@ class DecisionPerformanceSnapshot:
     mae_pct: float
     mfe_pnl: float
     mae_pnl: float
+    baseline_decision: str | None
+    ai_decision: str
+    decision_agreement_level: str
+    decision_agreement_source: str
+    ai_used: bool
+    comparison_bucket: str
+    unobserved_reason: str | None
+    pnl_per_exposure_hour: float | None
 
 
 CANCEL_ATTEMPT_ORDER_STATUSES = {"canceled", "cancelled", "expired"}
 CANCEL_SUCCESS_ORDER_STATUSES = {"canceled", "cancelled"}
+ENTRY_DECISIONS = {"long", "short"}
+MANAGEMENT_DECISIONS = {"reduce", "exit"}
+AI_BASELINE_BUCKET_ORDER = (
+    "baseline_only_entry",
+    "ai_approved_entry",
+    "ai_rejected_baseline_entry",
+    "ai_management_action",
+    "ai_hold_no_trade",
+    "provider_failed_fail_closed",
+)
+READINESS_MIN_CANDIDATE_EVENTS = 5
+READINESS_MIN_ACTUAL_ENTRIES = 2
+READINESS_SCALE_UP_MIN_CANDIDATE_EVENTS = 20
+READINESS_SCALE_UP_MIN_ACTUAL_ENTRIES = 5
+READINESS_MAX_DRAWDOWN = 1_000.0
+READINESS_STALE_BLOCK_RATIO_HIGH = 0.25
+READINESS_STALE_BLOCK_COUNT_HIGH = 3
+READINESS_PROTECTION_REASON_CODES = {
+    "PROTECTION_REQUIRED",
+    "PROTECTIVE_ORDER_FAILURE",
+    "MISSING_PROTECTIVE_ORDERS",
+    "PROTECTION_STATE_UNVERIFIED",
+    "PROTECTION_VERIFY_FAILED",
+    "INVALID_PROTECTION_BRACKETS",
+}
+READINESS_PROTECTION_AUDIT_EVENTS = {
+    "protective_order_failure",
+    "protection_verify_failed",
+    "unprotected_position_detected",
+    "emergency_exit_failed",
+}
+READINESS_UNKNOWN_REASON_CODES = {
+    "LIVE_ORDER_SUBMISSION_UNKNOWN",
+    "UNRESOLVED_SUBMISSION_GUARD_ACTIVE",
+    "UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED",
+}
+READINESS_UNKNOWN_AUDIT_EVENTS = {
+    "live_order_submission_unknown",
+}
+READINESS_UNKNOWN_ORDER_STATUSES = {
+    "submit_unknown",
+    "submission_unknown",
+    "unknown_submission",
+    "unknown",
+}
+READINESS_STALE_INCOMPLETE_REASON_CODES = {
+    "STALE_MARKET_DATA",
+    "INCOMPLETE_MARKET_DATA",
+    "ACCOUNT_STATE_STALE",
+    "POSITION_STATE_STALE",
+    "OPEN_ORDERS_STATE_STALE",
+    "MARKET_SNAPSHOT_STALE",
+    "MARKET_SNAPSHOT_INCOMPLETE",
+    "FEATURE_INPUT_MISSING",
+}
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -152,6 +220,128 @@ def _safe_bool(value: object, default: bool = False) -> bool:
     return default
 
 
+def _as_dict(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _normalized_decision(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _decision_agreement_payload(metadata: dict[str, object]) -> dict[str, object]:
+    agreement = _as_dict(metadata.get("decision_agreement"))
+    if agreement:
+        return agreement
+    decision_context = _as_dict(metadata.get("decision_context"))
+    return _as_dict(decision_context.get("decision_agreement"))
+
+
+def _decision_source(metadata: dict[str, object]) -> str:
+    return str(metadata.get("source") or "").strip().lower()
+
+
+def _ai_used_from_metadata(
+    *,
+    metadata: dict[str, object],
+    agreement: dict[str, object],
+    provider_name: str,
+) -> bool:
+    if "ai_used" in agreement:
+        return _safe_bool(agreement.get("ai_used"), default=False)
+    source = _decision_source(metadata)
+    if source == "llm":
+        return True
+    if source == "llm_fallback":
+        return False
+    provider = provider_name.strip().lower()
+    return provider not in {"", "deterministic", "deterministic-mock", "local"}
+
+
+def _baseline_decision_from_metadata(
+    *,
+    metadata: dict[str, object],
+    agreement: dict[str, object],
+    final_decision: str,
+    ai_used: bool,
+) -> str | None:
+    baseline = _as_dict(metadata.get("deterministic_baseline"))
+    baseline_decision = (
+        _normalized_decision(agreement.get("baseline_decision"))
+        or _normalized_decision(baseline.get("decision"))
+        or _normalized_decision(metadata.get("baseline_decision"))
+    )
+    if baseline_decision is None and not ai_used:
+        return final_decision
+    return baseline_decision
+
+
+def _is_fail_closed(metadata: dict[str, object], payload: dict[str, object]) -> bool:
+    return (
+        _decision_source(metadata) == "llm_fallback"
+        or _safe_bool(metadata.get("fail_closed_applied"), default=False)
+        or _safe_bool(metadata.get("data_quality_fail_closed_applied"), default=False)
+        or _safe_bool(payload.get("fail_closed_applied"), default=False)
+        or _safe_bool(payload.get("data_quality_fail_closed_applied"), default=False)
+    )
+
+
+def _comparison_bucket(
+    *,
+    baseline_decision: str | None,
+    ai_decision: str,
+    ai_used: bool,
+    fail_closed: bool,
+) -> str:
+    if fail_closed:
+        return "provider_failed_fail_closed"
+    baseline_is_entry = baseline_decision in ENTRY_DECISIONS
+    if ai_used and ai_decision in MANAGEMENT_DECISIONS:
+        return "ai_management_action"
+    if ai_used and ai_decision in ENTRY_DECISIONS:
+        return "ai_approved_entry"
+    if ai_used and baseline_is_entry and ai_decision == "hold":
+        return "ai_rejected_baseline_entry"
+    if ai_used:
+        return "ai_hold_no_trade"
+    if ai_decision in ENTRY_DECISIONS:
+        return "baseline_only_entry"
+    if ai_decision in MANAGEMENT_DECISIONS:
+        return "ai_management_action"
+    return "ai_hold_no_trade"
+
+
+def _unobserved_reason(
+    *,
+    snapshot_bucket: str,
+    decision: str,
+    fills: int,
+    orders: int,
+    linked_risk: RiskCheck | None,
+) -> str | None:
+    if fills > 0:
+        return None
+    if snapshot_bucket == "ai_rejected_baseline_entry":
+        return "ai_filtered_no_order"
+    if snapshot_bucket == "provider_failed_fail_closed":
+        return "provider_failed_fail_closed"
+    if linked_risk is not None and not linked_risk.allowed and decision in ENTRY_DECISIONS:
+        return "risk_blocked"
+    if orders > 0:
+        return "order_not_filled"
+    if decision in ENTRY_DECISIONS or decision in MANAGEMENT_DECISIONS:
+        return "no_order_created"
+    return "no_trade_intended"
+
+
+def _pnl_per_exposure_hour(net_pnl_after_fees: float, holding_minutes: float, fills: int) -> float | None:
+    if fills <= 0 or holding_minutes <= 0:
+        return None
+    return net_pnl_after_fees / (holding_minutes / 60.0)
+
+
 def _snapshot_net_pnl_estimate(session: Session, since: datetime) -> float:
     latest = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
     if latest is None:
@@ -164,6 +354,121 @@ def _snapshot_net_pnl_estimate(session: Session, since: datetime) -> float:
     )
     baseline_cumulative = baseline.cumulative_pnl if baseline is not None else 0.0
     return latest.cumulative_pnl - baseline_cumulative
+
+
+def _max_drawdown_from_pnl_snapshots(session: Session, since: datetime) -> float:
+    rows = list(
+        session.scalars(
+            select(PnLSnapshot)
+            .where(PnLSnapshot.created_at >= since)
+            .order_by(PnLSnapshot.created_at.asc())
+        )
+    )
+    if not rows:
+        return 0.0
+    values = [
+        _safe_float(row.equity, default=0.0)
+        if _safe_float(row.equity, default=0.0) > 0
+        else _safe_float(row.cumulative_pnl, default=0.0)
+        for row in rows
+    ]
+    peak = values[0]
+    max_drawdown = 0.0
+    for value in values:
+        peak = max(peak, value)
+        max_drawdown = max(max_drawdown, peak - value)
+    return max_drawdown
+
+
+def _max_consecutive_losses_from_pnl_snapshots(session: Session, since: datetime) -> int:
+    rows = list(
+        session.scalars(
+            select(PnLSnapshot)
+            .where(PnLSnapshot.created_at >= since)
+            .order_by(PnLSnapshot.created_at.asc())
+        )
+    )
+    if not rows:
+        latest = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
+        return int(latest.consecutive_losses) if latest is not None else 0
+    return max(int(row.consecutive_losses) for row in rows)
+
+
+def _reason_codes_from_payload(value: object) -> list[str]:
+    payload = _as_dict(value)
+    codes: list[str] = []
+    for key in (
+        "reason_codes",
+        "blocked_reason_codes",
+        "degraded_reason_codes",
+        "protection_reason_codes",
+        "data_quality_block_reason_codes",
+    ):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            codes.extend(str(item) for item in raw if item not in {None, ""})
+    for key in ("blocked_reason", "degraded_reason", "approval_required_reason"):
+        raw_code = payload.get(key)
+        if raw_code not in {None, ""}:
+            codes.append(str(raw_code))
+    return codes
+
+
+def _risk_reason_codes(row: RiskCheck) -> list[str]:
+    codes = [str(item) for item in row.reason_codes if item not in {None, ""}]
+    codes.extend(_reason_codes_from_payload(row.payload))
+    return list(dict.fromkeys(codes))
+
+
+def _order_reason_codes(row: Order) -> list[str]:
+    codes = [str(item) for item in row.reason_codes if item not in {None, ""}]
+    codes.extend(_reason_codes_from_payload(row.metadata_json))
+    return list(dict.fromkeys(codes))
+
+
+def _audit_reason_codes(row: AuditEvent) -> list[str]:
+    return _reason_codes_from_payload(row.payload)
+
+
+def _count_limited_live_safety_events(
+    session: Session,
+    *,
+    since: datetime,
+) -> tuple[int, int, int]:
+    risk_rows = list(session.scalars(select(RiskCheck).where(RiskCheck.created_at >= since)))
+    order_rows = list(session.scalars(select(Order).where(Order.created_at >= since)))
+    audit_rows = list(session.scalars(select(AuditEvent).where(AuditEvent.created_at >= since)))
+
+    protection_failure_count = 0
+    unknown_submission_count = 0
+    stale_incomplete_data_block_count = 0
+
+    for row in risk_rows:
+        codes = set(_risk_reason_codes(row))
+        if codes & READINESS_PROTECTION_REASON_CODES:
+            protection_failure_count += 1
+        if codes & READINESS_UNKNOWN_REASON_CODES:
+            unknown_submission_count += 1
+        if codes & READINESS_STALE_INCOMPLETE_REASON_CODES:
+            stale_incomplete_data_block_count += 1
+
+    for row in order_rows:
+        codes = set(_order_reason_codes(row))
+        status = str(row.status or "").strip().lower()
+        if codes & READINESS_UNKNOWN_REASON_CODES or status in READINESS_UNKNOWN_ORDER_STATUSES:
+            unknown_submission_count += 1
+
+    for row in audit_rows:
+        codes = set(_audit_reason_codes(row))
+        event_type = str(row.event_type or "").strip().lower()
+        if event_type in READINESS_PROTECTION_AUDIT_EVENTS or codes & READINESS_PROTECTION_REASON_CODES:
+            protection_failure_count += 1
+        if event_type in READINESS_UNKNOWN_AUDIT_EVENTS or codes & READINESS_UNKNOWN_REASON_CODES:
+            unknown_submission_count += 1
+        if codes & READINESS_STALE_INCOMPLETE_REASON_CODES:
+            stale_incomplete_data_block_count += 1
+
+    return protection_failure_count, unknown_submission_count, stale_incomplete_data_block_count
 
 
 def _extract_analysis_context(decision_row: AgentRun) -> tuple[str, str, bool, bool, bool]:
@@ -497,6 +802,230 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
     )
 
 
+def _decision_agrees_with_baseline(snapshot: DecisionPerformanceSnapshot) -> bool:
+    if snapshot.baseline_decision is None:
+        return False
+    level = snapshot.decision_agreement_level.strip().lower()
+    if level in {"full_agreement", "direction_match", "same_direction"}:
+        return True
+    if level:
+        return snapshot.baseline_decision == snapshot.ai_decision
+    return snapshot.baseline_decision == snapshot.ai_decision
+
+
+def _ai_baseline_bucket_entry(
+    bucket: str,
+    snapshots: list[DecisionPerformanceSnapshot],
+) -> AIBaselineComparisonBucket:
+    observed = [item for item in snapshots if item.fills > 0]
+    slippages = [item.average_slippage_pct for item in observed]
+    holdings = [item.holding_minutes_observed for item in observed if item.holding_minutes_observed > 0]
+    wins = sum(item.wins for item in snapshots)
+    losses = sum(item.losses for item in snapshots)
+    total_holding_hours = sum(item.holding_minutes_observed for item in observed if item.holding_minutes_observed > 0) / 60.0
+    net_pnl_after_fees = sum(item.net_realized_pnl_total for item in snapshots)
+    unobserved_reason_counts: dict[str, int] = defaultdict(int)
+    for item in snapshots:
+        if item.unobserved_reason:
+            unobserved_reason_counts[item.unobserved_reason] += 1
+    known_baseline = [item for item in snapshots if item.baseline_decision is not None]
+    agreements = sum(1 for item in known_baseline if _decision_agrees_with_baseline(item))
+    disagreements = len(known_baseline) - agreements
+    return AIBaselineComparisonBucket(
+        bucket=bucket,
+        decisions=len(snapshots),
+        approvals=sum(1 for item in snapshots if item.approved),
+        orders=sum(item.orders for item in snapshots),
+        fills=sum(item.fills for item in snapshots),
+        wins=wins,
+        losses=losses,
+        win_rate=(wins / (wins + losses)) if (wins + losses) else 0.0,
+        expectancy=(net_pnl_after_fees / len(observed)) if observed else 0.0,
+        realized_pnl=sum(item.realized_pnl_total for item in snapshots),
+        fee=sum(item.fee_total for item in snapshots),
+        net_pnl_after_fees=net_pnl_after_fees,
+        avg_slippage=(sum(slippages) / len(slippages) if slippages else 0.0),
+        avg_holding_minutes=(sum(holdings) / len(holdings) if holdings else 0.0),
+        pnl_per_exposure_hour=(net_pnl_after_fees / total_holding_hours if total_holding_hours > 0 else None),
+        observed_decisions=len(observed),
+        unobserved_decisions=len(snapshots) - len(observed),
+        unobserved_reason_counts=dict(unobserved_reason_counts),
+        baseline_entries=sum(1 for item in snapshots if item.baseline_decision in ENTRY_DECISIONS),
+        baseline_holds=sum(1 for item in snapshots if item.baseline_decision == "hold"),
+        ai_entries=sum(1 for item in snapshots if item.ai_used and item.ai_decision in ENTRY_DECISIONS),
+        ai_holds=sum(1 for item in snapshots if item.ai_used and item.ai_decision == "hold"),
+        ai_management_actions=sum(1 for item in snapshots if item.ai_used and item.ai_decision in MANAGEMENT_DECISIONS),
+        agreements=agreements,
+        disagreements=disagreements,
+    )
+
+
+def _build_ai_baseline_comparison(
+    snapshots: list[DecisionPerformanceSnapshot],
+) -> AIBaselineComparisonSummary:
+    grouped: dict[str, list[DecisionPerformanceSnapshot]] = {bucket: [] for bucket in AI_BASELINE_BUCKET_ORDER}
+    for snapshot in snapshots:
+        grouped.setdefault(snapshot.comparison_bucket, []).append(snapshot)
+    buckets = [
+        _ai_baseline_bucket_entry(bucket, grouped.get(bucket, []))
+        for bucket in AI_BASELINE_BUCKET_ORDER
+    ]
+    all_unobserved_reason_counts: dict[str, int] = defaultdict(int)
+    for bucket in buckets:
+        for reason, count in bucket.unobserved_reason_counts.items():
+            all_unobserved_reason_counts[reason] += count
+    rejected_bucket = next(
+        (bucket for bucket in buckets if bucket.bucket == "ai_rejected_baseline_entry"),
+        None,
+    )
+    rejected_observed_net = (
+        rejected_bucket.net_pnl_after_fees
+        if rejected_bucket is not None and rejected_bucket.observed_decisions > 0
+        else 0.0
+    )
+    rejected_filter_value = (
+        -rejected_observed_net
+        if rejected_bucket is not None and rejected_bucket.observed_decisions > 0
+        else None
+    )
+    return AIBaselineComparisonSummary(
+        buckets=buckets,
+        bucket_totals={bucket.bucket: bucket.decisions for bucket in buckets},
+        decisions=sum(bucket.decisions for bucket in buckets),
+        agreements=sum(bucket.agreements for bucket in buckets),
+        disagreements=sum(bucket.disagreements for bucket in buckets),
+        baseline_entries=sum(bucket.baseline_entries for bucket in buckets),
+        ai_entries=sum(bucket.ai_entries for bucket in buckets),
+        ai_holds=sum(bucket.ai_holds for bucket in buckets),
+        ai_management_actions=sum(bucket.ai_management_actions for bucket in buckets),
+        observed_decisions=sum(bucket.observed_decisions for bucket in buckets),
+        unobserved_decisions=sum(bucket.unobserved_decisions for bucket in buckets),
+        unobserved_reason_counts=dict(all_unobserved_reason_counts),
+        observed_net_pnl_after_fees=sum(bucket.net_pnl_after_fees for bucket in buckets),
+        observed_rejected_baseline_entry_net_pnl_after_fees=rejected_observed_net,
+        ai_filter_observed_value_net_pnl_after_fees=rejected_filter_value,
+    )
+
+
+def _build_limited_live_readiness(
+    session: Session,
+    *,
+    since: datetime,
+    window_label: str,
+    window_hours: int,
+    decision_items: list[DecisionPerformanceSnapshot],
+    summary: PerformanceWindowSummary,
+    ai_telemetry: AIUsageTelemetrySummary | Mapping[str, object],
+    ai_baseline_comparison: AIBaselineComparisonSummary,
+) -> LimitedLiveReadinessReport:
+    def telemetry_count(key: str) -> int:
+        if isinstance(ai_telemetry, Mapping):
+            return int(ai_telemetry.get(key, 0) or 0)
+        return int(getattr(ai_telemetry, key, 0) or 0)
+
+    actual_entries = sum(
+        1
+        for item in decision_items
+        if item.decision in ENTRY_DECISIONS and item.orders > 0
+    )
+    observed_entry_decisions = [
+        item
+        for item in decision_items
+        if item.decision in ENTRY_DECISIONS and item.fills > 0
+    ]
+    expectancy_after_fees = (
+        sum(item.net_realized_pnl_total for item in observed_entry_decisions) / len(observed_entry_decisions)
+        if observed_entry_decisions
+        else 0.0
+    )
+    protection_failure_count, unknown_submission_count, stale_incomplete_data_block_count = (
+        _count_limited_live_safety_events(session, since=since)
+    )
+    max_drawdown = _max_drawdown_from_pnl_snapshots(session, since)
+    consecutive_losses = _max_consecutive_losses_from_pnl_snapshots(session, since)
+    ai_filter_value = ai_baseline_comparison.ai_filter_observed_value_net_pnl_after_fees
+
+    reason_codes: list[str] = []
+    if len(decision_items) < READINESS_MIN_CANDIDATE_EVENTS or actual_entries < READINESS_MIN_ACTUAL_ENTRIES:
+        reason_codes.append("insufficient_sample")
+    if observed_entry_decisions and expectancy_after_fees < 0:
+        reason_codes.append("negative_expectancy")
+    if max_drawdown > READINESS_MAX_DRAWDOWN:
+        reason_codes.append("excessive_drawdown")
+    if protection_failure_count > 0:
+        reason_codes.append("protection_failures")
+    if unknown_submission_count > 0:
+        reason_codes.append("execution_unknowns")
+    stale_frequency_high = (
+        stale_incomplete_data_block_count >= READINESS_STALE_BLOCK_COUNT_HIGH
+        and len(decision_items) > 0
+        and stale_incomplete_data_block_count / len(decision_items) >= READINESS_STALE_BLOCK_RATIO_HIGH
+    )
+    if stale_frequency_high:
+        reason_codes.append("stale_data_frequency_high")
+    if ai_filter_value is not None and ai_filter_value < 0:
+        reason_codes.append("ai_filter_underperforming")
+
+    hard_block_reasons = {
+        "negative_expectancy",
+        "excessive_drawdown",
+        "protection_failures",
+        "execution_unknowns",
+        "ai_filter_underperforming",
+    }
+    if any(reason in hard_block_reasons for reason in reason_codes):
+        status = "blocked"
+    elif "insufficient_sample" in reason_codes:
+        status = "not_ready"
+    elif "stale_data_frequency_high" in reason_codes:
+        status = "watch"
+    elif (
+        len(decision_items) >= READINESS_SCALE_UP_MIN_CANDIDATE_EVENTS
+        and actual_entries >= READINESS_SCALE_UP_MIN_ACTUAL_ENTRIES
+        and expectancy_after_fees > 0
+    ):
+        status = "scale_up_candidate"
+    elif (
+        len(decision_items) >= READINESS_MIN_CANDIDATE_EVENTS
+        and actual_entries >= READINESS_MIN_ACTUAL_ENTRIES
+        and expectancy_after_fees > 0
+    ):
+        status = "limited_live_candidate"
+    else:
+        status = "watch"
+
+    return LimitedLiveReadinessReport(
+        window_label=window_label,
+        window_hours=window_hours,
+        status=status,
+        reason_codes=reason_codes,
+        read_only=True,
+        recent_candidate_events=len(decision_items),
+        ai_calls_total=telemetry_count("ai_calls_total"),
+        ai_calls_provider_invoked=telemetry_count("ai_calls_provider_invoked"),
+        ai_calls_skipped_preai=telemetry_count("ai_calls_skipped_preai"),
+        actual_entries=actual_entries,
+        fills=summary.fills,
+        expectancy_after_fees=expectancy_after_fees,
+        net_pnl_after_fees=summary.net_realized_pnl_total,
+        max_drawdown=max_drawdown,
+        consecutive_losses=consecutive_losses,
+        protection_failure_count=protection_failure_count,
+        unknown_submission_count=unknown_submission_count,
+        stale_incomplete_data_block_count=stale_incomplete_data_block_count,
+        ai_filter_observed_value_net_pnl_after_fees=ai_filter_value,
+        thresholds={
+            "min_candidate_events": READINESS_MIN_CANDIDATE_EVENTS,
+            "min_actual_entries": READINESS_MIN_ACTUAL_ENTRIES,
+            "scale_up_min_candidate_events": READINESS_SCALE_UP_MIN_CANDIDATE_EVENTS,
+            "scale_up_min_actual_entries": READINESS_SCALE_UP_MIN_ACTUAL_ENTRIES,
+            "max_drawdown": READINESS_MAX_DRAWDOWN,
+            "stale_block_ratio_high": READINESS_STALE_BLOCK_RATIO_HIGH,
+            "stale_block_count_high": READINESS_STALE_BLOCK_COUNT_HIGH,
+        },
+    )
+
+
 def _build_window_report(
     session: Session,
     *,
@@ -573,6 +1102,7 @@ def _build_window_report(
 
     for decision_row in decision_rows:
         payload = decision_row.output_payload if isinstance(decision_row.output_payload, dict) else {}
+        metadata = decision_row.metadata_json if isinstance(decision_row.metadata_json, dict) else {}
         rationale_codes = (
             [str(item) for item in payload.get("rationale_codes", []) if item]
             if isinstance(payload.get("rationale_codes"), list)
@@ -581,6 +1111,24 @@ def _build_window_report(
         symbol = str(payload.get("symbol") or "UNKNOWN")
         timeframe = str(payload.get("timeframe") or "UNKNOWN")
         decision = str(payload.get("decision") or "unknown")
+        agreement = _decision_agreement_payload(metadata)
+        ai_used = _ai_used_from_metadata(
+            metadata=metadata,
+            agreement=agreement,
+            provider_name=str(decision_row.provider_name or ""),
+        )
+        baseline_decision = _baseline_decision_from_metadata(
+            metadata=metadata,
+            agreement=agreement,
+            final_decision=decision,
+            ai_used=ai_used,
+        )
+        comparison_bucket = _comparison_bucket(
+            baseline_decision=baseline_decision,
+            ai_decision=decision,
+            ai_used=ai_used,
+            fail_closed=_is_fail_closed(metadata, payload),
+        )
         regime, trend_alignment, weak_volume, volatility_expanded, momentum_weakening = _extract_analysis_context(
             decision_row
         )
@@ -634,8 +1182,16 @@ def _build_window_report(
         fee_total = sum(_safe_float(execution_row.fee_paid) for execution_row in linked_executions)
         net_realized_total = realized_total - fee_total
         slippages = [_safe_float(execution_row.slippage_pct) for execution_row in linked_executions]
+        fill_count = len(linked_executions)
         wins = sum(1 for execution_row in linked_executions if (_safe_float(execution_row.realized_pnl) - _safe_float(execution_row.fee_paid)) > 0)
         losses = sum(1 for execution_row in linked_executions if (_safe_float(execution_row.realized_pnl) - _safe_float(execution_row.fee_paid)) < 0)
+        unobserved_reason = _unobserved_reason(
+            snapshot_bucket=comparison_bucket,
+            decision=decision,
+            fills=fill_count,
+            orders=len(linked_orders),
+            linked_risk=linked_risk,
+        )
         snapshot = DecisionPerformanceSnapshot(
             decision_run_id=decision_row.id,
             created_at=decision_row.created_at,
@@ -652,7 +1208,7 @@ def _build_window_report(
             approved_risk_pct=_safe_float(linked_risk.approved_risk_pct) if linked_risk is not None else 0.0,
             approved_leverage=_safe_float(linked_risk.approved_leverage) if linked_risk is not None else 0.0,
             orders=len(linked_orders),
-            fills=len(linked_executions),
+            fills=fill_count,
             wins=wins,
             losses=losses,
             realized_pnl_total=realized_total,
@@ -696,6 +1252,18 @@ def _build_window_report(
             mae_pct=mae_pct,
             mfe_pnl=mfe_pnl,
             mae_pnl=mae_pnl,
+            baseline_decision=baseline_decision,
+            ai_decision=decision,
+            decision_agreement_level=str(agreement.get("level") or ""),
+            decision_agreement_source=str(agreement.get("comparison_source") or ""),
+            ai_used=ai_used,
+            comparison_bucket=comparison_bucket,
+            unobserved_reason=unobserved_reason,
+            pnl_per_exposure_hour=_pnl_per_exposure_hour(
+                net_realized_total,
+                holding_minutes_observed,
+                fill_count,
+            ),
         )
         decision_items.append(snapshot)
         for rationale_code in rationale_codes:
@@ -815,11 +1383,30 @@ def _build_window_report(
         best_mfe_pct=max(overall_mfe) if overall_mfe else 0.0,
         worst_mae_pct=max(overall_mae) if overall_mae else 0.0,
     )
+    ai_telemetry = build_ai_telemetry_summary(
+        session,
+        decision_rows,
+        deduped_count=count_ai_deduped_events(session, since),
+    )
+    ai_baseline_comparison = _build_ai_baseline_comparison(decision_items)
+    limited_live_readiness = _build_limited_live_readiness(
+        session,
+        since=since,
+        window_label=window_label,
+        window_hours=window_hours,
+        decision_items=decision_items,
+        summary=summary,
+        ai_telemetry=ai_telemetry,
+        ai_baseline_comparison=ai_baseline_comparison,
+    )
 
     return PerformanceWindowReport(
         window_label=window_label,
         window_hours=window_hours,
         summary=summary,
+        ai_telemetry=ai_telemetry,
+        ai_baseline_comparison=ai_baseline_comparison,
+        limited_live_readiness=limited_live_readiness,
         decisions=[
             DecisionPerformanceEntry(
                 decision_run_id=item.decision_run_id,

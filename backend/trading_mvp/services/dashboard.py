@@ -30,15 +30,20 @@ from trading_mvp.schemas import (
     DashboardProfitabilityResponse,
     DashboardProfitabilityWindow,
     DecisionReferencePayload,
+    LimitedLiveReadinessReport,
+    OperatorAIReviewSnapshot,
     OperatorCandidateSelectionSnapshot,
     OperatorControlState,
     OperatorDashboardResponse,
+    OperatorDecisionEventContextSnapshot,
     OperatorDecisionSnapshot,
     OperatorExecutionFillSummary,
     OperatorExecutionSnapshot,
     OperatorMarketSignalSummary,
+    OperatorMarketSignalSnapshot,
     OperatorPositionSummary,
     OperatorProtectionSummary,
+    OperatorRiskGuardResultSnapshot,
     OperatorRiskSnapshot,
     OperatorSymbolSummary,
     OverviewResponse,
@@ -57,6 +62,7 @@ from trading_mvp.services.runtime_state import (
 from trading_mvp.services.settings import (
     build_event_operator_control_payload,
     build_operational_status_payload,
+    extract_freshest_raw_event_context,
     get_effective_symbols,
     get_or_create_settings,
     serialize_settings_runtime_summary,
@@ -80,6 +86,14 @@ OPERATOR_PERFORMANCE_ENTRY_LIMIT = 3
 OPERATOR_EXECUTION_PROFILE_LIMIT = 2
 OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 RECENT_FILL_LIMIT = 4
+AI_REVIEW_TYPE_BY_TRIGGER_REASON = {
+    "entry_candidate_event": "entry_candidate_review",
+    "breakout_exception_event": "breakout_exception_review",
+    "open_position_recheck_due": "open_position_review",
+    "protection_review_event": "protection_review",
+    "manual_review_event": "manual_review",
+    "periodic_backstop_due": "periodic_backstop_review",
+}
 
 MARKET_CONTEXT_SUMMARY_KEYS = (
     "primary_regime",
@@ -747,6 +761,125 @@ def _ai_trigger_reason_from_decision_row(row: AgentRun | None) -> str | None:
     ) or None
 
 
+def _ai_review_type_from_trigger_reason(trigger_reason: str | None) -> str | None:
+    if trigger_reason is None:
+        return None
+    normalized = str(trigger_reason or "").strip()
+    return AI_REVIEW_TYPE_BY_TRIGGER_REASON.get(normalized, normalized or None)
+
+
+def _ai_review_type_from_decision_row(row: AgentRun | None) -> str | None:
+    return _ai_review_type_from_trigger_reason(_ai_trigger_reason_from_decision_row(row))
+
+
+def _ai_trigger_reason_codes_from_decision_row(row: AgentRun | None) -> list[str]:
+    if row is None:
+        return []
+    metadata = _as_dict(row.metadata_json)
+    input_payload = _as_dict(row.input_payload)
+    ai_trigger = _as_dict(metadata.get("ai_trigger"))
+    if not ai_trigger:
+        ai_trigger = _as_dict(input_payload.get("ai_trigger"))
+    return _as_string_list(ai_trigger.get("reason_codes"))
+
+
+def _last_ai_skip_reason_from_decision_row(row: AgentRun | None) -> str | None:
+    if row is None:
+        return None
+    metadata = _as_dict(row.metadata_json)
+    return str(
+        metadata.get("last_ai_skip_reason")
+        or metadata.get("ai_skipped_reason")
+        or metadata.get("pre_ai_skip_reason")
+        or ""
+    ) or None
+
+
+def _dedupe_reason_from_decision_row(row: AgentRun | None) -> str | None:
+    if row is None:
+        return None
+    metadata = _as_dict(row.metadata_json)
+    explicit_reason = str(
+        metadata.get("dedupe_reason")
+        or metadata.get("trigger_dedupe_reason")
+        or metadata.get("ai_dedupe_reason")
+        or ""
+    ) or None
+    if explicit_reason is not None:
+        return explicit_reason
+    skip_reason = _last_ai_skip_reason_from_decision_row(row)
+    if skip_reason in {"TRIGGER_DEDUPED", "TRIGGER_FINGERPRINT_UNCHANGED"}:
+        return skip_reason
+    if bool(metadata.get("trigger_deduped", False)):
+        return "TRIGGER_DEDUPED"
+    return None
+
+
+def _provider_invoked_from_decision_row(row: AgentRun | None) -> bool:
+    if row is None:
+        return False
+    metadata = _as_dict(row.metadata_json)
+    source = str(metadata.get("source") or "").strip().lower()
+    if source in {"llm", "llm_fallback"}:
+        return True
+    if source in {"deterministic", "pre_ai_skip", "deterministic_skip"}:
+        return False
+    provider = str(row.provider_name or "").strip().lower()
+    return provider not in {"", "deterministic", "deterministic-mock", "local"}
+
+
+def _provider_status_from_review(*, provider_invoked: bool, provider_skipped: bool, deduped: bool) -> str:
+    if deduped:
+        return "deduped"
+    if provider_skipped:
+        return "skipped_pre_ai"
+    if provider_invoked:
+        return "invoked"
+    return "not_invoked"
+
+
+def _ai_review_snapshot_from_decision_row(row: AgentRun | None) -> OperatorAIReviewSnapshot:
+    if row is None:
+        return OperatorAIReviewSnapshot()
+    metadata = _as_dict(row.metadata_json)
+    input_payload = _as_dict(row.input_payload)
+    ai_trigger = _as_dict(metadata.get("ai_trigger")) or _as_dict(input_payload.get("ai_trigger"))
+    trigger_reason = _ai_trigger_reason_from_decision_row(row)
+    skip_reason = _last_ai_skip_reason_from_decision_row(row)
+    dedupe_reason = _dedupe_reason_from_decision_row(row)
+    trigger_deduped = bool(metadata.get("trigger_deduped", False) or dedupe_reason is not None)
+    provider_invoked = _provider_invoked_from_decision_row(row)
+    provider_skipped = bool(skip_reason or trigger_deduped)
+    return OperatorAIReviewSnapshot(
+        trigger_reason=trigger_reason,
+        trigger_reason_codes=_ai_trigger_reason_codes_from_decision_row(row),
+        review_type=_ai_review_type_from_trigger_reason(trigger_reason),
+        skip_reason=skip_reason,
+        dedupe_reason=dedupe_reason,
+        trigger_deduped=trigger_deduped,
+        trigger_fingerprint=str(
+            metadata.get("trigger_fingerprint")
+            or ai_trigger.get("trigger_fingerprint")
+            or ""
+        )
+        or None,
+        provider_name=row.provider_name,
+        provider_source=str(metadata.get("source") or "") or None,
+        provider_invoked=provider_invoked,
+        provider_skipped=provider_skipped,
+        provider_status=_provider_status_from_review(
+            provider_invoked=provider_invoked,
+            provider_skipped=provider_skipped,
+            deduped=trigger_deduped,
+        ),
+        invoked_at=(
+            _as_datetime(metadata.get("last_ai_invoked_at"))
+            or (row.created_at if str(metadata.get("source") or "") == "llm" else None)
+        ),
+        next_review_due_at=_as_datetime(metadata.get("next_ai_review_due_at")),
+    )
+
+
 def _fallback_ai_trigger_code_summary(codes: list[str]) -> str | None:
     if not codes:
         return None
@@ -855,6 +988,241 @@ def _ai_trigger_summary_from_decision_row(row: AgentRun | None) -> str | None:
         return feature_summary
 
     return _fallback_ai_trigger_code_summary(trigger_reason_codes or output_reason_codes)
+
+
+def _market_signal_summary_from_decision_row(row: AgentRun | None) -> str | None:
+    if row is None:
+        return None
+    input_payload = _as_dict(row.input_payload)
+    output_payload = _as_dict(row.output_payload)
+    trigger_reason = _ai_trigger_reason_from_decision_row(row)
+    if trigger_reason is None:
+        return None
+    return _entry_trigger_signal_summary(
+        features=_as_dict(input_payload.get("features")),
+        output_payload=output_payload,
+        trigger_reason=trigger_reason,
+    )
+
+
+def _market_signal_context_from_decision_row(row: AgentRun | None) -> OperatorMarketSignalSnapshot:
+    if row is None:
+        return OperatorMarketSignalSnapshot()
+    input_payload = _as_dict(row.input_payload)
+    output_payload = _as_dict(row.output_payload)
+    features = _as_dict(input_payload.get("features"))
+    regime = _as_dict(features.get("regime"))
+    breakout = _as_dict(features.get("breakout"))
+    breakout_direction = str(breakout.get("range_breakout_direction") or "") or None
+    if breakout_direction in {None, "", "none"}:
+        if bool(breakout.get("broke_swing_high")):
+            breakout_direction = "up"
+        elif bool(breakout.get("broke_swing_low")):
+            breakout_direction = "down"
+        else:
+            breakout_direction = None
+    return OperatorMarketSignalSnapshot(
+        summary=_market_signal_summary_from_decision_row(row),
+        trend_score=_as_optional_float(features.get("trend_score")),
+        momentum_score=_as_optional_float(features.get("momentum_score")),
+        volume_ratio=_as_optional_float(features.get("volume_ratio")),
+        primary_regime=str(regime.get("primary_regime") or "") or None,
+        trend_alignment=str(regime.get("trend_alignment") or "") or None,
+        volatility_regime=str(regime.get("volatility_regime") or "") or None,
+        volume_regime=str(regime.get("volume_regime") or "") or None,
+        momentum_state=str(regime.get("momentum_state") or "") or None,
+        weak_volume=bool(regime.get("weak_volume")) if regime.get("weak_volume") is not None else None,
+        momentum_weakening=(
+            bool(regime.get("momentum_weakening"))
+            if regime.get("momentum_weakening") is not None
+            else None
+        ),
+        breakout_direction=breakout_direction,
+        broke_swing_high=bool(breakout.get("broke_swing_high"))
+        if breakout.get("broke_swing_high") is not None
+        else None,
+        broke_swing_low=bool(breakout.get("broke_swing_low"))
+        if breakout.get("broke_swing_low") is not None
+        else None,
+    )
+
+
+def _first_non_empty_dict(*values: object) -> dict[str, Any]:
+    for value in values:
+        candidate = _as_dict(value)
+        if candidate:
+            return candidate
+    return {}
+
+
+def _first_present(*values: object) -> object:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        return value
+    return None
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_actual_release_enrichment(event_context: dict[str, Any], vendor: str) -> bool:
+    events = event_context.get("events")
+    if not isinstance(events, list):
+        return False
+    for event in events:
+        event_payload = _as_dict(event)
+        enrichment = _as_dict(event_payload.get("release_enrichment"))
+        vendor_payload = _as_dict(enrichment.get(vendor))
+        actual = vendor_payload.get("actual")
+        if actual is not None and actual != "":
+            return True
+    return False
+
+
+def _decision_macro_event_context_summary(row: AgentRun | None) -> OperatorDecisionEventContextSnapshot:
+    if row is None:
+        return OperatorDecisionEventContextSnapshot()
+    metadata = _as_dict(row.metadata_json)
+    input_payload = _as_dict(row.input_payload)
+    metadata_ai_context = _as_dict(metadata.get("ai_context"))
+    input_ai_context = _as_dict(input_payload.get("ai_context"))
+    ai_context = metadata_ai_context or input_ai_context
+    feature_layers = _as_dict(input_payload.get("feature_layers"))
+    features = _as_dict(input_payload.get("features"))
+    market_snapshot = _as_dict(input_payload.get("market_snapshot"))
+    full_event_context = _first_non_empty_dict(
+        features.get("event_context"),
+        market_snapshot.get("event_context"),
+    )
+    event_summary = _first_non_empty_dict(
+        ai_context.get("event_context_summary"),
+        feature_layers.get("event_context_summary"),
+        full_event_context,
+    )
+    event_risk_context = _first_non_empty_dict(
+        metadata.get("event_risk_context"),
+        ai_context.get("event_risk_context"),
+    )
+    event_risk_reason_codes = _as_string_list(metadata.get("event_risk_reason_codes"))
+    if not event_risk_reason_codes:
+        event_risk_reason_codes = _as_string_list(ai_context.get("event_risk_reason_codes"))
+    if not event_risk_reason_codes:
+        event_risk_reason_codes = _as_string_list(event_risk_context.get("reason_codes"))
+
+    source_status = str(
+        _first_present(
+            event_summary.get("source_status"),
+            full_event_context.get("source_status"),
+            event_risk_context.get("source_status"),
+        )
+        or ""
+    ) or None
+    is_stale = bool(
+        full_event_context.get("is_stale")
+        if full_event_context.get("is_stale") is not None
+        else source_status == "stale"
+    )
+    is_complete_raw = full_event_context.get("is_complete")
+    is_complete = is_complete_raw if isinstance(is_complete_raw, bool) else None
+    is_incomplete = bool(
+        is_complete is False
+        or source_status in {"incomplete", "unavailable", "error"}
+        or "MACRO_EVENT_CONTEXT_INCOMPLETE" in event_risk_reason_codes
+    )
+    enrichment_vendors = list(
+        dict.fromkeys(
+            _as_string_list(event_summary.get("enrichment_vendors"))
+            + _as_string_list(full_event_context.get("enrichment_vendors"))
+            + _as_string_list(event_risk_context.get("enrichment_vendors"))
+        )
+    )
+    bls_actual_enriched = _has_actual_release_enrichment(full_event_context, "bls")
+    bea_actual_enriched = _has_actual_release_enrichment(full_event_context, "bea")
+    if bls_actual_enriched and "bls" not in enrichment_vendors:
+        enrichment_vendors.append("bls")
+    if bea_actual_enriched and "bea" not in enrichment_vendors:
+        enrichment_vendors.append("bea")
+
+    return OperatorDecisionEventContextSnapshot(
+        source_status=source_status,
+        source_provenance=str(
+            _first_present(event_summary.get("source_provenance"), full_event_context.get("source_provenance"))
+            or ""
+        )
+        or None,
+        source_vendor=str(
+            _first_present(
+                event_summary.get("source_vendor"),
+                full_event_context.get("source_vendor"),
+                event_risk_context.get("source_vendor"),
+            )
+            or ""
+        )
+        or None,
+        next_event_name=str(
+            _first_present(
+                event_summary.get("next_event_name"),
+                full_event_context.get("next_event_name"),
+                event_risk_context.get("event_name"),
+            )
+            or ""
+        )
+        or None,
+        next_event_importance=str(
+            _first_present(
+                event_summary.get("next_event_importance"),
+                full_event_context.get("next_event_importance"),
+                event_risk_context.get("event_importance"),
+            )
+            or ""
+        )
+        or None,
+        minutes_to_next_event=_as_optional_int(
+            _first_present(
+                event_summary.get("minutes_to_next_event"),
+                full_event_context.get("minutes_to_next_event"),
+                event_risk_context.get("minutes_to_event"),
+            )
+        ),
+        active_risk_window=bool(
+            _first_present(
+                event_summary.get("active_risk_window"),
+                full_event_context.get("active_risk_window"),
+                event_risk_context.get("active_risk_window"),
+            )
+        ),
+        release_reaction_window="MACRO_RELEASE_REACTION_WINDOW" in event_risk_reason_codes,
+        is_stale=is_stale,
+        is_complete=is_complete,
+        is_incomplete=is_incomplete,
+        affected_assets=list(
+            dict.fromkeys(
+                _as_string_list(full_event_context.get("affected_assets"))
+                + _as_string_list(event_risk_context.get("affected_assets"))
+            )
+        ),
+        enrichment_vendors=enrichment_vendors,
+        bls_actual_enriched=bls_actual_enriched,
+        bea_actual_enriched=bea_actual_enriched,
+        event_risk_active=bool(
+            metadata.get("event_risk_active")
+            if metadata.get("event_risk_active") is not None
+            else ai_context.get("event_risk_active")
+            if ai_context.get("event_risk_active") is not None
+            else event_risk_context.get("event_risk_active", False)
+        ),
+        event_risk_reason_codes=event_risk_reason_codes,
+        event_bias_used=str(event_risk_context.get("event_bias_used") or "") or None,
+    )
 
 
 def _compact_derivatives_summary(value: object) -> dict[str, Any]:
@@ -1296,7 +1664,12 @@ def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -
         payload = _compact_decision_row(row) if compact else _serialize_model_row(row)
         _attach_decision_summary_fields(payload)
         payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(row)
+        payload["ai_review_type"] = _ai_review_type_from_decision_row(row)
+        payload["ai_trigger_reason_codes"] = _ai_trigger_reason_codes_from_decision_row(row)
+        payload["last_ai_skip_reason"] = _last_ai_skip_reason_from_decision_row(row)
+        payload["ai_skip_reason"] = payload["last_ai_skip_reason"]
         payload["ai_trigger_summary"] = _ai_trigger_summary_from_decision_row(row)
+        payload["market_signal_summary"] = _market_signal_summary_from_decision_row(row)
         payloads.append(payload)
     return payloads
 
@@ -1748,6 +2121,8 @@ def get_profitability_dashboard(
             window_label=window.window_label,
             window_hours=window.window_hours,
             summary=window.summary,
+            ai_baseline_comparison=window.ai_baseline_comparison,
+            limited_live_readiness=window.limited_live_readiness,
             rationale_winners=_top_positive_entries(window.rationale_codes),
             rationale_losers=_top_negative_entries(window.rationale_codes),
             top_regimes=_top_positive_entries(window.regimes, limit=4),
@@ -1786,6 +2161,11 @@ def get_profitability_dashboard(
             )
 
     primary_window = performance_report.windows[0] if performance_report.windows else None
+    limited_live_readiness = (
+        primary_window.limited_live_readiness
+        if primary_window is not None
+        else LimitedLiveReadinessReport()
+    )
     hold_blocked_summary = DashboardHoldBlockedSummary(
         hold_top_conditions=(
             sorted(
@@ -1813,6 +2193,7 @@ def get_profitability_dashboard(
         windows=windows,
         execution_windows=execution_windows,
         hold_blocked_summary=hold_blocked_summary,
+        limited_live_readiness=limited_live_readiness,
     )
 
 
@@ -1820,8 +2201,11 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     if row is None:
         return OperatorDecisionSnapshot()
     payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    input_payload = row.input_payload if isinstance(row.input_payload, dict) else {}
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     ai_trigger = _as_dict(metadata.get("ai_trigger"))
+    if not ai_trigger:
+        ai_trigger = _as_dict(input_payload.get("ai_trigger"))
     selection_context = _as_dict(metadata.get("selection_context"))
     slot_allocation = _as_dict(metadata.get("slot_allocation"))
     if not slot_allocation:
@@ -1862,6 +2246,11 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         or slot_allocation.get("capacity_reason")
         or ""
     ) or None
+    ai_trigger_reason = _ai_trigger_reason_from_decision_row(row)
+    ai_skip_reason = _last_ai_skip_reason_from_decision_row(row)
+    ai_review = _ai_review_snapshot_from_decision_row(row)
+    market_signal_context = _market_signal_context_from_decision_row(row)
+    macro_event_summary = _decision_macro_event_context_summary(row)
     return OperatorDecisionSnapshot(
         decision_run_id=row.id,
         created_at=row.created_at,
@@ -1911,12 +2300,9 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
             if metadata.get("analytics_excluded_from_entry_stats") is not None
             else intent_semantics.get("analytics_excluded_from_entry_stats")
         ),
-        last_ai_trigger_reason=str(
-            metadata.get("last_ai_trigger_reason")
-            or ai_trigger.get("trigger_reason")
-            or ""
-        )
-        or None,
+        last_ai_trigger_reason=ai_trigger_reason,
+        ai_review_type=_ai_review_type_from_trigger_reason(ai_trigger_reason),
+        ai_trigger_reason_codes=_ai_trigger_reason_codes_from_decision_row(row),
         last_ai_invoked_at=(
             _as_datetime(metadata.get("last_ai_invoked_at"))
             or (row.created_at if str(metadata.get("source") or "") == "llm" else None)
@@ -1929,12 +2315,14 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
             or ""
         )
         or None,
-        last_ai_skip_reason=str(
-            metadata.get("last_ai_skip_reason")
-            or metadata.get("ai_skipped_reason")
-            or ""
-        )
-        or None,
+        last_ai_skip_reason=ai_skip_reason,
+        ai_skip_reason=ai_skip_reason,
+        ai_trigger_summary=_ai_trigger_summary_from_decision_row(row),
+        market_signal_summary=_market_signal_summary_from_decision_row(row),
+        ai_review=ai_review,
+        market_signal_context=market_signal_context,
+        macro_event_context_summary=macro_event_summary,
+        macro_event_risk_summary=macro_event_summary,
         suppression_active=bool(suppression_projection.get("suppression_active")),
         suppression_reason_code=str(suppression_projection.get("suppression_reason_code") or "") or None,
         allow_same_side_add_on=bool(suppression_projection.get("allow_same_side_add_on")),
@@ -1962,23 +2350,36 @@ def _interval_review_state_from_scheduler(row: SchedulerRun | None) -> dict[str,
         return {}
     outcome = row.outcome
     trigger = _as_dict(outcome.get("trigger"))
+    trigger_reason = str(
+        outcome.get("last_ai_trigger_reason")
+        or trigger.get("trigger_reason")
+        or ""
+    ) or None
+    last_ai_skip_reason = str(outcome.get("last_ai_skip_reason") or "") or None
+    trigger_deduped = bool(outcome.get("trigger_deduped", False))
+    dedupe_reason = str(
+        outcome.get("dedupe_reason")
+        or trigger.get("dedupe_reason")
+        or (last_ai_skip_reason if trigger_deduped else "")
+        or ""
+    ) or None
     return {
-        "last_ai_trigger_reason": str(
-            outcome.get("last_ai_trigger_reason")
-            or trigger.get("trigger_reason")
-            or ""
-        )
-        or None,
+        "last_ai_trigger_reason": trigger_reason,
+        "ai_review_type": _ai_review_type_from_trigger_reason(trigger_reason),
+        "ai_trigger_reason_codes": _as_string_list(trigger.get("reason_codes")),
         "last_ai_invoked_at": _as_datetime(outcome.get("last_ai_invoked_at")),
         "next_ai_review_due_at": None,
-        "trigger_deduped": bool(outcome.get("trigger_deduped", False)),
+        "trigger_deduped": trigger_deduped,
         "trigger_fingerprint": str(
             outcome.get("trigger_fingerprint")
             or trigger.get("trigger_fingerprint")
             or ""
         )
         or None,
-        "last_ai_skip_reason": str(outcome.get("last_ai_skip_reason") or "") or None,
+        "last_ai_skip_reason": last_ai_skip_reason,
+        "ai_skip_reason": last_ai_skip_reason,
+        "dedupe_reason": dedupe_reason,
+        "provider_skipped": bool(last_ai_skip_reason or trigger_deduped),
     }
 
 
@@ -1995,20 +2396,42 @@ def _overlay_interval_review_state(
         return snapshot
     decision_created_at = decision_row.created_at if decision_row is not None else None
     update: dict[str, Any] = {}
+    ai_review_update: dict[str, Any] = {}
     if interval_state.get("last_ai_skip_reason") is not None:
         update["last_ai_skip_reason"] = interval_state["last_ai_skip_reason"]
+        update["ai_skip_reason"] = interval_state["ai_skip_reason"]
+        ai_review_update["skip_reason"] = interval_state["ai_skip_reason"]
     if bool(interval_state.get("trigger_deduped")):
         update["trigger_deduped"] = True
+        ai_review_update["trigger_deduped"] = True
+        ai_review_update["dedupe_reason"] = interval_state.get("dedupe_reason") or "TRIGGER_DEDUPED"
     if interval_state.get("last_ai_trigger_reason") is not None and (
         decision_created_at is None or interval_row.created_at >= decision_created_at
     ):
         update["last_ai_trigger_reason"] = interval_state["last_ai_trigger_reason"]
+        update["ai_review_type"] = interval_state["ai_review_type"]
+        ai_review_update["trigger_reason"] = interval_state["last_ai_trigger_reason"]
+        ai_review_update["review_type"] = interval_state["ai_review_type"]
+    if interval_state.get("ai_trigger_reason_codes"):
+        update["ai_trigger_reason_codes"] = interval_state["ai_trigger_reason_codes"]
+        ai_review_update["trigger_reason_codes"] = interval_state["ai_trigger_reason_codes"]
     if interval_state.get("trigger_fingerprint") is not None and (
         decision_created_at is None or interval_row.created_at >= decision_created_at
     ):
         update["trigger_fingerprint"] = interval_state["trigger_fingerprint"]
+        ai_review_update["trigger_fingerprint"] = interval_state["trigger_fingerprint"]
     if interval_state.get("last_ai_invoked_at") is not None:
         update["last_ai_invoked_at"] = interval_state["last_ai_invoked_at"]
+        ai_review_update["invoked_at"] = interval_state["last_ai_invoked_at"]
+    if interval_state.get("provider_skipped") is not None:
+        ai_review_update["provider_skipped"] = bool(interval_state["provider_skipped"])
+        ai_review_update["provider_status"] = _provider_status_from_review(
+            provider_invoked=snapshot.ai_review.provider_invoked,
+            provider_skipped=bool(interval_state["provider_skipped"]),
+            deduped=bool(ai_review_update.get("trigger_deduped", snapshot.ai_review.trigger_deduped)),
+        )
+    if ai_review_update:
+        update["ai_review"] = snapshot.ai_review.model_copy(update=ai_review_update)
     return snapshot.model_copy(update=update) if update else snapshot
 
 
@@ -2187,6 +2610,25 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
     )
 
 
+def _risk_guard_result_from_snapshot(snapshot: OperatorRiskSnapshot) -> OperatorRiskGuardResultSnapshot:
+    reason_codes = list(dict.fromkeys(snapshot.reason_codes + snapshot.blocked_reason_codes))
+    return OperatorRiskGuardResultSnapshot(
+        risk_check_id=snapshot.risk_check_id,
+        decision_run_id=snapshot.decision_run_id,
+        allowed=snapshot.allowed,
+        decision=snapshot.decision,
+        reason_codes=reason_codes,
+        blocked_reason_codes=snapshot.blocked_reason_codes,
+        approved_risk_pct=snapshot.approved_risk_pct,
+        approved_leverage=snapshot.approved_leverage,
+        hold_decision=(
+            snapshot.decision == "hold"
+            or "HOLD_DECISION" in reason_codes
+            or "HOLD_DECISION" in snapshot.blocked_reason_codes
+        ),
+    )
+
+
 def _decision_symbol(row: AgentRun | None) -> str | None:
     if row is None or not isinstance(row.output_payload, dict):
         return None
@@ -2255,28 +2697,13 @@ def _extract_symbol_event_context_summary(
     market_row: MarketSnapshot | None,
     feature_row: FeatureSnapshot | None,
 ) -> dict[str, Any]:
-    if row is not None and isinstance(row.input_payload, dict):
-        ai_context = _as_dict(row.input_payload.get("ai_context", {}))
-        if ai_context:
-            summary = _as_dict(ai_context.get("event_context_summary", {}))
-            if summary:
-                return _compact_event_context_summary(summary)
-        feature_layers = _as_dict(row.input_payload.get("feature_layers", {}))
-        if feature_layers:
-            summary = _as_dict(feature_layers.get("event_context_summary", {}))
-            if summary:
-                return _compact_event_context_summary(summary)
-        features = _as_dict(row.input_payload.get("features", {}))
-        if features:
-            event_context = _as_dict(features.get("event_context", {}))
-            if event_context:
-                return _compact_event_context_summary(event_context)
-    if feature_row is not None and isinstance(feature_row.payload, dict):
-        event_context = _as_dict(feature_row.payload.get("event_context", {}))
-        if event_context:
-            return _compact_event_context_summary(event_context)
-    if market_row is not None and isinstance(market_row.payload, dict):
-        return _compact_event_context_summary(market_row.payload.get("event_context", {}))
+    event_context, _source = extract_freshest_raw_event_context(
+        decision_row=row,
+        feature_row=feature_row,
+        market_row=market_row,
+    )
+    if event_context:
+        return _compact_event_context_summary(event_context)
     return _compact_event_context_summary({})
 
 
@@ -2655,6 +3082,8 @@ def _compact_profitability_window(window: DashboardProfitabilityWindow) -> Dashb
         window_label=window.window_label,
         window_hours=window.window_hours,
         summary=window.summary,
+        ai_baseline_comparison=window.ai_baseline_comparison,
+        limited_live_readiness=window.limited_live_readiness,
         rationale_winners=window.rationale_winners[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
         rationale_losers=window.rationale_losers[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
         top_regimes=window.top_regimes[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
@@ -2868,6 +3297,7 @@ def _build_operator_symbol_summaries(
                 )
             }
         )
+        risk_snapshot = _build_risk_snapshot(risk_row)
         summaries.append(
             OperatorSymbolSummary(
                 symbol=symbol_key,
@@ -2884,7 +3314,8 @@ def _build_operator_symbol_summaries(
                 event_operator_control=event_operator_control,
                 ai_decision=decision_snapshot,
                 pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),
-                risk_guard=_build_risk_snapshot(risk_row),
+                risk_guard=risk_snapshot,
+                risk_guard_result=_risk_guard_result_from_snapshot(risk_snapshot),
                 execution=_build_execution_snapshot_from_rows(
                     order_row,
                     execution_row,
@@ -2933,6 +3364,7 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         _compact_execution_window(window)
         for window in profitability.execution_windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
     ]
+    limited_live_readiness = profitability.limited_live_readiness
     audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT)
     return OperatorDashboardResponse(
         generated_at=utcnow_naive(),
@@ -2986,6 +3418,7 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
             reconciliation_summary=overview.reconciliation_summary,
             candidate_selection_summary=overview.candidate_selection_summary,
             operator_alert=overview.operator_alert,
+            limited_live_readiness=limited_live_readiness,
             scheduler_status=latest_scheduler.status if latest_scheduler is not None else None,
             scheduler_window=latest_scheduler.schedule_window if latest_scheduler is not None else None,
             scheduler_triggered_by=latest_scheduler.triggered_by if latest_scheduler is not None else None,
@@ -3018,8 +3451,20 @@ def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False)
     payloads: list[dict[str, object]] = []
     for risk_row, decision_row in rows:
         payload = _serialize_model_row(risk_row)
+        macro_event_summary = _decision_macro_event_context_summary(decision_row)
+        risk_snapshot = _build_risk_snapshot(risk_row)
         payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(decision_row)
+        payload["ai_review_type"] = _ai_review_type_from_decision_row(decision_row)
+        payload["ai_trigger_reason_codes"] = _ai_trigger_reason_codes_from_decision_row(decision_row)
+        payload["last_ai_skip_reason"] = _last_ai_skip_reason_from_decision_row(decision_row)
+        payload["ai_skip_reason"] = payload["last_ai_skip_reason"]
         payload["ai_trigger_summary"] = _ai_trigger_summary_from_decision_row(decision_row)
+        payload["market_signal_summary"] = _market_signal_summary_from_decision_row(decision_row)
+        payload["ai_review"] = _ai_review_snapshot_from_decision_row(decision_row).model_dump(mode="json")
+        payload["market_signal_context"] = _market_signal_context_from_decision_row(decision_row).model_dump(mode="json")
+        payload["macro_event_context_summary"] = macro_event_summary.model_dump(mode="json")
+        payload["macro_event_risk_summary"] = macro_event_summary.model_dump(mode="json")
+        payload["risk_guard_result"] = _risk_guard_result_from_snapshot(risk_snapshot).model_dump(mode="json")
         if compact:
             payload["payload"] = _compact_dict(payload.get("payload"), allowed_keys=RISK_COMPACT_PAYLOAD_KEYS)
             payload["payload_mode"] = "compact"

@@ -26,6 +26,26 @@ import {
 
 export type OperatorDetailTone = "good" | "warn" | "danger" | "neutral";
 
+type MacroEventContextSummary = {
+  source_status?: string | null;
+  source_vendor?: string | null;
+  next_event_name?: string | null;
+  next_event_importance?: string | null;
+  minutes_to_next_event?: number | null;
+  active_risk_window?: boolean | null;
+  release_reaction_window?: boolean | null;
+  is_stale?: boolean | null;
+  is_complete?: boolean | null;
+  is_incomplete?: boolean | null;
+  affected_assets?: string[] | null;
+  enrichment_vendors?: string[] | null;
+  bls_actual_enriched?: boolean | null;
+  bea_actual_enriched?: boolean | null;
+  event_risk_active?: boolean | null;
+  event_risk_reason_codes?: string[] | null;
+  event_bias_used?: string | null;
+};
+
 export type OperatorDetailItem = {
   label: string;
   value: string;
@@ -41,6 +61,8 @@ export type OperatorDetailSection = {
   key:
     | "current_regime"
     | "derivatives_orderbook"
+    | "ai_review_reason"
+    | "market_signal_summary"
     | "upcoming_event_risk"
     | "ai_event_view"
     | "operator_event_view"
@@ -63,6 +85,28 @@ export type OperatorDetailSymbolLike = {
   ai_decision: {
     decision: string | null;
     confidence: number | null;
+    ai_review?: {
+      review_type?: string | null;
+      trigger_reason?: string | null;
+      trigger_reason_codes?: string[] | null;
+      skip_reason?: string | null;
+      dedupe_reason?: string | null;
+      provider_status?: string | null;
+      provider_invoked?: boolean | null;
+      provider_skipped?: boolean | null;
+      invoked_at?: string | null;
+      provider_name?: string | null;
+    } | null;
+    ai_review_type?: string | null;
+    last_ai_trigger_reason?: string | null;
+    ai_trigger_reason_codes?: string[] | null;
+    ai_skip_reason?: string | null;
+    last_ai_skip_reason?: string | null;
+    ai_trigger_summary?: string | null;
+    market_signal_summary?: string | null;
+    market_signal_context?: Record<string, unknown> | null;
+    macro_event_context_summary?: MacroEventContextSummary | null;
+    macro_event_risk_summary?: MacroEventContextSummary | null;
     event_risk_acknowledgement?: string | null;
     confidence_penalty_reason?: string | null;
     scenario_note?: string | null;
@@ -97,6 +141,10 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function asNumber(value: unknown): number | null {
@@ -209,12 +257,218 @@ function boolToKorean(value: boolean | null | undefined) {
   return value ? "예" : "아니오";
 }
 
+const displayValueMap: Record<string, string> = {
+  entry_candidate_review: "신규 진입 후보 검토",
+  entry_candidate_event: "신규 진입 후보 검토",
+  breakout_exception_review: "돌파 예외 검토",
+  breakout_exception_event: "돌파 예외 검토",
+  protection_review: "보호 상태 점검",
+  protection_review_event: "보호 상태 점검",
+  manual_review: "수동 검토",
+  manual_review_event: "수동 검토",
+  skipped_pre_ai: "AI 검토 생략",
+  invoked: "AI 검토 실행",
+  deduped: "중복 생략",
+  ENTRY_CANDIDATE_SELECTED: "신규 진입 후보 선정",
+  ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
+  MACRO_EVENT_IMMINENT: "주요 경제 이벤트 임박으로 신규 진입 보수화",
+  MACRO_EVENT_RISK_WINDOW_ACTIVE: "거시 이벤트 리스크 구간",
+  MACRO_RELEASE_REACTION_WINDOW: "발표 직후 변동성 구간",
+  MACRO_EVENT_CONTEXT_STALE: "이벤트 데이터 지연",
+  MACRO_EVENT_CONTEXT_INCOMPLETE: "이벤트 데이터 불완전",
+  MACRO_EVENT_ENRICHMENT_AVAILABLE: "경제지표 실제값 반영 가능",
+  HOLD_DECISION: "현재 판단은 HOLD입니다.",
+  STALE_MARKET_DATA: "시장 데이터 지연",
+  low: "낮음",
+  medium: "보통",
+  high: "높음",
+  fred: "FRED",
+  bls: "BLS",
+  bea: "BEA",
+  external_api: "external_api",
+  available: "정상",
+  stale: "조금 늦음",
+  incomplete: "일부 누락",
+  unavailable: "연결 안 됨",
+};
+
+function formatDisplayValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "-";
+  }
+  if (typeof value === "boolean") {
+    return value ? "예" : "아니오";
+  }
+  if (typeof value === "number") {
+    return value.toLocaleString("ko-KR");
+  }
+  if (typeof value === "string") {
+    return displayValueMap[value] ?? value;
+  }
+  return String(value);
+}
+
+function hasMacroEventContext(value: Record<string, unknown>) {
+  return Boolean(
+    value.source_status ||
+      value.next_event_name ||
+      value.event_risk_active ||
+      asStringArray(value.event_risk_reason_codes).length > 0,
+  );
+}
+
+function macroEventDataUncertain(value: Record<string, unknown>) {
+  return Boolean(
+    asBoolean(value.is_stale) ||
+      asBoolean(value.is_incomplete) ||
+      asBoolean(value.is_complete) === false ||
+      ["stale", "incomplete", "unavailable", "error"].includes(String(value.source_status ?? "")),
+  );
+}
+
+function macroEventMinuteText(minutes: number) {
+  if (minutes < 0) {
+    return `${Math.abs(minutes)}분 전 발표`;
+  }
+  return `${minutes}분 전`;
+}
+
+function formatMacroEventContextSummary(value: Record<string, unknown>) {
+  if (!hasMacroEventContext(value)) {
+    return "이벤트 정보 없음";
+  }
+  if (macroEventDataUncertain(value)) {
+    return "이벤트 데이터 지연/불완전";
+  }
+  if (asBoolean(value.release_reaction_window)) {
+    return "발표 직후 변동성 구간";
+  }
+  const eventName = asString(value.next_event_name);
+  const isHighImpact = asString(value.next_event_importance) === "high";
+  const minutes = asNumber(value.minutes_to_next_event);
+  if (minutes !== null && minutes < 0 && asBoolean(value.active_risk_window)) {
+    return "발표 직후 변동성 구간";
+  }
+  if (minutes !== null) {
+    const prefix = isHighImpact ? "주요 경제 이벤트" : eventName ?? "경제 이벤트";
+    return `${prefix} ${macroEventMinuteText(minutes)}`;
+  }
+  if (asBoolean(value.active_risk_window)) {
+    return "거시 이벤트 리스크 구간";
+  }
+  return eventName ?? "이벤트 정보 있음";
+}
+
+function formatMacroEventContextDetail(value: Record<string, unknown>) {
+  if (!hasMacroEventContext(value)) {
+    return "AI 판단 당시 이벤트 컨텍스트 없음";
+  }
+  const parts: string[] = [];
+  if (macroEventDataUncertain(value)) {
+    parts.push("이벤트 데이터 지연/불완전");
+  }
+  const eventName = asString(value.next_event_name);
+  if (eventName) {
+    parts.push(eventName);
+  }
+  const eventImportance = asString(value.next_event_importance);
+  if (eventImportance) {
+    parts.push(`중요도 ${formatDisplayValue(eventImportance)}`);
+  }
+  if (asBoolean(value.active_risk_window)) {
+    parts.push("active risk window");
+  }
+  if (asBoolean(value.release_reaction_window)) {
+    parts.push("발표 직후 변동성 구간");
+  }
+  if (asBoolean(value.bls_actual_enriched)) {
+    parts.push("BLS 실제값 반영됨");
+  }
+  if (asBoolean(value.bea_actual_enriched)) {
+    parts.push("BEA 실제값 반영됨");
+  }
+  const sourceStatus = asString(value.source_status);
+  if (sourceStatus) {
+    const vendor = asString(value.source_vendor) ? ` / ${formatDisplayValue(asString(value.source_vendor))}` : "";
+    parts.push(`source ${formatDisplayValue(sourceStatus)}${vendor}`);
+  }
+  const affectedAssets = asStringArray(value.affected_assets);
+  if (affectedAssets.length > 0) {
+    parts.push(`자산 ${affectedAssets.join(", ")}`);
+  }
+  const reasonCodes = asStringArray(value.event_risk_reason_codes);
+  if (reasonCodes.length > 0) {
+    parts.push(`사유 ${reasonCodes.map((code) => formatDisplayValue(code)).join(", ")}`);
+  }
+  return parts.join(" / ");
+}
+
+function hasRecordValues(value: Record<string, unknown>) {
+  return Object.keys(value).length > 0;
+}
+
+function formatOptionalDisplay(value: unknown) {
+  const text = asString(value);
+  return text ? formatDisplayValue(text) : "정보 없음";
+}
+
+function formatAiReviewClassification(value: string | null) {
+  if (!value) {
+    return "정보 없음";
+  }
+  const labels: Record<string, string> = {
+    entry_candidate_review: "신규 진입 후보 검토",
+    entry_candidate_event: "신규 진입 후보 검토",
+    breakout_exception_review: "돌파 예외 검토",
+    breakout_exception_event: "돌파 예외 검토",
+    protection_review: "보호 상태 점검",
+    protection_review_event: "보호 상태 점검",
+    manual_review: "수동 검토",
+    manual_review_event: "수동 검토",
+    skipped_pre_ai: "AI 검토 생략",
+  };
+  return labels[value] ?? formatDisplayValue(value);
+}
+
+function formatReasonCodes(values: string[]) {
+  return values.length > 0 ? values.map((code) => formatDisplayValue(code)).join(" / ") : "없음";
+}
+
+function describeRiskReason(value: string | null | undefined) {
+  if (!value) {
+    return "없음";
+  }
+  const display = formatDisplayValue(value);
+  return display === value ? describeEventReasonCode(value) : display;
+}
+
+function formatProviderStatus(review: Record<string, unknown>, skipReason: string | null) {
+  const providerStatus = asString(review.provider_status);
+  if (asBoolean(review.provider_invoked) === true || providerStatus === "invoked") {
+    return "AI 검토 실행";
+  }
+  if (asBoolean(review.trigger_deduped) === true || providerStatus === "deduped" || skipReason === "TRIGGER_DEDUPED") {
+    return "중복 생략";
+  }
+  if (asBoolean(review.provider_skipped) === true || skipReason || providerStatus === "skipped_pre_ai") {
+    return "AI 검토 생략";
+  }
+  return providerStatus ? formatDisplayValue(providerStatus) : "정보 없음";
+}
+
 export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): OperatorDetailSection[] {
   const regime = asRecord(symbol.market_context_summary);
   const derivatives = asRecord(symbol.derivatives_summary);
   const legacyEventContext = asRecord(symbol.event_context_summary);
+  const aiReview = asRecord(symbol.ai_decision.ai_review);
+  const marketSignalContext = asRecord(symbol.ai_decision.market_signal_context);
+  const macroEventRiskContext = asRecord(
+    symbol.ai_decision.macro_event_risk_summary ?? symbol.ai_decision.macro_event_context_summary,
+  );
   const eventControl = symbol.event_operator_control ?? null;
-  const eventContext = asRecord(eventControl?.event_context ?? legacyEventContext);
+  const eventContext = hasRecordValues(macroEventRiskContext)
+    ? macroEventRiskContext
+    : asRecord(eventControl?.event_context ?? legacyEventContext);
   const operatorEventView = eventControl?.operator_event_view ?? null;
   const operatorEventViewConfigured = resolveOperatorEventViewConfigured(eventControl);
   const alignmentDecision = eventControl?.alignment_decision ?? null;
@@ -232,6 +486,21 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
     ...(symbol.risk_guard.degraded_reason ? [symbol.risk_guard.degraded_reason] : []),
   ]);
   const protectionReasons = unique(symbol.risk_guard.protection_reason_codes ?? []);
+
+  const aiReviewType = asString(aiReview.review_type) ?? symbol.ai_decision.ai_review_type ?? null;
+  const aiTriggerReason = asString(aiReview.trigger_reason) ?? symbol.ai_decision.last_ai_trigger_reason ?? null;
+  const aiTriggerReasonCodes = unique(
+    asStringArray(aiReview.trigger_reason_codes).length > 0
+      ? asStringArray(aiReview.trigger_reason_codes)
+      : asStringArray(symbol.ai_decision.ai_trigger_reason_codes),
+  );
+  const aiSkipReason =
+    asString(aiReview.skip_reason) ?? symbol.ai_decision.ai_skip_reason ?? symbol.ai_decision.last_ai_skip_reason ?? null;
+  const marketSignalSummary =
+    asString(symbol.ai_decision.market_signal_summary) ??
+    asString(marketSignalContext.summary) ??
+    asString(symbol.ai_decision.ai_trigger_summary) ??
+    "정보 없음";
 
   const rawEventSourceStatus = asString(eventContext.source_status) ?? "unknown";
   const normalizedEventSourceStatus = normalizeSourceStatus(rawEventSourceStatus);
@@ -265,11 +534,15 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
   const nextEventName = asString(eventContext.next_event_name) ?? "정보 없음";
   const minutesToNextEvent = asNumber(eventContext.minutes_to_next_event);
   const activeRiskWindow = asBoolean(eventContext.active_risk_window) ?? false;
+  const affectedAssets = asStringArray(eventContext.affected_assets);
 
   const riskBlockedReason = symbol.risk_guard.blocked_reason ?? null;
   const riskApprovalRequiredReason = symbol.risk_guard.approval_required_reason ?? null;
   const riskDegradedReason = symbol.risk_guard.degraded_reason ?? null;
   const riskPolicySource = symbol.risk_guard.policy_source ?? "none";
+
+  const riskBlockedReasonText =
+    riskBlockedReason !== null ? describeRiskReason(riskBlockedReason) : formatReasonCodes(blockedReasons);
 
   const policySummary = summarizeEntryPolicy({
     effectivePolicyPreview: rawEffectivePolicyPreview,
@@ -282,10 +555,10 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
   const blockedAndDegradedAlerts: OperatorDetailAlert[] = [
     ...blockedReasons.map((code) => ({
       tone: code === riskApprovalRequiredReason ? "warn" as const : "danger" as const,
-      text: describeEventReasonCode(code),
+      text: describeRiskReason(code),
     })),
-    ...degradedReasons.map((code) => ({ tone: "warn" as const, text: describeEventReasonCode(code) })),
-    ...protectionReasons.map((code) => ({ tone: "warn" as const, text: describeEventReasonCode(code) })),
+    ...degradedReasons.map((code) => ({ tone: "warn" as const, text: describeRiskReason(code) })),
+    ...protectionReasons.map((code) => ({ tone: "warn" as const, text: describeRiskReason(code) })),
     ...degradedFlags.map((flag) => ({ tone: "warn" as const, text: translateFlag(flag) })),
   ];
 
@@ -301,7 +574,7 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
   if (riskDegradedReason) {
     blockedAndDegradedAlerts.push({
       tone: "warn",
-      text: describeEventReasonCode(riskDegradedReason),
+      text: describeRiskReason(riskDegradedReason),
     });
   }
   if (blockedAndDegradedAlerts.length === 0) {
@@ -352,10 +625,81 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
       alerts: [],
     },
     {
+      key: "ai_review_reason",
+      title: "AI 검토 사유",
+      tone: aiSkipReason ? "warn" : "neutral",
+      items: [
+        {
+          label: "검토 분류",
+          value: formatAiReviewClassification(aiReviewType ?? aiTriggerReason),
+          hint: "신규 진입 후보 검토, 돌파 예외 검토, 보호 상태 점검처럼 실제 검토 경로를 보여줍니다.",
+        },
+        {
+          label: "trigger reason",
+          value: aiTriggerReason ?? "정보 없음",
+          hint: "AI 호출 원인이 되는 runtime trigger입니다. 시장 feature 요약과 분리해서 봅니다.",
+        },
+        {
+          label: "trigger reason code",
+          value: formatReasonCodes(aiTriggerReasonCodes),
+          hint: "pre-AI gate나 trigger가 남긴 원본 사유 코드입니다.",
+        },
+        {
+          label: "AI 검토 생략",
+          value: aiSkipReason ? formatDisplayValue(aiSkipReason) : "없음",
+          hint: aiSkipReason ? `원본 코드: ${aiSkipReason}` : "pre-AI skip이 없으면 없음으로 표시합니다.",
+        },
+        {
+          label: "공급자 상태",
+          value: formatProviderStatus(aiReview, aiSkipReason),
+          hint: asString(aiReview.provider_name) ?? "provider 정보 없음",
+        },
+      ],
+      alerts: aiSkipReason ? [{ tone: "warn", text: formatDisplayValue(aiSkipReason) }] : [],
+    },
+    {
+      key: "market_signal_summary",
+      title: "당시 시장 신호 요약",
+      tone: marketSignalSummary === "정보 없음" ? "warn" : "neutral",
+      items: [
+        {
+          label: "요약",
+          value: marketSignalSummary,
+          hint: "AI 호출 원인이 아니라 판단 당시 시장 feature 요약입니다.",
+        },
+        {
+          label: "모멘텀",
+          value: formatOptionalDisplay(marketSignalContext.momentum_state ?? regime.momentum_state),
+          hint: "AI 판단 당시 값이 있으면 우선 사용하고, legacy payload는 현재 레짐 요약으로 보완합니다.",
+        },
+        {
+          label: "거래량",
+          value: formatOptionalDisplay(marketSignalContext.volume_regime ?? regime.volume_regime),
+          hint: "거래량 강도 또는 pre-AI 약한 거래량 판단을 이해하기 위한 시장 feature입니다.",
+        },
+        {
+          label: "추세 정렬",
+          value: formatOptionalDisplay(marketSignalContext.trend_alignment ?? regime.trend_alignment),
+          hint: "상위 흐름과 같은 쪽인지 보여줍니다.",
+        },
+        {
+          label: "데이터 품질",
+          value: formatReasonCodes(asStringArray(marketSignalContext.data_quality_flags)),
+          hint: "stale/incomplete 같은 시장 입력 상태가 있으면 표시합니다.",
+        },
+      ],
+      alerts: [],
+    },
+    {
       key: "upcoming_event_risk",
-      title: "예정 이벤트 리스크",
+      title: "거시 이벤트 리스크",
       tone: activeRiskWindow ? "danger" : toneForSourceStatus(rawEventSourceStatus),
       items: [
+        {
+          label: "이벤트 요약",
+          value: formatMacroEventContextSummary(eventContext),
+          hint: formatMacroEventContextDetail(eventContext),
+        },
         { label: "다음 이벤트", value: nextEventName, hint: "가장 가까운 중요 일정입니다." },
         { label: "이벤트 시각", value: formatUtcTimestamp(asString(eventContext.next_event_at)), hint: "모든 시각은 UTC 기준입니다." },
         {
@@ -368,6 +712,21 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
           label: "위험 구간",
           value: activeRiskWindow ? "현재 주의 구간" : "현재는 아님",
           hint: asString(eventContext.summary_note) ?? "추가 설명 없음",
+        },
+        {
+          label: "BLS 실제값",
+          value: boolToKorean(asBoolean(eventContext.bls_actual_enriched)),
+          hint: "BLS 실제값 enrichment가 반영됐는지 보여줍니다.",
+        },
+        {
+          label: "BEA 실제값",
+          value: boolToKorean(asBoolean(eventContext.bea_actual_enriched)),
+          hint: "BEA 실제값 enrichment가 반영됐는지 보여줍니다.",
+        },
+        {
+          label: "영향 자산",
+          value: affectedAssets.length > 0 ? affectedAssets.join(", ") : "정보 없음",
+          hint: "이벤트 컨텍스트가 영향 대상으로 표시한 자산입니다.",
         },
         {
           label: "데이터 출처",
@@ -537,12 +896,12 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
         { label: "허용 레버리지", value: symbol.risk_guard.approved_leverage === null ? "정보 없음" : `${formatMaybeNumber(symbol.risk_guard.approved_leverage, 1)}x`, hint: "이번 진입에 허용된 최대 레버리지입니다." },
         {
           label: "차단 사유",
-          value: describeEventReasonCode(riskBlockedReason),
+          value: riskBlockedReasonText,
           hint: "신규 진입이 막힌 가장 직접적인 이유입니다.",
         },
         {
           label: "추가 확인 사유",
-          value: describeEventReasonCode(riskApprovalRequiredReason),
+          value: describeRiskReason(riskApprovalRequiredReason),
           hint: "한 번 더 확인이 필요한 경우 그 이유를 보여줍니다.",
         },
         { label: "판단 기준", value: describePolicySource(riskPolicySource), hint: "어떤 근거가 이번 판단을 이끌었는지 보여줍니다." },
@@ -561,14 +920,14 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
       items: [
         {
           label: "현재 차단 이유",
-          value: blockedReasons.length > 0 ? blockedReasons.map((code) => describeEventReasonCode(code)).join(" / ") : "없음",
+          value: formatReasonCodes(blockedReasons),
           hint: "지금 신규 진입을 막고 있는 이유입니다.",
         },
         {
           label: "주의가 필요한 상태",
           value:
             degradedReasons.length > 0
-              ? degradedReasons.map((code) => describeEventReasonCode(code)).join(" / ")
+              ? formatReasonCodes(degradedReasons)
               : degradedFlags.length > 0
                 ? degradedFlags.map((flag) => translateFlag(flag)).join(" / ")
                 : "없음",
@@ -578,7 +937,7 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
           label: "보호/미해결 주문 사유",
           value:
             protectionReasons.length > 0
-              ? protectionReasons.map((code) => describeEventReasonCode(code)).join(" / ")
+              ? formatReasonCodes(protectionReasons)
               : "없음",
           hint: "보호 복구와 미해결 제출 가드처럼 신규 진입과 별도인 안전 경로입니다.",
         },

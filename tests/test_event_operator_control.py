@@ -6,9 +6,15 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select
-
 from trading_mvp.main import app
-from trading_mvp.models import AuditEvent, FeatureSnapshot, MarketSnapshot, PnLSnapshot, Position
+from trading_mvp.models import (
+    AgentRun,
+    AuditEvent,
+    FeatureSnapshot,
+    MarketSnapshot,
+    PnLSnapshot,
+    Position,
+)
 from trading_mvp.schemas import (
     AIEventViewPayload,
     ManualNoTradeWindowPayload,
@@ -21,7 +27,11 @@ from trading_mvp.schemas import (
 from trading_mvp.services.audit import compact_audit_payload
 from trading_mvp.services.dashboard import get_operator_dashboard
 from trading_mvp.services.event_context import normalize_operator_event_context
-from trading_mvp.services.event_policy import derive_ai_event_view, evaluate_event_alignment, no_trade_window_is_active
+from trading_mvp.services.event_policy import (
+    derive_ai_event_view,
+    evaluate_event_alignment,
+    no_trade_window_is_active,
+)
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import evaluate_risk
 from trading_mvp.services.settings import (
@@ -183,6 +193,69 @@ def _seed_alignment_event_context_snapshot(
         )
     )
     db_session.flush()
+
+
+def test_event_operator_control_uses_fresh_snapshot_over_stale_decision_context(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    stale_time = utcnow_naive() - timedelta(days=1)
+    stale_event_at = stale_time + timedelta(minutes=45)
+    stale_event_context = {
+        "source_status": "external_api",
+        "source_vendor": "fred",
+        "generated_at": stale_time.isoformat(),
+        "is_stale": False,
+        "is_complete": True,
+        "next_event_at": stale_event_at.isoformat(),
+        "next_event_name": "Old FOMC",
+        "next_event_importance": "high",
+        "minutes_to_next_event": 45,
+        "active_risk_window": False,
+        "affected_assets": ["BTCUSDT"],
+        "events": [
+            {
+                "event_at": stale_event_at.isoformat(),
+                "event_name": "Old FOMC",
+                "importance": "high",
+                "affected_assets": ["BTCUSDT"],
+                "minutes_to_event": 45,
+            }
+        ],
+    }
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="test",
+            summary="stale decision event context",
+            input_payload={"features": {"event_context": stale_event_context}},
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+            metadata_json={},
+            schema_valid=True,
+            started_at=stale_time,
+            completed_at=stale_time,
+            created_at=stale_time,
+            updated_at=stale_time,
+        )
+    )
+    _seed_alignment_event_context_snapshot(db_session)
+    db_session.commit()
+
+    payload = build_event_operator_control_payload(
+        session=db_session,
+        settings_row=settings_row,
+        symbol="BTCUSDT",
+        timeframe="15m",
+    )
+
+    assert payload.event_context.next_event_name == "CPI"
+    assert payload.event_context.summary_note != "derived from latest decision input"
+    dashboard = get_operator_dashboard(db_session)
+    btc_summary = next(symbol for symbol in dashboard.symbols if symbol.symbol == "BTCUSDT")
+    assert btc_summary.event_context_summary["next_event_name"] == "CPI"
+    assert btc_summary.event_operator_control is not None
+    assert btc_summary.event_operator_control.event_context.next_event_name == "CPI"
 
 
 def test_event_operator_requests_require_timezone_aware_datetimes() -> None:

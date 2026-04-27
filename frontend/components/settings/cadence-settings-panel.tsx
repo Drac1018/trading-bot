@@ -3,7 +3,7 @@
 import { AIUsagePanel, type AIUsagePayload } from "../ai-usage-panel";
 import { Field, InlineFeedback, StatusPill, Toggle, inputClass, type FeedbackMessage } from "./form-primitives";
 import { formatDisplayValue } from "../../lib/ui-copy";
-import { type SymbolCadenceOverride, type SymbolEffectiveCadence } from "./types";
+import { SYMBOL_TIMEFRAME_OPTIONS, type SymbolCadenceOverride, type SymbolEffectiveCadence } from "./types";
 
 type CadenceForm = {
   default_symbol: string;
@@ -76,7 +76,7 @@ function SymbolCadenceOverridePanel({
           </StatusPill>
         </div>
         <p className="text-sm leading-6 text-slate-600">
-          기본 화면에서는 전역 운영 주기를 먼저 보고, 예외 심볼은 필요할 때만 열어 수정합니다. 비워 두면 전역 기본값을 그대로 상속합니다.
+          심볼별 시장 기준 타임프레임을 1m, 3m, 5m, 15m 중에서 선택할 수 있습니다. 비워 두면 전역 기본값을 그대로 상속합니다.
         </p>
       </div>
       <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -143,14 +143,20 @@ function SymbolCadenceOverridePanel({
 
                   <div className="mt-4 grid gap-3 md:grid-cols-2">
                     <Field label="타임프레임 override" hint="비우면 전역 타임프레임을 사용합니다.">
-                      <input
+                      <select
                         className={inputClass}
                         value={row.timeframe_override ?? ""}
                         onChange={(event) =>
                           onSymbolOverrideChange(row.symbol, { timeframe_override: event.target.value || null })
                         }
-                        placeholder={form.default_timeframe}
-                      />
+                      >
+                        <option value="">전역 {form.default_timeframe}</option>
+                        {SYMBOL_TIMEFRAME_OPTIONS.map((timeframe) => (
+                          <option key={timeframe} value={timeframe}>
+                            {timeframe}
+                          </option>
+                        ))}
+                      </select>
                     </Field>
                     <Field label="시장 갱신(분)" hint={`전역 ${form.market_refresh_interval_minutes}분`}>
                       <input

@@ -122,6 +122,64 @@ def _seed_market_snapshot(
     db_session.flush()
 
 
+def _entry_candidate_interval_plan(
+    *,
+    now,
+    last_ai_skip_reason: str | None = None,
+) -> dict[str, object]:
+    trigger = {
+        "trigger_reason": "entry_candidate_event",
+        "symbol": "BTCUSDT",
+        "timeframe": "15m",
+        "strategy_engine": "trend_pullback_engine",
+        "holding_profile": "scalp",
+        "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+        "trigger_fingerprint": "entry-candidate-fingerprint",
+        "fingerprint_basis": {"position_state_bucket": "flat"},
+        "fingerprint_changed_fields": [],
+        "last_decision_at": None,
+        "last_material_review_at": now.isoformat(),
+        "forced_review_reason": None,
+        "applied_review_cadence_minutes": 15,
+        "review_cadence_source": "holding_profile_cadence_hint",
+        "holding_profile_cadence_hint": {"holding_profile": "scalp", "decision_interval_minutes": 15},
+        "max_review_age_minutes": 45,
+        "triggered_at": now.isoformat(),
+    }
+    return {
+        "generated_at": now.isoformat(),
+        "candidate_selection": {"rankings": []},
+        "plans": [
+            {
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "cadence": {
+                    "mode": "watch",
+                    "effective_cadence": {
+                        "decision_cycle_interval_minutes": 15,
+                        "ai_call_interval_minutes": 15,
+                    },
+                },
+                "selection_context": {"assigned_slot": "slot_1", "candidate_weight": 0.64},
+                "trigger": trigger,
+                "trigger_deduped": False,
+                "last_decision_at": None,
+                "last_ai_invoked_at": None,
+                "last_material_review_at": now.isoformat(),
+                "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                "applied_review_cadence_minutes": 15,
+                "review_cadence_source": "holding_profile_cadence_hint",
+                "holding_profile_cadence_hint": {"holding_profile": "scalp", "decision_interval_minutes": 15},
+                "max_review_age_minutes": 45,
+                "fingerprint_changed_fields": [],
+                "dedupe_reason": None,
+                "forced_review_reason": None,
+                "last_ai_skip_reason": last_ai_skip_reason,
+            }
+        ],
+    }
+
+
 def test_run_due_operational_cycles_isolates_background_workflow_failure(monkeypatch, db_session) -> None:
     calls: list[str] = []
 
@@ -610,6 +668,113 @@ def test_deduped_entry_trigger_surfaces_reason_fields(monkeypatch, db_session) -
     assert outcome["applied_review_cadence_minutes"] == 15
     assert outcome["review_cadence_source"] == "holding_profile_cadence_hint"
     assert outcome["next_ai_review_due_at"] is None
+
+
+def test_interval_scheduler_keeps_ai_invoked_hold_distinct_from_skip(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _entry_candidate_interval_plan(now=now),
+    )
+
+    def fake_run_decision_cycle(self, **kwargs):  # noqa: ANN001
+        assert kwargs["review_trigger"]["trigger_reason"] == "entry_candidate_event"
+        return {
+            "symbol": "BTCUSDT",
+            "decision_run_id": 101,
+            "risk_check_id": 202,
+            "decision": {"decision": "hold"},
+            "risk_result": {
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            "execution": None,
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": now.isoformat(),
+            "last_ai_skip_reason": None,
+            "ai_skipped_reason": None,
+            "trigger_deduped": False,
+            "trigger_fingerprint": "entry-candidate-fingerprint",
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcome = result["results"][0]["outcome"]
+
+    assert outcome.get("ai_review_status") is None
+    assert outcome["trigger"]["trigger_reason"] == "entry_candidate_event"
+    assert outcome["decision"]["decision"] == "hold"
+    assert outcome["risk_result"]["reason_codes"] == ["HOLD_DECISION"]
+    assert outcome["last_ai_invoked_at"] == now.isoformat()
+    assert outcome["last_ai_skip_reason"] is None
+    assert outcome["ai_skipped_reason"] is None
+    assert outcome["execution"] is None
+
+
+def test_interval_scheduler_surfaces_preai_weak_volume_skip(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _entry_candidate_interval_plan(
+            now=now,
+            last_ai_skip_reason="ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+        ),
+    )
+
+    def fake_run_decision_cycle(self, **kwargs):  # noqa: ANN001
+        assert kwargs["review_trigger"]["trigger_reason"] == "entry_candidate_event"
+        return {
+            "symbol": "BTCUSDT",
+            "decision_run_id": 303,
+            "risk_check_id": 404,
+            "decision": {"decision": "hold"},
+            "risk_result": {
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            "execution": None,
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": None,
+            "last_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+            "ai_skipped_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+            "trigger_deduped": False,
+            "trigger_fingerprint": "entry-candidate-fingerprint",
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcome = result["results"][0]["outcome"]
+
+    assert outcome.get("ai_review_status") is None
+    assert outcome["trigger"]["trigger_reason"] == "entry_candidate_event"
+    assert outcome["decision"]["decision"] == "hold"
+    assert outcome["risk_result"]["reason_codes"] == ["HOLD_DECISION"]
+    assert outcome["last_ai_invoked_at"] is None
+    assert outcome["last_ai_skip_reason"] == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert outcome["ai_skipped_reason"] == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert outcome["execution"] is None
 
 
 def test_time_based_open_position_review_no_longer_schedules_next_due(monkeypatch, db_session) -> None:

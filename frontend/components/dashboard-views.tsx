@@ -11,8 +11,27 @@ import {
   summarizeLastAiRecommendation,
   summarizeRiskGate,
 } from "../lib/decision-timeline";
+import {
+  formatMacroEventContextDetail,
+  formatMacroEventContextSummary,
+  type MacroEventContextSummary,
+} from "../lib/ui-copy";
 
 type Row = Record<string, unknown>;
+type AiReviewReadModel = {
+  review_type?: string | null;
+  trigger_reason?: string | null;
+  trigger_reason_codes?: string[] | null;
+  skip_reason?: string | null;
+  dedupe_reason?: string | null;
+  trigger_deduped?: boolean | null;
+  provider_status?: string | null;
+  provider_invoked?: boolean | null;
+  provider_skipped?: boolean | null;
+  invoked_at?: string | null;
+  provider_name?: string | null;
+  trigger_fingerprint?: string | null;
+};
 type RiskCheckRow = {
   id?: number | null;
   symbol?: string | null;
@@ -22,10 +41,31 @@ type RiskCheckRow = {
   reason_codes?: string[];
   approved_risk_pct?: number | null;
   approved_leverage?: number | null;
+  ai_review?: AiReviewReadModel | null;
+  ai_review_type?: string | null;
   ai_trigger_reason?: string | null;
+  ai_trigger_reason_codes?: string[];
+  ai_skip_reason?: string | null;
+  last_ai_skip_reason?: string | null;
   ai_trigger_summary?: string | null;
+  market_signal_summary?: string | null;
+  macro_event_context_summary?: MacroEventContextSummary | null;
+  macro_event_risk_summary?: MacroEventContextSummary | null;
   created_at?: string | null;
   payload?: Record<string, unknown> | null;
+};
+
+type OperatorSymbol = OperatorDashboardPayload["symbols"][number];
+type OperatorAiDecisionReadModel = OperatorSymbol["ai_decision"] & {
+  ai_review?: AiReviewReadModel | null;
+  ai_review_type?: string | null;
+  ai_trigger_reason_codes?: string[] | null;
+  ai_skip_reason?: string | null;
+  ai_trigger_summary?: string | null;
+  market_signal_summary?: string | null;
+  market_signal_context?: Record<string, unknown> | null;
+  macro_event_context_summary?: MacroEventContextSummary | null;
+  macro_event_risk_summary?: MacroEventContextSummary | null;
 };
 
 const operatingStateLabelMap: Record<string, string> = {
@@ -57,6 +97,12 @@ const reasonCodeLabelMap: Record<string, string> = {
   DRAWDOWN_STATE_CAUTION: "드로다운 주의",
   DRAWDOWN_STATE_CONTAINMENT: "드로다운 억제",
   DRAWDOWN_STATE_RECOVERY: "드로다운 회복",
+  ENTRY_CANDIDATE_SELECTED: "신규 진입 후보 선정",
+  ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
+  MACRO_EVENT_IMMINENT: "주요 경제 이벤트 임박으로 신규 진입 보수화",
+  MACRO_EVENT_RISK_WINDOW_ACTIVE: "거시 이벤트 리스크 구간",
+  MACRO_RELEASE_REACTION_WINDOW: "발표 직후 변동성 구간",
+  STALE_MARKET_DATA: "시장 데이터 지연",
 };
 
 const schedulerStatusLabelMap: Record<string, string> = {
@@ -64,6 +110,52 @@ const schedulerStatusLabelMap: Record<string, string> = {
   success: "성공",
   failed: "실패",
 };
+
+const aiReviewTypeLabelMap: Record<string, string> = {
+  entry_candidate_review: "신규 진입 후보 검토",
+  breakout_exception_review: "돌파 예외 검토",
+  protection_review: "보호 상태 점검",
+  manual_review: "수동 검토",
+  open_position_review: "오픈 포지션 점검",
+  periodic_backstop_review: "주기 백스톱 검토",
+};
+
+const triggerReasonReviewLabelMap: Record<string, string> = {
+  entry_candidate_event: "신규 진입 후보 검토",
+  breakout_exception_event: "돌파 예외 검토",
+  protection_review_event: "보호 상태 점검",
+  manual_review_event: "수동 검토",
+  open_position_recheck_due: "오픈 포지션 점검",
+  periodic_backstop_due: "주기 백스톱 검토",
+};
+
+function asNonEmptyString(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function asStringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function asMacroEventContextSummary(value: unknown): MacroEventContextSummary | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as MacroEventContextSummary) : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function asAiReviewReadModel(value: unknown): AiReviewReadModel | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as AiReviewReadModel) : null;
+}
+
+function aiDecisionReadModel(symbol: OperatorSymbol): OperatorAiDecisionReadModel {
+  return symbol.ai_decision as OperatorAiDecisionReadModel;
+}
+
+function aiReviewReadModel(symbol: OperatorSymbol): AiReviewReadModel | null {
+  return asAiReviewReadModel(aiDecisionReadModel(symbol).ai_review);
+}
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) {
@@ -261,28 +353,117 @@ function translateAiSkipReason(value: string | null | undefined) {
     AI_FAILURE_BACKOFF: "AI 실패 백오프",
     AI_COOLDOWN_ACTIVE: "AI 쿨다운 유지",
     PROTECTION_REVIEW_DETERMINISTIC_ONLY: "보호 검토는 결정론 경로만 사용",
+    ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
+    MACRO_EVENT_IMMINENT: "주요 경제 이벤트 임박으로 신규 진입 보수화",
+    MACRO_EVENT_RISK_WINDOW_ACTIVE: "거시 이벤트 리스크 구간",
+    STALE_MARKET_DATA: "시장 데이터 지연으로 AI 검토 생략",
+    LOW_SCORE: "점수 부족으로 AI 검토 생략",
+    SPREAD_STRESS: "스프레드 부담으로 AI 검토 생략",
+    EXPOSURE_LIMIT: "노출 한도로 AI 검토 생략",
   };
   return labels[value] ?? value;
 }
 
-function aiReviewSummary(symbol: OperatorDashboardPayload["symbols"][number]) {
-  const trigger = describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason);
-  if (symbol.ai_decision.last_ai_skip_reason === "NO_EVENT") {
+function translateAiReviewType(value: string | null | undefined, fallbackTriggerReason?: string | null) {
+  const reviewType = asNonEmptyString(value);
+  if (reviewType) {
+    return aiReviewTypeLabelMap[reviewType] ?? reviewType;
+  }
+  if (fallbackTriggerReason) {
+    return triggerReasonReviewLabelMap[fallbackTriggerReason] ?? describeAiTriggerReason(fallbackTriggerReason).label;
+  }
+  return "-";
+}
+
+function getAiSkipReason(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  const review = aiReviewReadModel(symbol);
+  return (
+    asNonEmptyString(review?.skip_reason) ??
+    asNonEmptyString(ai.ai_skip_reason) ??
+    asNonEmptyString(ai.last_ai_skip_reason)
+  );
+}
+
+function getAiTriggerReasonCodes(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  const reviewCodes = asStringArray(aiReviewReadModel(symbol)?.trigger_reason_codes);
+  return reviewCodes.length > 0 ? reviewCodes : asStringArray(ai.ai_trigger_reason_codes);
+}
+
+function getAiTriggerReason(symbol: OperatorSymbol) {
+  return asNonEmptyString(aiReviewReadModel(symbol)?.trigger_reason) ?? symbol.ai_decision.last_ai_trigger_reason;
+}
+
+function aiReviewTypeLabel(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  const review = aiReviewReadModel(symbol);
+  return translateAiReviewType(review?.review_type ?? ai.ai_review_type, getAiTriggerReason(symbol));
+}
+
+function aiReviewReasonHint(symbol: OperatorSymbol) {
+  const reasonCodes = getAiTriggerReasonCodes(symbol);
+  if (reasonCodes.length > 0) {
+    return `사유 코드 ${formatTranslatedCodeList(reasonCodes)} / 원본 ${formatCodeList(reasonCodes)}`;
+  }
+  const triggerReason = getAiTriggerReason(symbol);
+  const trigger = describeAiTriggerReason(triggerReason);
+  if (trigger.legacy) {
+    return trigger.hint;
+  }
+  return triggerReason
+    ? `trigger ${triggerReason}`
+    : "trigger reason 없음";
+}
+
+function aiMarketSignalSummary(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  const marketSignalContext = asRecord(ai.market_signal_context);
+  return (
+    asNonEmptyString(ai.market_signal_summary) ??
+    asNonEmptyString(marketSignalContext?.summary) ??
+    asNonEmptyString(ai.ai_trigger_summary) ??
+    "feature 근거 없음"
+  );
+}
+
+function aiMacroEventContext(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  return (
+    asMacroEventContextSummary(ai.macro_event_risk_summary) ??
+    asMacroEventContextSummary(ai.macro_event_context_summary)
+  );
+}
+
+function aiReviewSummary(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  const review = aiReviewReadModel(symbol);
+  const trigger = describeAiTriggerReason(getAiTriggerReason(symbol));
+  const skipReason = getAiSkipReason(symbol);
+  const providerStatus = asNonEmptyString(review?.provider_status);
+  const triggerDeduped = review?.trigger_deduped === true || symbol.ai_decision.trigger_deduped === true;
+  if (skipReason === "NO_EVENT") {
     return { label: "AI 미호출", detail: "검토 이벤트 없음" };
   }
-  if (symbol.ai_decision.trigger_deduped || symbol.ai_decision.last_ai_skip_reason === "TRIGGER_DEDUPED") {
-    return { label: "AI 재검토 생략", detail: "직전 검토와 변화 없음" };
+  if (triggerDeduped || skipReason === "TRIGGER_DEDUPED" || providerStatus === "deduped") {
+    return { label: "AI 재검토 생략", detail: review?.dedupe_reason ?? "직전 검토와 변화 없음" };
   }
-  if (symbol.ai_decision.last_ai_skip_reason) {
+  if (skipReason || providerStatus === "skipped_pre_ai" || review?.provider_skipped === true) {
     return {
-      label: "AI 미호출",
-      detail: translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason),
+      label: "AI 검토 생략",
+      detail: translateAiSkipReason(skipReason ?? providerStatus),
     };
   }
-  if (symbol.ai_decision.last_ai_invoked_at || symbol.ai_decision.provider_name) {
+  if (
+    review?.provider_invoked === true ||
+    providerStatus === "invoked" ||
+    review?.invoked_at ||
+    ai.last_ai_invoked_at ||
+    ai.provider_name
+  ) {
     return {
-      label: trigger.legacy ? "과거 정책 기록" : "AI 호출",
-      detail: trigger.label,
+      label: trigger.legacy ? "과거 정책 기록" : "AI 검토 실행",
+      detail: aiReviewTypeLabel(symbol),
     };
   }
   return { label: "AI 상태 미확정", detail: "-" };
@@ -393,8 +574,16 @@ function asRiskCheckRow(row: Row): RiskCheckRow {
       : [],
     approved_risk_pct: typeof row.approved_risk_pct === "number" ? row.approved_risk_pct : null,
     approved_leverage: typeof row.approved_leverage === "number" ? row.approved_leverage : null,
+    ai_review: asAiReviewReadModel(row.ai_review),
+    ai_review_type: typeof row.ai_review_type === "string" ? row.ai_review_type : null,
     ai_trigger_reason: typeof row.ai_trigger_reason === "string" ? row.ai_trigger_reason : null,
+    ai_trigger_reason_codes: asStringArray(row.ai_trigger_reason_codes),
+    ai_skip_reason: typeof row.ai_skip_reason === "string" ? row.ai_skip_reason : null,
+    last_ai_skip_reason: typeof row.last_ai_skip_reason === "string" ? row.last_ai_skip_reason : null,
     ai_trigger_summary: typeof row.ai_trigger_summary === "string" ? row.ai_trigger_summary : null,
+    market_signal_summary: typeof row.market_signal_summary === "string" ? row.market_signal_summary : null,
+    macro_event_context_summary: asMacroEventContextSummary(row.macro_event_context_summary),
+    macro_event_risk_summary: asMacroEventContextSummary(row.macro_event_risk_summary),
     created_at: typeof row.created_at === "string" ? row.created_at : null,
     payload:
       row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
@@ -414,8 +603,13 @@ function riskAllowedPresentation(value: boolean | null | undefined) {
 }
 
 function riskTriggerReasonPresentation(row: RiskCheckRow) {
-  if (row.ai_trigger_reason) {
-    return describeAiTriggerReason(row.ai_trigger_reason).label;
+  const reviewType = asNonEmptyString(row.ai_review?.review_type) ?? row.ai_review_type;
+  const triggerReason = asNonEmptyString(row.ai_review?.trigger_reason) ?? row.ai_trigger_reason;
+  if (reviewType) {
+    return translateAiReviewType(reviewType, triggerReason);
+  }
+  if (triggerReason) {
+    return describeAiTriggerReason(triggerReason).label;
   }
   if (row.decision_run_id === null) {
     return "linked decision 없음";
@@ -423,7 +617,26 @@ function riskTriggerReasonPresentation(row: RiskCheckRow) {
   return "legacy row";
 }
 
+function riskTriggerReasonHint(row: RiskCheckRow, fallback: string) {
+  const reasonCodes = asStringArray(row.ai_review?.trigger_reason_codes);
+  const effectiveReasonCodes = reasonCodes.length > 0 ? reasonCodes : row.ai_trigger_reason_codes ?? [];
+  const triggerReason = asNonEmptyString(row.ai_review?.trigger_reason) ?? row.ai_trigger_reason;
+  if (effectiveReasonCodes.length > 0) {
+    return `사유 코드 ${formatTranslatedCodeList(effectiveReasonCodes)} / 원본 ${formatCodeList(
+      effectiveReasonCodes,
+    )}`;
+  }
+  if (triggerReason) {
+    const trigger = describeAiTriggerReason(triggerReason);
+    return trigger.legacy ? trigger.hint : `trigger ${triggerReason}`;
+  }
+  return fallback;
+}
+
 function riskTriggerSummaryPresentation(row: RiskCheckRow) {
+  if (row.market_signal_summary && row.market_signal_summary.trim().length > 0) {
+    return row.market_signal_summary;
+  }
   if (row.ai_trigger_summary && row.ai_trigger_summary.trim().length > 0) {
     return row.ai_trigger_summary;
   }
@@ -434,6 +647,18 @@ function riskTriggerSummaryPresentation(row: RiskCheckRow) {
     return "feature 근거 없음";
   }
   return "legacy row";
+}
+
+function riskSkipReason(row: RiskCheckRow) {
+  return (
+    asNonEmptyString(row.ai_review?.skip_reason) ??
+    asNonEmptyString(row.ai_skip_reason) ??
+    asNonEmptyString(row.last_ai_skip_reason)
+  );
+}
+
+function riskMacroEventContext(row: RiskCheckRow) {
+  return row.macro_event_risk_summary ?? row.macro_event_context_summary ?? null;
 }
 
 function SymbolTabs({
@@ -634,8 +859,15 @@ export function DecisionView({
   const execution = symbol ? summarizeExecutionState(symbol) : null;
   const historicalGapNotice = symbol ? describeHistoricalDecisionGap(symbol) : null;
   const triggerPresentation = symbol
-    ? describeAiTriggerReason(symbol.ai_decision.last_ai_trigger_reason)
+    ? describeAiTriggerReason(getAiTriggerReason(symbol))
     : null;
+  const aiReviewLabel = symbol ? aiReviewTypeLabel(symbol) : "-";
+  const aiReviewHint = symbol ? aiReviewReasonHint(symbol) : "-";
+  const aiSkipReason = symbol ? getAiSkipReason(symbol) : null;
+  const marketSignalSummary = symbol ? aiMarketSignalSummary(symbol) : "feature 근거 없음";
+  const macroEventContext = symbol ? aiMacroEventContext(symbol) : null;
+  const macroEventSummary = formatMacroEventContextSummary(macroEventContext);
+  const macroEventDetail = formatMacroEventContextDetail(macroEventContext);
   const blockedReasonText = symbol
     ? formatTranslatedCodeList(
         symbol.risk_guard.blocked_reason_codes.length > 0
@@ -711,7 +943,7 @@ export function DecisionView({
             formatDateTime(symbol.ai_decision.last_ai_invoked_at),
             triggerPresentation?.legacy
               ? `사유 ${triggerPresentation.label} / 현재 runtime trigger가 아니라 저장된 과거 정책 기록입니다.`
-              : `사유 ${triggerPresentation?.label ?? "-"}`,
+              : `검토 분류 ${aiReviewLabel}`,
           )}
           {metricCard(
             "현재 cycle 기준",
@@ -762,12 +994,20 @@ export function DecisionView({
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {metricCard(
-                triggerPresentation?.legacy ? "과거 정책 기록" : "AI 호출 사유",
-                triggerPresentation?.label ?? "-",
-                triggerPresentation?.legacy
-                  ? triggerPresentation.hint
-                  : `건너뜀 ${translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason)}`,
+                triggerPresentation?.legacy ? "과거 정책 기록" : "AI 호출 분류",
+                aiReviewLabel,
+                triggerPresentation?.legacy ? triggerPresentation.hint : aiReviewHint,
               )}
+              {aiSkipReason
+                ? metricCard("AI 검토 생략", translateAiSkipReason(aiSkipReason), `원본 코드 ${aiSkipReason}`)
+                : null}
+              {metricCard(
+                "당시 시장 신호 요약",
+                marketSignalSummary,
+                "AI 호출 원인이 아니라 판단 당시 feature 요약입니다.",
+              )}
+              {metricCard("이벤트 리스크", macroEventSummary, macroEventDetail)}
+              {metricCard("AI 최종 판단", translateDecision(symbol.ai_decision.decision), "마지막 AI output 기준")}
               {metricCard(
                 "AI 호출 시각",
                 formatDateTime(symbol.ai_decision.last_ai_invoked_at),
@@ -932,18 +1172,23 @@ export function SchedulerView({
       </section>
 
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">AI 호출 상태</p>
-        <h2 className="mt-2 text-xl font-semibold text-slate-950">심볼별 AI 호출 / 건너뜀 상태</h2>
+        <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">AI 검토 상태</p>
+        <h2 className="mt-2 text-xl font-semibold text-slate-950">심볼별 AI 검토 / 생략 상태</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          왜 AI가 불렸는지, 왜 안 불렸는지, 중복 지문으로 건너뛰었는지, soft cap과 차단 코드가 어떤지
-          심볼별로 바로 읽을 수 있습니다.
+          실제 검토 분류, pre-AI 생략 사유, 당시 시장 신호 요약, 이벤트 리스크, soft cap과 차단 코드를 심볼별로 바로 읽을 수 있습니다.
         </p>
         <div className="mt-5 grid gap-4 xl:grid-cols-3">
           {operator.symbols.map((symbol) => {
+            const aiReview = aiReviewReadModel(symbol);
             const review = aiReviewSummary(symbol);
-            const triggerPresentation = describeAiTriggerReason(
-              symbol.ai_decision.last_ai_trigger_reason,
-            );
+            const triggerPresentation = describeAiTriggerReason(getAiTriggerReason(symbol));
+            const reviewLabel = aiReviewTypeLabel(symbol);
+            const reviewHint = aiReviewReasonHint(symbol);
+            const skipReason = getAiSkipReason(symbol);
+            const marketSummary = aiMarketSignalSummary(symbol);
+            const macroEventContext = aiMacroEventContext(symbol);
+            const macroEventSummary = formatMacroEventContextSummary(macroEventContext);
+            const macroEventDetail = formatMacroEventContextDetail(macroEventContext);
             return (
               <div key={symbol.symbol} className="rounded-md border border-slate-200 bg-slate-50 p-4">
                 <div className="flex items-center justify-between gap-3">
@@ -953,11 +1198,13 @@ export function SchedulerView({
                   </div>
                   <span
                     className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(
-                      symbol.ai_decision.trigger_deduped
+                      aiReview?.trigger_deduped === true || symbol.ai_decision.trigger_deduped
                         ? "warn"
-                        : symbol.ai_decision.last_ai_invoked_at
+                        : aiReview?.provider_invoked === true ||
+                            aiReview?.provider_status === "invoked" ||
+                            symbol.ai_decision.last_ai_invoked_at
                           ? "good"
-                          : symbol.ai_decision.last_ai_skip_reason
+                          : skipReason
                             ? "neutral"
                             : "neutral",
                     )}`}
@@ -967,26 +1214,33 @@ export function SchedulerView({
                 </div>
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
                   {metricCard(
-                    triggerPresentation.legacy ? "과거 정책 기록" : "검토 사유",
-                    triggerPresentation.label,
-                    triggerPresentation.legacy ? triggerPresentation.hint : review.detail,
+                    triggerPresentation.legacy ? "과거 정책 기록" : "AI 호출 분류",
+                    reviewLabel,
+                    triggerPresentation.legacy ? triggerPresentation.hint : reviewHint,
                     { compact: true },
                   )}
                   {metricCard(
-                    "건너뜀 상태",
-                    translateAiSkipReason(symbol.ai_decision.last_ai_skip_reason),
-                    symbol.ai_decision.trigger_deduped ? "중복 지문 감지됨" : "중복 지문 없음",
+                    "AI 검토 생략",
+                    translateAiSkipReason(skipReason),
+                    skipReason ? `원본 코드 ${skipReason}` : "skip reason 없음",
                     { compact: true },
                   )}
+                  {metricCard(
+                    "당시 시장 신호 요약",
+                    marketSummary,
+                    "AI 호출 원인이 아니라 판단 당시 feature 요약입니다.",
+                    { compact: true },
+                  )}
+                  {metricCard("이벤트 리스크", macroEventSummary, macroEventDetail, { compact: true })}
                   {metricCard(
                     "마지막 AI 호출",
-                    formatDateTime(symbol.ai_decision.last_ai_invoked_at),
-                    `제공자 ${symbol.ai_decision.provider_name ?? "-"}`,
+                    formatDateTime(aiReview?.invoked_at ?? symbol.ai_decision.last_ai_invoked_at),
+                    `제공자 ${aiReview?.provider_name ?? symbol.ai_decision.provider_name ?? "-"}`,
                     { compact: true },
                   )}
                   {metricCard(
                     "트리거 지문",
-                    shortFingerprint(symbol.ai_decision.trigger_fingerprint),
+                    shortFingerprint(aiReview?.trigger_fingerprint ?? symbol.ai_decision.trigger_fingerprint),
                     "이벤트 기반 호출에서 동일 지문 재호출 방지에 사용합니다.",
                     { compact: true },
                   )}
@@ -1041,9 +1295,9 @@ export function RiskView({
     <div className="space-y-6">
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">리스크 점검</p>
-        <h2 className="mt-2 text-xl font-semibold text-slate-950">AI 호출 사유와 risk 결과를 한 카드에서 확인</h2>
+        <h2 className="mt-2 text-xl font-semibold text-slate-950">AI 검토 분류와 risk 결과를 한 카드에서 확인</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
-          왜 AI 검토가 열렸는지, 허용/차단이 어떻게 결정됐는지, 승인 risk와 leverage가 얼마였는지를 먼저 보여줍니다.
+          실제 AI 검토 분류, 당시 시장 신호 요약, 이벤트 리스크, 허용/차단 결과와 승인 risk/leverage를 분리해서 보여줍니다.
           근거가 부족한 예전 row는 추정하지 않고 legacy 여부를 그대로 드러냅니다.
         </p>
       </section>
@@ -1070,9 +1324,14 @@ export function RiskView({
               const allowed = riskAllowedPresentation(row.allowed);
               const triggerReason = riskTriggerReasonPresentation(row);
               const triggerSummary = riskTriggerSummaryPresentation(row);
+              const skipReason = riskSkipReason(row);
+              const macroEventContext = riskMacroEventContext(row);
+              const macroEventSummary = formatMacroEventContextSummary(macroEventContext);
+              const macroEventDetail = formatMacroEventContextDetail(macroEventContext);
               const symbolLabel = row.symbol ?? `Risk ${index + 1}`;
               const decisionRunLabel =
                 row.decision_run_id !== null ? `decision #${row.decision_run_id}` : "linked decision 없음";
+              const triggerReasonHint = riskTriggerReasonHint(row, decisionRunLabel);
 
               return (
                 <article
@@ -1094,10 +1353,21 @@ export function RiskView({
                   </div>
 
                   <div className="mt-4 grid gap-3 lg:grid-cols-2">
-                    {metricCard("AI 호출 분류", triggerReason, decisionRunLabel, { compact: true })}
-                    {metricCard("AI 호출 요약", triggerSummary, "추정 복원 없이 저장 근거만 표시", { compact: true })}
+                    {metricCard("AI 호출 분류", triggerReason, triggerReasonHint, { compact: true })}
+                    {skipReason
+                      ? metricCard("AI 검토 생략", translateAiSkipReason(skipReason), `원본 코드 ${skipReason}`, {
+                          compact: true,
+                        })
+                      : null}
+                    {metricCard(
+                      "당시 시장 신호 요약",
+                      triggerSummary,
+                      "AI 호출 원인이 아니라 판단 당시 feature 요약입니다.",
+                      { compact: true },
+                    )}
+                    {metricCard("이벤트 리스크", macroEventSummary, macroEventDetail, { compact: true })}
+                    {metricCard("AI 최종 판단", translateDecision(row.decision), "risk 대상 결정")}
                     {metricCard("허용 여부", allowed.label, allowed.hint)}
-                    {metricCard("의사결정", translateDecision(row.decision), "risk 대상 결정")}
                     {metricCard(
                       "차단 사유",
                       formatTranslatedCodeList(row.reason_codes),

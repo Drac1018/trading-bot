@@ -5,6 +5,7 @@ from threading import Event, Thread
 from time import perf_counter, sleep
 
 import httpx
+import pytest
 import trading_mvp.main as main_module
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -169,6 +170,14 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert "estimated_monthly_ai_calls" not in serialized
     assert "estimated_monthly_ai_calls" not in serialized["symbol_effective_cadences"][0]
     assert "starting_equity" not in serialized
+    routing_policy = serialized["ai_model_routing_policy"]
+    assert routing_policy["primary_model"] == "gpt-4.1-mini"
+    assert routing_policy["runtime_model_source"] == "settings.ai_model"
+    routes = {item["route"]: item for item in routing_policy["routes"]}
+    assert routes["pre_ai_skip_simple_classification"]["call_policy"] == "no_model_call"
+    assert routes["daily_dashboard_explanation"]["call_policy"] == "read_model_no_model_call"
+    assert routes["general_entry_review"]["configured_model"] == "gpt-4.1-mini"
+    assert "gpt-5-mini" in routes["macro_event_position_complex"]["model_candidates"]
 
 
 def test_settings_update_preserves_event_source_fields_when_older_payload_omits_them(db_session) -> None:
@@ -218,6 +227,7 @@ def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> No
     assert serialized["event_source_bls_enrichment_url"] == "https://bls.settings/releases"
     assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
     assert serialized["event_source_api_key_configured"] is True
+    assert "pre_ai_skip_simple_classification" in serialized["ai_model_routing_policy"]["no_model_call_routes"]
 
 
 def test_settings_auxiliary_serializers_expose_cadences_and_ai_usage(db_session) -> None:
@@ -664,6 +674,48 @@ def test_serialize_settings_merges_global_and_symbol_cadence_overrides(db_sessio
     assert effective["BTCUSDT"]["ai_call_interval_minutes"] == 10
     assert effective["ETHUSDT"]["decision_cycle_interval_minutes"] == 15
     assert effective["ETHUSDT"]["uses_global_defaults"] is True
+
+
+def test_symbol_cadence_override_allows_short_market_timeframes(db_session) -> None:
+    payload_data = build_settings_payload().model_dump()
+    payload_data["tracked_symbols"] = ["BTCUSDT", "XRPUSDT", "SOLUSDT"]
+    payload_data["symbol_cadence_overrides"] = [
+        {
+            "symbol": "XRPUSDT",
+            "enabled": True,
+            "timeframe_override": "1m",
+            "market_refresh_interval_minutes_override": 1,
+        },
+        {
+            "symbol": "SOLUSDT",
+            "enabled": True,
+            "timeframe_override": "5m",
+        },
+    ]
+
+    row = update_settings(db_session, AppSettingsUpdateRequest(**payload_data))
+    serialized = serialize_settings(row)
+    effective = {item["symbol"]: item for item in serialized["symbol_effective_cadences"]}
+
+    assert effective["XRPUSDT"]["timeframe"] == "1m"
+    assert effective["XRPUSDT"]["market_refresh_interval_minutes"] == 1
+    assert effective["SOLUSDT"]["timeframe"] == "5m"
+    assert effective["BTCUSDT"]["timeframe"] == "15m"
+    assert effective["BTCUSDT"]["uses_global_defaults"] is True
+
+
+def test_symbol_cadence_override_rejects_unsupported_timeframe() -> None:
+    payload_data = build_settings_payload().model_dump()
+    payload_data["symbol_cadence_overrides"] = [
+        {
+            "symbol": "XRPUSDT",
+            "enabled": True,
+            "timeframe_override": "2m",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="timeframe_override"):
+        AppSettingsUpdateRequest(**payload_data)
 
 
 def test_serialize_settings_applies_hard_runtime_caps(db_session) -> None:

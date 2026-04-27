@@ -23,7 +23,28 @@ const labelMap: Record<string, string> = {
   allowed: "허용 여부",
   confidence: "신뢰도",
   ai_trigger_reason: "AI 호출 분류",
-  ai_trigger_summary: "AI 호출 요약",
+  ai_review_type: "AI 호출 분류",
+  ai_trigger_reason_codes: "실제 trigger reason code",
+  ai_review: "AI 검토 사유",
+  ai_skip_reason: "AI 검토 생략 사유",
+  last_ai_skip_reason: "AI 검토 생략 사유",
+  provider_status: "AI 공급자 상태",
+  provider_invoked: "AI 공급자 호출",
+  provider_skipped: "AI 공급자 생략",
+  market_signal_context: "당시 시장 신호",
+  ai_trigger_summary: "당시 시장 신호 요약",
+  market_signal_summary: "당시 시장 신호 요약",
+  macro_event_context_summary: "이벤트 리스크",
+  macro_event_risk_summary: "이벤트 리스크",
+  risk_guard_result: "risk_guard 결과",
+  next_event_name: "다음 이벤트",
+  next_event_importance: "이벤트 중요도",
+  minutes_to_next_event: "이벤트까지 남은 시간",
+  active_risk_window: "이벤트 리스크 구간",
+  release_reaction_window: "발표 직후 변동성 구간",
+  enrichment_vendors: "실제값 반영 출처",
+  bls_actual_enriched: "BLS 실제값 반영",
+  bea_actual_enriched: "BEA 실제값 반영",
   suppression_active: "진입 제안 억제",
   suppression_reason_code: "진입 제안 억제 사유",
   allow_same_side_add_on: "same-side add-on 허용",
@@ -243,6 +264,10 @@ const valueMap: Record<string, string> = {
   success: "성공",
   failed: "실패",
   skipped: "건너뜀",
+  skipped_pre_ai: "AI 검토 생략",
+  invoked: "AI 검토 실행",
+  deduped: "중복 생략",
+  not_invoked: "AI 호출 없음",
   running: "실행 중",
   manual: "수동",
   low: "낮음",
@@ -264,10 +289,24 @@ const valueMap: Record<string, string> = {
   health_system: "헬스/시스템",
   ai_decision: "AI/의사결정",
   ai: "AI",
+  entry_candidate_review: "신규 진입 후보 검토",
+  breakout_exception_review: "돌파 예외 검토",
+  protection_review: "보호 상태 점검",
+  manual_review: "수동 검토",
+  open_position_review: "오픈 포지션 점검",
+  periodic_backstop_review: "주기 백스톱 검토",
   entry_candidate_event: "진입 후보 이벤트",
   breakout_exception_event: "브레이크아웃 예외 이벤트",
   protection_review_event: "보호 상태 점검",
   manual_review_event: "수동 검토",
+  external_api: "외부 API",
+  fixture: "테스트 fixture",
+  stub: "stub",
+  unavailable: "사용 불가",
+  incomplete: "불완전",
+  fred: "FRED",
+  bls: "BLS",
+  bea: "BEA",
   user: "사용자",
   manual_source: "수동",
   "deterministic-mock": "결정론 Mock",
@@ -356,6 +395,14 @@ const valueMap: Record<string, string> = {
 };
 
 const reasonCodeMap: Record<string, string> = {
+  ENTRY_CANDIDATE_SELECTED: "신규 진입 후보 선정",
+  ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
+  MACRO_EVENT_RISK_WINDOW_ACTIVE: "거시 이벤트 리스크 구간",
+  MACRO_EVENT_IMMINENT: "주요 경제 이벤트 임박으로 신규 진입 보수화",
+  MACRO_RELEASE_REACTION_WINDOW: "발표 직후 변동성 구간",
+  MACRO_EVENT_CONTEXT_STALE: "이벤트 데이터 지연",
+  MACRO_EVENT_CONTEXT_INCOMPLETE: "이벤트 데이터 불완전",
+  MACRO_EVENT_ENRICHMENT_AVAILABLE: "경제지표 실제값 반영 가능",
   ENTRY_AUTO_RESIZED: "진입 수량이 자동 축소 승인되었습니다.",
   ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT: "총 노출 한도에 맞게 진입 수량이 축소되었습니다.",
   ENTRY_CLAMPED_TO_DIRECTIONAL_LIMIT: "방향 편향 한도에 맞게 진입 수량이 축소되었습니다.",
@@ -558,6 +605,128 @@ function formatBoolean(key: string | undefined, value: boolean) {
 
 export const exchangeCanTradeAccountHint =
   "거래소 계좌 응답 기준으로 새 주문이 명시적으로 차단됐는지 보여줍니다. canTrade 필드가 없는 선물 응답은 차단으로 간주하지 않으며, 앱 실주문 준비 상태는 별도로 확인해야 합니다.";
+
+export type MacroEventContextSummary = {
+  source_status?: string | null;
+  source_vendor?: string | null;
+  next_event_name?: string | null;
+  next_event_importance?: string | null;
+  minutes_to_next_event?: number | null;
+  active_risk_window?: boolean | null;
+  release_reaction_window?: boolean | null;
+  is_stale?: boolean | null;
+  is_complete?: boolean | null;
+  is_incomplete?: boolean | null;
+  affected_assets?: string[] | null;
+  enrichment_vendors?: string[] | null;
+  bls_actual_enriched?: boolean | null;
+  bea_actual_enriched?: boolean | null;
+  event_risk_active?: boolean | null;
+  event_risk_reason_codes?: string[] | null;
+  event_bias_used?: string | null;
+};
+
+function asMacroEventContext(value: unknown): MacroEventContextSummary | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as MacroEventContextSummary;
+}
+
+function hasMacroEventContext(value: MacroEventContextSummary | null) {
+  if (!value) {
+    return false;
+  }
+  return Boolean(
+    value.source_status ||
+      value.next_event_name ||
+      value.event_risk_active ||
+      (Array.isArray(value.event_risk_reason_codes) && value.event_risk_reason_codes.length > 0),
+  );
+}
+
+function macroEventDataUncertain(value: MacroEventContextSummary) {
+  return Boolean(
+    value.is_stale ||
+      value.is_incomplete ||
+      value.is_complete === false ||
+      ["stale", "incomplete", "unavailable", "error"].includes(String(value.source_status ?? "")),
+  );
+}
+
+function macroEventMinuteText(minutes: number) {
+  if (minutes < 0) {
+    return `${Math.abs(minutes)}분 전 발표`;
+  }
+  return `${minutes}분 전`;
+}
+
+export function formatMacroEventContextSummary(value: unknown): string {
+  const context = asMacroEventContext(value);
+  if (!hasMacroEventContext(context) || !context) {
+    return "이벤트 정보 없음";
+  }
+  if (macroEventDataUncertain(context)) {
+    return "이벤트 데이터 지연/불완전";
+  }
+  if (context.release_reaction_window) {
+    return "발표 직후 변동성 구간";
+  }
+  const eventName = context.next_event_name?.trim();
+  const isHighImpact = context.next_event_importance === "high";
+  const minutes = typeof context.minutes_to_next_event === "number" ? context.minutes_to_next_event : null;
+  if (minutes !== null && minutes < 0 && context.active_risk_window) {
+    return "발표 직후 변동성 구간";
+  }
+  if (minutes !== null) {
+    const prefix = isHighImpact ? "주요 경제 이벤트" : eventName ?? "경제 이벤트";
+    return `${prefix} ${macroEventMinuteText(minutes)}`;
+  }
+  if (context.active_risk_window) {
+    return "이벤트 리스크 구간";
+  }
+  return eventName ?? "이벤트 정보 있음";
+}
+
+export function formatMacroEventContextDetail(value: unknown): string {
+  const context = asMacroEventContext(value);
+  if (!hasMacroEventContext(context) || !context) {
+    return "AI 판단 당시 이벤트 컨텍스트 없음";
+  }
+  const parts: string[] = [];
+  if (macroEventDataUncertain(context)) {
+    parts.push("이벤트 데이터 지연/불완전");
+  }
+  if (context.next_event_name) {
+    parts.push(context.next_event_name);
+  }
+  if (context.next_event_importance) {
+    parts.push(`중요도 ${formatDisplayValue(context.next_event_importance)}`);
+  }
+  if (context.active_risk_window) {
+    parts.push("active risk window");
+  }
+  if (context.release_reaction_window) {
+    parts.push("발표 직후 변동성 구간");
+  }
+  if (context.bls_actual_enriched) {
+    parts.push("BLS 실제값 반영됨");
+  }
+  if (context.bea_actual_enriched) {
+    parts.push("BEA 실제값 반영됨");
+  }
+  if (context.source_status) {
+    const vendor = context.source_vendor ? ` / ${formatDisplayValue(context.source_vendor)}` : "";
+    parts.push(`source ${formatDisplayValue(context.source_status)}${vendor}`);
+  }
+  if (context.affected_assets && context.affected_assets.length > 0) {
+    parts.push(`자산 ${context.affected_assets.join(", ")}`);
+  }
+  if (context.event_risk_reason_codes && context.event_risk_reason_codes.length > 0) {
+    parts.push(`사유 ${context.event_risk_reason_codes.map((code) => formatDisplayValue(code)).join(", ")}`);
+  }
+  return parts.join(" / ");
+}
 
 function formatNumber(key: string | undefined, value: number) {
   if (durationKeys.has(key ?? "")) {

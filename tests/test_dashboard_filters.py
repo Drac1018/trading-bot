@@ -24,6 +24,7 @@ from trading_mvp.services.dashboard import (
     get_overview,
     get_positions,
     get_profitability_dashboard,
+    get_risk_checks,
 )
 from trading_mvp.services.runtime_state import (
     mark_sync_success,
@@ -498,6 +499,7 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             },
             "ai_trigger": {
                 "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
                 "trigger_fingerprint": "btc-trigger-seed",
             },
             "last_ai_trigger_reason": "entry_candidate_event",
@@ -599,6 +601,7 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
             },
             "ai_trigger": {
                 "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
                 "trigger_fingerprint": "eth-trigger-seed",
             },
             "last_ai_trigger_reason": "entry_candidate_event",
@@ -800,6 +803,7 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
                     "last_ai_skip_reason": "TRIGGER_DEDUPED",
                     "trigger": {
                         "trigger_reason": "entry_candidate_event",
+                        "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
                         "trigger_fingerprint": "btc-trigger-seed",
                     },
                 },
@@ -820,6 +824,7 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
                     "last_ai_skip_reason": None,
                     "trigger": {
                         "trigger_reason": "entry_candidate_event",
+                        "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
                         "trigger_fingerprint": "eth-trigger-seed",
                     },
                 },
@@ -1426,8 +1431,24 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.ai_decision.decision == "long"
     assert btc.ai_decision.raw_output == {}
     assert btc.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert btc.ai_decision.ai_review_type == "entry_candidate_review"
+    assert btc.ai_decision.ai_trigger_reason_codes == ["ENTRY_CANDIDATE_SELECTED"]
     assert btc.ai_decision.trigger_deduped is True
     assert btc.ai_decision.last_ai_skip_reason == "TRIGGER_DEDUPED"
+    assert btc.ai_decision.ai_skip_reason == "TRIGGER_DEDUPED"
+    assert btc.ai_decision.ai_review.trigger_reason == "entry_candidate_event"
+    assert btc.ai_decision.ai_review.trigger_reason_codes == ["ENTRY_CANDIDATE_SELECTED"]
+    assert btc.ai_decision.ai_review.dedupe_reason == "TRIGGER_DEDUPED"
+    assert btc.ai_decision.ai_review.provider_invoked is True
+    assert btc.ai_decision.ai_review.provider_skipped is True
+    assert btc.ai_decision.ai_review.provider_status == "deduped"
+    assert btc.ai_decision.market_signal_summary is not None
+    assert btc.ai_decision.ai_trigger_summary == btc.ai_decision.market_signal_summary
+    assert btc.ai_decision.market_signal_context.summary == btc.ai_decision.market_signal_summary
+    assert btc.ai_decision.market_signal_context.momentum_score == 0.92
+    assert btc.ai_decision.market_signal_context.volume_ratio == 1.33
+    assert btc.ai_decision.market_signal_context.trend_alignment == "bullish_aligned"
+    assert btc.ai_decision.market_signal_context.breakout_direction == "up"
     assert btc.ai_decision.suppression_active is True
     assert btc.ai_decision.suppression_reason_code == "LARGEST_POSITION_LIMIT_REACHED"
     assert btc.ai_decision.allow_same_side_add_on is False
@@ -1445,6 +1466,11 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.risk_guard.holding_profile == "scalp"
     assert btc.risk_guard.holding_profile_reason == "scalp_default_intraday_bias"
     assert btc.risk_guard.portfolio_slot_soft_cap_applied is False
+    assert btc.risk_guard_result.allowed is False
+    assert btc.risk_guard_result.blocked_reason_codes == ["POSITION_STATE_STALE"]
+    assert btc.risk_guard_result.approved_risk_pct == 0.0
+    assert btc.risk_guard_result.approved_leverage == 0.0
+    assert btc.risk_guard_result.hold_decision is False
     assert btc.blocked_reasons == ["POSITION_STATE_STALE"]
     assert btc.candidate_selection.assigned_slot == "slot_1"
     assert btc.candidate_selection.candidate_weight == 0.64
@@ -1480,6 +1506,11 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert eth.ai_decision.decision == "long"
     assert eth.ai_decision.raw_output == {}
     assert eth.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert eth.ai_decision.ai_review_type == "entry_candidate_review"
+    assert eth.ai_decision.ai_trigger_reason_codes == ["ENTRY_CANDIDATE_SELECTED"]
+    assert eth.ai_decision.ai_review.provider_invoked is True
+    assert eth.ai_decision.ai_review.provider_skipped is False
+    assert eth.ai_decision.ai_review.provider_status == "invoked"
     assert eth.ai_decision.last_ai_invoked_at is not None
     assert eth.ai_decision.suppression_active is False
     assert eth.ai_decision.suppression_reason_code is None
@@ -1504,6 +1535,11 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert eth.risk_guard.holding_profile == "swing"
     assert eth.risk_guard.holding_profile_reason == "swing_intraday_trend_extension_allowed"
     assert eth.risk_guard.portfolio_slot_soft_cap_applied is True
+    assert eth.risk_guard_result.allowed is True
+    assert eth.risk_guard_result.blocked_reason_codes == []
+    assert eth.risk_guard_result.approved_risk_pct == 0.01
+    assert eth.risk_guard_result.approved_leverage == 2.0
+    assert eth.risk_guard_result.hold_decision is False
     assert eth.blocked_reasons == []
     assert eth.candidate_selection.assigned_slot == "slot_2"
     assert eth.candidate_selection.candidate_weight == 0.42
@@ -1538,6 +1574,548 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
         and event.payload.get("approval_window_open") is True
         for event in payload.audit_events
     )
+
+
+def test_operator_dashboard_exposes_weak_volume_preai_skip_reason(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BNBUSDT"
+    settings.tracked_symbols = ["BNBUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="deterministic",
+            summary="bnb weak volume pre-ai skip",
+            input_payload={
+                "ai_trigger": {
+                    "trigger_reason": "entry_candidate_event",
+                    "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                    "trigger_fingerprint": "bnb-trigger-seed",
+                },
+                "features": {
+                    "trend_score": 0.32,
+                    "momentum_score": 0.18,
+                    "volume_ratio": 0.07,
+                    "regime": {
+                        "primary_regime": "bullish",
+                        "trend_alignment": "bullish_aligned",
+                        "volume_regime": "weak",
+                        "weak_volume": True,
+                    },
+                },
+            },
+            output_payload={
+                "symbol": "BNBUSDT",
+                "timeframe": "15m",
+                "decision": "hold",
+                "confidence": 0.5,
+                "rationale_codes": ["ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"],
+                "explanation_short": "Weak volume pre-AI skip",
+            },
+            metadata_json={
+                "source": "deterministic",
+                "ai_trigger": {
+                    "trigger_reason": "entry_candidate_event",
+                    "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                    "trigger_fingerprint": "bnb-trigger-seed",
+                },
+                "last_ai_trigger_reason": "entry_candidate_event",
+                "last_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+                "pre_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+                "trigger_fingerprint": "bnb-trigger-seed",
+            },
+            schema_valid=True,
+            created_at=now,
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+    bnb = payload.symbols[0]
+
+    assert bnb.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert bnb.ai_decision.ai_review_type == "entry_candidate_review"
+    assert bnb.ai_decision.ai_trigger_reason_codes == ["ENTRY_CANDIDATE_SELECTED"]
+    assert bnb.ai_decision.last_ai_skip_reason == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert bnb.ai_decision.ai_skip_reason == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert bnb.ai_decision.ai_review.skip_reason == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert bnb.ai_decision.ai_review.provider_invoked is False
+    assert bnb.ai_decision.ai_review.provider_skipped is True
+    assert bnb.ai_decision.ai_review.provider_status == "skipped_pre_ai"
+    assert bnb.ai_decision.market_signal_summary is not None
+    assert bnb.ai_decision.ai_trigger_summary == bnb.ai_decision.market_signal_summary
+    assert bnb.ai_decision.market_signal_context.weak_volume is True
+    assert bnb.ai_decision.market_signal_context.volume_ratio == 0.07
+
+
+def test_operator_dashboard_distinguishes_ai_invoked_hold_from_preai_skip(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "HOLDUSDT"
+    settings.tracked_symbols = ["HOLDUSDT", "SKIPUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    hold_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="hold after ai",
+        input_payload={
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "hold-trigger",
+            },
+            "market_snapshot": {
+                "symbol": "HOLDUSDT",
+                "timeframe": "15m",
+                "snapshot_time": now.isoformat(),
+            },
+            "features": {
+                "trend_score": 0.32,
+                "momentum_score": 0.18,
+                "volume_ratio": 1.08,
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "normal",
+                    "weak_volume": False,
+                },
+            },
+        },
+        output_payload={
+            "symbol": "HOLDUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.62,
+            "rationale_codes": ["TEST_PROVIDER_CALLED"],
+            "explanation_short": "AI reviewed and held",
+        },
+        metadata_json={
+            "source": "llm",
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "hold-trigger",
+            },
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": now.isoformat(),
+            "last_ai_skip_reason": None,
+            "trigger_fingerprint": "hold-trigger",
+        },
+        schema_valid=True,
+        created_at=now,
+    )
+    skip_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="deterministic-mock",
+        summary="weak volume pre-ai skip",
+        input_payload={
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "skip-trigger",
+            },
+            "market_snapshot": {
+                "symbol": "SKIPUSDT",
+                "timeframe": "15m",
+                "snapshot_time": now.isoformat(),
+            },
+            "features": {
+                "trend_score": 0.32,
+                "momentum_score": 0.18,
+                "volume_ratio": 0.07,
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "weak",
+                    "weak_volume": True,
+                },
+            },
+        },
+        output_payload={
+            "symbol": "SKIPUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.5,
+            "rationale_codes": ["ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"],
+            "explanation_short": "Weak volume pre-AI skip",
+        },
+        metadata_json={
+            "source": "deterministic",
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "skip-trigger",
+            },
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+            "pre_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+            "trigger_fingerprint": "skip-trigger",
+        },
+        schema_valid=True,
+        created_at=now - timedelta(seconds=1),
+    )
+    db_session.add_all([hold_run, skip_run])
+    db_session.flush()
+    for run in (hold_run, skip_run):
+        db_session.add(
+            RiskCheck(
+                symbol=run.output_payload["symbol"],
+                decision_run_id=run.id,
+                allowed=False,
+                decision="hold",
+                reason_codes=["HOLD_DECISION"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={
+                    "allowed": False,
+                    "decision": "hold",
+                    "reason_codes": ["HOLD_DECISION"],
+                    "blocked_reason_codes": ["HOLD_DECISION"],
+                },
+            )
+        )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+    hold = next(item for item in payload.symbols if item.symbol == "HOLDUSDT")
+    skip = next(item for item in payload.symbols if item.symbol == "SKIPUSDT")
+
+    assert hold.ai_decision.decision == "hold"
+    assert hold.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert hold.ai_decision.ai_review_type == "entry_candidate_review"
+    assert hold.ai_decision.ai_trigger_reason_codes == ["ENTRY_CANDIDATE_SELECTED"]
+    assert hold.ai_decision.last_ai_invoked_at is not None
+    assert hold.ai_decision.last_ai_skip_reason is None
+    assert hold.ai_decision.ai_skip_reason is None
+    assert hold.ai_decision.ai_review.provider_invoked is True
+    assert hold.ai_decision.ai_review.provider_skipped is False
+    assert hold.ai_decision.ai_review.provider_status == "invoked"
+    assert hold.risk_guard.decision == "hold"
+    assert hold.risk_guard.blocked_reason_codes == ["HOLD_DECISION"]
+    assert hold.risk_guard_result.hold_decision is True
+    assert hold.ai_decision.market_signal_summary is not None
+    assert "거래량" in hold.ai_decision.market_signal_summary
+    assert hold.ai_decision.market_signal_context.volume_ratio == 1.08
+
+    assert skip.ai_decision.decision == "hold"
+    assert skip.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert skip.ai_decision.ai_review_type == "entry_candidate_review"
+    assert skip.ai_decision.ai_trigger_reason_codes == ["ENTRY_CANDIDATE_SELECTED"]
+    assert skip.ai_decision.last_ai_invoked_at is None
+    assert skip.ai_decision.last_ai_skip_reason == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert skip.ai_decision.ai_skip_reason == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert skip.ai_decision.ai_review.provider_invoked is False
+    assert skip.ai_decision.ai_review.provider_skipped is True
+    assert skip.ai_decision.ai_review.provider_status == "skipped_pre_ai"
+    assert skip.risk_guard.decision == "hold"
+    assert skip.risk_guard.blocked_reason_codes == ["HOLD_DECISION"]
+    assert skip.risk_guard_result.hold_decision is True
+    assert skip.ai_decision.market_signal_summary is not None
+    assert "거래량" in skip.ai_decision.market_signal_summary
+    assert skip.ai_decision.market_signal_context.weak_volume is True
+
+
+def test_operator_dashboard_exposes_decision_macro_event_context_and_enrichment(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "CPIUSDT"
+    settings.tracked_symbols = ["CPIUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    event_context = {
+        "source_status": "external_api",
+        "source_provenance": "external_api",
+        "source_vendor": "fred",
+        "generated_at": now.isoformat(),
+        "is_stale": False,
+        "is_complete": True,
+        "next_event_at": (now + timedelta(minutes=10)).isoformat(),
+        "next_event_name": "US CPI",
+        "next_event_importance": "high",
+        "minutes_to_next_event": 10,
+        "active_risk_window": True,
+        "affected_assets": ["USD", "CRYPTO"],
+        "event_bias": "bearish",
+        "enrichment_vendors": ["bls", "bea"],
+        "events": [
+            {
+                "event_name": "US CPI",
+                "event_at": (now + timedelta(minutes=10)).isoformat(),
+                "importance": "high",
+                "affected_assets": ["USD", "CRYPTO"],
+                "release_enrichment": {
+                    "bls": {"actual": 3.2, "prior": 3.1, "forecast": 3.0},
+                    "bea": {"actual": 0.4, "prior": 0.3, "forecast": 0.2},
+                },
+            }
+        ],
+    }
+    event_risk_context = {
+        "event_risk_active": True,
+        "reason_codes": [
+            "MACRO_EVENT_RISK_WINDOW_ACTIVE",
+            "MACRO_EVENT_IMMINENT",
+            "MACRO_EVENT_ENRICHMENT_AVAILABLE",
+        ],
+        "risk_pct_multiplier": 0.5,
+        "hold_bias": 0.25,
+        "event_name": "US CPI",
+        "event_importance": "high",
+        "minutes_to_event": 10,
+        "active_risk_window": True,
+        "source_status": "external_api",
+        "source_vendor": "fred",
+        "affected_assets": ["USD", "CRYPTO"],
+        "event_bias_observed": "bearish",
+        "event_bias_used": "bearish",
+        "enrichment_vendors": ["bls", "bea"],
+    }
+    run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="macro risk hold",
+        input_payload={
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "macro-event-trigger",
+            },
+            "market_snapshot": {
+                "symbol": "CPIUSDT",
+                "timeframe": "15m",
+                "snapshot_time": now.isoformat(),
+                "event_context": event_context,
+            },
+            "features": {
+                "trend_score": 0.32,
+                "momentum_score": 0.18,
+                "volume_ratio": 1.08,
+                "event_context": event_context,
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "normal",
+                    "weak_volume": False,
+                },
+            },
+            "ai_context": {
+                "event_context_summary": {
+                    "source_status": "external_api",
+                    "source_provenance": "external_api",
+                    "source_vendor": "fred",
+                    "next_event_name": "US CPI",
+                    "next_event_importance": "high",
+                    "minutes_to_next_event": 10,
+                    "active_risk_window": True,
+                    "event_bias": "bearish",
+                    "enrichment_vendors": ["bls", "bea"],
+                },
+                "event_risk_active": True,
+                "event_risk_reason_codes": event_risk_context["reason_codes"],
+                "event_risk_context": event_risk_context,
+            },
+        },
+        output_payload={
+            "symbol": "CPIUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.52,
+            "rationale_codes": ["MACRO_EVENT_IMMINENT"],
+            "explanation_short": "Macro event risk kept the entry conservative.",
+        },
+        metadata_json={
+            "source": "llm",
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": now.isoformat(),
+            "event_risk_active": True,
+            "event_risk_reason_codes": event_risk_context["reason_codes"],
+            "event_risk_context": event_risk_context,
+        },
+        schema_valid=True,
+        created_at=now,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(
+        RiskCheck(
+            symbol="CPIUSDT",
+            decision_run_id=run.id,
+            allowed=False,
+            decision="hold",
+            reason_codes=["HOLD_DECISION"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"allowed": False, "decision": "hold", "reason_codes": ["HOLD_DECISION"]},
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+    cpi = payload.symbols[0]
+    macro = cpi.ai_decision.macro_event_context_summary
+    macro_risk = cpi.ai_decision.macro_event_risk_summary
+    risk_row = get_risk_checks(db_session)[0]
+    risk_macro = risk_row["macro_event_context_summary"]
+
+    assert macro.source_status == "external_api"
+    assert macro.source_vendor == "fred"
+    assert macro.next_event_name == "US CPI"
+    assert macro.next_event_importance == "high"
+    assert macro.minutes_to_next_event == 10
+    assert macro.active_risk_window is True
+    assert macro.affected_assets == ["USD", "CRYPTO"]
+    assert macro.enrichment_vendors == ["bls", "bea"]
+    assert macro.bls_actual_enriched is True
+    assert macro.bea_actual_enriched is True
+    assert macro.event_risk_active is True
+    assert "MACRO_EVENT_IMMINENT" in macro.event_risk_reason_codes
+    assert macro.event_bias_used == "bearish"
+    assert macro_risk.next_event_name == "US CPI"
+    assert macro_risk.event_risk_active is True
+    assert macro_risk.bls_actual_enriched is True
+    assert risk_row["macro_event_risk_summary"]["next_event_name"] == "US CPI"
+    assert risk_macro["bls_actual_enriched"] is True
+    assert risk_macro["bea_actual_enriched"] is True
+
+
+def test_operator_dashboard_marks_stale_macro_event_context_without_directional_bias(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "STALUSDT"
+    settings.tracked_symbols = ["STALUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    event_context = {
+        "source_status": "stale",
+        "source_provenance": "external_api",
+        "source_vendor": "fred",
+        "generated_at": (now - timedelta(hours=5)).isoformat(),
+        "is_stale": True,
+        "is_complete": False,
+        "next_event_name": "US CPI",
+        "next_event_importance": "high",
+        "minutes_to_next_event": 10,
+        "active_risk_window": True,
+        "affected_assets": ["USD", "CRYPTO"],
+        "event_bias": "bearish",
+        "enrichment_vendors": [],
+        "events": [],
+    }
+    event_risk_context = {
+        "event_risk_active": False,
+        "reason_codes": ["MACRO_EVENT_CONTEXT_STALE", "MACRO_EVENT_CONTEXT_INCOMPLETE"],
+        "event_name": "US CPI",
+        "event_importance": "high",
+        "minutes_to_event": 10,
+        "active_risk_window": True,
+        "source_status": "stale",
+        "source_vendor": "fred",
+        "affected_assets": ["USD", "CRYPTO"],
+        "event_bias_observed": "bearish",
+        "event_bias_used": None,
+        "enrichment_vendors": [],
+    }
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="stale macro context",
+            input_payload={
+                "ai_trigger": {
+                    "trigger_reason": "entry_candidate_event",
+                    "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                    "trigger_fingerprint": "stale-macro-trigger",
+                },
+                "features": {
+                    "event_context": event_context,
+                    "trend_score": 0.32,
+                    "momentum_score": 0.18,
+                    "volume_ratio": 1.08,
+                    "regime": {"trend_alignment": "bullish_aligned", "volume_regime": "normal"},
+                },
+                "ai_context": {
+                    "event_context_summary": {
+                        "source_status": "stale",
+                        "source_provenance": "external_api",
+                        "source_vendor": "fred",
+                        "next_event_name": "US CPI",
+                        "next_event_importance": "high",
+                        "minutes_to_next_event": 10,
+                        "active_risk_window": True,
+                        "event_bias": "bearish",
+                        "enrichment_vendors": [],
+                    },
+                    "event_risk_active": False,
+                    "event_risk_reason_codes": event_risk_context["reason_codes"],
+                    "event_risk_context": event_risk_context,
+                },
+            },
+            output_payload={
+                "symbol": "STALUSDT",
+                "timeframe": "15m",
+                "decision": "hold",
+                "confidence": 0.52,
+                "rationale_codes": ["MACRO_EVENT_CONTEXT_STALE"],
+                "explanation_short": "Stale event context was not used as directional signal.",
+            },
+            metadata_json={
+                "source": "llm",
+                "last_ai_trigger_reason": "entry_candidate_event",
+                "last_ai_invoked_at": now.isoformat(),
+                "event_risk_active": False,
+                "event_risk_reason_codes": event_risk_context["reason_codes"],
+                "event_risk_context": event_risk_context,
+            },
+            schema_valid=True,
+            created_at=now,
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+    stale = payload.symbols[0].ai_decision.macro_event_context_summary
+    stale_risk = payload.symbols[0].ai_decision.macro_event_risk_summary
+
+    assert stale.source_status == "stale"
+    assert stale.is_stale is True
+    assert stale.is_complete is False
+    assert stale.is_incomplete is True
+    assert stale.event_risk_active is False
+    assert stale.event_bias_used is None
+    assert "MACRO_EVENT_CONTEXT_STALE" in stale.event_risk_reason_codes
+    assert "MACRO_EVENT_CONTEXT_INCOMPLETE" in stale.event_risk_reason_codes
+    assert stale_risk.source_status == "stale"
+    assert stale_risk.is_incomplete is True
 
 
 def test_overview_prioritizes_stale_sync_reasons_in_operational_status(db_session) -> None:
@@ -1952,6 +2530,8 @@ def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_fac
     assert payload["windows"][0]["window_label"] == "24h"
     assert "rationale_winners" in payload["windows"][0]
     assert "rationale_losers" in payload["windows"][0]
+    assert payload["windows"][0]["limited_live_readiness"]["read_only"] is True
+    assert payload["limited_live_readiness"]["status"] == payload["windows"][0]["limited_live_readiness"]["status"]
     assert "execution_windows" in payload
     assert payload["execution_windows"][0]["worst_profiles"]
     assert payload["hold_blocked_summary"]["latest_blocked_reasons"] == ["TRADING_PAUSED", "HOLD_DECISION"]
@@ -1976,6 +2556,8 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert "net_pnl" in payload["control"]["pnl_summary"]
     assert payload["control"]["pnl_summary"]["account_snapshot_available"] is False
     assert payload["control"]["account_sync_summary"]["account_snapshot_available"] is False
+    assert payload["control"]["limited_live_readiness"]["read_only"] is True
+    assert payload["market_signal"]["performance_windows"][0]["limited_live_readiness"]["read_only"] is True
     assert len(payload["symbols"]) == 2
     assert "ai_decision" not in payload
     assert "risk_guard" not in payload
@@ -1984,8 +2566,16 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     eth = next(item for item in payload["symbols"] if item["symbol"] == "ETHUSDT")
     assert btc["latest_price"] == 70500.0
     assert btc["ai_decision"]["last_ai_trigger_reason"] == "entry_candidate_event"
+    assert btc["ai_decision"]["ai_review_type"] == "entry_candidate_review"
+    assert btc["ai_decision"]["ai_trigger_reason_codes"] == ["ENTRY_CANDIDATE_SELECTED"]
     assert btc["ai_decision"]["trigger_deduped"] is True
     assert btc["ai_decision"]["last_ai_skip_reason"] == "TRIGGER_DEDUPED"
+    assert btc["ai_decision"]["ai_skip_reason"] == "TRIGGER_DEDUPED"
+    assert btc["ai_decision"]["ai_review"]["dedupe_reason"] == "TRIGGER_DEDUPED"
+    assert btc["ai_decision"]["ai_review"]["provider_status"] == "deduped"
+    assert btc["ai_decision"]["market_signal_context"]["summary"] == btc["ai_decision"]["market_signal_summary"]
+    assert btc["ai_decision"]["market_signal_context"]["breakout_direction"] == "up"
+    assert btc["ai_decision"]["market_signal_summary"] == btc["ai_decision"]["ai_trigger_summary"]
     assert btc["ai_decision"]["event_risk_acknowledgement"] == "High-impact macro event is approaching; event-aware caution applied."
     assert btc["ai_decision"]["confidence_penalty_reason"] == "EVENT_WINDOW_PROXIMITY"
     assert btc["ai_decision"]["scenario_note"] == "Prefer confirmation after the event before fresh entry."
@@ -1995,12 +2585,16 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert btc["risk_guard"]["allowed"] is False
     assert btc["risk_guard"]["assigned_slot"] == "slot_1"
     assert btc["risk_guard"]["holding_profile"] == "scalp"
+    assert btc["risk_guard_result"]["allowed"] is False
+    assert btc["risk_guard_result"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert btc["risk_guard_result"]["hold_decision"] is False
     assert btc["open_position"]["is_open"] is True
     assert btc["open_position"]["holding_profile"] == "swing"
     assert btc["open_position"]["hard_stop_active"] is True
     assert btc["open_position"]["stop_widening_allowed"] is False
     assert eth["latest_price"] == 3400.0
     assert eth["ai_decision"]["next_ai_review_due_at"] is None
+    assert eth["ai_decision"]["ai_review"]["provider_status"] == "invoked"
     assert eth["ai_decision"]["assigned_slot"] == "slot_2"
     assert eth["ai_decision"]["portfolio_slot_soft_cap_applied"] is True
     assert eth["ai_decision"]["event_risk_acknowledgement"] is None
@@ -2012,6 +2606,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert eth["risk_guard"]["approved_quantity"] == 44.117647
     assert eth["risk_guard"]["auto_resize_reason"] == "CLAMPED_TO_SINGLE_POSITION_HEADROOM"
     assert eth["risk_guard"]["portfolio_slot_soft_cap_applied"] is True
+    assert eth["risk_guard_result"]["allowed"] is True
+    assert eth["risk_guard_result"]["approved_risk_pct"] == 0.01
+    assert eth["risk_guard_result"]["approved_leverage"] == 2.0
     assert eth["candidate_selection"]["assigned_slot"] == "slot_2"
     assert eth["candidate_selection"]["candidate_weight"] == 0.42
     assert eth["execution"]["symbol"] == "ETHUSDT"
@@ -2104,10 +2701,21 @@ def test_risk_checks_api_includes_ai_trigger_summary(testclient_db_factory) -> N
     eth = next(item for item in payload if item["symbol"] == "ETHUSDT")
 
     assert btc["ai_trigger_reason"] == "entry_candidate_event"
+    assert btc["ai_review_type"] == "entry_candidate_review"
+    assert btc["ai_trigger_reason_codes"] == ["ENTRY_CANDIDATE_SELECTED"]
+    assert btc["ai_review"]["provider_status"] == "invoked"
+    assert btc["market_signal_context"]["breakout_direction"] == "up"
+    assert btc["risk_guard_result"]["allowed"] is False
+    assert btc["market_signal_summary"] == btc["ai_trigger_summary"]
     assert "상단 돌파" in btc["ai_trigger_summary"]
     assert "거래량" in btc["ai_trigger_summary"]
 
     assert eth["ai_trigger_reason"] == "entry_candidate_event"
+    assert eth["ai_review_type"] == "entry_candidate_review"
+    assert eth["ai_trigger_reason_codes"] == ["ENTRY_CANDIDATE_SELECTED"]
+    assert eth["ai_review"]["provider_status"] == "invoked"
+    assert eth["risk_guard_result"]["allowed"] is True
+    assert eth["market_signal_summary"] == eth["ai_trigger_summary"]
     assert "모멘텀" in eth["ai_trigger_summary"]
     assert "거래량" in eth["ai_trigger_summary"]
 

@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import { Field, InlineFeedback, StatusPill, Toggle, inputClass, type FeedbackMessage } from "./form-primitives";
-import { type EventSourceProvider } from "./types";
+import { type AIModelRoutePolicyItem, type AIModelRoutingPolicy, type EventSourceProvider } from "./types";
 
 type IntegrationForm = {
   ai_enabled: boolean;
@@ -42,10 +42,99 @@ function numberOrNull(value: string) {
 }
 
 const eventSourceProviderOptions: EventSourceProvider[] = ["stub", "fred"];
+const aiModelPresets = ["gpt-4.1-mini", "gpt-5-mini"] as const;
+
+function fallbackAiModelRoutingPolicy(primaryModel: string): AIModelRoutingPolicy {
+  return {
+    primary_model: primaryModel,
+    read_only: true,
+    runtime_model_source: "settings.ai_model",
+    summary:
+      "기존 payload 기준입니다. pre-AI skip과 dashboard read-model은 모델을 호출하지 않고, provider 호출 경로는 설정된 모델을 사용합니다.",
+    no_model_call_routes: ["pre_ai_skip_simple_classification", "daily_dashboard_explanation"],
+    candidate_model_routes: ["macro_event_position_complex", "operator_manual_high_risk"],
+    routes: [
+      {
+        route: "pre_ai_skip_simple_classification",
+        label: "pre-AI skip / simple classification",
+        call_policy: "no_model_call",
+        configured_model: null,
+        model_candidates: [],
+      },
+      {
+        route: "general_entry_review",
+        label: "general entry review",
+        call_policy: "provider_invoked_when_gate_allows",
+        configured_model: primaryModel,
+        default_model: "gpt-4.1-mini",
+        model_candidates: ["gpt-4.1-mini"],
+      },
+      {
+        route: "macro_event_position_complex",
+        label: "macro event + position + complex judgment",
+        call_policy: "candidate_model_tier",
+        configured_model: primaryModel,
+        default_model: "gpt-4.1-mini",
+        model_candidates: ["gpt-4.1-mini", "gpt-5-mini"],
+      },
+      {
+        route: "operator_manual_high_risk",
+        label: "operator manual review / high risk",
+        call_policy: "candidate_model_tier",
+        configured_model: primaryModel,
+        default_model: "gpt-5-mini",
+        model_candidates: ["gpt-5-mini", "상위 모델 직접 입력"],
+      },
+      {
+        route: "daily_dashboard_explanation",
+        label: "daily dashboard explanation",
+        call_policy: "read_model_no_model_call",
+        configured_model: null,
+        model_candidates: [],
+      },
+    ],
+  };
+}
+
+function routeLabel(route: AIModelRoutePolicyItem) {
+  const labels: Record<string, string> = {
+    pre_ai_skip_simple_classification: "pre-AI skip / 단순 분류",
+    general_entry_review: "일반 entry review",
+    macro_event_position_complex: "macro event + 포지션 + 복합 판단",
+    operator_manual_high_risk: "운영자 수동 review / 고위험 상황",
+    daily_dashboard_explanation: "일상 dashboard 설명",
+  };
+  return labels[route.route] ?? route.label ?? route.route;
+}
+
+function callPolicyLabel(route: AIModelRoutePolicyItem) {
+  if (route.call_policy === "no_model_call" || route.call_policy === "read_model_no_model_call") {
+    return "모델 호출 없음";
+  }
+  if (route.call_policy === "candidate_model_tier") {
+    return "후보 모델";
+  }
+  return "설정 모델 사용";
+}
+
+function callPolicyTone(route: AIModelRoutePolicyItem): "neutral" | "good" | "warn" {
+  if (route.call_policy === "no_model_call" || route.call_policy === "read_model_no_model_call") {
+    return "good";
+  }
+  if (route.call_policy === "candidate_model_tier") {
+    return "warn";
+  }
+  return "neutral";
+}
+
+function modelCandidateLabel(model: string) {
+  return model === "higher_model_option" ? "상위 모델 직접 입력" : model;
+}
 
 export function IntegrationSettingsPanel({
   form,
   state,
+  aiModelRoutingPolicy,
   eventSourceProvenanceLabel,
   eventSourceVendorLabel,
   eventEnrichmentLabel,
@@ -61,6 +150,7 @@ export function IntegrationSettingsPanel({
 }: {
   form: IntegrationForm;
   state: IntegrationState;
+  aiModelRoutingPolicy?: AIModelRoutingPolicy | null;
   eventSourceProvenanceLabel: string;
   eventSourceVendorLabel: string | null;
   eventEnrichmentLabel: string;
@@ -74,6 +164,12 @@ export function IntegrationSettingsPanel({
   onFieldChange: (field: keyof IntegrationForm, value: IntegrationForm[keyof IntegrationForm]) => void;
   onSave: () => void;
 }) {
+  const modelRoutingPolicy =
+    aiModelRoutingPolicy && Array.isArray(aiModelRoutingPolicy.routes) && aiModelRoutingPolicy.routes.length > 0
+      ? aiModelRoutingPolicy
+      : fallbackAiModelRoutingPolicy(form.ai_model);
+  const modelRoutes = modelRoutingPolicy.routes ?? [];
+
   return (
     <div className="space-y-5">
       <section className="grid gap-5 xl:grid-cols-2">
@@ -105,6 +201,22 @@ export function IntegrationSettingsPanel({
             </Field>
             <Field label="모델">
               <input className={inputClass} value={form.ai_model} onChange={(event) => onFieldChange("ai_model", event.target.value)} />
+              <div className="mt-2 flex flex-wrap gap-2">
+                {aiModelPresets.map((model) => (
+                  <button
+                    key={model}
+                    type="button"
+                    className={`rounded-md border px-3 py-1 text-xs font-semibold transition ${
+                      form.ai_model === model
+                        ? "border-blue-300 bg-blue-50 text-blue-700"
+                        : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                    }`}
+                    onClick={() => onFieldChange("ai_model", model)}
+                  >
+                    {model}
+                  </button>
+                ))}
+              </div>
             </Field>
             <Field label="온도" hint="낮게 유지할수록 응답 분산이 줄어듭니다.">
               <input
@@ -147,6 +259,40 @@ export function IntegrationSettingsPanel({
               />
               저장된 키 제거
             </label>
+          </div>
+          <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">AI 모델 호출 정책</p>
+                <p className="mt-1 text-sm leading-6 text-slate-600">
+                  {modelRoutingPolicy.summary ??
+                    "pre-AI skip과 dashboard read-model은 모델을 호출하지 않고, provider 호출 경로는 설정된 모델을 사용합니다."}
+                </p>
+              </div>
+              <StatusPill tone={modelRoutingPolicy.read_only === false ? "warn" : "neutral"}>
+                {modelRoutingPolicy.read_only === false ? "runtime routing" : "read-only"}
+              </StatusPill>
+            </div>
+            <div className="mt-4 grid gap-3">
+              {modelRoutes.map((route) => {
+                const candidates = route.model_candidates?.filter(Boolean).map(modelCandidateLabel) ?? [];
+                const modelText =
+                  route.call_policy === "no_model_call" || route.call_policy === "read_model_no_model_call"
+                    ? "모델 호출 없음"
+                    : route.call_policy === "candidate_model_tier" && candidates.length > 0
+                      ? candidates.join(" / ")
+                      : route.configured_model ?? route.default_model ?? "모델 없음";
+                return (
+                  <div key={route.route} className="rounded-md border border-slate-200 bg-slate-50 px-3 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-sm font-semibold text-slate-900">{routeLabel(route)}</p>
+                      <StatusPill tone={callPolicyTone(route)}>{callPolicyLabel(route)}</StatusPill>
+                    </div>
+                    <p className="mt-2 text-sm text-slate-700">{modelText}</p>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
 

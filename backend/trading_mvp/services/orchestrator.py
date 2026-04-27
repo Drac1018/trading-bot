@@ -50,7 +50,7 @@ from trading_mvp.services.agents import (
 )
 from trading_mvp.services.ai_context import build_ai_decision_context
 from trading_mvp.services.ai_prior_context import build_ai_prior_context
-from trading_mvp.services.ai_usage import get_openai_call_gate
+from trading_mvp.services.ai_usage import estimate_ai_usage_cost_usd, get_openai_call_gate
 from trading_mvp.services.audit import (
     create_alert,
     normalize_correlation_ids,
@@ -123,6 +123,12 @@ from trading_mvp.services.strategy_engines import select_strategy_engine
 from trading_mvp.time_utils import utcnow_naive
 
 ACTIVE_ENTRY_PLAN_STATUS = "armed"
+ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON = "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+ENTRY_CANDIDATE_EXTREME_LOW_VOLUME_RATIO = 0.10
+ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_MAX_RATIO = 0.20
+ENTRY_CANDIDATE_WEAK_VOLUME_REGIMES = frozenset(
+    {"weak", "low", "thin", "dry", "illiquid", "low_participation"}
+)
 ENTRY_PLAN_WATCH_TIMEFRAME = "1m"
 CADENCE_IDLE_MODE = "idle"
 CADENCE_WATCH_MODE = "watch"
@@ -5516,6 +5522,42 @@ class TradingOrchestrator:
                 return None
         return None
 
+    @staticmethod
+    def _entry_candidate_weak_volume_preai_skip_reason(
+        *,
+        review_trigger_payload: AIReviewTriggerPayload | None,
+        feature_payload: FeaturePayload,
+        open_positions: list[Position],
+    ) -> str | None:
+        if review_trigger_payload is None:
+            return None
+        if review_trigger_payload.trigger_reason != "entry_candidate_event":
+            return None
+        if open_positions:
+            return None
+
+        regime = feature_payload.regime
+        volume_ratio: float | None = None
+        if feature_payload.volume_ratio is not None:
+            try:
+                volume_ratio = float(feature_payload.volume_ratio)
+            except (TypeError, ValueError):
+                volume_ratio = None
+        volume_regime = str(getattr(regime, "volume_regime", "") or "").strip().lower()
+        weak_volume_signal = (
+            bool(getattr(regime, "weak_volume", False))
+            or volume_regime in ENTRY_CANDIDATE_WEAK_VOLUME_REGIMES
+        )
+        if volume_ratio is not None and volume_ratio <= ENTRY_CANDIDATE_EXTREME_LOW_VOLUME_RATIO:
+            return ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON
+        if (
+            weak_volume_signal
+            and volume_ratio is not None
+            and volume_ratio <= ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_MAX_RATIO
+        ):
+            return ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON
+        return None
+
     def build_interval_decision_plan(
         self,
         *,
@@ -6306,10 +6348,17 @@ class TradingOrchestrator:
                 min(int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]), 5),
             ),
         )
+        pre_ai_skip_reason = self._entry_candidate_weak_volume_preai_skip_reason(
+            review_trigger_payload=review_trigger_payload,
+            feature_payload=feature_payload,
+            open_positions=open_positions,
+        )
         ai_skipped_reason = str(cadence_profile.get("ai_skipped_reason") or "") or None
         if review_trigger_payload is not None:
             if review_trigger_payload.trigger_reason == "protection_review_event":
                 ai_skipped_reason = "PROTECTION_REVIEW_DETERMINISTIC_ONLY"
+            elif pre_ai_skip_reason is not None:
+                ai_skipped_reason = pre_ai_skip_reason
             else:
                 ai_skipped_reason = None
         if ai_skipped_reason is None and not openai_gate.allowed:
@@ -6365,10 +6414,13 @@ class TradingOrchestrator:
             "logic_variant": logic_variant,
             "symbol": symbol,
             "timeframe": timeframe,
+            "ai_provider": self.settings_row.ai_provider,
+            "ai_model": self.settings_row.ai_model,
             "holding_profile": getattr(decision, "holding_profile", "scalp"),
             "holding_profile_reason": getattr(decision, "holding_profile_reason", None),
             "cadence": cadence_profile,
             "ai_skipped_reason": ai_skipped_reason,
+            "pre_ai_skip_reason": pre_ai_skip_reason,
             "effective_cadence": dict(cadence_profile.get("effective_cadence") or {}),
             "analysis_context": _decision_analysis_context(
                 feature_payload,
@@ -6384,6 +6436,9 @@ class TradingOrchestrator:
             ),
             "ai_context": ai_context_payload,
             "ai_context_version": ai_context.ai_context_version,
+            "event_risk_active": ai_context.event_risk_active,
+            "event_risk_reason_codes": list(ai_context.event_risk_reason_codes),
+            "event_risk_context": dict(ai_context.event_risk_context),
             "ai_trigger": review_trigger_payload.model_dump(mode="json") if review_trigger_payload is not None else None,
             "last_ai_trigger_reason": review_trigger_payload.trigger_reason if review_trigger_payload is not None else None,
             "last_ai_invoked_at": (
@@ -6456,6 +6511,25 @@ class TradingOrchestrator:
             "cycle_id": cycle_id,
             "snapshot_id": market_row.id,
         }
+        usage_payload = (
+            decision_metadata.get("usage") if isinstance(decision_metadata.get("usage"), dict) else None
+        )
+        provider_attempted = provider_name == "openai" or str(decision_metadata.get("source") or "") in {
+            "llm",
+            "llm_fallback",
+        }
+        if provider_attempted:
+            estimated_cost_usd = estimate_ai_usage_cost_usd(
+                model=self.settings_row.ai_model,
+                usage=usage_payload,
+            )
+            decision_metadata["estimated_cost_usd"] = estimated_cost_usd
+            if usage_payload is None:
+                decision_metadata["cost_estimate_status"] = "missing_usage"
+            elif estimated_cost_usd is None:
+                decision_metadata["cost_estimate_status"] = "unknown_model_rate"
+            else:
+                decision_metadata["cost_estimate_status"] = "estimated"
         intent_semantics = infer_intent_semantics(
             decision.model_dump(mode="json"),
             decision_metadata,
@@ -6514,6 +6588,7 @@ class TradingOrchestrator:
                 "setup_cluster_state": decision_metadata.get("setup_cluster_state"),
                 "meta_gate": meta_gate_result.model_dump(mode="json"),
                 "ai_trigger": decision_metadata.get("ai_trigger"),
+                "pre_ai_skip_reason": decision_metadata.get("pre_ai_skip_reason"),
                 "prompt_family": decision_metadata.get("prompt_family"),
                 "bounded_output_applied": decision_metadata.get("bounded_output_applied"),
                 "fallback_reason_codes": decision_metadata.get("fallback_reason_codes"),
@@ -6592,6 +6667,7 @@ class TradingOrchestrator:
                     "cadence_mode": cadence_profile.get("mode"),
                     "cadence_reasons": list(cadence_profile.get("reasons") or []),
                     "ai_skipped_reason": ai_skipped_reason,
+                    "pre_ai_skip_reason": decision_metadata.get("pre_ai_skip_reason"),
                     "gate": openai_gate.as_metadata(),
                     "trigger": decision_metadata.get("ai_trigger"),
                     "fingerprint_changed_fields": decision_metadata.get("fingerprint_changed_fields"),

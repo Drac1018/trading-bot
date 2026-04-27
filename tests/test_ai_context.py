@@ -111,6 +111,49 @@ def _features():
     )
 
 
+def _review_trigger(trigger_reason: str) -> dict[str, object]:
+    return {
+        "trigger_reason": trigger_reason,
+        "symbol": "BTCUSDT",
+        "timeframe": "15m",
+        "strategy_engine": "trend_pullback_engine",
+        "holding_profile": "scalp",
+        "trigger_fingerprint": f"{trigger_reason}-macro-event-test",
+        "last_decision_at": None,
+        "triggered_at": utcnow_naive(),
+    }
+
+
+def _macro_event_context(
+    snapshot: MarketSnapshotPayload,
+    *,
+    minutes_to_event: int = 10,
+    active_risk_window: bool = True,
+    source_status: str = "external_api",
+    is_stale: bool = False,
+    is_complete: bool = True,
+    affected_assets: list[str] | None = None,
+    enrichment_vendors: list[str] | None = None,
+) -> EventContextPayload:
+    return EventContextPayload(
+        source_status=source_status,  # type: ignore[arg-type]
+        source_provenance="external_api",
+        source_vendor="fred",
+        generated_at=snapshot.snapshot_time,
+        is_stale=is_stale,
+        is_complete=is_complete,
+        next_event_at=snapshot.snapshot_time + timedelta(minutes=minutes_to_event),
+        next_event_name="US CPI",
+        next_event_importance="high",
+        minutes_to_next_event=minutes_to_event,
+        active_risk_window=active_risk_window,
+        affected_assets=affected_assets or ["USD", "CRYPTO"],
+        event_bias="bearish",
+        enrichment_vendors=enrichment_vendors or ["bls"],
+        events=[],
+    )
+
+
 def test_build_lead_market_contexts_records_runtime_failures(monkeypatch) -> None:
     def fail_build_market_context(**_kwargs):
         raise RuntimeError("lead market unavailable")
@@ -462,3 +505,92 @@ def test_build_ai_decision_context_includes_separated_feature_layer_summaries() 
     assert context.event_context_summary.source_vendor is None
     assert context.event_context_summary.enrichment_vendors == []
     assert context.event_context_summary.event_bias == "bearish"
+
+
+def test_entry_candidate_ai_context_marks_imminent_high_impact_macro_event() -> None:
+    snapshot, features = _features()
+    features = features.model_copy(update={"event_context": _macro_event_context(snapshot)})
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "trend_pullback_engine", "holding_profile": "scalp"},
+        review_trigger=_review_trigger("entry_candidate_event"),
+        decision_reference={},
+    )
+
+    assert context.event_risk_active is True
+    assert "MACRO_EVENT_IMMINENT" in context.event_risk_reason_codes
+    assert "MACRO_EVENT_RISK_WINDOW_ACTIVE" in context.event_risk_reason_codes
+    assert "MACRO_EVENT_ENRICHMENT_AVAILABLE" in context.event_risk_reason_codes
+    assert context.event_risk_context["risk_pct_multiplier"] == 0.5
+    assert context.event_risk_context["hold_bias"] == 0.25
+    assert context.event_risk_context["event_bias_used"] == "bearish"
+
+
+def test_breakout_exception_ai_context_applies_stronger_macro_hold_bias() -> None:
+    snapshot, features = _features()
+    features = features.model_copy(update={"event_context": _macro_event_context(snapshot)})
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "breakout_exception_engine", "holding_profile": "scalp"},
+        review_trigger=_review_trigger("breakout_exception_event"),
+        decision_reference={},
+    )
+
+    assert context.event_risk_active is True
+    assert "MACRO_EVENT_RISK_WINDOW_ACTIVE" in context.event_risk_reason_codes
+    assert context.event_risk_context["risk_pct_multiplier"] == 0.35
+    assert context.event_risk_context["hold_bias"] == 0.45
+
+
+def test_stale_event_context_keeps_uncertainty_without_directional_bias() -> None:
+    snapshot, features = _features()
+    features = features.model_copy(
+        update={
+            "event_context": _macro_event_context(
+                snapshot,
+                source_status="stale",
+                is_stale=True,
+                is_complete=False,
+            )
+        }
+    )
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "trend_pullback_engine", "holding_profile": "scalp"},
+        review_trigger=_review_trigger("entry_candidate_event"),
+        decision_reference={},
+    )
+
+    assert context.event_risk_active is False
+    assert "MACRO_EVENT_CONTEXT_STALE" in context.event_risk_reason_codes
+    assert "MACRO_EVENT_CONTEXT_INCOMPLETE" in context.event_risk_reason_codes
+    assert "MACRO_EVENT_RISK_WINDOW_ACTIVE" not in context.event_risk_reason_codes
+    assert context.event_risk_context["event_bias_observed"] == "bearish"
+    assert context.event_risk_context["event_bias_used"] is None
+
+
+def test_protection_review_ignores_macro_entry_conservatization() -> None:
+    snapshot, features = _features()
+    features = features.model_copy(update={"event_context": _macro_event_context(snapshot)})
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "protection_review", "holding_profile": "scalp"},
+        review_trigger=_review_trigger("protection_review_event"),
+        decision_reference={},
+    )
+
+    assert context.event_risk_active is False
+    assert context.event_risk_context["applies_to_new_entry"] is False
+    assert "MACRO_EVENT_RISK_WINDOW_ACTIVE" not in context.event_risk_reason_codes

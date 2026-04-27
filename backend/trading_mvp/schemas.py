@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from trading_mvp.time_utils import ensure_utc_aware, parse_utc_datetime
 
 RolloutMode = Literal["paper", "shadow", "live_dry_run", "limited_live", "full_live"]
+SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES = ("1m", "3m", "5m", "15m")
 HoldingProfile = Literal["scalp", "swing", "position"]
 ConfidenceBand = Literal["high", "medium", "low", "abstain"]
 RecommendedHoldingProfile = Literal["scalp", "swing", "position", "hold_current"]
@@ -384,6 +385,9 @@ class AIDecisionContextPacket(StrictBaseModel):
     initial_stop_type: str | None = None
     selection_context_summary: dict[str, Any] = Field(default_factory=dict)
     prompt_family_hint: str | None = None
+    event_risk_active: bool = False
+    event_risk_reason_codes: list[str] = Field(default_factory=list)
+    event_risk_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChiefReviewSummary(StrictBaseModel):
@@ -447,6 +451,92 @@ class SignalPerformanceEntry(StrictBaseModel):
     open_positions: int = Field(ge=0)
     closed_positions: int = Field(ge=0)
     latest_seen_at: datetime
+
+
+class AIDownstreamTelemetrySummary(StrictBaseModel):
+    agent_runs: int = Field(default=0, ge=0)
+    risk_checks: int = Field(default=0, ge=0)
+    risk_allowed: int = Field(default=0, ge=0)
+    risk_blocked: int = Field(default=0, ge=0)
+    orders: int = Field(default=0, ge=0)
+    executions: int = Field(default=0, ge=0)
+    fills: int = Field(default=0, ge=0)
+    realized_pnl: float = 0.0
+    fee: float = 0.0
+    net_realized_pnl: float = 0.0
+    average_slippage_pct: float = 0.0
+
+
+class AIUsageTelemetrySummary(StrictBaseModel):
+    ai_calls_total: int = Field(default=0, ge=0)
+    ai_calls_provider_invoked: int = Field(default=0, ge=0)
+    ai_calls_skipped_preai: int = Field(default=0, ge=0)
+    ai_calls_deduped: int = Field(default=0, ge=0)
+    ai_calls_failed: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    estimated_cost_usd: float | None = None
+    cost_estimate_status: str = "no_provider_calls"
+    missing_usage_rows: int = Field(default=0, ge=0)
+    unknown_cost_rows: int = Field(default=0, ge=0)
+    decision_counts: dict[str, int] = Field(default_factory=dict)
+    source_counts: dict[str, int] = Field(default_factory=dict)
+    should_abstain: int = Field(default=0, ge=0)
+    fail_closed: int = Field(default=0, ge=0)
+    preai_skip_reasons: dict[str, int] = Field(default_factory=dict)
+    downstream: AIDownstreamTelemetrySummary = Field(default_factory=AIDownstreamTelemetrySummary)
+    downstream_by_decision: dict[str, AIDownstreamTelemetrySummary] = Field(default_factory=dict)
+    cost_basis: dict[str, Any] = Field(default_factory=dict)
+
+
+class AIBaselineComparisonBucket(StrictBaseModel):
+    bucket: str
+    decisions: int = Field(default=0, ge=0)
+    approvals: int = Field(default=0, ge=0)
+    orders: int = Field(default=0, ge=0)
+    fills: int = Field(default=0, ge=0)
+    wins: int = Field(default=0, ge=0)
+    losses: int = Field(default=0, ge=0)
+    win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    expectancy: float = 0.0
+    realized_pnl: float = 0.0
+    fee: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    avg_slippage: float = Field(default=0.0, ge=0.0)
+    avg_holding_minutes: float = Field(default=0.0, ge=0.0)
+    pnl_per_exposure_hour: float | None = None
+    observed_decisions: int = Field(default=0, ge=0)
+    unobserved_decisions: int = Field(default=0, ge=0)
+    unobserved_reason_counts: dict[str, int] = Field(default_factory=dict)
+    baseline_entries: int = Field(default=0, ge=0)
+    baseline_holds: int = Field(default=0, ge=0)
+    ai_entries: int = Field(default=0, ge=0)
+    ai_holds: int = Field(default=0, ge=0)
+    ai_management_actions: int = Field(default=0, ge=0)
+    agreements: int = Field(default=0, ge=0)
+    disagreements: int = Field(default=0, ge=0)
+
+
+class AIBaselineComparisonSummary(StrictBaseModel):
+    buckets: list[AIBaselineComparisonBucket] = Field(default_factory=list)
+    bucket_totals: dict[str, int] = Field(default_factory=dict)
+    decisions: int = Field(default=0, ge=0)
+    agreements: int = Field(default=0, ge=0)
+    disagreements: int = Field(default=0, ge=0)
+    baseline_entries: int = Field(default=0, ge=0)
+    ai_entries: int = Field(default=0, ge=0)
+    ai_holds: int = Field(default=0, ge=0)
+    ai_management_actions: int = Field(default=0, ge=0)
+    observed_decisions: int = Field(default=0, ge=0)
+    unobserved_decisions: int = Field(default=0, ge=0)
+    unobserved_reason_counts: dict[str, int] = Field(default_factory=dict)
+    observed_net_pnl_after_fees: float = 0.0
+    observed_rejected_baseline_entry_net_pnl_after_fees: float = 0.0
+    ai_filter_observed_value_net_pnl_after_fees: float | None = None
+    comparison_basis: str = "agent_run_decision_agreement_and_execution_ledger"
+    filter_value_basis: str = (
+        "Only linked execution-ledger PnL is included. Rejected baseline entries without fills stay unobserved."
+    )
 
 
 class PerformanceAggregateEntry(StrictBaseModel):
@@ -578,10 +668,46 @@ class PerformanceWindowSummary(StrictBaseModel):
     mfe_mae_tracking_note: str = "MFE/MAE is derived from linked position market path highs and lows."
 
 
+LimitedLiveReadinessStatus = Literal[
+    "not_ready",
+    "watch",
+    "limited_live_candidate",
+    "scale_up_candidate",
+    "blocked",
+]
+
+
+class LimitedLiveReadinessReport(StrictBaseModel):
+    window_label: str = "unknown"
+    window_hours: int = Field(default=24, ge=1, le=24 * 30)
+    status: LimitedLiveReadinessStatus = "not_ready"
+    reason_codes: list[str] = Field(default_factory=list)
+    read_only: bool = True
+    recent_candidate_events: int = Field(ge=0, default=0)
+    ai_calls_total: int = Field(ge=0, default=0)
+    ai_calls_provider_invoked: int = Field(ge=0, default=0)
+    ai_calls_skipped_preai: int = Field(ge=0, default=0)
+    actual_entries: int = Field(ge=0, default=0)
+    fills: int = Field(ge=0, default=0)
+    expectancy_after_fees: float = 0.0
+    net_pnl_after_fees: float = 0.0
+    max_drawdown: float = Field(ge=0.0, default=0.0)
+    consecutive_losses: int = Field(ge=0, default=0)
+    protection_failure_count: int = Field(ge=0, default=0)
+    unknown_submission_count: int = Field(ge=0, default=0)
+    stale_incomplete_data_block_count: int = Field(ge=0, default=0)
+    ai_filter_observed_value_net_pnl_after_fees: float | None = None
+    thresholds: dict[str, int | float] = Field(default_factory=dict)
+    basis: str = "read_only_recent_window_observation"
+
+
 class PerformanceWindowReport(StrictBaseModel):
     window_label: str
     window_hours: int = Field(ge=1, le=24 * 30)
     summary: PerformanceWindowSummary
+    ai_telemetry: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
+    ai_baseline_comparison: AIBaselineComparisonSummary = Field(default_factory=AIBaselineComparisonSummary)
+    limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
     decisions: list[DecisionPerformanceEntry] = Field(default_factory=list)
     rationale_codes: list[PerformanceAggregateEntry] = Field(default_factory=list)
     symbols: list[PerformanceAggregateEntry] = Field(default_factory=list)
@@ -933,6 +1059,8 @@ class DashboardProfitabilityWindow(StrictBaseModel):
     window_label: str
     window_hours: int = Field(ge=1, le=24 * 30)
     summary: PerformanceWindowSummary
+    ai_baseline_comparison: AIBaselineComparisonSummary = Field(default_factory=AIBaselineComparisonSummary)
+    limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
     rationale_winners: list[PerformanceAggregateEntry] = Field(default_factory=list)
     rationale_losers: list[PerformanceAggregateEntry] = Field(default_factory=list)
     top_regimes: list[PerformanceAggregateEntry] = Field(default_factory=list)
@@ -960,6 +1088,7 @@ class DashboardProfitabilityResponse(StrictBaseModel):
     windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
     execution_windows: list[DashboardExecutionWindowSummary] = Field(default_factory=list)
     hold_blocked_summary: DashboardHoldBlockedSummary
+    limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
 
 
 class ControlStatusSummary(StrictBaseModel):
@@ -1116,6 +1245,62 @@ class OperatorControlState(StrictBaseModel):
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
     operator_alert: dict[str, Any] = Field(default_factory=dict)
+    limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
+
+
+class OperatorDecisionEventContextSnapshot(StrictBaseModel):
+    source_status: str | None = None
+    source_provenance: str | None = None
+    source_vendor: str | None = None
+    next_event_name: str | None = None
+    next_event_importance: str | None = None
+    minutes_to_next_event: int | None = None
+    active_risk_window: bool = False
+    release_reaction_window: bool = False
+    is_stale: bool = False
+    is_complete: bool | None = None
+    is_incomplete: bool = False
+    affected_assets: list[str] = Field(default_factory=list)
+    enrichment_vendors: list[str] = Field(default_factory=list)
+    bls_actual_enriched: bool = False
+    bea_actual_enriched: bool = False
+    event_risk_active: bool = False
+    event_risk_reason_codes: list[str] = Field(default_factory=list)
+    event_bias_used: str | None = None
+
+
+class OperatorAIReviewSnapshot(StrictBaseModel):
+    trigger_reason: str | None = None
+    trigger_reason_codes: list[str] = Field(default_factory=list)
+    review_type: str | None = None
+    skip_reason: str | None = None
+    dedupe_reason: str | None = None
+    trigger_deduped: bool = False
+    trigger_fingerprint: str | None = None
+    provider_name: str | None = None
+    provider_source: str | None = None
+    provider_invoked: bool = False
+    provider_skipped: bool = False
+    provider_status: str = "unknown"
+    invoked_at: datetime | None = None
+    next_review_due_at: datetime | None = None
+
+
+class OperatorMarketSignalSnapshot(StrictBaseModel):
+    summary: str | None = None
+    trend_score: float | None = None
+    momentum_score: float | None = None
+    volume_ratio: float | None = None
+    primary_regime: str | None = None
+    trend_alignment: str | None = None
+    volatility_regime: str | None = None
+    volume_regime: str | None = None
+    momentum_state: str | None = None
+    weak_volume: bool | None = None
+    momentum_weakening: bool | None = None
+    breakout_direction: str | None = None
+    broke_swing_high: bool | None = None
+    broke_swing_low: bool | None = None
 
 
 class OperatorDecisionSnapshot(StrictBaseModel):
@@ -1142,11 +1327,24 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     legacy_semantics_preserved: bool = False
     analytics_excluded_from_entry_stats: bool = False
     last_ai_trigger_reason: AITriggerReason | None = None
+    ai_review_type: str | None = None
+    ai_trigger_reason_codes: list[str] = Field(default_factory=list)
     last_ai_invoked_at: datetime | None = None
     next_ai_review_due_at: datetime | None = None
     trigger_deduped: bool = False
     trigger_fingerprint: str | None = None
     last_ai_skip_reason: str | None = None
+    ai_skip_reason: str | None = None
+    ai_trigger_summary: str | None = None
+    market_signal_summary: str | None = None
+    ai_review: OperatorAIReviewSnapshot = Field(default_factory=OperatorAIReviewSnapshot)
+    market_signal_context: OperatorMarketSignalSnapshot = Field(default_factory=OperatorMarketSignalSnapshot)
+    macro_event_context_summary: OperatorDecisionEventContextSnapshot = Field(
+        default_factory=OperatorDecisionEventContextSnapshot
+    )
+    macro_event_risk_summary: OperatorDecisionEventContextSnapshot = Field(
+        default_factory=OperatorDecisionEventContextSnapshot
+    )
     suppression_active: bool = False
     suppression_reason_code: str | None = None
     allow_same_side_add_on: bool = False
@@ -1232,6 +1430,18 @@ class OperatorRiskSnapshot(StrictBaseModel):
     debug_payload: dict[str, Any] = Field(default_factory=dict)
     current_cycle_result: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorRiskGuardResultSnapshot(StrictBaseModel):
+    risk_check_id: int | None = None
+    decision_run_id: int | None = None
+    allowed: bool | None = None
+    decision: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    blocked_reason_codes: list[str] = Field(default_factory=list)
+    approved_risk_pct: float | None = None
+    approved_leverage: float | None = None
+    hold_decision: bool = False
 
 
 class OperatorExecutionSnapshot(StrictBaseModel):
@@ -1345,6 +1555,7 @@ class OperatorSymbolSummary(StrictBaseModel):
     ai_decision: OperatorDecisionSnapshot = Field(default_factory=OperatorDecisionSnapshot)
     pending_entry_plan: PendingEntryPlanSnapshot = Field(default_factory=PendingEntryPlanSnapshot)
     risk_guard: OperatorRiskSnapshot = Field(default_factory=OperatorRiskSnapshot)
+    risk_guard_result: OperatorRiskGuardResultSnapshot = Field(default_factory=OperatorRiskGuardResultSnapshot)
     execution: OperatorExecutionSnapshot = Field(default_factory=OperatorExecutionSnapshot)
     open_position: OperatorPositionSummary = Field(default_factory=OperatorPositionSummary)
     protection_status: OperatorProtectionSummary = Field(default_factory=OperatorProtectionSummary)
@@ -2124,6 +2335,17 @@ class SymbolCadenceOverride(StrictBaseModel):
     ai_backstop_enabled_override: bool | None = None
     ai_backstop_interval_minutes_override: int | None = Field(default=None, ge=15, le=10080)
 
+    @field_validator("timeframe_override")
+    @classmethod
+    def _validate_timeframe_override(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if normalized not in SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES:
+            allowed = ", ".join(SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES)
+            raise ValueError(f"timeframe_override must be one of: {allowed}")
+        return normalized
+
 
 class SymbolEffectiveCadence(StrictBaseModel):
     symbol: str
@@ -2235,6 +2457,7 @@ class AppSettingsResponse(StrictBaseModel):
     ai_enabled: bool
     ai_provider: str
     ai_model: str
+    ai_model_routing_policy: dict[str, Any] = Field(default_factory=dict)
     ai_call_interval_minutes: int
     decision_cycle_interval_minutes: int
     ai_max_input_candles: int
@@ -2340,6 +2563,7 @@ class AppSettingsViewResponse(StrictBaseModel):
     ai_enabled: bool
     ai_provider: str
     ai_model: str
+    ai_model_routing_policy: dict[str, Any] = Field(default_factory=dict)
     ai_call_interval_minutes: int
     decision_cycle_interval_minutes: int
     ai_max_input_candles: int
@@ -2382,6 +2606,8 @@ class AppSettingsAIUsageResponse(StrictBaseModel):
     recent_ai_failure_reasons: list[str] = Field(default_factory=list)
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int] = Field(default_factory=dict)
+    ai_usage_summary_24h: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
+    ai_usage_summary_7d: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     manual_ai_guard_minutes: int
 
 

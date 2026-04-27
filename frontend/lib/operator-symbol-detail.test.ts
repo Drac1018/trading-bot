@@ -113,6 +113,36 @@ function buildSymbol(overrides: Record<string, unknown> = {}): OperatorDetailSym
     ai_decision: {
       decision: "long",
       confidence: 0.68,
+      ai_review: {
+        review_type: "entry_candidate_review",
+        trigger_reason: "entry_candidate_event",
+        trigger_reason_codes: ["ENTRY_CANDIDATE_SELECTED"],
+        skip_reason: null,
+        provider_status: "invoked",
+        provider_invoked: true,
+        provider_skipped: false,
+        invoked_at: "2026-04-20T11:02:00Z",
+        provider_name: "openai",
+      },
+      market_signal_summary: "모멘텀 강화 / 거래량 strong / 추세 상승 정렬",
+      market_signal_context: {
+        momentum_state: "strengthening",
+        volume_regime: "strong",
+        trend_alignment: "bullish_aligned",
+        data_quality_flags: [],
+      },
+      macro_event_risk_summary: {
+        source_status: "available",
+        source_vendor: "fred",
+        next_event_name: "FOMC",
+        next_event_importance: "high",
+        minutes_to_next_event: 42,
+        active_risk_window: false,
+        affected_assets: ["BTCUSDT"],
+        enrichment_vendors: ["bls", "bea"],
+        bls_actual_enriched: true,
+        bea_actual_enriched: true,
+      },
       event_risk_acknowledgement: "High-impact macro event is approaching.",
       confidence_penalty_reason: "EVENT_WINDOW_PROXIMITY",
       scenario_note: "Prefer confirmation after the event before fresh entry.",
@@ -146,12 +176,16 @@ test("buildOperatorDetailSections keeps the additive event/operator sections in 
 
   const sections = buildOperatorDetailSections(buildSymbol());
   const eventSection = sections.find((section) => section.key === "upcoming_event_risk");
+  const aiReviewSection = sections.find((section) => section.key === "ai_review_reason");
+  const marketSignalSection = sections.find((section) => section.key === "market_signal_summary");
 
   assert.deepEqual(
     sections.map((section) => section.key),
     [
       "current_regime",
       "derivatives_orderbook",
+      "ai_review_reason",
+      "market_signal_summary",
       "upcoming_event_risk",
       "ai_event_view",
       "operator_event_view",
@@ -167,7 +201,9 @@ test("buildOperatorDetailSections keeps the additive event/operator sections in 
     [
       "현재 레짐",
       "파생 / 오더북",
-      "예정 이벤트 리스크",
+      "AI 검토 사유",
+      "당시 시장 신호 요약",
+      "거시 이벤트 리스크",
       "AI 이벤트 뷰",
       "운영자 이벤트 뷰",
       "정렬 결과",
@@ -179,7 +215,47 @@ test("buildOperatorDetailSections keeps the additive event/operator sections in 
   );
   assert.equal(
     eventSection?.items.find((item) => item.label === "데이터 출처")?.value,
-    describeEventSourceProvenance("fixture"),
+    describeEventSourceProvenance("unknown"),
+  );
+  assert.equal(eventSection?.items.find((item) => item.label === "BLS 실제값")?.value, "예");
+  assert.equal(eventSection?.items.find((item) => item.label === "BEA 실제값")?.value, "예");
+  assert.equal(aiReviewSection?.items.find((item) => item.label === "검토 분류")?.value, "신규 진입 후보 검토");
+  assert.equal(marketSignalSection?.items.find((item) => item.label === "요약")?.value, "모멘텀 강화 / 거래량 strong / 추세 상승 정렬");
+});
+
+test("buildOperatorDetailSections keeps legacy AI trigger summary usable as market signal summary", async () => {
+  const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
+  const baseSymbol = buildSymbol();
+
+  const sections = buildOperatorDetailSections(
+    buildSymbol({
+      ai_decision: {
+        ...baseSymbol.ai_decision,
+        ai_review: null,
+        ai_review_type: null,
+        last_ai_trigger_reason: null,
+        ai_trigger_reason_codes: [],
+        ai_skip_reason: null,
+        last_ai_skip_reason: "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+        market_signal_summary: null,
+        market_signal_context: null,
+        macro_event_risk_summary: null,
+        ai_trigger_summary: "legacy momentum/volume/trend feature summary",
+      },
+    }),
+  );
+
+  const aiReviewSection = sections.find((section) => section.key === "ai_review_reason");
+  const marketSignalSection = sections.find((section) => section.key === "market_signal_summary");
+
+  assert.equal(marketSignalSection?.title, "당시 시장 신호 요약");
+  assert.equal(
+    marketSignalSection?.items.find((item) => item.label === "요약")?.value,
+    "legacy momentum/volume/trend feature summary",
+  );
+  assert.equal(
+    aiReviewSection?.items.find((item) => item.label === "AI 검토 생략")?.value,
+    "거래량 부족으로 AI 검토 생략",
   );
 });
 
@@ -203,6 +279,10 @@ test("buildOperatorDetailSections keeps unavailable source visible in plain lang
 
   const sections = buildOperatorDetailSections(
     buildSymbol({
+      ai_decision: {
+        ...buildSymbol().ai_decision,
+        macro_event_risk_summary: null,
+      },
       event_operator_control: {
         event_context: {
           source_status: "unavailable",

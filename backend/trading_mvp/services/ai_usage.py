@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import AgentRun, Setting
+from trading_mvp.models import AgentRun, AuditEvent, Execution, Order, RiskCheck, Setting
 from trading_mvp.time_utils import utcnow_naive
 
 AI_ATTEMPT_SOURCES = {"llm", "llm_fallback"}
+AI_DECISION_VALUES = ("hold", "long", "short", "reduce", "exit")
+AI_DEDUPED_EVENT_TYPE = "decision_ai_deduped"
+AI_COST_RATES_USD_PER_1M_TOKENS: dict[str, dict[str, float]] = {
+    "gpt-4.1": {"input": 2.0, "output": 8.0},
+    "gpt-4.1-mini": {"input": 0.4, "output": 1.6},
+    "gpt-4.1-nano": {"input": 0.1, "output": 0.4},
+}
 
 
 class TokenUsage(TypedDict):
@@ -46,6 +54,8 @@ class AIUsageMetrics(TypedDict):
     recent_ai_failure_reasons: list[str]
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int]
+    ai_usage_summary_24h: dict[str, Any]
+    ai_usage_summary_7d: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -74,11 +84,11 @@ class OpenAICallGate:
 
 
 @dataclass(slots=True)
-class AgentRunUsageRow:
-    created_at: datetime
-    role: str
-    provider_name: str
-    metadata_json: dict[str, Any]
+class CostEstimate:
+    estimated_cost_usd: float | None
+    input_tokens: int
+    output_tokens: int
+    status: str
 
 
 def manual_ai_guard_minutes(settings_row: Setting) -> int:
@@ -115,24 +125,123 @@ def failure_backoff_minutes(settings_row: Setting, error: str | None) -> int:
 
 
 def _metadata_source(row: AgentRun) -> str:
-    value = row.metadata_json.get("source")
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    value = metadata.get("source")
     return value if isinstance(value, str) else ""
 
 
 def _metadata_error(row: AgentRun) -> str:
-    value = row.metadata_json.get("error")
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    value = metadata.get("error")
     return value if isinstance(value, str) else ""
 
 
-def _metadata_usage(row: AgentRun) -> TokenUsage:
-    raw = row.metadata_json.get("usage")
+def _usage_from_mapping(raw: Mapping[str, Any] | None) -> TokenUsage:
     if not isinstance(raw, dict):
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    prompt_tokens = int(raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0)
+    completion_tokens = int(raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0)
+    total_tokens = int(raw.get("total_tokens", prompt_tokens + completion_tokens) or 0)
     return {
-        "prompt_tokens": int(raw.get("prompt_tokens", 0) or 0),
-        "completion_tokens": int(raw.get("completion_tokens", 0) or 0),
-        "total_tokens": int(raw.get("total_tokens", 0) or 0),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
     }
+
+
+def _metadata_usage(row: AgentRun) -> TokenUsage:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    return _usage_from_mapping(metadata.get("usage") if isinstance(metadata.get("usage"), dict) else None)
+
+
+def _metadata_has_usage(row: AgentRun) -> bool:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    return isinstance(metadata.get("usage"), dict)
+
+
+def _metadata_model(row: AgentRun) -> str | None:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    for key in ("ai_model", "model", "openai_model"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _canonical_model_name(model: str | None) -> str | None:
+    if not model:
+        return None
+    normalized = model.strip().lower()
+    for known_model in AI_COST_RATES_USD_PER_1M_TOKENS:
+        if normalized == known_model:
+            return known_model
+    for known_model in sorted(AI_COST_RATES_USD_PER_1M_TOKENS, key=len, reverse=True):
+        if normalized.startswith(f"{known_model}-"):
+            return known_model
+    return normalized
+
+
+def _rate_for_model(model: str | None) -> dict[str, float] | None:
+    canonical = _canonical_model_name(model)
+    if canonical is None:
+        return None
+    return AI_COST_RATES_USD_PER_1M_TOKENS.get(canonical)
+
+
+def estimate_ai_usage_cost_usd(*, model: str | None, usage: Mapping[str, Any] | None) -> float | None:
+    tokens = _usage_from_mapping(usage)
+    if tokens["total_tokens"] <= 0 and tokens["prompt_tokens"] <= 0 and tokens["completion_tokens"] <= 0:
+        return 0.0
+    rate = _rate_for_model(model)
+    if rate is None:
+        return None
+    estimated = (
+        (tokens["prompt_tokens"] * rate["input"])
+        + (tokens["completion_tokens"] * rate["output"])
+    ) / 1_000_000
+    return round(estimated, 8)
+
+
+def _estimate_row_cost(row: AgentRun) -> CostEstimate:
+    usage = _metadata_usage(row)
+    if not _metadata_has_usage(row):
+        return CostEstimate(
+            estimated_cost_usd=None,
+            input_tokens=usage["prompt_tokens"],
+            output_tokens=usage["completion_tokens"],
+            status="missing_usage",
+        )
+    cost = estimate_ai_usage_cost_usd(model=_metadata_model(row), usage=usage)
+    if cost is None:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            input_tokens=usage["prompt_tokens"],
+            output_tokens=usage["completion_tokens"],
+            status="unknown_model_rate",
+        )
+    return CostEstimate(
+        estimated_cost_usd=cost,
+        input_tokens=usage["prompt_tokens"],
+        output_tokens=usage["completion_tokens"],
+        status="estimated",
+    )
+
+
+def _output_payload(row: AgentRun) -> dict[str, Any]:
+    return row.output_payload if isinstance(row.output_payload, dict) else {}
+
+
+def _metadata_payload(row: AgentRun) -> dict[str, Any]:
+    return row.metadata_json if isinstance(row.metadata_json, dict) else {}
+
+
+def _output_decision(row: AgentRun) -> str | None:
+    decision = str(_output_payload(row).get("decision") or "").strip().lower()
+    return decision if decision in AI_DECISION_VALUES else None
+
+
+def _truthy_payload_value(*values: Any) -> bool:
+    return any(value is True for value in values)
 
 
 def is_ai_attempt(row: AgentRun) -> bool:
@@ -145,6 +254,135 @@ def is_ai_success(row: AgentRun) -> bool:
 
 def is_ai_failure(row: AgentRun) -> bool:
     return _metadata_source(row) == "llm_fallback"
+
+
+def _metadata_reason_list(row: AgentRun) -> list[str]:
+    metadata = _metadata_payload(row)
+    output = _output_payload(row)
+    values: list[str] = []
+    for key in ("pre_ai_skip_reason", "ai_skipped_reason", "last_ai_skip_reason"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    if str(metadata.get("source") or "") == "quality_fail_closed":
+        values.append(str(metadata.get("provider_status") or "QUALITY_FAIL_CLOSED"))
+    for key in ("data_quality_block_reason_codes", "event_risk_reason_codes"):
+        raw_values = metadata.get(key)
+        if isinstance(raw_values, list):
+            values.extend(str(item) for item in raw_values if item)
+    raw_flags = output.get("data_quality_flags")
+    if isinstance(raw_flags, list):
+        values.extend(str(item) for item in raw_flags if item)
+    return values
+
+
+def _normalize_skip_reason(reason: str) -> str:
+    normalized = reason.strip().upper()
+    if not normalized:
+        return "UNKNOWN"
+    if "STALE" in normalized or "INCOMPLETE_MARKET_DATA" in normalized:
+        return "STALE_MARKET_DATA"
+    if "MACRO_EVENT_IMMINENT" in normalized:
+        return "MACRO_EVENT_IMMINENT"
+    if "MACRO_EVENT_RISK_WINDOW_ACTIVE" in normalized or "MACRO_RELEASE_REACTION_WINDOW" in normalized:
+        return "MACRO_EVENT_RISK_WINDOW_ACTIVE"
+    if "SPREAD" in normalized and ("STRESS" in normalized or "WIDE" in normalized):
+        return "SPREAD_STRESS"
+    if "EXPOSURE" in normalized or "HEADROOM" in normalized or "POSITION_LIMIT" in normalized:
+        return "EXPOSURE_LIMIT"
+    if "LOW_SCORE" in normalized or ("LOW" in normalized and "SCORE" in normalized):
+        return "LOW_SCORE"
+    return normalized
+
+
+def _skip_reason_labels(row: AgentRun) -> list[str]:
+    labels = [_normalize_skip_reason(reason) for reason in _metadata_reason_list(row)]
+    return list(dict.fromkeys(label for label in labels if label))
+
+
+def _is_preai_skipped(row: AgentRun) -> bool:
+    if is_ai_attempt(row):
+        return False
+    metadata = _metadata_payload(row)
+    return bool(
+        _skip_reason_labels(row)
+        or metadata.get("provider_not_called_due_to_quality") is True
+        or str(metadata.get("source") or "") == "quality_fail_closed"
+    )
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    if value in {None, ""}:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _empty_downstream_summary() -> dict[str, Any]:
+    return {
+        "agent_runs": 0,
+        "risk_checks": 0,
+        "risk_allowed": 0,
+        "risk_blocked": 0,
+        "orders": 0,
+        "executions": 0,
+        "fills": 0,
+        "realized_pnl": 0.0,
+        "fee": 0.0,
+        "net_realized_pnl": 0.0,
+        "average_slippage_pct": 0.0,
+    }
+
+
+def _downstream_summary(session: Session, decision_ids: Sequence[int]) -> dict[str, Any]:
+    unique_decision_ids = sorted({int(item) for item in decision_ids if item is not None})
+    if not unique_decision_ids:
+        return _empty_downstream_summary()
+
+    risk_rows = list(
+        session.scalars(select(RiskCheck).where(RiskCheck.decision_run_id.in_(unique_decision_ids)))
+    )
+    order_rows = list(
+        session.scalars(select(Order).where(Order.decision_run_id.in_(unique_decision_ids)))
+    )
+    order_ids = [row.id for row in order_rows]
+    execution_rows = (
+        list(session.scalars(select(Execution).where(Execution.order_id.in_(order_ids))))
+        if order_ids
+        else []
+    )
+    slippages = [_safe_float(row.slippage_pct) for row in execution_rows]
+    realized_pnl = sum(_safe_float(row.realized_pnl) for row in execution_rows)
+    fee = sum(_safe_float(row.fee_paid) for row in execution_rows)
+    return {
+        "agent_runs": len(unique_decision_ids),
+        "risk_checks": len(risk_rows),
+        "risk_allowed": sum(1 for row in risk_rows if bool(row.allowed)),
+        "risk_blocked": sum(1 for row in risk_rows if not bool(row.allowed)),
+        "orders": len(order_rows),
+        "executions": len(execution_rows),
+        "fills": len(execution_rows),
+        "realized_pnl": realized_pnl,
+        "fee": fee,
+        "net_realized_pnl": realized_pnl - fee,
+        "average_slippage_pct": sum(slippages) / len(slippages) if slippages else 0.0,
+    }
+
+
+def count_ai_deduped_events(session: Session, since: datetime) -> int:
+    return int(
+        session.scalar(
+            select(func.count(AuditEvent.id)).where(
+                AuditEvent.event_type == AI_DEDUPED_EVENT_TYPE,
+                AuditEvent.created_at >= since,
+            )
+        )
+        or 0
+    )
 
 
 def _recent_role_runs(session: Session, role: str, *, limit: int = 25) -> list[AgentRun]:
@@ -250,6 +488,105 @@ def get_openai_call_gate(
     return OpenAICallGate(allowed=True, reason="allowed", manual_guard_minutes=manual_guard)
 
 
+def build_ai_telemetry_summary(
+    session: Session,
+    rows: Sequence[AgentRun],
+    *,
+    deduped_count: int = 0,
+) -> dict[str, Any]:
+    decision_rows = [row for row in rows if row.role == "trading_decision"]
+    provider_invoked_rows = [row for row in decision_rows if is_ai_attempt(row)]
+    failed_rows = [row for row in provider_invoked_rows if is_ai_failure(row)]
+    skipped_rows = [row for row in decision_rows if _is_preai_skipped(row)]
+    telemetry_row_ids = {
+        row.id
+        for row in [*provider_invoked_rows, *skipped_rows]
+        if row.id is not None
+    }
+    telemetry_rows = [row for row in decision_rows if row.id in telemetry_row_ids]
+
+    decision_counts = {decision: 0 for decision in AI_DECISION_VALUES}
+    decision_ids_by_decision: dict[str, list[int]] = {decision: [] for decision in AI_DECISION_VALUES}
+    source_counts: Counter[str] = Counter()
+    preai_skip_reasons: Counter[str] = Counter()
+    should_abstain = 0
+    fail_closed = 0
+    input_tokens = 0
+    output_tokens = 0
+    estimated_cost_total = 0.0
+    unknown_cost_rows = 0
+    missing_usage_rows = 0
+
+    for row in telemetry_rows:
+        decision = _output_decision(row)
+        if decision is not None:
+            decision_counts[decision] += 1
+            if row.id is not None:
+                decision_ids_by_decision[decision].append(int(row.id))
+        metadata = _metadata_payload(row)
+        output = _output_payload(row)
+        source_counts[str(metadata.get("source") or row.provider_name or "unknown")] += 1
+        if _truthy_payload_value(output.get("should_abstain"), metadata.get("should_abstain")):
+            should_abstain += 1
+        if _truthy_payload_value(output.get("fail_closed_applied"), metadata.get("fail_closed_applied")):
+            fail_closed += 1
+
+    for row in skipped_rows:
+        labels = _skip_reason_labels(row) or ["UNKNOWN"]
+        preai_skip_reasons.update(labels)
+
+    for row in provider_invoked_rows:
+        cost = _estimate_row_cost(row)
+        input_tokens += cost.input_tokens
+        output_tokens += cost.output_tokens
+        if cost.status == "missing_usage":
+            missing_usage_rows += 1
+            unknown_cost_rows += 1
+        elif cost.estimated_cost_usd is None:
+            unknown_cost_rows += 1
+        else:
+            estimated_cost_total += cost.estimated_cost_usd
+
+    if not provider_invoked_rows:
+        estimated_cost_usd: float | None = 0.0
+        cost_estimate_status = "no_provider_calls"
+    elif unknown_cost_rows:
+        estimated_cost_usd = None
+        cost_estimate_status = "partial_unknown"
+    else:
+        estimated_cost_usd = round(estimated_cost_total, 8)
+        cost_estimate_status = "estimated"
+
+    return {
+        "ai_calls_total": len(provider_invoked_rows) + len(skipped_rows) + int(deduped_count),
+        "ai_calls_provider_invoked": len(provider_invoked_rows),
+        "ai_calls_skipped_preai": len(skipped_rows),
+        "ai_calls_deduped": int(deduped_count),
+        "ai_calls_failed": len(failed_rows),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "estimated_cost_usd": estimated_cost_usd,
+        "cost_estimate_status": cost_estimate_status,
+        "missing_usage_rows": missing_usage_rows,
+        "unknown_cost_rows": unknown_cost_rows,
+        "decision_counts": decision_counts,
+        "source_counts": {key: int(value) for key, value in sorted(source_counts.items())},
+        "should_abstain": should_abstain,
+        "fail_closed": fail_closed,
+        "preai_skip_reasons": {key: int(value) for key, value in sorted(preai_skip_reasons.items())},
+        "downstream": _downstream_summary(session, sorted(telemetry_row_ids)),
+        "downstream_by_decision": {
+            decision: _downstream_summary(session, decision_ids)
+            for decision, decision_ids in decision_ids_by_decision.items()
+        },
+        "cost_basis": {
+            "rate_unit": "usd_per_1m_tokens",
+            "rates": AI_COST_RATES_USD_PER_1M_TOKENS,
+            "note": "Uses prompt_tokens as input and completion_tokens as output; cached-token discounts are not assumed.",
+        },
+    }
+
+
 def _summarize_attempt_rows(rows: list[AgentRun]) -> AIWindowSummary:
     attempts = [row for row in rows if is_ai_attempt(row)]
     successes = [row for row in attempts if is_ai_success(row)]
@@ -288,23 +625,27 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
     now = utcnow_naive()
     cutoff_7d = now - timedelta(days=7)
     cutoff_24h = now - timedelta(hours=24)
-    rows_7d = [
-        AgentRunUsageRow(
-            created_at=row.created_at,
-            role=row.role,
-            provider_name=row.provider_name,
-            metadata_json=row.metadata_json if isinstance(row.metadata_json, dict) else {},
-        )
-        for row in session.execute(
-            select(AgentRun.created_at, AgentRun.role, AgentRun.provider_name, AgentRun.metadata_json)
+    rows_7d = list(
+        session.scalars(
+            select(AgentRun)
             .where(AgentRun.created_at >= cutoff_7d)
             .order_by(desc(AgentRun.created_at))
         )
-    ]
+    )
     rows_24h = [row for row in rows_7d if row.created_at >= cutoff_24h]
 
     summary_24h = _summarize_attempt_rows(rows_24h)
     summary_7d = _summarize_attempt_rows(rows_7d)
+    ai_usage_summary_24h = build_ai_telemetry_summary(
+        session,
+        rows_24h,
+        deduped_count=count_ai_deduped_events(session, cutoff_24h),
+    )
+    ai_usage_summary_7d = build_ai_telemetry_summary(
+        session,
+        rows_7d,
+        deduped_count=count_ai_deduped_events(session, cutoff_7d),
+    )
 
     if summary_24h["calls"] > 0:
         projected_total = int(summary_24h["calls"] * 30)
@@ -336,4 +677,6 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         "recent_ai_failure_reasons": summary_7d["failure_reasons"],
         "observed_monthly_ai_calls_projection": projected_total,
         "observed_monthly_ai_calls_projection_breakdown": projected_breakdown,
+        "ai_usage_summary_24h": ai_usage_summary_24h,
+        "ai_usage_summary_7d": ai_usage_summary_7d,
     }

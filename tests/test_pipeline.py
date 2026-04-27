@@ -22,6 +22,7 @@ from trading_mvp.providers import ProviderResult
 from trading_mvp.schemas import (
     AIPriorContextPacket,
     DerivativesContextPayload,
+    EventContextPayload,
     FeaturePayload,
     MarketCandle,
     MarketSnapshotPayload,
@@ -59,6 +60,149 @@ def _mark_pipeline_sync_fresh(settings_row) -> None:
     now = utcnow_naive()
     for scope in ("account", "positions", "open_orders", "protective_orders"):
         mark_sync_success(settings_row, scope=scope, synced_at=now)
+
+
+def _pre_ai_gate_snapshot() -> MarketSnapshotPayload:
+    snapshot_time = utcnow_naive()
+    return MarketSnapshotPayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=70000.0,
+        latest_volume=1000.0,
+        candle_count=3,
+        is_stale=False,
+        is_complete=True,
+        candles=[
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=2), open=69950.0, high=70040.0, low=69920.0, close=70000.0, volume=900.0),
+            MarketCandle(timestamp=snapshot_time - timedelta(minutes=1), open=70000.0, high=70070.0, low=69980.0, close=70030.0, volume=980.0),
+            MarketCandle(timestamp=snapshot_time, open=70030.0, high=70090.0, low=70010.0, close=70060.0, volume=1020.0),
+        ],
+    )
+
+
+def _pre_ai_gate_feature(
+    *,
+    volume_ratio: float,
+    weak_volume: bool,
+    volume_regime: str = "normal",
+    event_context: EventContextPayload | None = None,
+) -> FeaturePayload:
+    feature_payload = FeaturePayload(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        trend_score=0.32,
+        volatility_pct=0.002,
+        volume_ratio=volume_ratio,
+        drawdown_pct=0.001,
+        rsi=58.0,
+        atr=90.0,
+        atr_pct=0.0013,
+        momentum_score=0.18,
+        multi_timeframe={
+            "15m": TimeframeFeatureContext(
+                timeframe="15m",
+                trend_score=0.32,
+                volatility_pct=0.002,
+                volume_ratio=volume_ratio,
+                drawdown_pct=0.001,
+                rsi=58.0,
+                atr=90.0,
+                atr_pct=0.0013,
+                momentum_score=0.18,
+            )
+        },
+        regime=RegimeFeatureContext(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            volume_regime=volume_regime,
+            momentum_state="stable",
+            weak_volume=weak_volume,
+            momentum_weakening=False,
+        ),
+    )
+    if event_context is not None:
+        return feature_payload.model_copy(update={"event_context": event_context})
+    return feature_payload
+
+
+def _pre_ai_gate_macro_event_context(*, minutes_to_event: int = 10) -> EventContextPayload:
+    generated_at = utcnow_naive()
+    return EventContextPayload(
+        source_status="external_api",
+        source_provenance="external_api",
+        source_vendor="fred",
+        generated_at=generated_at,
+        is_stale=False,
+        is_complete=True,
+        next_event_at=generated_at + timedelta(minutes=minutes_to_event),
+        next_event_name="US CPI",
+        next_event_importance="high",
+        minutes_to_next_event=minutes_to_event,
+        active_risk_window=True,
+        affected_assets=["USD", "CRYPTO"],
+        event_bias="bearish",
+        enrichment_vendors=["bls"],
+        events=[],
+    )
+
+
+def _pre_ai_gate_open_position() -> Position:
+    return Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=70060.0,
+        leverage=2.0,
+        stop_loss=69400.0,
+        take_profit=71200.0,
+        realized_pnl=0.0,
+        unrealized_pnl=6.0,
+        metadata_json={},
+    )
+
+
+class _AllowAiGate:
+    allowed = True
+    reason = "allowed"
+
+    def as_metadata(self) -> dict[str, object]:
+        return {"allowed": True, "reason": "allowed"}
+
+
+class _CountingDecisionProvider:
+    name = "openai"
+
+    def __init__(self, decision: str = "hold") -> None:
+        self.calls = 0
+        self.decision = decision
+
+    def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+        del role, response_model, instructions
+        self.calls += 1
+        latest_price = float(payload["market_snapshot"]["latest_price"])
+        return ProviderResult(
+            provider="openai",
+            output={
+                "decision": self.decision,
+                "confidence": 0.62,
+                "symbol": payload["market_snapshot"]["symbol"],
+                "timeframe": payload["market_snapshot"]["timeframe"],
+                "entry_mode": "none",
+                "max_holding_minutes": 120,
+                "risk_pct": 0.01,
+                "leverage": 1.0,
+                "rationale_codes": ["TEST_PROVIDER_CALLED"],
+                "no_trade_reason_codes": ["TEST_PROVIDER_CALLED"] if self.decision == "hold" else [],
+                "scenario_note": f"Provider observed {latest_price:.1f}",
+                "explanation_short": f"provider {self.decision}",
+                "explanation_detailed": "Provider was intentionally called for the pre-AI gate control case.",
+            },
+        )
 
 
 def _entry_plan_test_decision() -> TradeDecision:
@@ -2931,6 +3075,227 @@ def test_entry_event_invokes_ai_once(monkeypatch, db_session) -> None:
     assert invocation_payloads[0]["review_trigger"]["trigger_reason"] == "entry_candidate_event"
     assert invocation_payloads[0]["selection_context"]["assigned_slot"] == "slot_1"
     assert result["results"][0]["outcome"]["trigger"]["trigger_reason"] == "entry_candidate_event"
+
+
+def _run_pre_ai_gate_decision(
+    monkeypatch,
+    db_session,
+    *,
+    trigger_reason: str,
+    feature_payload: FeaturePayload,
+    provider: _CountingDecisionProvider,
+    open_position: Position | None = None,
+    selection_context: dict[str, object] | None = None,
+):
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    if open_position is not None:
+        db_session.add(open_position)
+    db_session.flush()
+
+    snapshot = _pre_ai_gate_snapshot()
+    trigger = _interval_review_plan(trigger_reason=trigger_reason)["plans"][0]["trigger"]
+    monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: _AllowAiGate())
+
+    orchestrator = TradingOrchestrator(db_session)
+    orchestrator.trading_agent = TradingDecisionAgent(provider)
+    result = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="manual" if trigger_reason == "manual_review_event" else "realtime_cycle",
+        exchange_sync_checked=True,
+        market_snapshot_override=snapshot,
+        market_context_override={
+            "15m": snapshot,
+            "1h": snapshot.model_copy(update={"timeframe": "1h"}),
+        },
+        selection_context=selection_context or {"assigned_slot": "slot_1", "candidate_weight": 0.64},
+        review_trigger=trigger,
+    )
+    decision_row = db_session.get(AgentRun, result["decision_run_id"])
+    assert decision_row is not None
+    return result, decision_row
+
+
+def test_entry_candidate_weak_volume_preai_skips_provider_and_records_reason(monkeypatch, db_session) -> None:
+    provider = _CountingDecisionProvider(decision="hold")
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=0.07, weak_volume=True, volume_regime="weak"),
+        provider=provider,
+    )
+    audit = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_ai_skipped")
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+
+    assert provider.calls == 0
+    assert result["decision"]["decision"] == "hold"
+    assert result["last_ai_trigger_reason"] == "entry_candidate_event"
+    assert result["last_ai_invoked_at"] is None
+    assert result["last_ai_skip_reason"] == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert result["risk_check_id"] is not None
+    assert "HOLD_DECISION" in result["risk_result"]["reason_codes"]
+    assert result["execution"] is None
+    assert decision_row.metadata_json["last_ai_skip_reason"] == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert decision_row.metadata_json["pre_ai_skip_reason"] == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert audit is not None
+    assert audit.payload["ai_skipped_reason"] == "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_entry_candidate_ai_invoked_hold_remains_ai_called_and_risk_hold(monkeypatch, db_session) -> None:
+    provider = _CountingDecisionProvider(decision="hold")
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+    )
+    invoked_audit = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_ai_invoked", AuditEvent.entity_id == str(decision_row.id))
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+    skipped_audit = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_ai_skipped", AuditEvent.entity_id == str(decision_row.id))
+        .limit(1)
+    )
+
+    assert provider.calls == 1
+    assert result["decision"]["decision"] == "hold"
+    assert result["risk_check_id"] is not None
+    assert result["risk_result"]["allowed"] is False
+    assert "HOLD_DECISION" in result["risk_result"]["reason_codes"]
+    assert result["execution"] is None
+    assert result["last_ai_trigger_reason"] == "entry_candidate_event"
+    assert result["last_ai_invoked_at"] is not None
+    assert result["last_ai_skip_reason"] is None
+    assert result["ai_skipped_reason"] is None
+    assert decision_row.provider_name == "openai"
+    assert decision_row.metadata_json["source"] == "llm"
+    assert decision_row.metadata_json["last_ai_skip_reason"] is None
+    assert decision_row.metadata_json["pre_ai_skip_reason"] is None
+    assert invoked_audit is not None
+    assert invoked_audit.payload["trigger"]["trigger_reason"] == "entry_candidate_event"
+    assert skipped_audit is None
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_entry_candidate_high_impact_event_records_conservative_ai_context(monkeypatch, db_session) -> None:
+    provider = _CountingDecisionProvider(decision="hold")
+    event_context = _pre_ai_gate_macro_event_context(minutes_to_event=10)
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(
+            volume_ratio=1.08,
+            weak_volume=False,
+            event_context=event_context,
+        ),
+        provider=provider,
+    )
+    input_ai_context = decision_row.input_payload["ai_context"]
+
+    assert provider.calls == 1
+    assert result["last_ai_skip_reason"] is None
+    assert input_ai_context["event_risk_active"] is True
+    assert "MACRO_EVENT_IMMINENT" in input_ai_context["event_risk_reason_codes"]
+    assert decision_row.metadata_json["event_risk_active"] is True
+    assert "MACRO_EVENT_RISK_WINDOW_ACTIVE" in decision_row.metadata_json["event_risk_reason_codes"]
+    assert decision_row.metadata_json["event_risk_context"]["risk_pct_multiplier"] == 0.5
+    assert decision_row.metadata_json["event_risk_context"]["event_bias_used"] == "bearish"
+
+
+def test_entry_candidate_weak_but_not_extreme_volume_keeps_ai_candidate_event(monkeypatch, db_session) -> None:
+    provider = _CountingDecisionProvider()
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=0.45, weak_volume=True, volume_regime="weak"),
+        provider=provider,
+    )
+
+    assert provider.calls == 1
+    assert result["last_ai_trigger_reason"] == "entry_candidate_event"
+    assert result["last_ai_skip_reason"] is None
+    assert decision_row.metadata_json["pre_ai_skip_reason"] is None
+
+
+def test_protection_review_weak_volume_does_not_use_entry_preai_gate(monkeypatch, db_session) -> None:
+    provider = _CountingDecisionProvider()
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="protection_review_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=0.07, weak_volume=True, volume_regime="weak"),
+        provider=provider,
+    )
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == "PROTECTION_REVIEW_DETERMINISTIC_ONLY"
+    assert decision_row.metadata_json["pre_ai_skip_reason"] is None
+    assert decision_row.metadata_json["last_ai_skip_reason"] != "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
+
+
+def test_manual_review_weak_volume_does_not_use_entry_preai_gate(monkeypatch, db_session) -> None:
+    provider = _CountingDecisionProvider()
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="manual_review_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=0.07, weak_volume=True, volume_regime="weak"),
+        provider=provider,
+    )
+
+    assert provider.calls == 1
+    assert result["last_ai_trigger_reason"] == "manual_review_event"
+    assert result["last_ai_skip_reason"] is None
+    assert decision_row.metadata_json["pre_ai_skip_reason"] is None
+
+
+def test_manual_open_position_reduce_route_weak_volume_does_not_use_entry_preai_gate(
+    monkeypatch,
+    db_session,
+) -> None:
+    provider = _CountingDecisionProvider(decision="reduce")
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="manual_review_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=0.07, weak_volume=True, volume_regime="weak"),
+        provider=provider,
+        open_position=_pre_ai_gate_open_position(),
+        selection_context={
+            "assigned_slot": "slot_1",
+            "candidate_weight": 0.64,
+            "strategy_engine": "trend_pullback_engine",
+            "strategy_engine_context": {"management_only_open_position_route": True},
+            "holding_profile": "scalp",
+            "holding_profile_reason": "open_position_management",
+        },
+    )
+
+    assert provider.calls == 1
+    assert result["decision"]["decision"] == "reduce"
+    assert result["last_ai_skip_reason"] is None
+    assert decision_row.metadata_json["pre_ai_skip_reason"] is None
+    assert "reduce" in decision_row.metadata_json["allowed_actions"]
+    assert "exit" in decision_row.metadata_json["allowed_actions"]
 
 
 def test_repeated_same_event_dedupes_ai(monkeypatch, db_session) -> None:

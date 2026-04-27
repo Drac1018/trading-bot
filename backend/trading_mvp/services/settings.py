@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
@@ -38,6 +38,7 @@ from trading_mvp.schemas import (
     OperatorEventViewPayload,
     OperatorEventViewRequest,
     RolloutMode,
+    SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES,
     SymbolCadenceOverride,
     SymbolEffectiveCadence,
 )
@@ -81,7 +82,13 @@ from trading_mvp.services.runtime_state import (
     summarize_runtime_state,
 )
 from trading_mvp.services.secret_store import decrypt_secret, encrypt_secret
-from trading_mvp.time_utils import ensure_utc_aware, isoformat_utc, utcnow_aware, utcnow_naive
+from trading_mvp.time_utils import (
+    ensure_utc_aware,
+    isoformat_utc,
+    parse_utc_datetime,
+    utcnow_aware,
+    utcnow_naive,
+)
 
 
 @dataclass(slots=True)
@@ -106,6 +113,14 @@ class EffectiveSymbolSettings:
     ai_backstop_interval_minutes: int
 
 
+@dataclass(slots=True)
+class EventContextCandidate:
+    payload: dict[str, Any]
+    source: str
+    observed_at: datetime | None
+    priority: int
+
+
 DISPLAY_MAX_LEVERAGE = 5.0
 DISPLAY_MAX_RISK_PER_TRADE = 0.02
 DISPLAY_MAX_DAILY_LOSS = 0.05
@@ -118,6 +133,17 @@ DEFAULT_LIMITED_LIVE_MAX_NOTIONAL = 500.0
 DEFAULT_AI_BACKSTOP_ENABLED = True
 DEFAULT_AI_BACKSTOP_INTERVAL_MINUTES = 180
 DEFAULT_EVENT_SOURCE_TIMEOUT_SECONDS = 10.0
+AI_ENTRY_REVIEW_MODEL = "gpt-4.1-mini"
+AI_COMPLEX_REVIEW_MODEL_CANDIDATES = ("gpt-4.1-mini", "gpt-5-mini")
+AI_HIGH_RISK_MODEL_CANDIDATES = ("gpt-5-mini", "higher_model_option")
+AI_NO_MODEL_CALL_ROUTES = (
+    "pre_ai_skip_simple_classification",
+    "daily_dashboard_explanation",
+)
+AI_CANDIDATE_MODEL_ROUTES = (
+    "macro_event_position_complex",
+    "operator_manual_high_risk",
+)
 LATEST_SYMBOL_DECISION_SCAN_LIMIT = 100
 ROLLOUT_MODE_SUBMIT_ENABLED = {"limited_live", "full_live"}
 ROLLOUT_MODE_LIVE_PATH = {"shadow", "live_dry_run", "limited_live", "full_live"}
@@ -132,6 +158,94 @@ RUNTIME_STATE_DETAIL_KEYS = {
 }
 EVENT_OPERATOR_CONTROL_DETAIL_KEY = "event_operator_control"
 PRESERVED_SETTINGS_DETAIL_KEYS = {*RUNTIME_STATE_DETAIL_KEYS, EVENT_OPERATOR_CONTROL_DETAIL_KEY}
+
+
+def build_ai_model_routing_policy(settings_row: Setting) -> dict[str, Any]:
+    configured_model = str(settings_row.ai_model or AI_ENTRY_REVIEW_MODEL).strip() or AI_ENTRY_REVIEW_MODEL
+    return {
+        "version": "2026-04-26",
+        "read_only": True,
+        "runtime_model_source": "settings.ai_model",
+        "primary_model": configured_model,
+        "summary": (
+            "Provider-invoked reviews use the single configured settings.ai_model. "
+            "Pre-AI skips, simple classifications, and dashboard read-model summaries do not call a model."
+        ),
+        "no_model_call_routes": list(AI_NO_MODEL_CALL_ROUTES),
+        "candidate_model_routes": list(AI_CANDIDATE_MODEL_ROUTES),
+        "routes": [
+            {
+                "route": "pre_ai_skip_simple_classification",
+                "label": "pre-AI skip / simple classification",
+                "call_policy": "no_model_call",
+                "configured_model": None,
+                "default_model": None,
+                "model_candidates": [],
+                "reason_codes": [
+                    "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+                    "STALE_MARKET_DATA",
+                    "LOW_SCORE",
+                    "SPREAD_STRESS",
+                    "EXPOSURE_LIMIT",
+                    "MACRO_EVENT_IMMINENT",
+                    "MACRO_EVENT_RISK_WINDOW_ACTIVE",
+                ],
+                "notes": [
+                    "Handled before TradingDecisionAgent provider invocation.",
+                    "Counts as skipped/deduped telemetry, not provider usage.",
+                ],
+            },
+            {
+                "route": "general_entry_review",
+                "label": "general entry review",
+                "call_policy": "provider_invoked_when_gate_allows",
+                "configured_model": configured_model,
+                "default_model": AI_ENTRY_REVIEW_MODEL,
+                "model_candidates": [AI_ENTRY_REVIEW_MODEL],
+                "notes": [
+                    "Conservative review for candidates that survive deterministic scanner and pre-AI gate.",
+                    "Current runtime provider uses settings.ai_model for this path.",
+                ],
+            },
+            {
+                "route": "macro_event_position_complex",
+                "label": "macro event + position + complex judgment",
+                "call_policy": "candidate_model_tier",
+                "configured_model": configured_model,
+                "default_model": AI_ENTRY_REVIEW_MODEL,
+                "model_candidates": list(AI_COMPLEX_REVIEW_MODEL_CANDIDATES),
+                "notes": [
+                    "Candidate tier for future route-specific model selection.",
+                    "This read-model does not enable automatic per-route provider switching.",
+                ],
+            },
+            {
+                "route": "operator_manual_high_risk",
+                "label": "operator manual review / high risk",
+                "call_policy": "candidate_model_tier",
+                "configured_model": configured_model,
+                "default_model": "gpt-5-mini",
+                "model_candidates": list(AI_HIGH_RISK_MODEL_CANDIDATES),
+                "notes": [
+                    "Operator can still type a higher model into the existing model field.",
+                    "No automatic high-risk escalation is performed by this settings payload.",
+                ],
+            },
+            {
+                "route": "daily_dashboard_explanation",
+                "label": "daily dashboard explanation",
+                "call_policy": "read_model_no_model_call",
+                "configured_model": None,
+                "default_model": None,
+                "model_candidates": [],
+                "notes": [
+                    "Dashboard copy should be generated from stored telemetry and read-model summaries.",
+                    "Use model calls only for explicit manual analysis outside normal dashboard rendering.",
+                ],
+            },
+        ],
+    }
+
 """
 ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
@@ -272,13 +386,14 @@ def normalize_symbol_cadence_overrides(
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
+        timeframe_override = str(raw["timeframe_override"]).strip() if raw.get("timeframe_override") else None
+        if timeframe_override not in SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES:
+            timeframe_override = None
         normalized.append(
             {
                 "symbol": symbol,
                 "enabled": bool(raw.get("enabled", True)),
-                "timeframe_override": str(raw["timeframe_override"]).strip()
-                if raw.get("timeframe_override")
-                else None,
+                "timeframe_override": timeframe_override,
                 "market_refresh_interval_minutes_override": (
                     int(raw["market_refresh_interval_minutes_override"])
                     if raw.get("market_refresh_interval_minutes_override") not in {None, ""}
@@ -534,29 +649,104 @@ def _latest_symbol_market_snapshot(
     return session.scalar(query.order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
 
 
-def _extract_raw_event_context(
+def _event_context_observed_at(payload: dict[str, Any], fallback: datetime | None) -> datetime | None:
+    return parse_utc_datetime(payload.get("generated_at")) or parse_utc_datetime(
+        payload.get("source_generated_at")
+    ) or ensure_utc_aware(fallback)
+
+
+def _event_context_candidate(
+    value: object,
+    *,
+    source: str,
+    fallback: datetime | None,
+    priority: int,
+) -> EventContextCandidate | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    payload = dict(value)
+    return EventContextCandidate(
+        payload=payload,
+        source=source,
+        observed_at=_event_context_observed_at(payload, fallback),
+        priority=priority,
+    )
+
+
+def _event_context_candidate_sort_key(candidate: EventContextCandidate) -> tuple[bool, datetime, int]:
+    observed_at = candidate.observed_at or datetime.min.replace(tzinfo=UTC)
+    return candidate.observed_at is not None, observed_at, -candidate.priority
+
+
+def extract_freshest_raw_event_context(
     *,
     decision_row: AgentRun | None,
     feature_row: FeatureSnapshot | None,
     market_row: MarketSnapshot | None,
 ) -> tuple[dict[str, Any], str | None]:
+    candidates: list[EventContextCandidate] = []
     if decision_row is not None and isinstance(decision_row.input_payload, dict):
         features = decision_row.input_payload.get("features")
-        if isinstance(features, dict) and isinstance(features.get("event_context"), dict):
-            return dict(features.get("event_context") or {}), "latest decision input"
+        if isinstance(features, dict):
+            candidate = _event_context_candidate(
+                features.get("event_context"),
+                source="latest decision input",
+                fallback=decision_row.created_at,
+                priority=10,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
         market_snapshot = decision_row.input_payload.get("market_snapshot")
-        if isinstance(market_snapshot, dict) and isinstance(market_snapshot.get("event_context"), dict):
-            return dict(market_snapshot.get("event_context") or {}), "decision market snapshot"
+        if isinstance(market_snapshot, dict):
+            candidate = _event_context_candidate(
+                market_snapshot.get("event_context"),
+                source="decision market snapshot",
+                fallback=decision_row.created_at,
+                priority=20,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
         ai_context = decision_row.input_payload.get("ai_context")
-        if isinstance(ai_context, dict) and isinstance(ai_context.get("event_context_summary"), dict):
-            return dict(ai_context.get("event_context_summary") or {}), "ai context summary"
+        if isinstance(ai_context, dict):
+            candidate = _event_context_candidate(
+                ai_context.get("event_context_summary"),
+                source="ai context summary",
+                fallback=decision_row.created_at,
+                priority=40,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
         feature_layers = decision_row.input_payload.get("feature_layers")
-        if isinstance(feature_layers, dict) and isinstance(feature_layers.get("event_context_summary"), dict):
-            return dict(feature_layers.get("event_context_summary") or {}), "feature layer summary"
-    if feature_row is not None and isinstance(feature_row.payload, dict) and isinstance(feature_row.payload.get("event_context"), dict):
-        return dict(feature_row.payload.get("event_context") or {}), "feature snapshot"
-    if market_row is not None and isinstance(market_row.payload, dict) and isinstance(market_row.payload.get("event_context"), dict):
-        return dict(market_row.payload.get("event_context") or {}), "market snapshot"
+        if isinstance(feature_layers, dict):
+            candidate = _event_context_candidate(
+                feature_layers.get("event_context_summary"),
+                source="feature layer summary",
+                fallback=decision_row.created_at,
+                priority=50,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    if feature_row is not None and isinstance(feature_row.payload, dict):
+        candidate = _event_context_candidate(
+            feature_row.payload.get("event_context"),
+            source="feature snapshot",
+            fallback=feature_row.feature_time,
+            priority=0,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    if market_row is not None and isinstance(market_row.payload, dict):
+        candidate = _event_context_candidate(
+            market_row.payload.get("event_context"),
+            source="market snapshot",
+            fallback=market_row.snapshot_time,
+            priority=0,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    if candidates:
+        selected = max(candidates, key=_event_context_candidate_sort_key)
+        return selected.payload, selected.source
     return {}, None
 
 
@@ -573,7 +763,7 @@ def _build_operator_event_context_payload(
     resolved_decision = decision_row or _latest_symbol_decision(session, symbol=symbol, timeframe=timeframe)
     resolved_feature = feature_row or _latest_symbol_feature(session, symbol=symbol, timeframe=timeframe)
     resolved_market = market_row or _latest_symbol_market_snapshot(session, symbol=symbol, timeframe=timeframe)
-    raw_context, context_source = _extract_raw_event_context(
+    raw_context, context_source = extract_freshest_raw_event_context(
         decision_row=resolved_decision,
         feature_row=resolved_feature,
         market_row=resolved_market,
@@ -2651,6 +2841,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         ai_enabled=settings_row.ai_enabled,
         ai_provider=settings_row.ai_provider,
         ai_model=settings_row.ai_model,
+        ai_model_routing_policy=build_ai_model_routing_policy(settings_row),
         ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
         decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
         ai_max_input_candles=settings_row.ai_max_input_candles,
@@ -2867,6 +3058,7 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         ai_enabled=settings_row.ai_enabled,
         ai_provider=settings_row.ai_provider,
         ai_model=settings_row.ai_model,
+        ai_model_routing_policy=build_ai_model_routing_policy(settings_row),
         ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
         decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
         ai_max_input_candles=settings_row.ai_max_input_candles,

@@ -13,10 +13,12 @@ import { IntegrationSettingsPanel } from "./settings/integration-settings-panel"
 import { MarketRiskPanel } from "./settings/market-risk-panel";
 import { EventResponseOverviewPanel } from "./settings/event-response-overview-panel";
 import {
+  type AIModelRoutingPolicy,
   type ControlStatusSummary,
   type EventSourceProvider,
   type LiveSyncResult,
   type RolloutMode,
+  SYMBOL_TIMEFRAME_OPTIONS,
   type SymbolCadenceOverride,
   type SymbolEffectiveCadence,
 } from "./settings/types";
@@ -159,6 +161,7 @@ export type SettingsPayload = {
   ai_enabled: boolean;
   ai_provider: "openai" | "mock";
   ai_model: string;
+  ai_model_routing_policy?: AIModelRoutingPolicy;
   ai_call_interval_minutes: number;
   decision_cycle_interval_minutes: number;
   ai_max_input_candles: number;
@@ -193,6 +196,7 @@ type FormState = Omit<
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
   | "pause_recovery_class" | "control_status_summary" | "event_operator_control" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured" | "event_source_api_key_configured"
+  | "ai_model_routing_policy"
   | "event_source_provider" | "event_source_api_url" | "event_source_timeout_seconds" | "event_source_default_assets" | "event_source_fred_release_ids"
   | "event_source_bls_enrichment_url" | "event_source_bls_enrichment_static_params" | "event_source_bea_enrichment_url" | "event_source_bea_enrichment_static_params"
 > & {
@@ -252,13 +256,20 @@ function describeEventSourceProviderOverride(value: SettingsPayload["event_sourc
   return "env fallback";
 }
 
+function normalizeTimeframeOverride(value: string | null | undefined) {
+  const normalized = value?.trim();
+  return normalized && SYMBOL_TIMEFRAME_OPTIONS.includes(normalized as (typeof SYMBOL_TIMEFRAME_OPTIONS)[number])
+    ? normalized
+    : null;
+}
+
 function normalizeSymbolOverrides(overrides: SymbolCadenceOverride[]) {
   const seen = new Set<string>();
   return overrides
     .map((item) => ({
       ...item,
       symbol: item.symbol.trim().toUpperCase(),
-      timeframe_override: item.timeframe_override?.trim() ? item.timeframe_override.trim() : null,
+      timeframe_override: normalizeTimeframeOverride(item.timeframe_override),
     }))
     .filter((item) => {
       if (!item.symbol || seen.has(item.symbol)) return false;
@@ -978,6 +989,7 @@ export function SettingsControls({
             event_source_provider: state.event_source_provider,
             event_source_api_key_configured: state.event_source_api_key_configured,
           }}
+          aiModelRoutingPolicy={state.ai_model_routing_policy}
           eventSourceProvenanceLabel={
             eventSourceProvenance ? describeEventSourceProvenance(eventSourceProvenance) : "외부 이벤트 소스 미연결"
           }

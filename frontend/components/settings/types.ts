@@ -2,6 +2,31 @@ export type RolloutMode = "paper" | "shadow" | "live_dry_run" | "limited_live" |
 
 export type EventSourceProvider = "stub" | "fred";
 
+export const SYMBOL_TIMEFRAME_OPTIONS = ["1m", "3m", "5m", "15m"] as const;
+export type SymbolTimeframeOption = (typeof SYMBOL_TIMEFRAME_OPTIONS)[number];
+
+export type AIModelRoutePolicyItem = {
+  route: string;
+  label: string;
+  call_policy: string;
+  configured_model?: string | null;
+  default_model?: string | null;
+  model_candidates?: string[];
+  reason_codes?: string[];
+  notes?: string[];
+};
+
+export type AIModelRoutingPolicy = {
+  version?: string;
+  read_only?: boolean;
+  runtime_model_source?: string;
+  primary_model?: string;
+  summary?: string;
+  no_model_call_routes?: string[];
+  candidate_model_routes?: string[];
+  routes?: AIModelRoutePolicyItem[];
+};
+
 export type ProtectionSyncState = {
   status?: string;
   protected?: boolean;

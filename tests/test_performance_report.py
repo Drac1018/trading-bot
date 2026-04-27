@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
-from trading_mvp.models import AgentRun, Execution, Order, PnLSnapshot, Position, RiskCheck
+from trading_mvp.models import AgentRun, AuditEvent, Execution, Order, PnLSnapshot, Position, RiskCheck
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.time_utils import utcnow_naive
 
@@ -32,6 +32,20 @@ def _feature_input(
                 "momentum_weakening": momentum_weakening,
             }
         }
+    }
+
+
+def _decision_agreement(*, baseline: str, final: str, ai_used: bool) -> dict[str, object]:
+    return {
+        "ai_used": ai_used,
+        "comparison_source": (
+            "deterministic_baseline_vs_ai_final"
+            if ai_used
+            else "deterministic_baseline_vs_deterministic_final"
+        ),
+        "level": "full_agreement" if baseline == final else "direction_disagreement",
+        "baseline_decision": baseline,
+        "final_decision": final,
     }
 
 
@@ -62,7 +76,11 @@ def _seed_performance_rows(db_session) -> None:
             "take_profit": 70800.0,
             "max_holding_minutes": 60,
         },
-        metadata_json={},
+        metadata_json={
+            "source": "llm",
+            "ai_model": "gpt-4.1-mini",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        },
         schema_valid=True,
     )
     recent_hold = AgentRun(
@@ -70,7 +88,7 @@ def _seed_performance_rows(db_session) -> None:
         trigger_event="realtime_cycle",
         schema_name="TradeDecision",
         status="completed",
-        provider_name="openai",
+        provider_name="deterministic-mock",
         summary="recent eth hold",
         input_payload=_feature_input(
             primary_regime="range",
@@ -85,8 +103,13 @@ def _seed_performance_rows(db_session) -> None:
             "decision": "hold",
             "rationale_codes": ["RANGE_CHOP"],
             "max_holding_minutes": 120,
+            "should_abstain": True,
         },
-        metadata_json={},
+        metadata_json={
+            "source": "deterministic",
+            "last_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+            "pre_ai_skip_reason": "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+        },
         schema_valid=True,
     )
     older_short = AgentRun(
@@ -114,7 +137,11 @@ def _seed_performance_rows(db_session) -> None:
             "take_profit": 170.0,
             "max_holding_minutes": 90,
         },
-        metadata_json={},
+        metadata_json={
+            "source": "llm",
+            "ai_model": "gpt-4.1-mini",
+            "usage": {"prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90},
+        },
         schema_valid=True,
     )
     db_session.add_all([recent_long, recent_hold, older_short])
@@ -366,9 +393,135 @@ def _seed_performance_rows(db_session) -> None:
                 consecutive_losses=0,
                 created_at=now,
             ),
+            AuditEvent(
+                event_type="decision_ai_deduped",
+                entity_type="symbol",
+                entity_id="BTCUSDT",
+                severity="info",
+                message="Repeated trigger fingerprint was deduplicated before AI review.",
+                payload={"symbol": "BTCUSDT", "dedupe_reason": "TRIGGER_FINGERPRINT_UNCHANGED"},
+                created_at=now - timedelta(minutes=30),
+            ),
         ]
     )
     db_session.flush()
+
+
+def _add_readiness_decision(
+    db_session,
+    *,
+    index: int,
+    decision: str,
+    realized_pnl: float = 0.0,
+    fee_paid: float = 0.0,
+) -> AgentRun:
+    symbol = f"RDY{index}USDT"
+    is_entry = decision in {"long", "short"}
+    row = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary=f"readiness {symbol} {decision}",
+        input_payload=_feature_input(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        output_payload={
+            "symbol": symbol,
+            "timeframe": "15m",
+            "decision": decision,
+            "rationale_codes": ["READINESS_SAMPLE"],
+            "entry_zone_min": 100.0,
+            "entry_zone_max": 101.0,
+            "stop_loss": 98.0,
+            "take_profit": 106.0,
+            "max_holding_minutes": 90,
+        },
+        metadata_json={
+            "source": "llm",
+            "ai_model": "gpt-4.1-mini",
+            "decision_agreement": _decision_agreement(
+                baseline=decision,
+                final=decision,
+                ai_used=True,
+            ),
+        },
+        schema_valid=True,
+    )
+    db_session.add(row)
+    db_session.flush()
+
+    db_session.add(
+        RiskCheck(
+            symbol=symbol,
+            decision_run_id=row.id,
+            allowed=is_entry,
+            decision=decision,
+            reason_codes=[] if is_entry else ["HOLD_DECISION"],
+            approved_risk_pct=0.01 if is_entry else 0.0,
+            approved_leverage=2.0 if is_entry else 0.0,
+            payload={},
+        )
+    )
+    db_session.flush()
+
+    if is_entry:
+        order = Order(
+            symbol=symbol,
+            decision_run_id=row.id,
+            side="buy" if decision == "long" else "sell",
+            order_type="market",
+            mode="live",
+            status="filled",
+            external_order_id=f"{symbol.lower()}-entry",
+            requested_quantity=1.0,
+            requested_price=100.0,
+            filled_quantity=1.0,
+            average_fill_price=100.0,
+            reason_codes=[],
+            metadata_json={},
+        )
+        db_session.add(order)
+        db_session.flush()
+        db_session.add(
+            Execution(
+                order_id=order.id,
+                symbol=symbol,
+                status="filled",
+                external_trade_id=f"{symbol.lower()}-fill",
+                fill_price=101.0,
+                fill_quantity=1.0,
+                fee_paid=fee_paid,
+                commission_asset="USDT",
+                slippage_pct=0.001,
+                realized_pnl=realized_pnl,
+                payload={},
+            )
+        )
+        db_session.flush()
+    return row
+
+
+def _seed_readiness_sample(
+    db_session,
+    *,
+    entry_pnls: list[tuple[float, float]],
+) -> None:
+    for index, (realized_pnl, fee_paid) in enumerate(entry_pnls, start=1):
+        _add_readiness_decision(
+            db_session,
+            index=index,
+            decision="long",
+            realized_pnl=realized_pnl,
+            fee_paid=fee_paid,
+        )
+    for index in range(len(entry_pnls) + 1, 6):
+        _add_readiness_decision(db_session, index=index, decision="hold")
 
 
 def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_session) -> None:
@@ -408,6 +561,39 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert day.summary.average_mae_pct == 0.006
     assert day.summary.best_mfe_pct == 0.018
     assert day.summary.worst_mae_pct == 0.006
+    assert day.ai_telemetry.ai_calls_total == 3
+    assert day.ai_telemetry.ai_calls_provider_invoked == 1
+    assert day.ai_telemetry.ai_calls_skipped_preai == 1
+    assert day.ai_telemetry.ai_calls_deduped == 1
+    assert day.ai_telemetry.input_tokens == 100
+    assert day.ai_telemetry.output_tokens == 20
+    assert day.ai_telemetry.estimated_cost_usd == pytest.approx(0.000072, abs=1e-12)
+    assert day.ai_telemetry.decision_counts["long"] == 1
+    assert day.ai_telemetry.decision_counts["hold"] == 1
+    assert day.ai_telemetry.should_abstain == 1
+    assert day.ai_telemetry.preai_skip_reasons["ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"] == 1
+    assert day.ai_telemetry.downstream.agent_runs == 2
+    assert day.ai_telemetry.downstream.risk_checks == 2
+    assert day.ai_telemetry.downstream.risk_allowed == 1
+    assert day.ai_telemetry.downstream.orders == 2
+    assert day.ai_telemetry.downstream.fills == 2
+    assert day.ai_telemetry.downstream.realized_pnl == 12.0
+    assert day.ai_telemetry.downstream.fee == 1.0
+    assert day.ai_telemetry.downstream.net_realized_pnl == 11.0
+    assert day.ai_telemetry.downstream.average_slippage_pct == pytest.approx(0.00125, abs=1e-9)
+    assert day.ai_telemetry.downstream_by_decision["long"].agent_runs == 1
+    assert day.ai_telemetry.downstream_by_decision["long"].risk_allowed == 1
+    assert day.ai_telemetry.downstream_by_decision["long"].fills == 2
+    assert day.ai_telemetry.downstream_by_decision["long"].net_realized_pnl == 11.0
+    assert day.ai_telemetry.downstream_by_decision["hold"].agent_runs == 1
+    assert day.ai_telemetry.downstream_by_decision["hold"].risk_blocked == 1
+    assert day.ai_telemetry.downstream_by_decision["hold"].fills == 0
+    assert day.limited_live_readiness.read_only is True
+    assert day.limited_live_readiness.status == "not_ready"
+    assert "insufficient_sample" in day.limited_live_readiness.reason_codes
+    assert day.limited_live_readiness.recent_candidate_events == 2
+    assert day.limited_live_readiness.actual_entries == 1
+    assert day.limited_live_readiness.ai_calls_provider_invoked == 1
 
     assert day.decisions[0].symbol == "ETHUSDT"
     assert day.decisions[0].decision == "hold"
@@ -444,6 +630,10 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert week.summary.average_mae_pct == pytest.approx(0.0185, abs=1e-9)
     assert week.summary.best_mfe_pct == pytest.approx(0.022, abs=1e-9)
     assert week.summary.worst_mae_pct == pytest.approx(0.031, abs=1e-9)
+    assert week.ai_telemetry.ai_calls_provider_invoked == 2
+    assert week.ai_telemetry.ai_calls_skipped_preai == 1
+    assert week.ai_telemetry.ai_calls_deduped == 1
+    assert week.ai_telemetry.estimated_cost_usd == pytest.approx(0.00012, abs=1e-12)
     assert {item.key for item in week.regimes} == {"bullish", "bearish", "range"}
     assert {item.key for item in week.symbols} == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
     assert {item.key for item in week.timeframes} == {"15m", "1h", "5m"}
@@ -452,6 +642,356 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert report.items
     assert report.items[0].fee_total >= 0.0
     assert report.items[0].net_realized_pnl_total >= report.items[0].realized_pnl_total - report.items[0].fee_total
+
+
+def test_limited_live_readiness_marks_positive_sample_as_candidate(db_session) -> None:
+    _seed_readiness_sample(db_session, entry_pnls=[(5.0, 0.5), (6.0, 0.5)])
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    readiness = report.windows[0].limited_live_readiness
+
+    assert readiness.status == "limited_live_candidate"
+    assert readiness.reason_codes == []
+    assert readiness.recent_candidate_events == 5
+    assert readiness.actual_entries == 2
+    assert readiness.fills == 2
+    assert readiness.expectancy_after_fees == pytest.approx(5.0, abs=1e-9)
+    assert readiness.net_pnl_after_fees == pytest.approx(10.0, abs=1e-9)
+
+
+def test_limited_live_readiness_blocks_negative_expectancy(db_session) -> None:
+    _seed_readiness_sample(db_session, entry_pnls=[(-3.0, 0.5), (-2.0, 0.5)])
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    readiness = report.windows[0].limited_live_readiness
+
+    assert readiness.status == "blocked"
+    assert "negative_expectancy" in readiness.reason_codes
+    assert readiness.expectancy_after_fees == pytest.approx(-3.0, abs=1e-9)
+
+
+def test_limited_live_readiness_blocks_protection_failures(db_session) -> None:
+    _seed_readiness_sample(db_session, entry_pnls=[(5.0, 0.5), (6.0, 0.5)])
+    db_session.add(
+        AuditEvent(
+            event_type="unprotected_position_detected",
+            entity_type="position",
+            entity_id="RDY1USDT",
+            severity="warning",
+            message="Protective order verification failed.",
+            payload={"reason_codes": ["PROTECTION_REQUIRED"]},
+        )
+    )
+    db_session.flush()
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    readiness = report.windows[0].limited_live_readiness
+
+    assert readiness.status == "blocked"
+    assert "protection_failures" in readiness.reason_codes
+    assert readiness.protection_failure_count >= 1
+
+
+def test_ai_telemetry_normalizes_preai_skip_reasons(db_session) -> None:
+    now = utcnow_naive()
+    rows: list[AgentRun] = []
+    for index, reason in enumerate(
+        [
+            "macro_event_imminent",
+            "macro_release_reaction_window",
+            "stale_market_data",
+            "low_score_gate",
+        ],
+        start=1,
+    ):
+        rows.append(
+            AgentRun(
+                role="trading_decision",
+                trigger_event="realtime_cycle",
+                schema_name="TradeDecision",
+                status="completed",
+                provider_name="deterministic-mock",
+                summary=f"pre-ai skip {reason}",
+                input_payload=_feature_input(
+                    primary_regime="range",
+                    trend_alignment="range",
+                    volatility_regime="normal",
+                    weak_volume=True,
+                    momentum_weakening=True,
+                ),
+                output_payload={
+                    "symbol": f"SKIP{index}USDT",
+                    "timeframe": "15m",
+                    "decision": "hold",
+                    "rationale_codes": ["PRE_AI_SKIP_TEST"],
+                    "max_holding_minutes": 60,
+                },
+                metadata_json={
+                    "source": "deterministic",
+                    "pre_ai_skip_reason": reason,
+                },
+                schema_valid=True,
+            )
+        )
+    db_session.add_all(rows)
+    db_session.flush()
+    for offset, row in enumerate(rows, start=1):
+        row.created_at = now - timedelta(minutes=offset)
+    db_session.flush()
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    telemetry = report.windows[0].ai_telemetry
+
+    assert telemetry.ai_calls_total == 4
+    assert telemetry.ai_calls_provider_invoked == 0
+    assert telemetry.ai_calls_skipped_preai == 4
+    assert telemetry.estimated_cost_usd == 0.0
+    assert telemetry.preai_skip_reasons["MACRO_EVENT_IMMINENT"] == 1
+    assert telemetry.preai_skip_reasons["MACRO_EVENT_RISK_WINDOW_ACTIVE"] == 1
+    assert telemetry.preai_skip_reasons["STALE_MARKET_DATA"] == 1
+    assert telemetry.preai_skip_reasons["LOW_SCORE"] == 1
+
+
+def test_ai_baseline_comparison_separates_observed_and_unobserved_results(db_session) -> None:
+    now = utcnow_naive()
+
+    def make_decision(
+        *,
+        symbol: str,
+        decision: str,
+        baseline: str,
+        ai_used: bool,
+        source: str,
+        fail_closed: bool = False,
+    ) -> AgentRun:
+        return AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai" if source in {"llm", "llm_fallback"} else "deterministic-mock",
+            summary=f"{symbol} {decision}",
+            input_payload=_feature_input(
+                primary_regime="bullish",
+                trend_alignment="bullish_aligned",
+                volatility_regime="normal",
+                weak_volume=False,
+                momentum_weakening=False,
+            ),
+            output_payload={
+                "symbol": symbol,
+                "timeframe": "15m",
+                "decision": decision,
+                "rationale_codes": ["TEST_BASELINE_AI"],
+                "entry_zone_min": 100.0,
+                "entry_zone_max": 101.0,
+                "stop_loss": 98.0,
+                "take_profit": 106.0,
+                "max_holding_minutes": 90,
+                "fail_closed_applied": fail_closed,
+            },
+            metadata_json={
+                "source": source,
+                "decision_agreement": _decision_agreement(
+                    baseline=baseline,
+                    final=decision,
+                    ai_used=ai_used,
+                ),
+                "fail_closed_applied": fail_closed,
+            },
+            schema_valid=True,
+        )
+
+    ai_profit = make_decision(symbol="BTCUSDT", decision="long", baseline="long", ai_used=True, source="llm")
+    ai_rejected = make_decision(symbol="ETHUSDT", decision="hold", baseline="long", ai_used=True, source="llm")
+    ai_blocked = make_decision(symbol="SOLUSDT", decision="long", baseline="hold", ai_used=True, source="llm")
+    ai_reduce = make_decision(symbol="BNBUSDT", decision="reduce", baseline="hold", ai_used=True, source="llm")
+    fail_closed = make_decision(
+        symbol="XRPUSDT",
+        decision="hold",
+        baseline="long",
+        ai_used=False,
+        source="llm_fallback",
+        fail_closed=True,
+    )
+    baseline_entry = make_decision(
+        symbol="ADAUSDT",
+        decision="long",
+        baseline="long",
+        ai_used=False,
+        source="deterministic",
+    )
+    db_session.add_all([ai_profit, ai_rejected, ai_blocked, ai_reduce, fail_closed, baseline_entry])
+    db_session.flush()
+    for offset, row in enumerate([ai_profit, ai_rejected, ai_blocked, ai_reduce, fail_closed, baseline_entry], start=1):
+        row.created_at = now - timedelta(minutes=offset * 5)
+
+    db_session.add_all(
+        [
+            RiskCheck(
+                symbol="BTCUSDT",
+                decision_run_id=ai_profit.id,
+                allowed=True,
+                decision="long",
+                reason_codes=[],
+                approved_risk_pct=0.01,
+                approved_leverage=2.0,
+                payload={},
+            ),
+            RiskCheck(
+                symbol="ETHUSDT",
+                decision_run_id=ai_rejected.id,
+                allowed=False,
+                decision="hold",
+                reason_codes=["HOLD_DECISION"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={},
+            ),
+            RiskCheck(
+                symbol="SOLUSDT",
+                decision_run_id=ai_blocked.id,
+                allowed=False,
+                decision="long",
+                reason_codes=["MAX_EXPOSURE"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={},
+            ),
+            RiskCheck(
+                symbol="BNBUSDT",
+                decision_run_id=ai_reduce.id,
+                allowed=True,
+                decision="reduce",
+                reason_codes=[],
+                approved_risk_pct=0.0,
+                approved_leverage=1.0,
+                payload={},
+            ),
+            RiskCheck(
+                symbol="XRPUSDT",
+                decision_run_id=fail_closed.id,
+                allowed=False,
+                decision="hold",
+                reason_codes=["AI_UNAVAILABLE_FAIL_CLOSED"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={},
+            ),
+            RiskCheck(
+                symbol="ADAUSDT",
+                decision_run_id=baseline_entry.id,
+                allowed=True,
+                decision="long",
+                reason_codes=[],
+                approved_risk_pct=0.01,
+                approved_leverage=2.0,
+                payload={},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="closed",
+        quantity=0.1,
+        entry_price=100.0,
+        mark_price=120.0,
+        leverage=2.0,
+        stop_loss=98.0,
+        take_profit=120.0,
+        realized_pnl=20.0,
+        unrealized_pnl=0.0,
+        metadata_json={},
+    )
+    db_session.add(position)
+    db_session.flush()
+    position.opened_at = now - timedelta(minutes=60)
+    position.closed_at = now - timedelta(minutes=15)
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=ai_profit.id,
+        position_id=position.id,
+        side="buy",
+        order_type="market",
+        mode="live",
+        status="filled",
+        external_order_id="btc-ai-profit",
+        requested_quantity=0.1,
+        requested_price=100.0,
+        filled_quantity=0.1,
+        average_fill_price=100.2,
+        reason_codes=[],
+        metadata_json={},
+    )
+    db_session.add(order)
+    db_session.flush()
+    order.created_at = now - timedelta(minutes=55)
+    execution = Execution(
+        order_id=order.id,
+        position_id=position.id,
+        symbol="BTCUSDT",
+        status="filled",
+        external_trade_id="btc-ai-profit-fill",
+        fill_price=120.0,
+        fill_quantity=0.1,
+        fee_paid=2.0,
+        commission_asset="USDT",
+        slippage_pct=0.002,
+        realized_pnl=20.0,
+        payload={},
+    )
+    db_session.add(execution)
+    db_session.flush()
+    execution.created_at = now - timedelta(minutes=54)
+    db_session.flush()
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    comparison = report.windows[0].ai_baseline_comparison
+    buckets = {item.bucket: item for item in comparison.buckets}
+
+    assert set(buckets) == {
+        "baseline_only_entry",
+        "ai_approved_entry",
+        "ai_rejected_baseline_entry",
+        "ai_management_action",
+        "ai_hold_no_trade",
+        "provider_failed_fail_closed",
+    }
+    approved = buckets["ai_approved_entry"]
+    assert approved.decisions == 2
+    assert approved.approvals == 1
+    assert approved.fills == 1
+    assert approved.wins == 1
+    assert approved.net_pnl_after_fees == 18.0
+    assert approved.expectancy == 18.0
+    assert approved.avg_slippage == pytest.approx(0.002, abs=1e-9)
+    assert approved.avg_holding_minutes == pytest.approx(45.0, abs=1e-9)
+    assert approved.pnl_per_exposure_hour == pytest.approx(24.0, abs=1e-9)
+    assert approved.unobserved_reason_counts["risk_blocked"] == 1
+
+    rejected = buckets["ai_rejected_baseline_entry"]
+    assert rejected.decisions == 1
+    assert rejected.baseline_entries == 1
+    assert rejected.ai_holds == 1
+    assert rejected.fills == 0
+    assert rejected.net_pnl_after_fees == 0.0
+    assert rejected.observed_decisions == 0
+    assert rejected.unobserved_decisions == 1
+    assert rejected.unobserved_reason_counts["ai_filtered_no_order"] == 1
+
+    assert buckets["ai_management_action"].decisions == 1
+    assert buckets["provider_failed_fail_closed"].decisions == 1
+    assert buckets["baseline_only_entry"].decisions == 1
+    assert comparison.decisions == 6
+    assert comparison.observed_decisions == 1
+    assert comparison.unobserved_decisions == 5
+    assert comparison.observed_net_pnl_after_fees == 18.0
+    assert comparison.observed_rejected_baseline_entry_net_pnl_after_fees == 0.0
+    assert comparison.ai_filter_observed_value_net_pnl_after_fees is None
 
 
 def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypatch) -> None:
@@ -481,6 +1021,16 @@ def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypa
         assert payload["windows"][0]["summary"]["decision_context_basis"] == "agent_run_input_features_regime"
         assert "average_arrival_slippage_pct" in payload["windows"][0]["summary"]
         assert "average_first_fill_latency_seconds" in payload["windows"][0]["summary"]
+        assert payload["windows"][0]["ai_telemetry"]["ai_calls_provider_invoked"] == 1
+        assert payload["windows"][0]["ai_telemetry"]["ai_calls_skipped_preai"] == 1
+        assert payload["windows"][0]["ai_telemetry"]["downstream"]["net_realized_pnl"] == 11.0
+        assert payload["windows"][0]["ai_telemetry"]["downstream_by_decision"]["long"]["net_realized_pnl"] == 11.0
+        assert payload["windows"][0]["ai_telemetry"]["downstream_by_decision"]["hold"]["risk_blocked"] == 1
+        assert "ai_baseline_comparison" in payload["windows"][0]
+        assert "buckets" in payload["windows"][0]["ai_baseline_comparison"]
+        assert payload["windows"][0]["limited_live_readiness"]["read_only"] is True
+        assert payload["windows"][0]["limited_live_readiness"]["status"] == "not_ready"
+        assert "insufficient_sample" in payload["windows"][0]["limited_live_readiness"]["reason_codes"]
         assert "regimes" in payload["windows"][0]
         assert "directions" in payload["windows"][0]
         assert "feature_flags" in payload["windows"][0]

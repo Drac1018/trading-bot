@@ -47,6 +47,35 @@ _EXECUTION_REGIME_ORDER = {
     "stress": 2,
     "unavailable": 3,
 }
+ENTRY_MACRO_EVENT_TRIGGER_REASONS = frozenset({"entry_candidate_event", "breakout_exception_event"})
+TRUSTED_EVENT_SOURCE_STATUSES = frozenset({"external_api"})
+STALE_EVENT_SOURCE_STATUSES = frozenset({"stale"})
+INCOMPLETE_EVENT_SOURCE_STATUSES = frozenset({"incomplete", "unavailable", "error"})
+MACRO_EVENT_RELEVANT_ASSETS = frozenset(
+    {
+        "BTC",
+        "BTCUSDT",
+        "ETH",
+        "ETHUSDT",
+        "CRYPTO",
+        "USD",
+        "USDT",
+        "BROAD_RISK",
+        "BROAD_RISK_ASSET",
+        "BROAD_RISK_ASSETS",
+        "RISK_ASSET",
+        "RISK_ASSETS",
+    }
+)
+MACRO_EVENT_IMMINENT_MINUTES = 30
+MACRO_EVENT_REACTION_WINDOW_MINUTES = 60
+MACRO_EVENT_ACTIVE_REASON_CODES = frozenset(
+    {
+        "MACRO_EVENT_RISK_WINDOW_ACTIVE",
+        "MACRO_EVENT_IMMINENT",
+        "MACRO_RELEASE_REACTION_WINDOW",
+    }
+)
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -503,6 +532,101 @@ def build_event_context_summary(
     )
 
 
+def _normalize_event_asset(value: object) -> str:
+    return str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+
+
+def _event_scope_matches_symbol(*, affected_assets: list[str], symbol: str) -> bool:
+    normalized_assets = {_normalize_event_asset(item) for item in affected_assets}
+    normalized_assets.discard("")
+    if not normalized_assets:
+        return False
+    normalized_symbol = _normalize_event_asset(symbol)
+    base_symbol = normalized_symbol
+    for quote in ("USDT", "USD", "BUSD", "USDC"):
+        if base_symbol.endswith(quote):
+            base_symbol = base_symbol[: -len(quote)]
+            break
+    if normalized_symbol in normalized_assets or base_symbol in normalized_assets:
+        return True
+    return bool(normalized_assets & MACRO_EVENT_RELEVANT_ASSETS)
+
+
+def build_event_risk_context(
+    *,
+    features: FeaturePayload,
+    review_trigger: AIReviewTriggerPayload | None,
+) -> dict[str, Any]:
+    event_context = features.event_context
+    trigger_reason = review_trigger.trigger_reason if review_trigger is not None else None
+    applies_to_new_entry = trigger_reason in ENTRY_MACRO_EVENT_TRIGGER_REASONS
+    source_status = str(event_context.source_status or "")
+    reason_codes: list[str] = []
+    if applies_to_new_entry:
+        if source_status in STALE_EVENT_SOURCE_STATUSES or event_context.is_stale:
+            reason_codes.append("MACRO_EVENT_CONTEXT_STALE")
+        if source_status in INCOMPLETE_EVENT_SOURCE_STATUSES or not event_context.is_complete:
+            reason_codes.append("MACRO_EVENT_CONTEXT_INCOMPLETE")
+        if event_context.enrichment_vendors:
+            reason_codes.append("MACRO_EVENT_ENRICHMENT_AVAILABLE")
+
+    source_trustworthy = (
+        source_status in TRUSTED_EVENT_SOURCE_STATUSES
+        and event_context.is_complete
+        and not event_context.is_stale
+    )
+    high_impact = event_context.next_event_importance == "high"
+    asset_relevant = _event_scope_matches_symbol(
+        affected_assets=list(event_context.affected_assets),
+        symbol=features.symbol,
+    )
+    minutes_to_event = event_context.minutes_to_next_event
+    if applies_to_new_entry and source_trustworthy and high_impact and asset_relevant:
+        if event_context.active_risk_window:
+            reason_codes.append("MACRO_EVENT_RISK_WINDOW_ACTIVE")
+        if minutes_to_event is not None and 0 <= minutes_to_event <= MACRO_EVENT_IMMINENT_MINUTES:
+            reason_codes.append("MACRO_EVENT_IMMINENT")
+        if (
+            minutes_to_event is not None
+            and -MACRO_EVENT_REACTION_WINDOW_MINUTES <= minutes_to_event < 0
+        ):
+            reason_codes.append("MACRO_RELEASE_REACTION_WINDOW")
+
+    reason_codes = _unique_codes(reason_codes)
+    event_risk_active = any(code in MACRO_EVENT_ACTIVE_REASON_CODES for code in reason_codes)
+    risk_pct_multiplier = 1.0
+    hold_bias = 0.0
+    if event_risk_active:
+        if trigger_reason == "breakout_exception_event":
+            risk_pct_multiplier = 0.35
+            hold_bias = 0.45
+        else:
+            risk_pct_multiplier = 0.5
+            hold_bias = 0.25
+
+    return {
+        "applies_to_new_entry": applies_to_new_entry,
+        "trigger_reason": trigger_reason,
+        "event_risk_active": event_risk_active,
+        "reason_codes": reason_codes,
+        "risk_pct_multiplier": risk_pct_multiplier,
+        "hold_bias": hold_bias,
+        "should_abstain_bias": event_risk_active,
+        "event_name": event_context.next_event_name,
+        "event_importance": event_context.next_event_importance,
+        "minutes_to_event": minutes_to_event,
+        "active_risk_window": event_context.active_risk_window,
+        "source_status": event_context.source_status,
+        "source_vendor": event_context.source_vendor,
+        "source_trustworthy": source_trustworthy,
+        "affected_assets": list(event_context.affected_assets),
+        "asset_relevant": asset_relevant,
+        "event_bias_observed": event_context.event_bias,
+        "event_bias_used": event_context.event_bias if event_risk_active and source_trustworthy else None,
+        "enrichment_vendors": list(event_context.enrichment_vendors),
+    }
+
+
 def _previous_ai_context_payload(
     *,
     previous_input_payload: Mapping[str, Any] | None,
@@ -811,6 +935,10 @@ def build_ai_decision_context(
     derivatives_summary = build_derivatives_summary(features=features)
     lead_lag_summary = build_lead_lag_summary(features=features)
     event_context_summary = build_event_context_summary(features=features)
+    event_risk_context = build_event_risk_context(
+        features=features,
+        review_trigger=resolved_review_trigger,
+    )
     data_quality = build_data_quality_packet(
         market_snapshot=market_snapshot,
         features=features,
@@ -940,4 +1068,7 @@ def build_ai_decision_context(
         ),
         selection_context_summary=_selection_context_summary(resolved_selection_context),
         prompt_family_hint=prompt_family_hint,
+        event_risk_active=bool(event_risk_context.get("event_risk_active")),
+        event_risk_reason_codes=_as_list(event_risk_context.get("reason_codes")),
+        event_risk_context=event_risk_context,
     )
