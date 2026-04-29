@@ -303,6 +303,7 @@ class Execution(TimestampMixin, Base):
 
 class PnLSnapshot(TimestampMixin, Base):
     __tablename__ = "pnl_snapshots"
+    __table_args__ = (Index("ix_pnl_snapshots_created_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     snapshot_date: Mapped[date] = mapped_column(Date, index=True)

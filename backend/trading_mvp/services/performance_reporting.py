@@ -5,9 +5,11 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from threading import Lock
+from time import monotonic
 from typing import Any
 
-from sqlalchemy import Text, cast, desc, select
+from sqlalchemy import Text, cast, desc, func, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import (
@@ -44,6 +46,18 @@ DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
     ("7d", 24 * 7),
     ("30d", 24 * 30),
 )
+SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS = 15.0
+
+
+@dataclass(slots=True)
+class _CachedSignalPerformanceReport:
+    stored_at: float
+    source_key: tuple[object, ...]
+    payload: SignalPerformanceReportResponse
+
+
+_signal_performance_report_cache: dict[tuple[object, ...], _CachedSignalPerformanceReport] = {}
+_signal_performance_report_cache_lock = Lock()
 
 
 @dataclass(slots=True)
@@ -160,6 +174,21 @@ class DecisionPerformanceContext:
     metadata_json: dict[str, Any]
     output_payload: dict[str, Any]
     role: str = "trading_decision"
+
+
+@dataclass(slots=True)
+class PnLSnapshotPoint:
+    created_at: datetime
+    equity: float
+    cumulative_pnl: float
+    consecutive_losses: int
+
+
+@dataclass(slots=True)
+class PnLSnapshotWindowCache:
+    rows: list[PnLSnapshotPoint]
+    latest: PnLSnapshotPoint | None
+    baseline_before_max_since: PnLSnapshotPoint | None
 
 
 @dataclass(slots=True)
@@ -439,7 +468,68 @@ def _pnl_per_exposure_hour(net_pnl_after_fees: float, holding_minutes: float, fi
     return net_pnl_after_fees / (holding_minutes / 60.0)
 
 
-def _snapshot_net_pnl_estimate(session: Session, since: datetime) -> float:
+def _pnl_point_from_row(row: PnLSnapshot | None) -> PnLSnapshotPoint | None:
+    if row is None:
+        return None
+    return PnLSnapshotPoint(
+        created_at=row.created_at,
+        equity=_safe_float(row.equity, default=0.0),
+        cumulative_pnl=_safe_float(row.cumulative_pnl, default=0.0),
+        consecutive_losses=int(row.consecutive_losses),
+    )
+
+
+def _load_pnl_snapshot_cache(session: Session, max_since: datetime) -> PnLSnapshotWindowCache:
+    latest = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
+    baseline = session.scalar(
+        select(PnLSnapshot)
+        .where(PnLSnapshot.created_at < max_since)
+        .order_by(desc(PnLSnapshot.created_at))
+        .limit(1)
+    )
+    rows = [
+        point
+        for point in (
+            _pnl_point_from_row(row)
+            for row in session.scalars(
+                select(PnLSnapshot)
+                .where(PnLSnapshot.created_at >= max_since)
+                .order_by(PnLSnapshot.created_at.asc())
+            )
+        )
+        if point is not None
+    ]
+    return PnLSnapshotWindowCache(
+        rows=rows,
+        latest=_pnl_point_from_row(latest),
+        baseline_before_max_since=_pnl_point_from_row(baseline),
+    )
+
+
+def _pnl_rows_since(cache: PnLSnapshotWindowCache, since: datetime) -> list[PnLSnapshotPoint]:
+    return [row for row in cache.rows if row.created_at >= since]
+
+
+def _pnl_baseline_before(cache: PnLSnapshotWindowCache, since: datetime) -> PnLSnapshotPoint | None:
+    baseline = cache.baseline_before_max_since
+    for row in cache.rows:
+        if row.created_at >= since:
+            break
+        baseline = row
+    return baseline
+
+
+def _snapshot_net_pnl_estimate(
+    session: Session,
+    since: datetime,
+    pnl_snapshot_cache: PnLSnapshotWindowCache | None = None,
+) -> float:
+    if pnl_snapshot_cache is not None:
+        if pnl_snapshot_cache.latest is None:
+            return 0.0
+        baseline = _pnl_baseline_before(pnl_snapshot_cache, since)
+        baseline_cumulative = baseline.cumulative_pnl if baseline is not None else 0.0
+        return pnl_snapshot_cache.latest.cumulative_pnl - baseline_cumulative
     latest = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
     if latest is None:
         return 0.0
@@ -453,20 +543,26 @@ def _snapshot_net_pnl_estimate(session: Session, since: datetime) -> float:
     return latest.cumulative_pnl - baseline_cumulative
 
 
-def _max_drawdown_from_pnl_snapshots(session: Session, since: datetime) -> float:
-    rows = list(
-        session.scalars(
-            select(PnLSnapshot)
-            .where(PnLSnapshot.created_at >= since)
-            .order_by(PnLSnapshot.created_at.asc())
+def _max_drawdown_from_pnl_snapshots(
+    session: Session,
+    since: datetime,
+    pnl_snapshot_cache: PnLSnapshotWindowCache | None = None,
+) -> float:
+    rows: Sequence[PnLSnapshot | PnLSnapshotPoint]
+    if pnl_snapshot_cache is None:
+        rows = list(
+            session.scalars(
+                select(PnLSnapshot)
+                .where(PnLSnapshot.created_at >= since)
+                .order_by(PnLSnapshot.created_at.asc())
+            )
         )
-    )
+    else:
+        rows = _pnl_rows_since(pnl_snapshot_cache, since)
     if not rows:
         return 0.0
     values = [
-        _safe_float(row.equity, default=0.0)
-        if _safe_float(row.equity, default=0.0) > 0
-        else _safe_float(row.cumulative_pnl, default=0.0)
+        _safe_float(row.equity, default=0.0) if _safe_float(row.equity, default=0.0) > 0 else _safe_float(row.cumulative_pnl, default=0.0)
         for row in rows
     ]
     peak = values[0]
@@ -477,15 +573,26 @@ def _max_drawdown_from_pnl_snapshots(session: Session, since: datetime) -> float
     return max_drawdown
 
 
-def _max_consecutive_losses_from_pnl_snapshots(session: Session, since: datetime) -> int:
-    rows = list(
-        session.scalars(
-            select(PnLSnapshot)
-            .where(PnLSnapshot.created_at >= since)
-            .order_by(PnLSnapshot.created_at.asc())
+def _max_consecutive_losses_from_pnl_snapshots(
+    session: Session,
+    since: datetime,
+    pnl_snapshot_cache: PnLSnapshotWindowCache | None = None,
+) -> int:
+    rows: Sequence[PnLSnapshot | PnLSnapshotPoint]
+    if pnl_snapshot_cache is None:
+        rows = list(
+            session.scalars(
+                select(PnLSnapshot)
+                .where(PnLSnapshot.created_at >= since)
+                .order_by(PnLSnapshot.created_at.asc())
+            )
         )
-    )
+    else:
+        rows = _pnl_rows_since(pnl_snapshot_cache, since)
     if not rows:
+        if pnl_snapshot_cache is not None:
+            latest = pnl_snapshot_cache.latest
+            return int(latest.consecutive_losses) if latest is not None else 0
         latest = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
         return int(latest.consecutive_losses) if latest is not None else 0
     return max(int(row.consecutive_losses) for row in rows)
@@ -1289,6 +1396,7 @@ def _build_limited_live_readiness(
     ai_telemetry: AIUsageTelemetrySummary | Mapping[str, object],
     ai_baseline_comparison: AIBaselineComparisonSummary,
     safety_event_cache: ReadinessSafetyEventCache | None = None,
+    pnl_snapshot_cache: PnLSnapshotWindowCache | None = None,
 ) -> LimitedLiveReadinessReport:
     def telemetry_count(key: str) -> int:
         if isinstance(ai_telemetry, Mapping):
@@ -1313,8 +1421,8 @@ def _build_limited_live_readiness(
     protection_failure_count, unknown_submission_count, stale_incomplete_data_block_count = (
         _count_limited_live_safety_events(session, since=since, safety_event_cache=safety_event_cache)
     )
-    max_drawdown = _max_drawdown_from_pnl_snapshots(session, since)
-    consecutive_losses = _max_consecutive_losses_from_pnl_snapshots(session, since)
+    max_drawdown = _max_drawdown_from_pnl_snapshots(session, since, pnl_snapshot_cache)
+    consecutive_losses = _max_consecutive_losses_from_pnl_snapshots(session, since, pnl_snapshot_cache)
     ai_filter_value = ai_baseline_comparison.ai_filter_observed_value_net_pnl_after_fees
 
     reason_codes: list[str] = []
@@ -1407,6 +1515,7 @@ def _build_window_report(
     decision_limit: int,
     safety_event_cache: ReadinessSafetyEventCache | None = None,
     decision_contexts: Sequence[DecisionPerformanceContext] | None = None,
+    pnl_snapshot_cache: PnLSnapshotWindowCache | None = None,
 ) -> PerformanceWindowReport:
     since = utcnow_naive() - timedelta(hours=window_hours)
     now = utcnow_naive()
@@ -1729,7 +1838,7 @@ def _build_window_report(
         take_profit_closes=sum(item.take_profit_closes for item in decision_items),
         manual_closes=sum(item.manual_closes for item in decision_items),
         unclassified_closes=sum(item.unclassified_closes for item in decision_items),
-        snapshot_net_pnl_estimate=_snapshot_net_pnl_estimate(session, since),
+        snapshot_net_pnl_estimate=_snapshot_net_pnl_estimate(session, since, pnl_snapshot_cache),
         average_mfe_pct=(sum(overall_mfe) / len(overall_mfe) if overall_mfe else 0.0),
         average_mae_pct=(sum(overall_mae) / len(overall_mae) if overall_mae else 0.0),
         best_mfe_pct=max(overall_mfe) if overall_mfe else 0.0,
@@ -1751,6 +1860,7 @@ def _build_window_report(
         ai_telemetry=ai_telemetry,
         ai_baseline_comparison=ai_baseline_comparison,
         safety_event_cache=safety_event_cache,
+        pnl_snapshot_cache=pnl_snapshot_cache,
     )
 
     return PerformanceWindowReport(
@@ -1819,6 +1929,37 @@ def _build_window_report(
     )
 
 
+def _performance_report_db_identity(session: Session) -> str:
+    bind = session.get_bind()
+    return str(bind.url) if bind is not None else "unknown"
+
+
+def _latest_scalar(session: Session, statement: Any) -> object:
+    return session.scalar(statement)
+
+
+def _signal_performance_source_key(session: Session) -> tuple[object, ...]:
+    safety_event_types = tuple(READINESS_AUDIT_SAFETY_EVENT_TYPES)
+    latest_safety_audit = None
+    if safety_event_types:
+        latest_safety_audit = _latest_scalar(
+            session,
+            select(func.max(AuditEvent.created_at)).where(AuditEvent.event_type.in_(safety_event_types)),
+        )
+    return (
+        _latest_scalar(
+            session,
+            select(func.max(AgentRun.id)).where(AgentRun.role == "trading_decision"),
+        ),
+        _latest_scalar(session, select(func.max(DecisionPerformanceFact.id))),
+        _latest_scalar(session, select(func.max(RiskCheck.id))),
+        _latest_scalar(session, select(func.max(Order.id))),
+        _latest_scalar(session, select(func.max(Execution.id))),
+        _latest_scalar(session, select(func.max(PnLSnapshot.created_at))),
+        latest_safety_audit,
+    )
+
+
 def build_signal_performance_report(
     session: Session,
     *,
@@ -1827,6 +1968,23 @@ def build_signal_performance_report(
     window_specs: Sequence[tuple[str, int]] | None = None,
 ) -> SignalPerformanceReportResponse:
     selected_window_specs = tuple(window_specs or DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS)
+    cache_key = (
+        _performance_report_db_identity(session),
+        window_hours,
+        limit,
+        selected_window_specs,
+    )
+    source_key = _signal_performance_source_key(session)
+    now_monotonic = monotonic()
+    with _signal_performance_report_cache_lock:
+        cached = _signal_performance_report_cache.get(cache_key)
+        if (
+            cached is not None
+            and cached.source_key == source_key
+            and now_monotonic - cached.stored_at <= SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS
+        ):
+            return cached.payload.model_copy(deep=True)
+
     max_window_hours = max((window_hour_count for _window_label, window_hour_count in selected_window_specs), default=window_hours)
     max_since = utcnow_naive() - timedelta(hours=max_window_hours)
     decision_contexts = _load_decision_performance_contexts(session, max_since)
@@ -1834,6 +1992,7 @@ def build_signal_performance_report(
         session,
         max_since,
     )
+    pnl_snapshot_cache = _load_pnl_snapshot_cache(session, max_since)
     windows = [
         _build_window_report(
             session,
@@ -1843,6 +2002,7 @@ def build_signal_performance_report(
             decision_limit=limit,
             safety_event_cache=safety_event_cache,
             decision_contexts=decision_contexts,
+            pnl_snapshot_cache=pnl_snapshot_cache,
         )
         for window_label, window_hour_count in selected_window_specs
     ]
@@ -1879,12 +2039,21 @@ def build_signal_performance_report(
         )
         for item in primary_window.rationale_codes
     ]
-    return SignalPerformanceReportResponse(
+    payload = SignalPerformanceReportResponse(
         generated_at=utcnow_naive(),
         window_hours=primary_window.window_hours,
         items=items[:limit],
         windows=windows,
     )
+    with _signal_performance_report_cache_lock:
+        if len(_signal_performance_report_cache) > 16:
+            _signal_performance_report_cache.clear()
+        _signal_performance_report_cache[cache_key] = _CachedSignalPerformanceReport(
+            stored_at=monotonic(),
+            source_key=source_key,
+            payload=payload.model_copy(deep=True),
+        )
+    return payload
 
 
 def _categorize_competitor_note(note: CompetitorNote) -> tuple[str, str]:

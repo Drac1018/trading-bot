@@ -669,6 +669,42 @@ def test_build_signal_performance_report_uses_cached_decision_facts(db_session, 
     assert {"BTCUSDT", "ETHUSDT"} <= day_symbols
 
 
+def test_build_signal_performance_report_reuses_cached_subreport(db_session, monkeypatch) -> None:
+    _seed_performance_rows(db_session)
+
+    first = build_signal_performance_report(db_session)
+
+    def fail_on_rebuild(*_args, **_kwargs):
+        raise AssertionError("unexpected performance subreport rebuild")
+
+    monkeypatch.setattr(performance_reporting, "_load_pnl_snapshot_cache", fail_on_rebuild)
+
+    second = build_signal_performance_report(db_session)
+
+    assert second.generated_at == first.generated_at
+    assert second.windows[0].summary.snapshot_net_pnl_estimate == 20.0
+
+
+def test_build_signal_performance_report_loads_pnl_snapshots_once(db_session, monkeypatch) -> None:
+    _seed_performance_rows(db_session)
+    cache_loads: list[object] = []
+    original_loader = performance_reporting._load_pnl_snapshot_cache
+
+    def load_spy(*args, **kwargs):
+        cache_loads.append(args[1] if len(args) > 1 else kwargs.get("max_since"))
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(performance_reporting, "_load_pnl_snapshot_cache", load_spy)
+
+    report = build_signal_performance_report(
+        db_session,
+        window_specs=(("24h", 24), ("7d", 24 * 7), ("30d", 24 * 30)),
+    )
+
+    assert len(cache_loads) == 1
+    assert report.windows[0].summary.snapshot_net_pnl_estimate == 20.0
+
+
 def test_limited_live_readiness_marks_positive_sample_as_candidate(db_session) -> None:
     _seed_readiness_sample(db_session, entry_pnls=[(5.0, 0.5), (6.0, 0.5)])
 
