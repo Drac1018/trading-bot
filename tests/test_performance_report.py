@@ -6,10 +6,18 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
-from trading_mvp.models import AgentRun, AuditEvent, Execution, Order, PnLSnapshot, Position, RiskCheck
+from trading_mvp.models import (
+    AgentRun,
+    AuditEvent,
+    Execution,
+    Order,
+    PnLSnapshot,
+    Position,
+    RiskCheck,
+)
+from trading_mvp.services import performance_reporting
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.time_utils import utcnow_naive
 
@@ -644,6 +652,23 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert report.items[0].net_realized_pnl_total >= report.items[0].realized_pnl_total - report.items[0].fee_total
 
 
+def test_build_signal_performance_report_uses_cached_decision_facts(db_session, monkeypatch) -> None:
+    _seed_performance_rows(db_session)
+    for row in db_session.query(AgentRun).filter_by(role="trading_decision"):
+        performance_reporting.persist_decision_performance_fact(db_session, row)
+    db_session.flush()
+
+    def fail_on_agent_run_fallback(row):
+        raise AssertionError(f"unexpected AgentRun JSON fallback for {row.id}")
+
+    monkeypatch.setattr(performance_reporting, "_context_from_agent_run", fail_on_agent_run_fallback)
+
+    report = build_signal_performance_report(db_session)
+
+    day_symbols = {item.symbol for item in report.windows[0].decisions}
+    assert {"BTCUSDT", "ETHUSDT"} <= day_symbols
+
+
 def test_limited_live_readiness_marks_positive_sample_as_candidate(db_session) -> None:
     _seed_readiness_sample(db_session, entry_pnls=[(5.0, 0.5), (6.0, 0.5)])
 
@@ -690,6 +715,65 @@ def test_limited_live_readiness_blocks_protection_failures(db_session) -> None:
     assert readiness.status == "blocked"
     assert "protection_failures" in readiness.reason_codes
     assert readiness.protection_failure_count >= 1
+
+
+def test_limited_live_readiness_reuses_safety_event_cache_across_windows(db_session, monkeypatch) -> None:
+    now = utcnow_naive()
+    _seed_readiness_sample(db_session, entry_pnls=[(5.0, 0.5), (6.0, 0.5)])
+    db_session.add_all(
+        [
+            AuditEvent(
+                event_type="unprotected_position_detected",
+                entity_type="position",
+                entity_id="RDY1USDT",
+                severity="warning",
+                message="Protective order verification failed.",
+                payload={"reason_codes": ["PROTECTION_REQUIRED"]},
+                created_at=now - timedelta(minutes=15),
+            ),
+            AuditEvent(
+                event_type="live_order_submission_unknown",
+                entity_type="order",
+                entity_id="RDY2USDT",
+                severity="warning",
+                message="Live order submission outcome is unknown.",
+                payload={},
+                created_at=now - timedelta(days=2),
+            ),
+            AuditEvent(
+                event_type="risk_blocked",
+                entity_type="risk_check",
+                entity_id="RDY3USDT",
+                severity="warning",
+                message="Risk blocked stale market data.",
+                payload={"reason_codes": ["STALE_MARKET_DATA"]},
+                created_at=now - timedelta(days=10),
+            ),
+        ]
+    )
+    db_session.flush()
+
+    cache_loads: list[object] = []
+    original_loader = performance_reporting._load_limited_live_safety_event_cache
+
+    def load_spy(*args, **kwargs):
+        cache_loads.append((args, kwargs))
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(performance_reporting, "_load_limited_live_safety_event_cache", load_spy)
+
+    report = performance_reporting.build_signal_performance_report(
+        db_session,
+        window_specs=(("24h", 24), ("7d", 24 * 7), ("30d", 24 * 30)),
+        limit=20,
+    )
+
+    assert len(cache_loads) == 1
+    windows = {window.window_label: window for window in report.windows}
+    assert windows["24h"].limited_live_readiness.protection_failure_count == 1
+    assert windows["24h"].limited_live_readiness.unknown_submission_count == 0
+    assert windows["7d"].limited_live_readiness.unknown_submission_count == 1
+    assert windows["30d"].limited_live_readiness.stale_incomplete_data_block_count == 1
 
 
 def test_ai_telemetry_normalizes_preai_skip_reasons(db_session) -> None:

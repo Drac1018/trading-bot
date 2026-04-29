@@ -772,6 +772,20 @@ def record_binance_rest_success(
         status = "recovering"
         circuit_state = "recovering"
         reason_code = BINANCE_REST_RECOVERING_REASON_CODE
+    resolved_api_codes = {
+        _coerce_int(item, 0)
+        for item in _as_dict(detail).get("resolved_api_codes", [])
+        if _coerce_int(item, 0)
+    }
+    recent_failures = [
+        dict(item)
+        for item in previous.get("recent_failures", [])
+        if isinstance(item, dict)
+        and (
+            not resolved_api_codes
+            or _coerce_int(item.get("api_code"), 0) not in resolved_api_codes
+        )
+    ][:BINANCE_REST_RECENT_FAILURE_LIMIT]
     payload = {
         **_as_dict(detail),
         "status": status,
@@ -791,11 +805,7 @@ def record_binance_rest_success(
         "server_error_count": _coerce_int(previous.get("server_error_count"), 0),
         "rate_limit_count": _coerce_int(previous.get("rate_limit_count"), 0),
         "mutating_failure_count": _coerce_int(previous.get("mutating_failure_count"), 0),
-        "recent_failures": [
-            dict(item)
-            for item in previous.get("recent_failures", [])
-            if isinstance(item, dict)
-        ][:BINANCE_REST_RECENT_FAILURE_LIMIT],
+        "recent_failures": recent_failures,
     }
     return _write_binance_rest_detail(settings_row, payload)
 

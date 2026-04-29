@@ -87,5 +87,6 @@ function Invoke-CheckedPython {
 }
 
 $databaseUrl = Test-ExplicitDatabaseConfiguration
+$env:DATABASE_URL = $databaseUrl
 Start-LocalPostgresqlIfConfigured -DatabaseUrl $databaseUrl
 Invoke-CheckedPython -Arguments @("workers\worker.py")

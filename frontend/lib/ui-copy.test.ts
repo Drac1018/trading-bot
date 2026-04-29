@@ -64,23 +64,16 @@ test("ui-copy does not present stale macro event bias as a trade signal", async 
 });
 
 test("ui-copy formats boolean and enum values with user-facing wording", async () => {
-  const { formatDisplayValue } = await uiCopyModule;
+  const { formatDisplayValue, translateLabel } = await uiCopyModule;
 
-  assert.equal(formatDisplayValue(true, "exchange_can_trade"), "가능");
+  assert.equal(translateLabel("available_balance"), "사용 가능 잔고");
+  assert.equal(translateLabel("max_withdraw_amount"), "출금 가능 최대 금액");
   assert.equal(formatDisplayValue(false, "app_live_armed"), "해제됨");
   assert.equal(formatDisplayValue(true, "degraded"), "신규 진입 보류");
   assert.equal(formatDisplayValue("approval_control"), "승인/운영 제어");
+  assert.equal(formatDisplayValue("hold"), "신규 진입 대기");
   assert.equal(formatDisplayValue("stale"), "조금 늦음");
   assert.equal(formatDisplayValue("limited_live"), "제한된 실거래");
-});
-
-test("ui-copy explains exchange_can_trade without raw canTrade wording", async () => {
-  const { exchangeCanTradeAccountHint } = await uiCopyModule;
-
-  assert.equal(
-    exchangeCanTradeAccountHint,
-    "거래소 계좌 응답 기준으로 새 주문이 명시적으로 차단됐는지 보여줍니다. canTrade 필드가 없는 선물 응답은 차단으로 간주하지 않으며, 앱 실주문 준비 상태는 별도로 확인해야 합니다.",
-  );
 });
 
 test("ui-copy keeps reason codes meaning-first for operator-facing tables", async () => {
@@ -119,7 +112,7 @@ test("ui-copy separates AI review reason from market signal summary", async () =
   assert.equal(translateLabel("market_signal_summary"), "당시 시장 신호 요약");
   assert.equal(translateLabel("macro_event_risk_summary"), "이벤트 리스크");
   assert.equal(translateLabel("ai_review_type"), "AI 호출 분류");
-  assert.equal(translateLabel("ai_trigger_reason_codes"), "실제 trigger reason code");
+  assert.equal(translateLabel("ai_trigger_reason_codes"), "AI 호출 세부 코드");
   assert.equal(formatDisplayValue("entry_candidate_review"), "신규 진입 후보 검토");
   assert.equal(formatDisplayValue("ENTRY_CANDIDATE_SELECTED"), "신규 진입 후보 선정");
   assert.equal(formatDisplayValue("ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"), "거래량 부족으로 AI 검토 생략");

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
-from typing import Any, Protocol
+from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -20,6 +20,8 @@ class ExternalEventFetchPayload:
     source_status: str = "external_api"
     source_vendor: EventSourceVendor | None = None
     enrichment_vendors: tuple[EventSourceVendor, ...] = ()
+    failed_release_ids: tuple[int, ...] = ()
+    parse_failed_release_ids: tuple[int, ...] = ()
     events: tuple[Mapping[str, object], ...] = ()
     source_generated_at: datetime | None = None
     is_stale: bool | None = None
@@ -535,11 +537,29 @@ class FredReleaseDatesAdapter:
     default_assets: tuple[str, ...] = ()
     release_ids: tuple[int, ...] = ()
     post_release_retention_minutes: int = 180
+    fetch_retry_attempts: int = 2
     post_release_enrichers: tuple[PostReleaseEventEnrichmentAdapter, ...] = ()
     release_catalog: Mapping[int, FredReleaseDefinition] = field(
         default_factory=lambda: dict(DEFAULT_FRED_RELEASE_CATALOG)
     )
+    _release_payload_cache: dict[int, Mapping[str, object]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _release_payload_cache_cycle_key: str | None = field(default=None, init=False, repr=False)
     fetcher: ExternalEventFetcher | None = None
+
+    def begin_cycle(self, cycle_key: object) -> None:
+        normalized_key = str(cycle_key or "").strip() or "default"
+        if normalized_key == self._release_payload_cache_cycle_key:
+            return
+        self._release_payload_cache.clear()
+        self._release_payload_cache_cycle_key = normalized_key
+
+    def end_cycle(self) -> None:
+        self._release_payload_cache.clear()
+        self._release_payload_cache_cycle_key = None
 
     def _headers(self) -> dict[str, str]:
         return {"Accept": "application/json"}
@@ -555,18 +575,39 @@ class FredReleaseDatesAdapter:
             "include_release_dates_with_no_data": "true",
         }
 
-    def _fetch_release_payload(self, *, release_id: int) -> Mapping[str, object]:
+    def _fetch_release_payload_once(self, *, release_id: int) -> Mapping[str, object]:
         url = f"{self.base_url.rstrip('/')}/release/dates"
         params = self._release_params(release_id)
         headers = self._headers()
         if self.fetcher is not None:
             payload = self.fetcher(url=url, params=params, headers=headers)
-            return payload if isinstance(payload, Mapping) else {}
+            return dict(payload) if isinstance(payload, Mapping) else {}
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.get(url, params=params, headers=headers)
             response.raise_for_status()
             payload = response.json()
-        return payload if isinstance(payload, Mapping) else {}
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
+    def _fetch_release_payload(self, *, release_id: int) -> Mapping[str, object]:
+        cache_enabled = self._release_payload_cache_cycle_key is not None
+        if cache_enabled:
+            cached = self._release_payload_cache.get(release_id)
+            if cached is not None:
+                return dict(cached)
+        attempts = max(1, int(self.fetch_retry_attempts))
+        last_error: Exception | None = None
+        for _ in range(attempts):
+            try:
+                normalized = dict(self._fetch_release_payload_once(release_id=release_id))
+            except Exception as exc:
+                last_error = exc
+                continue
+            if cache_enabled:
+                self._release_payload_cache[release_id] = normalized
+            return normalized
+        if last_error is not None:
+            raise last_error
+        return {}
 
     def _resolved_definitions(self) -> tuple[FredReleaseDefinition, ...]:
         release_ids = self.release_ids or DEFAULT_FRED_RELEASE_IDS
@@ -684,24 +725,24 @@ class FredReleaseDatesAdapter:
     ) -> ExternalEventFetchPayload:
         normalized_generated_at = ensure_utc_aware(generated_at).astimezone(UTC).replace(tzinfo=None)
         events: list[Mapping[str, object]] = []
-        fetch_failed = False
-        parse_incomplete = False
+        failed_release_ids: list[int] = []
+        parse_failed_release_ids: list[int] = []
         saw_no_data = False
 
         for definition in self._resolved_definitions():
             try:
                 payload = self._fetch_release_payload(release_id=definition.release_id)
             except Exception:
-                fetch_failed = True
+                failed_release_ids.append(definition.release_id)
                 continue
 
             if payload.get("error_code") or payload.get("error_message"):
-                fetch_failed = True
+                failed_release_ids.append(definition.release_id)
                 continue
 
             raw_release_dates = payload.get("release_dates")
             if not isinstance(raw_release_dates, Sequence) or isinstance(raw_release_dates, (str, bytes)):
-                parse_incomplete = True
+                parse_failed_release_ids.append(definition.release_id)
                 continue
 
             next_event_at, release_parse_incomplete = self._select_event_at(
@@ -709,7 +750,8 @@ class FredReleaseDatesAdapter:
                 raw_release_dates=raw_release_dates,
                 generated_at=normalized_generated_at,
             )
-            parse_incomplete = parse_incomplete or release_parse_incomplete
+            if release_parse_incomplete:
+                parse_failed_release_ids.append(definition.release_id)
 
             if next_event_at is None:
                 saw_no_data = True
@@ -730,30 +772,35 @@ class FredReleaseDatesAdapter:
                 generated_at=normalized_generated_at,
                 events=events,
             )
-            status = "incomplete" if fetch_failed or parse_incomplete else "external_api"
+            status = "incomplete" if failed_release_ids or parse_failed_release_ids else "external_api"
             return ExternalEventFetchPayload(
                 source_status=status,
                 source_vendor="fred",
                 enrichment_vendors=self._collect_enrichment_vendors(events_with_enrichment),
+                failed_release_ids=tuple(dict.fromkeys(failed_release_ids)),
+                parse_failed_release_ids=tuple(dict.fromkeys(parse_failed_release_ids)),
                 events=events_with_enrichment,
                 source_generated_at=normalized_generated_at,
                 is_stale=False,
                 is_complete=status == "external_api",
             )
 
-        if fetch_failed:
+        if failed_release_ids:
             return ExternalEventFetchPayload(
                 source_status="error",
                 source_vendor="fred",
+                failed_release_ids=tuple(dict.fromkeys(failed_release_ids)),
+                parse_failed_release_ids=tuple(dict.fromkeys(parse_failed_release_ids)),
                 source_generated_at=normalized_generated_at,
                 is_stale=False,
                 is_complete=False,
             )
 
-        if parse_incomplete:
+        if parse_failed_release_ids:
             return ExternalEventFetchPayload(
                 source_status="incomplete",
                 source_vendor="fred",
+                parse_failed_release_ids=tuple(dict.fromkeys(parse_failed_release_ids)),
                 source_generated_at=normalized_generated_at,
                 is_stale=False,
                 is_complete=False,

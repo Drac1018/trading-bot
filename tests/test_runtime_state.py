@@ -4,11 +4,13 @@ from datetime import timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from trading_mvp.database import Base
 from trading_mvp.services.runtime_state import (
     build_sync_freshness_summary,
+    get_binance_rest_detail,
     mark_sync_success,
+    record_binance_rest_issue,
+    record_binance_rest_success,
     set_user_stream_detail,
 )
 from trading_mvp.services.settings import get_or_create_settings
@@ -58,3 +60,29 @@ def test_runtime_detail_top_level_write_preserves_fresh_exchange_sync(tmp_path) 
     assert summary["open_orders"]["last_sync_at"] == fresh_at.isoformat()
     assert summary["protective_orders"]["last_sync_at"] == fresh_at.isoformat()
     assert settings_row.pause_reason_detail["user_stream"]["status"] == "connected"
+
+
+def test_binance_rest_success_can_clear_resolved_timestamp_failures(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+
+    record_binance_rest_issue(
+        settings_row,
+        reason_code="BINANCE_REST_TIME_SYNC_REQUIRED",
+        source="binance_client:account",
+        failure_type="time_sync",
+        http_status=400,
+        api_code=-1021,
+        error="HTTPStatusError",
+    )
+    assert get_binance_rest_detail(settings_row)["recent_failures"]
+
+    record_binance_rest_success(
+        settings_row,
+        source="binance_client:account:time_sync",
+        detail={"resolved_api_codes": [-1021]},
+    )
+
+    summary = get_binance_rest_detail(settings_row)
+    assert summary["status"] == "ok"
+    assert summary["consecutive_failures"] == 0
+    assert summary["recent_failures"] == []

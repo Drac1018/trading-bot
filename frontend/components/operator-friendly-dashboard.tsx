@@ -3,12 +3,11 @@
 import { useEffect, useMemo, useState } from "react";
 
 import type { OperatorDashboardPayload } from "./overview-dashboard";
+import { formatAuditEntityType, formatAuditRowTitle } from "../lib/audit-log";
 import { lookupRiskReasonCode } from "../lib/risk-reason-copy.js";
 import { normalizeSyncScopeStatus } from "../lib/sync-freshness";
 
 type Tone = "safe" | "warn" | "danger" | "neutral" | "info";
-type TabId = "today" | "positions" | "audit";
-type SymbolSummary = OperatorDashboardPayload["symbols"][number];
 type AuditEvent = OperatorDashboardPayload["audit_events"][number];
 
 type ActionItem = {
@@ -34,12 +33,6 @@ const tradingSyncBlockers = new Set([
 
 const recoverableSyncStatuses = new Set(["stale", "skipped", "unknown"]);
 
-const tabs: { id: TabId; label: string }[] = [
-  { id: "today", label: "오늘 할 일" },
-  { id: "positions", label: "포지션" },
-  { id: "audit", label: "감사 로그" },
-];
-
 const passiveBlockers = new Set([
   "HOLD_DECISION",
   "ENTRY_TRIGGER_NOT_MET",
@@ -57,32 +50,8 @@ const reasonFallbackMap: Record<string, string> = {
   PROTECTION_REQUIRED: "보호주문 복구가 끝나기 전까지 신규 진입을 막습니다.",
   DEGRADED_MANAGE_ONLY: "관리 전용 상태라 신규 진입보다 보호와 정리를 우선합니다.",
   EMERGENCY_EXIT: "비상 청산 상태라 신규 진입을 막습니다.",
-  HOLD_DECISION: "현재 AI 판단은 새 포지션을 열지 않는 쪽입니다.",
+  HOLD_DECISION: "현재 AI 판단은 신규 진입 신호가 없어 대기 중입니다.",
   ENTRY_TRIGGER_NOT_MET: "현재 진입 조건이 아직 충족되지 않았습니다.",
-};
-
-const auditTitleMap: Record<string, string> = {
-  exchange_sync_cycle_completed: "거래소 상태 동기화 완료",
-  background_exchange_polling_sync_completed: "거래소 상태 자동 확인 완료",
-  trading_paused: "거래 일시정지",
-  trading_resumed: "거래 일시정지 해제",
-  live_sync: "거래소 상태 동기화 완료",
-  trading_auto_resume_skipped: "자동 재개 보류",
-  live_approval_armed: "실거래 승인 열림",
-  live_approval_disarmed: "실거래 승인 닫힘",
-  protection_recreate_attempted: "보호주문 재생성 시도",
-  protection_recreate_failed: "보호주문 재생성 실패",
-  protected_recreated: "보호주문 재생성 완료",
-  unprotected_position_detected: "미보호 포지션 감지",
-};
-
-const auditMessageTitleMap: Record<string, string> = {
-  "Exchange sync cycle completed.": "거래소 상태 동기화 완료",
-  "Background exchange polling sync completed.": "거래소 상태 자동 확인 완료",
-  "Live exchange state synchronized.": "거래소 상태 동기화 완료",
-  "Trading auto resume was skipped.": "자동 재개 보류",
-  "Interval decision cycle skipped because no trigger was detected.": "검토할 변화 없음",
-  "No deterministic entry or review trigger was detected for this interval cycle.": "검토할 진입 신호 없음",
 };
 
 function unique(values: string[]) {
@@ -185,6 +154,21 @@ function importantBlockers(control: OperatorDashboardPayload["control"]) {
   return controlBlockers(control).filter((code) => !passiveBlockers.has(code));
 }
 
+function currentRiskBlockers(control: OperatorDashboardPayload["control"]) {
+  const currentCycle = control.control_status_summary?.blocked_reasons_current_cycle ?? [];
+  const explicitBlockers = control.control_status_summary?.blocked_reason_codes ?? [];
+  return unique([...currentCycle, ...explicitBlockers, ...control.latest_blocked_reasons]);
+}
+
+function isCurrentRiskBlocked(control: OperatorDashboardPayload["control"]) {
+  return control.control_status_summary?.risk_allowed === false;
+}
+
+function isPassiveRiskOnly(control: OperatorDashboardPayload["control"]) {
+  const blockers = currentRiskBlockers(control);
+  return blockers.length === 0 || blockers.every((code) => passiveBlockers.has(code));
+}
+
 function hasTradingSyncBlocker(control: OperatorDashboardPayload["control"]) {
   return importantBlockers(control).some((code) => tradingSyncBlockers.has(code));
 }
@@ -223,7 +207,8 @@ function protectionLabel(control: OperatorDashboardPayload["control"]) {
 function mainState(operator: OperatorDashboardPayload) {
   const control = operator.control;
   const blockers = importantBlockers(control);
-  const passiveOnly = !control.can_enter_new_position && blockers.length === 0;
+  const riskBlockers = currentRiskBlockers(control);
+  const passiveRiskOnly = isPassiveRiskOnly(control);
 
   if (control.trading_paused) {
     return {
@@ -233,19 +218,19 @@ function mainState(operator: OperatorDashboardPayload) {
     };
   }
 
-  if (control.can_enter_new_position) {
-    return {
-      title: "신규 진입 가능",
-      detail: "계좌, 동기화, 보호주문 기준이 새 주문을 허용하는 상태입니다.",
-      tone: "safe" as const,
-    };
-  }
+  if (isCurrentRiskBlocked(control)) {
+    if (passiveRiskOnly) {
+      return {
+        title: "신규 진입 없음",
+        detail: riskBlockers.length > 0 ? translateReasonCode(riskBlockers[0]) : "이번 판단 주기에서 신규 진입 신호가 없습니다.",
+        tone: "neutral" as const,
+      };
+    }
 
-  if (passiveOnly) {
     return {
-      title: "신규 진입 없음",
-      detail: "현재 조건에서는 새 포지션을 열지 않습니다.",
-      tone: "neutral" as const,
+      title: "신규 진입 차단",
+      detail: riskBlockers.length > 0 ? translateReasonCode(riskBlockers[0]) : "이번 판단 주기에서 리스크 기준이 신규 진입을 막았습니다.",
+      tone: "danger" as const,
     };
   }
 
@@ -254,6 +239,22 @@ function mainState(operator: OperatorDashboardPayload) {
       title: "진입 안전 확인 중",
       detail: "잔고 화면은 최신이어도 신규 진입은 포지션, 미체결 주문, 보호주문 기준까지 다시 맞춘 뒤 허용됩니다.",
       tone: "warn" as const,
+    };
+  }
+
+  if (control.can_enter_new_position) {
+    return {
+      title: "진입 안전 기준 정상",
+      detail: "계좌, 동기화, 보호주문 기준은 새 주문을 보낼 준비 상태입니다. 실제 신규 진입은 이번 AI/리스크 판단을 따릅니다.",
+      tone: "safe" as const,
+    };
+  }
+
+  if (blockers.length === 0) {
+    return {
+      title: "신규 진입 없음",
+      detail: "현재 조건에서는 신규 진입 신호를 기다리는 중입니다.",
+      tone: "neutral" as const,
     };
   }
 
@@ -281,13 +282,20 @@ function entryPermissionStatus(control: OperatorDashboardPayload["control"]) {
   if (control.trading_paused) {
     return { label: "보류", tone: "neutral" as const };
   }
+  if (isCurrentRiskBlocked(control)) {
+    return isPassiveRiskOnly(control)
+      ? { label: "진입 없음", tone: "neutral" as const }
+      : { label: "차단", tone: "danger" as const };
+  }
   if (needsSyncCatchUp(control)) {
     return { label: "갱신 중", tone: "warn" as const };
   }
   if (importantBlockers(control).length > 0) {
     return { label: "차단", tone: "danger" as const };
   }
-  return { label: "허용", tone: "safe" as const };
+  return control.can_enter_new_position
+    ? { label: "준비됨", tone: "safe" as const }
+    : { label: "보류", tone: "neutral" as const };
 }
 
 function syncActionTitle(status: string) {
@@ -401,44 +409,25 @@ function translateSyncStatus(status: string) {
   return labels[status] ?? status;
 }
 
-function positionStatus(symbol: SymbolSummary) {
-  if (!symbol.open_position.is_open) {
-    return {
-      side: "없음",
-      size: "-",
-      exposure: "0 USDT",
-      protection: "해당 없음",
-      next: symbol.blocked_reasons.length > 0 ? translateReasonCode(symbol.blocked_reasons[0]) : "신규 진입 대기",
-      tone: "neutral" as const,
-    };
-  }
-  const quantity = symbol.open_position.quantity;
-  const markPrice = symbol.open_position.mark_price;
-  const exposure =
-    quantity !== null && markPrice !== null ? formatMoney(Math.abs(quantity * markPrice), 2) : "-";
-  const protection = symbol.protection_status.protected
-    ? { label: "정상", tone: "safe" as const }
-    : { label: "확인 필요", tone: "warn" as const };
-  return {
-    side: translateSide(symbol.open_position.side),
-    size: quantity !== null ? formatNumber(Math.abs(quantity), 6) : "-",
-    exposure,
-    protection: protection.label,
-    next: symbol.protection_status.protected ? "보호주문 유지" : "보호주문 확인",
-    tone: protection.tone,
-  };
-}
-
-function translateSide(value: string | null | undefined) {
-  if (value === "long") return "롱";
-  if (value === "short") return "숏";
-  return value ?? "-";
-}
-
 function recentAuditEvents(operator: OperatorDashboardPayload) {
   const globalEvents = operator.audit_events;
   const symbolEvents = operator.symbols.flatMap((symbol) => symbol.audit_events);
+  const seen = new Set<string>();
   return [...globalEvents, ...symbolEvents]
+    .filter((event) => {
+      const key = [
+        event.event_type,
+        event.entity_type,
+        event.entity_id ?? "",
+        event.created_at,
+        event.message ?? "",
+      ].join("|");
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
     .slice(0, 6);
 }
@@ -454,19 +443,11 @@ function auditTone(event: AuditEvent): Tone {
 }
 
 function auditTitle(event: AuditEvent) {
-  const message = event.message?.trim();
-  return auditMessageTitleMap[message ?? ""] ?? auditTitleMap[event.event_type] ?? message ?? event.event_type.replace(/_/g, " ");
+  return formatAuditRowTitle(event);
 }
 
 function auditDetail(event: AuditEvent) {
-  const entityLabel: Record<string, string> = {
-    scheduler_run: "자동 실행",
-    binance: "거래소",
-    settings: "설정",
-    position: "포지션",
-    order: "주문",
-  };
-  const label = entityLabel[event.entity_type] ?? event.entity_type;
+  const label = formatAuditEntityType(event.entity_type);
   return event.entity_id ? `${label} ${event.entity_id}` : label;
 }
 
@@ -594,41 +575,6 @@ function Panel({
   );
 }
 
-function TabButton({
-  active,
-  label,
-  testId,
-  onClick,
-}: {
-  active: boolean;
-  label: string;
-  testId: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      data-testid={testId}
-      onClick={onClick}
-      className={`h-11 rounded-md border px-5 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
-        active
-          ? "border-blue-600 bg-blue-600 text-white"
-          : "border-slate-200 bg-white text-slate-700 hover:border-blue-200 hover:bg-blue-50"
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-function ProgressBar({ value }: { value: number }) {
-  return (
-    <div className="h-3 overflow-hidden rounded-md bg-slate-100" aria-label={`보호 여유 ${value}%`}>
-      <div className="h-full rounded-md bg-emerald-500" style={{ width: `${value}%` }} />
-    </div>
-  );
-}
-
 async function fetchPayload(): Promise<OperatorDashboardPayload> {
   const response = await fetch(`${apiBaseUrl}/api/dashboard/operator`, { cache: "no-store" });
   if (!response.ok) {
@@ -644,7 +590,6 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
     new Date(initial.generated_at.endsWith("Z") ? initial.generated_at : `${initial.generated_at}Z`),
   );
   const [refreshError, setRefreshError] = useState("");
-  const [activeTab, setActiveTab] = useState<TabId>("today");
   const [checkedIds, setCheckedIds] = useState<string[]>([]);
   const syncCatchUpNeeded = needsSyncCatchUp(payload.control);
 
@@ -889,10 +834,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                     </div>
                   ))}
                 </div>
-                <div className="mt-5 space-y-2">
-                  <ProgressBar value={entryPermission.tone === "safe" ? 72 : entryPermission.tone === "warn" ? 58 : 46} />
+                <div className="mt-5 rounded-md border border-slate-100 bg-slate-50 px-4 py-3">
                   <p className="text-sm leading-6 text-slate-600">
-                    보호주문, 동기화, 승인 상태를 통과해야 새 포지션을 열 수 있습니다.
+                    위 수치는 백엔드가 계산한 최신 노출/여유 값입니다. 보호주문, 동기화, 승인 상태를 통과해야 새 포지션을 열 수 있습니다.
                   </p>
                 </div>
               </Panel>
@@ -922,101 +866,6 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
               </ol>
             </Panel>
           </div>
-
-          <section id="today" className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="flex flex-wrap gap-2">
-              {tabs.map((tab) => (
-                <TabButton
-                  key={tab.id}
-                  active={activeTab === tab.id}
-                  label={tab.label}
-                  testId={`tab-${tab.id}`}
-                  onClick={() => setActiveTab(tab.id)}
-                />
-              ))}
-            </div>
-
-            <div className="mt-4 border-t border-slate-100 pt-4">
-              {activeTab === "today" ? (
-                <div className="grid gap-4 lg:grid-cols-2">
-                  {(actions.length > 0 ? actions : [{
-                    id: "no-action",
-                    title: "바로 확인할 항목 없음",
-                    detail: "운영자가 지금 처리해야 할 안전 항목이 없습니다.",
-                    symbol: "전체",
-                    priority: "보통" as const,
-                    tone: "safe" as const,
-                  }]).map((item) => (
-                    <div key={item.id} className="rounded-lg border border-slate-200 p-4">
-                      <p className="text-sm font-medium text-slate-500">{item.symbol}</p>
-                      <p className="mt-2 text-base font-semibold leading-6 text-slate-950">{item.title}</p>
-                      <p className="mt-2 text-sm leading-6 text-slate-600">{item.detail}</p>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              {activeTab === "positions" ? (
-                <div className="overflow-x-auto">
-                  <table data-testid="position-table" className="min-w-full border-separate border-spacing-0 text-left text-sm">
-                    <thead className="text-slate-500">
-                      <tr>
-                        <th className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-semibold">심볼</th>
-                        <th className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-semibold">방향</th>
-                        <th className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-semibold">수량</th>
-                        <th className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-semibold">노출</th>
-                        <th className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-semibold">보호</th>
-                        <th className="whitespace-nowrap border-b border-slate-200 px-3 py-3 font-semibold">다음 조치</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {operator.symbols.map((symbol) => {
-                        const row = positionStatus(symbol);
-                        return (
-                          <tr key={symbol.symbol}>
-                            <td className="whitespace-nowrap border-b border-slate-100 px-3 py-3 font-semibold text-slate-950">{symbol.symbol}</td>
-                            <td className="whitespace-nowrap border-b border-slate-100 px-3 py-3 text-slate-700">{row.side}</td>
-                            <td className="whitespace-nowrap border-b border-slate-100 px-3 py-3 text-slate-700">{row.size}</td>
-                            <td className="whitespace-nowrap border-b border-slate-100 px-3 py-3 text-slate-700">{row.exposure}</td>
-                            <td className="whitespace-nowrap border-b border-slate-100 px-3 py-3">
-                              <span className={`rounded-md border px-2.5 py-1 font-semibold ${toneClass(row.tone)}`}>
-                                {row.protection}
-                              </span>
-                            </td>
-                            <td className="whitespace-nowrap border-b border-slate-100 px-3 py-3 text-slate-700">{row.next}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              ) : null}
-
-              {activeTab === "audit" ? (
-                <div data-testid="audit-tab" className="divide-y divide-slate-100">
-                  {audits.length === 0 ? (
-                    <div className="py-6 text-sm text-slate-500">최근 감사 로그가 없습니다.</div>
-                  ) : (
-                    audits.map((event, index) => {
-                      const tone = auditTone(event);
-                      return (
-                        <div key={`${event.event_type}-${event.entity_id}-${event.created_at}-${index}`} className="grid gap-3 py-4 sm:grid-cols-[72px_1fr_auto] sm:items-center">
-                          <time className="text-sm text-slate-500">{formatTime(event.created_at)}</time>
-                          <div>
-                            <p className="text-sm font-semibold text-slate-950">{auditTitle(event)}</p>
-                            <p className="mt-1 text-sm leading-6 text-slate-600">{auditDetail(event)}</p>
-                          </div>
-                          <span className={`w-fit rounded-md border px-2.5 py-1 text-sm font-semibold ${toneClass(tone)}`}>
-                            {tone === "safe" ? "정상" : tone === "danger" ? "차단" : "확인"}
-                          </span>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              ) : null}
-            </div>
-          </section>
 
           <div className="flex flex-wrap items-center justify-between gap-3 pb-8 text-sm text-slate-500">
             <span>마지막 로컬 갱신 {lastUpdated.toLocaleTimeString("ko-KR", { hour12: false, timeZone: "Asia/Seoul" })}</span>

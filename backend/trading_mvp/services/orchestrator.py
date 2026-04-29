@@ -119,7 +119,10 @@ from trading_mvp.services.settings import (
 )
 from trading_mvp.services.skip_quality import build_skip_quality_report, record_skip_event
 from trading_mvp.services.strategy_engine_analytics import build_strategy_engine_bucket_report
-from trading_mvp.services.strategy_engines import select_strategy_engine
+from trading_mvp.services.strategy_engines import (
+    quiet_range_mean_reversion_allowed,
+    select_strategy_engine,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 ACTIVE_ENTRY_PLAN_STATUS = "armed"
@@ -144,6 +147,38 @@ ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS = {
     "ENTRY_TRIGGER_NOT_MET",
     "SLIPPAGE_THRESHOLD_EXCEEDED",
 }
+ENTRY_PLAN_SIMULATION_ROLLOUT_MODES = frozenset({"shadow", "live_dry_run"})
+ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES = frozenset(
+    {"ROLLOUT_MODE_SHADOW", "ROLLOUT_MODE_LIVE_DRY_RUN"}
+)
+ENTRY_PLAN_SIMULATED_EXECUTION_STATUSES = frozenset({"shadow", "dry_run"})
+ENTRY_PLAN_HOLD_CANCEL_REASON_CODES = frozenset(
+    {
+        "ENTRY_PLAN_INVALIDATED",
+        "PLAN_INVALIDATED",
+        "REGIME_INVALIDATED",
+        "SETUP_INVALIDATED",
+        "SIGNAL_INVALIDATED",
+        "STRUCTURE_INVALIDATED",
+        "TREND_INVALIDATED",
+        "TREND_REVERSED",
+        "TREND_REVERSAL",
+        "OPPOSITE_SIGNAL",
+        "LEAD_MARKET_DIVERGENCE",
+        "META_GATE_LEAD_LAG_DIVERGENCE",
+        "META_GATE_DERIVATIVES_HEADWIND",
+        "NO_TRADE_ZONE_RANGE_WEAK_VOLUME",
+        "MANUAL_NO_TRADE_ACTIVE",
+        "OPERATOR_FORCE_NO_TRADE",
+        "OPERATOR_BIAS_NO_TRADE",
+    }
+)
+ENTRY_PLAN_LONG_INVALIDATED_BY_REASON_CODES = frozenset(
+    {"TREND_DOWN", "BEARISH_CONTINUATION", "BEARISH_CONTINUATION_REBOUND"}
+)
+ENTRY_PLAN_SHORT_INVALIDATED_BY_REASON_CODES = frozenset(
+    {"TREND_UP", "BULLISH_CONTINUATION", "BULLISH_CONTINUATION_PULLBACK"}
+)
 SETUP_CLUSTER_DISABLED_REASON_CODE = "SETUP_CLUSTER_DISABLED"
 SETUP_CLUSTER_LOOKBACK = 8
 SETUP_CLUSTER_MIN_SAMPLE_SIZE = 4
@@ -490,6 +525,26 @@ class TradingOrchestrator:
     @staticmethod
     def _build_cycle_id(*, trigger_event: str, symbol: str, snapshot_id: int) -> str:
         return f"{trigger_event}:{symbol.upper()}:{snapshot_id}:{uuid4().hex[:8]}"
+
+    def _event_context_cycle_active(self) -> bool:
+        cycle_active = getattr(self.event_context_provider, "event_context_cycle_active", None)
+        return bool(cycle_active()) if callable(cycle_active) else False
+
+    def _begin_event_context_cycle(self, cycle_key: object) -> bool:
+        if self._event_context_cycle_active():
+            return False
+        begin_cycle = getattr(self.event_context_provider, "begin_event_context_cycle", None)
+        if not callable(begin_cycle):
+            return False
+        begin_cycle(cycle_key)
+        return True
+
+    def _end_event_context_cycle(self, owns_cycle: bool) -> None:
+        if not owns_cycle:
+            return
+        end_cycle = getattr(self.event_context_provider, "end_event_context_cycle", None)
+        if callable(end_cycle):
+            end_cycle()
 
     def _effective_symbol_settings(self, symbol: str):
         return get_effective_symbol_settings(self.settings_row, symbol.upper())
@@ -997,11 +1052,13 @@ class TradingOrchestrator:
         primary_regime = str(regime.get("primary_regime") or "unknown")
         weak_volume = bool(regime.get("weak_volume", False))
         momentum_weakening = bool(regime.get("momentum_weakening", False))
+        quiet_range_allowed = quiet_range_mean_reversion_allowed(payload)
         return {
             "primary_regime": primary_regime,
             "weak_volume": weak_volume,
             "momentum_weakening": momentum_weakening,
-            "no_trade_zone": primary_regime == "range" and weak_volume and momentum_weakening,
+            "quiet_range_mean_reversion_allowed": quiet_range_allowed,
+            "no_trade_zone": primary_regime == "range" and weak_volume and momentum_weakening and not quiet_range_allowed,
         }
 
     @staticmethod
@@ -2069,12 +2126,165 @@ class TradingOrchestrator:
         )
         return plan
 
+    def _defer_pending_entry_plan(
+        self,
+        plan: PendingEntryPlan,
+        *,
+        reason: str,
+        generated_at: datetime,
+        market_row_id: int | None = None,
+        detail: dict[str, object] | None = None,
+    ) -> PendingEntryPlan:
+        if plan.plan_status != ACTIVE_ENTRY_PLAN_STATUS:
+            return plan
+        metadata = self._pending_entry_plan_metadata(plan)
+        max_extension_seconds = max(int(plan.idea_ttl_minutes or 15), 1) * 60
+        try:
+            current_extension_seconds = max(int(metadata.get("external_wait_extension_seconds") or 0), 0)
+        except (TypeError, ValueError):
+            current_extension_seconds = 0
+        last_watch_at = _coerce_datetime(metadata.get("last_watch_at"))
+        elapsed_since_last_watch_seconds = 60
+        if last_watch_at is not None:
+            if last_watch_at.tzinfo is not None:
+                last_watch_at = last_watch_at.replace(tzinfo=None)
+            elapsed_since_last_watch_seconds = max(int((generated_at - last_watch_at).total_seconds()), 0)
+        remaining_extension_seconds = max(max_extension_seconds - current_extension_seconds, 0)
+        cadence_extension_seconds = min(60, elapsed_since_last_watch_seconds)
+        catch_up_seconds = 0
+        if plan.expires_at <= generated_at and elapsed_since_last_watch_seconds > 0:
+            minimum_wait_until = generated_at + timedelta(seconds=60)
+            catch_up_needed_seconds = max(int((minimum_wait_until - plan.expires_at).total_seconds()), 0)
+            catch_up_budget_seconds = (
+                catch_up_needed_seconds
+                if last_watch_at is None
+                else elapsed_since_last_watch_seconds + 60
+            )
+            catch_up_seconds = min(catch_up_needed_seconds, catch_up_budget_seconds)
+        extension_seconds = min(
+            max(cadence_extension_seconds, catch_up_seconds),
+            remaining_extension_seconds,
+        )
+        if extension_seconds > 0:
+            plan.expires_at = plan.expires_at + timedelta(seconds=extension_seconds)
+            current_extension_seconds += extension_seconds
+        wait_detail = dict(detail or {})
+        if extension_seconds > 0:
+            wait_detail["extended_ttl_seconds"] = extension_seconds
+            wait_detail["external_wait_extension_seconds"] = current_extension_seconds
+            wait_detail["external_wait_extension_cap_seconds"] = max_extension_seconds
+        metadata["last_watch_at"] = generated_at.isoformat()
+        metadata["last_watch_blocked_reason_codes"] = [reason]
+        metadata["external_wait_extension_seconds"] = current_extension_seconds
+        if market_row_id is not None:
+            metadata["last_watch_snapshot_id"] = market_row_id
+            metadata["last_watch_cycle_id"] = f"entry-plan-watch:{plan.id}:{market_row_id}"
+        if isinstance(wait_detail.get("stale_scopes"), list):
+            metadata["last_watch_stale_scopes"] = list(wait_detail["stale_scopes"])
+        if wait_detail:
+            metadata["last_watch_block_detail"] = wait_detail
+        plan.metadata_json = metadata
+        self.session.add(plan)
+        self.session.flush()
+        return plan
+
+    @staticmethod
+    def _decision_reason_code_set(decision: object) -> set[str]:
+        reason_codes: set[str] = set()
+        for attr_name in (
+            "rationale_codes",
+            "primary_reason_codes",
+            "no_trade_reason_codes",
+            "abstain_reason_codes",
+            "invalidation_reason_codes",
+        ):
+            values = getattr(decision, attr_name, []) or []
+            if not isinstance(values, list):
+                continue
+            reason_codes.update(str(code).strip().upper() for code in values if str(code or "").strip())
+        return reason_codes
+
+    @classmethod
+    def _hold_decision_invalidates_plan(cls, decision: object, plan: PendingEntryPlan) -> bool:
+        if str(getattr(decision, "decision", "") or "") != "hold":
+            return False
+        invalidation_reason_codes = getattr(decision, "invalidation_reason_codes", []) or []
+        if isinstance(invalidation_reason_codes, list) and {
+            str(code).strip().upper()
+            for code in invalidation_reason_codes
+            if str(code or "").strip()
+        } & ENTRY_PLAN_HOLD_CANCEL_REASON_CODES:
+            return True
+        reason_codes = cls._decision_reason_code_set(decision)
+        if reason_codes & ENTRY_PLAN_HOLD_CANCEL_REASON_CODES:
+            return True
+        if plan.side == "long" and reason_codes & ENTRY_PLAN_LONG_INVALIDATED_BY_REASON_CODES:
+            return True
+        return bool(plan.side == "short" and reason_codes & ENTRY_PLAN_SHORT_INVALIDATED_BY_REASON_CODES)
+
     def _plan_entry_allowed_without_trigger(self, decision: object, risk_result) -> bool:
         decision_side = str(getattr(decision, "decision", "") or "")
         if decision_side not in {"long", "short"}:
             return False
         blockers = set(getattr(risk_result, "blocked_reason_codes", []) or getattr(risk_result, "reason_codes", []))
         return len(blockers - ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS) == 0
+
+    @staticmethod
+    def _unique_reason_codes(values: list[object]) -> list[str]:
+        reason_codes: list[str] = []
+        for value in values:
+            code = str(value or "").strip()
+            if code and code not in reason_codes:
+                reason_codes.append(code)
+        return reason_codes
+
+    @classmethod
+    def _entry_plan_control_block(
+        cls,
+        operational_status,
+    ) -> tuple[bool, list[str]]:
+        reason_codes = cls._unique_reason_codes(
+            [
+                *list(getattr(operational_status, "blocked_reasons", []) or []),
+                *list(getattr(operational_status, "blocked_reason_codes", []) or []),
+            ]
+        )
+        reason_codes = [
+            code
+            for code in reason_codes
+            if code not in ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
+        ]
+        guard_reason_code = str(getattr(operational_status, "guard_mode_reason_code", "") or "").strip()
+        if guard_reason_code and guard_reason_code not in ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES:
+            reason_codes = cls._unique_reason_codes([*reason_codes, guard_reason_code])
+        if bool(getattr(operational_status, "can_enter_new_position", False)):
+            return False, reason_codes
+
+        rollout_mode = str(getattr(operational_status, "rollout_mode", "") or "")
+        simulation_without_submit = (
+            rollout_mode in ENTRY_PLAN_SIMULATION_ROLLOUT_MODES
+            and not bool(getattr(operational_status, "exchange_submit_allowed", False))
+            and bool(getattr(operational_status, "live_execution_ready", False))
+            and not bool(getattr(operational_status, "trading_paused", False))
+            and str(getattr(operational_status, "operating_state", "") or "") == "TRADABLE"
+            and not reason_codes
+        )
+        if simulation_without_submit:
+            return False, []
+
+        if not reason_codes:
+            operating_state = str(getattr(operational_status, "operating_state", "") or "")
+            if bool(getattr(operational_status, "trading_paused", False)):
+                reason_codes.append("TRADING_PAUSED")
+            elif not bool(getattr(operational_status, "live_execution_ready", False)):
+                reason_codes.append(guard_reason_code or "LIVE_EXECUTION_NOT_READY")
+            elif operating_state and operating_state != "TRADABLE":
+                reason_codes.append(operating_state)
+            elif not bool(getattr(operational_status, "exchange_submit_allowed", False)):
+                reason_codes.append(guard_reason_code or "EXCHANGE_SUBMIT_DISABLED")
+            else:
+                reason_codes.append("ENTRY_CONTROL_BLOCKED")
+        return True, reason_codes
 
     def _arm_pending_entry_plan(
         self,
@@ -2182,11 +2392,12 @@ class TradingOrchestrator:
         self,
         *,
         symbol: str,
-        decision_side: str,
+        decision: TradeDecision,
         decision_run_id: int | None,
         cycle_id: str,
         snapshot_id: int,
     ) -> list[PendingEntryPlanSnapshot]:
+        decision_side = str(decision.decision)
         decision_correlation_ids = normalize_correlation_ids(
             cycle_id=cycle_id,
             snapshot_id=snapshot_id,
@@ -2194,8 +2405,17 @@ class TradingOrchestrator:
         )
         canceled: list[PendingEntryPlanSnapshot] = []
         for plan in self._active_pending_entry_plans(symbol=symbol):
-            should_cancel = decision_side == "hold" or plan.side != decision_side
+            should_cancel = plan.side != decision_side
+            if decision_side == "hold":
+                should_cancel = self._hold_decision_invalidates_plan(decision, plan)
             if not should_cancel:
+                metadata = self._pending_entry_plan_metadata(plan)
+                metadata["last_ai_hold_review_at"] = utcnow_naive().isoformat()
+                metadata["last_ai_hold_decision_run_id"] = decision_run_id
+                metadata["last_ai_hold_reason_codes"] = sorted(self._decision_reason_code_set(decision))
+                plan.metadata_json = metadata
+                self.session.add(plan)
+                self.session.flush()
                 continue
             reason = "NEW_AI_HOLD_DECISION" if decision_side == "hold" else "OPPOSITE_AI_PLAN_REPLACED"
             canceled.append(
@@ -2344,26 +2564,18 @@ class TradingOrchestrator:
             and current_expected_rr < 0.85
             and (expected_rr_deterioration_pct or 0.0) >= 0.5
         )
+        late_chase_rr_failure = bool(
+            late_chase
+            and current_expected_rr is not None
+            and current_expected_rr < 0.85
+        )
         cancel_recommended = bool(
             zone_entered
             and not (
                 reclaim_signal_score >= 0.55
                 and quality_score >= quality_threshold
             )
-            and (
-                (
-                    severe_late_chase
-                    and (
-                        current_expected_rr is None
-                        or current_expected_rr < 1.0
-                        or quality_score < quality_threshold
-                    )
-                )
-                or (
-                    rr_collapse
-                    and quality_score < max(quality_threshold - 0.08, 0.5)
-                )
-            )
+            and (rr_collapse or late_chase_rr_failure)
         )
         confirm_met = bool(
             zone_entered
@@ -2375,7 +2587,11 @@ class TradingOrchestrator:
             reason = "QUALITY_CONFIRMED"
         elif cancel_recommended:
             quality_state = "cancel"
-            reason = "QUALITY_REJECTED_LATE_CHASE" if severe_late_chase else "QUALITY_REJECTED_RR_DETERIORATED"
+            reason = (
+                "QUALITY_REJECTED_LATE_CHASE"
+                if late_chase_rr_failure
+                else "QUALITY_REJECTED_RR_DETERIORATED"
+            )
         elif not zone_entered:
             quality_state = "waiting"
             reason = "ZONE_NOT_ENTERED"
@@ -2399,6 +2615,9 @@ class TradingOrchestrator:
             "lower_wick_ratio": round(lower_wick_ratio, 4),
             "upper_wick_ratio": round(upper_wick_ratio, 4),
             "late_chase": late_chase,
+            "severe_late_chase": severe_late_chase,
+            "rr_collapse": rr_collapse,
+            "late_chase_rr_failure": late_chase_rr_failure,
             "late_chase_ratio": round(chase_ratio, 4) if chase_ratio is not None else None,
             "observed_chase_bps": round(observed_chase_bps, 6),
             "baseline_expected_rr": round(baseline_expected_rr, 4) if baseline_expected_rr is not None else None,
@@ -3008,6 +3227,10 @@ class TradingOrchestrator:
             decision = "reduce"
             scenario = "reduce"
             explanation_short = "오픈 포지션 관리 우선 심볼"
+        elif feature_payload.regime.weak_volume:
+            decision = "hold"
+            scenario = "hold"
+            explanation_short = "유동성 약화 관찰 심볼"
         elif feature_payload.trend_score >= 0.15:
             decision = "long"
             scenario = "trend_follow"
@@ -3016,10 +3239,6 @@ class TradingOrchestrator:
             decision = "short"
             scenario = "trend_follow"
             explanation_short = "하락 정렬 진입 후보"
-        elif feature_payload.regime.weak_volume:
-            decision = "hold"
-            scenario = "hold"
-            explanation_short = "유동성 약화 관찰 심볼"
         elif feature_payload.momentum_score > 0:
             decision = "long"
             scenario = "pullback_entry"
@@ -3032,7 +3251,7 @@ class TradingOrchestrator:
                 "trend_pullback_engine": "trend_pullback_candidate",
                 "trend_continuation_engine": "trend_continuation_candidate",
                 "breakout_exception_engine": "breakout_exception_candidate",
-                "range_mean_reversion_engine": "range_mean_reversion_scaffold",
+                "range_mean_reversion_engine": "range_mean_reversion_candidate",
                 "protection_reduce_engine": "protection_reduce_priority",
             }.get(selected_engine_name, "strategy_engine_candidate")
 
@@ -3057,6 +3276,8 @@ class TradingOrchestrator:
         regime = feature_payload.regime
         if priority:
             regime_fit = 1.0
+        elif selected_engine_name == "range_mean_reversion_engine":
+            regime_fit = 0.9 if regime.primary_regime == "range" else 0.35
         elif decision == "long":
             regime_fit = 1.0 if regime.trend_alignment == "bullish_aligned" else 0.45
         elif decision == "short":
@@ -4077,47 +4298,53 @@ class TradingOrchestrator:
             exchange_sync_result = self.run_exchange_sync_cycle(trigger_event=trigger_event)
         selected_symbols = [item.upper() for item in symbols] if symbols else get_effective_symbols(self.settings_row)
         results: list[dict[str, object]] = []
-        for symbol in selected_symbols:
-            effective_settings = self._effective_symbol_settings(symbol)
-            effective_timeframe = timeframe or effective_settings.timeframe
-            market_snapshot, market_row = self._collect_market_snapshot(
-                symbol=symbol,
-                timeframe=effective_timeframe,
-                upto_index=upto_index,
-                force_stale=force_stale,
-            )
-            feature_row: FeatureSnapshot | None = None
-            feature_generation_error: str | None = None
-            try:
-                market_context = build_market_context(
+        event_context_cycle_owner = self._begin_event_context_cycle(
+            f"market-refresh:{trigger_event}:{timeframe or 'effective'}:{utcnow_naive().isoformat()}"
+        )
+        try:
+            for symbol in selected_symbols:
+                effective_settings = self._effective_symbol_settings(symbol)
+                effective_timeframe = timeframe or effective_settings.timeframe
+                market_snapshot, market_row = self._collect_market_snapshot(
                     symbol=symbol,
-                    base_timeframe=effective_timeframe,
+                    timeframe=effective_timeframe,
                     upto_index=upto_index,
                     force_stale=force_stale,
-                    use_binance=self.settings_row.binance_market_data_enabled,
-                    binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
-                    stale_threshold_seconds=self.settings_row.stale_market_seconds,
-                    event_context_provider=self.event_context_provider,
                 )
-                higher_timeframe_context = {
-                    tf: payload for tf, payload in market_context.items() if tf != effective_timeframe
-                }
-                feature_payload = compute_features(market_snapshot, higher_timeframe_context)
-                feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
-            except Exception as exc:
-                feature_generation_error = str(exc)
-            results.append(
-                {
-                    "symbol": symbol,
-                    "timeframe": effective_timeframe,
-                    "market_snapshot_id": market_row.id,
-                    "feature_snapshot_id": feature_row.id if feature_row is not None else None,
-                    "feature_generation_error": feature_generation_error,
-                    "snapshot_time": market_snapshot.snapshot_time.isoformat(),
-                    "latest_price": market_snapshot.latest_price,
-                    "status": status,
-                }
-            )
+                feature_row: FeatureSnapshot | None = None
+                feature_generation_error: str | None = None
+                try:
+                    market_context = build_market_context(
+                        symbol=symbol,
+                        base_timeframe=effective_timeframe,
+                        upto_index=upto_index,
+                        force_stale=force_stale,
+                        use_binance=self.settings_row.binance_market_data_enabled,
+                        binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+                        stale_threshold_seconds=self.settings_row.stale_market_seconds,
+                        event_context_provider=self.event_context_provider,
+                    )
+                    higher_timeframe_context = {
+                        tf: payload for tf, payload in market_context.items() if tf != effective_timeframe
+                    }
+                    feature_payload = compute_features(market_snapshot, higher_timeframe_context)
+                    feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
+                except Exception as exc:
+                    feature_generation_error = str(exc)
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "timeframe": effective_timeframe,
+                        "market_snapshot_id": market_row.id,
+                        "feature_snapshot_id": feature_row.id if feature_row is not None else None,
+                        "feature_generation_error": feature_generation_error,
+                        "snapshot_time": market_snapshot.snapshot_time.isoformat(),
+                        "latest_price": market_snapshot.latest_price,
+                        "status": status,
+                    }
+                )
+        finally:
+            self._end_event_context_cycle(event_context_cycle_owner)
         return {
             "symbols": selected_symbols,
             "cycles": len(results),
@@ -4251,14 +4478,19 @@ class TradingOrchestrator:
                     or bool(operational_status.sync_freshness_summary[scope].get("incomplete"))
                 )
             ]
+            market_stale_reason_codes: list[str] = []
+            if market_snapshot.is_stale:
+                market_stale_reason_codes.append("MARKET_STATE_STALE")
+            if not market_snapshot.is_complete:
+                market_stale_reason_codes.append("MARKET_STATE_INCOMPLETE")
             symbol_missing_protection = symbol in runtime_state["missing_protection_symbols"]
             protection_issue = (
                 operational_status.operating_state == PROTECTION_REQUIRED_STATE
                 or symbol_missing_protection
             )
-            control_blocked = (
-                operational_status.trading_paused
-                or not operational_status.live_execution_ready
+            symbol_verification_blocked = symbol in runtime_state.get("protection_verification_blocked_symbols", [])
+            entry_control_blocked, entry_control_blocked_reasons = self._entry_plan_control_block(
+                operational_status
             )
             symbol_results: list[dict[str, object]] = []
             for plan in active_plans:
@@ -4269,6 +4501,81 @@ class TradingOrchestrator:
                     "execution": None,
                     "risk_result": None,
                 }
+                if symbol_missing_protection or symbol_verification_blocked:
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="PLAN_CANCELED_PROTECTION_BLOCK",
+                        detail={
+                            "operating_state": operational_status.operating_state,
+                            "symbol_missing_protection": symbol_missing_protection,
+                            "symbol_verification_blocked": symbol_verification_blocked,
+                        },
+                    )
+                    result_item["status"] = "canceled"
+                    symbol_results.append(result_item)
+                    continue
+                if protection_issue:
+                    self._defer_pending_entry_plan(
+                        plan,
+                        reason="PLAN_WAITING_FOR_PROTECTION_STATE",
+                        generated_at=generated_at,
+                        market_row_id=market_row.id,
+                        detail={
+                            "operating_state": operational_status.operating_state,
+                            "missing_protection_symbols": list(runtime_state["missing_protection_symbols"]),
+                        },
+                    )
+                    result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+                    result_item["status"] = "armed_waiting_protection_state"
+                    result_item["blocked_reasons"] = ["PLAN_WAITING_FOR_PROTECTION_STATE"]
+                    symbol_results.append(result_item)
+                    continue
+                if stale_scopes:
+                    self._defer_pending_entry_plan(
+                        plan,
+                        reason="PLAN_WAITING_FOR_FRESH_SYNC",
+                        generated_at=generated_at,
+                        market_row_id=market_row.id,
+                        detail={"stale_scopes": list(stale_scopes)},
+                    )
+                    result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+                    result_item["status"] = "armed_waiting_sync"
+                    result_item["blocked_reasons"] = ["PLAN_WAITING_FOR_FRESH_SYNC"]
+                    result_item["stale_scopes"] = list(stale_scopes)
+                    symbol_results.append(result_item)
+                    continue
+                if market_stale_reason_codes:
+                    self._defer_pending_entry_plan(
+                        plan,
+                        reason="PLAN_WAITING_FOR_FRESH_MARKET",
+                        generated_at=generated_at,
+                        market_row_id=market_row.id,
+                        detail={
+                            "market_reason_codes": list(market_stale_reason_codes),
+                            "market_snapshot_time": market_snapshot.snapshot_time.isoformat(),
+                            "market_snapshot_stale": market_snapshot.is_stale,
+                            "market_snapshot_incomplete": not market_snapshot.is_complete,
+                        },
+                    )
+                    result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+                    result_item["status"] = "armed_waiting_market"
+                    result_item["blocked_reasons"] = ["PLAN_WAITING_FOR_FRESH_MARKET"]
+                    result_item["market_reason_codes"] = list(market_stale_reason_codes)
+                    symbol_results.append(result_item)
+                    continue
+                if entry_control_blocked:
+                    self._defer_pending_entry_plan(
+                        plan,
+                        reason="PLAN_WAITING_FOR_ENTRY_CONTROL",
+                        generated_at=generated_at,
+                        market_row_id=market_row.id,
+                        detail={"blocked_reasons": list(entry_control_blocked_reasons)},
+                    )
+                    result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+                    result_item["status"] = "control_blocked"
+                    result_item["blocked_reasons"] = list(entry_control_blocked_reasons)
+                    symbol_results.append(result_item)
+                    continue
                 if plan.expires_at <= generated_at:
                     self._cancel_pending_entry_plan(
                         plan,
@@ -4287,24 +4594,6 @@ class TradingOrchestrator:
                             "latest_price": market_snapshot.latest_price,
                             "invalidation_price": plan.invalidation_price,
                         },
-                    )
-                    result_item["status"] = "canceled"
-                    symbol_results.append(result_item)
-                    continue
-                if stale_scopes:
-                    self._cancel_pending_entry_plan(
-                        plan,
-                        reason="PLAN_CANCELED_STALE_SYNC",
-                        detail={"stale_scopes": stale_scopes},
-                    )
-                    result_item["status"] = "canceled"
-                    symbol_results.append(result_item)
-                    continue
-                if protection_issue:
-                    self._cancel_pending_entry_plan(
-                        plan,
-                        reason="PLAN_CANCELED_PROTECTION_BLOCK",
-                        detail={"operating_state": operational_status.operating_state},
                     )
                     result_item["status"] = "canceled"
                     symbol_results.append(result_item)
@@ -4329,11 +4618,6 @@ class TradingOrchestrator:
                 self.session.flush()
                 result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
 
-                if control_blocked:
-                    result_item["status"] = "control_blocked"
-                    result_item["blocked_reasons"] = list(operational_status.blocked_reasons)
-                    symbol_results.append(result_item)
-                    continue
                 if bool(confirm_detail.get("cancel_recommended")):
                     self._cancel_pending_entry_plan(
                         plan,
@@ -4350,14 +4634,19 @@ class TradingOrchestrator:
                     result_item["blocked_reasons"] = ["PLAN_CONFIRM_QUALITY_REJECTED"]
                     symbol_results.append(result_item)
                     continue
-                if not bool(confirm_detail.get("confirm_met")):
-                    result_item["status"] = "armed_waiting_confirmation"
-                    result_item["blocked_reasons"] = ["PLAN_CONFIRM_QUALITY_LOW"]
-                    symbol_results.append(result_item)
-                    continue
                 if plan.max_chase_bps is not None and observed_chase_bps > plan.max_chase_bps:
                     result_item["status"] = "armed_waiting_reentry"
                     result_item["blocked_reasons"] = ["PLAN_MAX_CHASE_EXCEEDED"]
+                    symbol_results.append(result_item)
+                    continue
+                if bool(confirm_detail.get("late_chase")) and not bool(confirm_detail.get("confirm_met")):
+                    result_item["status"] = "armed_waiting_reentry"
+                    result_item["blocked_reasons"] = ["PLAN_LATE_CHASE_WAITING_REENTRY"]
+                    symbol_results.append(result_item)
+                    continue
+                if not bool(confirm_detail.get("confirm_met")):
+                    result_item["status"] = "armed_waiting_confirmation"
+                    result_item["blocked_reasons"] = ["PLAN_CONFIRM_QUALITY_LOW"]
                     symbol_results.append(result_item)
                     continue
 
@@ -4434,7 +4723,12 @@ class TradingOrchestrator:
                 )
                 result_item["execution"] = execution_result
                 success_status = str(execution_result.get("status") or "")
-                if success_status in {"filled", "partially_filled", "emergency_exit"} or (
+                if success_status in {
+                    "filled",
+                    "partially_filled",
+                    "emergency_exit",
+                    *ENTRY_PLAN_SIMULATED_EXECUTION_STATUSES,
+                } or (
                     success_status == "deduplicated"
                     and str(execution_result.get("dedupe_reason") or "") == "cycle_action_already_completed"
                 ):
@@ -5960,45 +6254,51 @@ class TradingOrchestrator:
         effective_settings = self._effective_symbol_settings(symbol)
         timeframe = timeframe or effective_settings.timeframe
         exchange_sync_result: dict[str, object] | None = None
-        if self._should_poll_exchange_state(trigger_event) and not exchange_sync_checked:
-            exchange_sync_result = self.run_exchange_sync_cycle(symbol=symbol, trigger_event=trigger_event)
-        if market_snapshot_override is None:
-            market_snapshot, market_row = self._collect_market_snapshot(
-                symbol=symbol,
-                timeframe=timeframe,
-                upto_index=upto_index,
-                force_stale=force_stale,
-            )
-        else:
-            market_snapshot = market_snapshot_override
-            market_row = persist_market_snapshot(self.session, market_snapshot)
-        cycle_id = self._build_cycle_id(
-            trigger_event=trigger_event,
-            symbol=symbol,
-            snapshot_id=market_row.id,
+        event_context_cycle_owner = self._begin_event_context_cycle(
+            f"decision:{trigger_event}:{symbol}:{timeframe}:{utcnow_naive().isoformat()}"
         )
-        market_context = (
-            dict(market_context_override)
-            if market_context_override is not None
-            else build_market_context(
+        try:
+            if self._should_poll_exchange_state(trigger_event) and not exchange_sync_checked:
+                exchange_sync_result = self.run_exchange_sync_cycle(symbol=symbol, trigger_event=trigger_event)
+            if market_snapshot_override is None:
+                market_snapshot, market_row = self._collect_market_snapshot(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    upto_index=upto_index,
+                    force_stale=force_stale,
+                )
+            else:
+                market_snapshot = market_snapshot_override
+                market_row = persist_market_snapshot(self.session, market_snapshot)
+            cycle_id = self._build_cycle_id(
+                trigger_event=trigger_event,
                 symbol=symbol,
+                snapshot_id=market_row.id,
+            )
+            market_context = (
+                dict(market_context_override)
+                if market_context_override is not None
+                else build_market_context(
+                    symbol=symbol,
+                    base_timeframe=timeframe,
+                    upto_index=upto_index,
+                    force_stale=force_stale,
+                    use_binance=self.settings_row.binance_market_data_enabled,
+                    binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
+                    stale_threshold_seconds=self.settings_row.stale_market_seconds,
+                    event_context_provider=self.event_context_provider,
+                )
+            )
+            higher_timeframe_context = {
+                tf: payload for tf, payload in market_context.items() if tf != timeframe
+            }
+            lead_market_features = self._build_lead_market_features(
                 base_timeframe=timeframe,
                 upto_index=upto_index,
                 force_stale=force_stale,
-                use_binance=self.settings_row.binance_market_data_enabled,
-                binance_testnet_enabled=self.settings_row.binance_testnet_enabled,
-                stale_threshold_seconds=self.settings_row.stale_market_seconds,
-                event_context_provider=self.event_context_provider,
             )
-        )
-        higher_timeframe_context = {
-            tf: payload for tf, payload in market_context.items() if tf != timeframe
-        }
-        lead_market_features = self._build_lead_market_features(
-            base_timeframe=timeframe,
-            upto_index=upto_index,
-            force_stale=force_stale,
-        )
+        finally:
+            self._end_event_context_cycle(event_context_cycle_owner)
         if not self.settings_row.ai_enabled:
             cadence_profile = self.get_symbol_cadence_profile(
                 symbol=symbol,
@@ -6879,7 +7179,7 @@ class TradingOrchestrator:
                 snapshot.model_dump(mode="json")
                 for snapshot in self._cancel_symbol_entry_plans_from_decision(
                     symbol=symbol,
-                    decision_side=decision.decision,
+                    decision=decision,
                     decision_run_id=decision_run.id,
                     cycle_id=cycle_id,
                     snapshot_id=market_row.id,
@@ -7032,62 +7332,68 @@ class TradingOrchestrator:
             for effective in get_effective_symbol_schedule(self.settings_row)
             if effective.enabled and effective.symbol in selected_symbols
         ]
-        candidate_selection = self._rank_candidate_symbols(
-            decision_symbols=decision_symbols,
-            timeframe=timeframe,
-            upto_index=upto_index,
-            force_stale=force_stale,
-        )
-        selected_cycle_symbols = [
-            str(item).upper()
-            for item in candidate_selection.get("selected_symbols", decision_symbols)
-            if item
-        ] or decision_symbols
         results: list[dict[str, object]] = []
         failed_symbols: list[str] = []
-        for symbol in selected_cycle_symbols:
-            try:
-                results.append(
-                    self.run_decision_cycle(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        trigger_event=trigger_event,
-                        upto_index=upto_index,
-                        force_stale=force_stale,
-                        auto_resume_checked=True,
-                        logic_variant=logic_variant,
-                        exchange_sync_checked=True,
-                        selection_context=self._selection_context_from_candidate_selection(
+        event_context_cycle_owner = self._begin_event_context_cycle(
+            f"selected-symbols:{trigger_event}:{timeframe or 'effective'}:{utcnow_naive().isoformat()}"
+        )
+        try:
+            candidate_selection = self._rank_candidate_symbols(
+                decision_symbols=decision_symbols,
+                timeframe=timeframe,
+                upto_index=upto_index,
+                force_stale=force_stale,
+            )
+            selected_cycle_symbols = [
+                str(item).upper()
+                for item in candidate_selection.get("selected_symbols", decision_symbols)
+                if item
+            ] or decision_symbols
+            for symbol in selected_cycle_symbols:
+                try:
+                    results.append(
+                        self.run_decision_cycle(
                             symbol=symbol,
-                            candidate_selection=candidate_selection,
-                        ),
+                            timeframe=timeframe,
+                            trigger_event=trigger_event,
+                            upto_index=upto_index,
+                            force_stale=force_stale,
+                            auto_resume_checked=True,
+                            logic_variant=logic_variant,
+                            exchange_sync_checked=True,
+                            selection_context=self._selection_context_from_candidate_selection(
+                                symbol=symbol,
+                                candidate_selection=candidate_selection,
+                            ),
+                        )
                     )
-                )
-            except Exception as exc:
-                failed_symbols.append(symbol)
-                record_audit_event(
-                    self.session,
-                    event_type="decision_cycle_failed",
-                    entity_type="symbol",
-                    entity_id=symbol,
-                    severity="error",
-                    message="Decision cycle failed for tracked symbol.",
-                    payload={"trigger_event": trigger_event, "error": str(exc)},
-                )
-                record_health_event(
-                    self.session,
-                    component="decision_cycle",
-                    status="error",
-                    message="Tracked symbol decision cycle failed.",
-                    payload={"symbol": symbol, "trigger_event": trigger_event, "error": str(exc)},
-                )
-                results.append(
-                    {
-                        "symbol": symbol,
-                        "status": "failed",
-                        "error": str(exc),
-                    }
-                )
+                except Exception as exc:
+                    failed_symbols.append(symbol)
+                    record_audit_event(
+                        self.session,
+                        event_type="decision_cycle_failed",
+                        entity_type="symbol",
+                        entity_id=symbol,
+                        severity="error",
+                        message="Decision cycle failed for tracked symbol.",
+                        payload={"trigger_event": trigger_event, "error": str(exc)},
+                    )
+                    record_health_event(
+                        self.session,
+                        component="decision_cycle",
+                        status="error",
+                        message="Tracked symbol decision cycle failed.",
+                        payload={"symbol": symbol, "trigger_event": trigger_event, "error": str(exc)},
+                    )
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "status": "failed",
+                            "error": str(exc),
+                        }
+                    )
+        finally:
+            self._end_event_context_cycle(event_context_cycle_owner)
         return {
             "symbols": selected_cycle_symbols,
             "tracked_symbols": decision_symbols,

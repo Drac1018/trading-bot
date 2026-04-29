@@ -36,7 +36,6 @@ const operatorItems: NavItem[] = [
 ];
 
 const debugItems: NavItem[] = [
-  { href: "/ui-example", label: "UI 개선 예시", icon: "debug" },
   { href: "/dashboard/agents", label: "고급 디버그", icon: "debug" },
 ];
 

@@ -20,6 +20,7 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.account import account_snapshot_to_dict, create_exchange_pnl_snapshot
 from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.runtime_state import write_runtime_detail_key
 from trading_mvp.services.settings import (
     derive_guard_mode_reason,
     get_effective_symbols,
@@ -29,7 +30,6 @@ from trading_mvp.services.settings import (
     is_live_execution_ready,
     serialize_settings_view,
 )
-from trading_mvp.services.runtime_state import write_runtime_detail_key
 from trading_mvp.time_utils import utcnow_naive
 
 FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "finished"}

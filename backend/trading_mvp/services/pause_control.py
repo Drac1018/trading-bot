@@ -12,7 +12,6 @@ from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.binance import BinanceClient
 from trading_mvp.services.pause_policy import (
     get_pause_reason_policy,
-    pause_reason_allows_auto_resume,
     pause_reason_recovery_class,
     pause_reason_severity,
 )

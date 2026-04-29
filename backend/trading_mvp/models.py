@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trading_mvp.database import Base
@@ -102,6 +102,9 @@ class Setting(TimestampMixin, Base):
 
 class MarketSnapshot(TimestampMixin, Base):
     __tablename__ = "market_snapshots"
+    __table_args__ = (
+        Index("ix_market_snapshots_symbol_timeframe_snapshot_time", "symbol", "timeframe", "snapshot_time"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(30), index=True)
@@ -117,6 +120,9 @@ class MarketSnapshot(TimestampMixin, Base):
 
 class FeatureSnapshot(TimestampMixin, Base):
     __tablename__ = "feature_snapshots"
+    __table_args__ = (
+        Index("ix_feature_snapshots_symbol_timeframe_feature_time", "symbol", "timeframe", "feature_time"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(30), index=True)
@@ -134,6 +140,7 @@ class FeatureSnapshot(TimestampMixin, Base):
 
 class AgentRun(TimestampMixin, Base):
     __tablename__ = "agent_runs"
+    __table_args__ = (Index("ix_agent_runs_role_created_at", "role", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     role: Mapped[str] = mapped_column(String(50), index=True)
@@ -148,6 +155,39 @@ class AgentRun(TimestampMixin, Base):
     schema_valid: Mapped[bool] = mapped_column(Boolean, default=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=utcnow_naive)
     completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=utcnow_naive)
+
+
+class DecisionPerformanceFact(TimestampMixin, Base):
+    __tablename__ = "decision_performance_facts"
+    __table_args__ = (
+        Index("ix_decision_performance_facts_created_at", "created_at"),
+        Index("ix_decision_performance_facts_decision_run_id", "decision_run_id", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    decision_run_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    provider_name: Mapped[str] = mapped_column(String(50), default="deterministic-mock")
+    symbol: Mapped[str] = mapped_column(String(30), default="UNKNOWN")
+    timeframe: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
+    decision: Mapped[str] = mapped_column(String(30), default="unknown")
+    rationale_codes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    regime: Mapped[str] = mapped_column(String(40), default="unknown")
+    trend_alignment: Mapped[str] = mapped_column(String(40), default="unknown")
+    weak_volume: Mapped[bool] = mapped_column(Boolean, default=False)
+    volatility_expanded: Mapped[bool] = mapped_column(Boolean, default=False)
+    momentum_weakening: Mapped[bool] = mapped_column(Boolean, default=False)
+    entry_zone_min: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_zone_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_holding_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    baseline_decision: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    ai_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    comparison_bucket: Mapped[str] = mapped_column(String(60), default="ai_hold_no_trade")
+    decision_agreement_level: Mapped[str] = mapped_column(String(80), default="")
+    decision_agreement_source: Mapped[str] = mapped_column(String(80), default="")
+    telemetry_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    telemetry_output: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class RiskCheck(TimestampMixin, Base):
@@ -340,6 +380,7 @@ class Alert(TimestampMixin, Base):
 
 class SchedulerRun(TimestampMixin, Base):
     __tablename__ = "scheduler_runs"
+    __table_args__ = (Index("ix_scheduler_runs_created_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     schedule_window: Mapped[str] = mapped_column(String(20), index=True)
@@ -382,6 +423,10 @@ class SystemHealthEvent(TimestampMixin, Base):
 
 class AuditEvent(TimestampMixin, Base):
     __tablename__ = "audit_events"
+    __table_args__ = (
+        Index("ix_audit_events_created_at", "created_at"),
+        Index("ix_audit_events_event_type_created_at", "event_type", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     event_type: Mapped[str] = mapped_column(String(80), index=True)

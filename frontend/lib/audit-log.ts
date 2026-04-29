@@ -30,6 +30,64 @@ export type AuditLegacyReviewPresentation = {
 const legacyReviewTriggerReasons = new Set(["open_position_recheck_due", "periodic_backstop_due"]);
 const maxAuditTriggerTraversalDepth = 6;
 
+const auditEventTitleMap: Record<string, string> = {
+  background_exchange_polling_sync_completed: "거래소 상태 자동 확인",
+  decision_ai_no_event: "검토할 진입 신호 없음",
+  exchange_position_mode_guard_cleared: "포지션 모드 확인 완료",
+  exchange_sync_cycle_completed: "거래소 동기화 완료",
+  interval_decision_cycle_completed: "판단 주기 완료",
+  live_poll_sync: "거래소 상태 자동 확인",
+  live_sync: "실거래 상태 확인",
+  market_snapshot: "시장 스냅샷 수집",
+  order_submit_failed: "주문 제출 실패",
+  order_submit_unknown: "주문 제출 상태 불확실",
+  protection_recreate_attempted: "보호주문 재생성 시도",
+  protection_recreate_failed: "보호주문 재생성 실패",
+  protected_recreated: "보호주문 재생성 완료",
+  risk_blocked: "리스크 차단",
+  scheduler_run: "자동 실행 기록",
+  trading_auto_resume_skipped: "자동 재개 보류",
+  trading_paused: "거래 일시정지",
+  trading_resumed: "거래 재개",
+  unprotected_position_detected: "보호주문 없는 포지션 감지",
+};
+
+const auditMessageTitleMap: Record<string, string> = {
+  "AI decision skipped because no deterministic entry or review trigger was present.": "검토할 진입 신호 없음",
+  "Background exchange polling sync completed.": "거래소 상태 자동 확인",
+  "Exchange position mode guard cleared.": "포지션 모드 확인 완료",
+  "Exchange sync cycle completed.": "거래소 동기화 완료",
+  "Execution rejected by exchange.": "거래소 주문 거절",
+  "Interval decision cycle skipped because no trigger was detected.": "검토할 변화 없음",
+  "Interval decision cycle completed.": "판단 주기 완료",
+  "Live exchange state synchronized.": "거래소 상태 동기화 완료",
+  "Live sync completed.": "실거래 상태 확인",
+  "Market refresh cycle completed.": "시장 갱신 완료",
+  "Market snapshot collected.": "시장 스냅샷 수집",
+  "No deterministic entry or review trigger was detected for this interval cycle.": "검토할 진입 신호 없음",
+  "Risk guard blocked the entry.": "리스크 차단",
+  "Trading auto resume was skipped.": "자동 재개 보류",
+  "Trading auto-resume skipped.": "자동 재개 보류",
+  "Trading paused manually.": "수동 거래 일시정지",
+  "Trading resumed manually.": "수동 거래 재개",
+};
+
+const auditEntityTypeMap: Record<string, string> = {
+  account: "계좌",
+  agent_run: "AI 실행",
+  binance: "Binance",
+  decision_run: "판단 실행",
+  market: "시장",
+  market_snapshot: "시장 스냅샷",
+  order: "주문",
+  position: "포지션",
+  risk_check: "리스크 점검",
+  scheduler_run: "자동 실행",
+  settings: "설정",
+  symbol: "심볼",
+  system: "시스템",
+};
+
 export const AUDIT_TAB_ORDER: AuditTab[] = [
   "all",
   "risk",
@@ -60,9 +118,9 @@ export const AUDIT_TAB_CONFIG: Record<
   risk: {
     label: "리스크",
     title: "리스크 감사 로그",
-    description: "risk_guard 허용·차단과 리스크 검증 결과를 모아 봅니다.",
+    description: "리스크 가드 허용·차단과 리스크 검증 결과를 모아 봅니다.",
     emptyTitle: "리스크 이벤트가 없습니다.",
-    emptyDescription: "현재 조회 범위 안에는 risk_guard 허용·차단 또는 리스크 체크 관련 감사 이벤트가 없습니다."
+    emptyDescription: "현재 조회 범위 안에는 리스크 가드 허용·차단 또는 리스크 체크 관련 감사 이벤트가 없습니다."
   },
   execution: {
     label: "실행",
@@ -76,7 +134,7 @@ export const AUDIT_TAB_CONFIG: Record<
     title: "승인 및 운영제어 감사 로그",
     description: "pause, resume, live approval, auto-resume 같은 운영 제어 이벤트를 추적합니다.",
     emptyTitle: "승인/운영제어 이벤트가 없습니다.",
-    emptyDescription: "현재 조회 범위 안에는 승인 창, pause/resume, auto-resume 관련 감사 이벤트가 없습니다."
+    emptyDescription: "현재 조회 범위 안에는 승인 창, 운영 중지/해제, 자동 복구 관련 감사 이벤트가 없습니다."
   },
   protection: {
     label: "보호주문",
@@ -230,6 +288,64 @@ export function getSeverityValue(row: AuditRow): string {
 export function getAuditEventCategory(row: AuditRow): AuditTab {
   const category = typeof row.event_category === "string" ? row.event_category : null;
   return normalizeEventCategory(category);
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function hasKoreanText(value: string): boolean {
+  return /[가-힣]/.test(value);
+}
+
+export function formatAuditEventType(value: unknown): string {
+  const eventType = stringValue(value);
+  if (!eventType) {
+    return "감사 이벤트";
+  }
+  return auditEventTitleMap[eventType] ?? "감사 이벤트";
+}
+
+export function formatAuditEntityType(value: unknown): string {
+  const entityType = stringValue(value);
+  if (!entityType) {
+    return "대상 없음";
+  }
+  return auditEntityTypeMap[entityType.toLowerCase()] ?? "대상";
+}
+
+export function formatAuditMessage(row: AuditRow): string {
+  const message = stringValue(row.message);
+  if (!message) {
+    return "메시지 없음";
+  }
+  const messageTitle = auditMessageTitleMap[message];
+  if (messageTitle) {
+    return messageTitle;
+  }
+  if (hasKoreanText(message)) {
+    return message;
+  }
+  const eventTitle = formatAuditEventType(row.event_type);
+  return eventTitle !== "감사 이벤트" ? eventTitle : "감사 메시지 확인 필요";
+}
+
+export function formatAuditRowTitle(row: AuditRow, index?: number): string {
+  const rawMessage = stringValue(row.message);
+  const messageTitle = rawMessage ? auditMessageTitleMap[rawMessage] : null;
+  if (messageTitle) {
+    return messageTitle;
+  }
+
+  const eventTitle = formatAuditEventType(row.event_type);
+  if (eventTitle !== "감사 이벤트") {
+    return eventTitle;
+  }
+
+  if (rawMessage && hasKoreanText(rawMessage)) {
+    return rawMessage;
+  }
+  return `감사 이벤트 ${(index ?? 0) + 1}`;
 }
 
 export function compareAuditRows(left: AuditRow, right: AuditRow, sortMode: SortMode): number {

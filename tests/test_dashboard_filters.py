@@ -16,6 +16,8 @@ from trading_mvp.models import (
     SchedulerRun,
 )
 from trading_mvp.services.dashboard import (
+    OPERATOR_RECENT_ROW_SCAN_LIMIT,
+    _latest_rows_by_symbol,
     classify_audit_event,
     get_audit_timeline,
     get_executions,
@@ -318,6 +320,46 @@ def _seed_profitability_dashboard_rows(db_session) -> None:
         ]
     )
     db_session.flush()
+
+
+def test_latest_rows_by_symbol_uses_recent_scan_with_offset_fallback(db_session) -> None:
+    now = utcnow_naive()
+    target = MarketSnapshot(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        snapshot_time=now - timedelta(minutes=OPERATOR_RECENT_ROW_SCAN_LIMIT + 5),
+        latest_price=70000.0,
+        latest_volume=1200.0,
+        candle_count=60,
+        is_stale=False,
+        is_complete=True,
+        payload={},
+    )
+    newer_noise = [
+        MarketSnapshot(
+            symbol=f"NOISE{i}USDT",
+            timeframe="15m",
+            snapshot_time=now - timedelta(seconds=i),
+            latest_price=1.0,
+            latest_volume=1.0,
+            candle_count=60,
+            is_stale=False,
+            is_complete=True,
+            payload={},
+        )
+        for i in range(OPERATOR_RECENT_ROW_SCAN_LIMIT + 1)
+    ]
+    db_session.add_all([target, *newer_noise])
+    db_session.flush()
+
+    rows = _latest_rows_by_symbol(
+        db_session,
+        MarketSnapshot,
+        ["BTCUSDT"],
+        MarketSnapshot.snapshot_time,
+    )
+
+    assert rows["BTCUSDT"].id == target.id
 
 
 def _seed_multi_symbol_operator_rows(db_session) -> None:

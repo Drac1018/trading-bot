@@ -69,6 +69,12 @@ export function EventResponseOverviewPanel({
     !blockedReason &&
     !approvalRequiredReason &&
     (policySource ?? "none") === "none";
+  const completeReference = eventContext?.complete_reference ?? null;
+  const missingReleaseIds = [
+    ...(eventContext?.failed_release_ids ?? []),
+    ...(eventContext?.parse_failed_release_ids ?? []),
+  ].filter((value, index, values) => values.indexOf(value) === index);
+  const hasCompleteReference = eventContext?.source_status === "incomplete" && completeReference !== null;
 
   return (
     <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
@@ -115,6 +121,16 @@ export function EventResponseOverviewPanel({
             </div>
           </div>
           <p className="mt-3 text-xs text-slate-500">{eventSourceHelp}</p>
+          {hasCompleteReference && completeReference ? (
+            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-900">
+              <p className="font-semibold">최신 조회 일부 실패 / 직전 완전본 참고</p>
+              <p className="mt-1 text-xs leading-5">
+                직전 완전본: {completeReference.next_event_name ?? "정보 없음"} ·{" "}
+                {formatUtcTimestamp(completeReference.generated_at)}
+                {missingReleaseIds.length > 0 ? ` · 누락 release: ${missingReleaseIds.join(", ")}` : ""}
+              </p>
+            </div>
+          ) : null}
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <div className="rounded-2xl bg-slate-50 px-4 py-3">
               <p className="text-xs text-slate-500">다음 이벤트</p>

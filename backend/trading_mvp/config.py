@@ -49,7 +49,7 @@ def _read_dotenv_value(name: str) -> str | None:
     dotenv_path = _PROJECT_ROOT / ".env"
     if not dotenv_path.exists():
         return None
-    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+    for line in dotenv_path.read_text(encoding="utf-8-sig").splitlines():
         trimmed = line.strip()
         if not trimmed or trimmed.startswith("#") or "=" not in trimmed:
             continue

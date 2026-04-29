@@ -45,7 +45,10 @@ from trading_mvp.services.holding_profile import (
     deterministic_stop_management_payload,
     evaluate_holding_profile,
 )
-from trading_mvp.services.strategy_engines import select_strategy_engine
+from trading_mvp.services.strategy_engines import (
+    range_mean_reversion_volume_ok,
+    select_strategy_engine,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES = {"PENDING_ENTRY_PLAN_TRIGGERED"}
@@ -119,6 +122,10 @@ def persist_agent_run(
     )
     session.add(row)
     session.flush()
+    if row.role == AgentRole.TRADING_DECISION.value:
+        from trading_mvp.services.performance_reporting import persist_decision_performance_fact
+
+        persist_decision_performance_fact(session, row)
     return row
 
 
@@ -607,8 +614,8 @@ class TradingDecisionAgent:
         take_multiple = 2.0
 
         if features.regime.primary_regime == "range":
-            stop_multiple *= 0.85
-            take_multiple *= 0.75
+            stop_multiple *= 0.72
+            take_multiple *= 0.7
         elif features.regime.trend_alignment in {"bullish_aligned", "bearish_aligned"}:
             take_multiple *= 1.25
 
@@ -1297,8 +1304,17 @@ class TradingDecisionAgent:
 
         timeframe_minutes = self._timeframe_minutes(market_snapshot.timeframe)
         pullback_state = str(features.pullback_context.state or "")
+        range_reversion_setup = features.regime.primary_regime == "range" and entry_mode == "pullback_confirm"
 
-        if entry_mode == "breakout_confirm":
+        if range_reversion_setup:
+            profile_name = "range_reversion_fast"
+            profile_rationale_code = "SETUP_TIME_PROFILE_RANGE_REVERSION_FAST"
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 0.75)), 6), 10)
+            max_holding_minutes = min(max(int(round(timeframe_minutes * 5.0)), 45), 90)
+            early_fail_minutes = min(max(int(round(max_holding_minutes * 0.2)), 12), 24)
+            early_fail_r_floor = -0.05
+            hold_extension_minutes = min(max(int(round(timeframe_minutes * 0.6)), 5), 10)
+        elif entry_mode == "breakout_confirm":
             profile_name = "breakout_fast"
             profile_rationale_code = "SETUP_TIME_PROFILE_BREAKOUT_FAST"
             idea_ttl_minutes = min(max(int(round(timeframe_minutes * 0.8)), 8), 12)
@@ -1943,6 +1959,12 @@ class TradingDecisionAgent:
             and features.candle_structure.body_ratio < 0.55
         )
         range_like_signal = regime_name == "range"
+        range_position = float(features.location.range_position_pct or 0.0)
+        range_vwap_distance = float(features.location.vwap_distance_pct or 0.0)
+        range_width_ok = float(features.breakout.range_width_pct or 0.0) >= 0.25
+        range_intact = str(features.breakout.range_breakout_direction or "none") == "none"
+        range_volume_alive = float(features.volume_persistence.persistence_ratio or 0.0) >= 0.6
+        range_volume_ok = range_mean_reversion_volume_ok(features)
         strong_bullish_breakout_exception = self._breakout_exception_allowed(features, "long")
         strong_bearish_breakout_exception = self._breakout_exception_allowed(features, "short")
         pullback_long_signal = (
@@ -2001,8 +2023,67 @@ class TradingDecisionAgent:
             and features.volume_persistence.persistence_ratio >= 0.95
             and not countertrend
         )
-        long_signal = pullback_long_signal or continuation_long_signal or strong_bullish_breakout_exception
-        short_signal = pullback_short_signal or continuation_short_signal or strong_bearish_breakout_exception
+        range_reversion_long_signal = (
+            range_like_signal
+            and range_volume_ok
+            and range_width_ok
+            and range_intact
+            and range_volume_alive
+            and range_position <= 0.32
+            and 30.0 <= features.rsi <= 48.0
+            and -2.5 <= range_vwap_distance <= 0.35
+            and features.momentum_score >= -0.45
+            and not bearish_rejection
+            and not countertrend
+        )
+        range_reversion_short_signal = (
+            range_like_signal
+            and range_volume_ok
+            and range_width_ok
+            and range_intact
+            and range_volume_alive
+            and range_position >= 0.68
+            and 52.0 <= features.rsi <= 70.0
+            and -0.35 <= range_vwap_distance <= 2.5
+            and features.momentum_score <= 0.45
+            and not bullish_rejection
+            and not countertrend
+        )
+        long_signal = (
+            pullback_long_signal
+            or continuation_long_signal
+            or range_reversion_long_signal
+            or strong_bullish_breakout_exception
+        )
+        short_signal = (
+            pullback_short_signal
+            or continuation_short_signal
+            or range_reversion_short_signal
+            or strong_bearish_breakout_exception
+        )
+        range_breakout_against_long = range_like_signal and (
+            str(features.breakout.range_breakout_direction or "none") == "down"
+            or bool(features.breakout.broke_swing_low)
+        )
+        range_breakout_against_short = range_like_signal and (
+            str(features.breakout.range_breakout_direction or "none") == "up"
+            or bool(features.breakout.broke_swing_high)
+        )
+        range_long_target_zone_reached = range_like_signal and range_position >= 0.72 and features.rsi >= 58.0
+        range_short_target_zone_reached = range_like_signal and range_position <= 0.28 and features.rsi <= 42.0
+        range_position_reduce_signal = bool(
+            open_position is not None
+            and (
+                (
+                    open_position.side == "long"
+                    and (range_breakout_against_long or range_long_target_zone_reached)
+                )
+                or (
+                    open_position.side == "short"
+                    and (range_breakout_against_short or range_short_target_zone_reached)
+                )
+            )
+        )
         long_breakout_like = strong_bullish_breakout_exception or (
             features.breakout.broke_swing_high or features.breakout.range_breakout_direction == "up"
         )
@@ -2063,7 +2144,9 @@ class TradingDecisionAgent:
             )
             or float(short_derivatives.get("alignment_score", 0.5)) <= 0.28
         )
-        weakening_signal = momentum_weakening or weak_volume or range_like_signal
+        weakening_signal = (momentum_weakening or weak_volume) and not (
+            range_like_signal and range_volume_ok
+        )
         operating_state = str(risk_context.get("operating_state", "TRADABLE"))
         position_management_context = (
             risk_context.get("position_management_context")
@@ -2140,6 +2223,14 @@ class TradingDecisionAgent:
             detailed_explanation = (
                 "보유 시간 경과, 레짐 전환, 또는 모멘텀 약화가 감지돼 남은 기대값이 낮아졌습니다. "
                 "보호 방향 우선 원칙에 따라 포지션을 일부 줄여 수익 보호와 손실 제한을 강화합니다."
+            )
+        elif decision == "hold" and open_position is not None and range_position_reduce_signal:
+            decision = "reduce"
+            rationale = ["RANGE_MEAN_REVERSION_MANAGEMENT", "RANGE_TARGET_OR_INVALIDATION"]
+            short_explanation = "박스권 되돌림 포지션이 목표 구간 또는 무효화 구간에 가까워져 일부 축소합니다."
+            detailed_explanation = (
+                "박스권이라는 사실만으로 약화로 보지 않고, 반대편 목표 구간 도달 또는 박스 이탈처럼 "
+                "진입 근거가 약해진 경우에만 노출을 줄입니다."
             )
         elif decision == "hold" and open_position is not None and weakening_signal:
             decision = "reduce"
@@ -2282,6 +2373,13 @@ class TradingDecisionAgent:
                 "상위 추세 정렬 안에서 눌림 매수 구간을 기다리는 편이 추격 진입보다 보수적입니다. "
                 "현재는 즉시 추격보다 되돌림 확인 후 진입하는 시나리오가 우선입니다."
             )
+            if range_reversion_long_signal:
+                rationale = ["RANGE_MEAN_REVERSION", "RANGE_LOWER_REVERSION", "RSI_RANGE_SUPPORT"]
+                short_explanation = "Range support is holding, so the system prepares a fast mean-reversion long."
+                detailed_explanation = (
+                    "Price is near the lower edge of an intact range with acceptable RSI, volume persistence, "
+                    "and VWAP location. This is treated as a fast scalp-style reversion setup, not a swing trend entry."
+                )
         elif decision == "hold" and short_signal:
             decision = "short"
             rationale = ["TREND_DOWN", "PULLBACK_ENTRY_BIAS", "RSI_WEAK"]
@@ -2296,6 +2394,14 @@ class TradingDecisionAgent:
                 "하락 추세 안에서 반등 매도 구간을 기다리는 편이 추격 숏보다 안전합니다. "
                 "현재는 1분 확인이 붙는 되돌림 진입 시나리오를 우선합니다."
             )
+
+            if range_reversion_short_signal:
+                rationale = ["RANGE_MEAN_REVERSION", "RANGE_UPPER_REVERSION", "RSI_RANGE_RESISTANCE"]
+                short_explanation = "Range resistance is holding, so the system prepares a fast mean-reversion short."
+                detailed_explanation = (
+                    "Price is near the upper edge of an intact range with acceptable RSI, volume persistence, "
+                    "and VWAP location. This is treated as a fast scalp-style reversion setup, not a swing trend entry."
+                )
 
         if decision == "long" and bool(long_add_on_context.get("candidate")):
             rationale.extend([str(code) for code in long_add_on_context.get("allowed_reason_codes") or []])
@@ -2377,16 +2483,20 @@ class TradingDecisionAgent:
         risk_pct = max(0.003, round(confidence * 0.008, 4))
         if features.regime.volatility_regime == "expanded":
             risk_pct *= 0.85
-        if weak_volume or range_like_signal:
+        if range_like_signal:
             risk_pct *= 0.85
+        if weak_volume:
+            risk_pct *= 0.75
         risk_pct = min(float(risk_context["max_risk_per_trade"]), round(risk_pct, 4))
 
         leverage = max(1.0, round(1.0 + (confidence * 1.6), 2))
         if features.regime.volatility_regime == "expanded":
             leverage *= 0.85
-        if weak_volume or range_like_signal:
+        if range_like_signal:
             leverage *= 0.9
-        leverage = min(float(risk_context["max_leverage"]), round(leverage, 2))
+        if weak_volume:
+            leverage *= 0.75
+        leverage = min(float(risk_context["max_leverage"]), max(1.0, round(leverage, 2)))
 
         pullback_outer = atr * (0.3 if range_like_signal else 0.42)
         pullback_inner = atr * (0.1 if range_like_signal else 0.16)
@@ -2477,7 +2587,7 @@ class TradingDecisionAgent:
             and not weak_volume
             and not momentum_weakening
         )
-        weakening_signal = weak_volume or momentum_weakening or regime_name in {"range", "transition"}
+        weakening_signal = weak_volume or momentum_weakening or regime_name == "transition"
 
         if open_position is not None and operating_state == "PROTECTION_REQUIRED":
             decision = "long" if open_position.side == "long" else "short"

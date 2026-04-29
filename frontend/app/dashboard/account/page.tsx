@@ -6,15 +6,13 @@ import { useCallback, useEffect, useState } from "react";
 import { DataTable } from "../../../components/data-table";
 import { PageShell } from "../../../components/page-shell";
 import { fetchJson, postJson } from "../../../lib/api";
-import { exchangeCanTradeAccountHint, formatDisplayValue } from "../../../lib/ui-copy";
+import { formatDisplayValue } from "../../../lib/ui-copy";
 
 type AccountSummary = {
   connected: boolean;
   message: string;
   testnet_enabled: boolean;
   futures_enabled: boolean;
-  can_trade: boolean;
-  exchange_can_trade?: boolean;
   available_balance: number;
   total_wallet_balance: number;
   total_unrealized_profit: number;
@@ -45,6 +43,44 @@ type AccountCachePayload = {
   payload: AccountPayload;
 };
 
+type AccountCacheLoadResult = {
+  cache: AccountCachePayload;
+  cacheError?: string | null;
+};
+
+const unknownAccountErrorMessage = "알 수 없는 오류가 발생했습니다.";
+
+function errorMessageFromUnknown(error: unknown) {
+  return error instanceof Error ? error.message : unknownAccountErrorMessage;
+}
+
+async function fetchAccountCacheWithLocalFallback(): Promise<AccountCacheLoadResult> {
+  try {
+    return { cache: await fetchJson<AccountCachePayload>("/api/binance/account/cache") };
+  } catch (cacheError: unknown) {
+    const cacheErrorMessage = errorMessageFromUnknown(cacheError);
+    try {
+      const payload = await fetchJson<AccountPayload>("/api/binance/account/local");
+      return {
+        cache: {
+          status: "cache_unavailable",
+          source: "local",
+          message: "계정 캐시 API 응답 실패로 최근 로컬 동기화 기준을 표시합니다.",
+          requested_at: null,
+          started_at: null,
+          refreshed_at: null,
+          last_error: cacheErrorMessage,
+          duration_ms: null,
+          payload,
+        },
+        cacheError: cacheErrorMessage,
+      };
+    } catch (localError: unknown) {
+      throw new Error(`${cacheErrorMessage}; 로컬 동기화 조회도 실패: ${errorMessageFromUnknown(localError)}`);
+    }
+  }
+}
+
 function isRefreshPending(status: string) {
   return status === "queued" || status === "refreshing" || status === "already_running";
 }
@@ -65,7 +101,44 @@ function cacheStatusLabel(status: string) {
   if (status === "ready") {
     return "캐시 준비됨";
   }
+  if (status === "cache_unavailable") {
+    return "캐시 조회 실패";
+  }
   return "로컬 기준";
+}
+
+const accountCacheStaleAfterMs = 15 * 60 * 1000;
+
+function parseApiDate(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value.endsWith("Z") ? value : `${value}Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function accountCacheAgeMs(value: string | null | undefined) {
+  const parsed = parseApiDate(value);
+  return parsed ? Math.max(0, Date.now() - parsed.getTime()) : null;
+}
+
+function isAccountCacheStale(cache: AccountCachePayload) {
+  const ageMs = accountCacheAgeMs(cache.refreshed_at);
+  return cache.source === "cached_live" && ageMs !== null && ageMs > accountCacheStaleAfterMs;
+}
+
+function formatCacheAge(value: string | null | undefined) {
+  const ageMs = accountCacheAgeMs(value);
+  if (ageMs === null) {
+    return null;
+  }
+  const minutes = Math.max(0, Math.round(ageMs / 60000));
+  if (minutes < 60) {
+    return `${minutes}분`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}시간 ${remainingMinutes}분` : `${hours}시간`;
 }
 
 function MetricCard({
@@ -115,7 +188,15 @@ function LoadingPanel() {
   );
 }
 
-function ErrorPanel({ message }: { message: string }) {
+function ErrorPanel({
+  message,
+  onRetry,
+  retrying,
+}: {
+  message: string;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
   return (
     <section className="rounded-lg border border-rose-200 bg-white p-5 shadow-sm sm:p-6">
       <div className="flex flex-wrap gap-2">
@@ -129,6 +210,14 @@ function ErrorPanel({ message }: { message: string }) {
         에서도 확인할 수 있습니다.
       </p>
       <p className="mt-3 rounded-md border border-rose-100 bg-rose-50 p-4 text-sm leading-6 text-rose-800">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        disabled={retrying}
+        className="mt-4 inline-flex min-h-11 items-center justify-center rounded-md border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-800 transition hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {retrying ? "다시 확인 중" : "다시 확인"}
+      </button>
     </section>
   );
 }
@@ -145,7 +234,10 @@ function SnapshotSourcePanel({
   onRefreshCache: () => void;
 }) {
   const isCachedLive = cache.source === "cached_live";
-  const statusTone = cache.status === "failed" ? "warn" : isRefreshPending(cache.status) ? "neutral" : "good";
+  const cacheStale = isAccountCacheStale(cache);
+  const cacheAgeText = formatCacheAge(cache.refreshed_at);
+  const sourceTone = cacheStale ? "warn" : isCachedLive ? "good" : "neutral";
+  const statusTone = cache.status === "failed" ? "warn" : isRefreshPending(cache.status) ? "neutral" : cacheStale ? "warn" : "good";
   const refreshedText = cache.refreshed_at
     ? `마지막 원본 갱신: ${formatDisplayValue(cache.refreshed_at, "exchange_update_time")}`
     : "아직 성공한 원본 캐시가 없습니다.";
@@ -157,16 +249,22 @@ function SnapshotSourcePanel({
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap gap-2">
-            <StatusBadge tone={isCachedLive ? "good" : "neutral"} label={isCachedLive ? "캐시된 Binance 원본" : "최근 로컬 동기화"} />
-            <StatusBadge tone={statusTone} label={cacheStatusLabel(cache.status)} />
+            <StatusBadge tone={sourceTone} label={cacheStale ? "Binance 원본 캐시 지연" : isCachedLive ? "캐시된 Binance 원본" : "최근 로컬 동기화"} />
+            <StatusBadge tone={statusTone} label={cacheStale ? "원본 캐시 오래됨" : cacheStatusLabel(cache.status)} />
           </div>
           <p className="mt-4 text-sm leading-7 text-slate-700">
-            {cache.message} 버튼은 갱신 요청만 보내며, 화면은 Binance 원본 API 응답을 직접 기다리지 않습니다.
+            {cache.message} 갱신 버튼은 요청만 보내고, 화면은 사용 가능한 최근 계정 기준을 즉시 표시합니다.
           </p>
           <p className="mt-2 text-sm leading-6 text-slate-500">
             {refreshedText}
+            {cacheAgeText ? ` · 경과 ${cacheAgeText}` : ""}
             {durationText ? ` · ${durationText}` : ""}
           </p>
+          {cacheStale ? (
+            <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-900">
+              Binance 원본 캐시가 {cacheAgeText ?? "기준 시간 초과"} 전 값입니다. 최신 진입 가능 여부는 개요 화면의 운영 상태를 기준으로 확인하세요.
+            </p>
+          ) : null}
           {cacheError ? (
             <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-900">
               캐시 갱신 실패: {cacheError}
@@ -199,9 +297,11 @@ function AccountContent({
 }) {
   const payload = cache.payload;
   const summary = payload.summary;
+  const cacheStale = isAccountCacheStale(cache);
+  const cacheAgeMs = accountCacheAgeMs(cache.refreshed_at);
   const hasExchangeOpenOrders = cache.source === "cached_live";
   const displayedOpenOrders = hasExchangeOpenOrders ? payload.open_orders : [];
-  const sourceLabel = cache.source === "cached_live" ? "캐시된 Binance 원본" : "최근 로컬 동기화";
+  const sourceLabel = cache.source === "cached_live" ? "Binance 원본 캐시" : "최근 로컬 동기화";
   const openOrdersSourceDescription = hasExchangeOpenOrders
     ? `${sourceLabel} 기준 미체결 주문 목록입니다.`
     : "Binance 원본 캐시가 준비된 경우에만 미체결 주문을 표시합니다.";
@@ -211,20 +311,12 @@ function AccountContent({
   const openOrdersMetricHint = hasExchangeOpenOrders
     ? "거래소 원본에서 가져온 미체결 주문 수입니다."
     : "로컬 DB 주문 기록은 미체결 주문으로 표시하지 않습니다. 캐시 갱신 후 Binance 원본 주문만 표시합니다.";
-  const exchangeCanTrade = summary.exchange_can_trade ?? summary.can_trade;
-  const exchangePermissionLabel =
-    cache.source === "cached_live" ? `거래소 주문 권한 ${exchangeCanTrade ? "가능" : "차단"}` : "거래소 원본 주문 권한 미조회";
-  const exchangePermissionTone = cache.source === "cached_live" ? (exchangeCanTrade ? "good" : "warn") : "neutral";
-  const exchangePermissionHint =
-    cache.source === "cached_live"
-      ? exchangeCanTradeAccountHint
-      : "로컬 동기화 정보에는 Binance canTrade 원본 권한이 포함되지 않습니다.";
-
   const exchangeSummaryRow: Record<string, unknown> = {
     data_source: sourceLabel,
-    cache_status: cacheStatusLabel(cache.status),
+    cache_status: cacheStale ? "원본 캐시 오래됨" : cacheStatusLabel(cache.status),
+    cache_stale: cacheStale,
+    cache_age_minutes: cacheAgeMs !== null ? Math.round(cacheAgeMs / 60000) : null,
     connected: summary.connected,
-    exchange_can_trade: exchangeCanTrade,
     testnet_enabled: summary.testnet_enabled,
     futures_enabled: summary.futures_enabled,
     available_balance: summary.available_balance,
@@ -249,10 +341,12 @@ function AccountContent({
 
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <div className="flex flex-wrap gap-2">
-          <StatusBadge tone={summary.connected ? "good" : "warn"} label={summary.connected ? "계정 연결됨" : "계정 연결 확인 필요"} />
-          <StatusBadge tone={exchangePermissionTone} label={exchangePermissionLabel} />
-          <StatusBadge tone={summary.futures_enabled ? "good" : "warn"} label={`Futures ${summary.futures_enabled ? "사용" : "꺼짐"}`} />
-          <StatusBadge tone={summary.testnet_enabled ? "neutral" : "good"} label={summary.testnet_enabled ? "Testnet" : "Live Exchange"} />
+          <StatusBadge
+            tone={cacheStale ? "warn" : summary.connected ? "good" : "warn"}
+            label={cacheStale ? "계정 캐시 지연" : summary.connected ? "계정 연결됨" : "계정 연결 확인 필요"}
+          />
+          <StatusBadge tone={summary.futures_enabled ? "good" : "warn"} label={summary.futures_enabled ? "선물 계정 사용" : "선물 계정 꺼짐"} />
+          <StatusBadge tone={summary.testnet_enabled ? "neutral" : "good"} label={summary.testnet_enabled ? "테스트넷" : "실거래 계정"} />
         </div>
 
         <div className="mt-5 rounded-md border border-slate-200 bg-slate-50 p-5 text-sm leading-7 text-slate-700">
@@ -260,7 +354,7 @@ function AccountContent({
           <Link className="font-semibold text-blue-700 underline decoration-blue-300 underline-offset-4" href="/">
             개요 화면
           </Link>
-          의 운영 상태를 기준으로 봅니다. 이 화면은 계정 원본/캐시 상태와 잔고 확인에 집중합니다.
+          의 운영 상태를 기준으로 봅니다. 이 화면은 계정 원본 상태와 잔고 확인에 집중합니다.
         </div>
 
         <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -270,11 +364,6 @@ function AccountContent({
           <MetricCard label="마진 잔고" value={formatDisplayValue(summary.total_margin_balance, "total_margin_balance")} />
           <MetricCard label="열린 포지션" value={formatDisplayValue(summary.open_positions, "open_positions")} />
           <MetricCard label="미체결 주문" value={openOrdersMetricValue} hint={openOrdersMetricHint} />
-          <MetricCard
-            label="거래소 주문 권한"
-            value={cache.source === "cached_live" ? formatDisplayValue(exchangeCanTrade, "exchange_can_trade") : "원본 캐시 필요"}
-            hint={exchangePermissionHint}
-          />
           <MetricCard label="현재 안내" value={summary.connected ? "응답 정상" : "연결 확인 필요"} hint={summary.message} />
         </div>
       </section>
@@ -312,34 +401,43 @@ export default function BinanceAccountPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [cacheError, setCacheError] = useState<string | null>(null);
   const [refreshingCache, setRefreshingCache] = useState(false);
+  const [loadingCache, setLoadingCache] = useState(false);
   const [autoRefreshRequested, setAutoRefreshRequested] = useState(false);
 
-  const applyCacheResponse = useCallback((nextCache: AccountCachePayload) => {
+  const applyCacheResponse = useCallback((nextCache: AccountCachePayload, nextCacheError?: string | null) => {
     setCache(nextCache);
     setErrorMessage(null);
-    setCacheError(nextCache.status === "failed" ? nextCache.last_error ?? nextCache.message : null);
+    setCacheError(nextCacheError ?? (nextCache.status === "failed" ? nextCache.last_error ?? nextCache.message : null));
     setRefreshingCache(isRefreshPending(nextCache.status));
   }, []);
 
-  useEffect(() => {
-    let active = true;
-
-    fetchJson<AccountCachePayload>("/api/binance/account/cache")
-      .then((nextCache) => {
-        if (active) {
-          applyCacheResponse(nextCache);
-        }
+  const loadAccountCache = useCallback(() => {
+    setLoadingCache(true);
+    fetchAccountCacheWithLocalFallback()
+      .then(({ cache: nextCache, cacheError: nextCacheError }) => {
+        applyCacheResponse(nextCache, nextCacheError);
       })
       .catch((error: unknown) => {
-        if (active) {
-          setErrorMessage(error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.");
-        }
+        setErrorMessage(errorMessageFromUnknown(error));
+      })
+      .finally(() => {
+        setLoadingCache(false);
       });
-
-    return () => {
-      active = false;
-    };
   }, [applyCacheResponse]);
+
+  useEffect(() => {
+    loadAccountCache();
+  }, [loadAccountCache]);
+
+  useEffect(() => {
+    if (!errorMessage || cache) {
+      return;
+    }
+    const intervalId = window.setInterval(loadAccountCache, 3000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [cache, errorMessage, loadAccountCache]);
 
   useEffect(() => {
     if (!refreshingCache) {
@@ -348,15 +446,15 @@ export default function BinanceAccountPage() {
 
     let active = true;
     const intervalId = window.setInterval(() => {
-      fetchJson<AccountCachePayload>("/api/binance/account/cache")
-        .then((nextCache) => {
+      fetchAccountCacheWithLocalFallback()
+        .then(({ cache: nextCache, cacheError: nextCacheError }) => {
           if (active) {
-            applyCacheResponse(nextCache);
+            applyCacheResponse(nextCache, nextCacheError);
           }
         })
         .catch((error: unknown) => {
           if (active) {
-            setCacheError(error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.");
+            setCacheError(errorMessageFromUnknown(error));
             setRefreshingCache(false);
           }
         });
@@ -377,7 +475,7 @@ export default function BinanceAccountPage() {
         applyCacheResponse(nextCache);
       })
       .catch((error: unknown) => {
-        setCacheError(error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.");
+        setCacheError(errorMessageFromUnknown(error));
         setRefreshingCache(false);
       });
   }, [applyCacheResponse]);
@@ -394,13 +492,13 @@ export default function BinanceAccountPage() {
   return (
     <div className="space-y-6">
       <PageShell
-        eyebrow="Exchange Account"
+        eyebrow="계좌 상태"
         title="거래소 계정 / 자산 현황"
-        description="화면은 캐시된 Binance 원본 또는 최근 로컬 동기화 기준으로 즉시 표시합니다. 캐시 갱신은 백그라운드로 요청해 원본 API 지연이 페이지 대기로 이어지지 않게 했습니다."
+        description="Binance 원본 캐시 또는 최근 로컬 동기화 기준으로 잔고와 계정 원본 상태를 확인합니다. 최종 진입 가능 여부는 개요 화면의 운영 상태를 따릅니다."
       />
 
       {errorMessage ? (
-        <ErrorPanel message={errorMessage} />
+        <ErrorPanel message={errorMessage} onRetry={loadAccountCache} retrying={loadingCache} />
       ) : cache ? (
         <AccountContent
           cache={cache}

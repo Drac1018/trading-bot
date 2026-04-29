@@ -3,10 +3,9 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sqlalchemy import select
-
 from trading_mvp.models import Order
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
-from trading_mvp.services.execution import execute_live_trade
+from trading_mvp.services.execution import execute_live_trade, sync_live_state
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
@@ -298,6 +297,35 @@ class EntryBlockedAfterVerifyFailureClient(ProtectionVerifySuccessClient):
     pass
 
 
+class FlatExchangeSyncClient(ProtectionVerifySuccessClient):
+    def get_open_orders(self, symbol: str):
+        return []
+
+    def get_position_information(self, symbol: str):
+        return []
+
+    def fetch_order(
+        self,
+        *,
+        symbol: str,
+        order_type: str | None = None,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "orderId": order_id or "flat-sync-order",
+            "clientOrderId": client_order_id or "flat-sync-order",
+            "type": order_type or "MARKET",
+            "status": "CANCELED",
+            "origQty": "0.0",
+            "executedQty": "0.0",
+            "avgPrice": "0.0",
+            "price": "0.0",
+            "reduceOnly": "true",
+            "closePosition": "true",
+        }
+
+
 def test_protection_verify_refetch_marks_verified_and_uses_same_lookup_path(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     client = ProtectionVerifySuccessClient()
@@ -378,6 +406,44 @@ def test_protection_verify_failed_blocks_followup_entry_for_same_symbol(monkeypa
     assert second_result["reason_codes"] == ["PROTECTION_VERIFY_FAILED"]
     assert second_result["protection_verify_block"]["status"] == "verify_failed"
     assert blocked_client.new_order_calls == 0
+
+
+def test_protection_verify_block_clears_after_flat_exchange_sync(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    failing_client = ProtectionVerifyFailureClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: failing_client)
+
+    first_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=5,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    settings_row = get_or_create_settings(db_session)
+    blocked_client = EntryBlockedAfterVerifyFailureClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: blocked_client)
+    blocked_result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=6,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: FlatExchangeSyncClient())
+    sync_live_state(db_session, settings_row, symbol="BTCUSDT")
+    db_session.flush()
+    synced_settings = get_or_create_settings(db_session)
+    recovery = synced_settings.pause_reason_detail["protection_recovery"]
+
+    assert first_result["status"] == "emergency_exit"
+    assert blocked_result["status"] == "blocked"
+    assert "BTCUSDT" not in recovery.get("verification_blocks", {})
 
 
 def test_protection_verify_unavailable_marks_unverified_and_blocks_followup_entry(monkeypatch, db_session) -> None:

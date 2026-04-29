@@ -66,6 +66,7 @@ from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.scheduler import (
+    abandon_stale_scheduler_runs,
     maybe_refresh_exchange_sync_freshness,
     run_due_exchange_sync_cycle,
     run_due_operational_cycles,
@@ -229,11 +230,14 @@ def _run_background_scheduler_tick() -> int:
             if _manual_pause_active(settings_row):
                 session.rollback()
                 return interval_seconds
+            abandon_stale_scheduler_runs(session)
+            session.commit()
             run_due_operational_cycles(
                 session,
                 include_exchange_sync=False,
                 commit_between=True,
                 continue_on_error=True,
+                session_factory=polling_session_factory,
             )
             run_due_windows(session)
             session.commit()

@@ -15,6 +15,7 @@ from trading_mvp.schemas import (
     DerivativesSummaryPayload,
     EventContextPayload,
     EventContextSummaryPayload,
+    FeaturePayload,
     LeadLagSummaryPayload,
     MarketCandle,
     MarketSnapshotPayload,
@@ -156,6 +157,74 @@ def _setup_cluster_context(
         },
         "active_cluster_keys": [cluster_key] if active else [],
     }
+
+
+def _range_reversion_context(*, side: str) -> tuple[MarketSnapshotPayload, FeaturePayload]:
+    base = _snapshot(
+        "15m",
+        [
+            100.0,
+            100.5,
+            99.8,
+            100.4,
+            99.9,
+            100.6,
+            99.7,
+            100.3,
+            99.8,
+            100.5,
+            99.9,
+            100.4,
+            99.8,
+            100.5,
+            99.9,
+            100.1,
+        ],
+        volumes=[980, 1010, 990, 1020, 1000, 1030, 995, 1015, 1005, 1025, 1000, 1010, 990, 1020, 1005, 1015],
+    )
+    features = compute_features(
+        base,
+        {
+            "1h": _snapshot(
+                "1h",
+                [100.0, 100.4, 99.9, 100.3, 99.8, 100.5, 99.9, 100.4, 99.8, 100.3, 99.9, 100.5, 99.8, 100.4, 99.9, 100.2],
+            ),
+            "4h": _snapshot(
+                "4h",
+                [100.0, 100.3, 99.9, 100.2, 99.8, 100.4, 99.9, 100.3, 99.8, 100.2, 99.9, 100.4, 99.8, 100.3, 99.9, 100.1],
+            ),
+        },
+    )
+    features.regime.primary_regime = "range"
+    features.regime.trend_alignment = "range"
+    features.regime.volume_regime = "normal"
+    features.regime.momentum_state = "stable"
+    features.regime.weak_volume = False
+    features.regime.momentum_weakening = False
+    features.breakout.range_width_pct = 1.2
+    features.breakout.range_breakout_direction = "none"
+    features.breakout.broke_swing_high = False
+    features.breakout.broke_swing_low = False
+    features.volume_persistence.persistence_ratio = 1.0
+    features.trend_score = 0.02
+    features.pullback_context.state = "range"
+    features.pullback_context.aligned_with_higher_timeframe = False
+    features.candle_structure.body_ratio = 0.42
+    if side == "long":
+        features.location.range_position_pct = 0.18
+        features.location.vwap_distance_pct = -0.45
+        features.rsi = 39.0
+        features.momentum_score = -0.18
+        features.candle_structure.lower_wick_ratio = 0.38
+        features.candle_structure.upper_wick_ratio = 0.14
+    else:
+        features.location.range_position_pct = 0.82
+        features.location.vwap_distance_pct = 0.45
+        features.rsi = 61.0
+        features.momentum_score = 0.18
+        features.candle_structure.lower_wick_ratio = 0.14
+        features.candle_structure.upper_wick_ratio = 0.38
+    return base, features
 
 
 def test_summarize_universe_breadth_flags_weak_universe_without_directional_candidates() -> None:
@@ -387,10 +456,45 @@ def test_compute_features_adds_structure_location_volume_and_pullback_context() 
     assert features.breakout.range_breakout_direction == "up"
     assert features.candle_structure.bullish_streak >= 1
     assert features.location.range_position_pct > 1.0
+    assert features.location.range_position_pct < 1.5
     assert features.location.vwap_distance_pct > 0.0
     assert features.volume_persistence.sustained_high_volume is True
     assert features.pullback_context.higher_timeframe_bias == "bullish"
     assert features.pullback_context.state == "bullish_continuation"
+
+
+def test_compute_features_uses_actual_sub_dollar_prices_for_range_location() -> None:
+    base = _snapshot(
+        "15m",
+        [
+            0.2520,
+            0.2532,
+            0.2524,
+            0.2536,
+            0.2528,
+            0.2540,
+            0.2526,
+            0.2534,
+            0.2522,
+            0.2530,
+            0.2518,
+            0.2528,
+            0.2521,
+            0.2531,
+            0.2524,
+            0.2529,
+        ],
+        volumes=[1000, 1010, 990, 1020, 1005, 1030, 995, 1015, 1000, 1020, 990, 1010, 1000, 1025, 1005, 1015],
+    )
+
+    features = compute_features(base, {})
+
+    assert features.breakout.range_breakout_direction == "none"
+    assert 0.0 <= features.location.range_position_pct <= 1.0
+    assert abs(features.location.distance_from_recent_high_pct) < 3.0
+    assert abs(features.location.distance_from_recent_low_pct) < 3.0
+    assert abs(features.location.vwap_distance_pct) < 1.0
+    assert features.breakout.range_width_pct > 0.5
 
 
 def test_compute_features_marks_partial_flags_when_context_is_insufficient() -> None:
@@ -685,6 +789,213 @@ def test_trading_agent_applies_setup_specific_time_profiles() -> None:
     assert breakout_timing["max_holding_minutes"] < continuation_timing["max_holding_minutes"]
     assert breakout_timing["idea_ttl_minutes"] < continuation_timing["idea_ttl_minutes"]
     assert breakout_timing["profile_rationale_code"] == "SETUP_TIME_PROFILE_BREAKOUT_FAST"
+
+
+@pytest.mark.parametrize(
+    ("side", "expected_decision", "expected_rationale"),
+    [
+        ("long", "long", "RANGE_LOWER_REVERSION"),
+        ("short", "short", "RANGE_UPPER_REVERSION"),
+    ],
+)
+def test_trading_agent_allows_box_range_reversion_with_fast_scalp_profile(
+    side: str,
+    expected_decision: str,
+    expected_rationale: str,
+) -> None:
+    base, features = _range_reversion_context(side=side)
+
+    decision, _, metadata = _agent().run(
+        base,
+        features,
+        [],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    assert decision.decision == expected_decision
+    assert decision.entry_mode == "pullback_confirm"
+    assert decision.holding_profile == "scalp"
+    assert decision.max_holding_minutes <= 90
+    assert expected_rationale in decision.rationale_codes
+    assert "SETUP_TIME_PROFILE_RANGE_REVERSION_FAST" in decision.rationale_codes
+    assert decision.stop_loss is not None
+    assert abs(float(decision.stop_loss) - base.latest_price) <= features.atr
+    assert metadata["strategy_engine"]["selected_engine"]["engine_name"] == "range_mean_reversion_engine"
+
+
+@pytest.mark.parametrize(
+    ("side", "range_position", "expected_decision", "expected_rationale"),
+    [
+        ("long", 0.30, "long", "RANGE_LOWER_REVERSION"),
+        ("short", 0.70, "short", "RANGE_UPPER_REVERSION"),
+    ],
+)
+def test_trading_agent_allows_relaxed_box_range_reversion_conditions(
+    side: str,
+    range_position: float,
+    expected_decision: str,
+    expected_rationale: str,
+) -> None:
+    base, features = _range_reversion_context(side=side)
+    features.location.range_position_pct = range_position
+    features.breakout.range_width_pct = 0.28
+    features.volume_persistence.persistence_ratio = 0.62
+
+    decision, _, metadata = _agent().run(
+        base,
+        features,
+        [],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    assert decision.decision == expected_decision
+    assert expected_rationale in decision.rationale_codes
+    assert metadata["strategy_engine"]["selected_engine"]["engine_name"] == "range_mean_reversion_engine"
+
+
+def test_trading_agent_allows_quiet_weak_volume_range_with_reduced_budget() -> None:
+    base, normal_features = _range_reversion_context(side="long")
+    normal_features.location.range_position_pct = 0.30
+    normal_features.breakout.range_width_pct = 0.28
+    normal_features.volume_persistence.persistence_ratio = 0.62
+    normal_decision, _, _ = _agent().run(
+        base,
+        normal_features,
+        [],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    _, quiet_features = _range_reversion_context(side="long")
+    quiet_features.location.range_position_pct = 0.30
+    quiet_features.breakout.range_width_pct = 0.28
+    quiet_features.volume_persistence.persistence_ratio = 0.62
+    quiet_features.volume_ratio = 0.55
+    quiet_features.regime.volume_regime = "weak"
+    quiet_features.regime.weak_volume = True
+    quiet_features.regime.momentum_weakening = True
+    quiet_features.regime.momentum_state = "weakening"
+    quiet_features.derivatives.spread_bps = 4.0
+
+    quiet_decision, _, quiet_metadata = _agent().run(
+        base,
+        quiet_features,
+        [],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    selected_engine = quiet_metadata["strategy_engine"]["selected_engine"]
+    assert quiet_decision.decision == "long"
+    assert "RANGE_LOWER_REVERSION" in quiet_decision.rationale_codes
+    assert selected_engine["engine_name"] == "range_mean_reversion_engine"
+    assert "QUIET_RANGE_WEAK_VOLUME_ALLOWED" in selected_engine["reasons"]
+    assert quiet_decision.risk_pct < normal_decision.risk_pct
+    assert quiet_decision.leverage <= normal_decision.leverage
+
+
+def test_trading_agent_holds_quiet_weak_volume_range_position_until_range_exit() -> None:
+    base, features = _range_reversion_context(side="long")
+    features.location.range_position_pct = 0.30
+    features.breakout.range_width_pct = 0.28
+    features.volume_persistence.persistence_ratio = 0.62
+    features.volume_ratio = 0.55
+    features.regime.volume_regime = "weak"
+    features.regime.weak_volume = True
+    features.regime.momentum_weakening = True
+    features.regime.momentum_state = "weakening"
+    features.derivatives.spread_bps = 4.0
+    open_position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=base.latest_price,
+        mark_price=base.latest_price,
+        leverage=1.0,
+        stop_loss=base.latest_price - features.atr,
+        take_profit=base.latest_price + (features.atr * 1.5),
+    )
+
+    decision, _, _ = _agent().run(
+        base,
+        features,
+        [open_position],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    assert decision.decision == "hold"
+    assert "WEAKENING_SIGNAL" not in decision.rationale_codes
+
+
+def test_trading_agent_does_not_reduce_range_position_only_because_regime_is_range() -> None:
+    base, features = _range_reversion_context(side="long")
+    open_position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=base.latest_price,
+        mark_price=base.latest_price,
+        leverage=2.0,
+        stop_loss=base.latest_price - features.atr,
+        take_profit=base.latest_price + (features.atr * 1.8),
+    )
+
+    decision, _, _ = _agent().run(
+        base,
+        features,
+        [open_position],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    assert decision.decision == "hold"
+    assert "WEAKENING_SIGNAL" not in decision.rationale_codes
+
+
+def test_trading_agent_reduces_range_position_at_target_zone() -> None:
+    base, features = _range_reversion_context(side="long")
+    features.location.range_position_pct = 0.72
+    features.location.vwap_distance_pct = 0.2
+    features.rsi = 58.0
+    features.momentum_score = 0.12
+    open_position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=base.latest_price - (features.atr * 0.4),
+        mark_price=base.latest_price,
+        leverage=2.0,
+        stop_loss=base.latest_price - features.atr,
+        take_profit=base.latest_price + (features.atr * 1.8),
+    )
+
+    decision, _, _ = _agent().run(
+        base,
+        features,
+        [open_position],
+        _risk_context(),
+        use_ai=False,
+        max_input_candles=16,
+    )
+
+    assert decision.decision == "reduce"
+    assert "RANGE_MEAN_REVERSION_MANAGEMENT" in decision.rationale_codes
+    assert "RANGE_TARGET_OR_INVALIDATION" in decision.rationale_codes
 
 
 def test_trading_agent_defaults_to_scalp_under_weak_regime() -> None:
@@ -2073,6 +2384,143 @@ def test_strategy_engine_selector_prefers_continuation_engine_for_bullish_contin
     assert selection.selected_engine.engine_name == "trend_continuation_engine"
     assert selection.selected_engine.decision_hint == "long"
     assert selection.selected_engine.entry_mode == "pullback_confirm"
+
+
+def test_strategy_engine_selector_uses_box_edges_for_range_reversion() -> None:
+    base, features = _range_reversion_context(side="short")
+
+    selection = select_strategy_engine(
+        market_snapshot=base,
+        features=features,
+        open_positions=[],
+        risk_context={},
+        long_breakout_allowed=False,
+        short_breakout_allowed=False,
+    )
+
+    assert selection.selected_engine.engine_name == "range_mean_reversion_engine"
+    assert selection.selected_engine.scenario == "pullback_entry"
+    assert selection.selected_engine.decision_hint == "short"
+    assert "RANGE_UPPER_REVERSION_SHORT" in selection.selected_engine.reasons
+
+
+@pytest.mark.parametrize(
+    ("side", "range_position", "expected_decision", "expected_reason"),
+    [
+        ("long", 0.30, "long", "RANGE_LOWER_REVERSION_LONG"),
+        ("short", 0.70, "short", "RANGE_UPPER_REVERSION_SHORT"),
+    ],
+)
+def test_strategy_engine_selector_accepts_relaxed_range_reversion_edges(
+    side: str,
+    range_position: float,
+    expected_decision: str,
+    expected_reason: str,
+) -> None:
+    base, features = _range_reversion_context(side=side)
+    features.location.range_position_pct = range_position
+    features.breakout.range_width_pct = 0.28
+    features.volume_persistence.persistence_ratio = 0.62
+
+    selection = select_strategy_engine(
+        market_snapshot=base,
+        features=features,
+        open_positions=[],
+        risk_context={},
+        long_breakout_allowed=False,
+        short_breakout_allowed=False,
+    )
+
+    assert selection.selected_engine.engine_name == "range_mean_reversion_engine"
+    assert selection.selected_engine.eligible is True
+    assert selection.selected_engine.decision_hint == expected_decision
+    assert expected_reason in selection.selected_engine.reasons
+
+
+@pytest.mark.parametrize(
+    ("weak_volume", "breakout_direction", "expected_reason"),
+    [
+        (True, "none", "WEAK_VOLUME_RANGE"),
+        (False, "down", "RANGE_BREAKOUT_ACTIVE"),
+    ],
+)
+def test_strategy_engine_selector_keeps_range_safety_blocks(
+    weak_volume: bool,
+    breakout_direction: str,
+    expected_reason: str,
+) -> None:
+    base, features = _range_reversion_context(side="long")
+    features.location.range_position_pct = 0.30
+    features.breakout.range_width_pct = 0.28
+    features.volume_persistence.persistence_ratio = 0.62
+    features.regime.weak_volume = weak_volume
+    if weak_volume:
+        features.volume_ratio = 0.30
+        features.regime.volume_regime = "weak"
+    features.breakout.range_breakout_direction = breakout_direction
+
+    selection = select_strategy_engine(
+        market_snapshot=base,
+        features=features,
+        open_positions=[],
+        risk_context={},
+        long_breakout_allowed=False,
+        short_breakout_allowed=False,
+    )
+    range_candidate = next(
+        candidate for candidate in selection.candidates if candidate.engine_name == "range_mean_reversion_engine"
+    )
+
+    assert range_candidate.eligible is False
+    assert expected_reason in range_candidate.reasons
+
+
+def test_strategy_engine_selector_allows_quiet_weak_volume_range_reversion() -> None:
+    base, features = _range_reversion_context(side="short")
+    features.location.range_position_pct = 0.70
+    features.breakout.range_width_pct = 0.28
+    features.volume_persistence.persistence_ratio = 0.62
+    features.volume_ratio = 0.55
+    features.regime.volume_regime = "weak"
+    features.regime.weak_volume = True
+    features.derivatives.spread_bps = 4.0
+
+    selection = select_strategy_engine(
+        market_snapshot=base,
+        features=features,
+        open_positions=[],
+        risk_context={},
+        long_breakout_allowed=False,
+        short_breakout_allowed=False,
+    )
+
+    assert selection.selected_engine.engine_name == "range_mean_reversion_engine"
+    assert selection.selected_engine.eligible is True
+    assert selection.selected_engine.decision_hint == "short"
+    assert "QUIET_RANGE_WEAK_VOLUME_ALLOWED" in selection.selected_engine.reasons
+    assert "RANGE_UPPER_REVERSION_SHORT" in selection.selected_engine.reasons
+
+
+def test_strategy_engine_selector_keeps_range_no_edge_in_range_engine() -> None:
+    base, features = _range_reversion_context(side="long")
+    features.location.range_position_pct = 0.5
+    features.location.vwap_distance_pct = 0.0
+    features.rsi = 50.0
+    features.momentum_score = 0.0
+
+    selection = select_strategy_engine(
+        market_snapshot=base,
+        features=features,
+        open_positions=[],
+        risk_context={},
+        long_breakout_allowed=False,
+        short_breakout_allowed=False,
+    )
+
+    assert selection.selected_engine.engine_name == "range_mean_reversion_engine"
+    assert selection.selected_engine.eligible is False
+    assert selection.selected_engine.decision_hint == "hold"
+    assert "RANGE_MIDDLE_NO_EDGE" in selection.selected_engine.reasons
 
 
 def test_strategy_engine_selector_prefers_protection_reduce_engine_when_protection_required() -> None:

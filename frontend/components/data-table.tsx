@@ -43,6 +43,23 @@ function renderValue(value: unknown, key?: string) {
   return <span>{formatDisplayValue(value, key)}</span>;
 }
 
+function rowSubtitle(row: TableRow) {
+  const timeKey = ["created_at", "updated_at", "exchange_update_time", "snapshot_time", "feature_time"].find(
+    (key) => typeof row[key] === "string" && String(row[key]).trim().length > 0,
+  );
+  if (timeKey) {
+    return `${translateLabel(timeKey)} ${formatDisplayValue(row[timeKey], timeKey)}`;
+  }
+
+  const idKey = ["id", "order_id", "decision_run_id", "agent_run_id", "scheduler_run_id"].find(
+    (key) =>
+      typeof row[key] === "string" ||
+      typeof row[key] === "number" ||
+      typeof row[key] === "bigint",
+  );
+  return idKey ? `${translateLabel(idKey)} ${formatDisplayValue(row[idKey], idKey)}` : null;
+}
+
 export function DataTable({
   title,
   description,
@@ -85,14 +102,16 @@ export function DataTable({
         </div>
       ) : (
         <div className="grid gap-4 2xl:grid-cols-2">
-          {rows.map((row, index) => (
-            <article key={rowKeys[index]} className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+          {rows.map((row, index) => {
+            const subtitle = rowSubtitle(row);
+            return (
+              <article key={rowKeys[index]} className="rounded-lg border border-slate-200 bg-slate-50 p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <h3 className="text-base font-semibold text-slate-950">
                     {rowTitleFormatter ? rowTitleFormatter(row, index) : defaultGetRowTitle(row, index)}
                   </h3>
-                  <p className="mt-1 text-xs text-slate-500">항목 #{index + 1}</p>
+                  {subtitle ? <p className="mt-1 text-xs text-slate-500">{subtitle}</p> : null}
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {typeof row.status === "string" ? (
@@ -136,7 +155,7 @@ export function DataTable({
               {detail.length > 0 ? (
                 <details className="mt-4 rounded-md border border-slate-200 bg-white">
                   <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-slate-950">
-                    상세 payload 보기
+                    고급 정보 보기
                   </summary>
                   <div className="space-y-4 border-t border-slate-200 px-4 py-4">
                     {detail.map((column) => (
@@ -150,8 +169,9 @@ export function DataTable({
                   </div>
                 </details>
               ) : null}
-            </article>
-          ))}
+              </article>
+            );
+          })}
         </div>
       )}
     </section>

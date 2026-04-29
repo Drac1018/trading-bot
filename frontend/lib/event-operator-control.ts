@@ -71,6 +71,23 @@ export type OperatorEventContextPayload = {
   upcoming_events: OperatorEventItemPayload[];
   affected_assets: string[];
   enrichment_vendors?: EventSourceVendor[];
+  failed_release_ids?: number[];
+  parse_failed_release_ids?: number[];
+  complete_reference?: {
+    source_status: OperatorEventSourceStatus;
+    source_provenance?: EventSourceProvenance | null;
+    source_vendor?: EventSourceVendor | null;
+    generated_at?: string | null;
+    next_event_at?: string | null;
+    next_event_name?: string | null;
+    next_event_importance: OperatorEventImportance;
+    minutes_to_next_event?: number | null;
+    active_risk_window: boolean;
+    upcoming_events: OperatorEventItemPayload[];
+    affected_assets: string[];
+    enrichment_vendors?: EventSourceVendor[];
+    summary_note?: string | null;
+  } | null;
   summary_note?: string | null;
 };
 
@@ -457,6 +474,7 @@ export function describeSourceStatusHelp(
 ) {
   const kind = options?.kind ?? "event_context";
   const provenance = options?.provenance ?? null;
+  const rawValue = String(value ?? "").trim().toLowerCase();
   const normalizedValue = normalizeSourceStatus(value);
   if (kind === "event_context" && provenance === "fixture") {
     return "현재는 샘플 이벤트 일정으로 보여주고 있습니다. 실제 외부 일정 연동은 아직 연결되지 않았습니다.";
@@ -464,7 +482,11 @@ export function describeSourceStatusHelp(
   if (kind === "event_context" && provenance === "stub") {
     return "현재는 임시 예시 데이터를 보여주고 있습니다. 실제 이벤트 데이터를 아직 연결하지 않은 상태입니다.";
   }
-  switch (value) {
+  const switchValue =
+    normalizedValue === "available" && !["available", "fixture", "stub"].includes(rawValue)
+      ? "available"
+      : rawValue;
+  switch (switchValue) {
     case "available":
       return kind === "ai_event_view"
         ? "AI가 이벤트 관련 의견을 남겨 두었습니다."

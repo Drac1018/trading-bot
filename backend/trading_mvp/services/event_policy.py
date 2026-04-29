@@ -22,6 +22,28 @@ from trading_mvp.time_utils import ensure_utc_aware, utcnow_aware
 KNOWN_BIAS_VALUES = {"bullish", "bearish", "neutral", "no_trade"}
 KNOWN_RISK_STATE_VALUES = {"risk_on", "risk_off", "neutral"}
 KNOWN_SOURCE_STATUSES = {"available", "stale", "incomplete", "unavailable", "error"}
+EVENT_CONTEXT_SOURCE_STATE = {
+    "external_api": "available",
+    "fixture": "available",
+    "stub": "available",
+    "available": "available",
+    "stale": "stale",
+    "incomplete": "incomplete",
+    "unavailable": "unavailable",
+    "error": "error",
+}
+EVENT_AWARE_TEXT_MARKERS = (
+    "event",
+    "macro",
+    "fomc",
+    "cpi",
+    "ppi",
+    "gdp",
+    "fred",
+    "bls",
+    "bea",
+    "release",
+)
 DEGRADED_REASON_PRIORITY = (
     "event_context_error",
     "event_context_stale",
@@ -38,6 +60,12 @@ DEGRADED_REASON_PRIORITY = (
 
 def _as_dict(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _as_string_list(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [str(item) for item in value if str(item or "").strip()]
 
 
 def _normalize_symbols(values: Sequence[object] | None) -> list[str]:
@@ -106,6 +134,46 @@ def _dedupe_reason_codes(values: Sequence[str]) -> list[str]:
     return deduped
 
 
+def _event_text_signal(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(marker in lowered for marker in EVENT_AWARE_TEXT_MARKERS):
+        return text
+    return None
+
+
+def _event_reason_codes(*values: object) -> list[str]:
+    reason_codes: list[str] = []
+    for value in values:
+        reason_codes.extend(_as_string_list(value))
+    return _dedupe_reason_codes(reason_codes)
+
+
+def _reason_codes_include_event_context(reason_codes: Sequence[str]) -> bool:
+    return any(code.startswith(("MACRO_EVENT_", "MACRO_RELEASE_", "EVENT_")) for code in reason_codes)
+
+
+def _source_state_from_event_context(
+    *,
+    event_summary: Mapping[str, Any],
+    event_risk_context: Mapping[str, Any],
+    reason_codes: Sequence[str],
+) -> str:
+    if "MACRO_EVENT_CONTEXT_STALE" in reason_codes:
+        return "stale"
+    if "MACRO_EVENT_CONTEXT_INCOMPLETE" in reason_codes:
+        return "incomplete"
+    raw_status = str(
+        event_summary.get("source_status")
+        or event_risk_context.get("source_status")
+        or ""
+    ).strip().lower()
+    mapped = EVENT_CONTEXT_SOURCE_STATE.get(raw_status)
+    return mapped or "available"
+
+
 def _event_source_reason_codes(
     *,
     source_status: OperatorEventSourceStatus,
@@ -132,9 +200,9 @@ def _ai_source_reason_codes(ai_event_view: AIEventViewPayload) -> list[str]:
         reason_codes.append("ai_stale")
     elif source_state == "incomplete":
         reason_codes.append("ai_incomplete")
-    elif source_state in {"unavailable", "unknown"}:
-        reason_codes.append("ai_unavailable")
-    elif ai_event_view.ai_bias == "unknown" and ai_event_view.ai_risk_state == "unknown":
+    elif source_state in {"unavailable", "unknown"} or (
+        ai_event_view.ai_bias == "unknown" and ai_event_view.ai_risk_state == "unknown"
+    ):
         reason_codes.append("ai_unavailable")
     return reason_codes
 
@@ -159,20 +227,25 @@ def derive_ai_event_view(
     output = _as_dict(output_payload)
     metadata = _as_dict(metadata_json)
     explicit = _as_dict(output.get("ai_event_view")) or _as_dict(metadata.get("ai_event_view"))
+    metadata_ai_context = _as_dict(metadata.get("ai_context"))
+    output_ai_context = _as_dict(output.get("ai_context"))
+    ai_context = metadata_ai_context or output_ai_context
+    event_summary = _as_dict(ai_context.get("event_context_summary"))
+    event_risk_context = _as_dict(metadata.get("event_risk_context")) or _as_dict(
+        ai_context.get("event_risk_context")
+    )
+    event_risk_reason_codes = _event_reason_codes(
+        metadata.get("event_risk_reason_codes"),
+        ai_context.get("event_risk_reason_codes"),
+        event_risk_context.get("reason_codes"),
+    )
 
-    scenario_note = (
-        str(explicit.get("scenario_note") or output.get("scenario_note") or metadata.get("scenario_note") or "")
-        or None
+    raw_scenario_note = output.get("scenario_note") or metadata.get("scenario_note")
+    raw_confidence_penalty_reason = output.get("confidence_penalty_reason") or metadata.get(
+        "confidence_penalty_reason"
     )
-    confidence_penalty_reason = (
-        str(
-            explicit.get("confidence_penalty_reason")
-            or output.get("confidence_penalty_reason")
-            or metadata.get("confidence_penalty_reason")
-            or ""
-        )
-        or None
-    )
+    event_scenario_note = _event_text_signal(raw_scenario_note)
+    event_confidence_penalty_reason = _event_text_signal(raw_confidence_penalty_reason)
     event_risk_ack = (
         str(
             explicit.get("event_risk_acknowledgement")
@@ -181,6 +254,15 @@ def derive_ai_event_view(
             or ""
         )
         or None
+    )
+    scenario_note = (
+        str(explicit.get("scenario_note") or "")
+        or event_risk_ack
+        or event_scenario_note
+    )
+    confidence_penalty_reason = (
+        str(explicit.get("confidence_penalty_reason") or "")
+        or event_confidence_penalty_reason
     )
     has_event_aware_signal = any(
         value is not None
@@ -191,18 +273,22 @@ def derive_ai_event_view(
             explicit.get("ai_bias"),
             explicit.get("ai_risk_state"),
         )
-    )
+    ) or _reason_codes_include_event_context(event_risk_reason_codes)
     if not has_event_aware_signal:
         return AIEventViewPayload(source_state="unavailable")
 
-    confidence_value = explicit.get("ai_confidence", output.get("confidence"))
+    confidence_value = explicit.get("ai_confidence")
     confidence: float | None = None
     if isinstance(confidence_value, (int, float)) and 0.0 <= float(confidence_value) <= 1.0:
         confidence = float(confidence_value)
 
     source_state = str(explicit.get("source_state") or "").strip().lower()
     if source_state not in {"available", "stale", "incomplete", "unavailable", "error", "unknown"}:
-        source_state = "available"
+        source_state = _source_state_from_event_context(
+            event_summary=event_summary,
+            event_risk_context=event_risk_context,
+            reason_codes=event_risk_reason_codes,
+        )
 
     decision_value = explicit.get("decision", output.get("decision"))
     return AIEventViewPayload(
@@ -242,9 +328,7 @@ def operator_view_is_active(
     valid_to = ensure_utc_aware(view.valid_to)
     if valid_from is not None and now < valid_from:
         return False
-    if valid_to is not None and now >= valid_to:
-        return False
-    return True
+    return not (valid_to is not None and now >= valid_to)
 
 
 def no_trade_window_is_active(
@@ -308,9 +392,12 @@ def evaluate_event_policy(
     if operator_active and operator_view.operator_bias == "no_trade":
         reason_codes.append("operator_no_trade")
 
-    if ai_event_view.ai_bias == "unknown" or effective_operator_bias == "unknown":
-        alignment_status = "insufficient_data"
-    elif ai_event_view.ai_risk_state == "unknown" or effective_operator_risk_state == "unknown":
+    if (
+        ai_event_view.ai_bias == "unknown"
+        or effective_operator_bias == "unknown"
+        or ai_event_view.ai_risk_state == "unknown"
+        or effective_operator_risk_state == "unknown"
+    ):
         alignment_status = "insufficient_data"
     elif ai_event_view.ai_bias == effective_operator_bias and ai_event_view.ai_risk_state == effective_operator_risk_state:
         alignment_status = "aligned"
@@ -324,11 +411,11 @@ def evaluate_event_policy(
         reason_codes.append("risk_state_conflict")
 
     effective_policy_preview: OperatorEffectivePolicyPreview = "allow_normal"
-    if active_windows:
-        effective_policy_preview = "force_no_trade_window"
-    elif operator_active and operator_view.enforcement_mode == "force_no_trade":
-        effective_policy_preview = "force_no_trade_window"
-    elif operator_active and operator_view.operator_bias == "no_trade":
+    if (
+        active_windows
+        or (operator_active and operator_view.enforcement_mode == "force_no_trade")
+        or (operator_active and operator_view.operator_bias == "no_trade")
+    ):
         effective_policy_preview = "force_no_trade_window"
     elif operator_active and operator_view.enforcement_mode == "block_on_conflict" and alignment_status == "conflict":
         effective_policy_preview = "block_new_entries"

@@ -42,6 +42,17 @@ def test_runtime_database_url_requires_explicit_configuration(monkeypatch) -> No
         raise AssertionError("missing DATABASE_URL should fail")
 
 
+def test_runtime_database_url_accepts_utf8_bom_dotenv(monkeypatch, tmp_path) -> None:
+    database_url = "postgresql+psycopg://trading:trading@127.0.0.1:5432/trading_mvp"
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TRADING_MVP_ALLOW_SQLITE", raising=False)
+    monkeypatch.setattr(config_module, "_PROJECT_ROOT", tmp_path)
+    (tmp_path / ".env").write_text(f"DATABASE_URL={database_url}\n", encoding="utf-8-sig")
+
+    assert config_module.get_explicit_database_url() == database_url
+    assert config_module.require_runtime_database_url("test startup") == database_url
+
+
 def test_runtime_database_url_requires_sqlite_opt_in(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./runtime/state.db")
     monkeypatch.delenv("TRADING_MVP_ALLOW_SQLITE", raising=False)

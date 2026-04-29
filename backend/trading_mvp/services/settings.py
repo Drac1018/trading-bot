@@ -23,6 +23,7 @@ from trading_mvp.models import (
     SystemHealthEvent,
 )
 from trading_mvp.schemas import (
+    SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES,
     AIEventViewPayload,
     AppSettingsAIUsageResponse,
     AppSettingsCadenceResponse,
@@ -38,7 +39,6 @@ from trading_mvp.schemas import (
     OperatorEventViewPayload,
     OperatorEventViewRequest,
     RolloutMode,
-    SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES,
     SymbolCadenceOverride,
     SymbolEffectiveCadence,
 )
@@ -145,6 +145,7 @@ AI_CANDIDATE_MODEL_ROUTES = (
     "operator_manual_high_risk",
 )
 LATEST_SYMBOL_DECISION_SCAN_LIMIT = 100
+EVENT_CONTEXT_REFERENCE_SCAN_LIMIT = 100
 ROLLOUT_MODE_SUBMIT_ENABLED = {"limited_live", "full_live"}
 ROLLOUT_MODE_LIVE_PATH = {"shadow", "live_dry_run", "limited_live", "full_live"}
 RUNTIME_STATE_DETAIL_KEYS = {
@@ -649,6 +650,88 @@ def _latest_symbol_market_snapshot(
     return session.scalar(query.order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
 
 
+def _raw_event_context_from_market_row(row: MarketSnapshot | None) -> dict[str, Any]:
+    if row is None or not isinstance(row.payload, dict):
+        return {}
+    event_context = row.payload.get("event_context")
+    return dict(event_context) if isinstance(event_context, dict) else {}
+
+
+def _event_context_is_complete(payload: dict[str, Any]) -> bool:
+    source_status = str(payload.get("source_status") or "").strip().lower()
+    return bool(payload.get("is_complete")) and source_status not in {
+        "stale",
+        "incomplete",
+        "unavailable",
+        "error",
+    }
+
+
+def _event_context_needs_complete_reference(payload: dict[str, Any]) -> bool:
+    source_status = str(payload.get("source_status") or "").strip().lower()
+    failed_release_ids = payload.get("failed_release_ids")
+    parse_failed_release_ids = payload.get("parse_failed_release_ids")
+    return (
+        source_status == "incomplete"
+        or bool(failed_release_ids)
+        or bool(parse_failed_release_ids)
+    )
+
+
+def _latest_complete_event_context_reference(
+    session: Session | None,
+    *,
+    symbol: str,
+    timeframe: str | None,
+    before: datetime | None,
+) -> dict[str, Any] | None:
+    if session is None:
+        return None
+    query = select(MarketSnapshot).where(MarketSnapshot.symbol == symbol.upper())
+    if timeframe:
+        query = query.where(MarketSnapshot.timeframe == timeframe)
+    if before is not None:
+        query = query.where(MarketSnapshot.snapshot_time < ensure_utc_aware(before).replace(tzinfo=None))
+    rows = list(
+        session.scalars(
+            query.order_by(desc(MarketSnapshot.snapshot_time)).limit(EVENT_CONTEXT_REFERENCE_SCAN_LIMIT)
+        )
+    )
+    for row in rows:
+        event_context = _raw_event_context_from_market_row(row)
+        if not event_context or not _event_context_is_complete(event_context):
+            continue
+        event_context.setdefault("summary_note", "previous complete market snapshot")
+        return event_context
+    return None
+
+
+def _attach_complete_event_context_reference(
+    raw_context: dict[str, Any],
+    *,
+    session: Session | None,
+    symbol: str,
+    timeframe: str | None,
+) -> dict[str, Any]:
+    if not raw_context or not _event_context_needs_complete_reference(raw_context):
+        return raw_context
+    observed_at = _event_context_observed_at(raw_context, None)
+    complete_reference = _latest_complete_event_context_reference(
+        session,
+        symbol=symbol,
+        timeframe=timeframe,
+        before=observed_at,
+    )
+    if complete_reference is None:
+        return raw_context
+    enriched = dict(raw_context)
+    enriched["complete_reference"] = complete_reference
+    note = "최신 조회 일부 실패 / 직전 완전본 참고"
+    existing_note = str(enriched.get("summary_note") or "").strip()
+    enriched["summary_note"] = f"{existing_note}; {note}" if existing_note else note
+    return enriched
+
+
 def _event_context_observed_at(payload: dict[str, Any], fallback: datetime | None) -> datetime | None:
     return parse_utc_datetime(payload.get("generated_at")) or parse_utc_datetime(
         payload.get("source_generated_at")
@@ -768,14 +851,23 @@ def _build_operator_event_context_payload(
         feature_row=resolved_feature,
         market_row=resolved_market,
     )
+    raw_context = _attach_complete_event_context_reference(
+        raw_context,
+        session=session,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    context_note = (
+        f"derived from {context_source}"
+        if context_source is not None
+        else f"no event context available for {symbol.upper()} / {timeframe or settings_row.default_timeframe}"
+    )
+    raw_note = str(raw_context.get("summary_note") or "").strip()
+    summary_note = f"{context_note}; {raw_note}" if raw_note and raw_note not in context_note else context_note
     return normalize_operator_event_context(
         raw_context,
         generated_at=utcnow_aware(),
-        summary_note=(
-            f"derived from {context_source}"
-            if context_source is not None
-            else f"no event context available for {symbol.upper()} / {timeframe or settings_row.default_timeframe}"
-        ),
+        summary_note=summary_note,
     )
 
 

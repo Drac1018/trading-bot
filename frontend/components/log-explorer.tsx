@@ -15,6 +15,10 @@ import {
   AUDIT_TAB_ORDER,
   describeAuditLegacyReview,
   filterAuditRows,
+  formatAuditEntityType,
+  formatAuditEventType,
+  formatAuditMessage,
+  formatAuditRowTitle,
   getAuditEventCategory,
   getAuditTabCounts,
   parseAuditTab,
@@ -22,7 +26,7 @@ import {
   type AuditTab,
   type SortMode,
 } from "../lib/audit-log";
-import { formatDisplayValue, getRowTitle } from "../lib/ui-copy";
+import { formatDisplayValue } from "../lib/ui-copy";
 import { DataTable } from "./data-table";
 
 export type { AuditRow } from "../lib/audit-log";
@@ -57,6 +61,30 @@ function updateTabQuery(pathname: string, searchParams: URLSearchParams, nextTab
 
   const queryString = nextParams.toString();
   return queryString ? `${pathname}?${queryString}` : pathname;
+}
+
+function buildAuditDisplayRow(row: AuditRow): AuditRow {
+  const legacyReview = describeAuditLegacyReview(row);
+  const presentation = {
+    event_label: formatAuditEventType(row.event_type),
+    entity_type_label: formatAuditEntityType(row.entity_type),
+    message_label: formatAuditMessage(row),
+  };
+
+  if (!legacyReview) {
+    return {
+      ...presentation,
+      ...row,
+    };
+  }
+
+  return {
+    ...presentation,
+    ...row,
+    policy_badges: [legacyReview.badge],
+    policy_context: legacyReview.label,
+    policy_note: legacyReview.hint,
+  };
 }
 
 export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 30 }: LogExplorerProps) {
@@ -126,23 +154,7 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 30
     return [...values];
   }, [categoryRows]);
 
-  const displayRows = useMemo(
-    () =>
-      rows.map((row) => {
-        const legacyReview = describeAuditLegacyReview(row);
-        if (!legacyReview) {
-          return row;
-        }
-
-        return {
-          ...row,
-          policy_badges: [legacyReview.badge],
-          policy_context: legacyReview.label,
-          policy_note: legacyReview.hint,
-        };
-      }),
-    [rows],
-  );
+  const displayRows = useMemo(() => rows.map(buildAuditDisplayRow), [rows]);
 
   const filteredRows = useMemo(
     () =>
@@ -298,14 +310,18 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 30
           emptyStateDescription={emptyState.description}
           rowTitleFormatter={(row, index) => {
             const legacyReview = describeAuditLegacyReview(row);
-            const baseTitle = getRowTitle(row, index);
+            const baseTitle = formatAuditRowTitle(row, index);
             return legacyReview ? `${baseTitle} · 과거 정책 기록` : baseTitle;
           }}
           labelOverrides={{
+            entity_type_label: "대상 유형",
+            event_label: "이벤트",
+            message_label: "메시지",
             policy_badges: "표시 배지",
             policy_context: "정책 맥락",
             policy_note: "해석 메모",
           }}
+          hiddenColumns={["event_type", "entity_type", "message"]}
         />
         {visibleSuppressedRows > 0 ? (
           <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700">
@@ -315,7 +331,7 @@ export function LogExplorer({ initialRows, initialTab = "all", initialLimit = 30
         ) : null}
         {visibleLegacyRows > 0 ? (
           <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-sm leading-6 text-slate-700">
-            시간 기반 AI review 사유(`open_position_recheck_due`, `periodic_backstop_due`)는 현재 runtime trigger가 아니라
+            시간 기반 AI 검토 사유(`open_position_recheck_due`, `periodic_backstop_due`)는 현재 런타임 트리거가 아니라
             저장된 과거 정책 기록으로 분리 표시합니다.
           </div>
         ) : null}

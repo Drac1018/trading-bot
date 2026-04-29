@@ -3236,6 +3236,24 @@ def test_entry_candidate_weak_but_not_extreme_volume_keeps_ai_candidate_event(mo
     assert decision_row.metadata_json["pre_ai_skip_reason"] is None
 
 
+def test_cadence_flags_keep_quiet_range_weak_volume_watchable() -> None:
+    feature_payload = _pre_ai_gate_feature(volume_ratio=0.55, weak_volume=True, volume_regime="weak")
+    feature_payload.regime.primary_regime = "range"
+    feature_payload.regime.trend_alignment = "range"
+    feature_payload.regime.momentum_state = "weakening"
+    feature_payload.regime.momentum_weakening = True
+    feature_payload.breakout.range_width_pct = 0.28
+    feature_payload.breakout.range_breakout_direction = "none"
+    feature_payload.location.range_position_pct = 0.30
+    feature_payload.volume_persistence.persistence_ratio = 0.62
+    feature_payload.derivatives.spread_bps = 4.0
+
+    flags = TradingOrchestrator._cadence_feature_flags(feature_payload)
+
+    assert flags["quiet_range_mean_reversion_allowed"] is True
+    assert flags["no_trade_zone"] is False
+
+
 def test_protection_review_weak_volume_does_not_use_entry_preai_gate(monkeypatch, db_session) -> None:
     provider = _CountingDecisionProvider()
     result, decision_row = _run_pre_ai_gate_decision(

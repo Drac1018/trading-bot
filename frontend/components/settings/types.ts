@@ -78,7 +78,6 @@ export type SymbolEffectiveCadence = {
 };
 
 export type ControlStatusSummary = {
-  exchange_can_trade: boolean | null;
   exchange_connectivity_state?: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;

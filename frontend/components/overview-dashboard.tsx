@@ -64,7 +64,6 @@ type AuditEvent = {
 };
 
 type ControlStatusSummary = {
-  exchange_can_trade: boolean | null;
   exchange_connectivity_state: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;
@@ -1104,7 +1103,6 @@ function rolloutModeLabel(mode: RolloutMode) {
 function resolveControlStatusSummary(control: OperatorDashboardPayload["control"]): ControlStatusSummary {
   const summary = control.control_status_summary;
   return {
-    exchange_can_trade: summary?.exchange_can_trade ?? null,
     exchange_connectivity_state:
       summary?.exchange_connectivity_state ?? control.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? control.rollout_mode,
@@ -1153,18 +1151,16 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
             : ("neutral" as const),
     },
     {
-      title: "거래소 주문 가능 상태",
+      title: "거래소 연결/동기화",
       value: translateExchangeConnectivityState(summary.exchange_connectivity_state),
       hint:
-        summary.exchange_connectivity_state === "degraded"
+        summary.exchange_connectivity_state === "blocked" || summary.exchange_connectivity_state === "degraded"
           ? summary.degraded_reason_codes[0]
             ? translateReasonCode(summary.degraded_reason_codes[0])
             : "거래소 연결 또는 동기화 상태를 다시 확인해야 합니다."
-          : summary.exchange_can_trade === null
-          ? "최근 계좌 동기화에서 거래소 주문 가능 여부를 아직 확인하지 못했습니다."
-          : summary.exchange_can_trade
-            ? "거래소 계좌 상태 기준으로 새 주문을 보낼 수 있습니다."
-            : "거래소 계좌 상태 기준으로 새 주문이 막혀 있습니다.",
+          : summary.exchange_connectivity_state === "tradable"
+            ? "계좌, 주문, 포지션 동기화 상태 기준으로 거래소 연결이 정상입니다."
+            : "거래소 연결과 동기화 상태를 확인 중입니다.",
       kind:
         summary.exchange_connectivity_state === "blocked"
           ? ("danger" as const)
@@ -1383,13 +1379,7 @@ function GlobalOperatorSummary({
           label: "신규 진입 보류",
           detail: `${translateOperatingState(control.operating_state)} 상태라 보호 주문 확인과 복구를 우선합니다.`,
         }
-      : controlSummary.exchange_can_trade === false
-        ? {
-            kind: "danger" as const,
-            label: "거래소 주문 차단",
-            detail: "거래소 계좌 상태상 지금은 새 주문을 보낼 수 없습니다.",
-          }
-        : controlSummary.risk_allowed === false
+      : controlSummary.risk_allowed === false
           ? {
               kind: "warn" as const,
               label: "신규 진입 차단",

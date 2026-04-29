@@ -87,6 +87,7 @@ function Invoke-CheckedPython {
 }
 
 $databaseUrl = Test-ExplicitDatabaseConfiguration
+$env:DATABASE_URL = $databaseUrl
 Start-LocalPostgresqlIfConfigured -DatabaseUrl $databaseUrl
 Invoke-CheckedPython -Arguments @("-m", "trading_mvp.migrate")
 Invoke-CheckedPython -Arguments @("-m", "uvicorn", "trading_mvp.main:app", "--app-dir", "backend", "--host", "0.0.0.0", "--port", "8000")

@@ -35,7 +35,7 @@ export const dashboardPages: Record<
   market: {
     title: "시장 / 신호 입력",
     eyebrow: "시장 데이터",
-    description: "시장 스냅샷과 feature 입력만 확인합니다. AI 판단과 risk 차단 정보는 의사결정 탭으로 분리했습니다.",
+    description: "시장 스냅샷과 지표 입력만 확인합니다. AI 판단과 리스크 차단 정보는 의사결정 탭으로 분리했습니다.",
     sections: [
       {
         title: "시장 스냅샷",
@@ -45,14 +45,14 @@ export const dashboardPages: Record<
       {
         title: "신호 입력",
         endpoint: "/api/market/features?limit=20",
-        description: "추세, 변동성, 거래량, RSI, ATR 등 계산된 입력 feature입니다.",
+        description: "추세, 변동성, 거래량, RSI, ATR 등 계산된 지표 입력입니다.",
       },
     ],
   },
   decisions: {
     title: "의사결정",
     eyebrow: "평가 / 판단",
-    description: "현재 입력을 바탕으로 한 AI 평가와 risk 차단 결과를 한 화면에서 확인합니다.",
+    description: "현재 입력을 바탕으로 한 AI 평가와 리스크 차단 결과를 한 화면에서 확인합니다.",
     sections: [
       {
         title: "의사결정 기록",
@@ -75,7 +75,7 @@ export const dashboardPages: Record<
   },
   orders: {
     title: "실거래 주문 / 체결",
-    eyebrow: "Live Logs",
+    eyebrow: "주문 기록",
     description: "Binance 실거래 주문과 체결 내역을 확인합니다.",
     sections: [
       {
@@ -86,19 +86,19 @@ export const dashboardPages: Record<
       {
         title: "실거래 체결",
         endpoint: "/api/executions?limit=20",
-        description: "부분 체결을 포함한 실제 execution ledger입니다.",
+        description: "부분 체결을 포함한 실제 체결 기록입니다.",
       },
     ],
   },
   risk: {
     title: "리스크 상태",
     eyebrow: "정책 우선",
-    description: "AI 추천보다 우선하는 risk_guard 결과와 운영 경고를 확인합니다.",
+    description: "AI 추천보다 우선하는 리스크 가드 결과와 운영 경고를 확인합니다.",
     sections: [
       {
         title: "리스크 체크",
         endpoint: "/api/risk/checks?limit=12&compact=true",
-        description: "허용 여부, 차단 사유, 승인 risk만 먼저 확인합니다.",
+        description: "허용 여부, 차단 사유, 승인 리스크만 먼저 확인합니다.",
       },
       {
         title: "알림",
@@ -120,12 +120,12 @@ export const dashboardPages: Record<
     ],
   },
   scheduler: {
-    title: "스케쥴러 상태",
+    title: "스케줄러 상태",
     eyebrow: "주기 실행",
     description: "마지막 실행, 다음 실행, 성공/실패 상태만 확인합니다. 판단 상세는 의사결정 탭으로 이동했습니다.",
     sections: [
       {
-        title: "스케쥴러 실행 기록",
+        title: "스케줄러 실행 기록",
         endpoint: "/api/scheduler?limit=20",
         description: "주기별 실행 결과와 다음 실행 예정 시각입니다.",
       },

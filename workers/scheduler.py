@@ -88,10 +88,14 @@ def main() -> None:
                     rq_queue_class(queue_name, connection=redis_connection).enqueue(run_window_job, window)
             else:
                 with SessionLocal() as session:
-                    run_due_interval_decision_cycle(session)
-                    for window in windows:
-                        run_window(session, window, triggered_by="scheduler-inline")
-                    session.commit()
+                    try:
+                        run_due_interval_decision_cycle(session)
+                        for window in windows:
+                            run_window(session, window, triggered_by="scheduler-inline")
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        raise
         except Exception as exc:
             _record_scheduler_loop_failure(exc)
         time.sleep(interval_seconds)

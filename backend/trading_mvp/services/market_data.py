@@ -18,6 +18,7 @@ from trading_mvp.services.event_context import EventContextProvider, build_event
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
+CONTEXT_TIMEFRAME_STALE_GRACE_SECONDS = 300
 LEAD_MARKET_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 LEAD_CONTEXT_OK = "ok"
 LEAD_CONTEXT_PARTIAL = "partial"
@@ -114,6 +115,14 @@ def timeframe_to_minutes(timeframe: str) -> int:
     if timeframe.endswith("h"):
         return int(timeframe[:-1]) * 60
     raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+
+def _context_stale_threshold_seconds(timeframe: str, configured_threshold_seconds: int) -> int:
+    try:
+        timeframe_seconds = timeframe_to_minutes(timeframe) * 60
+    except (AttributeError, TypeError, ValueError):
+        return configured_threshold_seconds
+    return max(configured_threshold_seconds, timeframe_seconds + CONTEXT_TIMEFRAME_STALE_GRACE_SECONDS)
 
 
 def generate_seed_candles(symbol: str, timeframe: str, points: int = 160) -> list[MarketCandle]:
@@ -416,7 +425,7 @@ def build_market_context(
             force_stale=force_stale,
             use_binance=use_binance,
             binance_testnet_enabled=binance_testnet_enabled,
-            stale_threshold_seconds=stale_threshold_seconds,
+            stale_threshold_seconds=_context_stale_threshold_seconds(timeframe, stale_threshold_seconds),
             derivatives_context_override=derivatives_context,
             event_context_override=shared_event_context,
         )

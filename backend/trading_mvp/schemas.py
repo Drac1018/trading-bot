@@ -1262,6 +1262,9 @@ class OperatorDecisionEventContextSnapshot(StrictBaseModel):
     is_incomplete: bool = False
     affected_assets: list[str] = Field(default_factory=list)
     enrichment_vendors: list[str] = Field(default_factory=list)
+    failed_release_ids: list[int] = Field(default_factory=list)
+    parse_failed_release_ids: list[int] = Field(default_factory=list)
+    complete_reference: dict[str, Any] = Field(default_factory=dict)
     bls_actual_enriched: bool = False
     bea_actual_enriched: bool = False
     event_risk_active: bool = False
@@ -1827,6 +1830,8 @@ class EventContextPayload(StrictBaseModel):
     affected_assets: list[str] = Field(default_factory=list)
     event_bias: EventBias | None = None
     enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
+    failed_release_ids: list[int] = Field(default_factory=list)
+    parse_failed_release_ids: list[int] = Field(default_factory=list)
     events: list[MacroEventPayload] = Field(default_factory=list)
 
 
@@ -1853,6 +1858,25 @@ class OperatorActiveRiskWindowPayload(StrictBaseModel):
     _normalize_end_at = field_validator("end_at", mode="before")(_coerce_aware_datetime)
 
 
+class OperatorEventContextReferencePayload(StrictBaseModel):
+    source_status: OperatorEventSourceStatus = "available"
+    source_provenance: EventSourceProvenance | None = None
+    source_vendor: EventSourceVendor | None = None
+    generated_at: datetime | None = None
+    next_event_at: datetime | None = None
+    next_event_name: str | None = None
+    next_event_importance: OperatorEventImportance = "unknown"
+    minutes_to_next_event: int | None = None
+    active_risk_window: bool = False
+    upcoming_events: list[OperatorEventItemPayload] = Field(default_factory=list)
+    affected_assets: list[str] = Field(default_factory=list)
+    enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
+    summary_note: str | None = None
+
+    _normalize_generated_at = field_validator("generated_at", mode="before")(_coerce_aware_datetime)
+    _normalize_next_event_at = field_validator("next_event_at", mode="before")(_coerce_aware_datetime)
+
+
 class OperatorEventContextPayload(StrictBaseModel):
     source_status: OperatorEventSourceStatus = "unavailable"
     source_provenance: EventSourceProvenance | None = None
@@ -1869,6 +1893,9 @@ class OperatorEventContextPayload(StrictBaseModel):
     upcoming_events: list[OperatorEventItemPayload] = Field(default_factory=list)
     affected_assets: list[str] = Field(default_factory=list)
     enrichment_vendors: list[EventSourceVendor] = Field(default_factory=list)
+    failed_release_ids: list[int] = Field(default_factory=list)
+    parse_failed_release_ids: list[int] = Field(default_factory=list)
+    complete_reference: OperatorEventContextReferencePayload | None = None
     summary_note: str | None = None
 
     _normalize_generated_at = field_validator("generated_at", mode="before")(_coerce_required_aware_datetime)

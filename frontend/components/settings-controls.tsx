@@ -52,8 +52,6 @@ import { formatDisplayValue } from "../lib/ui-copy";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
-const rolloutModeOptions: RolloutMode[] = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"];
-const eventSourceProviderOptions: EventSourceProvider[] = ["stub", "fred"];
 type FeedbackKey =
   | "control_save"
   | "integration_save"
@@ -400,7 +398,6 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     ? "one-way required for current local position model"
     : null;
   return {
-    exchange_can_trade: summary?.exchange_can_trade ?? null,
     exchange_connectivity_state: summary?.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? state.rollout_mode,
     exchange_submit_allowed: summary?.exchange_submit_allowed ?? state.exchange_submit_allowed,
@@ -793,12 +790,12 @@ export function SettingsControls({
   };
 
   return (
-    <div className="space-y-5 rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+    <div className="space-y-4 rounded-lg border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">실거래 설정</p>
-          <h2 className="mt-2 text-2xl font-semibold text-slate-900 sm:text-3xl">심볼, AI, 거래소 운영 제어</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">이 화면은 변경 가능한 설정값과 즉시 제어를 다루되, 현재 gate 상태도 함께 보여줍니다. 심볼별 AI 추천, risk 승인, 실제 실행 흐름은 개요 화면에서 이어서 확인합니다.</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">실거래 설정</p>
+          <h2 className="mt-2 text-xl font-semibold text-slate-900 sm:text-2xl">심볼, AI, 거래소 운영 제어</h2>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">변경 가능한 설정과 즉시 제어를 한곳에서 다룹니다. 심볼별 AI 추천, 리스크 승인, 실제 실행 흐름은 개요 화면에서 확인합니다.</p>
         </div>
         <div className="grid gap-2 sm:grid-cols-2">
           <StatusPill tone={state.openai_api_key_configured ? "good" : "warn"}>OpenAI 키: {state.openai_api_key_configured ? "설정됨" : "없음"}</StatusPill>
@@ -817,7 +814,7 @@ export function SettingsControls({
             <Link
               key={tab.value}
               href={viewHref(tab.value)}
-              className={`rounded-md border px-4 py-4 transition ${
+              className={`rounded-md border px-4 py-3 transition ${
                 active
                   ? "border-blue-600 bg-blue-600 text-white"
                   : "border-slate-200 bg-slate-50 text-slate-700 hover:border-blue-200 hover:bg-blue-50"

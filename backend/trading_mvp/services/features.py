@@ -86,6 +86,10 @@ def _safe_pct(numerator: float, denominator: float) -> float:
     return (numerator / denominator) * 100
 
 
+def _positive_price_denominator(value: float) -> float:
+    return value if value > 0 else 1.0
+
+
 def _ratio_to_bias(ratio: float | None) -> float | None:
     if ratio is None or ratio <= 0:
         return None
@@ -121,7 +125,7 @@ def _breakout_context(snapshot: MarketSnapshotPayload, *, lookback_bars: int = 8
         swing_low=round(swing_low, 4),
         range_high=round(range_high, 4),
         range_low=round(range_low, 4),
-        range_width_pct=round(_safe_pct(range_high - range_low, max(latest_close, 1.0)), 4),
+        range_width_pct=round(_safe_pct(range_high - range_low, _positive_price_denominator(latest_close)), 4),
         broke_swing_high=latest_close > swing_high,
         broke_swing_low=latest_close < swing_low,
         range_breakout_direction=range_breakout_direction,
@@ -168,16 +172,19 @@ def _candle_structure_context(snapshot: MarketSnapshotPayload) -> CandleStructur
 
 
 def _location_context(snapshot: MarketSnapshotPayload, breakout: BreakoutFeatureContext) -> LocationFeatureContext:
-    latest_price = max(float(snapshot.latest_price), 1.0)
+    latest_price = float(snapshot.latest_price)
+    price_denominator = _positive_price_denominator(latest_price)
     recent_span = breakout.swing_high - breakout.swing_low
     range_position = 0.5
     if recent_span > 0:
         range_position = (latest_price - breakout.swing_low) / recent_span
     vwap = _vwap(snapshot.candles)
-    vwap_distance_pct = _safe_pct(latest_price - vwap, max(vwap, 1.0)) if vwap is not None else 0.0
+    vwap_distance_pct = (
+        _safe_pct(latest_price - vwap, _positive_price_denominator(vwap)) if vwap is not None else 0.0
+    )
     return LocationFeatureContext(
-        distance_from_recent_high_pct=round(_safe_pct(latest_price - breakout.swing_high, latest_price), 4),
-        distance_from_recent_low_pct=round(_safe_pct(latest_price - breakout.swing_low, latest_price), 4),
+        distance_from_recent_high_pct=round(_safe_pct(latest_price - breakout.swing_high, price_denominator), 4),
+        distance_from_recent_low_pct=round(_safe_pct(latest_price - breakout.swing_low, price_denominator), 4),
         range_position_pct=round(range_position, 4),
         vwap_distance_pct=round(vwap_distance_pct, 4),
     )

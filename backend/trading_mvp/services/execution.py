@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.config import get_settings
@@ -609,6 +609,21 @@ def _optional_int(value: object) -> int | None:
 
 def _build_binance_request_error_hook(settings_row: Setting) -> Callable[[dict[str, object]], None]:
     def _hook(event: dict[str, object]) -> None:
+        if event.get("event") == "binance_time_sync":
+            record_binance_rest_success(
+                settings_row,
+                source=f"binance_client:{event.get('endpoint_category') or 'unknown'}:time_sync",
+                detail={
+                    "time_sync": {
+                        "method": event.get("method"),
+                        "path": event.get("path"),
+                        "offset_ms": event.get("offset_ms"),
+                        "recv_window_ms": event.get("recv_window_ms"),
+                    },
+                    "resolved_api_codes": event.get("resolved_api_codes") or [-1021],
+                },
+            )
+            return
         record_binance_rest_issue(
             settings_row,
             reason_code=str(event.get("reason_code") or "BINANCE_REST_REQUEST_FAILED"),
@@ -2567,8 +2582,110 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
     return fee_total, realized_total
 
 
+def _backfill_missing_final_order_trades(
+    session: Session,
+    settings_row: Setting,
+    client: BinanceClient,
+    *,
+    symbol: str,
+) -> int:
+    orders = session.scalars(
+        select(Order)
+        .where(
+            Order.mode == "live",
+            Order.symbol == symbol,
+            Order.status.in_(("filled", "partially_filled")),
+            Order.order_type.notin_(("stop_market", "take_profit_market")),
+            ~Order.id.in_(select(Execution.order_id).where(Execution.order_id.is_not(None))),
+        )
+        .order_by(Order.id.asc())
+    ).all()
+    backfilled = 0
+    for order in orders:
+        if not order.external_order_id and not order.client_order_id:
+            continue
+        try:
+            trades = client.get_account_trades(symbol=order.symbol, order_id=order.external_order_id)
+        except Exception as exc:
+            record_audit_event(
+                session,
+                event_type="live_trade_backfill_failed",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="warning",
+                message="Filled live order trade backfill failed.",
+                payload={"symbol": order.symbol, "order_id": order.id, "error": str(exc)},
+            )
+            continue
+        if not trades:
+            record_audit_event(
+                session,
+                event_type="live_trade_backfill_empty",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="warning",
+                message="Filled live order had no account trades available during backfill.",
+                payload={
+                    "symbol": order.symbol,
+                    "order_id": order.id,
+                    "exchange_order_id": order.external_order_id,
+                    "client_order_id": order.client_order_id,
+                },
+            )
+            continue
+        fee_paid, realized_pnl = _record_live_trades(session, order, trades)
+        if fee_paid or realized_pnl or _sum_trade_quantity(trades) > 0:
+            backfilled += 1
+            record_audit_event(
+                session,
+                event_type="live_trade_backfilled",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="info",
+                message="Missing filled live order executions were backfilled from exchange trades.",
+                payload={
+                    "symbol": order.symbol,
+                    "order_id": order.id,
+                    "exchange_order_id": order.external_order_id,
+                    "trade_count": len(trades),
+                    "filled_quantity": _sum_trade_quantity(trades),
+                    "fees": fee_paid,
+                    "realized_pnl": realized_pnl,
+                },
+            )
+    if backfilled:
+        create_exchange_pnl_snapshot(session, settings_row)
+    return backfilled
+
+
 def _sum_trade_quantity(trades: list[dict[str, object]]) -> float:
     return sum(abs(_to_float(trade.get("qty"))) for trade in trades)
+
+
+def _sync_closed_position_pnl(session: Session, position: Position) -> None:
+    if position.id is None:
+        return
+    totals = session.execute(
+        select(
+            func.coalesce(func.sum(Execution.realized_pnl), 0.0),
+            func.coalesce(func.sum(Execution.fee_paid), 0.0),
+        )
+        .join(Order, Order.id == Execution.order_id)
+        .where(Order.position_id == position.id)
+    ).one()
+    gross_realized = float(totals[0] or 0.0)
+    fee_total = float(totals[1] or 0.0)
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
+    metadata["closed_position_pnl"] = {
+        "gross_realized_pnl": gross_realized,
+        "fee_total": fee_total,
+        "net_realized_pnl": gross_realized - fee_total,
+        "source": "executions",
+        "updated_at": utcnow_naive().isoformat(),
+    }
+    position.realized_pnl = gross_realized
+    position.unrealized_pnl = 0.0
+    position.metadata_json = metadata
 
 
 def _upsert_exchange_order_row(
@@ -3537,6 +3654,7 @@ def sync_live_positions(
             metadata["exchange_position_mode"] = position_mode
             metadata["exchange_position_side"] = "BOTH" if position_mode == POSITION_MODE_ONE_WAY else None
             local.metadata_json = metadata
+            _sync_closed_position_pnl(session, local)
             session.add(local)
             session.flush()
         _record_sync_success(
@@ -3861,6 +3979,26 @@ def _execute_primary_order_with_policy(
         fee_paid, realized_pnl = _record_live_trades(session, order, trades)
         filled_quantity = min(_sum_trade_quantity(trades), submitted_quantity)
         average_fill_price = order.average_fill_price or submitted_price
+        if filled_quantity <= 0 and order.status in {"filled", "partially_filled"} and order.filled_quantity > 0:
+            filled_quantity = min(float(order.filled_quantity or 0.0), submitted_quantity)
+            average_fill_price = float(order.average_fill_price or submitted_price)
+            record_audit_event(
+                session,
+                event_type="live_execution_trade_lookup_empty",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="warning",
+                message="Exchange order was filled but account trades were unavailable for execution-quality calculation.",
+                payload={
+                    "symbol": symbol,
+                    "order_id": order.id,
+                    "exchange_order_id": order.external_order_id,
+                    "client_order_id": order.client_order_id,
+                    "fallback_filled_quantity": filled_quantity,
+                    "fallback_average_fill_price": average_fill_price,
+                },
+                correlation_ids=normalize_correlation_ids(correlation_ids, execution_id=order.id),
+            )
         fill_slippage_pct = 0.0
         if filled_quantity > 0 and average_fill_price > 0:
             fill_slippage_pct = abs(average_fill_price - requested_price) / max(requested_price, 1.0)
@@ -5132,6 +5270,12 @@ def sync_live_state(
                 synced_orders += 1
         else:
             synced_orders += _count_symbol_order_stream_events(stream_events, symbol=item_symbol)
+        synced_orders += _backfill_missing_final_order_trades(
+            session,
+            settings_row,
+            client,
+            symbol=item_symbol,
+        )
         try:
             open_orders = (
                 _symbol_payloads(bulk_open_orders, item_symbol)
@@ -5302,7 +5446,7 @@ def sync_live_state(
                 scope="protective_orders",
                 detail={"symbol": item_symbol, "status": protection_state["status"]},
             )
-            if protection_state["status"] == "protected":
+            if protection_state["status"] in {"flat", "protected"}:
                 _clear_symbol_protection_verify_block(
                     session,
                     settings_row,

@@ -22,6 +22,7 @@ ALGO_ORDER_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT", 
 ORDER_SUBMISSION_PATHS = {"/fapi/v1/order", "/fapi/v1/algoOrder"}
 BINANCE_TRANSIENT_API_CODES = {-1001, -1007}
 BINANCE_RATE_LIMIT_API_CODES = {-1003, -1015}
+BINANCE_TIMESTAMP_API_CODES = {-1021}
 RequestErrorHook = Callable[[dict[str, object]], None]
 
 
@@ -108,7 +109,10 @@ def classify_binance_rest_exception(
     rate_limited = api_code in BINANCE_RATE_LIMIT_API_CODES or http_status in {418, 429}
     server_error = http_status is not None and 500 <= http_status <= 599
     transient_api = api_code in BINANCE_TRANSIENT_API_CODES
-    if rate_limited:
+    if api_code in BINANCE_TIMESTAMP_API_CODES:
+        reason_code = "BINANCE_REST_TIME_SYNC_REQUIRED"
+        failure_type = "time_sync"
+    elif rate_limited:
         reason_code = "BINANCE_REST_RATE_LIMITED"
         failure_type = "rate_limit"
     elif server_error:
@@ -264,6 +268,31 @@ class BinanceClient:
         except Exception:
             return
 
+    def _record_time_sync(
+        self,
+        *,
+        method_upper: str,
+        path: str,
+        endpoint_category: str,
+        offset_ms: int,
+    ) -> None:
+        if self.request_error_hook is None:
+            return
+        try:
+            self.request_error_hook(
+                {
+                    "event": "binance_time_sync",
+                    "method": method_upper,
+                    "path": path,
+                    "endpoint_category": endpoint_category,
+                    "offset_ms": offset_ms,
+                    "recv_window_ms": self.recv_window_ms,
+                    "resolved_api_codes": [-1021],
+                }
+            )
+        except Exception:
+            return
+
     def _sign(self, query: str) -> str:
         return hmac.new(
             self.api_secret.encode("utf-8"),
@@ -336,7 +365,13 @@ class BinanceClient:
                         code = error_payload.get("code")
                         message = error_payload.get("msg") or error_payload.get("message") or error_payload.get("error")
                         if signed and code == -1021 and not time_sync_attempted:
-                            self._refresh_server_time_offset_ms()
+                            offset_ms = self._refresh_server_time_offset_ms()
+                            self._record_time_sync(
+                                method_upper=method_upper,
+                                path=path,
+                                endpoint_category=endpoint_category,
+                                offset_ms=offset_ms,
+                            )
                             time_sync_attempted = True
                             continue
                         if code is not None or message:

@@ -7,7 +7,11 @@ from trading_mvp.models import PendingEntryPlan, RiskCheck
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
 from trading_mvp.services.dashboard import get_overview
 from trading_mvp.services.orchestrator import TradingOrchestrator
-from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
+from trading_mvp.services.runtime_state import (
+    mark_sync_issue,
+    mark_sync_success,
+    record_binance_rest_issue,
+)
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
@@ -39,6 +43,8 @@ def _snapshot(
     snapshot_time,
     latest_price: float,
     candles: list[tuple[float, float, float, float]],
+    is_stale: bool = False,
+    is_complete: bool = True,
 ) -> MarketSnapshotPayload:
     candle_rows = []
     for index, (open_price, high_price, low_price, close_price) in enumerate(candles):
@@ -59,8 +65,8 @@ def _snapshot(
         latest_price=latest_price,
         latest_volume=1000.0,
         candle_count=len(candle_rows),
-        is_stale=False,
-        is_complete=True,
+        is_stale=is_stale,
+        is_complete=is_complete,
         candles=candle_rows,
     )
 
@@ -74,11 +80,19 @@ def _decision_snapshot(*, snapshot_time, latest_price: float = 70000.0) -> Marke
     )
 
 
-def _watch_snapshot(*, snapshot_time, latest_price: float) -> MarketSnapshotPayload:
+def _watch_snapshot(
+    *,
+    snapshot_time,
+    latest_price: float,
+    is_stale: bool = False,
+    is_complete: bool = True,
+) -> MarketSnapshotPayload:
     return _snapshot(
         timeframe="1m",
         snapshot_time=snapshot_time,
         latest_price=latest_price,
+        is_stale=is_stale,
+        is_complete=is_complete,
         candles=[
             (69480.0, 69500.0, 69320.0, 69360.0),
             (69350.0, 69480.0, 69240.0, latest_price),
@@ -106,6 +120,18 @@ def _watch_snapshot_late_chase(*, snapshot_time, latest_price: float = 70500.0) 
         candles=[
             (69450.0, 69520.0, 69290.0, 69340.0),
             (69340.0, 70520.0, 69280.0, latest_price),
+        ],
+    )
+
+
+def _watch_snapshot_chase_without_rr_collapse(*, snapshot_time, latest_price: float = 69500.0) -> MarketSnapshotPayload:
+    return _snapshot(
+        timeframe="1m",
+        snapshot_time=snapshot_time,
+        latest_price=latest_price,
+        candles=[
+            (69340.0, 69420.0, 69280.0, 69320.0),
+            (69320.0, 69510.0, 69290.0, latest_price),
         ],
     )
 
@@ -141,7 +167,11 @@ def _pullback_long_decision() -> TradeDecision:
     )
 
 
-def _hold_decision() -> TradeDecision:
+def _hold_decision(
+    *,
+    rationale_codes: list[str] | None = None,
+    invalidation_reason_codes: list[str] | None = None,
+) -> TradeDecision:
     return TradeDecision(
         decision="hold",
         confidence=0.41,
@@ -158,7 +188,8 @@ def _hold_decision() -> TradeDecision:
         max_holding_minutes=120,
         risk_pct=0.001,
         leverage=1.0,
-        rationale_codes=["NO_EDGE"],
+        rationale_codes=rationale_codes or ["NO_EDGE"],
+        invalidation_reason_codes=invalidation_reason_codes or [],
         explanation_short="현재는 hold가 우선입니다.",
         explanation_detailed="새 계획보다 기존 armed plan을 취소하고 관망하는 편이 안전합니다.",
     )
@@ -292,6 +323,55 @@ def test_entry_plan_watcher_executes_after_zone_entry_and_confirm_without_new_ai
     assert trigger_details["quality_components"]["reclaim_signal_strength"] >= 0.55
 
 
+def test_entry_plan_watcher_marks_shadow_execution_terminal(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "shadow"
+    db_session.add(settings_row)
+    db_session.flush()
+    execution_calls = 0
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execution_calls
+        execution_calls += 1
+        return {
+            "status": "shadow",
+            "reason_codes": ["ROLLOUT_MODE_SHADOW"],
+            "submit_blocked": True,
+            "_cache_dedupe": False,
+        }
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    first_watch = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive() + timedelta(minutes=1),
+            latest_price=69420.0,
+        ),
+    )
+    second_watch = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive() + timedelta(minutes=2),
+            latest_price=69420.0,
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert first_watch["results"][0]["plans"][0]["status"] == "triggered"
+    assert second_watch["results"] == []
+    assert execution_calls == 1
+    assert refreshed is not None
+    assert refreshed.plan_status == "triggered"
+    assert refreshed.metadata_json["execution_result"]["status"] == "shadow"
+
+
 def test_entry_plan_watcher_keeps_waiting_on_weak_reclaim_quality(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
@@ -359,6 +439,41 @@ def test_entry_plan_watcher_cancels_on_late_chase_and_rr_deterioration(monkeypat
     assert refreshed.canceled_reason == "PLAN_CONFIRM_QUALITY_REJECTED"
 
 
+def test_entry_plan_watcher_waits_on_chase_without_rr_collapse(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 302, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot_chase_without_rr_collapse(
+            snapshot_time=utcnow_naive() + timedelta(minutes=1)
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "armed_waiting_reentry"
+    assert watch_result["results"][0]["plans"][0]["blocked_reasons"] == ["PLAN_MAX_CHASE_EXCEEDED"]
+    trigger_details = watch_result["results"][0]["plans"][0]["plan"]["trigger_details"]
+    assert trigger_details["late_chase"] is True
+    assert trigger_details["rr_collapse"] is False
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+
+
 def test_entry_plan_watcher_expires_plan_without_execution(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
@@ -390,7 +505,163 @@ def test_entry_plan_watcher_expires_plan_without_execution(monkeypatch, db_sessi
     assert refreshed.plan_status == "expired"
 
 
-def test_new_hold_decision_cancels_existing_armed_plan(monkeypatch, db_session) -> None:
+def test_entry_plan_watcher_waits_on_stale_market_before_invalidating_or_expiring(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    plan.expires_at = utcnow_naive() - timedelta(seconds=1)
+    original_expires_at = plan.expires_at
+    db_session.add(plan)
+    db_session.flush()
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 1, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive(),
+            latest_price=68400.0,
+            is_stale=True,
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    plan_result = watch_result["results"][0]["plans"][0]
+    assert plan_result["status"] == "armed_waiting_market"
+    assert plan_result["blocked_reasons"] == ["PLAN_WAITING_FOR_FRESH_MARKET"]
+    assert plan_result["market_reason_codes"] == ["MARKET_STATE_STALE"]
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+    assert refreshed.expires_at > original_expires_at
+    assert refreshed.metadata_json["last_watch_blocked_reason_codes"] == ["PLAN_WAITING_FOR_FRESH_MARKET"]
+    assert refreshed.metadata_json["last_watch_block_detail"]["market_reason_codes"] == ["MARKET_STATE_STALE"]
+
+
+def test_entry_plan_watcher_waits_on_stale_market_before_invalidating_plan(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 1, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive(),
+            latest_price=68400.0,
+            is_stale=True,
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "armed_waiting_market"
+    assert watch_result["results"][0]["plans"][0]["blocked_reasons"] == ["PLAN_WAITING_FOR_FRESH_MARKET"]
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+
+
+def test_entry_plan_watcher_catches_up_long_overdue_plan_while_waiting_on_blocker(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    plan.expires_at = utcnow_naive() - timedelta(minutes=5)
+    original_expires_at = plan.expires_at
+    db_session.add(plan)
+    db_session.flush()
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 1, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+    before_watch = utcnow_naive()
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive(),
+            latest_price=68400.0,
+            is_stale=True,
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "armed_waiting_market"
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+    assert refreshed.expires_at > original_expires_at
+    assert refreshed.expires_at > before_watch
+
+
+def test_entry_plan_watcher_waits_on_binance_rest_block_before_expiry_or_invalidation(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    plan.expires_at = utcnow_naive() - timedelta(minutes=2)
+    settings_row = get_or_create_settings(db_session)
+    record_binance_rest_issue(
+        settings_row,
+        reason_code="BINANCE_REST_SERVER_ERROR",
+        source="test",
+        server_error=True,
+    )
+    db_session.add_all([plan, settings_row])
+    db_session.flush()
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 1, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=68400.0),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "control_blocked"
+    assert watch_result["results"][0]["plans"][0]["blocked_reasons"] == ["BINANCE_REST_CIRCUIT_OPEN"]
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+
+
+def test_new_generic_hold_decision_keeps_existing_armed_plan(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session, snapshot_time=utcnow_naive())
     existing_plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
     assert existing_plan is not None
@@ -412,15 +683,74 @@ def test_new_hold_decision_cancels_existing_armed_plan(monkeypatch, db_session) 
     refreshed = db_session.get(PendingEntryPlan, existing_plan.id)
 
     assert result["decision"]["decision"] == "hold"
+    assert result["canceled_entry_plans"] == []
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+    assert refreshed.metadata_json["last_ai_hold_decision_run_id"] == result["decision_run_id"]
+
+
+def test_new_hold_with_non_cancel_invalidation_reason_keeps_existing_armed_plan(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session, snapshot_time=utcnow_naive())
+    existing_plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert existing_plan is not None
+
+    later_snapshot = _decision_snapshot(snapshot_time=utcnow_naive() + timedelta(minutes=15), latest_price=70100.0)
+    orchestrator.trading_agent.run = lambda *args, **kwargs: (
+        _hold_decision(invalidation_reason_codes=["STOP_WIDENING_FORBIDDEN"]),
+        "deterministic-mock",
+        {},
+    )
+    result = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot_override=later_snapshot,
+        market_context_override=_market_context(later_snapshot),
+        exchange_sync_checked=True,
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, existing_plan.id)
+
+    assert result["decision"]["decision"] == "hold"
+    assert result["canceled_entry_plans"] == []
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+
+
+def test_new_invalidating_hold_decision_cancels_existing_armed_plan(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session, snapshot_time=utcnow_naive())
+    existing_plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert existing_plan is not None
+
+    later_snapshot = _decision_snapshot(snapshot_time=utcnow_naive() + timedelta(minutes=15), latest_price=70100.0)
+    orchestrator.trading_agent.run = lambda *args, **kwargs: (
+        _hold_decision(rationale_codes=["REGIME_INVALIDATED"], invalidation_reason_codes=["ENTRY_PLAN_INVALIDATED"]),
+        "deterministic-mock",
+        {},
+    )
+    result = orchestrator.run_decision_cycle(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot_override=later_snapshot,
+        market_context_override=_market_context(later_snapshot),
+        exchange_sync_checked=True,
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, existing_plan.id)
+
+    assert result["decision"]["decision"] == "hold"
     assert result["canceled_entry_plans"]
     assert refreshed is not None
     assert refreshed.plan_status == "canceled"
     assert refreshed.canceled_reason == "NEW_AI_HOLD_DECISION"
 
 
-def test_entry_plan_watcher_cancels_on_stale_sync(monkeypatch, db_session) -> None:
+def test_entry_plan_watcher_waits_on_stale_sync_without_canceling_plan(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    original_expires_at = plan.expires_at
     settings_row = get_or_create_settings(db_session)
     mark_sync_issue(
         settings_row,
@@ -447,21 +777,143 @@ def test_entry_plan_watcher_cancels_on_stale_sync(monkeypatch, db_session) -> No
         market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
     )
     db_session.flush()
-    refreshed = db_session.get(PendingEntryPlan, plan.id if plan is not None else 0)
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "armed_waiting_sync"
+    assert watch_result["results"][0]["plans"][0]["blocked_reasons"] == ["PLAN_WAITING_FOR_FRESH_SYNC"]
+    assert watch_result["results"][0]["plans"][0]["stale_scopes"] == ["account"]
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+    assert refreshed.metadata_json["last_watch_stale_scopes"] == ["account"]
+    assert refreshed.expires_at > original_expires_at
+    first_deferred_expires_at = refreshed.expires_at
+    metadata = dict(refreshed.metadata_json or {})
+    metadata["last_watch_at"] = utcnow_naive().isoformat()
+    refreshed.metadata_json = metadata
+    db_session.add(refreshed)
+    db_session.flush()
+
+    repeated_wait = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
+    )
+    db_session.flush()
+    repeated = db_session.get(PendingEntryPlan, plan.id)
+
+    assert repeated_wait["results"][0]["plans"][0]["status"] == "armed_waiting_sync"
+    assert repeated is not None
+    assert repeated.expires_at == first_deferred_expires_at
+
+    mark_sync_success(settings_row, scope="account", synced_at=utcnow_naive())
+    db_session.add(settings_row)
+    db_session.flush()
+
+    retry_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive() + timedelta(minutes=1), latest_price=69420.0),
+    )
+    db_session.flush()
+    retried = db_session.get(PendingEntryPlan, plan.id)
+
+    assert retry_result["results"][0]["plans"][0]["status"] == "triggered"
+    assert execute_called is True
+    assert retried is not None
+    assert retried.plan_status == "triggered"
+
+
+def test_entry_plan_watcher_waits_on_other_symbol_protection_state(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    settings_row = get_or_create_settings(db_session)
+    settings_row.pause_reason_detail = {
+        **dict(settings_row.pause_reason_detail or {}),
+        "operating_state": "PROTECTION_REQUIRED",
+        "protection_recovery": {
+            "missing_symbols": ["ETHUSDT"],
+            "missing_items": {"ETHUSDT": ["stop_loss"]},
+        },
+    }
+    db_session.add(settings_row)
+    db_session.flush()
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 1, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "armed_waiting_protection_state"
+    assert watch_result["results"][0]["plans"][0]["blocked_reasons"] == ["PLAN_WAITING_FOR_PROTECTION_STATE"]
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+
+
+def test_entry_plan_watcher_cancels_on_same_symbol_protection_state(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    settings_row = get_or_create_settings(db_session)
+    settings_row.pause_reason_detail = {
+        **dict(settings_row.pause_reason_detail or {}),
+        "operating_state": "PROTECTION_REQUIRED",
+        "protection_recovery": {
+            "missing_symbols": ["BTCUSDT"],
+            "missing_items": {"BTCUSDT": ["stop_loss"]},
+        },
+    }
+    db_session.add(settings_row)
+    db_session.flush()
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 1, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
 
     assert watch_result["results"][0]["plans"][0]["status"] == "canceled"
     assert execute_called is False
     assert refreshed is not None
     assert refreshed.plan_status == "canceled"
-    assert refreshed.canceled_reason == "PLAN_CANCELED_STALE_SYNC"
+    assert refreshed.canceled_reason == "PLAN_CANCELED_PROTECTION_BLOCK"
 
 
 def test_entry_plan_watcher_respects_approval_and_prevents_duplicate_execution(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
     settings_row = get_or_create_settings(db_session)
     settings_row.live_execution_armed = False
     settings_row.live_execution_armed_until = None
-    db_session.add(settings_row)
+    db_session.add_all([plan, settings_row])
     db_session.flush()
 
     execution_calls = 0
@@ -505,6 +957,44 @@ def test_entry_plan_watcher_respects_approval_and_prevents_duplicate_execution(m
     assert second_trigger["results"] == []
     assert execution_calls == 1
     assert len(overview.active_entry_plans) == 0
+
+
+def test_entry_plan_watcher_waits_on_entry_control_before_expiring_plan(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    plan.expires_at = utcnow_naive() - timedelta(seconds=1)
+    original_expires_at = plan.expires_at
+    settings_row = get_or_create_settings(db_session)
+    settings_row.live_execution_armed = False
+    settings_row.live_execution_armed_until = None
+    db_session.add_all([plan, settings_row])
+    db_session.flush()
+
+    execution_calls = 0
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execution_calls
+        execution_calls += 1
+        return {"order_id": 77, "status": "filled"}
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+
+    blocked_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert blocked_result["results"][0]["plans"][0]["status"] == "control_blocked"
+    assert blocked_result["results"][0]["plans"][0]["blocked_reasons"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert execution_calls == 0
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.canceled_reason is None
+    assert refreshed.expires_at > original_expires_at
 
 
 def test_entry_plan_watcher_reports_armed_entry_plan_cadence(monkeypatch, db_session) -> None:

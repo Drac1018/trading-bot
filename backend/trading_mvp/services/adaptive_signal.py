@@ -9,7 +9,10 @@ from sqlalchemy.orm import Session
 
 from trading_mvp.models import AgentRun, Execution, Order, RiskCheck, Setting
 from trading_mvp.schemas import PerformanceAggregateEntry, SignalPerformanceReportResponse
-from trading_mvp.services.performance_reporting import _extract_analysis_context, build_signal_performance_report
+from trading_mvp.services.performance_reporting import (
+    _extract_analysis_context,
+    build_signal_performance_report,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 ADAPTIVE_WINDOW_WEIGHTS: dict[str, float] = {"24h": 0.6, "7d": 0.4}

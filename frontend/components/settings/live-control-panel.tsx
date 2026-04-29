@@ -61,6 +61,29 @@ function renderMissingProtectionItems(
     .join(" / ");
 }
 
+const passiveEntryReasonCodes = new Set([
+  "HOLD_DECISION",
+  "ENTRY_TRIGGER_NOT_MET",
+  "NO_EDGE",
+  "RANGE_CHOP",
+  "WEAK_VOLUME",
+  "MOMENTUM_WEAKENING",
+]);
+
+function isPassiveEntryReason(reason: string | null | undefined) {
+  return reason ? passiveEntryReasonCodes.has(reason) : false;
+}
+
+function passiveEntryReasonText(reason: string | null | undefined) {
+  if (reason === "HOLD_DECISION") {
+    return "현재는 신규 진입 신호가 없어 대기 중입니다. 실거래 승인과 운영 상태는 열려 있으며, 조건이 맞으면 다음 판단 주기에서 다시 검토합니다.";
+  }
+  if (reason === "ENTRY_TRIGGER_NOT_MET") {
+    return "진입 트리거가 아직 충족되지 않아 대기 중입니다. 조건이 맞으면 다음 판단 주기에서 다시 검토합니다.";
+  }
+  return `${formatDisplayValue(reason, "blocked_reason_codes")} 조건이 개선되면 다음 판단 주기에서 다시 검토합니다.`;
+}
+
 function ControlStatusPanel({
   state,
   summary,
@@ -70,7 +93,10 @@ function ControlStatusPanel({
 }) {
   const currentCycleBlockedReasons = summary.blocked_reasons_current_cycle;
   const approvalBlockedReasons = summary.approval_control_blocked_reasons ?? [];
+  const hardApprovalBlockedReasons = approvalBlockedReasons.filter((reason) => !isPassiveEntryReason(reason));
+  const waitingApprovalReasons = approvalBlockedReasons.filter(isPassiveEntryReason);
   const primaryBlocker = currentCycleBlockedReasons[0];
+  const primaryBlockerIsPassive = isPassiveEntryReason(primaryBlocker);
   const cards = [
     {
       label: "운영 모드",
@@ -93,32 +119,11 @@ function ControlStatusPanel({
             : ("neutral" as const),
     },
     {
-      label: "거래소 canTrade",
-      value:
-        summary.exchange_can_trade === null
-          ? "미확인"
-          : summary.exchange_can_trade
-            ? "주문 가능"
-            : "주문 차단",
-      detail:
-        summary.exchange_can_trade === null
-          ? "최근 계좌 동기화에 거래소 canTrade 상태가 없습니다."
-          : summary.exchange_can_trade
-            ? "거래소 계좌 상태 기준으로 신규 주문이 가능합니다."
-            : "거래소 계좌 상태 기준으로 신규 주문이 차단됩니다.",
-      tone:
-        summary.exchange_can_trade === null
-          ? ("neutral" as const)
-          : summary.exchange_can_trade
-            ? ("good" as const)
-            : ("danger" as const),
-    },
-    {
-      label: "앱 live arm",
-      value: summary.app_live_armed ? "Arm됨" : "Arm 해제",
+      label: "앱 실거래 승인",
+      value: summary.app_live_armed ? "승인됨" : "승인 닫힘",
       detail: summary.app_live_armed
-        ? "앱 실거래 경로가 arm 상태입니다."
-        : "앱 live arm이 내려가 있어 실거래 경로가 열리지 않습니다.",
+        ? "앱 실거래 경로가 승인된 상태입니다."
+        : "앱 실거래 승인이 닫혀 있어 실거래 경로가 열리지 않습니다.",
       tone: summary.app_live_armed ? ("good" as const) : ("warn" as const),
     },
     {
@@ -132,7 +137,7 @@ function ControlStatusPanel({
       tone: summary.approval_window_open ? ("good" as const) : ("warn" as const),
     },
     {
-      label: "pause",
+      label: "운영 중지",
       value: summary.paused ? "중지" : "운영 중",
       detail: summary.paused
         ? formatDisplayValue(state.pause_reason_code, "pause_reason_code")
@@ -140,7 +145,7 @@ function ControlStatusPanel({
       tone: summary.paused ? ("danger" as const) : ("good" as const),
     },
     {
-      label: "degraded",
+      label: "안전 모드",
       value: summary.degraded ? "관리 전용" : "정상",
       detail: summary.degraded
         ? `${formatDisplayValue(state.operating_state, "operating_state")} / 보호 복구 ${formatDisplayValue(state.protection_recovery_status, "protection_recovery_status")}`
@@ -148,27 +153,33 @@ function ControlStatusPanel({
       tone: summary.degraded ? ("warn" as const) : ("good" as const),
     },
     {
-      label: "risk 허용",
+      label: "신규 진입 리스크",
       value:
         summary.risk_allowed === null
           ? "미평가"
           : summary.risk_allowed
             ? "허용"
-            : "차단",
+            : primaryBlockerIsPassive
+              ? "대기"
+              : "차단",
       detail:
         summary.risk_allowed === null
-          ? "현재 cycle risk 결과가 아직 집계되지 않았습니다."
+          ? "이번 판단 주기 리스크 결과가 아직 집계되지 않았습니다."
           : summary.risk_allowed
-            ? "현재 cycle risk_guard가 신규 진입을 허용했습니다."
+            ? "이번 판단 주기 리스크 가드가 신규 진입을 허용했습니다."
+            : primaryBlockerIsPassive
+              ? passiveEntryReasonText(primaryBlocker)
             : primaryBlocker
               ? formatDisplayValue(primaryBlocker, "blocked_reason_codes")
-              : state.guard_mode_reason_message ?? "현재 cycle risk_guard가 신규 진입을 차단했습니다.",
+              : state.guard_mode_reason_message ?? "이번 판단 주기 리스크 가드가 신규 진입을 차단했습니다.",
       tone:
         summary.risk_allowed === null
           ? ("neutral" as const)
           : summary.risk_allowed
             ? ("good" as const)
-            : ("danger" as const),
+            : primaryBlockerIsPassive
+              ? ("warn" as const)
+              : ("danger" as const),
     },
   ];
 
@@ -189,24 +200,24 @@ function ControlStatusPanel({
       <div className="rounded-md border border-slate-200 bg-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-sm font-semibold text-slate-900">현재 cycle 차단 사유</p>
+            <p className="text-sm font-semibold text-slate-900">이번 판단 주기 상태</p>
             <p className="mt-1 text-sm leading-6 text-slate-600">
-              과거 blocker나 auto-resume blocker를 섞지 않고, 지금 cycle 기준으로 신규 진입을 막는 이유만 보여줍니다.
+              이번 판단 주기에서 신규 진입을 진행하지 않은 이유를 보여줍니다. 운영 중지나 실거래 승인 차단과는 별도로 봅니다.
             </p>
           </div>
           <StatusPill tone={currentCycleBlockedReasons.length > 0 ? "warn" : "good"}>
-            {currentCycleBlockedReasons.length > 0 ? `${currentCycleBlockedReasons.length}건` : "없음"}
+            {currentCycleBlockedReasons.length > 0 ? `${currentCycleBlockedReasons.length}건` : "대기 사유 없음"}
           </StatusPill>
         </div>
         <div className="mt-4 space-y-2">
           {currentCycleBlockedReasons.length === 0 ? (
             <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
-              현재 cycle 기준 차단 사유는 없습니다.
+              이번 판단 주기 기준 대기/차단 사유는 없습니다.
             </div>
           ) : (
             currentCycleBlockedReasons.map((reason) => (
-              <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm text-slate-800">
-                {formatDisplayValue(reason, "blocked_reason_codes")}
+              <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm leading-6 text-slate-800">
+                {isPassiveEntryReason(reason) ? passiveEntryReasonText(reason) : formatDisplayValue(reason, "blocked_reason_codes")}
               </div>
             ))
           )}
@@ -221,26 +232,45 @@ function ControlStatusPanel({
       <div className="rounded-md border border-slate-200 bg-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-sm font-semibold text-slate-900">approval control summary</p>
+            <p className="text-sm font-semibold text-slate-900">승인/운영 제어 요약</p>
             <p className="mt-1 text-sm leading-6 text-slate-600">
-              can_enter_new_position 외에도 승인/운영 제어 관점에서 현재 차단 사유를 분리해 보여줍니다.
+              승인 창, 운영 중지, 실거래 경로 문제를 분리하고, 단순 대기 사유는 낮은 우선순위로 보여줍니다.
             </p>
           </div>
-          <StatusPill tone={approvalBlockedReasons.length > 0 ? "danger" : "good"}>
-            {approvalBlockedReasons.length > 0 ? `${approvalBlockedReasons.length}건` : "정상"}
+          <StatusPill
+            tone={
+              hardApprovalBlockedReasons.length > 0
+                ? "danger"
+                : waitingApprovalReasons.length > 0
+                  ? "warn"
+                  : "good"
+            }
+          >
+            {hardApprovalBlockedReasons.length > 0
+              ? `${hardApprovalBlockedReasons.length}건`
+              : waitingApprovalReasons.length > 0
+                ? `대기 ${waitingApprovalReasons.length}건`
+                : "정상"}
           </StatusPill>
         </div>
         <div className="mt-4 space-y-2">
-          {approvalBlockedReasons.length === 0 ? (
+          {hardApprovalBlockedReasons.length === 0 && waitingApprovalReasons.length === 0 ? (
             <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
               승인/운영 제어 관점에서 즉시 차단 사유가 없습니다.
             </div>
           ) : (
-            approvalBlockedReasons.map((reason) => (
-              <div key={reason} className="rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-900">
-                {formatDisplayValue(reason, "blocked_reason_codes")}
-              </div>
-            ))
+            <>
+              {hardApprovalBlockedReasons.map((reason) => (
+                <div key={reason} className="rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-900">
+                  {formatDisplayValue(reason, "blocked_reason_codes")}
+                </div>
+              ))}
+              {waitingApprovalReasons.map((reason) => (
+                <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+                  {passiveEntryReasonText(reason)}
+                </div>
+              ))}
+            </>
           )}
         </div>
       </div>
@@ -372,18 +402,18 @@ export function LiveControlPanel({
           <h3 className="text-lg font-semibold text-slate-900">실거래 제어</h3>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
             운영 중지, 승인 창 제어, 거래소 재동기화처럼 즉시 반응이 필요한 제어를 상단 핵심 패널로 모았습니다.
-            아래 상태는 백엔드가 내려준 현재 gate 요약이며, 심볼별 세부 흐름은 개요 화면에서 확인합니다.
+            아래 상태는 백엔드가 내려준 현재 차단/승인 요약이며, 심볼별 세부 흐름은 개요 화면에서 확인합니다.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           <StatusPill tone={state.trading_paused ? "danger" : "good"}>
-            {state.trading_paused ? "pause 활성" : "운영 중"}
+            {state.trading_paused ? "운영 중지" : "운영 중"}
           </StatusPill>
           <StatusPill tone={state.live_execution_armed ? "good" : "warn"}>
-            {state.live_execution_armed ? "approval armed" : "approval 닫힘"}
+            {state.live_execution_armed ? "승인 창 열림" : "승인 창 닫힘"}
           </StatusPill>
           <StatusPill tone={state.live_execution_ready ? "good" : "warn"}>
-            {state.live_execution_ready ? "live ready" : "live guard"}
+            {state.live_execution_ready ? "실거래 경로 준비" : "실거래 경로 제한"}
           </StatusPill>
           <StatusPill tone={state.exchange_submit_allowed ? "good" : "neutral"}>
             {state.exchange_submit_allowed ? "실주문 제출 허용" : "실주문 제출 제한"}
@@ -397,9 +427,9 @@ export function LiveControlPanel({
         <div className="rounded-md border border-slate-200 bg-white p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-sm font-semibold text-slate-900">즉시 실행 액션</p>
+              <p className="text-sm font-semibold text-slate-900">즉시 실행</p>
               <p className="mt-1 text-sm leading-6 text-slate-600">
-                pause/resume/live arm/sync는 저장된 현재 설정 기준으로만 실행합니다.
+                운영 중지, 실거래 승인, 거래소 동기화는 저장된 현재 설정 기준으로만 실행합니다.
               </p>
             </div>
             <StatusPill tone="neutral">저장값 기준 실행</StatusPill>
@@ -407,31 +437,44 @@ export function LiveControlPanel({
           <p className="mt-4 text-sm leading-6 text-slate-600">
             즉시 중지는 신규 진입만 막는 운영 중지입니다. 기존 포지션의 보호 주문 유지, 축소, 비상 청산은 계속 허용됩니다.
           </p>
-          <div className="mt-4 flex flex-wrap gap-2">
-            <button className="rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={onPause} type="button">
-              즉시 중지
-            </button>
-            <button className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white" onClick={onResume} type="button">
-              중지 해제
-            </button>
-            <button
-              className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
-              disabled={liveArmBlocked}
-              onClick={onArm}
-              type="button"
-            >
-              실거래 승인
-            </button>
-            <button className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700" onClick={onDisarm} type="button">
-              승인 해제
-            </button>
-            <button className="rounded-full border border-amber-200 px-4 py-2 text-sm font-semibold text-slate-700" onClick={onSync} type="button">
-              거래소 동기화
-            </button>
+          <div className="mt-4 grid gap-3 md:grid-cols-3">
+            <div className="rounded-md border border-rose-100 bg-rose-50 p-3">
+              <p className="text-xs font-semibold text-rose-900">운영 중지</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button className="rounded-md bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={onPause} type="button">
+                  즉시 중지
+                </button>
+                <button className="rounded-md border border-rose-200 bg-white px-4 py-2 text-sm font-semibold text-rose-900" onClick={onResume} type="button">
+                  중지 해제
+                </button>
+              </div>
+            </div>
+            <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
+              <p className="text-xs font-semibold text-slate-900">실거래 승인</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  className="rounded-md bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+                  disabled={liveArmBlocked}
+                  onClick={onArm}
+                  type="button"
+                >
+                  승인 열기
+                </button>
+                <button className="rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={onDisarm} type="button">
+                  승인 닫기
+                </button>
+              </div>
+            </div>
+            <div className="rounded-md border border-amber-100 bg-amber-50 p-3">
+              <p className="text-xs font-semibold text-amber-900">거래소 확인</p>
+              <button className="mt-3 rounded-md border border-amber-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={onSync} type="button">
+                거래소 동기화
+              </button>
+            </div>
           </div>
           <p className="mt-3 text-xs leading-5 text-slate-500">
             실거래 승인 시간: 저장값 {state.live_approval_window_minutes}분 / 동기화 심볼: 저장값 {state.default_symbol}
-            {actionsUseSavedSettings ? " / 현재 form 입력과 저장값이 다르면 저장 후 다시 실행하세요." : ""}
+            {actionsUseSavedSettings ? " / 현재 입력값과 저장값이 다르면 저장 후 다시 실행하세요." : ""}
           </p>
           <div className="mt-3">
             <InlineFeedback message={feedback} />
@@ -449,7 +492,7 @@ export function LiveControlPanel({
             <div>
               <p className="text-sm font-semibold text-slate-900">저장형 운영 기본값</p>
               <p className="mt-1 text-sm leading-6 text-slate-600">
-                운영 모드, 승인 유지 시간, limited live 한도는 저장 후에만 런타임에 반영됩니다.
+                운영 모드, 승인 유지 시간, 제한 실거래 주문 한도는 저장 후에만 런타임에 반영됩니다.
               </p>
             </div>
             <StatusPill tone="neutral">저장 후 반영</StatusPill>
@@ -478,7 +521,7 @@ export function LiveControlPanel({
                 onChange={(event) => onFieldChange("live_approval_window_minutes", Number(event.target.value))}
               />
             </Field>
-            <Field label="limited live 주문당 최대 notional">
+            <Field label="제한 실거래 주문당 최대 금액">
               <input
                 className={inputClass}
                 min={1}

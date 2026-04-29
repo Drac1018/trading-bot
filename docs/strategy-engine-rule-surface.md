@@ -107,6 +107,11 @@
   - range 내부의 반대편 회귀 기대만 본다
 - entry bias:
   - `entry_candidate_event`에서 `hold / long / short`
+- 구현된 edge rules:
+  - intact range 하단 25% + RSI 30~48 + VWAP 위치가 허용 범위면 `long`
+  - intact range 상단 25% + RSI 52~70 + VWAP 위치가 허용 범위면 `short`
+  - weak volume, 너무 좁은 range, active range breakout, 약한 volume persistence는 `hold`
+  - 승인된 진입은 빠른 `range_reversion_fast` 시간 프로파일을 쓰고 scalp bias를 유지
 - holding profile bias:
   - 기본은 `scalp`
   - 장기 보유 서사와는 맞지 않음

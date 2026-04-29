@@ -258,6 +258,104 @@ def test_event_operator_control_uses_fresh_snapshot_over_stale_decision_context(
     assert btc_summary.event_operator_control.event_context.next_event_name == "CPI"
 
 
+def test_event_operator_control_attaches_previous_complete_reference_for_incomplete_latest_snapshot(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    previous_time = utcnow_naive() - timedelta(minutes=20)
+    latest_time = utcnow_naive() - timedelta(minutes=2)
+    previous_event_at = previous_time + timedelta(minutes=45)
+    latest_event_at = latest_time + timedelta(minutes=30)
+    previous_context = {
+        "source_status": "external_api",
+        "source_vendor": "fred",
+        "generated_at": previous_time.isoformat(),
+        "is_stale": False,
+        "is_complete": True,
+        "next_event_at": previous_event_at.isoformat(),
+        "next_event_name": "Previous Complete CPI",
+        "next_event_importance": "high",
+        "minutes_to_next_event": 45,
+        "active_risk_window": False,
+        "affected_assets": ["BTCUSDT"],
+        "events": [
+            {
+                "event_at": previous_event_at.isoformat(),
+                "event_name": "Previous Complete CPI",
+                "importance": "high",
+                "affected_assets": ["BTCUSDT"],
+                "minutes_to_event": 45,
+            }
+        ],
+    }
+    latest_context = {
+        "source_status": "incomplete",
+        "source_vendor": "fred",
+        "generated_at": latest_time.isoformat(),
+        "is_stale": False,
+        "is_complete": False,
+        "next_event_at": latest_event_at.isoformat(),
+        "next_event_name": "Latest Partial CPI",
+        "next_event_importance": "high",
+        "minutes_to_next_event": 30,
+        "active_risk_window": False,
+        "affected_assets": ["BTCUSDT"],
+        "failed_release_ids": [50],
+        "parse_failed_release_ids": [46],
+        "events": [
+            {
+                "event_at": latest_event_at.isoformat(),
+                "event_name": "Latest Partial CPI",
+                "importance": "high",
+                "affected_assets": ["BTCUSDT"],
+                "minutes_to_event": 30,
+            }
+        ],
+    }
+    for snapshot_time, event_context in (
+        (previous_time, previous_context),
+        (latest_time, latest_context),
+    ):
+        db_session.add(
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=snapshot_time,
+                latest_price=66547.8,
+                latest_volume=1250.0,
+                candle_count=60,
+                is_stale=False,
+                is_complete=True,
+                payload={
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": snapshot_time.isoformat(),
+                    "latest_price": 66547.8,
+                    "latest_volume": 1250.0,
+                    "candle_count": 60,
+                    "is_stale": False,
+                    "is_complete": True,
+                    "candles": [],
+                    "event_context": event_context,
+                },
+            )
+        )
+    db_session.commit()
+
+    payload = build_event_operator_control_payload(
+        session=db_session,
+        settings_row=settings_row,
+        symbol="BTCUSDT",
+        timeframe="15m",
+    )
+
+    assert payload.event_context.source_status == "incomplete"
+    assert payload.event_context.next_event_name == "Latest Partial CPI"
+    assert payload.event_context.failed_release_ids == [50]
+    assert payload.event_context.parse_failed_release_ids == [46]
+    assert payload.event_context.complete_reference is not None
+    assert payload.event_context.complete_reference.next_event_name == "Previous Complete CPI"
+    assert "최신 조회 일부 실패 / 직전 완전본 참고" in (payload.event_context.summary_note or "")
+
+
 def test_event_operator_requests_require_timezone_aware_datetimes() -> None:
     with pytest.raises(ValidationError):
         OperatorEventViewRequest(
@@ -366,6 +464,53 @@ def test_normalize_operator_event_context_marks_successful_sources_available(
     assert payload.source_vendor == ("fred" if raw_status == "external_api" else None)
     assert payload.enrichment_vendors == (["bls"] if raw_status == "external_api" else [])
     assert payload.is_complete is True
+
+
+def test_derive_ai_event_view_ignores_generic_data_quality_penalty_without_event_signal() -> None:
+    payload = derive_ai_event_view(
+        output_payload={
+            "decision": "hold",
+            "confidence": 0.09,
+            "scenario_note": "Trend continuation candidate with low confidence due to data quality and freshness issues.",
+            "confidence_penalty_reason": "Data quality degraded and decision reference freshness blocking",
+        }
+    )
+
+    assert payload.source_state == "unavailable"
+    assert payload.ai_bias == "unknown"
+    assert payload.ai_risk_state == "unknown"
+    assert payload.ai_confidence is None
+    assert payload.scenario_note is None
+    assert payload.confidence_penalty_reason is None
+
+
+def test_derive_ai_event_view_uses_event_ack_and_macro_source_state() -> None:
+    payload = derive_ai_event_view(
+        output_payload={
+            "decision": "hold",
+            "confidence": 0.09,
+            "event_risk_acknowledgement": "FOMC Press Release in 199 minutes, high importance, incomplete context",
+            "scenario_note": "Trend continuation candidate with low confidence due to data quality and freshness issues.",
+            "confidence_penalty_reason": "Data quality degraded and decision reference freshness blocking",
+        },
+        metadata_json={
+            "ai_context": {
+                "event_context_summary": {
+                    "source_status": "incomplete",
+                    "source_vendor": "fred",
+                    "next_event_name": "FOMC Press Release",
+                },
+                "event_risk_reason_codes": ["MACRO_EVENT_CONTEXT_INCOMPLETE"],
+            }
+        },
+    )
+
+    assert payload.source_state == "incomplete"
+    assert payload.ai_bias == "no_trade"
+    assert payload.ai_risk_state == "neutral"
+    assert payload.ai_confidence is None
+    assert payload.scenario_note == "FOMC Press Release in 199 minutes, high importance, incomplete context"
+    assert payload.confidence_penalty_reason is None
 
 
 def test_alignment_and_effective_policy_preview_rules() -> None:

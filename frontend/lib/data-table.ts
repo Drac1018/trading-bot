@@ -32,6 +32,12 @@ const preferredColumnOrder = [
 ] as const;
 
 const detailColumnSet = new Set([
+  "ai_trigger_reason",
+  "ai_trigger_reason_codes",
+  "capacity_reason",
+  "rationale_codes",
+  "trigger_event",
+  "trigger_fingerprint",
   "event_category",
   "input_payload",
   "output_payload",

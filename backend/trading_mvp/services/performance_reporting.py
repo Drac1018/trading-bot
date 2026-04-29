@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import Text, cast, desc, select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import AgentRun, AuditEvent, CompetitorNote, Execution, Order, PnLSnapshot, Position, RiskCheck
+from trading_mvp.models import (
+    AgentRun,
+    AuditEvent,
+    CompetitorNote,
+    DecisionPerformanceFact,
+    Execution,
+    Order,
+    PnLSnapshot,
+    Position,
+    RiskCheck,
+)
 from trading_mvp.schemas import (
     AIBaselineComparisonBucket,
     AIBaselineComparisonSummary,
@@ -121,6 +133,63 @@ class DecisionPerformanceSnapshot:
     pnl_per_exposure_hour: float | None
 
 
+@dataclass(slots=True)
+class DecisionPerformanceContext:
+    id: int
+    created_at: datetime
+    provider_name: str
+    symbol: str
+    timeframe: str
+    decision: str
+    rationale_codes: list[str]
+    regime: str
+    trend_alignment: str
+    weak_volume: bool
+    volatility_expanded: bool
+    momentum_weakening: bool
+    entry_zone_min: float | None
+    entry_zone_max: float | None
+    stop_loss: float | None
+    take_profit: float | None
+    max_holding_minutes: int | None
+    baseline_decision: str | None
+    ai_used: bool
+    comparison_bucket: str
+    decision_agreement_level: str
+    decision_agreement_source: str
+    metadata_json: dict[str, Any]
+    output_payload: dict[str, Any]
+    role: str = "trading_decision"
+
+
+@dataclass(slots=True)
+class ReadinessSafetyEvent:
+    created_at: datetime
+    protection_failure: bool = False
+    unknown_submission: bool = False
+    stale_incomplete_data_block: bool = False
+
+
+@dataclass(slots=True)
+class ReadinessSafetyEventCache:
+    events: list[ReadinessSafetyEvent]
+
+    def counts_since(self, since: datetime) -> tuple[int, int, int]:
+        protection_failure_count = 0
+        unknown_submission_count = 0
+        stale_incomplete_data_block_count = 0
+        for event in self.events:
+            if event.created_at < since:
+                continue
+            if event.protection_failure:
+                protection_failure_count += 1
+            if event.unknown_submission:
+                unknown_submission_count += 1
+            if event.stale_incomplete_data_block:
+                stale_incomplete_data_block_count += 1
+        return protection_failure_count, unknown_submission_count, stale_incomplete_data_block_count
+
+
 CANCEL_ATTEMPT_ORDER_STATUSES = {"canceled", "cancelled", "expired"}
 CANCEL_SUCCESS_ORDER_STATUSES = {"canceled", "cancelled"}
 ENTRY_DECISIONS = {"long", "short"}
@@ -162,6 +231,17 @@ READINESS_UNKNOWN_REASON_CODES = {
 READINESS_UNKNOWN_AUDIT_EVENTS = {
     "live_order_submission_unknown",
 }
+READINESS_AUDIT_SAFETY_EVENT_TYPES = READINESS_PROTECTION_AUDIT_EVENTS | READINESS_UNKNOWN_AUDIT_EVENTS | {
+    "live_execution_error",
+    "live_execution_rejected",
+    "live_execution_skipped",
+    "pending_entry_plan_blocked",
+    "pending_entry_plan_canceled",
+    "pending_entry_plan_deferred",
+    "protection_verification_failed",
+    "risk_blocked",
+    "risk_check",
+}
 READINESS_UNKNOWN_ORDER_STATUSES = {
     "submit_unknown",
     "submission_unknown",
@@ -178,6 +258,23 @@ READINESS_STALE_INCOMPLETE_REASON_CODES = {
     "MARKET_SNAPSHOT_INCOMPLETE",
     "FEATURE_INPUT_MISSING",
 }
+READINESS_AUDIT_REASON_PAYLOAD_KEYS = (
+    "reason_codes",
+    "blocked_reason_codes",
+    "degraded_reason_codes",
+    "protection_reason_codes",
+    "data_quality_block_reason_codes",
+    "blocked_reason",
+    "degraded_reason",
+    "approval_required_reason",
+)
+READINESS_AUDIT_REASON_PAYLOAD_KEY_MARKERS = tuple(f'"{key}"' for key in READINESS_AUDIT_REASON_PAYLOAD_KEYS)
+READINESS_AUDIT_REASON_CODE_MARKERS = tuple(
+    f'"{code}"'
+    for code in sorted(
+        READINESS_PROTECTION_REASON_CODES | READINESS_UNKNOWN_REASON_CODES | READINESS_STALE_INCOMPLETE_REASON_CODES
+    )
+)
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -415,60 +512,122 @@ def _reason_codes_from_payload(value: object) -> list[str]:
 
 
 def _risk_reason_codes(row: RiskCheck) -> list[str]:
-    codes = [str(item) for item in row.reason_codes if item not in {None, ""}]
-    codes.extend(_reason_codes_from_payload(row.payload))
-    return list(dict.fromkeys(codes))
+    return _risk_reason_codes_from_values(row.reason_codes, row.payload)
 
 
 def _order_reason_codes(row: Order) -> list[str]:
-    codes = [str(item) for item in row.reason_codes if item not in {None, ""}]
-    codes.extend(_reason_codes_from_payload(row.metadata_json))
-    return list(dict.fromkeys(codes))
+    return _order_reason_codes_from_values(row.reason_codes, row.metadata_json)
 
 
 def _audit_reason_codes(row: AuditEvent) -> list[str]:
     return _reason_codes_from_payload(row.payload)
 
 
+def _payload_text_may_have_readiness_reason_codes(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    return any(marker in value for marker in READINESS_AUDIT_REASON_PAYLOAD_KEY_MARKERS) and any(
+        marker in value for marker in READINESS_AUDIT_REASON_CODE_MARKERS
+    )
+
+
+def _reason_codes_from_payload_text(value: object) -> list[str]:
+    if not _payload_text_may_have_readiness_reason_codes(value):
+        return []
+    try:
+        payload = json.loads(value) if isinstance(value, str) else {}
+    except ValueError:
+        return []
+    return _reason_codes_from_payload(payload)
+
+
+def _risk_reason_codes_from_values(reason_codes: object, payload: object) -> list[str]:
+    codes = [str(item) for item in reason_codes if item not in {None, ""}] if isinstance(reason_codes, list) else []
+    codes.extend(_reason_codes_from_payload(payload))
+    return list(dict.fromkeys(codes))
+
+
+def _order_reason_codes_from_values(reason_codes: object, metadata_json: object) -> list[str]:
+    codes = [str(item) for item in reason_codes if item not in {None, ""}] if isinstance(reason_codes, list) else []
+    codes.extend(_reason_codes_from_payload(metadata_json))
+    return list(dict.fromkeys(codes))
+
+
+def _append_safety_observation(
+    events: list[ReadinessSafetyEvent],
+    *,
+    created_at: datetime,
+    protection_failure: bool = False,
+    unknown_submission: bool = False,
+    stale_incomplete_data_block: bool = False,
+) -> None:
+    if protection_failure or unknown_submission or stale_incomplete_data_block:
+        events.append(
+            ReadinessSafetyEvent(
+                created_at=created_at,
+                protection_failure=protection_failure,
+                unknown_submission=unknown_submission,
+                stale_incomplete_data_block=stale_incomplete_data_block,
+            )
+        )
+
+
+def _load_limited_live_safety_event_cache(session: Session, since: datetime) -> ReadinessSafetyEventCache:
+    events: list[ReadinessSafetyEvent] = []
+
+    for created_at, reason_codes, payload in session.execute(
+        select(RiskCheck.created_at, RiskCheck.reason_codes, RiskCheck.payload).where(RiskCheck.created_at >= since)
+    ):
+        codes = set(_risk_reason_codes_from_values(reason_codes, payload))
+        _append_safety_observation(
+            events,
+            created_at=created_at,
+            protection_failure=bool(codes & READINESS_PROTECTION_REASON_CODES),
+            unknown_submission=bool(codes & READINESS_UNKNOWN_REASON_CODES),
+            stale_incomplete_data_block=bool(codes & READINESS_STALE_INCOMPLETE_REASON_CODES),
+        )
+
+    for created_at, reason_codes, metadata_json, status in session.execute(
+        select(Order.created_at, Order.reason_codes, Order.metadata_json, Order.status).where(Order.created_at >= since)
+    ):
+        codes = set(_order_reason_codes_from_values(reason_codes, metadata_json))
+        normalized_status = str(status or "").strip().lower()
+        _append_safety_observation(
+            events,
+            created_at=created_at,
+            unknown_submission=bool(codes & READINESS_UNKNOWN_REASON_CODES)
+            or normalized_status in READINESS_UNKNOWN_ORDER_STATUSES,
+        )
+
+    for created_at, event_type, payload_text in session.execute(
+        select(AuditEvent.created_at, AuditEvent.event_type, cast(AuditEvent.payload, Text)).where(
+            AuditEvent.created_at >= since,
+            AuditEvent.event_type.in_(tuple(READINESS_AUDIT_SAFETY_EVENT_TYPES)),
+        )
+    ):
+        codes = set(_reason_codes_from_payload_text(payload_text))
+        normalized_event_type = str(event_type or "").strip().lower()
+        _append_safety_observation(
+            events,
+            created_at=created_at,
+            protection_failure=normalized_event_type in READINESS_PROTECTION_AUDIT_EVENTS
+            or bool(codes & READINESS_PROTECTION_REASON_CODES),
+            unknown_submission=normalized_event_type in READINESS_UNKNOWN_AUDIT_EVENTS
+            or bool(codes & READINESS_UNKNOWN_REASON_CODES),
+            stale_incomplete_data_block=bool(codes & READINESS_STALE_INCOMPLETE_REASON_CODES),
+        )
+
+    return ReadinessSafetyEventCache(events=events)
+
+
 def _count_limited_live_safety_events(
     session: Session,
     *,
     since: datetime,
+    safety_event_cache: ReadinessSafetyEventCache | None = None,
 ) -> tuple[int, int, int]:
-    risk_rows = list(session.scalars(select(RiskCheck).where(RiskCheck.created_at >= since)))
-    order_rows = list(session.scalars(select(Order).where(Order.created_at >= since)))
-    audit_rows = list(session.scalars(select(AuditEvent).where(AuditEvent.created_at >= since)))
-
-    protection_failure_count = 0
-    unknown_submission_count = 0
-    stale_incomplete_data_block_count = 0
-
-    for row in risk_rows:
-        codes = set(_risk_reason_codes(row))
-        if codes & READINESS_PROTECTION_REASON_CODES:
-            protection_failure_count += 1
-        if codes & READINESS_UNKNOWN_REASON_CODES:
-            unknown_submission_count += 1
-        if codes & READINESS_STALE_INCOMPLETE_REASON_CODES:
-            stale_incomplete_data_block_count += 1
-
-    for row in order_rows:
-        codes = set(_order_reason_codes(row))
-        status = str(row.status or "").strip().lower()
-        if codes & READINESS_UNKNOWN_REASON_CODES or status in READINESS_UNKNOWN_ORDER_STATUSES:
-            unknown_submission_count += 1
-
-    for row in audit_rows:
-        codes = set(_audit_reason_codes(row))
-        event_type = str(row.event_type or "").strip().lower()
-        if event_type in READINESS_PROTECTION_AUDIT_EVENTS or codes & READINESS_PROTECTION_REASON_CODES:
-            protection_failure_count += 1
-        if event_type in READINESS_UNKNOWN_AUDIT_EVENTS or codes & READINESS_UNKNOWN_REASON_CODES:
-            unknown_submission_count += 1
-        if codes & READINESS_STALE_INCOMPLETE_REASON_CODES:
-            stale_incomplete_data_block_count += 1
-
-    return protection_failure_count, unknown_submission_count, stale_incomplete_data_block_count
+    cache = safety_event_cache or _load_limited_live_safety_event_cache(session, since)
+    return cache.counts_since(since)
 
 
 def _extract_analysis_context(decision_row: AgentRun) -> tuple[str, str, bool, bool, bool]:
@@ -511,6 +670,218 @@ def _extract_analysis_context(decision_row: AgentRun) -> tuple[str, str, bool, b
         metadata_flags.get("volatility_expanded", volatility_regime == "expanded")
     )
     return primary_regime, trend_alignment, weak_volume, volatility_expanded, momentum_weakening
+
+
+def _rationale_codes_from_payload(payload: Mapping[str, Any]) -> list[str]:
+    raw_codes = payload.get("rationale_codes")
+    codes = [str(item) for item in raw_codes if item] if isinstance(raw_codes, list) else []
+    return codes or ["UNSPECIFIED"]
+
+
+def _compact_telemetry_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "source",
+        "error",
+        "usage",
+        "ai_model",
+        "model",
+        "openai_model",
+        "pre_ai_skip_reason",
+        "ai_skipped_reason",
+        "last_ai_skip_reason",
+        "provider_not_called_due_to_quality",
+        "provider_status",
+        "data_quality_block_reason_codes",
+        "event_risk_reason_codes",
+        "should_abstain",
+        "fail_closed_applied",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            compact[key] = value
+    return compact
+
+
+def _compact_telemetry_output(payload: Mapping[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {"decision": payload.get("decision")}
+    for key in ("should_abstain", "fail_closed_applied", "data_quality_flags"):
+        value = payload.get(key)
+        if value is not None:
+            compact[key] = value
+    return compact
+
+
+def _decision_performance_fact_values(row: AgentRun) -> dict[str, Any]:
+    payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    decision = str(payload.get("decision") or "unknown")
+    agreement = _decision_agreement_payload(metadata)
+    ai_used = _ai_used_from_metadata(
+        metadata=metadata,
+        agreement=agreement,
+        provider_name=str(row.provider_name or ""),
+    )
+    baseline_decision = _baseline_decision_from_metadata(
+        metadata=metadata,
+        agreement=agreement,
+        final_decision=decision,
+        ai_used=ai_used,
+    )
+    comparison_bucket = _comparison_bucket(
+        baseline_decision=baseline_decision,
+        ai_decision=decision,
+        ai_used=ai_used,
+        fail_closed=_is_fail_closed(metadata, payload),
+    )
+    regime, trend_alignment, weak_volume, volatility_expanded, momentum_weakening = _extract_analysis_context(row)
+    return {
+        "decision_run_id": int(row.id),
+        "provider_name": str(row.provider_name or "deterministic-mock"),
+        "symbol": str(payload.get("symbol") or "UNKNOWN"),
+        "timeframe": str(payload.get("timeframe") or "UNKNOWN"),
+        "decision": decision,
+        "rationale_codes": _rationale_codes_from_payload(payload),
+        "regime": regime,
+        "trend_alignment": trend_alignment,
+        "weak_volume": weak_volume,
+        "volatility_expanded": volatility_expanded,
+        "momentum_weakening": momentum_weakening,
+        "entry_zone_min": _safe_float(payload.get("entry_zone_min"), default=0.0) or None,
+        "entry_zone_max": _safe_float(payload.get("entry_zone_max"), default=0.0) or None,
+        "stop_loss": _safe_float(payload.get("stop_loss"), default=0.0) or None,
+        "take_profit": _safe_float(payload.get("take_profit"), default=0.0) or None,
+        "max_holding_minutes": _safe_int(payload.get("max_holding_minutes")),
+        "baseline_decision": baseline_decision,
+        "ai_used": ai_used,
+        "comparison_bucket": comparison_bucket,
+        "decision_agreement_level": str(agreement.get("level") or ""),
+        "decision_agreement_source": str(agreement.get("comparison_source") or ""),
+        "telemetry_metadata": _compact_telemetry_metadata(metadata),
+        "telemetry_output": _compact_telemetry_output(payload),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def persist_decision_performance_fact(session: Session, row: AgentRun) -> DecisionPerformanceFact | None:
+    if row.id is None or row.role != "trading_decision":
+        return None
+    values = _decision_performance_fact_values(row)
+    fact = session.scalar(
+        select(DecisionPerformanceFact).where(
+            DecisionPerformanceFact.decision_run_id == int(row.id)
+        )
+    )
+    if fact is None:
+        fact = DecisionPerformanceFact(**values)
+        session.add(fact)
+    else:
+        for key, value in values.items():
+            setattr(fact, key, value)
+    session.flush()
+    return fact
+
+
+def _context_from_fact(fact: DecisionPerformanceFact) -> DecisionPerformanceContext:
+    metadata = fact.telemetry_metadata if isinstance(fact.telemetry_metadata, dict) else {}
+    output = fact.telemetry_output if isinstance(fact.telemetry_output, dict) else {}
+    output = {"decision": fact.decision, **output}
+    return DecisionPerformanceContext(
+        id=fact.decision_run_id,
+        created_at=fact.created_at,
+        provider_name=fact.provider_name,
+        symbol=fact.symbol,
+        timeframe=fact.timeframe,
+        decision=fact.decision,
+        rationale_codes=(
+            [str(item) for item in fact.rationale_codes if item]
+            if isinstance(fact.rationale_codes, list)
+            else ["UNSPECIFIED"]
+        ),
+        regime=fact.regime,
+        trend_alignment=fact.trend_alignment,
+        weak_volume=bool(fact.weak_volume),
+        volatility_expanded=bool(fact.volatility_expanded),
+        momentum_weakening=bool(fact.momentum_weakening),
+        entry_zone_min=fact.entry_zone_min,
+        entry_zone_max=fact.entry_zone_max,
+        stop_loss=fact.stop_loss,
+        take_profit=fact.take_profit,
+        max_holding_minutes=fact.max_holding_minutes,
+        baseline_decision=fact.baseline_decision,
+        ai_used=bool(fact.ai_used),
+        comparison_bucket=fact.comparison_bucket,
+        decision_agreement_level=fact.decision_agreement_level,
+        decision_agreement_source=fact.decision_agreement_source,
+        metadata_json=metadata,
+        output_payload=output,
+    )
+
+
+def _context_from_agent_run(row: AgentRun) -> DecisionPerformanceContext:
+    values = _decision_performance_fact_values(row)
+    return DecisionPerformanceContext(
+        id=values["decision_run_id"],
+        created_at=values["created_at"],
+        provider_name=values["provider_name"],
+        symbol=values["symbol"],
+        timeframe=values["timeframe"],
+        decision=values["decision"],
+        rationale_codes=values["rationale_codes"],
+        regime=values["regime"],
+        trend_alignment=values["trend_alignment"],
+        weak_volume=values["weak_volume"],
+        volatility_expanded=values["volatility_expanded"],
+        momentum_weakening=values["momentum_weakening"],
+        entry_zone_min=values["entry_zone_min"],
+        entry_zone_max=values["entry_zone_max"],
+        stop_loss=values["stop_loss"],
+        take_profit=values["take_profit"],
+        max_holding_minutes=values["max_holding_minutes"],
+        baseline_decision=values["baseline_decision"],
+        ai_used=values["ai_used"],
+        comparison_bucket=values["comparison_bucket"],
+        decision_agreement_level=values["decision_agreement_level"],
+        decision_agreement_source=values["decision_agreement_source"],
+        metadata_json=values["telemetry_metadata"],
+        output_payload=values["telemetry_output"],
+    )
+
+
+def _load_decision_performance_contexts(
+    session: Session,
+    since: datetime,
+) -> list[DecisionPerformanceContext]:
+    decision_refs = list(
+        session.execute(
+            select(AgentRun.id, AgentRun.created_at)
+            .where(AgentRun.role == "trading_decision", AgentRun.created_at >= since)
+            .order_by(AgentRun.created_at.desc())
+        )
+    )
+    decision_ids = [int(row_id) for row_id, _created_at in decision_refs if row_id is not None]
+    if not decision_ids:
+        return []
+
+    facts = list(
+        session.scalars(
+            select(DecisionPerformanceFact).where(
+                DecisionPerformanceFact.decision_run_id.in_(decision_ids)
+            )
+        )
+    )
+    contexts_by_id: dict[int, DecisionPerformanceContext] = {
+        fact.decision_run_id: _context_from_fact(fact) for fact in facts
+    }
+    missing_ids = [row_id for row_id in decision_ids if row_id not in contexts_by_id]
+    if missing_ids:
+        missing_rows = list(
+            session.scalars(select(AgentRun).where(AgentRun.id.in_(missing_ids)))
+        )
+        for row in missing_rows:
+            contexts_by_id[int(row.id)] = _context_from_agent_run(row)
+    return [contexts_by_id[row_id] for row_id in decision_ids if row_id in contexts_by_id]
 
 
 def _planned_risk_reward_ratio(
@@ -917,6 +1288,7 @@ def _build_limited_live_readiness(
     summary: PerformanceWindowSummary,
     ai_telemetry: AIUsageTelemetrySummary | Mapping[str, object],
     ai_baseline_comparison: AIBaselineComparisonSummary,
+    safety_event_cache: ReadinessSafetyEventCache | None = None,
 ) -> LimitedLiveReadinessReport:
     def telemetry_count(key: str) -> int:
         if isinstance(ai_telemetry, Mapping):
@@ -939,7 +1311,7 @@ def _build_limited_live_readiness(
         else 0.0
     )
     protection_failure_count, unknown_submission_count, stale_incomplete_data_block_count = (
-        _count_limited_live_safety_events(session, since=since)
+        _count_limited_live_safety_events(session, since=since, safety_event_cache=safety_event_cache)
     )
     max_drawdown = _max_drawdown_from_pnl_snapshots(session, since)
     consecutive_losses = _max_consecutive_losses_from_pnl_snapshots(session, since)
@@ -1033,16 +1405,15 @@ def _build_window_report(
     window_hours: int,
     aggregate_limit: int,
     decision_limit: int,
+    safety_event_cache: ReadinessSafetyEventCache | None = None,
+    decision_contexts: Sequence[DecisionPerformanceContext] | None = None,
 ) -> PerformanceWindowReport:
     since = utcnow_naive() - timedelta(hours=window_hours)
     now = utcnow_naive()
-    decision_rows = list(
-        session.scalars(
-            select(AgentRun)
-            .where(AgentRun.role == "trading_decision", AgentRun.created_at >= since)
-            .order_by(AgentRun.created_at.desc())
-        )
-    )
+    if decision_contexts is None:
+        decision_rows = _load_decision_performance_contexts(session, since)
+    else:
+        decision_rows = [row for row in decision_contexts if row.created_at >= since]
     decision_ids = [row.id for row in decision_rows]
 
     risk_by_decision: dict[int, RiskCheck] = {}
@@ -1101,40 +1472,21 @@ def _build_window_report(
     }
 
     for decision_row in decision_rows:
-        payload = decision_row.output_payload if isinstance(decision_row.output_payload, dict) else {}
-        metadata = decision_row.metadata_json if isinstance(decision_row.metadata_json, dict) else {}
-        rationale_codes = (
-            [str(item) for item in payload.get("rationale_codes", []) if item]
-            if isinstance(payload.get("rationale_codes"), list)
-            else []
-        ) or ["UNSPECIFIED"]
-        symbol = str(payload.get("symbol") or "UNKNOWN")
-        timeframe = str(payload.get("timeframe") or "UNKNOWN")
-        decision = str(payload.get("decision") or "unknown")
-        agreement = _decision_agreement_payload(metadata)
-        ai_used = _ai_used_from_metadata(
-            metadata=metadata,
-            agreement=agreement,
-            provider_name=str(decision_row.provider_name or ""),
-        )
-        baseline_decision = _baseline_decision_from_metadata(
-            metadata=metadata,
-            agreement=agreement,
-            final_decision=decision,
-            ai_used=ai_used,
-        )
-        comparison_bucket = _comparison_bucket(
-            baseline_decision=baseline_decision,
-            ai_decision=decision,
-            ai_used=ai_used,
-            fail_closed=_is_fail_closed(metadata, payload),
-        )
-        regime, trend_alignment, weak_volume, volatility_expanded, momentum_weakening = _extract_analysis_context(
-            decision_row
-        )
-        planned_holding_minutes = _safe_int(payload.get("max_holding_minutes"))
-        stop_loss = _safe_float(payload.get("stop_loss"), default=0.0) or None
-        take_profit = _safe_float(payload.get("take_profit"), default=0.0) or None
+        rationale_codes = decision_row.rationale_codes or ["UNSPECIFIED"]
+        symbol = decision_row.symbol
+        timeframe = decision_row.timeframe
+        decision = decision_row.decision
+        baseline_decision = decision_row.baseline_decision
+        ai_used = decision_row.ai_used
+        comparison_bucket = decision_row.comparison_bucket
+        regime = decision_row.regime
+        trend_alignment = decision_row.trend_alignment
+        weak_volume = decision_row.weak_volume
+        volatility_expanded = decision_row.volatility_expanded
+        momentum_weakening = decision_row.momentum_weakening
+        planned_holding_minutes = decision_row.max_holding_minutes
+        stop_loss = decision_row.stop_loss
+        take_profit = decision_row.take_profit
 
         linked_risk = risk_by_decision.get(decision_row.id)
         linked_orders = orders_by_decision.get(decision_row.id, [])
@@ -1227,8 +1579,8 @@ def _build_window_report(
             take_profit=take_profit,
             planned_risk_reward_ratio=_planned_risk_reward_ratio(
                 decision=decision,
-                entry_zone_min=payload.get("entry_zone_min"),
-                entry_zone_max=payload.get("entry_zone_max"),
+                entry_zone_min=decision_row.entry_zone_min,
+                entry_zone_max=decision_row.entry_zone_max,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
             ),
@@ -1254,8 +1606,8 @@ def _build_window_report(
             mae_pnl=mae_pnl,
             baseline_decision=baseline_decision,
             ai_decision=decision,
-            decision_agreement_level=str(agreement.get("level") or ""),
-            decision_agreement_source=str(agreement.get("comparison_source") or ""),
+            decision_agreement_level=decision_row.decision_agreement_level,
+            decision_agreement_source=decision_row.decision_agreement_source,
             ai_used=ai_used,
             comparison_bucket=comparison_bucket,
             unobserved_reason=unobserved_reason,
@@ -1398,6 +1750,7 @@ def _build_window_report(
         summary=summary,
         ai_telemetry=ai_telemetry,
         ai_baseline_comparison=ai_baseline_comparison,
+        safety_event_cache=safety_event_cache,
     )
 
     return PerformanceWindowReport(
@@ -1474,6 +1827,13 @@ def build_signal_performance_report(
     window_specs: Sequence[tuple[str, int]] | None = None,
 ) -> SignalPerformanceReportResponse:
     selected_window_specs = tuple(window_specs or DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS)
+    max_window_hours = max((window_hour_count for _window_label, window_hour_count in selected_window_specs), default=window_hours)
+    max_since = utcnow_naive() - timedelta(hours=max_window_hours)
+    decision_contexts = _load_decision_performance_contexts(session, max_since)
+    safety_event_cache = _load_limited_live_safety_event_cache(
+        session,
+        max_since,
+    )
     windows = [
         _build_window_report(
             session,
@@ -1481,6 +1841,8 @@ def build_signal_performance_report(
             window_hours=window_hour_count,
             aggregate_limit=limit,
             decision_limit=limit,
+            safety_event_cache=safety_event_cache,
+            decision_contexts=decision_contexts,
         )
         for window_label, window_hour_count in selected_window_specs
     ]

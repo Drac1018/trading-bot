@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import desc, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from trading_mvp.models import MarketSnapshot, PendingEntryPlan, SchedulerRun
 from trading_mvp.services.account import get_open_positions
@@ -29,6 +30,7 @@ RELEASE_ENRICHMENT_WATCH_WORKFLOW = "release_enrichment_watch_cycle"
 READ_REFRESH_SYNC_DEBOUNCE_SECONDS = 30
 RELEASE_ENRICHMENT_RETRY_SECONDS = 15
 RELEASE_ENRICHMENT_WATCH_WINDOW_SECONDS = 120
+STALE_RUNNING_SCHEDULER_RUN_SECONDS = 30 * 60
 BLS_RELEASE_WATCH_EVENT_NAMES = {
     "Consumer Price Index",
     "Producer Price Index",
@@ -371,6 +373,46 @@ def _finish_scheduler_run(
     for key, value in payload.items():
         result.setdefault(key, value)
     return result
+
+
+def abandon_stale_scheduler_runs(
+    session: Session,
+    *,
+    older_than_seconds: int = STALE_RUNNING_SCHEDULER_RUN_SECONDS,
+    now: datetime | None = None,
+) -> int:
+    cutoff = (now or utcnow_naive()) - timedelta(seconds=max(60, older_than_seconds))
+    rows = list(
+        session.scalars(
+            select(SchedulerRun)
+            .where(SchedulerRun.status == "running")
+            .where(SchedulerRun.created_at < cutoff)
+            .order_by(SchedulerRun.created_at)
+        )
+    )
+    abandoned_at = now or utcnow_naive()
+    for row in rows:
+        previous_outcome = dict(row.outcome or {})
+        row.status = "abandoned"
+        row.outcome = {
+            **previous_outcome,
+            "abandoned_reason": "STALE_RUNNING_SCHEDULER_RUN",
+            "abandoned_at": abandoned_at.isoformat(),
+        }
+        session.add(row)
+    if rows:
+        record_health_event(
+            session,
+            component="scheduler",
+            status="warning",
+            message="Stale running scheduler rows were marked abandoned.",
+            payload={
+                "abandoned_count": len(rows),
+                "older_than_seconds": max(60, older_than_seconds),
+                "scheduler_run_ids": [row.id for row in rows],
+            },
+        )
+    return len(rows)
 
 
 def run_window(session: Session, window: str, triggered_by: str = "manual") -> dict[str, object]:
@@ -1169,49 +1211,67 @@ def run_due_operational_cycles(
     include_exchange_sync: bool = True,
     commit_between: bool = False,
     continue_on_error: bool = False,
+    session_factory: Callable[[], Session] | sessionmaker[Session] | None = None,
 ) -> list[dict[str, object]]:
     outputs: list[dict[str, object]] = []
 
-    def run_step(workflow: str, action) -> object | None:
+    def run_step(workflow: str, action: Callable[[Session], object | None]) -> object | None:
+        step_session = session_factory() if session_factory is not None else session
+        owns_session = step_session is not session
         try:
-            result = action()
-            if commit_between:
-                session.commit()
+            result = action(step_session)
+            if commit_between or owns_session:
+                step_session.commit()
             return result
         except Exception as exc:
-            session.rollback()
+            step_session.rollback()
             if not continue_on_error:
                 raise
             try:
                 record_health_event(
-                    session,
+                    step_session,
                     component="scheduler",
                     status="error",
                     message="Background scheduler workflow failed.",
                     payload={"workflow": workflow, "error": str(exc)},
                 )
-                session.commit()
+                step_session.commit()
             except Exception:
-                session.rollback()
+                step_session.rollback()
             return None
+        finally:
+            if owns_session:
+                step_session.close()
 
     if include_exchange_sync:
-        exchange = run_step(EXCHANGE_SYNC_WORKFLOW, lambda: run_due_exchange_sync_cycle(session))
+        exchange = run_step(EXCHANGE_SYNC_WORKFLOW, lambda step_session: run_due_exchange_sync_cycle(step_session))
         if exchange is not None:
             outputs.append(exchange)  # type: ignore[arg-type]
-    market = run_step(MARKET_REFRESH_WORKFLOW, lambda: run_market_refresh_cycle(session, triggered_by="scheduler"))
+    market = run_step(
+        MARKET_REFRESH_WORKFLOW,
+        lambda step_session: run_market_refresh_cycle(step_session, triggered_by="scheduler"),
+    )
     if isinstance(market, dict) and market["results"]:
         outputs.append(market)
-    release_watch = run_step(RELEASE_ENRICHMENT_WATCH_WORKFLOW, lambda: run_release_enrichment_watch_cycle(session, triggered_by="scheduler"))
+    release_watch = run_step(
+        RELEASE_ENRICHMENT_WATCH_WORKFLOW,
+        lambda step_session: run_release_enrichment_watch_cycle(step_session, triggered_by="scheduler"),
+    )
     if isinstance(release_watch, dict) and release_watch["results"]:
         outputs.append(release_watch)
-    position_management = run_step(POSITION_MANAGEMENT_WORKFLOW, lambda: run_position_management_cycle(session, triggered_by="scheduler"))
+    position_management = run_step(
+        POSITION_MANAGEMENT_WORKFLOW,
+        lambda step_session: run_position_management_cycle(step_session, triggered_by="scheduler"),
+    )
     if isinstance(position_management, dict) and position_management["results"]:
         outputs.append(position_management)
-    entry_plan_watcher = run_step(ENTRY_PLAN_WATCHER_WORKFLOW, lambda: run_due_entry_plan_watcher_cycle(session))
+    entry_plan_watcher = run_step(
+        ENTRY_PLAN_WATCHER_WORKFLOW,
+        lambda step_session: run_due_entry_plan_watcher_cycle(step_session),
+    )
     if isinstance(entry_plan_watcher, dict) and entry_plan_watcher.get("results"):
         outputs.append(entry_plan_watcher)
-    decisions = run_step(INTERVAL_DECISION_WORKFLOW, lambda: run_due_interval_decision_cycle(session))
+    decisions = run_step(INTERVAL_DECISION_WORKFLOW, lambda step_session: run_due_interval_decision_cycle(step_session))
     if isinstance(decisions, dict) and decisions.get("results"):
         outputs.append(decisions)
     return outputs

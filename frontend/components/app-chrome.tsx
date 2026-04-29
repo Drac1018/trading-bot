@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useState } from "react";
 
 import { AlertNotifier } from "./alert-notifier";
 
@@ -28,7 +29,6 @@ type ChromeNavItem = {
 
 const topNav: ChromeNavItem[] = [
   { href: "/", label: "대시보드" },
-  { href: "/#today", label: "오늘 할 일" },
   { href: "/dashboard/positions", label: "포지션" },
   { href: "/dashboard/orders", label: "주문 / 체결" },
   { href: "/dashboard/audit", label: "감사 로그" },
@@ -37,7 +37,6 @@ const topNav: ChromeNavItem[] = [
 
 const sideNav: ChromeNavItem[] = [
   { href: "/", label: "대시보드", icon: "home" },
-  { href: "/#today", label: "오늘 할 일", icon: "list" },
   { href: "/dashboard/account", label: "계좌 / 잔고", icon: "wallet" },
   { href: "/dashboard/market", label: "시장 상태", icon: "market" },
   { href: "/dashboard/decisions", label: "AI 판단", icon: "brain" },
@@ -50,14 +49,10 @@ const sideNav: ChromeNavItem[] = [
 ];
 
 const debugNav: ChromeNavItem[] = [
-  { href: "/ui-example", label: "UI 개선 예시", icon: "debug" },
   { href: "/dashboard/agents", label: "고급 디버그", icon: "debug" },
 ];
 
 function isActive(pathname: string, href: string) {
-  if (href === "/#today") {
-    return false;
-  }
   return href === "/" ? pathname === href : pathname.startsWith(href);
 }
 
@@ -127,16 +122,57 @@ function SideNavGroup({
   );
 }
 
+function MobileNav({ items, pathname }: { items: ChromeNavItem[]; pathname: string }) {
+  const [open, setOpen] = useState(false);
+  const currentItem = items.find((item) => isActive(pathname, item.href)) ?? {
+    href: "/",
+    label: "대시보드",
+    icon: "home" as const,
+  };
+
+  return (
+    <nav className="border-b border-slate-200 bg-white lg:hidden" aria-label="모바일 메뉴">
+      <div className="mx-auto max-w-[1680px] px-4 py-3 sm:px-6">
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls="mobile-nav-panel"
+          onClick={() => setOpen((value) => !value)}
+          className="flex min-h-11 w-full items-center justify-between gap-3 rounded-md border border-slate-200 bg-white px-4 text-left text-sm font-semibold text-slate-900 shadow-sm"
+        >
+          <span className="flex min-w-0 items-center gap-3">
+            {currentItem.icon ? <Icon name={currentItem.icon} className="h-4 w-4 shrink-0 text-blue-600" /> : null}
+            <span className="truncate">현재 화면: {currentItem.label}</span>
+          </span>
+          <span aria-hidden="true" className="text-slate-500">
+            {open ? "닫기" : "메뉴"}
+          </span>
+        </button>
+
+        {open ? (
+          <div id="mobile-nav-panel" className="mt-3 grid gap-2 sm:grid-cols-2">
+            {items.map((item) => (
+              <Link
+                key={item.href}
+                href={item.href}
+                onClick={() => setOpen(false)}
+                className={`flex min-h-11 items-center gap-3 rounded-md border border-slate-200 px-4 text-sm font-semibold transition ${navItemClass(
+                  isActive(pathname, item.href),
+                )}`}
+              >
+                {item.icon ? <Icon name={item.icon} className="h-4 w-4 shrink-0" /> : null}
+                <span>{item.label}</span>
+              </Link>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </nav>
+  );
+}
+
 export function AppChrome({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-
-  if (pathname === "/ui-example") {
-    return (
-      <div className="min-h-screen bg-slate-50 text-slate-950">
-        {children}
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-[#f7f9fc] text-slate-950">
@@ -172,9 +208,10 @@ export function AppChrome({ children }: { children: React.ReactNode }) {
             <Link
               href="/dashboard/audit"
               aria-label="감사 로그"
-              className="flex h-11 w-11 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 transition hover:bg-slate-50"
+              className="hidden h-11 items-center gap-2 rounded-md border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 md:flex"
             >
-              <Icon name="bell" />
+              <Icon name="bell" className="h-4 w-4" />
+              감사 로그
             </Link>
             <Link
               href="/dashboard/settings"
@@ -186,6 +223,7 @@ export function AppChrome({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       </header>
+      <MobileNav items={sideNav} pathname={pathname} />
 
       <div className="mx-auto grid max-w-[1680px] gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[230px_minmax(0,1fr)] lg:px-8">
         <aside className="hidden lg:block">

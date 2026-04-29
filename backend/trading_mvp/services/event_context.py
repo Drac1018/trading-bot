@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -17,6 +17,7 @@ from trading_mvp.schemas import (
     MacroEventPayload,
     OperatorActiveRiskWindowPayload,
     OperatorEventContextPayload,
+    OperatorEventContextReferencePayload,
     OperatorEventImportance,
     OperatorEventItemPayload,
     OperatorEventSourceStatus,
@@ -24,8 +25,8 @@ from trading_mvp.schemas import (
 from trading_mvp.services.event_context_adapters import (
     BEAActualReleaseEnrichmentAdapter,
     BLSActualReleaseEnrichmentAdapter,
-    ExternalEventFetchPayload,
     ExternalEventFetcher,
+    ExternalEventFetchPayload,
     ExternalMacroEventAdapter,
     FredReleaseDatesAdapter,
     PostReleaseEventEnrichmentAdapter,
@@ -120,6 +121,22 @@ def _normalize_vendor_list(values: object) -> list[EventSourceVendor]:
     return normalized
 
 
+def _normalize_release_id_list(values: object) -> list[int]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return []
+    normalized: list[int] = []
+    for item in values:
+        if isinstance(item, bool):
+            continue
+        try:
+            release_id = int(item)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if release_id not in normalized:
+            normalized.append(release_id)
+    return normalized
+
+
 def _normalize_release_enrichment(value: object) -> dict[str, dict[str, Any]]:
     if not isinstance(value, Mapping):
         return {}
@@ -163,6 +180,8 @@ def _build_event_context_payload(
     stale_after_minutes: int = 180,
     is_stale: bool | None = None,
     is_complete: bool | None = None,
+    failed_release_ids: Sequence[int] | None = None,
+    parse_failed_release_ids: Sequence[int] | None = None,
 ) -> EventContextPayload:
     normalized_generated_at = generated_at.replace(tzinfo=None) if generated_at.tzinfo is not None else generated_at
     normalized_source_generated_at = _parse_datetime(source_generated_at)
@@ -276,6 +295,8 @@ def _build_event_context_payload(
         affected_assets=deduped_assets,
         event_bias=summary_bias,
         enrichment_vendors=summary_enrichment_vendors,
+        failed_release_ids=_normalize_release_id_list(failed_release_ids or []),
+        parse_failed_release_ids=_normalize_release_id_list(parse_failed_release_ids or []),
         events=events,
     )
 
@@ -502,6 +523,26 @@ class NormalizedHTTPEventAdapter:
 class ExternalAPIEventContextProvider:
     adapter: ExternalMacroEventAdapter
     stale_after_minutes: int = 180
+    _event_context_cycle_depth: int = field(default=0, init=False, repr=False)
+
+    def event_context_cycle_active(self) -> bool:
+        return self._event_context_cycle_depth > 0
+
+    def begin_event_context_cycle(self, cycle_key: object) -> None:
+        begin_cycle = getattr(self.adapter, "begin_cycle", None)
+        if self._event_context_cycle_depth == 0 and callable(begin_cycle):
+            begin_cycle(cycle_key)
+        self._event_context_cycle_depth += 1
+
+    def end_event_context_cycle(self) -> None:
+        if self._event_context_cycle_depth <= 0:
+            return
+        self._event_context_cycle_depth -= 1
+        if self._event_context_cycle_depth > 0:
+            return
+        end_cycle = getattr(self.adapter, "end_cycle", None)
+        if callable(end_cycle):
+            end_cycle()
 
     def get_event_context(
         self,
@@ -526,6 +567,8 @@ class ExternalAPIEventContextProvider:
             stale_after_minutes=self.stale_after_minutes,
             is_stale=result.is_stale,
             is_complete=result.is_complete,
+            failed_release_ids=result.failed_release_ids,
+            parse_failed_release_ids=result.parse_failed_release_ids,
         )
 
 
@@ -846,6 +889,59 @@ def _normalize_operator_event_items(
     return items
 
 
+def _normalize_complete_reference(
+    value: object,
+    *,
+    generated_at: datetime,
+) -> OperatorEventContextReferencePayload | None:
+    if not isinstance(value, Mapping) or not value:
+        return None
+    source = dict(value)
+    reference_generated_at = _parse_aware_datetime(source.get("generated_at")) or generated_at
+    upcoming_events = _normalize_operator_event_items(
+        source.get("events") or source.get("upcoming_events"),
+        generated_at=reference_generated_at,
+    )
+    next_event_at = _parse_aware_datetime(source.get("next_event_at"))
+    next_event_name = str(source.get("next_event_name") or "").strip() or None
+    next_event_importance = _normalize_operator_importance(source.get("next_event_importance"))
+    minutes_to_next_event = source.get("minutes_to_next_event")
+    if not isinstance(minutes_to_next_event, int):
+        minutes_to_next_event = (
+            _minutes_until(generated_at=reference_generated_at, event_at=next_event_at)
+            if next_event_at is not None
+            else None
+        )
+    if not upcoming_events and next_event_at is not None and next_event_name is not None:
+        upcoming_events = [
+            OperatorEventItemPayload(
+                event_at=next_event_at,
+                event_name=next_event_name,
+                importance=next_event_importance,
+                affected_assets=_normalized_assets(source.get("affected_assets")),
+                minutes_to_event=minutes_to_next_event,
+            )
+        ]
+    return OperatorEventContextReferencePayload(
+        source_status=_normalize_operator_source_status(source.get("source_status")),
+        source_provenance=_normalize_source_provenance(
+            source.get("source_provenance"),
+            fallback_status=source.get("source_status"),
+        ),
+        source_vendor=_normalize_source_vendor(source.get("source_vendor")),
+        generated_at=reference_generated_at,
+        next_event_at=next_event_at,
+        next_event_name=next_event_name,
+        next_event_importance=next_event_importance,
+        minutes_to_next_event=minutes_to_next_event,
+        active_risk_window=bool(source.get("active_risk_window")),
+        upcoming_events=upcoming_events,
+        affected_assets=_normalized_assets(source.get("affected_assets")),
+        enrichment_vendors=_normalize_vendor_list(source.get("enrichment_vendors")),
+        summary_note=str(source.get("summary_note") or "").strip() or None,
+    )
+
+
 def normalize_operator_event_context(
     raw_context: Mapping[str, object] | EventContextPayload | None,
     *,
@@ -883,6 +979,9 @@ def normalize_operator_event_context(
             upcoming_events=[],
             affected_assets=[],
             enrichment_vendors=[],
+            failed_release_ids=[],
+            parse_failed_release_ids=[],
+            complete_reference=None,
             summary_note=resolved_summary_note or "event context provider unavailable",
         )
 
@@ -956,6 +1055,12 @@ def normalize_operator_event_context(
         upcoming_events=upcoming_events,
         affected_assets=_normalized_assets(source.get("affected_assets")),
         enrichment_vendors=_normalize_vendor_list(source.get("enrichment_vendors")),
+        failed_release_ids=_normalize_release_id_list(source.get("failed_release_ids")),
+        parse_failed_release_ids=_normalize_release_id_list(source.get("parse_failed_release_ids")),
+        complete_reference=_normalize_complete_reference(
+            source.get("complete_reference"),
+            generated_at=generated_at_value,
+        ),
         summary_note=resolved_summary_note,
     )
 

@@ -6,10 +6,9 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
-
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
-from trading_mvp.models import AgentRun, AuditEvent, Order
+from trading_mvp.models import AgentRun, AuditEvent, Execution, Order, Position
 from trading_mvp.schemas import (
     ExecutionIntent,
     MarketCandle,
@@ -17,9 +16,9 @@ from trading_mvp.schemas import (
     RiskCheckResult,
     TradeDecision,
 )
-from trading_mvp.services.execution import execute_live_trade
-from trading_mvp.services.execution_policy import select_execution_plan
 from trading_mvp.services.dashboard import get_executions
+from trading_mvp.services.execution import execute_live_trade, sync_live_state
+from trading_mvp.services.execution_policy import select_execution_plan
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
@@ -313,6 +312,30 @@ class LimitRepriceFallbackClient(PolicyCaptureClient):
         return {"status": "CANCELED"}
 
 
+class FilledOrderNoTradesClient(PolicyCaptureClient):
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        return []
+
+
+class FilledOrderBackfillClient(PolicyCaptureClient):
+    def __init__(self) -> None:
+        super().__init__(initial_position_qty=0.0)
+        self.trade_calls = 0
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        self.trade_calls += 1
+        return [
+            {
+                "id": f"trade-{order_id}",
+                "price": "70010",
+                "qty": "0.01",
+                "commission": "0.07",
+                "commissionAsset": "USDT",
+                "realizedPnl": "1.23",
+            }
+        ]
+
+
 def test_entry_policy_prefers_limit_under_passive_conditions() -> None:
     settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
     plan = select_execution_plan(
@@ -587,6 +610,134 @@ def test_large_partial_fill_finishes_remaining_quantity_with_market(monkeypatch,
     assert result["execution_attempts"][-1]["order_type"] == "MARKET"
     assert result["execution_quality"]["aggressive_fallback_used"] is True
     assert result["execution_quality"]["execution_quality_status"] == "aggressive_completion"
+
+
+def test_filled_order_with_empty_trade_lookup_uses_exchange_fill_for_quality(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = FilledOrderNoTradesClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=18,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+
+    assert result["status"] == "filled"
+    assert result["fill_quantity"] > 0
+    assert result["execution_attempts"][0]["filled_quantity"] == result["fill_quantity"]
+    assert result["execution_quality"]["fill_ratio"] == 1.0
+    assert result["execution_quality"]["execution_quality_status"] == "clean_fill"
+    assert db_session.scalar(select(Execution).limit(1)) is None
+    assert "live_execution_trade_lookup_empty" in set(db_session.scalars(select(AuditEvent.event_type)))
+
+
+def test_sync_live_state_backfills_missing_final_order_executions(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=19,
+        risk_check_id=None,
+        position_id=None,
+        side="long",
+        order_type="market",
+        mode="live",
+        status="filled",
+        requested_quantity=0.01,
+        requested_price=70000.0,
+        filled_quantity=0.01,
+        average_fill_price=70010.0,
+        reason_codes=[],
+        metadata_json={},
+        external_order_id="filled-missing-exec",
+        client_order_id="mvp-filled-missing-exec",
+        exchange_status="FILLED",
+    )
+    db_session.add(order)
+    db_session.flush()
+    client = FilledOrderBackfillClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+
+    result = sync_live_state(db_session, settings_row, symbol="BTCUSDT")
+    execution = db_session.scalar(select(Execution).where(Execution.order_id == order.id))
+
+    assert result["synced_orders"] >= 1
+    assert client.trade_calls == 1
+    assert execution is not None
+    assert execution.fill_quantity == 0.01
+    assert execution.fee_paid == 0.07
+    assert execution.realized_pnl == 1.23
+
+
+def test_sync_live_state_zeroes_unrealized_and_summarizes_closed_position_pnl(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    position = Position(
+        symbol="BTCUSDT",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=69900.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=-1.0,
+        mode="live",
+        metadata_json={},
+    )
+    db_session.add(position)
+    db_session.flush()
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=20,
+        risk_check_id=None,
+        position_id=position.id,
+        side="reduce",
+        order_type="market",
+        mode="live",
+        status="filled",
+        requested_quantity=0.01,
+        requested_price=70100.0,
+        filled_quantity=0.01,
+        average_fill_price=70100.0,
+        reason_codes=[],
+        metadata_json={},
+        external_order_id="closed-position-order",
+        client_order_id="mvp-closed-position-order",
+        exchange_status="FILLED",
+        reduce_only=True,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        Execution(
+            order_id=order.id,
+            position_id=position.id,
+            symbol="BTCUSDT",
+            status="filled",
+            fill_price=70100.0,
+            fill_quantity=0.01,
+            fee_paid=0.05,
+            realized_pnl=1.0,
+            external_trade_id="closed-position-trade",
+            payload={},
+        )
+    )
+    db_session.flush()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: PolicyCaptureClient(initial_position_qty=0.0))
+
+    sync_live_state(db_session, settings_row, symbol="BTCUSDT")
+    db_session.refresh(position)
+
+    assert position.status == "closed"
+    assert position.quantity == 0.0
+    assert position.unrealized_pnl == 0.0
+    assert position.realized_pnl == 1.0
+    assert position.metadata_json["closed_position_pnl"]["net_realized_pnl"] == 0.95
 
 
 def test_get_executions_includes_decision_and_execution_quality(monkeypatch, db_session) -> None:

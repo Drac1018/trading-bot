@@ -16,7 +16,7 @@ const sharedRiskReasonMap: Record<string, string> = {
   SLIPPAGE_THRESHOLD_EXCEEDED: "허용한 슬리피지 범위를 넘어 신규 진입을 차단했습니다.",
   DAILY_LOSS_LIMIT_REACHED: "일일 손실 한도에 도달해 신규 진입을 차단했습니다.",
   MAX_CONSECUTIVE_LOSSES_REACHED: "연속 손실 한도에 도달해 보수적 제한이 적용되었습니다.",
-  HOLD_DECISION: "현재 AI 판단은 신규 진입이 아닌 HOLD입니다.",
+  HOLD_DECISION: "현재 AI 판단은 신규 진입 신호가 없어 대기 중입니다.",
   GROSS_EXPOSURE_LIMIT_REACHED: "총 노출 한도를 초과해 신규 진입을 차단했습니다.",
   LARGEST_POSITION_LIMIT_REACHED: "심볼 집중도 한도 유지",
   DETERMINISTIC_BASELINE_DISAGREEMENT: "결정론적 기준선 불일치 상태 유지",

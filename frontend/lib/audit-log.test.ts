@@ -73,6 +73,23 @@ test("filterAuditRows applies tab, severity, search and sort together", async ()
   assert.deepEqual(searched.map((row) => row.event_type), ["risk_blocked"]);
 });
 
+test("audit presentation localizes common event and message fields", async () => {
+  const { formatAuditEntityType, formatAuditEventType, formatAuditMessage, formatAuditRowTitle } = await auditLogModule;
+
+  const row: AuditRow = {
+    event_category: "ai_decision",
+    event_type: "decision_ai_no_event",
+    entity_type: "symbol",
+    message: "AI decision skipped because no deterministic entry or review trigger was present.",
+    created_at: "2026-04-15T12:10:00Z",
+  };
+
+  assert.equal(formatAuditEventType(row.event_type), "검토할 진입 신호 없음");
+  assert.equal(formatAuditEntityType(row.entity_type), "심볼");
+  assert.equal(formatAuditMessage(row), "검토할 진입 신호 없음");
+  assert.equal(formatAuditRowTitle(row), "검토할 진입 신호 없음");
+});
+
 test("describeAuditLegacyReview marks legacy time-based trigger rows separately", async () => {
   const { describeAuditLegacyReview, extractLegacyReviewTriggerReason } = await auditLogModule;
 

@@ -284,6 +284,7 @@ def test_order_submission_timeout_is_not_blind_retried(monkeypatch, order_type, 
 
 def test_timestamp_error_resyncs_with_server_time(monkeypatch) -> None:
     captured_account_timestamps: list[int] = []
+    events: list[dict[str, object]] = []
     calls = {"account": 0}
 
     class FakeResponse:
@@ -328,12 +329,16 @@ def test_timestamp_error_resyncs_with_server_time(monkeypatch) -> None:
     )
     monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
 
-    payload = BinanceClient(api_key="key", api_secret="secret").get_account_info()
+    payload = BinanceClient(api_key="key", api_secret="secret", request_error_hook=events.append).get_account_info()
 
     assert payload["availableBalance"] == "100"
     assert len(captured_account_timestamps) == 2
     assert captured_account_timestamps[0] == 1_700_000_000_750
     assert captured_account_timestamps[1] == 1_699_999_999_750
+    assert events[0]["event"] == "binance_request_error"
+    assert events[0]["reason_code"] == "BINANCE_REST_TIME_SYNC_REQUIRED"
+    assert events[1]["event"] == "binance_time_sync"
+    assert events[1]["offset_ms"] == 1000
 
 
 def test_normalize_order_quantity_meets_min_notional(monkeypatch) -> None:

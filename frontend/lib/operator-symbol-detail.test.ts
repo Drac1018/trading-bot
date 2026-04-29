@@ -215,10 +215,10 @@ test("buildOperatorDetailSections keeps the additive event/operator sections in 
   );
   assert.equal(
     eventSection?.items.find((item) => item.label === "데이터 출처")?.value,
-    describeEventSourceProvenance("unknown"),
+    describeEventSourceProvenance("fixture"),
   );
-  assert.equal(eventSection?.items.find((item) => item.label === "BLS 실제값")?.value, "예");
-  assert.equal(eventSection?.items.find((item) => item.label === "BEA 실제값")?.value, "예");
+  assert.equal(eventSection?.items.find((item) => item.label === "BLS 실제값")?.value, "정보 없음");
+  assert.equal(eventSection?.items.find((item) => item.label === "BEA 실제값")?.value, "정보 없음");
   assert.equal(aiReviewSection?.items.find((item) => item.label === "검토 분류")?.value, "신규 진입 후보 검토");
   assert.equal(marketSignalSection?.items.find((item) => item.label === "요약")?.value, "모멘텀 강화 / 거래량 strong / 추세 상승 정렬");
 });
@@ -257,6 +257,41 @@ test("buildOperatorDetailSections keeps legacy AI trigger summary usable as mark
     aiReviewSection?.items.find((item) => item.label === "AI 검토 생략")?.value,
     "거래량 부족으로 AI 검토 생략",
   );
+});
+
+test("buildOperatorDetailSections does not reuse generic decision confidence as AI event confidence", async () => {
+  const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
+  const baseSymbol = buildSymbol();
+  const genericPenalty = "Data quality degraded and decision reference freshness blocking";
+
+  const sections = buildOperatorDetailSections(
+    buildSymbol({
+      event_operator_control: {
+        ...baseSymbol.event_operator_control!,
+        ai_event_view: {
+          ai_bias: "unknown",
+          ai_risk_state: "unknown",
+          ai_confidence: null,
+          scenario_note: null,
+          confidence_penalty_reason: null,
+          source_state: "unavailable",
+        },
+      },
+      ai_decision: {
+        ...baseSymbol.ai_decision,
+        confidence: 0.09,
+        scenario_note: "Trend continuation candidate with low confidence due to data quality and freshness issues.",
+        confidence_penalty_reason: genericPenalty,
+        event_risk_acknowledgement: null,
+      },
+    }),
+  );
+
+  const aiEventSection = sections.find((section) => section.key === "ai_event_view");
+
+  assert.ok(aiEventSection);
+  assert.notEqual(aiEventSection.items[2]?.value, "0.09");
+  assert.notEqual(aiEventSection.items[4]?.value, genericPenalty);
 });
 
 test("buildOperatorDetailSections exposes user-facing preview text", async () => {
@@ -425,4 +460,68 @@ test("buildOperatorDetailSections keeps manual no-trade windows visible with act
   assert.ok(previewSection);
   assert.equal(previewSection.tone, "danger");
   assert.ok(previewSection.items.some((item) => item.value === "신규 진입 금지"));
+});
+
+test("buildOperatorDetailSections shows previous complete reference for incomplete FRED snapshot", async () => {
+  const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
+  const { describeSourceStatus } = await eventOperatorControlModule;
+  const baseSymbol = buildSymbol();
+
+  const sections = buildOperatorDetailSections(
+    buildSymbol({
+      event_operator_control: {
+        ...baseSymbol.event_operator_control!,
+        event_context: {
+          ...baseSymbol.event_operator_control!.event_context,
+          source_status: "incomplete",
+          source_provenance: "external_api",
+          source_vendor: "fred",
+          generated_at: "2026-04-20T11:00:00Z",
+          is_stale: false,
+          is_complete: false,
+          active_risk_window: false,
+          next_event_at: "2026-04-20T12:30:00Z",
+          next_event_name: "Latest Partial CPI",
+          next_event_importance: "high",
+          minutes_to_next_event: 90,
+          failed_release_ids: [50],
+          parse_failed_release_ids: [46],
+          complete_reference: {
+            source_status: "available",
+            source_provenance: "external_api",
+            source_vendor: "fred",
+            generated_at: "2026-04-20T10:00:00Z",
+            next_event_at: "2026-04-20T12:30:00Z",
+            next_event_name: "Previous Complete CPI",
+            next_event_importance: "high",
+            minutes_to_next_event: 150,
+            active_risk_window: false,
+            upcoming_events: [],
+            affected_assets: ["BTCUSDT"],
+            enrichment_vendors: [],
+            summary_note: "previous complete market snapshot",
+          },
+          upcoming_events: [],
+          affected_assets: ["BTCUSDT"],
+          summary_note: "최신 조회 일부 실패 / 직전 완전본 참고",
+        },
+      },
+    }),
+  );
+
+  const eventSection = sections.find((section) => section.key === "upcoming_event_risk");
+
+  assert.ok(eventSection);
+  assert.equal(eventSection.items.find((item) => item.label === "이벤트 요약")?.value, "이벤트 데이터 지연/불완전");
+  assert.equal(eventSection.items.find((item) => item.label === "다음 이벤트")?.value, "Latest Partial CPI");
+  assert.equal(
+    eventSection.items.find((item) => item.label === "데이터 상태")?.value,
+    describeSourceStatus("incomplete", { kind: "event_context" }),
+  );
+  assert.ok(eventSection.items.find((item) => item.label === "AI 판단 당시 이벤트")?.hint.includes("FOMC"));
+  assert.ok(
+    eventSection.items.find((item) => item.label === "직전 완전본")?.value.includes("Previous Complete CPI"),
+  );
+  assert.equal(eventSection.items.find((item) => item.label === "누락 release")?.value, "50, 46");
+  assert.ok(eventSection.alerts.some((alert) => alert.text.includes("최신 조회 일부 실패 / 직전 완전본 참고")));
 });

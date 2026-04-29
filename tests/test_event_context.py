@@ -13,10 +13,10 @@ from trading_mvp.services.event_context import (
     resolve_event_context_provider,
     resolve_event_context_provider_from_env,
 )
-from trading_mvp.services.event_context_adapters import FredReleaseDatesAdapter
 from trading_mvp.services.event_context_adapters import (
     BEAActualReleaseEnrichmentAdapter,
     BLSActualReleaseEnrichmentAdapter,
+    FredReleaseDatesAdapter,
 )
 from trading_mvp.services.features import compute_features
 from trading_mvp.services.market_data import build_market_context, build_market_snapshot
@@ -224,6 +224,62 @@ def test_fred_release_dates_adapter_translates_calendar_response() -> None:
     assert payload.enrichment_vendors == []
 
 
+def test_fred_release_dates_adapter_reuses_release_payloads_across_symbols() -> None:
+    generated_at = datetime(2026, 1, 28, 18, 0, 0)
+    later_generated_at = datetime(2026, 1, 28, 18, 5, 0)
+    calls: dict[int, int] = {}
+
+    def _fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, headers
+        release_id = int(params["release_id"])
+        calls[release_id] = calls.get(release_id, 0) + 1
+        payloads = {
+            101: {"release_dates": [{"release_id": 101, "date": "2026-01-28"}]},
+            10: {"release_dates": [{"release_id": 10, "date": "2026-02-10"}]},
+        }
+        return payloads[release_id]
+
+    provider = ExternalAPIEventContextProvider(
+        adapter=FredReleaseDatesAdapter(
+            api_key="fred-demo",
+            fetcher=_fetcher,
+            release_ids=(101, 10),
+        )
+    )
+
+    provider.begin_event_context_cycle("scan-cycle-a")
+    btc_payload = build_event_context(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        provider=provider,
+    )
+    eth_payload = build_event_context(
+        symbol="ETHUSDT",
+        timeframe="15m",
+        generated_at=later_generated_at,
+        provider=provider,
+    )
+    provider.end_event_context_cycle()
+
+    assert calls == {101: 1, 10: 1}
+    assert btc_payload.source_status == "external_api"
+    assert eth_payload.source_status == "external_api"
+    assert btc_payload.events[0].affected_assets == ["BTCUSDT"]
+    assert eth_payload.events[0].affected_assets == ["ETHUSDT"]
+
+    provider.begin_event_context_cycle("scan-cycle-b")
+    build_event_context(
+        symbol="XRPUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        provider=provider,
+    )
+    provider.end_event_context_cycle()
+
+    assert calls == {101: 2, 10: 2}
+
+
 def test_fred_release_dates_adapter_marks_partial_parsing_as_incomplete() -> None:
     generated_at = datetime(2026, 4, 20, 12, 0, 0)
 
@@ -252,6 +308,72 @@ def test_fred_release_dates_adapter_marks_partial_parsing_as_incomplete() -> Non
     assert payload.source_vendor == "fred"
     assert payload.is_complete is False
     assert payload.next_event_name == "Consumer Price Index"
+    assert payload.failed_release_ids == []
+    assert payload.parse_failed_release_ids == [50]
+
+
+def test_fred_release_dates_adapter_persists_failed_release_ids_on_partial_fetch() -> None:
+    generated_at = datetime(2026, 4, 20, 12, 0, 0)
+
+    def _fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, headers
+        release_id = int(params["release_id"])
+        if release_id == 10:
+            return {"release_dates": [{"release_id": 10, "date": "2026-04-21"}]}
+        raise RuntimeError("FRED release fetch failed")
+
+    payload = build_event_context(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        provider=ExternalAPIEventContextProvider(
+            adapter=FredReleaseDatesAdapter(
+                api_key="fred-demo",
+                fetcher=_fetcher,
+                release_ids=(10, 50),
+            )
+        ),
+    )
+
+    assert payload.source_status == "incomplete"
+    assert payload.source_provenance == "external_api"
+    assert payload.source_vendor == "fred"
+    assert payload.is_complete is False
+    assert payload.next_event_name == "Consumer Price Index"
+    assert payload.failed_release_ids == [50]
+    assert payload.parse_failed_release_ids == []
+
+
+def test_fred_release_dates_adapter_retries_transient_release_fetch_failure() -> None:
+    generated_at = datetime(2026, 4, 20, 12, 0, 0)
+    calls: dict[int, int] = {}
+
+    def _fetcher(*, url: str, params: dict[str, str], headers: dict[str, str]) -> dict[str, object]:
+        del url, headers
+        release_id = int(params["release_id"])
+        calls[release_id] = calls.get(release_id, 0) + 1
+        if release_id == 50 and calls[release_id] == 1:
+            raise RuntimeError("transient FRED release fetch failure")
+        return {"release_dates": [{"release_id": release_id, "date": "2026-04-21"}]}
+
+    payload = build_event_context(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        generated_at=generated_at,
+        provider=ExternalAPIEventContextProvider(
+            adapter=FredReleaseDatesAdapter(
+                api_key="fred-demo",
+                fetcher=_fetcher,
+                release_ids=(10, 50),
+            )
+        ),
+    )
+
+    assert calls == {10: 1, 50: 2}
+    assert payload.source_status == "external_api"
+    assert payload.is_complete is True
+    assert payload.failed_release_ids == []
+    assert payload.parse_failed_release_ids == []
 
 
 def test_fred_release_dates_adapter_marks_missing_upcoming_dates_as_unavailable() -> None:

@@ -4,15 +4,17 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 from trading_mvp.models import AgentRun, MarketSnapshot, Position, SchedulerRun, SystemHealthEvent
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import mark_sync_success
 from trading_mvp.services.scheduler import (
+    abandon_stale_scheduler_runs,
     get_due_interval_decision_symbols,
     get_due_position_management_symbols,
-    run_release_enrichment_watch_cycle,
     run_due_operational_cycles,
     run_interval_decision_cycle,
+    run_release_enrichment_watch_cycle,
 )
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
@@ -212,6 +214,80 @@ def test_run_due_operational_cycles_isolates_background_workflow_failure(monkeyp
     assert result == [{"workflow": "position_management_cycle", "results": [{"status": "ok"}]}]
     assert health_event is not None
     assert health_event.payload["workflow"] == "market_refresh_cycle"
+
+
+def test_run_due_operational_cycles_can_use_isolated_sessions(monkeypatch, db_session) -> None:
+    calls: list[str] = []
+    session_ids: list[int] = []
+    SessionFactory = sessionmaker(
+        bind=db_session.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    def fail_market_refresh(session, triggered_by="scheduler"):
+        calls.append("market")
+        session_ids.append(id(session))
+        raise RuntimeError("market failed")
+
+    def run_position_management(session, triggered_by="scheduler"):
+        calls.append("position_management")
+        session_ids.append(id(session))
+        return {"workflow": "position_management_cycle", "results": [{"status": "ok"}]}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_market_refresh_cycle", fail_market_refresh)
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.run_release_enrichment_watch_cycle",
+        lambda session, triggered_by="scheduler": {"workflow": "release_enrichment_watch_cycle", "results": []},
+    )
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_position_management_cycle", run_position_management)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_entry_plan_watcher_cycle", lambda session: None)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_interval_decision_cycle", lambda session: None)
+
+    result = run_due_operational_cycles(
+        db_session,
+        include_exchange_sync=False,
+        continue_on_error=True,
+        session_factory=SessionFactory,
+    )
+
+    health_event = db_session.scalar(select(SystemHealthEvent).order_by(SystemHealthEvent.id.desc()).limit(1))
+    assert calls == ["market", "position_management"]
+    assert len(set(session_ids)) == 2
+    assert result == [{"workflow": "position_management_cycle", "results": [{"status": "ok"}]}]
+    assert health_event is not None
+    assert health_event.payload["workflow"] == "market_refresh_cycle"
+
+
+def test_abandon_stale_scheduler_runs_marks_only_old_running_rows(db_session) -> None:
+    now = utcnow_naive()
+    stale = SchedulerRun(
+        schedule_window="1m",
+        workflow="interval_decision_cycle",
+        status="running",
+        triggered_by="scheduler",
+        outcome={"symbol": "BTCUSDT"},
+        created_at=now - timedelta(hours=2),
+    )
+    fresh = SchedulerRun(
+        schedule_window="1m",
+        workflow="interval_decision_cycle",
+        status="running",
+        triggered_by="scheduler",
+        outcome={"symbol": "ETHUSDT"},
+        created_at=now - timedelta(minutes=5),
+    )
+    db_session.add_all([stale, fresh])
+    db_session.flush()
+
+    count = abandon_stale_scheduler_runs(db_session, older_than_seconds=1800, now=now)
+    db_session.flush()
+
+    assert count == 1
+    assert stale.status == "abandoned"
+    assert stale.outcome["abandoned_reason"] == "STALE_RUNNING_SCHEDULER_RUN"
+    assert fresh.status == "running"
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,7 @@ export type AiTriggerReasonPresentation = {
 export type DecisionTimelineSymbolLike = {
   ai_decision: {
     decision: string | null;
+    created_at?: string | null;
     decision_reference?: {
       display_gap?: boolean | null;
       display_gap_reason?: string | null;
@@ -23,6 +24,8 @@ export type DecisionTimelineSymbolLike = {
   risk_guard: {
     allowed: boolean | null;
     decision: string | null;
+    created_at?: string | null;
+    as_of?: string | null;
     survival_path?: string | null;
     blocked_reason_codes?: string[];
     auto_resized_entry: boolean;
@@ -32,6 +35,8 @@ export type DecisionTimelineSymbolLike = {
     order_id: number | null;
     order_status: string | null;
     execution_status: string | null;
+    created_at?: string | null;
+    execution_created_at?: string | null;
   };
   pending_entry_plan?: {
     plan_id: number | null;
@@ -90,7 +95,7 @@ export function describeAiTriggerReason(
     default:
       return {
         label: value ?? "-",
-        hint: value ? "저장된 trigger reason 원문입니다." : "-",
+        hint: value ? "저장된 AI 호출 사유 원문입니다." : "-",
         legacy: false,
       };
   }
@@ -107,7 +112,7 @@ function translateDecision(decision: string | null | undefined): string {
     case "exit":
       return "청산";
     case "hold":
-      return "보류";
+      return "신규 진입 대기";
     default:
       return "-";
   }
@@ -121,20 +126,78 @@ function isSurvivalDecision(decision: string | null | undefined): boolean {
   return decision === "reduce" || decision === "exit";
 }
 
+function isHoldDecision(decision: string | null | undefined): boolean {
+  return decision === "hold";
+}
+
+function hasPassiveHoldBlocker(symbol: DecisionTimelineSymbolLike): boolean {
+  return (
+    isHoldDecision(symbol.risk_guard.decision ?? symbol.ai_decision.decision) ||
+    (symbol.risk_guard.blocked_reason_codes ?? []).includes("HOLD_DECISION")
+  );
+}
+
+function timestampMs(value: string | null | undefined): number {
+  if (!value) {
+    return 0;
+  }
+  const parsed = Date.parse(value.endsWith("Z") ? value : `${value}Z`);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function latestDecisionReferenceMs(symbol: DecisionTimelineSymbolLike): number {
+  return Math.max(
+    timestampMs(symbol.ai_decision.created_at),
+    timestampMs(symbol.risk_guard.created_at),
+    timestampMs(symbol.risk_guard.as_of),
+  );
+}
+
+function executionTimestampMs(symbol: DecisionTimelineSymbolLike): number {
+  return Math.max(
+    timestampMs(symbol.execution.execution_created_at),
+    timestampMs(symbol.execution.created_at),
+  );
+}
+
+export function isHistoricalExecutionRecord(symbol: DecisionTimelineSymbolLike): boolean {
+  const executionMs = executionTimestampMs(symbol);
+  const decisionReferenceMs = latestDecisionReferenceMs(symbol);
+  return symbol.execution.order_id !== null && executionMs > 0 && decisionReferenceMs > 0 && executionMs < decisionReferenceMs;
+}
+
+function formatExecutionStatus(status: string | null | undefined): string {
+  if (status === "filled") {
+    return "체결 완료";
+  }
+  if (status === "partially_filled") {
+    return "부분 체결";
+  }
+  if (status === "cancelled" || status === "canceled") {
+    return "취소";
+  }
+  if (status === "rejected") {
+    return "거부";
+  }
+  return status ?? "상태 미확인";
+}
+
 function describeSelectionReason(reason: string | null | undefined): string {
   switch (reason) {
     case "ranked_portfolio_focus":
-      return "최신 cycle 실행 후보로 선정됐습니다.";
+      return "이번 판단 주기에서 실행 후보로 선정됐습니다.";
     case "priority_position_or_protection":
       return "기존 포지션 또는 보호 주문 관리가 우선입니다.";
     case "breadth_hold_bias":
-      return "시장 breadth가 약해 이번 cycle 후보에서 제외됐습니다.";
+      return "시장 폭이 약해 이번 판단 주기 후보에서 제외됐습니다.";
     case "capacity_reached":
-      return "현재 허용 슬롯이 이미 모두 사용 중입니다.";
+      return "이번 판단 주기에는 새 주문 슬롯을 배정하지 않았습니다.";
     case "score_below_threshold":
-      return "이번 cycle 점수가 진입 기준치에 못 미쳤습니다.";
+      return "이번 판단 주기 점수가 진입 기준치에 못 미쳤습니다.";
     case "low_edge_hold_candidate":
       return "기대 edge가 약해 보류 후보로 남았습니다.";
+    case "low_conviction_slot_excluded":
+      return "확신도가 낮아 이번 판단 주기 주문 슬롯에서 제외됐습니다.";
     case "underperforming_expectancy_bucket":
       return "최근 기대값 버킷이 약해 실행 후보에서 제외됐습니다.";
     case "expectancy_below_threshold":
@@ -142,9 +205,9 @@ function describeSelectionReason(reason: string | null | undefined): string {
     case "adverse_signed_slippage":
       return "체결 품질이 불리해 실행 후보에서 제외됐습니다.";
     case "duplicate_exposure":
-      return "비슷한 노출이 이미 있어 이번 cycle에서는 제외됐습니다.";
+      return "비슷한 노출이 이미 있어 이번 판단 주기에서는 제외됐습니다.";
     default:
-      return reason ? `최신 cycle 사유: ${reason}` : "최신 cycle 실행 대상이 아닙니다.";
+      return reason ? "이번 판단 주기 사유가 내부 코드로 기록됐습니다." : "이번 판단 주기 실행 대상이 아닙니다.";
   }
 }
 
@@ -212,9 +275,9 @@ export function describeHistoricalDecisionGap(symbol: DecisionTimelineSymbolLike
   }
   const rawReason = symbol.ai_decision.decision_reference?.display_gap_reason;
   if (typeof rawReason === "string" && rawReason.trim().length > 0) {
-    return "현재 화면은 마지막 AI 추천보다 더 최신 시장 새로고침과 cycle 상태를 함께 보여주고 있습니다.";
+    return "현재 화면은 마지막 AI 추천보다 더 최신 시장 새로고침과 판단 주기 상태를 함께 보여주고 있습니다.";
   }
-  return "현재 화면은 마지막 AI 추천보다 더 최신 cycle 상태를 함께 보여주고 있습니다.";
+  return "현재 화면은 마지막 AI 추천보다 더 최신 판단 주기 상태를 함께 보여주고 있습니다.";
 }
 
 export function summarizeLastAiRecommendation(symbol: DecisionTimelineSymbolLike): DecisionTimelineSummary {
@@ -262,8 +325,15 @@ export function summarizeRiskGate(symbol: DecisionTimelineSymbolLike): DecisionT
       };
     }
     return {
-      label: "리스크 통과",
+      label: hasPassiveHoldBlocker(symbol) ? "신규 진입 대기" : "리스크 통과",
       detail: translateDecision(decision),
+      kind: "neutral",
+    };
+  }
+  if (hasPassiveHoldBlocker(symbol)) {
+    return {
+      label: "신규 진입 대기",
+      detail: "현재는 신규 진입 신호가 없어 대기 중입니다.",
       kind: "neutral",
     };
   }
@@ -284,7 +354,7 @@ export function summarizeRiskGate(symbol: DecisionTimelineSymbolLike): DecisionT
 export function summarizeCurrentCycleSelection(symbol: DecisionTimelineSymbolLike): DecisionTimelineSummary {
   if (symbol.candidate_selection.selected === true) {
     return {
-      label: "현재 cycle 선정",
+      label: "이번 판단 주기 선정",
       detail: describeSelectionReason(
         symbol.candidate_selection.selected_reason ?? symbol.candidate_selection.selection_reason,
       ),
@@ -293,7 +363,7 @@ export function summarizeCurrentCycleSelection(symbol: DecisionTimelineSymbolLik
   }
   if (symbol.candidate_selection.selected === false) {
     return {
-      label: "현재 cycle 미선정",
+      label: "이번 판단 주기 미선정",
       detail: describeSelectionReason(
         symbol.candidate_selection.rejected_reason ?? symbol.candidate_selection.selection_reason,
       ),
@@ -301,10 +371,10 @@ export function summarizeCurrentCycleSelection(symbol: DecisionTimelineSymbolLik
     };
   }
   return {
-    label: "현재 cycle 정보 없음",
+    label: "이번 판단 주기 정보 없음",
     detail: hasHistoricalDecisionGap(symbol)
-      ? "마지막 AI 추천은 남아 있지만 최신 cycle 선택 결과는 비어 있습니다."
-      : "최신 cycle 선택 결과가 아직 정리되지 않았습니다.",
+      ? "마지막 AI 추천은 남아 있지만 이번 판단 주기 선택 결과는 비어 있습니다."
+      : "이번 판단 주기 선택 결과가 아직 정리되지 않았습니다.",
     kind: "neutral",
   };
 }
@@ -314,17 +384,17 @@ export function summarizeExecutionState(symbol: DecisionTimelineSymbolLike): Dec
   const executionStatus = symbol.execution.execution_status ?? symbol.execution.order_status;
   const flowLabel = isSurvivalDecision(decision) ? "정리/축소" : isEntryDecision(decision) ? "신규 진입" : "주문";
 
-  if (symbol.execution.order_id !== null) {
+  if (symbol.execution.order_id !== null && !isHistoricalExecutionRecord(symbol)) {
     if (executionStatus === "filled") {
       return {
         label: `${flowLabel} 실행 완료`,
-        detail: executionStatus,
+        detail: formatExecutionStatus(executionStatus),
         kind: "good",
       };
     }
     return {
       label: `${flowLabel} 주문 제출`,
-      detail: executionStatus ?? "pending",
+      detail: formatExecutionStatus(executionStatus ?? "pending"),
       kind: "warn",
     };
   }
@@ -337,7 +407,7 @@ export function summarizeExecutionState(symbol: DecisionTimelineSymbolLike): Dec
   if (symbol.candidate_selection.selected === false) {
     const prefix = hasHistoricalDecisionGap(symbol) ? "마지막 AI 추천은 남아 있지만 " : "";
     return {
-      label: "현재 cycle 미선정",
+      label: "이번 판단 주기 주문 없음",
       detail: `${prefix}${describeSelectionReason(
         symbol.candidate_selection.rejected_reason ?? symbol.candidate_selection.selection_reason,
       )}`,
@@ -346,6 +416,13 @@ export function summarizeExecutionState(symbol: DecisionTimelineSymbolLike): Dec
   }
 
   if (symbol.risk_guard.allowed === false) {
+    if (hasPassiveHoldBlocker(symbol)) {
+      return {
+        label: "이번 판단 주기 주문 없음",
+        detail: "현재는 신규 진입 신호가 없어 대기 중입니다.",
+        kind: "neutral",
+      };
+    }
     return {
       label: "실행 없음",
       detail: "안전 점검에서 차단돼 주문이 나가지 않았습니다.",
@@ -355,8 +432,8 @@ export function summarizeExecutionState(symbol: DecisionTimelineSymbolLike): Dec
 
   if (symbol.ai_decision.decision === "hold") {
     return {
-      label: "실행 없음",
-      detail: "AI가 신규 진입을 권하지 않았습니다.",
+      label: "이번 판단 주기 주문 없음",
+      detail: "AI가 신규 진입을 기다리기로 판단했습니다.",
       kind: "neutral",
     };
   }
@@ -364,7 +441,7 @@ export function summarizeExecutionState(symbol: DecisionTimelineSymbolLike): Dec
   if (symbol.risk_guard.allowed === true && isEntryDecision(decision)) {
     return {
       label: "주문 제출 전",
-      detail: "리스크 통과는 주문 제출 완료 의미가 아니며, 현재 cycle 선정 또는 진입 트리거 확인이 더 필요합니다.",
+      detail: "리스크 통과는 주문 제출 완료 의미가 아니며, 이번 판단 주기 선정 또는 진입 트리거 확인이 더 필요합니다.",
       kind: "warn",
     };
   }
@@ -373,5 +450,26 @@ export function summarizeExecutionState(symbol: DecisionTimelineSymbolLike): Dec
     label: "실행 대상 아님",
     detail: "현재 주문 또는 진입 플랜 기록이 없습니다.",
     kind: "neutral",
+  };
+}
+
+export function summarizeRecentExecutionRecord(symbol: DecisionTimelineSymbolLike): DecisionTimelineSummary | null {
+  if (symbol.execution.order_id === null) {
+    return null;
+  }
+
+  const executionStatus = symbol.execution.execution_status ?? symbol.execution.order_status;
+  if (isHistoricalExecutionRecord(symbol)) {
+    return {
+      label: executionStatus === "filled" ? "최근 과거 체결 기록" : "최근 과거 주문 기록",
+      detail: formatExecutionStatus(executionStatus),
+      kind: "neutral",
+    };
+  }
+
+  return {
+    label: executionStatus === "filled" ? "이번 판단 주기 체결 기록" : "이번 판단 주기 주문 기록",
+    detail: formatExecutionStatus(executionStatus),
+    kind: executionStatus === "filled" ? "good" : "warn",
   };
 }

@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { usePathname } from "next/navigation";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const pollMs = 15000;
@@ -38,7 +37,6 @@ function writeSeenIds(ids: Set<number>) {
 }
 
 export function AlertNotifier() {
-  const pathname = usePathname();
   const [permission, setPermission] = useState<NotificationPermission | "unsupported" | "loading">("loading");
   const [latestAlerts, setLatestAlerts] = useState<AlertRow[]>([]);
   const seenIdsRef = useRef<Set<number>>(new Set());
@@ -119,7 +117,7 @@ export function AlertNotifier() {
     [latestAlerts],
   );
 
-  if (pathname === "/ui-example" || permission === "loading" || permission === "unsupported") {
+  if (permission === "loading" || permission === "unsupported") {
     return null;
   }
 

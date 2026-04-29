@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import timedelta
 
 from sqlalchemy import select
-
 from trading_mvp.models import AuditEvent, RiskCheck, SystemHealthEvent
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
 from trading_mvp.services.binance import BinanceAPIError

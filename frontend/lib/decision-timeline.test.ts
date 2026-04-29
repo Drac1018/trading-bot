@@ -82,7 +82,7 @@ test("historical AI snapshot is labeled separately from current cycle and execut
   assert.equal(aiSummary.kind, "warn");
   assert.ok(aiSummary.label.includes("과거"));
   assert.equal(currentCycle.kind, "neutral");
-  assert.ok(currentCycle.label.includes("현재 cycle"));
+  assert.ok(currentCycle.label.includes("이번 판단 주기"));
   assert.equal(execution.kind, "neutral");
   assert.ok(execution.detail.includes("마지막 AI 추천"));
   assert.ok(describeHistoricalDecisionGap(symbol)?.includes("현재 화면"));
@@ -126,6 +126,65 @@ test("risk pass remains distinct from order submission", async () => {
   assert.ok(risk.label.includes("주문 전"));
   assert.equal(execution.kind, "warn");
   assert.ok(execution.label.includes("주문 제출 전"));
+});
+
+test("old execution records are separated from the current decision cycle", async () => {
+  const { summarizeExecutionState, summarizeRecentExecutionRecord } = await decisionTimelineModule;
+
+  const symbol = buildSymbol({
+    ai_decision: {
+      decision: "hold",
+      created_at: "2026-04-28T11:45:41.860943",
+    },
+    risk_guard: {
+      allowed: false,
+      decision: "hold",
+      blocked_reason_codes: ["HOLD_DECISION"],
+      auto_resized_entry: false,
+      adjustment_reason_codes: [],
+      created_at: "2026-04-28T11:45:42.000000",
+    },
+    execution: {
+      order_id: 22,
+      order_status: "filled",
+      execution_status: "filled",
+      created_at: "2026-04-27T12:43:49.813126",
+    },
+    candidate_selection: {
+      selected: false,
+      selection_reason: "capacity_reached",
+      selected_reason: null,
+      rejected_reason: "capacity_reached",
+    },
+  });
+
+  const currentExecution = summarizeExecutionState(symbol);
+  const historicalExecution = summarizeRecentExecutionRecord(symbol);
+
+  assert.equal(currentExecution.label, "이번 판단 주기 주문 없음");
+  assert.equal(currentExecution.kind, "neutral");
+  assert.equal(historicalExecution?.label, "최근 과거 체결 기록");
+  assert.equal(historicalExecution?.detail, "체결 완료");
+});
+
+test("hold decision is shown as waiting rather than a hard risk block", async () => {
+  const { summarizeRiskGate } = await decisionTimelineModule;
+
+  const symbol = buildSymbol({
+    ai_decision: { decision: "hold" },
+    risk_guard: {
+      allowed: false,
+      decision: "hold",
+      blocked_reason_codes: ["HOLD_DECISION"],
+      auto_resized_entry: false,
+      adjustment_reason_codes: [],
+    },
+  });
+
+  const risk = summarizeRiskGate(symbol);
+
+  assert.equal(risk.label, "신규 진입 대기");
+  assert.equal(risk.kind, "neutral");
 });
 
 test("legacy trigger reasons are marked separately from current runtime reasons", async () => {

@@ -10,6 +10,13 @@ const labelMap: Record<string, string> = {
   rationale: "근거",
   status: "상태",
   event_category: "감사 분류",
+  event_type: "이벤트",
+  event_label: "이벤트",
+  entity_type: "대상 유형",
+  entity_type_label: "대상 유형",
+  entity_id: "대상 ID",
+  message: "메시지",
+  message_label: "메시지",
   severity: "심각도",
   priority: "우선순위",
   effort: "작업량",
@@ -24,7 +31,7 @@ const labelMap: Record<string, string> = {
   confidence: "신뢰도",
   ai_trigger_reason: "AI 호출 분류",
   ai_review_type: "AI 호출 분류",
-  ai_trigger_reason_codes: "실제 trigger reason code",
+  ai_trigger_reason_codes: "AI 호출 세부 코드",
   ai_review: "AI 검토 사유",
   ai_skip_reason: "AI 검토 생략 사유",
   last_ai_skip_reason: "AI 검토 생략 사유",
@@ -36,7 +43,7 @@ const labelMap: Record<string, string> = {
   market_signal_summary: "당시 시장 신호 요약",
   macro_event_context_summary: "이벤트 리스크",
   macro_event_risk_summary: "이벤트 리스크",
-  risk_guard_result: "risk_guard 결과",
+  risk_guard_result: "리스크 가드 결과",
   next_event_name: "다음 이벤트",
   next_event_importance: "이벤트 중요도",
   minutes_to_next_event: "이벤트까지 남은 시간",
@@ -58,6 +65,9 @@ const labelMap: Record<string, string> = {
   risk_pct: "리스크 비중",
   approved_risk_pct: "승인 리스크 비중",
   rationale_codes: "근거 코드",
+  capacity_reason: "수용 한도 사유",
+  trigger_event: "AI 호출 이벤트",
+  trigger_fingerprint: "AI 호출 지문",
   reason_codes: "판정 사유",
   blocked_reason_codes: "차단 사유",
   adjustment_reason_codes: "조정 사유",
@@ -94,7 +104,20 @@ const labelMap: Record<string, string> = {
   guard_mode_reason_category: "차단 사유 분류",
   guard_mode_reason_code: "차단 사유 코드",
   guard_mode_reason_message: "차단 사유 설명",
-  exchange_can_trade: "거래소 주문 가능 상태",
+  asset: "자산",
+  available_balance: "사용 가능 잔고",
+  total_wallet_balance: "총 지갑 잔고",
+  wallet_balance: "지갑 잔고",
+  total_unrealized_profit: "미실현 손익 합계",
+  unrealized_profit: "미실현 손익",
+  total_margin_balance: "마진 잔고 합계",
+  margin_balance: "마진 잔고",
+  max_withdraw_amount: "출금 가능 최대 금액",
+  data_source: "데이터 기준",
+  cache_status: "캐시 상태",
+  cache_stale: "캐시 지연 여부",
+  cache_age_minutes: "캐시 경과 시간(분)",
+  cache_refreshed_at: "캐시 갱신 시각",
   app_live_armed: "앱 실거래 준비",
   approval_window_open: "실거래 승인 창",
   paused: "운영 일시 중지",
@@ -136,7 +159,7 @@ const labelMap: Record<string, string> = {
   last_market_refresh_at: "마지막 시장 갱신",
   last_position_management_at: "마지막 포지션 관리",
   last_decision_at: "마지막 재검토 확인",
-  last_ai_decision_at: "마지막 AI 호출",
+  last_ai_decision_at: "최근 AI 호출",
   next_market_refresh_due_at: "다음 시장 갱신 예정",
   next_position_management_due_at: "다음 포지션 관리 예정",
   next_decision_due_at: "다음 재검토 확인 예정",
@@ -236,7 +259,7 @@ const labelMap: Record<string, string> = {
 };
 
 const valueMap: Record<string, string> = {
-  hold: "보류",
+  hold: "신규 진입 대기",
   long: "롱",
   short: "숏",
   reduce: "축소",
@@ -419,7 +442,7 @@ const reasonCodeMap: Record<string, string> = {
   INVALID_LONG_BRACKETS: "롱 포지션 보호 가격 구조가 유효하지 않습니다.",
   INVALID_SHORT_BRACKETS: "숏 포지션 보호 가격 구조가 유효하지 않습니다.",
   SLIPPAGE_THRESHOLD_EXCEEDED: "슬리피지가 허용 범위를 초과했습니다.",
-  HOLD_DECISION: "현재 판단은 HOLD입니다.",
+  HOLD_DECISION: "현재는 신규 진입 신호가 없어 대기 중입니다.",
   LIVE_ENV_DISABLED: "실거래 환경 플래그가 꺼져 있습니다.",
   LIVE_TRADING_DISABLED: "실거래 사용 설정이 꺼져 있습니다.",
   ROLLOUT_MODE_SHADOW: "그림자 점검 단계라 실제 주문은 보내지 않습니다.",
@@ -586,7 +609,7 @@ function formatBoolean(key: string | undefined, value: boolean) {
   if (key === "allow_same_side_add_on") return value ? "허용" : "불가";
   if (key === "schema_valid") return value ? "정상" : "실패";
   if (key === "trading_paused") return value ? "중지됨" : "운영 중";
-  if (key === "exchange_can_trade") return value ? "가능" : "차단";
+  if (key === "cache_stale") return value ? "오래됨" : "정상";
   if (key === "app_live_armed") return value ? "준비됨" : "해제됨";
   if (key === "approval_window_open") return value ? "열림" : "닫힘";
   if (key === "paused") return value ? "중지됨" : "운영 중";
@@ -602,9 +625,6 @@ function formatBoolean(key: string | undefined, value: boolean) {
   }
   return value ? "예" : "아니오";
 }
-
-export const exchangeCanTradeAccountHint =
-  "거래소 계좌 응답 기준으로 새 주문이 명시적으로 차단됐는지 보여줍니다. canTrade 필드가 없는 선물 응답은 차단으로 간주하지 않으며, 앱 실주문 준비 상태는 별도로 확인해야 합니다.";
 
 export type MacroEventContextSummary = {
   source_status?: string | null;
@@ -704,7 +724,7 @@ export function formatMacroEventContextDetail(value: unknown): string {
     parts.push(`중요도 ${formatDisplayValue(context.next_event_importance)}`);
   }
   if (context.active_risk_window) {
-    parts.push("active risk window");
+    parts.push("이벤트 리스크 구간 활성");
   }
   if (context.release_reaction_window) {
     parts.push("발표 직후 변동성 구간");
@@ -799,8 +819,12 @@ export function normalizeDisplayValue(value: unknown, key?: string): unknown {
 export function getRowTitle(row: Record<string, unknown>, index: number) {
   const symbol = typeof row.symbol === "string" ? row.symbol : null;
   const timeframe = typeof row.timeframe === "string" ? row.timeframe : null;
+  const asset = typeof row.asset === "string" ? row.asset : null;
   if (symbol && timeframe) {
     return `${symbol} / ${timeframe}`;
+  }
+  if (asset) {
+    return asset;
   }
   if (typeof row.title === "string") {
     return row.title;
@@ -814,7 +838,10 @@ export function getRowTitle(row: Record<string, unknown>, index: number) {
   if (typeof row.event_type === "string") {
     return translateString(row.event_type);
   }
-  return `항목 ${index + 1}`;
+  if (typeof row.id === "number" || typeof row.id === "string") {
+    return `ID ${formatDisplayValue(row.id, "id")}`;
+  }
+  return `데이터 항목 ${index + 1}`;
 }
 
 export function formatListValue(value: unknown, key?: string): string[] {

@@ -50,20 +50,20 @@ function fallbackAiModelRoutingPolicy(primaryModel: string): AIModelRoutingPolic
     read_only: true,
     runtime_model_source: "settings.ai_model",
     summary:
-      "기존 payload 기준입니다. pre-AI skip과 dashboard read-model은 모델을 호출하지 않고, provider 호출 경로는 설정된 모델을 사용합니다.",
+      "기존 payload 기준입니다. AI 호출 전 생략과 대시보드 읽기 모델은 모델을 호출하지 않고, 제공자 호출 경로는 설정된 모델을 사용합니다.",
     no_model_call_routes: ["pre_ai_skip_simple_classification", "daily_dashboard_explanation"],
     candidate_model_routes: ["macro_event_position_complex", "operator_manual_high_risk"],
     routes: [
       {
         route: "pre_ai_skip_simple_classification",
-        label: "pre-AI skip / simple classification",
+        label: "AI 호출 전 생략 / 단순 분류",
         call_policy: "no_model_call",
         configured_model: null,
         model_candidates: [],
       },
       {
         route: "general_entry_review",
-        label: "general entry review",
+        label: "일반 진입 검토",
         call_policy: "provider_invoked_when_gate_allows",
         configured_model: primaryModel,
         default_model: "gpt-4.1-mini",
@@ -71,7 +71,7 @@ function fallbackAiModelRoutingPolicy(primaryModel: string): AIModelRoutingPolic
       },
       {
         route: "macro_event_position_complex",
-        label: "macro event + position + complex judgment",
+        label: "거시 이벤트 + 포지션 + 복합 판단",
         call_policy: "candidate_model_tier",
         configured_model: primaryModel,
         default_model: "gpt-4.1-mini",
@@ -79,7 +79,7 @@ function fallbackAiModelRoutingPolicy(primaryModel: string): AIModelRoutingPolic
       },
       {
         route: "operator_manual_high_risk",
-        label: "operator manual review / high risk",
+        label: "운영자 수동 검토 / 고위험 상황",
         call_policy: "candidate_model_tier",
         configured_model: primaryModel,
         default_model: "gpt-5-mini",
@@ -87,7 +87,7 @@ function fallbackAiModelRoutingPolicy(primaryModel: string): AIModelRoutingPolic
       },
       {
         route: "daily_dashboard_explanation",
-        label: "daily dashboard explanation",
+        label: "일상 대시보드 설명",
         call_policy: "read_model_no_model_call",
         configured_model: null,
         model_candidates: [],
@@ -98,11 +98,11 @@ function fallbackAiModelRoutingPolicy(primaryModel: string): AIModelRoutingPolic
 
 function routeLabel(route: AIModelRoutePolicyItem) {
   const labels: Record<string, string> = {
-    pre_ai_skip_simple_classification: "pre-AI skip / 단순 분류",
-    general_entry_review: "일반 entry review",
-    macro_event_position_complex: "macro event + 포지션 + 복합 판단",
-    operator_manual_high_risk: "운영자 수동 review / 고위험 상황",
-    daily_dashboard_explanation: "일상 dashboard 설명",
+    pre_ai_skip_simple_classification: "AI 호출 전 생략 / 단순 분류",
+    general_entry_review: "일반 진입 검토",
+    macro_event_position_complex: "거시 이벤트 + 포지션 + 복합 판단",
+    operator_manual_high_risk: "운영자 수동 검토 / 고위험 상황",
+    daily_dashboard_explanation: "일상 대시보드 설명",
   };
   return labels[route.route] ?? route.label ?? route.route;
 }
@@ -266,11 +266,11 @@ export function IntegrationSettingsPanel({
                 <p className="text-sm font-semibold text-slate-900">AI 모델 호출 정책</p>
                 <p className="mt-1 text-sm leading-6 text-slate-600">
                   {modelRoutingPolicy.summary ??
-                    "pre-AI skip과 dashboard read-model은 모델을 호출하지 않고, provider 호출 경로는 설정된 모델을 사용합니다."}
+                    "AI 호출 전 생략과 대시보드 읽기 모델은 모델을 호출하지 않고, 제공자 호출 경로는 설정된 모델을 사용합니다."}
                 </p>
               </div>
               <StatusPill tone={modelRoutingPolicy.read_only === false ? "warn" : "neutral"}>
-                {modelRoutingPolicy.read_only === false ? "runtime routing" : "read-only"}
+                {modelRoutingPolicy.read_only === false ? "런타임 라우팅" : "읽기 전용"}
               </StatusPill>
             </div>
             <div className="mt-4 grid gap-3">
@@ -301,9 +301,9 @@ export function IntegrationSettingsPanel({
             <div>
               <h3 className="text-lg font-semibold text-slate-900">외부 이벤트 소스</h3>
               <p className="mt-2 text-sm leading-6 text-slate-600">
-                FRED 기반 매크로 일정 source를 settings에서 고정하거나, 비워 두고 기존 env fallback을 유지할 수 있습니다.
-                아래 BLS/BEA enrichment API는 발표가 지난 이벤트의 actual 값을 보강하는 observe-only layer이며
-                `risk_guard`를 직접 바꾸지 않습니다.
+                FRED 기반 매크로 일정 소스를 설정에서 고정하거나, 비워 두고 기존 환경 변수 대체 경로를 유지할 수 있습니다.
+                아래 BLS/BEA 보강 API는 발표가 지난 이벤트의 실제값을 보강하는 관찰 전용 계층이며
+                리스크 가드를 직접 바꾸지 않습니다.
               </p>
             </div>
             <StatusPill tone={state.event_source_provider === "fred" ? "good" : "neutral"}>
@@ -311,12 +311,12 @@ export function IntegrationSettingsPanel({
             </StatusPill>
           </div>
           <div className="mt-4 rounded-md border border-slate-200 bg-white px-4 py-3">
-            <p className="text-xs text-slate-500">현재 런타임 event source</p>
+            <p className="text-xs text-slate-500">현재 런타임 이벤트 소스</p>
             <p className="mt-2 text-sm font-semibold text-slate-900">{eventSourceProvenanceLabel}</p>
             {eventSourceVendorLabel ? (
-              <p className="mt-2 text-sm text-slate-700">primary calendar vendor: {eventSourceVendorLabel}</p>
+              <p className="mt-2 text-sm text-slate-700">주 일정 제공자: {eventSourceVendorLabel}</p>
             ) : null}
-            <p className="mt-1 text-sm text-slate-700">post-release enrichment: {eventEnrichmentLabel}</p>
+            <p className="mt-1 text-sm text-slate-700">발표 후 실제값 보강: {eventEnrichmentLabel}</p>
             <p className="mt-2 text-sm leading-6 text-slate-700">{eventSourceHelp}</p>
           </div>
           <div className="mt-4 grid gap-4 md:grid-cols-2">

@@ -39,6 +39,9 @@ type MacroEventContextSummary = {
   is_incomplete?: boolean | null;
   affected_assets?: string[] | null;
   enrichment_vendors?: string[] | null;
+  failed_release_ids?: number[] | null;
+  parse_failed_release_ids?: number[] | null;
+  complete_reference?: Record<string, unknown> | null;
   bls_actual_enriched?: boolean | null;
   bea_actual_enriched?: boolean | null;
   event_risk_active?: boolean | null;
@@ -147,6 +150,12 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function asNumberArray(value: unknown): number[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+    : [];
+}
+
 function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -156,6 +165,10 @@ function asBoolean(value: unknown): boolean | null {
 }
 
 function unique(values: string[]) {
+  return values.filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function uniqueNumbers(values: number[]) {
   return values.filter((item, index, array) => array.indexOf(item) === index);
 }
 
@@ -277,7 +290,7 @@ const displayValueMap: Record<string, string> = {
   MACRO_EVENT_CONTEXT_STALE: "이벤트 데이터 지연",
   MACRO_EVENT_CONTEXT_INCOMPLETE: "이벤트 데이터 불완전",
   MACRO_EVENT_ENRICHMENT_AVAILABLE: "경제지표 실제값 반영 가능",
-  HOLD_DECISION: "현재 판단은 HOLD입니다.",
+  HOLD_DECISION: "현재는 신규 진입 신호가 없어 대기 중입니다.",
   STALE_MARKET_DATA: "시장 데이터 지연",
   low: "낮음",
   medium: "보통",
@@ -376,7 +389,7 @@ function formatMacroEventContextDetail(value: Record<string, unknown>) {
     parts.push(`중요도 ${formatDisplayValue(eventImportance)}`);
   }
   if (asBoolean(value.active_risk_window)) {
-    parts.push("active risk window");
+    parts.push("이벤트 리스크 구간 활성");
   }
   if (asBoolean(value.release_reaction_window)) {
     parts.push("발표 직후 변동성 구간");
@@ -466,9 +479,9 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
     symbol.ai_decision.macro_event_risk_summary ?? symbol.ai_decision.macro_event_context_summary,
   );
   const eventControl = symbol.event_operator_control ?? null;
-  const eventContext = hasRecordValues(macroEventRiskContext)
-    ? macroEventRiskContext
-    : asRecord(eventControl?.event_context ?? legacyEventContext);
+  const currentEventContext = asRecord(eventControl?.event_context ?? legacyEventContext);
+  const eventContext = currentEventContext;
+  const aiMacroEventContext = macroEventRiskContext;
   const operatorEventView = eventControl?.operator_event_view ?? null;
   const operatorEventViewConfigured = resolveOperatorEventViewConfigured(eventControl);
   const alignmentDecision = eventControl?.alignment_decision ?? null;
@@ -520,21 +533,27 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
   const aiConfidence =
     typeof eventControl?.ai_event_view?.ai_confidence === "number"
       ? eventControl.ai_event_view.ai_confidence
-      : symbol.ai_decision.confidence;
+      : null;
   const aiScenarioNote =
     eventControl?.ai_event_view?.scenario_note
-    ?? symbol.ai_decision.scenario_note
     ?? symbol.ai_decision.event_risk_acknowledgement
     ?? "정보 없음";
   const aiPenaltyReason =
     eventControl?.ai_event_view?.confidence_penalty_reason
-    ?? symbol.ai_decision.confidence_penalty_reason
     ?? "정보 없음";
 
   const nextEventName = asString(eventContext.next_event_name) ?? "정보 없음";
   const minutesToNextEvent = asNumber(eventContext.minutes_to_next_event);
   const activeRiskWindow = asBoolean(eventContext.active_risk_window) ?? false;
   const affectedAssets = asStringArray(eventContext.affected_assets);
+  const completeReference = asRecord(eventContext.complete_reference);
+  const missingReleaseIds = uniqueNumbers([
+    ...asNumberArray(eventContext.failed_release_ids),
+    ...asNumberArray(eventContext.parse_failed_release_ids),
+  ]);
+  const hasCompleteReference = rawEventSourceStatus === "incomplete" && hasRecordValues(completeReference);
+  const completeReferenceEventName = asString(completeReference.next_event_name) ?? "정보 없음";
+  const completeReferenceGeneratedAt = asString(completeReference.generated_at);
 
   const riskBlockedReason = symbol.risk_guard.blocked_reason ?? null;
   const riskApprovalRequiredReason = symbol.risk_guard.approval_required_reason ?? null;
@@ -635,19 +654,19 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
           hint: "신규 진입 후보 검토, 돌파 예외 검토, 보호 상태 점검처럼 실제 검토 경로를 보여줍니다.",
         },
         {
-          label: "trigger reason",
+          label: "AI 호출 사유",
           value: aiTriggerReason ?? "정보 없음",
-          hint: "AI 호출 원인이 되는 runtime trigger입니다. 시장 feature 요약과 분리해서 봅니다.",
+          hint: "AI 호출 원인이 되는 런타임 트리거입니다. 시장 지표 요약과 분리해서 봅니다.",
         },
         {
-          label: "trigger reason code",
+          label: "AI 호출 사유 코드",
           value: formatReasonCodes(aiTriggerReasonCodes),
-          hint: "pre-AI gate나 trigger가 남긴 원본 사유 코드입니다.",
+          hint: "AI 호출 전 차단/트리거가 남긴 내부 사유 코드입니다.",
         },
         {
           label: "AI 검토 생략",
           value: aiSkipReason ? formatDisplayValue(aiSkipReason) : "없음",
-          hint: aiSkipReason ? `원본 코드: ${aiSkipReason}` : "pre-AI skip이 없으면 없음으로 표시합니다.",
+          hint: aiSkipReason ? "판단 전 생략 여부" : "AI 호출 전 생략이 없으면 없음으로 표시합니다.",
         },
         {
           label: "공급자 상태",
@@ -665,17 +684,17 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
         {
           label: "요약",
           value: marketSignalSummary,
-          hint: "AI 호출 원인이 아니라 판단 당시 시장 feature 요약입니다.",
+          hint: "AI 호출 원인이 아니라 판단 당시 시장 지표 요약입니다.",
         },
         {
           label: "모멘텀",
           value: formatOptionalDisplay(marketSignalContext.momentum_state ?? regime.momentum_state),
-          hint: "AI 판단 당시 값이 있으면 우선 사용하고, legacy payload는 현재 레짐 요약으로 보완합니다.",
+          hint: "AI 판단 당시 값이 있으면 우선 사용하고, 과거 payload는 현재 레짐 요약으로 보완합니다.",
         },
         {
           label: "거래량",
           value: formatOptionalDisplay(marketSignalContext.volume_regime ?? regime.volume_regime),
-          hint: "거래량 강도 또는 pre-AI 약한 거래량 판단을 이해하기 위한 시장 feature입니다.",
+          hint: "거래량 강도 또는 AI 호출 전 약한 거래량 판단을 이해하기 위한 시장 지표입니다.",
         },
         {
           label: "추세 정렬",
@@ -699,6 +718,27 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
           label: "이벤트 요약",
           value: formatMacroEventContextSummary(eventContext),
           hint: formatMacroEventContextDetail(eventContext),
+        },
+        {
+          label: "AI 판단 당시 이벤트",
+          value: hasMacroEventContext(aiMacroEventContext)
+            ? formatMacroEventContextSummary(aiMacroEventContext)
+            : "정보 없음",
+          hint: formatMacroEventContextDetail(aiMacroEventContext),
+        },
+        {
+          label: "직전 완전본",
+          value: hasCompleteReference
+            ? `${completeReferenceEventName} / ${formatUtcTimestamp(completeReferenceGeneratedAt)}`
+            : "없음",
+          hint: hasCompleteReference
+            ? "최신 조회 일부 실패 / 직전 완전본 참고"
+            : "최신 이벤트 조회가 완전하면 별도 참고본이 필요 없습니다.",
+        },
+        {
+          label: "누락 release",
+          value: missingReleaseIds.length > 0 ? missingReleaseIds.join(", ") : "없음",
+          hint: "FRED release fetch 또는 parse 실패가 있으면 release_id를 보여줍니다.",
         },
         { label: "다음 이벤트", value: nextEventName, hint: "가장 가까운 중요 일정입니다." },
         { label: "이벤트 시각", value: formatUtcTimestamp(asString(eventContext.next_event_at)), hint: "모든 시각은 UTC 기준입니다." },
@@ -740,15 +780,23 @@ export function buildOperatorDetailSections(symbol: OperatorDetailSymbolLike): O
         },
       ],
       alerts:
-        normalizedEventSourceStatus !== "available" && normalizedEventSourceStatus !== "unknown"
-          ? [{
-              tone: toneForSourceStatus(rawEventSourceStatus),
-              text: describeSourceStatusHelp(rawEventSourceStatus, {
-                kind: "event_context",
-                provenance: eventSourceProvenance,
-              }),
-            }]
-          : [],
+        [
+          ...(normalizedEventSourceStatus !== "available" && normalizedEventSourceStatus !== "unknown"
+            ? [{
+                tone: toneForSourceStatus(rawEventSourceStatus),
+                text: describeSourceStatusHelp(rawEventSourceStatus, {
+                  kind: "event_context",
+                  provenance: eventSourceProvenance,
+                }),
+              }]
+            : []),
+          ...(hasCompleteReference
+            ? [{
+                tone: "warn" as const,
+                text: "최신 조회 일부 실패 / 직전 완전본 참고",
+              }]
+            : []),
+        ],
     },
     {
       key: "ai_event_view",

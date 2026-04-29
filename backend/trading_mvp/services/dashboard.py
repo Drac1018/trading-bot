@@ -39,8 +39,8 @@ from trading_mvp.schemas import (
     OperatorDecisionSnapshot,
     OperatorExecutionFillSummary,
     OperatorExecutionSnapshot,
-    OperatorMarketSignalSummary,
     OperatorMarketSignalSnapshot,
+    OperatorMarketSignalSummary,
     OperatorPositionSummary,
     OperatorProtectionSummary,
     OperatorRiskGuardResultSnapshot,
@@ -130,6 +130,10 @@ EVENT_CONTEXT_SUMMARY_KEYS = (
     "is_stale",
     "is_complete",
     "affected_assets",
+    "enrichment_vendors",
+    "failed_release_ids",
+    "parse_failed_release_ids",
+    "complete_reference",
 )
 EVENT_CONTEXT_VISIBILITY_DEFAULTS = {
     "source_status": "unavailable",
@@ -1009,7 +1013,6 @@ def _market_signal_context_from_decision_row(row: AgentRun | None) -> OperatorMa
     if row is None:
         return OperatorMarketSignalSnapshot()
     input_payload = _as_dict(row.input_payload)
-    output_payload = _as_dict(row.output_payload)
     features = _as_dict(input_payload.get("features"))
     regime = _as_dict(features.get("regime"))
     breakout = _as_dict(features.get("breakout"))
@@ -1211,6 +1214,17 @@ def _decision_macro_event_context_summary(row: AgentRun | None) -> OperatorDecis
             )
         ),
         enrichment_vendors=enrichment_vendors,
+        failed_release_ids=[
+            int(item)
+            for item in _as_string_list(full_event_context.get("failed_release_ids"))
+            if str(item).isdigit()
+        ],
+        parse_failed_release_ids=[
+            int(item)
+            for item in _as_string_list(full_event_context.get("parse_failed_release_ids"))
+            if str(item).isdigit()
+        ],
+        complete_reference=_as_dict(full_event_context.get("complete_reference")),
         bls_actual_enriched=bls_actual_enriched,
         bea_actual_enriched=bea_actual_enriched,
         event_risk_active=bool(
@@ -2949,17 +2963,26 @@ def _latest_rows_by_symbol(
     timestamp_column: Any,
     *conditions: Any,
 ) -> dict[str, Any]:
-    symbol_column = model.symbol
+    symbol_set = {str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()}
+    if not symbol_set:
+        return {}
     rows: dict[str, Any] = {}
-    for symbol in symbols:
-        row = session.scalar(
-            select(model)
-            .where(symbol_column == symbol, *conditions)
-            .order_by(desc(timestamp_column))
-            .limit(1)
-        )
-        if row is not None:
-            rows[str(symbol).upper()] = row
+
+    def consume(result: Sequence[Any]) -> bool:
+        for row in result:
+            symbol = str(getattr(row, "symbol", "") or "").upper()
+            if symbol in symbol_set and symbol not in rows:
+                rows[symbol] = row
+            if len(rows) == len(symbol_set):
+                return True
+        return False
+
+    statement = select(model).where(*conditions).order_by(desc(timestamp_column))
+    scan_limit = max(OPERATOR_RECENT_ROW_SCAN_LIMIT, len(symbol_set))
+    limited_rows = list(session.scalars(statement.limit(scan_limit)))
+    if consume(limited_rows) or len(limited_rows) < scan_limit:
+        return rows
+    consume(list(session.scalars(statement.offset(scan_limit).limit(scan_limit))))
     return rows
 
 
