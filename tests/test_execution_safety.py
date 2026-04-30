@@ -19,6 +19,8 @@ from trading_mvp.services.binance_user_stream import normalize_user_stream_event
 from trading_mvp.services.execution import (
     _cancel_exit_orders,
     _cap_quantity_to_approved_notional,
+    _record_live_trades,
+    _signed_slippage_bps,
     apply_normalized_user_stream_events,
     apply_position_management,
     build_execution_intent,
@@ -218,6 +220,83 @@ def _add_pending_live_order(
         )
     )
     db_session.flush()
+
+
+def test_signed_slippage_bps_long_entry_adverse() -> None:
+    assert _signed_slippage_bps(side="BUY", requested_price=100.0, fill_price=101.0) == pytest.approx(100.0)
+
+
+def test_signed_slippage_bps_long_entry_favorable() -> None:
+    assert _signed_slippage_bps(side="BUY", requested_price=100.0, fill_price=99.0) == pytest.approx(-100.0)
+
+
+def test_signed_slippage_bps_short_entry_adverse() -> None:
+    assert _signed_slippage_bps(side="SELL", requested_price=100.0, fill_price=99.0) == pytest.approx(100.0)
+
+
+def test_signed_slippage_bps_short_entry_favorable() -> None:
+    assert _signed_slippage_bps(side="SELL", requested_price=100.0, fill_price=101.0) == pytest.approx(-100.0)
+
+
+def test_signed_slippage_bps_long_exit_adverse() -> None:
+    assert _signed_slippage_bps(side="SELL", requested_price=100.0, fill_price=99.0) == pytest.approx(100.0)
+
+
+def test_signed_slippage_bps_short_exit_adverse() -> None:
+    assert _signed_slippage_bps(side="BUY", requested_price=100.0, fill_price=101.0) == pytest.approx(100.0)
+
+
+def test_signed_slippage_bps_missing_prices_returns_zero() -> None:
+    assert _signed_slippage_bps(side="BUY", requested_price=0.0, fill_price=101.0) == 0.0
+    assert _signed_slippage_bps(side="SELL", requested_price=100.0, fill_price=0.0) == 0.0
+
+
+def test_record_live_trades_stores_signed_slippage_without_changing_absolute_slippage(db_session) -> None:
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=None,
+        risk_check_id=None,
+        position_id=None,
+        side="buy",
+        order_type="market",
+        mode="live",
+        status="filled",
+        external_order_id="signed-order-1",
+        client_order_id="signed-client-1",
+        reduce_only=False,
+        close_only=False,
+        parent_order_id=None,
+        exchange_status="FILLED",
+        requested_quantity=1.0,
+        requested_price=100.0,
+        filled_quantity=1.0,
+        average_fill_price=101.0,
+        reason_codes=[],
+        metadata_json={},
+    )
+    db_session.add(order)
+    db_session.flush()
+
+    _record_live_trades(
+        db_session,
+        order,
+        [
+            {
+                "id": "signed-trade-1",
+                "price": "101",
+                "qty": "1",
+                "commission": "0.1",
+                "commissionAsset": "USDT",
+                "realizedPnl": "0",
+            }
+        ],
+    )
+    execution = db_session.scalar(select(Execution).where(Execution.external_trade_id == "signed-trade-1"))
+
+    assert execution is not None
+    assert execution.slippage_pct == pytest.approx(0.01)
+    assert execution.payload["signed_slippage_pct"] == pytest.approx(0.01)
+    assert execution.payload["signed_slippage_bps"] == pytest.approx(100.0)
 
 
 def test_execute_live_trade_returns_blocked_without_touching_exchange_when_risk_disallows(monkeypatch, db_session) -> None:
@@ -1131,6 +1210,71 @@ class EntrySuccessClient:
     def cancel_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
         self.orders = [item for item in self.orders if str(item.get("orderId", "")) != str(order_id or "")]
         return {"status": "CANCELED"}
+
+
+class SignedSlippageEntryClient(EntrySuccessClient):
+    def __init__(self, *, fill_price: float) -> None:
+        super().__init__()
+        self.fill_price = fill_price
+
+    def get_position_information(self, symbol: str):
+        self.position_information_calls += 1
+        if not self.entry_submitted:
+            return []
+        return [
+            {
+                "positionAmt": "0.01",
+                "entryPrice": str(self.fill_price),
+                "markPrice": str(self.fill_price),
+                "leverage": "2",
+            }
+        ]
+
+    def new_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        stop_price: float | None = None,
+        reduce_only: bool = False,
+        close_position: bool = False,
+        client_order_id: str | None = None,
+        response_type: str = "RESULT",
+        working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
+    ):
+        if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            return super().new_order(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                price=price,
+                stop_price=stop_price,
+                reduce_only=reduce_only,
+                close_position=close_position,
+                client_order_id=client_order_id,
+                response_type=response_type,
+                working_type=working_type,
+                time_in_force=time_in_force,
+            )
+        self.entry_submitted = True
+        return {"orderId": "signed-entry-1", "status": "FILLED", "executedQty": quantity or 0.01, "avgPrice": str(self.fill_price)}
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        return [
+            {
+                "id": "trade-signed-entry-1",
+                "price": str(self.fill_price),
+                "qty": "0.01",
+                "commission": "0.1",
+                "commissionAsset": "USDT",
+                "realizedPnl": "0.0",
+            }
+        ]
 
 
 class AutoResizeCaptureClient(EntrySuccessClient):
@@ -2093,6 +2237,44 @@ def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_sess
     assert client.account_info_calls >= 3
     assert client.open_orders_calls >= 3
     assert client.position_information_calls >= 3
+
+
+def test_live_execution_records_signed_slippage_in_result_audit_and_execution(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = SignedSlippageEntryClient(fill_price=70100.0)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=51,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    expected_signed_bps = ((70100.0 - 70000.0) / 70000.0) * 10000.0
+    execution = db_session.scalar(select(Execution).where(Execution.external_trade_id == "trade-signed-entry-1"))
+    order = db_session.scalar(select(Order).where(Order.external_order_id == "signed-entry-1"))
+    audit_event = db_session.scalar(select(AuditEvent).where(AuditEvent.event_type == "live_execution").order_by(AuditEvent.id.desc()))
+
+    assert result["status"] == "filled"
+    assert result["entry_execution_type"] == "entry_passive_limit"
+    assert result["signed_slippage_bps"] == pytest.approx(expected_signed_bps)
+    assert result["execution_quality"]["entry_execution_type"] == "entry_passive_limit"
+    assert result["execution_quality"]["signed_slippage_bps"] == pytest.approx(expected_signed_bps)
+    assert execution is not None
+    assert execution.slippage_pct == pytest.approx((70100.0 - 70000.0) / 70000.0)
+    assert execution.payload["entry_execution_type"] == "entry_passive_limit"
+    assert execution.payload["signed_slippage_bps"] == pytest.approx(expected_signed_bps)
+    assert order is not None
+    assert order.metadata_json["entry_execution_type"] == "entry_passive_limit"
+    assert audit_event is not None
+    assert audit_event.payload["entry_execution_type"] == "entry_passive_limit"
+    assert audit_event.payload["signed_slippage_bps"] == pytest.approx(expected_signed_bps)
+    assert audit_event.payload["execution_quality"]["entry_execution_type"] == "entry_passive_limit"
+    assert audit_event.payload["execution_quality"]["signed_slippage_bps"] == pytest.approx(expected_signed_bps)
 
 
 def test_position_management_context_uses_position_holding_profile_without_stop_widening(db_session) -> None:

@@ -113,6 +113,9 @@ from trading_mvp.time_utils import utcnow_naive
 FINAL_ORDER_STATUSES = {"filled", "canceled", "rejected", "expired"}
 AUTO_RESUME_DELAY_MINUTES = 5
 PROTECTIVE_ORDER_TYPES = ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT = "entry_passive_limit"
+ENTRY_EXECUTION_TYPE_MARKETABLE = "entry_marketable"
+ENTRY_EXECUTION_TYPE_UNKNOWN = "entry_unknown"
 PROTECTION_RETRY_ATTEMPTS = 2
 PROTECTION_VERIFY_DEADLINE_SECONDS = 30
 PROTECTION_VERIFY_FETCH_ATTEMPTS = 2
@@ -876,6 +879,11 @@ def apply_user_stream_event(
             if trade_id and trade_id != "0" and last_fill_quantity > 0:
                 existing = session.scalar(select(Execution).where(Execution.external_trade_id == trade_id).limit(1))
                 if existing is None:
+                    signed_slippage_bps = _signed_slippage_bps(
+                        side=row.side,
+                        requested_price=row.requested_price,
+                        fill_price=last_fill_price,
+                    )
                     session.add(
                         Execution(
                             order_id=row.id,
@@ -891,7 +899,13 @@ def apply_user_stream_event(
                             if last_fill_price > 0 and row.requested_price > 0
                             else 0.0,
                             realized_pnl=_to_float(order_update.get("rp")),
-                            payload={"user_stream": dict(order_update)},
+                            payload={
+                                "user_stream": dict(order_update),
+                                "requested_price": row.requested_price,
+                                "requested_quantity": row.requested_quantity,
+                                "signed_slippage_pct": signed_slippage_bps / 10000.0,
+                                "signed_slippage_bps": signed_slippage_bps,
+                            },
                         )
                     )
             applied_symbols.append(symbol)
@@ -2541,6 +2555,44 @@ def _flag_enabled(value: object) -> bool:
     return str(value).lower() == "true"
 
 
+def _signed_slippage_bps(*, side: str | None, requested_price: float | None, fill_price: float | None) -> float:
+    requested = _to_float(requested_price)
+    filled = _to_float(fill_price)
+    if requested <= 0 or filled <= 0:
+        return 0.0
+    raw_bps = ((filled - requested) / requested) * 10000.0
+    side_key = str(side or "").lower()
+    if side_key == "buy":
+        return raw_bps
+    if side_key == "sell":
+        return -raw_bps
+    return 0.0
+
+
+def _entry_execution_type_for_plan(
+    plan: ExecutionPlan,
+    *,
+    order_type: str | None = None,
+    execution_quality: dict[str, object] | None = None,
+) -> str:
+    if plan.intent_type not in {"entry", "scale_in"}:
+        return ENTRY_EXECUTION_TYPE_UNKNOWN
+    quality = execution_quality or {}
+    if _flag_enabled(quality.get("aggressive_fallback_used")):
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    policy_name = str(plan.policy_name or "").lower()
+    if "marketable" in policy_name or "market" in policy_name or plan.marketable:
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    if "passive" in policy_name or "maker" in policy_name:
+        return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+    normalized_order_type = str(order_type or plan.order_type or "").lower()
+    if normalized_order_type == "limit":
+        return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+    if normalized_order_type == "market" or normalized_order_type.endswith("_market"):
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    return ENTRY_EXECUTION_TYPE_UNKNOWN
+
+
 def _record_live_trades(session: Session, order: Order, trades: list[dict[str, object]]) -> tuple[float, float]:
     fee_total = 0.0
     realized_total = 0.0
@@ -2555,6 +2607,12 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
         fill_quantity = abs(_to_float(trade.get("qty")))
         fee_paid = abs(_to_float(trade.get("commission")))
         realized_pnl = _to_float(trade.get("realizedPnl"))
+        metadata = _as_object_dict(order.metadata_json)
+        signed_slippage_bps = _signed_slippage_bps(
+            side=order.side,
+            requested_price=order.requested_price,
+            fill_price=fill_price,
+        )
         execution = Execution(
             order_id=order.id,
             position_id=order.position_id,
@@ -2572,7 +2630,10 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
                 "requested_price": order.requested_price,
                 "requested_quantity": order.requested_quantity,
                 "order_type": order.order_type,
-                "execution_policy": (order.metadata_json or {}).get("execution_policy"),
+                "execution_policy": metadata.get("execution_policy"),
+                "entry_execution_type": metadata.get("entry_execution_type", ENTRY_EXECUTION_TYPE_UNKNOWN),
+                "signed_slippage_pct": signed_slippage_bps / 10000.0,
+                "signed_slippage_bps": signed_slippage_bps,
             },
         )
         session.add(execution)
@@ -3469,6 +3530,7 @@ def _classify_execution_quality(
 def _build_execution_quality_summary(
     *,
     plan: ExecutionPlan,
+    side: str,
     requested_quantity: float,
     requested_price: float,
     filled_quantity: float,
@@ -3482,6 +3544,11 @@ def _build_execution_quality_summary(
     slippage_pct = 0.0
     if filled_quantity > 0 and average_fill_price > 0:
         slippage_pct = abs(average_fill_price - requested_price) / max(requested_price, 1.0)
+    signed_slippage_bps = _signed_slippage_bps(
+        side=side,
+        requested_price=requested_price,
+        fill_price=average_fill_price if filled_quantity > 0 else 0.0,
+    )
     fill_ratio = 0.0 if requested_quantity <= 0 else min(filled_quantity / requested_quantity, 1.0)
     timed_out_attempts = sum(1 for attempt in execution_attempts if bool(attempt.get("timed_out")))
     partial_fill_attempts = sum(
@@ -3497,6 +3564,10 @@ def _build_execution_quality_summary(
         aggressive_fallback_used=aggressive_fallback_used,
         slippage_pct=slippage_pct,
         slippage_threshold_pct=slippage_threshold_pct,
+    )
+    entry_execution_type = _entry_execution_type_for_plan(
+        plan,
+        execution_quality={"aggressive_fallback_used": aggressive_fallback_used},
     )
     return {
         "policy_profile": plan.policy_profile,
@@ -3514,12 +3585,15 @@ def _build_execution_quality_summary(
         "partial_fill_attempts": partial_fill_attempts,
         "aggressive_fallback_used": aggressive_fallback_used,
         "realized_slippage_pct": slippage_pct,
+        "signed_slippage_pct": signed_slippage_bps / 10000.0,
+        "signed_slippage_bps": signed_slippage_bps,
         "slippage_threshold_pct": slippage_threshold_pct,
         "fees_total": fee_paid,
         "realized_pnl_total": realized_pnl,
         "net_realized_pnl_total": realized_pnl - fee_paid,
         "execution_quality_status": execution_quality_status,
         "decision_quality_status": decision_quality_status,
+        "entry_execution_type": entry_execution_type,
         "signal_vs_execution_note": (
             "Execution quality is measured separately from signal outcome; signal outcome stays pending until realized PnL closes."
         ),
@@ -3898,6 +3972,10 @@ def _execute_primary_order_with_policy(
         order.metadata_json = {
             **(order.metadata_json or {}),
             "execution_policy": execution_plan.to_payload(),
+            "entry_execution_type": _entry_execution_type_for_plan(
+                execution_plan,
+                order_type=current_order_type,
+            ),
             "execution_attempt": attempt_index + 1,
         }
         _apply_submission_tracking(
@@ -4002,6 +4080,11 @@ def _execute_primary_order_with_policy(
         fill_slippage_pct = 0.0
         if filled_quantity > 0 and average_fill_price > 0:
             fill_slippage_pct = abs(average_fill_price - requested_price) / max(requested_price, 1.0)
+        fill_signed_slippage_bps = _signed_slippage_bps(
+            side=side,
+            requested_price=requested_price,
+            fill_price=average_fill_price if filled_quantity > 0 else 0.0,
+        )
         if filled_quantity > 0:
             total_fee_paid += fee_paid
             total_realized_pnl += realized_pnl
@@ -4022,6 +4105,7 @@ def _execute_primary_order_with_policy(
                         "filled_quantity": filled_quantity,
                         "remaining_quantity": max(submitted_quantity - filled_quantity, 0.0),
                         "fill_slippage_pct": fill_slippage_pct,
+                        "fill_signed_slippage_bps": fill_signed_slippage_bps,
                         "execution_policy": execution_plan.to_payload(),
                     },
                 )
@@ -4042,6 +4126,7 @@ def _execute_primary_order_with_policy(
                 "filled_quantity": filled_quantity,
                 "average_fill_price": average_fill_price if filled_quantity > 0 else None,
                 "fill_slippage_pct": fill_slippage_pct,
+                "fill_signed_slippage_bps": fill_signed_slippage_bps,
                 "remaining_quantity": remaining_quantity,
                 "remaining_ratio": remaining_ratio,
                 "timed_out": timed_out,
@@ -4050,6 +4135,10 @@ def _execute_primary_order_with_policy(
         order.metadata_json = {
             **(order.metadata_json or {}),
             "execution_policy": execution_plan.to_payload(),
+            "entry_execution_type": _entry_execution_type_for_plan(
+                execution_plan,
+                order_type=current_order_type,
+            ),
             "execution_attempt": attempt_index + 1,
             "execution_attempts": execution_attempts,
         }
@@ -4187,6 +4276,7 @@ def _execute_primary_order_with_policy(
         final_status = "filled"
     execution_quality = _build_execution_quality_summary(
         plan=execution_plan,
+        side=side,
         requested_quantity=requested_quantity,
         requested_price=requested_price,
         filled_quantity=total_filled_quantity,
@@ -4200,6 +4290,11 @@ def _execute_primary_order_with_policy(
     final_order.metadata_json = {
         **(final_order.metadata_json or {}),
         "execution_policy": execution_plan.to_payload(),
+        "entry_execution_type": _entry_execution_type_for_plan(
+            execution_plan,
+            order_type=final_order.order_type,
+            execution_quality=execution_quality,
+        ),
         "execution_attempts": execution_attempts,
         "execution_quality": execution_quality,
     }
@@ -6466,6 +6561,7 @@ def _execute_live_trade_body(
             execution_price = client.normalize_price(decision.symbol, execution_plan.price)
         else:
             execution_price = execution_plan.price
+    planned_entry_execution_type = _entry_execution_type_for_plan(execution_plan)
     record_audit_event(
         session,
         event_type="live_execution_attempted",
@@ -6479,6 +6575,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
                 "rollout_mode": rollout_mode,
                 "exchange_submit_allowed": exchange_submit_allowed,
@@ -6505,6 +6602,7 @@ def _execute_live_trade_body(
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
                 "approved_notional_cap": approved_notional_cap,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
                 "preflight_request": dict(preflight_request),
                 "rollout_mode": rollout_mode,
@@ -6522,6 +6620,7 @@ def _execute_live_trade_body(
             "requested_quantity": normalized_quantity,
             "requested_price": execution_price,
             "approved_notional_cap": approved_notional_cap,
+            "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
             "preflight_request": dict(preflight_request),
             "submit_blocked": True,
@@ -6604,6 +6703,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -6614,6 +6714,7 @@ def _execute_live_trade_body(
             "intent_type": intent_type,
             "requested_quantity": normalized_quantity,
             "requested_price": execution_price,
+            "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
         }
         guard_action = _entry_action_for_decision(decision)
@@ -6669,6 +6770,7 @@ def _execute_live_trade_body(
             "submit_attempt_count": submission_tracking.get("submit_attempt_count"),
             "last_submit_error": submission_tracking.get("last_submit_error"),
             "intent_type": intent_type,
+            "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
         }
     except BinanceAPIError as exc:
@@ -6698,6 +6800,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
                 **({"submit_request": dict(submit_request)} if isinstance(submit_request, dict) else {}),
                 **({"submission_tracking": submission_tracking} if submission_tracking else {}),
@@ -6718,6 +6821,7 @@ def _execute_live_trade_body(
                 "available_balance": live_balances["available_balance"],
                 "intent_type": intent_type,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -6737,6 +6841,7 @@ def _execute_live_trade_body(
                 "equity": live_balances["equity"],
                 "intent_type": intent_type,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
             correlation_ids=normalize_correlation_ids(execution_correlation_ids, execution_id=order.id),
@@ -6749,6 +6854,7 @@ def _execute_live_trade_body(
             "error": str(exc),
             "exchange_code": exc.code,
             "intent_type": intent_type,
+            "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
         }
     except Exception as exc:
@@ -6769,6 +6875,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -6784,6 +6891,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
         )
@@ -6800,6 +6908,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "requested_quantity": normalized_quantity,
                 "requested_price": execution_price,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
             correlation_ids=normalize_correlation_ids(execution_correlation_ids, execution_id=order.id),
@@ -6813,6 +6922,7 @@ def _execute_live_trade_body(
                 "symbol": decision.symbol,
                 "error": str(exc),
                 "intent_type": intent_type,
+                "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
             },
             correlation_ids=normalize_correlation_ids(execution_correlation_ids, execution_id=order.id),
@@ -6824,6 +6934,7 @@ def _execute_live_trade_body(
             "reason_codes": ["LIVE_EXECUTION_ERROR"],
             "error": str(exc),
             "intent_type": intent_type,
+            "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
         }
     order = execution_result["order"]
@@ -6833,14 +6944,28 @@ def _execute_live_trade_body(
     aggregate_filled_quantity = float(execution_result["filled_quantity"])
     final_execution_status = str(execution_result["status"])
     execution_quality = dict(execution_result.get("execution_quality") or {})
+    entry_execution_type = _entry_execution_type_for_plan(
+        execution_plan,
+        order_type=order.order_type,
+        execution_quality=execution_quality,
+    )
+    signed_slippage_bps = _signed_slippage_bps(
+        side=side,
+        requested_price=execution_price,
+        fill_price=aggregate_fill_price if aggregate_filled_quantity > 0 else 0.0,
+    )
     net_realized_pnl = realized_pnl - fee_paid
     if execution_quality:
+        execution_quality.setdefault("signed_slippage_pct", signed_slippage_bps / 10000.0)
+        execution_quality.setdefault("signed_slippage_bps", signed_slippage_bps)
+        execution_quality.setdefault("entry_execution_type", entry_execution_type)
         if aggregate_filled_quantity > 0 and abs(net_realized_pnl) > 1e-9:
             execution_quality["decision_quality_status"] = "profit" if net_realized_pnl > 0 else "loss"
         elif aggregate_filled_quantity > 0 and abs(net_realized_pnl) <= 1e-9:
             execution_quality["decision_quality_status"] = "flat_or_pending"
         order.metadata_json = {
             **(order.metadata_json or {}),
+            "entry_execution_type": entry_execution_type,
             "execution_quality": execution_quality,
         }
         session.add(order)
@@ -6967,6 +7092,8 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "execution_attempts": execution_result["attempts"],
                 "execution_quality": execution_quality,
+                "entry_execution_type": entry_execution_type,
+                "signed_slippage_bps": signed_slippage_bps,
                 **holding_profile_payload,
                 "position_management": {
                     "reduce_fraction": reduce_fraction,
@@ -7023,7 +7150,9 @@ def _execute_live_trade_body(
             payload={
                 "order_id": order.id,
                 "slippage_pct": slippage_pct,
+                "signed_slippage_bps": signed_slippage_bps,
                 "intent_type": intent_type,
+                "entry_execution_type": entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
                 "execution_quality": execution_quality,
             },
@@ -7055,7 +7184,9 @@ def _execute_live_trade_body(
             "protection_lifecycle": final_protection_lifecycle,
             "pre_trade_protection": pre_trade_protection,
             "slippage_pct": slippage_pct,
+            "signed_slippage_bps": signed_slippage_bps,
             "intent_type": intent_type,
+            "entry_execution_type": entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
             "execution_attempts": execution_result["attempts"],
             "execution_quality": execution_quality,
@@ -7098,6 +7229,8 @@ def _execute_live_trade_body(
         "fill_quantity": aggregate_filled_quantity,
         "realized_pnl": realized_pnl,
         "fees": fee_paid,
+        "signed_slippage_bps": signed_slippage_bps,
+        "entry_execution_type": entry_execution_type,
         "equity": pnl_snapshot.equity,
         "funding_sync": funding_sync,
         "protective_order_ids": protective_order_ids,

@@ -4,11 +4,12 @@ from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import (
+    AccountLedgerEntry,
     AgentRun,
     AuditEvent,
     Execution,
@@ -569,6 +570,9 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert day.summary.average_mae_pct == 0.006
     assert day.summary.best_mfe_pct == 0.018
     assert day.summary.worst_mae_pct == 0.006
+    assert day.entry_quality["entry_marketable"].trade_count == 1
+    assert day.entry_quality["entry_marketable"].net_pnl == pytest.approx(11.0, abs=1e-9)
+    assert day.entry_quality["entry_passive_limit"].trade_count == 0
     assert day.ai_telemetry.ai_calls_total == 3
     assert day.ai_telemetry.ai_calls_provider_invoked == 1
     assert day.ai_telemetry.ai_calls_skipped_preai == 1
@@ -650,6 +654,113 @@ def test_build_signal_performance_report_returns_regime_and_flag_breakdowns(db_s
     assert report.items
     assert report.items[0].fee_total >= 0.0
     assert report.items[0].net_realized_pnl_total >= report.items[0].realized_pnl_total - report.items[0].fee_total
+
+
+def test_entry_quality_breakdown_separates_passive_limit_and_marketable_entries(db_session) -> None:
+    _seed_performance_rows(db_session)
+    btc_entry = db_session.query(Order).filter_by(external_order_id="btc-entry").one()
+    btc_entry.order_type = "limit"
+    btc_entry.metadata_json = {
+        "execution_policy": {
+            "policy_name": "entry_passive_limit",
+            "marketable": False,
+        }
+    }
+    sol_entry = db_session.query(Order).filter_by(external_order_id="sol-entry").one()
+    sol_entry.metadata_json = {
+        "execution_policy": {
+            "policy_name": "entry_marketable",
+            "marketable": True,
+        }
+    }
+    sol_entry.average_fill_price = 180.0
+    sol_entry_fill = db_session.query(Execution).filter_by(external_trade_id="sol-entry-fill").one()
+    sol_entry_fill.fill_price = 180.0
+    db_session.flush()
+
+    report = build_signal_performance_report(db_session, window_specs=(("7d", 24 * 7),), limit=20)
+
+    entry_quality = report.windows[0].entry_quality
+    passive = entry_quality["entry_passive_limit"]
+    marketable = entry_quality["entry_marketable"]
+    assert passive.trade_count == 1
+    assert passive.net_pnl == pytest.approx(11.0, abs=1e-9)
+    assert passive.expectancy == pytest.approx(11.0, abs=1e-9)
+    assert passive.avg_signed_slippage_bps > 0.0
+    assert marketable.trade_count == 1
+    assert marketable.net_pnl == pytest.approx(-5.5, abs=1e-9)
+    assert marketable.win_rate == 0.0
+    assert marketable.avg_adverse_slippage_bps > 0.0
+    decisions_by_symbol = {item.symbol: item for item in report.windows[0].decisions}
+    assert decisions_by_symbol["BTCUSDT"].entry_execution_type == "entry_passive_limit"
+    assert decisions_by_symbol["SOLUSDT"].entry_execution_type == "entry_marketable"
+
+
+def test_build_signal_performance_report_attributes_funding_to_position_interval(db_session) -> None:
+    _seed_performance_rows(db_session)
+    btc_position = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    assert btc_position is not None
+    db_session.add_all(
+        [
+            AccountLedgerEntry(
+                entry_type="funding",
+                asset="USDT",
+                symbol="BTCUSDT",
+                amount=-2.5,
+                external_ref_id="funding-btc-match",
+                occurred_at=btc_position.opened_at + timedelta(minutes=20),
+                payload={"incomeType": "FUNDING_FEE"},
+            ),
+            AccountLedgerEntry(
+                entry_type="funding",
+                asset="USDT",
+                symbol="BTCUSDT",
+                amount=-9.0,
+                external_ref_id="funding-btc-outside",
+                occurred_at=btc_position.closed_at + timedelta(minutes=5),
+                payload={"incomeType": "FUNDING_FEE"},
+            ),
+            AccountLedgerEntry(
+                entry_type="funding",
+                asset="USDT",
+                symbol="ETHUSDT",
+                amount=-7.0,
+                external_ref_id="funding-other-symbol",
+                occurred_at=btc_position.opened_at + timedelta(minutes=20),
+                payload={"incomeType": "FUNDING_FEE"},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    day = report.windows[0]
+    btc_decision = next(item for item in day.decisions if item.symbol == "BTCUSDT")
+    btc_bucket = next(item for item in day.symbols if item.key == "BTCUSDT")
+
+    assert btc_decision.realized_pnl_total == 12.0
+    assert btc_decision.fee_total == 1.0
+    assert btc_decision.funding_total == pytest.approx(-2.5, abs=1e-9)
+    assert btc_decision.net_pnl_excluding_funding == pytest.approx(11.0, abs=1e-9)
+    assert btc_decision.net_pnl_including_funding == pytest.approx(8.5, abs=1e-9)
+    assert btc_decision.funding_attribution_status == "matched"
+    assert day.summary.funding_total == pytest.approx(-2.5, abs=1e-9)
+    assert day.summary.net_pnl_excluding_funding == pytest.approx(11.0, abs=1e-9)
+    assert day.summary.net_pnl_including_funding == pytest.approx(8.5, abs=1e-9)
+    assert btc_bucket.funding_total == pytest.approx(-2.5, abs=1e-9)
+    assert btc_bucket.net_pnl_including_funding == pytest.approx(8.5, abs=1e-9)
+
+
+def test_build_signal_performance_report_handles_missing_funding_records(db_session) -> None:
+    _seed_performance_rows(db_session)
+
+    report = build_signal_performance_report(db_session, window_specs=(("24h", 24),), limit=20)
+    btc_decision = next(item for item in report.windows[0].decisions if item.symbol == "BTCUSDT")
+
+    assert btc_decision.funding_total == 0.0
+    assert btc_decision.net_pnl_excluding_funding == pytest.approx(11.0, abs=1e-9)
+    assert btc_decision.net_pnl_including_funding == pytest.approx(11.0, abs=1e-9)
+    assert btc_decision.funding_attribution_status == "no_funding_records"
 
 
 def test_build_signal_performance_report_uses_cached_decision_facts(db_session, monkeypatch) -> None:
@@ -1148,6 +1259,7 @@ def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypa
         assert payload["windows"][0]["ai_telemetry"]["downstream_by_decision"]["hold"]["risk_blocked"] == 1
         assert "ai_baseline_comparison" in payload["windows"][0]
         assert "buckets" in payload["windows"][0]["ai_baseline_comparison"]
+        assert payload["windows"][0]["entry_quality"]["entry_marketable"]["trade_count"] == 1
         assert payload["windows"][0]["limited_live_readiness"]["read_only"] is True
         assert payload["windows"][0]["limited_live_readiness"]["status"] == "not_ready"
         assert "insufficient_sample" in payload["windows"][0]["limited_live_readiness"]["reason_codes"]

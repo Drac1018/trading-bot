@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import type { OperatorDashboardPayload } from "./overview-dashboard";
+import type { EntryQualityBreakdown, OperatorDashboardPayload, ProfitabilityCostBreakdown } from "./overview-dashboard";
 import { formatAuditEntityType, formatAuditRowTitle } from "../lib/audit-log";
 import { lookupRiskReasonCode } from "../lib/risk-reason-copy.js";
 import { normalizeSyncScopeStatus } from "../lib/sync-freshness";
@@ -488,6 +488,68 @@ function exposureCards(operator: OperatorDashboardPayload) {
   ];
 }
 
+const profitabilityWarningCopy: Record<string, string> = {
+  fee_exceeds_gross_pnl: "수수료가 gross PnL보다 큽니다.",
+  cost_exceeds_gross_pnl: "수수료와 funding 비용이 gross PnL보다 큽니다.",
+  positive_gross_negative_net: "gross PnL은 양수지만 비용 반영 후 net PnL은 음수입니다.",
+  adverse_slippage_positive: "평균 체결 슬리피지가 거래자에게 불리하게 누적되고 있습니다.",
+  high_marketable_ratio_low_net_pnl: "marketable 진입 비중이 높고 net PnL이 낮습니다.",
+};
+
+function costWindowLabel(value: string | null | undefined) {
+  const labels: Record<string, string> = {
+    today: "오늘",
+    "24h": "24시간",
+    "7d": "7일",
+    "30d": "30일",
+    all_time: "전체",
+  };
+  return value ? labels[value] ?? value : "-";
+}
+
+function entryQualityLabel(value: string) {
+  const labels: Record<string, string> = {
+    entry_passive_limit: "Passive limit",
+    entry_marketable: "Marketable",
+    entry_unknown: "Unknown",
+  };
+  return labels[value] ?? value;
+}
+
+function primaryProfitabilityCost(operator: OperatorDashboardPayload): ProfitabilityCostBreakdown | null {
+  const breakdowns = operator.market_signal.profitability_cost_breakdowns ?? [];
+  return (
+    breakdowns.find((item) => item.window_label === "today") ??
+    operator.market_signal.performance_windows[0]?.cost_breakdown ??
+    breakdowns[0] ??
+    null
+  );
+}
+
+function primaryEntryQuality(operator: OperatorDashboardPayload): EntryQualityBreakdown[] {
+  const source = operator.market_signal.performance_windows[0]?.entry_quality ?? {};
+  return ["entry_passive_limit", "entry_marketable", "entry_unknown"]
+    .map((key) => source[key])
+    .filter((item): item is EntryQualityBreakdown => Boolean(item));
+}
+
+function profitabilityTone(cost: ProfitabilityCostBreakdown | null): Tone {
+  if (!cost || cost.status === "no_data") {
+    return "neutral";
+  }
+  if (cost.warning_codes.includes("positive_gross_negative_net") || cost.net_pnl < 0) {
+    return "danger";
+  }
+  return cost.warning_codes.length > 0 ? "warn" : "safe";
+}
+
+function formatBps(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "-";
+  }
+  return `${formatNumber(value, 2)} bps`;
+}
+
 function toneClass(tone: Tone) {
   return {
     safe: "border-emerald-200 bg-emerald-50 text-emerald-800",
@@ -572,6 +634,157 @@ function Panel({
       </div>
       {children}
     </section>
+  );
+}
+
+function ProfitabilityCostPanel({
+  cost,
+  breakdowns,
+  entryQuality,
+}: {
+  cost: ProfitabilityCostBreakdown | null;
+  breakdowns: ProfitabilityCostBreakdown[];
+  entryQuality: EntryQualityBreakdown[];
+}) {
+  const tone = profitabilityTone(cost);
+  const warningLabels = cost?.warning_codes.map((code) => profitabilityWarningCopy[code] ?? code) ?? [];
+  const statusLabel = !cost || cost.status === "no_data"
+    ? "데이터 없음"
+    : warningLabels.length > 0
+      ? "비용 경고"
+      : "정상";
+  const visibleBreakdowns = breakdowns.length > 0 ? breakdowns : cost ? [cost] : [];
+  const visibleEntryQuality = entryQuality.filter((item) => item.trade_count > 0);
+
+  return (
+    <Panel title="수익성 비용 분해" action={<StatusPill tone={tone}>{statusLabel}</StatusPill>}>
+      <p className="mt-4 text-sm leading-6 text-slate-600">
+        거래 확대 판단용 화면이 아니라 gross PnL이 수수료, funding, 불리한 체결에 먹히는지 확인하는 화면입니다.
+      </p>
+
+      {cost ? (
+        <>
+          <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {[
+              ["기간", costWindowLabel(cost.window_label), cost.status === "no_data" ? "집계 데이터 없음" : "비용 확인 기준"],
+              ["Net PnL", formatMoney(cost.net_pnl, 2), `funding 포함 ${formatMoney(cost.net_pnl_including_funding, 2)}`],
+              ["Gross PnL", formatMoney(cost.gross_pnl, 2), `실현 손익 ${formatMoney(cost.realized_pnl, 2)}`],
+              ["Fee", formatMoney(cost.fee, 2), `gross 대비 ${formatPct(cost.fee_to_gross_pnl_ratio)}`],
+              ["Funding", formatMoney(cost.funding, 2), "양수는 수취, 음수는 비용"],
+              ["총 비용", formatMoney(cost.total_cost, 2), `gross 대비 ${formatPct(cost.cost_to_gross_pnl_ratio)}`],
+              ["Signed slippage", formatBps(cost.signed_slippage_bps_avg), "양수는 불리한 평균 체결"],
+              ["Adverse slippage", formatBps(cost.adverse_slippage_bps_avg), "불리한 방향만 누적한 평균"],
+            ].map(([label, value, hint]) => (
+              <div key={label} className="rounded-md border border-slate-100 bg-slate-50 p-4">
+                <p className="text-sm text-slate-500">{label}</p>
+                <p className="mt-2 text-lg font-semibold text-slate-950">{value}</p>
+                <p className="mt-1 text-xs leading-5 text-slate-500">{hint}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            <div className="rounded-md border border-slate-100 bg-slate-50 p-4">
+              <p className="text-sm font-semibold text-slate-950">진입 방식 비중</p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <div>
+                  <p className="text-xs text-slate-500">Marketable entry</p>
+                  <p className="mt-1 text-base font-semibold text-slate-950">
+                    {formatPct(cost.marketable_entry_ratio)}
+                  </p>
+                  <p className="text-xs text-slate-500">{cost.marketable_entry_count}건</p>
+                </div>
+                <div>
+                  <p className="text-xs text-slate-500">Passive limit entry</p>
+                  <p className="mt-1 text-base font-semibold text-slate-950">
+                    {formatPct(cost.passive_entry_ratio)}
+                  </p>
+                  <p className="text-xs text-slate-500">{cost.passive_entry_count}건</p>
+                </div>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-slate-500">
+                marketable 비중이 높으면 빠른 체결 대신 수수료와 슬리피지 부담이 커질 수 있습니다.
+              </p>
+            </div>
+
+            <div className={`rounded-md border p-4 ${toneClass(tone)}`}>
+              <p className="text-sm font-semibold">비용 경고</p>
+              {warningLabels.length > 0 ? (
+                <ul className="mt-3 space-y-2 text-sm leading-6">
+                  {warningLabels.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-3 text-sm leading-6">현재 기간에서는 비용이 gross PnL을 넘는 경고가 없습니다.</p>
+              )}
+            </div>
+          </div>
+
+          {visibleEntryQuality.length > 0 ? (
+            <div className="mt-5 rounded-md border border-slate-100 bg-white">
+              <div className="grid gap-2 border-b border-slate-100 px-4 py-3 text-xs font-semibold text-slate-500 sm:grid-cols-6">
+                <span>진입 방식</span>
+                <span>거래</span>
+                <span>승률</span>
+                <span>Net</span>
+                <span>Expectancy</span>
+                <span>Slippage</span>
+              </div>
+              {visibleEntryQuality.map((item) => (
+                <div
+                  key={item.entry_type}
+                  className="grid gap-2 border-b border-slate-100 px-4 py-3 text-sm last:border-b-0 sm:grid-cols-6"
+                >
+                  <span className="font-semibold text-slate-950">{entryQualityLabel(item.entry_type)}</span>
+                  <span className="text-slate-700">{item.trade_count}건</span>
+                  <span className="text-slate-700">{formatPct(item.win_rate)}</span>
+                  <span className={item.net_pnl < 0 ? "font-semibold text-rose-700" : "text-slate-700"}>
+                    {formatMoney(item.net_pnl, 2)}
+                  </span>
+                  <span className="text-slate-700">{formatMoney(item.expectancy, 2)}</span>
+                  <span className="text-slate-700">
+                    {formatBps(item.avg_signed_slippage_bps)} / adverse {formatBps(item.avg_adverse_slippage_bps)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {visibleBreakdowns.length > 1 ? (
+            <div className="mt-5 rounded-md border border-slate-100 bg-white">
+              <div className="grid gap-2 border-b border-slate-100 px-4 py-3 text-xs font-semibold text-slate-500 sm:grid-cols-5">
+                <span>기간</span>
+                <span>Net</span>
+                <span>Gross</span>
+                <span>총 비용</span>
+                <span>진입 방식</span>
+              </div>
+              {visibleBreakdowns.map((item) => (
+                <div
+                  key={item.window_label}
+                  className="grid gap-2 border-b border-slate-100 px-4 py-3 text-sm last:border-b-0 sm:grid-cols-5"
+                >
+                  <span className="font-semibold text-slate-950">{costWindowLabel(item.window_label)}</span>
+                  <span className={item.net_pnl < 0 ? "font-semibold text-rose-700" : "text-slate-700"}>
+                    {formatMoney(item.net_pnl, 2)}
+                  </span>
+                  <span className="text-slate-700">{formatMoney(item.gross_pnl, 2)}</span>
+                  <span className="text-slate-700">{formatMoney(item.total_cost, 2)}</span>
+                  <span className="text-slate-700">
+                    M {formatPct(item.marketable_entry_ratio)} / P {formatPct(item.passive_entry_ratio)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <div className="mt-5 rounded-md border border-dashed border-slate-200 bg-slate-50 p-5 text-sm text-slate-500">
+          아직 비용 분해에 사용할 거래 데이터가 없습니다.
+        </div>
+      )}
+    </Panel>
   );
 }
 
@@ -672,6 +885,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   const remainingActions = actions.filter((item) => !checkedIds.includes(item.id));
   const audits = recentAuditEvents(operator);
   const exposure = exposureCards(operator);
+  const profitabilityBreakdowns = operator.market_signal.profitability_cost_breakdowns ?? [];
+  const profitabilityCost = primaryProfitabilityCost(operator);
+  const entryQuality = primaryEntryQuality(operator);
   const openPositionCount = operator.symbols.filter((symbol) => symbol.open_position.is_open).length;
 
   const toggleChecked = (id: string) => {
@@ -840,6 +1056,12 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                   </p>
                 </div>
               </Panel>
+
+              <ProfitabilityCostPanel
+                cost={profitabilityCost}
+                breakdowns={profitabilityBreakdowns}
+                entryQuality={entryQuality}
+              />
             </div>
 
             <Panel title="최근 감사 로그" className="xl:min-h-[510px]">

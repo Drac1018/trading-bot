@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import timedelta
 from threading import Event
 
+import pytest
 from fastapi.testclient import TestClient
 from trading_mvp.main import app
 from trading_mvp.models import (
+    AccountLedgerEntry,
     AuditEvent,
     Execution,
     FeatureSnapshot,
@@ -264,7 +266,7 @@ def _seed_profitability_dashboard_rows(db_session) -> None:
                 commission_asset="USDT",
                 slippage_pct=0.0012,
                 realized_pnl=0.0,
-                payload={},
+                payload={"signed_slippage_bps": 1.1428571429},
             ),
             Execution(
                 order_id=exit_order.id,
@@ -278,7 +280,7 @@ def _seed_profitability_dashboard_rows(db_session) -> None:
                 commission_asset="USDT",
                 slippage_pct=0.0,
                 realized_pnl=8.0,
-                payload={},
+                payload={"signed_slippage_bps": 0.0},
             ),
         ]
     )
@@ -287,6 +289,19 @@ def _seed_profitability_dashboard_rows(db_session) -> None:
     btc_tp_fill = db_session.query(Execution).filter_by(external_trade_id="btc-tp-fill").one()
     btc_entry_fill.created_at = now - timedelta(minutes=88, seconds=15)
     btc_tp_fill.created_at = now - timedelta(minutes=15)
+    db_session.flush()
+
+    db_session.add(
+        AccountLedgerEntry(
+            entry_type="funding",
+            asset="USDT",
+            symbol="BTCUSDT",
+            amount=-0.25,
+            external_ref_id="btc-funding-dashboard",
+            occurred_at=now - timedelta(minutes=45),
+            payload={"incomeType": "FUNDING_FEE"},
+        )
+    )
     db_session.flush()
 
     db_session.add(
@@ -1410,9 +1425,24 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     payload = get_profitability_dashboard(db_session)
 
     assert [item.window_label for item in payload.windows] == ["24h", "7d", "30d"]
+    assert [item.window_label for item in payload.cost_breakdowns] == ["today", "7d", "30d", "all_time"]
     assert payload.windows[0].rationale_winners
     assert payload.windows[0].top_regimes
     assert payload.windows[0].top_symbols
+    cost = payload.windows[0].cost_breakdown
+    assert cost.gross_pnl == pytest.approx(8.0, abs=1e-9)
+    assert cost.realized_pnl == pytest.approx(8.0, abs=1e-9)
+    assert cost.fee == pytest.approx(0.4, abs=1e-9)
+    assert cost.funding == pytest.approx(-0.25, abs=1e-9)
+    assert cost.net_pnl_excluding_funding == pytest.approx(7.6, abs=1e-9)
+    assert cost.net_pnl_including_funding == pytest.approx(7.35, abs=1e-9)
+    assert cost.signed_slippage_bps_avg > 0.0
+    assert cost.adverse_slippage_bps_avg > 0.0
+    assert cost.passive_entry_count == 3
+    assert cost.passive_entry_ratio == pytest.approx(1.0, abs=1e-9)
+    assert payload.windows[0].entry_quality["entry_passive_limit"].trade_count == 1
+    assert payload.windows[0].entry_quality["entry_passive_limit"].net_pnl == pytest.approx(7.35, abs=1e-9)
+    assert payload.windows[0].entry_quality["entry_marketable"].trade_count == 0
     assert payload.execution_windows
     assert payload.execution_windows[0].worst_profiles
     assert payload.execution_windows[0].execution_quality_summary["cancel_attempts"] == 2
@@ -1426,6 +1456,32 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     assert payload.adaptive_signal_summary["status"] in {"active", "neutral", "insufficient_data", "disabled"}
     assert payload.latest_decision is not None
     assert payload.latest_risk is not None
+
+
+def test_profitability_dashboard_cost_breakdown_flags_cost_leakage(db_session) -> None:
+    _seed_profitability_dashboard_rows(db_session)
+    for execution in db_session.query(Execution).all():
+        execution.fee_paid = 5.0
+    for order in db_session.query(Order).filter(Order.reduce_only.is_(False), Order.close_only.is_(False)).all():
+        order.order_type = "market"
+        metadata = dict(order.metadata_json) if isinstance(order.metadata_json, dict) else {}
+        execution_policy = dict(metadata.get("execution_policy") or {})
+        execution_policy["execution_style"] = "marketable"
+        metadata["execution_policy"] = execution_policy
+        order.metadata_json = metadata
+    db_session.flush()
+
+    payload = get_profitability_dashboard(db_session)
+
+    cost = payload.windows[0].cost_breakdown
+    assert cost.marketable_entry_ratio == pytest.approx(1.0, abs=1e-9)
+    assert {
+        "fee_exceeds_gross_pnl",
+        "cost_exceeds_gross_pnl",
+        "positive_gross_negative_net",
+        "adverse_slippage_positive",
+        "high_marketable_ratio_low_net_pnl",
+    }.issubset(set(cost.warning_codes))
 
 
 def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_session) -> None:
@@ -2570,6 +2626,10 @@ def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_fac
     assert response.status_code == 200
     payload = response.json()
     assert payload["windows"][0]["window_label"] == "24h"
+    assert payload["windows"][0]["cost_breakdown"]["net_pnl_including_funding"] == 7.35
+    assert payload["windows"][0]["entry_quality"]["entry_passive_limit"]["trade_count"] == 1
+    assert payload["entry_quality"]["entry_passive_limit"]["trade_count"] == 1
+    assert payload["cost_breakdowns"][0]["window_label"] == "today"
     assert "rationale_winners" in payload["windows"][0]
     assert "rationale_losers" in payload["windows"][0]
     assert payload["windows"][0]["limited_live_readiness"]["read_only"] is True
@@ -2600,6 +2660,8 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert payload["control"]["account_sync_summary"]["account_snapshot_available"] is False
     assert payload["control"]["limited_live_readiness"]["read_only"] is True
     assert payload["market_signal"]["performance_windows"][0]["limited_live_readiness"]["read_only"] is True
+    assert "entry_quality" in payload["market_signal"]["performance_windows"][0]
+    assert payload["market_signal"]["profitability_cost_breakdowns"][0]["window_label"] == "today"
     assert len(payload["symbols"]) == 2
     assert "ai_decision" not in payload
     assert "risk_guard" not in payload

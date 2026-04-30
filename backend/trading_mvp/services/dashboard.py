@@ -9,6 +9,7 @@ from sqlalchemy import String, cast, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import (
+    AccountLedgerEntry,
     AgentRun,
     Alert,
     AuditEvent,
@@ -27,6 +28,7 @@ from trading_mvp.schemas import (
     DashboardExecutionProfileSummary,
     DashboardExecutionWindowSummary,
     DashboardHoldBlockedSummary,
+    DashboardProfitabilityCostBreakdown,
     DashboardProfitabilityResponse,
     DashboardProfitabilityWindow,
     DecisionReferencePayload,
@@ -49,6 +51,7 @@ from trading_mvp.schemas import (
     OverviewResponse,
     PendingEntryPlanSnapshot,
     PerformanceAggregateEntry,
+    PerformanceWindowSummary,
 )
 from trading_mvp.services.audit import compact_audit_payload
 from trading_mvp.services.intent_semantics import infer_intent_semantics
@@ -72,6 +75,13 @@ from trading_mvp.time_utils import utcnow_naive
 FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "finished"}
 FINAL_EXCHANGE_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "FINISHED"}
 PROTECTIVE_ORDER_TYPES = {"stop_market", "take_profit_market"}
+PROFITABILITY_COST_WINDOW_SPECS: tuple[tuple[str, int | None], ...] = (
+    ("today", None),
+    ("7d", 24 * 7),
+    ("30d", 24 * 30),
+    ("all_time", None),
+)
+MARKETABLE_ENTRY_WARNING_RATIO = 0.7
 AUDIT_CATEGORY_RISK = "risk"
 AUDIT_CATEGORY_EXECUTION = "execution"
 AUDIT_CATEGORY_APPROVAL_CONTROL = "approval_control"
@@ -496,6 +506,220 @@ def _adverse_slippage_pct(*, side: str, requested_price: float, fill_price: floa
     if side_key == "sell":
         return max((requested_price - fill_price) / requested_price, 0.0)
     return abs(fill_price - requested_price) / requested_price
+
+
+def _signed_slippage_bps_from_prices(*, side: str, requested_price: float, fill_price: float) -> float | None:
+    if requested_price <= 0 or fill_price <= 0:
+        return None
+    side_key = side.lower()
+    if side_key == "buy":
+        return ((fill_price - requested_price) / requested_price) * 10000.0
+    if side_key == "sell":
+        return ((requested_price - fill_price) / requested_price) * 10000.0
+    return None
+
+
+def _first_numeric_value(source: dict[str, Any], keys: Sequence[str]) -> float | None:
+    for key in keys:
+        value = source.get(key)
+        if value is None or value == "":
+            continue
+        return _as_float(value, default=0.0)
+    return None
+
+
+def _execution_signed_slippage_bps(execution_row: Execution, order_row: Order | None) -> float | None:
+    payload = _as_dict(execution_row.payload)
+    explicit = _first_numeric_value(payload, ("signed_slippage_bps", "fill_signed_slippage_bps"))
+    if explicit is not None:
+        return explicit
+    quality: dict[str, Any] = {}
+    if order_row is not None:
+        metadata = _as_dict(order_row.metadata_json)
+        quality = _as_dict(metadata.get("execution_quality"))
+    explicit = _first_numeric_value(quality, ("signed_slippage_bps", "fill_signed_slippage_bps"))
+    if explicit is not None:
+        return explicit
+    if order_row is None:
+        return None
+    return _signed_slippage_bps_from_prices(
+        side=str(order_row.side or ""),
+        requested_price=_as_float(order_row.requested_price, default=0.0),
+        fill_price=_as_float(execution_row.fill_price, default=0.0),
+    )
+
+
+def _is_entry_order(order_row: Order) -> bool:
+    order_type = str(order_row.order_type or "").lower()
+    if bool(order_row.reduce_only) or bool(order_row.close_only):
+        return False
+    return order_type not in PROTECTIVE_ORDER_TYPES
+
+
+def _entry_order_style(order_row: Order) -> str:
+    metadata = _as_dict(order_row.metadata_json)
+    policy = _as_dict(metadata.get("execution_policy"))
+    quality = _as_dict(metadata.get("execution_quality"))
+    style = str(
+        metadata.get("entry_execution_type")
+        or quality.get("entry_execution_type")
+        or policy.get("entry_execution_type")
+        or policy.get("policy_name")
+        or policy.get("execution_style")
+        or policy.get("entry_style")
+        or policy.get("order_style")
+        or quality.get("execution_style")
+        or ""
+    ).lower()
+    if style in {"entry_marketable", "marketable", "aggressive", "market"}:
+        return "marketable"
+    if style in {"entry_passive_limit", "passive", "passive_limit", "maker"}:
+        return "passive"
+    if bool(quality.get("aggressive_fallback_used")):
+        return "marketable"
+    if policy.get("marketable") is not None:
+        return "marketable" if bool(policy.get("marketable")) else "passive"
+
+    order_type = str(order_row.order_type or "").lower()
+    if order_type == "limit":
+        return "passive"
+    if order_type == "market" or order_type.endswith("_market"):
+        return "marketable"
+    return "unknown"
+
+
+def _profitability_window_since(window_label: str, window_hours: int | None, now: datetime) -> datetime | None:
+    if window_label == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if window_hours is not None:
+        return now - timedelta(hours=window_hours)
+    return None
+
+
+def _funding_total_for_window(session: Session, since: datetime | None) -> float:
+    statement = select(func.coalesce(func.sum(AccountLedgerEntry.amount), 0.0)).where(
+        AccountLedgerEntry.entry_type == "funding"
+    )
+    if since is not None:
+        statement = statement.where(AccountLedgerEntry.occurred_at >= since)
+    return _as_float(session.scalar(statement), default=0.0)
+
+
+def _build_profitability_cost_breakdown(
+    session: Session,
+    *,
+    window_label: str,
+    window_hours: int | None,
+    since: datetime | None,
+    summary: PerformanceWindowSummary | None = None,
+) -> DashboardProfitabilityCostBreakdown:
+    order_statement = select(Order).where(Order.mode == "live")
+    if since is not None:
+        order_statement = order_statement.where(Order.created_at >= since)
+    order_rows = list(session.scalars(order_statement))
+    entry_rows = [row for row in order_rows if _is_entry_order(row)]
+    marketable_entry_count = 0
+    passive_entry_count = 0
+    for row in entry_rows:
+        style = _entry_order_style(row)
+        if style == "marketable":
+            marketable_entry_count += 1
+        elif style == "passive":
+            passive_entry_count += 1
+
+    execution_statement = (
+        select(Execution, Order)
+        .join(Order, Order.id == Execution.order_id)
+        .where(Order.mode == "live")
+    )
+    if since is not None:
+        execution_statement = execution_statement.where(Execution.created_at >= since)
+    execution_rows = list(session.execute(execution_statement))
+
+    signed_weighted_sum = 0.0
+    adverse_weighted_sum = 0.0
+    signed_weight = 0.0
+    for execution_row, order_row in execution_rows:
+        signed_bps = _execution_signed_slippage_bps(execution_row, order_row)
+        if signed_bps is None:
+            continue
+        weight = abs(_as_float(execution_row.fill_quantity, default=0.0)) or 1.0
+        signed_weighted_sum += signed_bps * weight
+        adverse_weighted_sum += max(signed_bps, 0.0) * weight
+        signed_weight += weight
+
+    signed_slippage_bps_avg = signed_weighted_sum / signed_weight if signed_weight > 0 else 0.0
+    adverse_slippage_bps_avg = adverse_weighted_sum / signed_weight if signed_weight > 0 else 0.0
+
+    if summary is not None:
+        gross_pnl = _as_float(summary.gross_pnl_total, default=0.0)
+        realized_pnl = _as_float(summary.realized_pnl_total, default=0.0)
+        fee = _as_float(summary.fee_total, default=0.0)
+        funding = _as_float(summary.funding_total, default=0.0)
+        net_pnl_excluding_funding = _as_float(summary.net_pnl_excluding_funding, default=realized_pnl - fee)
+        net_pnl_including_funding = _as_float(
+            summary.net_pnl_including_funding,
+            default=net_pnl_excluding_funding + funding,
+        )
+        data_count = summary.decisions + len(order_rows) + len(execution_rows)
+        basis = "decision_performance_summary_plus_execution_ledger"
+    else:
+        realized_pnl = sum(_as_float(row.realized_pnl, default=0.0) for row, _order in execution_rows)
+        gross_pnl = realized_pnl
+        fee = sum(abs(_as_float(row.fee_paid, default=0.0)) for row, _order in execution_rows)
+        funding = _funding_total_for_window(session, since)
+        net_pnl_excluding_funding = realized_pnl - fee
+        net_pnl_including_funding = net_pnl_excluding_funding + funding
+        data_count = len(order_rows) + len(execution_rows)
+        basis = "execution_ledger_plus_account_funding_ledger"
+
+    entry_count = len(entry_rows)
+    marketable_entry_ratio = marketable_entry_count / entry_count if entry_count else 0.0
+    passive_entry_ratio = passive_entry_count / entry_count if entry_count else 0.0
+    total_cost = fee + max(-funding, 0.0)
+    fee_to_gross_pnl_ratio = fee / gross_pnl if gross_pnl > 0 else None
+    cost_to_gross_pnl_ratio = total_cost / gross_pnl if gross_pnl > 0 else None
+
+    warning_codes: list[str] = []
+    if gross_pnl > 0 and fee > gross_pnl:
+        warning_codes.append("fee_exceeds_gross_pnl")
+    if gross_pnl > 0 and total_cost > gross_pnl:
+        warning_codes.append("cost_exceeds_gross_pnl")
+    if gross_pnl > 0 and net_pnl_including_funding < 0:
+        warning_codes.append("positive_gross_negative_net")
+    if adverse_slippage_bps_avg > 0:
+        warning_codes.append("adverse_slippage_positive")
+    if (
+        marketable_entry_count > 0
+        and marketable_entry_ratio >= MARKETABLE_ENTRY_WARNING_RATIO
+        and net_pnl_including_funding <= 0
+    ):
+        warning_codes.append("high_marketable_ratio_low_net_pnl")
+
+    return DashboardProfitabilityCostBreakdown(
+        window_label=window_label,
+        window_hours=window_hours,
+        status="ok" if data_count > 0 else "no_data",
+        gross_pnl=gross_pnl,
+        realized_pnl=realized_pnl,
+        fee=fee,
+        funding=funding,
+        net_pnl=net_pnl_including_funding,
+        net_pnl_excluding_funding=net_pnl_excluding_funding,
+        net_pnl_including_funding=net_pnl_including_funding,
+        signed_slippage_bps_avg=signed_slippage_bps_avg,
+        adverse_slippage_bps_avg=adverse_slippage_bps_avg,
+        entry_count=entry_count,
+        marketable_entry_count=marketable_entry_count,
+        passive_entry_count=passive_entry_count,
+        marketable_entry_ratio=marketable_entry_ratio,
+        passive_entry_ratio=passive_entry_ratio,
+        fee_to_gross_pnl_ratio=fee_to_gross_pnl_ratio,
+        cost_to_gross_pnl_ratio=cost_to_gross_pnl_ratio,
+        total_cost=total_cost,
+        warning_codes=warning_codes,
+        basis=basis,
+    )
 
 
 def _execution_quality_metrics_for_order(
@@ -2124,32 +2348,58 @@ def get_profitability_dashboard(
     performance_window_specs: Sequence[tuple[str, int]] | None = None,
 ) -> DashboardProfitabilityResponse:
     overview = overview or get_overview(session)
+    now = utcnow_naive()
     performance_report = build_signal_performance_report(
         session,
         window_specs=performance_window_specs,
     )
     execution_report = get_execution_quality_report(session)
 
-    windows = [
-        DashboardProfitabilityWindow(
+    cost_breakdown_by_label = {
+        window.window_label: _build_profitability_cost_breakdown(
+            session,
             window_label=window.window_label,
             window_hours=window.window_hours,
+            since=_profitability_window_since(window.window_label, window.window_hours, now),
             summary=window.summary,
-            ai_baseline_comparison=window.ai_baseline_comparison,
-            limited_live_readiness=window.limited_live_readiness,
-            rationale_winners=_top_positive_entries(window.rationale_codes),
-            rationale_losers=_top_negative_entries(window.rationale_codes),
-            top_regimes=_top_positive_entries(window.regimes, limit=4),
-            top_symbols=_top_positive_entries(window.symbols, limit=4),
-            top_timeframes=_top_positive_entries(window.timeframes, limit=4),
-            top_hold_conditions=sorted(
-                window.hold_conditions,
-                key=lambda item: (item.holds, item.decisions, item.key),
-                reverse=True,
-            )[:4],
         )
         for window in performance_report.windows
+    }
+    summary_by_label = {window.window_label: window.summary for window in performance_report.windows}
+    cost_breakdowns = [
+        _build_profitability_cost_breakdown(
+            session,
+            window_label=window_label,
+            window_hours=window_hours,
+            since=_profitability_window_since(window_label, window_hours, now),
+            summary=summary_by_label.get(window_label),
+        )
+        for window_label, window_hours in PROFITABILITY_COST_WINDOW_SPECS
     ]
+
+    windows: list[DashboardProfitabilityWindow] = []
+    for window in performance_report.windows:
+        windows.append(
+            DashboardProfitabilityWindow(
+                window_label=window.window_label,
+                window_hours=window.window_hours,
+                summary=window.summary,
+                cost_breakdown=cost_breakdown_by_label[window.window_label],
+                entry_quality=window.entry_quality,
+                ai_baseline_comparison=window.ai_baseline_comparison,
+                limited_live_readiness=window.limited_live_readiness,
+                rationale_winners=_top_positive_entries(window.rationale_codes),
+                rationale_losers=_top_negative_entries(window.rationale_codes),
+                top_regimes=_top_positive_entries(window.regimes, limit=4),
+                top_symbols=_top_positive_entries(window.symbols, limit=4),
+                top_timeframes=_top_positive_entries(window.timeframes, limit=4),
+                top_hold_conditions=sorted(
+                    window.hold_conditions,
+                    key=lambda item: (item.holds, item.decisions, item.key),
+                    reverse=True,
+                )[:4],
+            )
+        )
 
     execution_windows: list[DashboardExecutionWindowSummary] = []
     raw_execution_windows = execution_report.get("windows")
@@ -2205,6 +2455,8 @@ def get_profitability_dashboard(
         latest_decision=overview.latest_decision,
         latest_risk=overview.latest_risk,
         windows=windows,
+        entry_quality=primary_window.entry_quality if primary_window is not None else {},
+        cost_breakdowns=cost_breakdowns,
         execution_windows=execution_windows,
         hold_blocked_summary=hold_blocked_summary,
         limited_live_readiness=limited_live_readiness,
@@ -3105,6 +3357,8 @@ def _compact_profitability_window(window: DashboardProfitabilityWindow) -> Dashb
         window_label=window.window_label,
         window_hours=window.window_hours,
         summary=window.summary,
+        cost_breakdown=window.cost_breakdown,
+        entry_quality=window.entry_quality,
         ai_baseline_comparison=window.ai_baseline_comparison,
         limited_live_readiness=window.limited_live_readiness,
         rationale_winners=window.rationale_winners[:OPERATOR_PERFORMANCE_ENTRY_LIMIT],
@@ -3255,6 +3509,7 @@ def _build_operator_symbol_summaries(
         decision_row = latest_decisions.get(symbol_key)
         interval_review_row = latest_interval_reviews.get(symbol_key)
         risk_row = latest_risks.get(symbol_key)
+        pending_entry_plan_row = active_entry_plans.get(symbol_key)
         order_row = latest_orders.get(symbol_key)
         execution_row = latest_executions_by_order_id.get(order_row.id) if order_row is not None else None
         position_row = open_positions.get(symbol_key)
@@ -3301,6 +3556,7 @@ def _build_operator_symbol_summaries(
             feature_row.feature_time if feature_row is not None else None,
             decision_row.created_at if decision_row is not None else None,
             risk_row.created_at if risk_row is not None else None,
+            pending_entry_plan_row.created_at if pending_entry_plan_row is not None else None,
             order_row.created_at if order_row is not None else None,
             execution_row.created_at if execution_row is not None else None,
             position_row.created_at if position_row is not None else None,
@@ -3336,7 +3592,7 @@ def _build_operator_symbol_summaries(
                 event_context_summary=event_context_summary,
                 event_operator_control=event_operator_control,
                 ai_decision=decision_snapshot,
-                pending_entry_plan=_build_pending_entry_plan_snapshot(active_entry_plans.get(symbol_key)),
+                pending_entry_plan=_build_pending_entry_plan_snapshot(pending_entry_plan_row),
                 risk_guard=risk_snapshot,
                 risk_guard_result=_risk_guard_result_from_snapshot(risk_snapshot),
                 execution=_build_execution_snapshot_from_rows(
@@ -3456,6 +3712,7 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         market_signal=OperatorMarketSignalSummary(
             market_context_summary=_compact_market_context_summary(overview.market_context_summary),
             performance_windows=compact_performance_windows,
+            profitability_cost_breakdowns=profitability.cost_breakdowns,
             hold_blocked_summary=profitability.hold_blocked_summary,
             adaptive_signal_summary=_compact_adaptive_signal_summary(profitability.adaptive_signal_summary),
         ),

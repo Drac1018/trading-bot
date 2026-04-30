@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from trading_mvp.config import get_settings
-from trading_mvp.models import Order, RiskCheck, Setting
+from trading_mvp.models import Execution, Order, RiskCheck, Setting
 from trading_mvp.schemas import (
     EventOperatorControlPayload,
     MarketSnapshotPayload,
@@ -148,6 +148,22 @@ ADD_ON_LEVERAGE_MULTIPLIER = 0.9
 ADD_ON_NOTIONAL_MULTIPLIER = 0.6
 ADD_ON_HIGH_R_MULTIPLIER = 0.78
 ADD_ON_HIGH_R_THRESHOLD = 1.0
+EXPECTED_COST_EXCEEDS_EDGE_REASON_CODE = "EXPECTED_COST_EXCEEDS_EDGE"
+EXPECTED_COST_UNAVAILABLE_REASON_CODE = "EXPECTED_COST_UNAVAILABLE"
+ADVERSE_SLIPPAGE_TOO_HIGH_REASON_CODE = "ADVERSE_SLIPPAGE_TOO_HIGH"
+FUNDING_HEADWIND_TOO_HIGH_REASON_CODE = "FUNDING_HEADWIND_TOO_HIGH"
+MARKETABLE_ENTRY_COST_TOO_HIGH_REASON_CODE = "MARKETABLE_ENTRY_COST_TOO_HIGH"
+EXPECTED_COST_ENTRY_MARKETABLE = "entry_marketable"
+EXPECTED_COST_ENTRY_PASSIVE_LIMIT = "entry_passive_limit"
+EXPECTED_COST_ENTRY_UNKNOWN = "entry_unknown"
+EXPECTED_COST_TAKER_FEE_BPS = 4.0
+EXPECTED_COST_MAKER_FEE_BPS = 2.0
+EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS = 3.0
+EXPECTED_COST_PASSIVE_SLIPPAGE_BPS = 1.0
+EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS = 2.0
+EXPECTED_COST_RECENT_SLIPPAGE_SAMPLE_LIMIT = 20
+EXPECTED_COST_ADVERSE_SLIPPAGE_ALERT_BPS = 12.0
+EXPECTED_COST_FUNDING_HEADWIND_ALERT_BPS = 5.0
 PORTFOLIO_SLOT_SOFT_CAP_REASON_CODE = "PORTFOLIO_SLOT_SOFT_CAP"
 HOLDING_PROFILE_SWING_SOFT_CAP_REASON_CODE = "HOLDING_PROFILE_SWING_SOFT_CAP"
 HOLDING_PROFILE_POSITION_SOFT_CAP_REASON_CODE = "HOLDING_PROFILE_POSITION_SOFT_CAP"
@@ -861,6 +877,301 @@ def _entry_trigger_evaluation(
     return detail["reason_codes"], detail
 
 
+def _normalize_expected_entry_type(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {EXPECTED_COST_ENTRY_MARKETABLE, "marketable", "market", "aggressive", "immediate"}:
+        return EXPECTED_COST_ENTRY_MARKETABLE
+    if text in {
+        EXPECTED_COST_ENTRY_PASSIVE_LIMIT,
+        "passive",
+        "passive_limit",
+        "maker",
+        "post_only",
+        "post-only",
+        "pullback_confirm",
+    }:
+        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+    if "marketable" in text or "market" in text or "aggressive" in text:
+        return EXPECTED_COST_ENTRY_MARKETABLE
+    if "passive" in text or "maker" in text or "post_only" in text or "post-only" in text:
+        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+    return None
+
+
+def _expected_entry_execution_type(decision: TradeDecision, decision_context: dict[str, Any] | None) -> str:
+    context = _as_dict(decision_context)
+    expected_cost_gate = _as_dict(context.get("expected_cost_gate"))
+    execution_policy = _as_dict(context.get("execution_policy"))
+    selection_context = _as_dict(context.get("selection_context"))
+    selection_execution_policy = _as_dict(selection_context.get("execution_policy"))
+    for value in (
+        expected_cost_gate.get("entry_execution_type"),
+        context.get("entry_execution_type"),
+        execution_policy.get("entry_execution_type"),
+        execution_policy.get("execution_style"),
+        execution_policy.get("entry_style"),
+        execution_policy.get("order_style"),
+        selection_context.get("entry_execution_type"),
+        selection_execution_policy.get("entry_execution_type"),
+        selection_execution_policy.get("execution_style"),
+        selection_execution_policy.get("entry_style"),
+        selection_execution_policy.get("order_style"),
+        selection_context.get("entry_mode"),
+        decision.entry_mode,
+    ):
+        normalized = _normalize_expected_entry_type(value)
+        if normalized is not None:
+            return normalized
+    if decision.entry_mode in {"immediate", "breakout_confirm"}:
+        return EXPECTED_COST_ENTRY_MARKETABLE
+    if decision.entry_mode == "pullback_confirm":
+        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+    return EXPECTED_COST_ENTRY_UNKNOWN
+
+
+def _first_positive_float(*values: object) -> float | None:
+    for value in values:
+        parsed = _optional_float(value)
+        if parsed is not None and parsed > 0.0:
+            return parsed
+    return None
+
+
+def _expected_edge_bps_from_context(decision_context: dict[str, Any] | None) -> tuple[float | None, str | None]:
+    context = _as_dict(decision_context)
+    expected_cost_gate = _as_dict(context.get("expected_cost_gate"))
+    selection_context = _as_dict(context.get("selection_context"))
+    candidate = _as_dict(selection_context.get("candidate"))
+    strategy_engine_context = _as_dict(selection_context.get("strategy_engine_context"))
+    meta_gate = _as_dict(context.get("meta_gate"))
+    value = _first_positive_float(
+        expected_cost_gate.get("expected_edge_bps"),
+        context.get("expected_edge_bps"),
+        selection_context.get("expected_edge_bps"),
+        candidate.get("expected_edge_bps"),
+        candidate.get("target_move_bps"),
+        candidate.get("expected_move_bps"),
+        strategy_engine_context.get("expected_edge_bps"),
+        strategy_engine_context.get("target_move_bps"),
+        meta_gate.get("expected_edge_bps"),
+    )
+    if value is None:
+        return None, None
+    return value, "decision_context"
+
+
+def _expected_edge_bps(
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    decision_context: dict[str, Any] | None,
+) -> tuple[float | None, str]:
+    context_edge, context_source = _expected_edge_bps_from_context(decision_context)
+    if context_edge is not None:
+        return context_edge, context_source or "decision_context"
+    entry_price = _entry_price(decision, market_snapshot)
+    if entry_price <= 0 or decision.take_profit is None:
+        return None, "missing_target_or_entry"
+    if decision.decision == "long" and decision.take_profit > entry_price:
+        return ((decision.take_profit - entry_price) / entry_price) * 10_000, "take_profit_distance"
+    if decision.decision == "short" and decision.take_profit < entry_price:
+        return ((entry_price - decision.take_profit) / entry_price) * 10_000, "take_profit_distance"
+    return None, "invalid_target_direction"
+
+
+def _spread_bps_from_market(market_snapshot: MarketSnapshotPayload) -> tuple[float, str]:
+    derivatives = market_snapshot.derivatives_context
+    spread_bps = _optional_float(getattr(derivatives, "spread_bps", None))
+    if spread_bps is not None and spread_bps >= 0.0:
+        return spread_bps, "derivatives_context.spread_bps"
+    best_bid = _optional_float(getattr(derivatives, "best_bid", None))
+    best_ask = _optional_float(getattr(derivatives, "best_ask", None))
+    if best_bid is not None and best_ask is not None and best_bid > 0.0 and best_ask > best_bid:
+        midpoint = (best_bid + best_ask) / 2.0
+        return ((best_ask - best_bid) / midpoint) * 10_000, "best_bid_ask"
+    return 0.0, "unavailable"
+
+
+def _funding_headwind_bps(decision: TradeDecision, market_snapshot: MarketSnapshotPayload) -> tuple[float, str]:
+    funding_rate = _optional_float(getattr(market_snapshot.derivatives_context, "funding_rate", None))
+    if funding_rate is None:
+        return 0.0, "unavailable"
+    if decision.decision == "long" and funding_rate > 0.0:
+        return abs(funding_rate) * 10_000, "long_pays_positive_funding"
+    if decision.decision == "short" and funding_rate < 0.0:
+        return abs(funding_rate) * 10_000, "short_pays_negative_funding"
+    return 0.0, "not_headwind"
+
+
+def _observed_chase_bps(decision: TradeDecision, market_snapshot: MarketSnapshotPayload) -> float:
+    entry_price = _entry_price(decision, market_snapshot)
+    entry_min, entry_max = _entry_zone_bounds(decision, market_snapshot)
+    latest_price = market_snapshot.latest_price
+    if decision.decision == "long":
+        chase_anchor = max(entry_price, entry_max)
+        return max(((latest_price - chase_anchor) / max(chase_anchor, 1.0)) * 10_000, 0.0)
+    chase_anchor = min(entry_price, entry_min)
+    return max(((chase_anchor - latest_price) / max(chase_anchor, 1.0)) * 10_000, 0.0)
+
+
+def _signed_slippage_bps_from_execution(execution: Execution) -> float | None:
+    payload = execution.payload if isinstance(execution.payload, dict) else {}
+    for value in (
+        payload.get("signed_slippage_bps"),
+        _as_dict(payload.get("execution_quality")).get("signed_slippage_bps"),
+    ):
+        parsed = _optional_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _recent_entry_adverse_slippage_bps(
+    session: Session,
+    *,
+    symbol: str,
+    side: str,
+) -> tuple[float, int]:
+    rows = session.execute(
+        select(Execution, Order)
+        .join(Order, Execution.order_id == Order.id)
+        .where(Execution.symbol == symbol)
+        .order_by(Execution.created_at.desc())
+        .limit(EXPECTED_COST_RECENT_SLIPPAGE_SAMPLE_LIMIT * 3)
+    ).all()
+    samples: list[float] = []
+    for execution, order in rows:
+        if order is None or bool(order.reduce_only) or bool(order.close_only):
+            continue
+        if _is_protective_order_type(order.order_type):
+            continue
+        if _order_exposure_side(order) != side:
+            continue
+        signed_slippage_bps = _signed_slippage_bps_from_execution(execution)
+        if signed_slippage_bps is None:
+            continue
+        samples.append(max(float(signed_slippage_bps), 0.0))
+        if len(samples) >= EXPECTED_COST_RECENT_SLIPPAGE_SAMPLE_LIMIT:
+            break
+    if not samples:
+        return 0.0, 0
+    return sum(samples) / len(samples), len(samples)
+
+
+def _expected_fee_components(entry_execution_type: str) -> dict[str, float]:
+    entry_fee_bps = (
+        EXPECTED_COST_MAKER_FEE_BPS
+        if entry_execution_type == EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+        else EXPECTED_COST_TAKER_FEE_BPS
+    )
+    exit_fee_bps = EXPECTED_COST_TAKER_FEE_BPS
+    return {
+        "entry_fee_bps": entry_fee_bps,
+        "exit_fee_bps": exit_fee_bps,
+        "total_fee_bps": entry_fee_bps + exit_fee_bps,
+    }
+
+
+def _expected_slippage_bps(
+    *,
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    entry_execution_type: str,
+    recent_adverse_slippage_bps: float,
+    decision_context: dict[str, Any] | None,
+) -> tuple[float, str]:
+    context = _as_dict(decision_context)
+    expected_cost_gate = _as_dict(context.get("expected_cost_gate"))
+    explicit_slippage = _first_positive_float(
+        expected_cost_gate.get("expected_slippage_bps"),
+        context.get("expected_slippage_bps"),
+    )
+    if explicit_slippage is not None:
+        return max(explicit_slippage, recent_adverse_slippage_bps), "decision_context"
+    fallback = EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS
+    if entry_execution_type == EXPECTED_COST_ENTRY_MARKETABLE:
+        fallback = EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS
+    elif entry_execution_type == EXPECTED_COST_ENTRY_PASSIVE_LIMIT:
+        fallback = EXPECTED_COST_PASSIVE_SLIPPAGE_BPS
+    observed_chase_bps = _observed_chase_bps(decision, market_snapshot)
+    return max(fallback, observed_chase_bps, recent_adverse_slippage_bps), "fallback_plus_observed_chase"
+
+
+def _expected_cost_gate_evaluation(
+    session: Session,
+    *,
+    settings_row: Setting,
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    decision_context: dict[str, Any] | None,
+) -> tuple[list[str], dict[str, Any]]:
+    entry_execution_type = _expected_entry_execution_type(decision, decision_context)
+    expected_edge_bps, expected_edge_source = _expected_edge_bps(decision, market_snapshot, decision_context)
+    spread_bps, spread_source = _spread_bps_from_market(market_snapshot)
+    funding_headwind_bps, funding_source = _funding_headwind_bps(decision, market_snapshot)
+    recent_adverse_slippage_bps, recent_slippage_samples = _recent_entry_adverse_slippage_bps(
+        session,
+        symbol=decision.symbol,
+        side=decision.decision,
+    )
+    expected_slippage_bps, slippage_source = _expected_slippage_bps(
+        decision=decision,
+        market_snapshot=market_snapshot,
+        entry_execution_type=entry_execution_type,
+        recent_adverse_slippage_bps=recent_adverse_slippage_bps,
+        decision_context=decision_context,
+    )
+    fee_components = _expected_fee_components(entry_execution_type)
+    expected_cost_bps = (
+        fee_components["total_fee_bps"]
+        + expected_slippage_bps
+        + spread_bps
+        + funding_headwind_bps
+    )
+    reason_codes: list[str] = []
+    if expected_edge_bps is None or expected_edge_bps <= 0.0:
+        reason_codes.append(EXPECTED_COST_UNAVAILABLE_REASON_CODE)
+    elif expected_cost_bps >= expected_edge_bps:
+        reason_codes.append(EXPECTED_COST_EXCEEDS_EDGE_REASON_CODE)
+        if entry_execution_type == EXPECTED_COST_ENTRY_MARKETABLE:
+            reason_codes.append(MARKETABLE_ENTRY_COST_TOO_HIGH_REASON_CODE)
+        if recent_adverse_slippage_bps >= min(expected_edge_bps, EXPECTED_COST_ADVERSE_SLIPPAGE_ALERT_BPS):
+            reason_codes.append(ADVERSE_SLIPPAGE_TOO_HIGH_REASON_CODE)
+        if funding_headwind_bps >= min(expected_edge_bps, EXPECTED_COST_FUNDING_HEADWIND_ALERT_BPS):
+            reason_codes.append(FUNDING_HEADWIND_TOO_HIGH_REASON_CODE)
+
+    debug_payload = {
+        "applied": True,
+        "status": "blocked" if reason_codes else "pass",
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "entry_execution_type": entry_execution_type,
+        "expected_edge_bps": _round_float(expected_edge_bps),
+        "expected_edge_source": expected_edge_source,
+        "expected_cost_bps": _round_float(expected_cost_bps),
+        "cost_components": {
+            "fee_bps": _round_float(fee_components["total_fee_bps"]),
+            "entry_fee_bps": _round_float(fee_components["entry_fee_bps"]),
+            "exit_fee_bps": _round_float(fee_components["exit_fee_bps"]),
+            "slippage_bps": _round_float(expected_slippage_bps),
+            "slippage_source": slippage_source,
+            "spread_bps": _round_float(spread_bps),
+            "spread_source": spread_source,
+            "funding_headwind_bps": _round_float(funding_headwind_bps),
+            "funding_source": funding_source,
+            "recent_adverse_slippage_bps": _round_float(recent_adverse_slippage_bps),
+            "recent_slippage_sample_count": recent_slippage_samples,
+        },
+        "thresholds": {
+            "settings_slippage_threshold_bps": _round_float(settings_row.slippage_threshold_pct * 10_000),
+            "adverse_slippage_alert_bps": EXPECTED_COST_ADVERSE_SLIPPAGE_ALERT_BPS,
+            "funding_headwind_alert_bps": EXPECTED_COST_FUNDING_HEADWIND_ALERT_BPS,
+        },
+        "comparison": "block_when_expected_cost_gte_expected_edge",
+    }
+    return debug_payload["reason_codes"], debug_payload
+
+
 def get_symbol_risk_tier(symbol: str) -> Literal["btc", "major_alt", "alt"]:
     normalized = symbol.upper()
     if normalized in BTC_SYMBOLS:
@@ -1479,6 +1790,7 @@ def evaluate_risk(
     requested_exposure_limit_codes: list[str] = []
     final_exposure_limit_codes: list[str] = []
     entry_trigger_debug: dict[str, Any] = {}
+    expected_cost_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     decision_agreement = _decision_agreement_context(decision_context)
     setup_cluster_state = _setup_cluster_state_context(decision_context)
     suppression_context = _recent_performance_suppression_context(decision_context, decision)
@@ -1716,6 +2028,15 @@ def evaluate_risk(
     slippage = abs(entry - market_snapshot.latest_price) / max(market_snapshot.latest_price, 1.0)
     if slippage > settings_row.slippage_threshold_pct and is_entry_decision:
         blocked_reason_codes.append("SLIPPAGE_THRESHOLD_EXCEEDED")
+    if is_entry_decision:
+        expected_cost_reason_codes, expected_cost_gate = _expected_cost_gate_evaluation(
+            session,
+            settings_row=settings_row,
+            decision=decision,
+            market_snapshot=market_snapshot,
+            decision_context=decision_context,
+        )
+        blocked_reason_codes.extend(expected_cost_reason_codes)
     if decision.decision == "hold":
         blocked_reason_codes.append("HOLD_DECISION")
         operating_mode = "hold" if operating_mode != "paused" else operating_mode
@@ -2038,6 +2359,7 @@ def evaluate_risk(
         "final_exposure_limit_codes": final_exposure_limit_codes,
         "exchange_minimums": exchange_minimums,
         "entry_trigger": entry_trigger_debug,
+        "expected_cost_gate": expected_cost_gate,
         "decision_agreement": {
             **decision_agreement,
             "agreement_adjusted_notional": _round_float(

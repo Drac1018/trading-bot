@@ -37,14 +37,61 @@ type PerformanceWindow = {
     holds: number;
     wins: number;
     losses: number;
+    gross_pnl_total: number;
+    realized_pnl_total: number;
     net_realized_pnl_total: number;
+    net_pnl_excluding_funding: number;
+    net_pnl_including_funding: number;
     fee_total: number;
+    funding_total: number;
   };
+  cost_breakdown?: ProfitabilityCostBreakdown;
+  entry_quality?: Record<string, EntryQualityBreakdown>;
   rationale_winners: PerformanceEntry[];
   rationale_losers: PerformanceEntry[];
   top_regimes: PerformanceEntry[];
   top_symbols: PerformanceEntry[];
   top_hold_conditions: PerformanceEntry[];
+};
+
+export type EntryQualityBreakdown = {
+  entry_type: "entry_passive_limit" | "entry_marketable" | "entry_unknown";
+  trade_count: number;
+  win_rate: number;
+  gross_pnl: number;
+  fee: number;
+  funding: number;
+  net_pnl: number;
+  avg_signed_slippage_bps: number;
+  avg_adverse_slippage_bps: number;
+  avg_hold_time: number;
+  expectancy: number;
+  basis: string;
+};
+
+export type ProfitabilityCostBreakdown = {
+  window_label: string;
+  window_hours: number | null;
+  status: string;
+  gross_pnl: number;
+  realized_pnl: number;
+  fee: number;
+  funding: number;
+  net_pnl: number;
+  net_pnl_excluding_funding: number;
+  net_pnl_including_funding: number;
+  signed_slippage_bps_avg: number;
+  adverse_slippage_bps_avg: number;
+  entry_count: number;
+  marketable_entry_count: number;
+  passive_entry_count: number;
+  marketable_entry_ratio: number;
+  passive_entry_ratio: number;
+  fee_to_gross_pnl_ratio: number | null;
+  cost_to_gross_pnl_ratio: number | null;
+  total_cost: number;
+  warning_codes: string[];
+  basis: string;
 };
 
 type ExecutionWindow = {
@@ -336,6 +383,7 @@ export type OperatorDashboardPayload = {
   market_signal: {
     market_context_summary: Record<string, unknown>;
     performance_windows: PerformanceWindow[];
+    profitability_cost_breakdowns: ProfitabilityCostBreakdown[];
     hold_blocked_summary: {
       hold_top_conditions: PerformanceEntry[];
       latest_blocked_reasons: string[];

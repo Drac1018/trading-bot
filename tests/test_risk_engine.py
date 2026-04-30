@@ -4,8 +4,8 @@ from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
-from trading_mvp.models import PnLSnapshot, Position
-from trading_mvp.schemas import TradeDecision
+from trading_mvp.models import Execution, Order, PnLSnapshot, Position
+from trading_mvp.schemas import DerivativesContextPayload, TradeDecision
 from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import (
@@ -510,6 +510,196 @@ def test_reduce_is_allowed_while_trading_is_paused(db_session) -> None:
     assert result.allowed is True
     assert "TRADING_PAUSED" not in result.reason_codes
     assert "LIVE_TRADING_DISABLED" not in result.reason_codes
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_expected_cost_gate_blocks_entry_when_cost_exceeds_edge(db_session, side: str) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    take_profit = entry_price * (1.0005 if side == "long" else 0.9995)
+    stop_loss = entry_price * (0.99 if side == "long" else 1.01)
+    decision = _entry_decision(
+        decision=side,
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        max_chase_bps=20.0,
+    )
+
+    result, row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "EXPECTED_COST_EXCEEDS_EDGE" in result.reason_codes
+    assert "MARKETABLE_ENTRY_COST_TOO_HIGH" in result.reason_codes
+    expected_cost_gate = result.debug_payload["expected_cost_gate"]
+    assert expected_cost_gate["status"] == "blocked"
+    assert expected_cost_gate["expected_cost_bps"] >= expected_cost_gate["expected_edge_bps"]
+    assert row.payload["debug_payload"]["expected_cost_gate"]["reason_codes"] == expected_cost_gate["reason_codes"]
+
+
+def test_expected_cost_gate_blocks_entry_when_edge_is_unavailable(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=None,  # type: ignore[arg-type]
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "EXPECTED_COST_UNAVAILABLE" in result.reason_codes
+    assert result.debug_payload["expected_cost_gate"]["expected_edge_source"] == "missing_target_or_entry"
+
+
+def test_expected_cost_gate_uses_recent_adverse_signed_slippage(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    order = Order(
+        symbol="BTCUSDT",
+        side="long",
+        order_type="market",
+        mode="live",
+        status="filled",
+        requested_quantity=0.01,
+        requested_price=entry_price,
+        filled_quantity=0.01,
+        average_fill_price=entry_price * 1.004,
+        reason_codes=[],
+        metadata_json={"entry_execution_type": "entry_marketable"},
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        Execution(
+            order_id=order.id,
+            symbol="BTCUSDT",
+            fill_price=entry_price * 1.004,
+            fill_quantity=0.01,
+            fee_paid=0.0,
+            slippage_pct=0.004,
+            realized_pnl=0.0,
+            payload={"signed_slippage_bps": 40.0},
+        )
+    )
+    db_session.flush()
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.003,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "EXPECTED_COST_EXCEEDS_EDGE" in result.reason_codes
+    assert "ADVERSE_SLIPPAGE_TOO_HIGH" in result.reason_codes
+    components = result.debug_payload["expected_cost_gate"]["cost_components"]
+    assert components["recent_adverse_slippage_bps"] == pytest.approx(40.0)
+    assert components["recent_slippage_sample_count"] == 1
+
+
+def test_expected_cost_gate_blocks_large_funding_headwind(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    base_snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    snapshot = base_snapshot.model_copy(
+        update={
+            "derivatives_context": DerivativesContextPayload(
+                source="binance_public",
+                funding_rate=0.002,
+            )
+        }
+    )
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.002,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "EXPECTED_COST_EXCEEDS_EDGE" in result.reason_codes
+    assert "FUNDING_HEADWIND_TOO_HIGH" in result.reason_codes
+    components = result.debug_payload["expected_cost_gate"]["cost_components"]
+    assert components["funding_headwind_bps"] == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize("decision_name", ["reduce", "exit"])
+def test_expected_cost_gate_does_not_block_survival_paths(db_session, decision_name: str) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        decision=decision_name,
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["POSITION_MANAGEMENT_TEST"],
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={"expected_cost_gate": {"expected_edge_bps": 0.1}},
+    )
+
+    assert result.allowed is True
+    assert "EXPECTED_COST_EXCEEDS_EDGE" not in result.reason_codes
+    assert "EXPECTED_COST_UNAVAILABLE" not in result.reason_codes
+    assert result.debug_payload["expected_cost_gate"]["applied"] is False
 
 
 def test_btc_uses_five_x_hard_cap(db_session) -> None:

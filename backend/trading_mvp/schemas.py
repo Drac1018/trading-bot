@@ -436,9 +436,13 @@ class SignalPerformanceEntry(StrictBaseModel):
     exits: int = Field(ge=0)
     wins: int = Field(ge=0)
     losses: int = Field(ge=0)
+    gross_pnl_total: float = 0.0
     realized_pnl_total: float
     fee_total: float = 0.0
+    funding_total: float = 0.0
     net_realized_pnl_total: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
     average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
@@ -552,9 +556,13 @@ class PerformanceAggregateEntry(StrictBaseModel):
     exits: int = Field(ge=0)
     wins: int = Field(ge=0)
     losses: int = Field(ge=0)
+    gross_pnl_total: float = 0.0
     realized_pnl_total: float = 0.0
     fee_total: float = 0.0
+    funding_total: float = 0.0
     net_realized_pnl_total: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
     average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
@@ -579,6 +587,9 @@ class FeatureFlagPerformanceEntry(StrictBaseModel):
     disabled: PerformanceAggregateEntry
 
 
+EntryExecutionType = Literal["entry_passive_limit", "entry_marketable", "entry_unknown"]
+
+
 class DecisionPerformanceEntry(StrictBaseModel):
     decision_run_id: int
     created_at: datetime
@@ -598,10 +609,17 @@ class DecisionPerformanceEntry(StrictBaseModel):
     fills: int = Field(ge=0)
     wins: int = Field(ge=0)
     losses: int = Field(ge=0)
+    gross_pnl_total: float = 0.0
     realized_pnl_total: float = 0.0
     fee_total: float = 0.0
+    funding_total: float = 0.0
     net_realized_pnl_total: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
+    funding_attribution_status: str = "missing_position_interval"
     average_slippage_pct: float = Field(ge=0.0)
+    average_signed_slippage_bps: float = 0.0
+    average_adverse_slippage_bps: float = Field(ge=0.0, default=0.0)
     arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     realized_slippage_pct: float = Field(ge=0.0, default=0.0)
     first_fill_latency_seconds: float = Field(ge=0.0, default=0.0)
@@ -623,6 +641,7 @@ class DecisionPerformanceEntry(StrictBaseModel):
     mae_pnl: float | None = None
     mfe_mae_tracking_status: str = "calculated"
     mfe_mae_tracking_basis: str = "position_window_market_path"
+    entry_execution_type: EntryExecutionType = "entry_unknown"
 
 
 class PerformanceWindowSummary(StrictBaseModel):
@@ -637,9 +656,13 @@ class PerformanceWindowSummary(StrictBaseModel):
     exits: int = Field(ge=0)
     wins: int = Field(ge=0)
     losses: int = Field(ge=0)
+    gross_pnl_total: float = 0.0
     realized_pnl_total: float = 0.0
     fee_total: float = 0.0
+    funding_total: float = 0.0
     net_realized_pnl_total: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
     average_slippage_pct: float = Field(ge=0.0)
     average_arrival_slippage_pct: float = Field(ge=0.0, default=0.0)
     average_realized_slippage_pct: float = Field(ge=0.0, default=0.0)
@@ -701,6 +724,21 @@ class LimitedLiveReadinessReport(StrictBaseModel):
     basis: str = "read_only_recent_window_observation"
 
 
+class EntryQualityPerformanceEntry(StrictBaseModel):
+    entry_type: EntryExecutionType
+    trade_count: int = Field(ge=0)
+    win_rate: float = Field(ge=0.0, le=1.0, default=0.0)
+    gross_pnl: float = 0.0
+    fee: float = 0.0
+    funding: float = 0.0
+    net_pnl: float = 0.0
+    avg_signed_slippage_bps: float = 0.0
+    avg_adverse_slippage_bps: float = Field(ge=0.0, default=0.0)
+    avg_hold_time: float = Field(ge=0.0, default=0.0)
+    expectancy: float = 0.0
+    basis: str = "filled_entry_decisions_execution_ledger"
+
+
 class PerformanceWindowReport(StrictBaseModel):
     window_label: str
     window_hours: int = Field(ge=1, le=24 * 30)
@@ -718,6 +756,7 @@ class PerformanceWindowReport(StrictBaseModel):
     hold_conditions: list[PerformanceAggregateEntry] = Field(default_factory=list)
     close_outcomes: list[PerformanceAggregateEntry] = Field(default_factory=list)
     feature_flags: list[FeatureFlagPerformanceEntry] = Field(default_factory=list)
+    entry_quality: dict[str, EntryQualityPerformanceEntry] = Field(default_factory=dict)
 
 
 class SignalPerformanceReportResponse(StrictBaseModel):
@@ -1055,10 +1094,39 @@ class DashboardExecutionWindowSummary(StrictBaseModel):
     worst_profiles: list[DashboardExecutionProfileSummary] = Field(default_factory=list)
 
 
+class DashboardProfitabilityCostBreakdown(StrictBaseModel):
+    window_label: str
+    window_hours: int | None = Field(default=None, ge=1, le=24 * 30)
+    status: str = "no_data"
+    gross_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    fee: float = 0.0
+    funding: float = 0.0
+    net_pnl: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
+    signed_slippage_bps_avg: float = 0.0
+    adverse_slippage_bps_avg: float = 0.0
+    entry_count: int = Field(default=0, ge=0)
+    marketable_entry_count: int = Field(default=0, ge=0)
+    passive_entry_count: int = Field(default=0, ge=0)
+    marketable_entry_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    passive_entry_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    fee_to_gross_pnl_ratio: float | None = None
+    cost_to_gross_pnl_ratio: float | None = None
+    total_cost: float = 0.0
+    warning_codes: list[str] = Field(default_factory=list)
+    basis: str = "decision_performance_summary_plus_execution_ledger"
+
+
 class DashboardProfitabilityWindow(StrictBaseModel):
     window_label: str
     window_hours: int = Field(ge=1, le=24 * 30)
     summary: PerformanceWindowSummary
+    cost_breakdown: DashboardProfitabilityCostBreakdown = Field(
+        default_factory=lambda: DashboardProfitabilityCostBreakdown(window_label="unknown")
+    )
+    entry_quality: dict[str, EntryQualityPerformanceEntry] = Field(default_factory=dict)
     ai_baseline_comparison: AIBaselineComparisonSummary = Field(default_factory=AIBaselineComparisonSummary)
     limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
     rationale_winners: list[PerformanceAggregateEntry] = Field(default_factory=list)
@@ -1086,6 +1154,8 @@ class DashboardProfitabilityResponse(StrictBaseModel):
     latest_decision: dict[str, Any] | None = None
     latest_risk: dict[str, Any] | None = None
     windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
+    entry_quality: dict[str, EntryQualityPerformanceEntry] = Field(default_factory=dict)
+    cost_breakdowns: list[DashboardProfitabilityCostBreakdown] = Field(default_factory=list)
     execution_windows: list[DashboardExecutionWindowSummary] = Field(default_factory=list)
     hold_blocked_summary: DashboardHoldBlockedSummary
     limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
@@ -1573,6 +1643,7 @@ class OperatorSymbolSummary(StrictBaseModel):
 class OperatorMarketSignalSummary(StrictBaseModel):
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
     performance_windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
+    profitability_cost_breakdowns: list[DashboardProfitabilityCostBreakdown] = Field(default_factory=list)
     hold_blocked_summary: DashboardHoldBlockedSummary
     adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
 

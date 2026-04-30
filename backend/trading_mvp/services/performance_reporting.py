@@ -13,6 +13,7 @@ from sqlalchemy import Text, cast, desc, func, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import (
+    AccountLedgerEntry,
     AgentRun,
     AuditEvent,
     CompetitorNote,
@@ -28,6 +29,7 @@ from trading_mvp.schemas import (
     AIBaselineComparisonSummary,
     AIUsageTelemetrySummary,
     DecisionPerformanceEntry,
+    EntryQualityPerformanceEntry,
     FeatureFlagPerformanceEntry,
     LimitedLiveReadinessReport,
     PerformanceAggregateEntry,
@@ -76,7 +78,10 @@ class SignalBucket:
     losses: int = 0
     realized_pnl_total: float = 0.0
     fee_total: float = 0.0
+    funding_total: float = 0.0
     net_realized_pnl_total: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
     slippages: list[float] = field(default_factory=list)
     holding_minutes: list[float] = field(default_factory=list)
     holding_over_plan_count: int = 0
@@ -109,10 +114,17 @@ class DecisionPerformanceSnapshot:
     fills: int
     wins: int
     losses: int
+    gross_pnl_total: float
     realized_pnl_total: float
     fee_total: float
+    funding_total: float
     net_realized_pnl_total: float
+    net_pnl_excluding_funding: float
+    net_pnl_including_funding: float
+    funding_attribution_status: str
     average_slippage_pct: float
+    average_signed_slippage_bps: float
+    average_adverse_slippage_bps: float
     arrival_slippage_pct: float
     realized_slippage_pct: float
     first_fill_latency_seconds: float
@@ -145,6 +157,7 @@ class DecisionPerformanceSnapshot:
     comparison_bucket: str
     unobserved_reason: str | None
     pnl_per_exposure_hour: float | None
+    entry_execution_type: str
 
 
 @dataclass(slots=True)
@@ -223,6 +236,15 @@ CANCEL_ATTEMPT_ORDER_STATUSES = {"canceled", "cancelled", "expired"}
 CANCEL_SUCCESS_ORDER_STATUSES = {"canceled", "cancelled"}
 ENTRY_DECISIONS = {"long", "short"}
 MANAGEMENT_DECISIONS = {"reduce", "exit"}
+ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT = "entry_passive_limit"
+ENTRY_EXECUTION_TYPE_MARKETABLE = "entry_marketable"
+ENTRY_EXECUTION_TYPE_UNKNOWN = "entry_unknown"
+ENTRY_EXECUTION_TYPES = (
+    ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT,
+    ENTRY_EXECUTION_TYPE_MARKETABLE,
+    ENTRY_EXECUTION_TYPE_UNKNOWN,
+)
+PROTECTIVE_ORDER_TYPE_PREFIXES = ("STOP", "TAKE_PROFIT")
 AI_BASELINE_BUCKET_ORDER = (
     "baseline_only_entry",
     "ai_approved_entry",
@@ -350,6 +372,133 @@ def _as_dict(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _normalize_entry_execution_type(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in ENTRY_EXECUTION_TYPES:
+        return text
+    if text in {"passive", "passive_limit", "maker", "post_only"}:
+        return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+    if text in {"marketable", "market", "aggressive"}:
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    if "passive" in text or "maker" in text:
+        return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+    if "marketable" in text or "market" in text or "aggressive" in text:
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    return None
+
+
+def _is_entry_order_row(order_row: Order) -> bool:
+    if bool(order_row.reduce_only) or bool(order_row.close_only):
+        return False
+    order_type = str(order_row.order_type or "").upper()
+    return not order_type.startswith(PROTECTIVE_ORDER_TYPE_PREFIXES)
+
+
+def _entry_execution_type_from_order(order_row: Order) -> str:
+    if not _is_entry_order_row(order_row):
+        return ENTRY_EXECUTION_TYPE_UNKNOWN
+    metadata = _as_dict(order_row.metadata_json)
+    quality = _as_dict(metadata.get("execution_quality"))
+    policy = _as_dict(metadata.get("execution_policy"))
+
+    for value in (
+        metadata.get("entry_execution_type"),
+        quality.get("entry_execution_type"),
+        policy.get("entry_execution_type"),
+        policy.get("policy_name"),
+        policy.get("execution_style"),
+        policy.get("entry_style"),
+        policy.get("order_style"),
+        quality.get("execution_style"),
+    ):
+        normalized = _normalize_entry_execution_type(value)
+        if normalized is not None:
+            return normalized
+
+    if _safe_bool(quality.get("aggressive_fallback_used"), default=False):
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    if policy.get("marketable") is not None:
+        return ENTRY_EXECUTION_TYPE_MARKETABLE if _safe_bool(policy.get("marketable")) else ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+
+    order_type = str(order_row.order_type or "").lower()
+    if order_type == "limit":
+        return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+    if order_type == "market" or order_type.endswith("_market"):
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    return ENTRY_EXECUTION_TYPE_UNKNOWN
+
+
+def _entry_execution_type_for_decision(
+    orders: list[Order],
+    executions_by_order: dict[int, list[Execution]],
+) -> str:
+    entry_orders = [order for order in orders if _is_entry_order_row(order)]
+    if not entry_orders:
+        return ENTRY_EXECUTION_TYPE_UNKNOWN
+    filled_entry_orders = [order for order in entry_orders if executions_by_order.get(order.id)]
+    source_orders = filled_entry_orders or entry_orders
+    observed = [_entry_execution_type_from_order(order) for order in source_orders]
+    if ENTRY_EXECUTION_TYPE_MARKETABLE in observed:
+        return ENTRY_EXECUTION_TYPE_MARKETABLE
+    if ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT in observed:
+        return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+    return ENTRY_EXECUTION_TYPE_UNKNOWN
+
+
+def _signed_slippage_bps(*, side: str | None, requested_price: float | None, fill_price: float | None) -> float:
+    requested = _safe_float(requested_price, default=0.0)
+    filled = _safe_float(fill_price, default=0.0)
+    if requested <= 0 or filled <= 0:
+        return 0.0
+    raw_bps = ((filled - requested) / requested) * 10000.0
+    side_key = str(side or "").lower()
+    if side_key == "buy":
+        return raw_bps
+    if side_key == "sell":
+        return -raw_bps
+    return 0.0
+
+
+def _execution_signed_slippage_bps(execution_row: Execution, order_row: Order) -> float:
+    payload = _as_dict(execution_row.payload)
+    for key in ("signed_slippage_bps", "fill_signed_slippage_bps"):
+        if payload.get(key) is not None:
+            return _safe_float(payload.get(key), default=0.0)
+    metadata = _as_dict(order_row.metadata_json)
+    quality = _as_dict(metadata.get("execution_quality"))
+    for key in ("signed_slippage_bps", "fill_signed_slippage_bps"):
+        if quality.get(key) is not None:
+            return _safe_float(quality.get(key), default=0.0)
+    return _signed_slippage_bps(
+        side=str(order_row.side or ""),
+        requested_price=_safe_float(order_row.requested_price, default=0.0),
+        fill_price=_safe_float(execution_row.fill_price, default=0.0),
+    )
+
+
+def _decision_entry_slippage_bps_snapshot(
+    orders: list[Order],
+    executions_by_order: dict[int, list[Execution]],
+) -> tuple[float, float]:
+    signed_weighted_sum = 0.0
+    adverse_weighted_sum = 0.0
+    total_weight = 0.0
+    for order_row in orders:
+        if not _is_entry_order_row(order_row):
+            continue
+        for execution_row in executions_by_order.get(order_row.id, []):
+            signed_bps = _execution_signed_slippage_bps(execution_row, order_row)
+            weight = abs(_safe_float(execution_row.fill_quantity, default=0.0)) or 1.0
+            signed_weighted_sum += signed_bps * weight
+            adverse_weighted_sum += max(signed_bps, 0.0) * weight
+            total_weight += weight
+    if total_weight <= 0:
+        return 0.0, 0.0
+    return signed_weighted_sum / total_weight, adverse_weighted_sum / total_weight
+
+
 def _normalized_decision(value: object) -> str | None:
     if value is None:
         return None
@@ -466,6 +615,131 @@ def _pnl_per_exposure_hour(net_pnl_after_fees: float, holding_minutes: float, fi
     if fills <= 0 or holding_minutes <= 0:
         return None
     return net_pnl_after_fees / (holding_minutes / 60.0)
+
+
+def _position_interval(position: Position, *, now: datetime) -> tuple[datetime, datetime] | None:
+    opened_at = position.opened_at
+    if opened_at is None:
+        return None
+    closed_at = position.closed_at or now
+    if closed_at < opened_at:
+        return None
+    return opened_at, closed_at
+
+
+def _position_owner_decision_ids(orders_by_decision: Mapping[int, list[Order]]) -> dict[int, int]:
+    candidates_by_position: dict[int, list[tuple[int, datetime, int, int]]] = defaultdict(list)
+    for decision_id, orders in orders_by_decision.items():
+        for order in orders:
+            if order.position_id is None:
+                continue
+            priority = 0 if not order.reduce_only and not order.close_only else 1
+            candidates_by_position[int(order.position_id)].append((priority, order.created_at, int(order.id), int(decision_id)))
+    return {
+        position_id: sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0][3]
+        for position_id, candidates in candidates_by_position.items()
+        if candidates
+    }
+
+
+def _load_funding_entries_for_positions(
+    session: Session,
+    positions: Sequence[Position],
+    *,
+    now: datetime,
+) -> list[AccountLedgerEntry]:
+    intervals = [
+        interval
+        for position in positions
+        if (interval := _position_interval(position, now=now)) is not None
+    ]
+    symbols = sorted({position.symbol for position in positions if position.symbol})
+    if not intervals or not symbols:
+        return []
+    earliest_open = min(interval[0] for interval in intervals)
+    latest_close = max(interval[1] for interval in intervals)
+    return list(
+        session.scalars(
+            select(AccountLedgerEntry)
+            .where(
+                AccountLedgerEntry.entry_type == "funding",
+                AccountLedgerEntry.symbol.in_(symbols),
+                AccountLedgerEntry.occurred_at >= earliest_open,
+                AccountLedgerEntry.occurred_at <= latest_close,
+            )
+            .order_by(AccountLedgerEntry.occurred_at.asc(), AccountLedgerEntry.id.asc())
+        )
+    )
+
+
+def _funding_by_position(
+    positions: Sequence[Position],
+    funding_entries: Sequence[AccountLedgerEntry],
+    *,
+    now: datetime,
+) -> tuple[dict[int, float], dict[int, str]]:
+    intervals_by_position = {
+        int(position.id): interval
+        for position in positions
+        if position.id is not None and (interval := _position_interval(position, now=now)) is not None
+    }
+    positions_by_symbol: dict[str, list[Position]] = defaultdict(list)
+    for position in positions:
+        if position.id in intervals_by_position:
+            positions_by_symbol[str(position.symbol or "").upper()].append(position)
+
+    funding_by_position_id: dict[int, float] = defaultdict(float)
+    match_count_by_position_id: dict[int, int] = defaultdict(int)
+    ambiguous_position_ids: set[int] = set()
+    for entry in funding_entries:
+        symbol = str(entry.symbol or "").upper()
+        matched_position_ids: list[int] = []
+        for position in positions_by_symbol.get(symbol, []):
+            interval = intervals_by_position.get(int(position.id))
+            if interval is None:
+                continue
+            opened_at, closed_at = interval
+            if opened_at <= entry.occurred_at <= closed_at:
+                matched_position_ids.append(int(position.id))
+        if not matched_position_ids:
+            continue
+        amount_share = _safe_float(entry.amount) / len(matched_position_ids)
+        if len(matched_position_ids) > 1:
+            ambiguous_position_ids.update(matched_position_ids)
+        for position_id in matched_position_ids:
+            funding_by_position_id[position_id] += amount_share
+            match_count_by_position_id[position_id] += 1
+
+    status_by_position_id: dict[int, str] = {}
+    for position in positions:
+        position_id = int(position.id)
+        if position_id not in intervals_by_position:
+            status_by_position_id[position_id] = "missing_position_interval"
+        elif match_count_by_position_id.get(position_id, 0) > 0:
+            status_by_position_id[position_id] = "ambiguous_match" if position_id in ambiguous_position_ids else "matched"
+        else:
+            status_by_position_id[position_id] = "no_funding_records"
+    return dict(funding_by_position_id), status_by_position_id
+
+
+def _funding_status_for_decision(
+    *,
+    linked_position_ids: Sequence[int],
+    owned_position_ids: Sequence[int],
+    status_by_position_id: Mapping[int, str],
+) -> str:
+    if not linked_position_ids:
+        return "missing_position_interval"
+    if not owned_position_ids:
+        return "ambiguous_match"
+    statuses = [status_by_position_id.get(position_id, "missing_position_interval") for position_id in owned_position_ids]
+    if any(status == "ambiguous_match" for status in statuses):
+        return "ambiguous_match"
+    if any(status == "matched" for status in statuses):
+        return "matched"
+    if all(status == "missing_position_interval" for status in statuses):
+        return "missing_position_interval"
+    return "no_funding_records"
 
 
 def _pnl_point_from_row(row: PnLSnapshot | None) -> PnLSnapshotPoint | None:
@@ -1216,9 +1490,13 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
             exits=0,
             wins=0,
             losses=0,
+            gross_pnl_total=0.0,
             realized_pnl_total=0.0,
             fee_total=0.0,
+            funding_total=0.0,
             net_realized_pnl_total=0.0,
+            net_pnl_excluding_funding=0.0,
+            net_pnl_including_funding=0.0,
             average_slippage_pct=0.0,
             average_arrival_slippage_pct=0.0,
             average_realized_slippage_pct=0.0,
@@ -1256,9 +1534,13 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
         exits=sum(1 for item in snapshots if item.decision == "exit"),
         wins=sum(item.wins for item in snapshots),
         losses=sum(item.losses for item in snapshots),
+        gross_pnl_total=sum(item.gross_pnl_total for item in snapshots),
         realized_pnl_total=sum(item.realized_pnl_total for item in snapshots),
         fee_total=sum(item.fee_total for item in snapshots),
+        funding_total=sum(item.funding_total for item in snapshots),
         net_realized_pnl_total=sum(item.net_realized_pnl_total for item in snapshots),
+        net_pnl_excluding_funding=sum(item.net_pnl_excluding_funding for item in snapshots),
+        net_pnl_including_funding=sum(item.net_pnl_including_funding for item in snapshots),
         average_slippage_pct=(sum(slippages) / len(slippages) if slippages else 0.0),
         average_arrival_slippage_pct=(sum(arrival_slippages) / len(arrival_slippages) if arrival_slippages else 0.0),
         average_realized_slippage_pct=(sum(realized_slippages) / len(realized_slippages) if realized_slippages else 0.0),
@@ -1278,6 +1560,46 @@ def _bucket_from_snapshots(key: str, snapshots: list[DecisionPerformanceSnapshot
         unclassified_closes=sum(item.unclassified_closes for item in snapshots),
         latest_seen_at=max(item.created_at for item in snapshots),
     )
+
+
+def _build_entry_quality_breakdown(
+    snapshots: list[DecisionPerformanceSnapshot],
+) -> dict[str, EntryQualityPerformanceEntry]:
+    result: dict[str, EntryQualityPerformanceEntry] = {}
+    for entry_type in ENTRY_EXECUTION_TYPES:
+        observed = [
+            item
+            for item in snapshots
+            if item.decision in ENTRY_DECISIONS
+            and item.fills > 0
+            and item.entry_execution_type == entry_type
+        ]
+        trade_count = len(observed)
+        gross_pnl = sum(item.gross_pnl_total for item in observed)
+        fee = sum(item.fee_total for item in observed)
+        funding = sum(item.funding_total for item in observed)
+        net_pnl = sum(item.net_pnl_including_funding for item in observed)
+        holdings = [item.holding_minutes_observed for item in observed if item.holding_minutes_observed > 0]
+        signed_slippage = [item.average_signed_slippage_bps for item in observed]
+        adverse_slippage = [item.average_adverse_slippage_bps for item in observed]
+        result[entry_type] = EntryQualityPerformanceEntry(
+            entry_type=entry_type,  # type: ignore[arg-type]
+            trade_count=trade_count,
+            win_rate=(
+                sum(1 for item in observed if item.net_pnl_including_funding > 0) / trade_count
+                if trade_count
+                else 0.0
+            ),
+            gross_pnl=gross_pnl,
+            fee=fee,
+            funding=funding,
+            net_pnl=net_pnl,
+            avg_signed_slippage_bps=sum(signed_slippage) / len(signed_slippage) if signed_slippage else 0.0,
+            avg_adverse_slippage_bps=sum(adverse_slippage) / len(adverse_slippage) if adverse_slippage else 0.0,
+            avg_hold_time=sum(holdings) / len(holdings) if holdings else 0.0,
+            expectancy=net_pnl / trade_count if trade_count else 0.0,
+        )
+    return result
 
 
 def _decision_agrees_with_baseline(snapshot: DecisionPerformanceSnapshot) -> bool:
@@ -1564,6 +1886,17 @@ def _build_window_report(
     if position_ids:
         for position_row in session.scalars(select(Position).where(Position.id.in_(position_ids))):
             positions_by_id[position_row.id] = position_row
+    position_owner_decision_ids = _position_owner_decision_ids(orders_by_decision)
+    funding_entries = _load_funding_entries_for_positions(
+        session,
+        list(positions_by_id.values()),
+        now=now,
+    )
+    funding_by_position_id, funding_status_by_position_id = _funding_by_position(
+        list(positions_by_id.values()),
+        funding_entries,
+        now=now,
+    )
 
     decision_items: list[DecisionPerformanceSnapshot] = []
     rationale_groups: dict[str, list[DecisionPerformanceSnapshot]] = defaultdict(list)
@@ -1612,11 +1945,27 @@ def _build_window_report(
             }
         )
         linked_positions = [positions_by_id[position_id] for position_id in linked_position_ids]
+        owned_position_ids = [
+            position_id
+            for position_id in linked_position_ids
+            if position_owner_decision_ids.get(position_id, decision_row.id) == decision_row.id
+        ]
+        funding_total = sum(funding_by_position_id.get(position_id, 0.0) for position_id in owned_position_ids)
+        funding_attribution_status = _funding_status_for_decision(
+            linked_position_ids=linked_position_ids,
+            owned_position_ids=owned_position_ids,
+            status_by_position_id=funding_status_by_position_id,
+        )
         mfe_pct, mae_pct, mfe_pnl, mae_pnl = _position_excursion_snapshot(linked_positions)
         arrival_slippage_pct, realized_slippage_pct, first_fill_latency_seconds, cancel_attempts, cancel_successes, _cancel_success_rate = _execution_quality_snapshot(
             linked_orders,
             executions_by_order,
         )
+        average_signed_slippage_bps, average_adverse_slippage_bps = _decision_entry_slippage_bps_snapshot(
+            linked_orders,
+            executions_by_order,
+        )
+        entry_execution_type = _entry_execution_type_for_decision(linked_orders, executions_by_order)
         holding_minutes_observed, holding_result_status, open_positions, closed_positions, holding_over_plan_count = _holding_snapshot(
             linked_positions,
             planned_max_holding_minutes=planned_holding_minutes,
@@ -1642,6 +1991,7 @@ def _build_window_report(
         realized_total = sum(_safe_float(execution_row.realized_pnl) for execution_row in linked_executions)
         fee_total = sum(_safe_float(execution_row.fee_paid) for execution_row in linked_executions)
         net_realized_total = realized_total - fee_total
+        net_pnl_including_funding = net_realized_total + funding_total
         slippages = [_safe_float(execution_row.slippage_pct) for execution_row in linked_executions]
         fill_count = len(linked_executions)
         wins = sum(1 for execution_row in linked_executions if (_safe_float(execution_row.realized_pnl) - _safe_float(execution_row.fee_paid)) > 0)
@@ -1672,10 +2022,17 @@ def _build_window_report(
             fills=fill_count,
             wins=wins,
             losses=losses,
+            gross_pnl_total=realized_total,
             realized_pnl_total=realized_total,
             fee_total=fee_total,
+            funding_total=funding_total,
             net_realized_pnl_total=net_realized_total,
+            net_pnl_excluding_funding=net_realized_total,
+            net_pnl_including_funding=net_pnl_including_funding,
+            funding_attribution_status=funding_attribution_status,
             average_slippage_pct=(sum(slippages) / len(slippages) if slippages else 0.0),
+            average_signed_slippage_bps=average_signed_slippage_bps,
+            average_adverse_slippage_bps=average_adverse_slippage_bps,
             arrival_slippage_pct=arrival_slippage_pct,
             realized_slippage_pct=realized_slippage_pct,
             first_fill_latency_seconds=first_fill_latency_seconds,
@@ -1725,6 +2082,7 @@ def _build_window_report(
                 holding_minutes_observed,
                 fill_count,
             ),
+            entry_execution_type=entry_execution_type,
         )
         decision_items.append(snapshot)
         for rationale_code in rationale_codes:
@@ -1810,9 +2168,13 @@ def _build_window_report(
         exits=sum(1 for item in decision_items if item.decision == "exit"),
         wins=sum(item.wins for item in decision_items),
         losses=sum(item.losses for item in decision_items),
+        gross_pnl_total=sum(item.gross_pnl_total for item in decision_items),
         realized_pnl_total=sum(item.realized_pnl_total for item in decision_items),
         fee_total=sum(item.fee_total for item in decision_items),
+        funding_total=sum(item.funding_total for item in decision_items),
         net_realized_pnl_total=sum(item.net_realized_pnl_total for item in decision_items),
+        net_pnl_excluding_funding=sum(item.net_pnl_excluding_funding for item in decision_items),
+        net_pnl_including_funding=sum(item.net_pnl_including_funding for item in decision_items),
         average_slippage_pct=(sum(overall_slippages) / len(overall_slippages) if overall_slippages else 0.0),
         average_arrival_slippage_pct=(
             sum(overall_arrival_slippages) / len(overall_arrival_slippages) if overall_arrival_slippages else 0.0
@@ -1850,6 +2212,7 @@ def _build_window_report(
         deduped_count=count_ai_deduped_events(session, since),
     )
     ai_baseline_comparison = _build_ai_baseline_comparison(decision_items)
+    entry_quality = _build_entry_quality_breakdown(decision_items)
     limited_live_readiness = _build_limited_live_readiness(
         session,
         since=since,
@@ -1890,10 +2253,17 @@ def _build_window_report(
                 fills=item.fills,
                 wins=item.wins,
                 losses=item.losses,
+                gross_pnl_total=item.gross_pnl_total,
                 realized_pnl_total=item.realized_pnl_total,
                 fee_total=item.fee_total,
+                funding_total=item.funding_total,
                 net_realized_pnl_total=item.net_realized_pnl_total,
+                net_pnl_excluding_funding=item.net_pnl_excluding_funding,
+                net_pnl_including_funding=item.net_pnl_including_funding,
+                funding_attribution_status=item.funding_attribution_status,
                 average_slippage_pct=item.average_slippage_pct,
+                average_signed_slippage_bps=item.average_signed_slippage_bps,
+                average_adverse_slippage_bps=item.average_adverse_slippage_bps,
                 arrival_slippage_pct=item.arrival_slippage_pct,
                 realized_slippage_pct=item.realized_slippage_pct,
                 first_fill_latency_seconds=item.first_fill_latency_seconds,
@@ -1914,6 +2284,7 @@ def _build_window_report(
                 mae_pct=item.mae_pct,
                 mfe_pnl=item.mfe_pnl,
                 mae_pnl=item.mae_pnl,
+                entry_execution_type=item.entry_execution_type,  # type: ignore[arg-type]
             )
             for item in decision_items[:decision_limit]
         ],
@@ -1926,6 +2297,7 @@ def _build_window_report(
         hold_conditions=hold_condition_items[:aggregate_limit],
         close_outcomes=close_outcome_items[:aggregate_limit],
         feature_flags=flag_items,
+        entry_quality=entry_quality,
     )
 
 
@@ -1955,6 +2327,7 @@ def _signal_performance_source_key(session: Session) -> tuple[object, ...]:
         _latest_scalar(session, select(func.max(RiskCheck.id))),
         _latest_scalar(session, select(func.max(Order.id))),
         _latest_scalar(session, select(func.max(Execution.id))),
+        _latest_scalar(session, select(func.max(AccountLedgerEntry.id))),
         _latest_scalar(session, select(func.max(PnLSnapshot.created_at))),
         latest_safety_audit,
     )
@@ -2021,9 +2394,13 @@ def build_signal_performance_report(
             exits=item.exits,
             wins=item.wins,
             losses=item.losses,
+            gross_pnl_total=item.gross_pnl_total,
             realized_pnl_total=item.realized_pnl_total,
             fee_total=item.fee_total,
+            funding_total=item.funding_total,
             net_realized_pnl_total=item.net_realized_pnl_total,
+            net_pnl_excluding_funding=item.net_pnl_excluding_funding,
+            net_pnl_including_funding=item.net_pnl_including_funding,
             average_slippage_pct=item.average_slippage_pct,
             average_arrival_slippage_pct=item.average_arrival_slippage_pct,
             average_realized_slippage_pct=item.average_realized_slippage_pct,

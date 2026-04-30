@@ -67,6 +67,14 @@ MACRO_EVENT_RELEVANT_ASSETS = frozenset(
         "RISK_ASSETS",
     }
 )
+EXPECTED_COST_ENTRY_MARKETABLE = "entry_marketable"
+EXPECTED_COST_ENTRY_PASSIVE_LIMIT = "entry_passive_limit"
+EXPECTED_COST_ENTRY_UNKNOWN = "entry_unknown"
+EXPECTED_COST_TAKER_FEE_BPS = 4.0
+EXPECTED_COST_MAKER_FEE_BPS = 2.0
+EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS = 3.0
+EXPECTED_COST_PASSIVE_SLIPPAGE_BPS = 1.0
+EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS = 2.0
 MACRO_EVENT_IMMINENT_MINUTES = 30
 MACRO_EVENT_REACTION_WINDOW_MINUTES = 60
 MACRO_EVENT_ACTIVE_REASON_CODES = frozenset(
@@ -119,6 +127,160 @@ def _unique_codes(*groups: list[str]) -> list[str]:
             ordered.append(code)
             seen.add(code)
     return ordered
+
+
+def _normalize_expected_entry_type(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {EXPECTED_COST_ENTRY_MARKETABLE, "marketable", "market", "aggressive", "immediate"}:
+        return EXPECTED_COST_ENTRY_MARKETABLE
+    if text in {
+        EXPECTED_COST_ENTRY_PASSIVE_LIMIT,
+        "passive",
+        "passive_limit",
+        "maker",
+        "post_only",
+        "post-only",
+        "pullback_confirm",
+    }:
+        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+    if "marketable" in text or "market" in text or "aggressive" in text:
+        return EXPECTED_COST_ENTRY_MARKETABLE
+    if "passive" in text or "maker" in text or "post_only" in text or "post-only" in text:
+        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+    return None
+
+
+def _expected_entry_execution_type(selection_context: Mapping[str, Any]) -> str:
+    selection = _as_dict(selection_context)
+    strategy_engine_context = _as_dict(selection.get("strategy_engine_context"))
+    execution_policy = _as_dict(selection.get("execution_policy"))
+    candidate = _as_dict(selection.get("candidate"))
+    for value in (
+        selection.get("entry_execution_type"),
+        strategy_engine_context.get("entry_execution_type"),
+        strategy_engine_context.get("execution_style"),
+        strategy_engine_context.get("entry_style"),
+        execution_policy.get("entry_execution_type"),
+        execution_policy.get("execution_style"),
+        execution_policy.get("entry_style"),
+        candidate.get("entry_execution_type"),
+        selection.get("entry_mode"),
+        selection.get("candidate_entry_mode"),
+        candidate.get("entry_mode"),
+    ):
+        normalized = _normalize_expected_entry_type(value)
+        if normalized is not None:
+            return normalized
+    entry_mode = str(selection.get("entry_mode") or candidate.get("entry_mode") or "").strip().lower()
+    if entry_mode in {"immediate", "breakout_confirm"}:
+        return EXPECTED_COST_ENTRY_MARKETABLE
+    if entry_mode == "pullback_confirm":
+        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+    return EXPECTED_COST_ENTRY_UNKNOWN
+
+
+def _expected_fee_bps(entry_execution_type: str) -> float:
+    entry_fee_bps = (
+        EXPECTED_COST_MAKER_FEE_BPS
+        if entry_execution_type == EXPECTED_COST_ENTRY_PASSIVE_LIMIT
+        else EXPECTED_COST_TAKER_FEE_BPS
+    )
+    return entry_fee_bps + EXPECTED_COST_TAKER_FEE_BPS
+
+
+def _cost_context_spread_bps(
+    *,
+    market_snapshot: MarketSnapshotPayload,
+    features: FeaturePayload,
+) -> tuple[float, str]:
+    spread_bps = _safe_float(features.derivatives.spread_bps)
+    if spread_bps is not None:
+        return max(spread_bps, 0.0), "features.derivatives.spread_bps"
+    spread_bps = _safe_float(market_snapshot.derivatives_context.spread_bps)
+    if spread_bps is not None:
+        return max(spread_bps, 0.0), "market_snapshot.derivatives_context.spread_bps"
+    best_bid = _safe_float(features.derivatives.best_bid) or _safe_float(market_snapshot.derivatives_context.best_bid)
+    best_ask = _safe_float(features.derivatives.best_ask) or _safe_float(market_snapshot.derivatives_context.best_ask)
+    if best_bid is not None and best_ask is not None and best_bid > 0.0 and best_ask > best_bid:
+        midpoint = (best_bid + best_ask) / 2.0
+        return ((best_ask - best_bid) / midpoint) * 10_000, "best_bid_ask"
+    return 0.0, "unavailable"
+
+
+def _cost_context_funding_headwind_bps(
+    *,
+    side: str,
+    market_snapshot: MarketSnapshotPayload,
+    features: FeaturePayload,
+) -> tuple[float, str]:
+    funding_rate = _safe_float(features.derivatives.funding_rate)
+    if funding_rate is None:
+        funding_rate = _safe_float(market_snapshot.derivatives_context.funding_rate)
+    if funding_rate is None:
+        return 0.0, "unavailable"
+    if side == "long" and funding_rate > 0.0:
+        return abs(funding_rate) * 10_000, "long_pays_positive_funding"
+    if side == "short" and funding_rate < 0.0:
+        return abs(funding_rate) * 10_000, "short_pays_negative_funding"
+    return 0.0, "not_headwind"
+
+
+def _candidate_side(selection_context: Mapping[str, Any], features: FeaturePayload) -> str:
+    selection = _as_dict(selection_context)
+    candidate = _as_dict(selection.get("candidate"))
+    side = str(candidate.get("decision") or selection.get("decision") or selection.get("decision_hint") or "").lower()
+    if side in {"long", "short"}:
+        return side
+    direction = _direction_regime(features)
+    if direction == "bullish":
+        return "long"
+    if direction == "bearish":
+        return "short"
+    return "unknown"
+
+
+def build_expected_cost_context(
+    *,
+    market_snapshot: MarketSnapshotPayload,
+    features: FeaturePayload,
+    selection_context: Mapping[str, Any],
+) -> dict[str, Any]:
+    side = _candidate_side(selection_context, features)
+    entry_execution_type = _expected_entry_execution_type(selection_context)
+    fee_bps = _expected_fee_bps(entry_execution_type)
+    slippage_bps = EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS
+    if entry_execution_type == EXPECTED_COST_ENTRY_MARKETABLE:
+        slippage_bps = EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS
+    elif entry_execution_type == EXPECTED_COST_ENTRY_PASSIVE_LIMIT:
+        slippage_bps = EXPECTED_COST_PASSIVE_SLIPPAGE_BPS
+    spread_bps, spread_source = _cost_context_spread_bps(
+        market_snapshot=market_snapshot,
+        features=features,
+    )
+    funding_headwind_bps, funding_source = _cost_context_funding_headwind_bps(
+        side=side,
+        market_snapshot=market_snapshot,
+        features=features,
+    )
+    expected_cost_bps = fee_bps + slippage_bps + spread_bps + funding_headwind_bps
+    return {
+        "status": "estimated" if side in {"long", "short"} else "side_unknown",
+        "basis": "pre_decision_cost_pressure_hint_only_risk_guard_recomputes",
+        "candidate_side": side,
+        "entry_execution_type": entry_execution_type,
+        "expected_cost_bps": round(expected_cost_bps, 6),
+        "cost_components": {
+            "fee_bps": round(fee_bps, 6),
+            "slippage_bps": round(slippage_bps, 6),
+            "spread_bps": round(spread_bps, 6),
+            "spread_source": spread_source,
+            "funding_headwind_bps": round(funding_headwind_bps, 6),
+            "funding_source": funding_source,
+        },
+        "operator_note": "Costs are informational here; risk_guard performs the hard gate.",
+    }
 
 
 def _lead_context_status(*, available: bool, missing_symbols: list[str]) -> LeadContextStatus:
@@ -1027,6 +1189,19 @@ def build_ai_decision_context(
         previous_input_payload=previous_input_payload,
         previous_ai_invoked_at=previous_ai_invoked_at,
     )
+    strategy_engine_context = _strategy_engine_context(
+        selection_context=resolved_selection_context,
+        previous_decision_metadata=previous_decision_metadata,
+    )
+    expected_cost_context = build_expected_cost_context(
+        market_snapshot=market_snapshot,
+        features=features,
+        selection_context=resolved_selection_context,
+    )
+    strategy_engine_context = {
+        **strategy_engine_context,
+        "expected_cost_context": expected_cost_context,
+    }
     return AIDecisionContextPacket(
         symbol=market_snapshot.symbol,
         timeframe=market_snapshot.timeframe,
@@ -1039,10 +1214,7 @@ def build_ai_decision_context(
         data_quality=data_quality,
         previous_thesis=previous_thesis,
         strategy_engine=strategy_engine,
-        strategy_engine_context=_strategy_engine_context(
-            selection_context=resolved_selection_context,
-            previous_decision_metadata=previous_decision_metadata,
-        ),
+        strategy_engine_context=strategy_engine_context,
         holding_profile=holding_profile,  # type: ignore[arg-type]
         holding_profile_reason=holding_profile_reason,
         assigned_slot=assigned_slot,

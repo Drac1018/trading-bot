@@ -6,6 +6,7 @@ import { getSelectedSymbolPolicyHint } from "../lib/selected-symbol";
 import {
   describeAiTriggerReason,
   describeHistoricalDecisionGap,
+  isHistoricalExecutionRecord,
   summarizeRecentExecutionRecord,
   summarizeCurrentCycleSelection,
   summarizeExecutionState,
@@ -69,6 +70,19 @@ type OperatorAiDecisionReadModel = OperatorSymbol["ai_decision"] & {
   macro_event_context_summary?: MacroEventContextSummary | null;
   macro_event_risk_summary?: MacroEventContextSummary | null;
 };
+type OperatorProtectionReadModel = OperatorSymbol["protection_status"] & {
+  blocked_reason_code?: string | null;
+  blocked_reason?: string | null;
+  verification_deadline_at?: string | null;
+};
+type TimelineStage = {
+  key: string;
+  title: string;
+  label: string;
+  detail: string;
+  kind: "good" | "warn" | "danger" | "neutral";
+};
+type RiskReasonGroupKey = "freshness" | "exposure" | "approval" | "protection" | "trigger" | "other";
 
 const operatingStateLabelMap: Record<string, string> = {
   TRADABLE: "신규 진입 가능",
@@ -131,6 +145,33 @@ const triggerReasonReviewLabelMap: Record<string, string> = {
   periodic_backstop_due: "주기 백스톱 검토",
 };
 
+const riskReasonGroupLabels: Record<RiskReasonGroupKey, string> = {
+  freshness: "데이터 신선도",
+  exposure: "노출 한도",
+  approval: "승인 상태",
+  protection: "보호 주문",
+  trigger: "진입 조건",
+  other: "기타",
+};
+
+const riskReasonGroupHints: Record<RiskReasonGroupKey, string> = {
+  freshness: "계좌, 포지션, 오더, 시장 데이터가 stale/incomplete/untrusted 상태인지 확인",
+  exposure: "단일 포지션, 방향 편중, 총 노출, 동일 tier 집중도, 상관 위험 한도",
+  approval: "live approval window, live arm/disarm, 실거래 승인 상태",
+  protection: "보호 주문 누락, 미검증, stop/take profit 확인 실패",
+  trigger: "pending entry plan 또는 진입 트리거 조건 미충족",
+  other: "아직 별도 운영 그룹에 매핑되지 않은 원문 사유",
+};
+
+const riskReasonGroupOrder: RiskReasonGroupKey[] = [
+  "freshness",
+  "exposure",
+  "approval",
+  "protection",
+  "trigger",
+  "other",
+];
+
 function asNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -157,6 +198,10 @@ function aiDecisionReadModel(symbol: OperatorSymbol): OperatorAiDecisionReadMode
 
 function aiReviewReadModel(symbol: OperatorSymbol): AiReviewReadModel | null {
   return asAiReviewReadModel(aiDecisionReadModel(symbol).ai_review);
+}
+
+function protectionReadModel(symbol: OperatorSymbol): OperatorProtectionReadModel {
+  return symbol.protection_status as OperatorProtectionReadModel;
 }
 
 function formatDateTime(value: string | null | undefined) {
@@ -264,6 +309,10 @@ function translateDecision(value: string | null | undefined) {
     return "신규 진입 대기";
   }
   return value ?? "-";
+}
+
+function isEntryDecision(value: string | null | undefined) {
+  return value === "long" || value === "short";
 }
 
 function translateAiSkipReason(value: string | null | undefined) {
@@ -391,6 +440,443 @@ function aiReviewSummary(symbol: OperatorSymbol) {
     };
   }
   return { label: "AI 상태 미확정", detail: "-" };
+}
+
+function timelineStageBadgeClass(kind: TimelineStage["kind"]) {
+  return badgeClass(kind === "danger" ? "danger" : kind === "warn" ? "warn" : kind === "good" ? "good" : "neutral");
+}
+
+function aiProviderInvoked(symbol: OperatorSymbol) {
+  const ai = aiDecisionReadModel(symbol);
+  const review = aiReviewReadModel(symbol);
+  return Boolean(
+    review?.provider_invoked === true ||
+      review?.provider_status === "invoked" ||
+      review?.invoked_at ||
+      ai.last_ai_invoked_at ||
+      ai.provider_name,
+  );
+}
+
+function buildAiDecisionFlowStages(symbol: OperatorSymbol): TimelineStage[] {
+  const ai = aiDecisionReadModel(symbol);
+  const review = aiReviewReadModel(symbol);
+  const triggerReason = getAiTriggerReason(symbol);
+  const triggerPresentation = describeAiTriggerReason(triggerReason);
+  const skipReason = getAiSkipReason(symbol);
+  const triggerDeduped = review?.trigger_deduped === true || symbol.ai_decision.trigger_deduped === true;
+  const riskReasons = symbol.risk_guard.blocked_reason_codes;
+  const currentExecutionExists = symbol.execution.order_id !== null && !isHistoricalExecutionRecord(symbol);
+  const pendingPlan = pendingEntryPlanPresentation(symbol);
+  const effectiveDecision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
+
+  const eventStage: TimelineStage = triggerReason
+    ? {
+        key: "event",
+        title: "이벤트",
+        label: "생성됨",
+        detail: triggerPresentation.legacy
+          ? `${triggerPresentation.label} / 과거 정책 기록`
+          : `호출 사유 ${triggerPresentation.label}`,
+        kind: triggerPresentation.legacy ? "warn" : "good",
+      }
+    : skipReason === "NO_EVENT"
+      ? {
+          key: "event",
+          title: "이벤트",
+          label: "없음",
+          detail: "이번 주기에 AI 검토 이벤트가 없습니다.",
+          kind: "neutral",
+        }
+      : ai.decision_run_id || ai.created_at
+        ? {
+            key: "event",
+            title: "이벤트",
+            label: "기록 있음",
+            detail: "decision row는 있지만 이벤트 원인은 확인 불가입니다.",
+            kind: "warn",
+          }
+        : {
+            key: "event",
+            title: "이벤트",
+            label: "확인 불가",
+            detail: "저장된 이벤트 또는 decision row가 없습니다.",
+            kind: "neutral",
+          };
+
+  const aiStage: TimelineStage = aiProviderInvoked(symbol)
+    ? {
+        key: "ai",
+        title: "AI",
+        label: "호출됨",
+        detail: aiReviewTypeLabel(symbol),
+        kind: "good",
+      }
+    : triggerDeduped || skipReason
+      ? {
+          key: "ai",
+          title: "AI",
+          label: skipReason === "NO_EVENT" ? "대기" : "스킵됨",
+          detail:
+            triggerDeduped || skipReason === "TRIGGER_DEDUPED"
+              ? "동일 지문 중복으로 재검토 생략"
+              : translateAiSkipReason(skipReason),
+          kind: skipReason === "NO_EVENT" ? "neutral" : "warn",
+        }
+      : triggerReason
+        ? {
+            key: "ai",
+            title: "AI",
+            label: "대기",
+            detail: "호출 또는 스킵 결과가 아직 기록되지 않았습니다.",
+            kind: "warn",
+          }
+        : {
+            key: "ai",
+            title: "AI",
+            label: "확인 불가",
+            detail: "AI 호출/스킵 기록이 없습니다.",
+            kind: "neutral",
+          };
+
+  const riskStage: TimelineStage =
+    symbol.risk_guard.allowed === true
+      ? {
+          key: "risk",
+          title: "Risk",
+          label: "승인",
+          detail: isEntryDecision(effectiveDecision)
+            ? "deterministic risk_guard 신규 진입 승인"
+            : "deterministic risk_guard 통과",
+          kind: "good",
+        }
+      : symbol.risk_guard.allowed === false
+        ? {
+            key: "risk",
+            title: "Risk",
+            label: "차단",
+            detail: riskReasons.length > 0 ? formatTranslatedCodeList(riskReasons) : "차단 사유 기록 없음",
+            kind: "danger",
+          }
+        : {
+            key: "risk",
+            title: "Risk",
+            label: "미평가",
+            detail: "risk_guard 평가 기록이 없습니다.",
+            kind: "neutral",
+          };
+
+  const executionStage: TimelineStage = currentExecutionExists
+    ? {
+        key: "execution",
+        title: "실행",
+        label: symbol.execution.execution_status === "filled" ? "주문 실행" : "주문 제출",
+        detail: symbol.execution.execution_status ?? symbol.execution.order_status ?? "execution 상태 확인 필요",
+        kind: symbol.execution.execution_status === "filled" ? "good" : "warn",
+      }
+    : pendingPlan.planActive
+      ? {
+          key: "execution",
+          title: "실행",
+          label: "조건부 대기",
+          detail: pendingPlan.detail,
+          kind: "warn",
+        }
+      : symbol.risk_guard.allowed === false
+        ? {
+            key: "execution",
+            title: "실행",
+            label: "실행 차단",
+            detail: "risk_guard 차단으로 신규 주문이 실행되지 않습니다.",
+            kind: "danger",
+          }
+        : symbol.risk_guard.allowed === true && isEntryDecision(effectiveDecision)
+          ? {
+              key: "execution",
+              title: "실행",
+              label: "실행 없음",
+              detail: "리스크 승인은 주문 체결 기록이 아니며, 주문 또는 pending plan 기록이 없습니다.",
+              kind: "warn",
+            }
+          : {
+              key: "execution",
+              title: "실행",
+              label: "실행 없음",
+              detail: "현재 주문 실행 대상 기록이 없습니다.",
+              kind: "neutral",
+            };
+
+  return [eventStage, aiStage, riskStage, executionStage];
+}
+
+function AiDecisionFlowTimeline({ symbol }: { symbol: OperatorSymbol }) {
+  const stages = buildAiDecisionFlowStages(symbol);
+  return (
+    <div className="mt-5 rounded-md border border-slate-200 bg-slate-50 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-slate-950">AI 판단 흐름</p>
+          <p className="mt-1 text-xs leading-5 text-slate-600">
+            이벤트 생성, AI 호출/스킵, deterministic risk_guard, execution/pending 상태를 분리해서 봅니다.
+          </p>
+        </div>
+        <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-semibold text-slate-600">
+          {symbol.symbol}
+        </span>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-4">
+        {stages.map((stage) => (
+          <div key={stage.key} className="rounded-md border border-slate-200 bg-white p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">{stage.title}</p>
+              <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${timelineStageBadgeClass(stage.kind)}`}>
+                {stage.label}
+              </span>
+            </div>
+            <p className="mt-3 break-words text-xs leading-5 text-slate-600">{stage.detail}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function classifyRiskReasonGroup(value: string): RiskReasonGroupKey {
+  const normalized = value.trim();
+  const upper = normalized.toUpperCase();
+  const lower = normalized.toLowerCase();
+
+  if (
+    upper.includes("STALE") ||
+    upper.includes("OUTDATED") ||
+    upper.includes("INCOMPLETE") ||
+    upper.includes("UNTRUSTED") ||
+    lower.includes("신선도") ||
+    lower.includes("지연") ||
+    lower.includes("오래") ||
+    lower.includes("불완전")
+  ) {
+    return "freshness";
+  }
+
+  if (
+    upper.includes("PROTECTION") ||
+    upper.includes("PROTECTIVE") ||
+    upper.includes("STOP") ||
+    upper.includes("TAKE_PROFIT") ||
+    lower.includes("protective order") ||
+    lower.includes("missing protection") ||
+    lower.includes("take profit") ||
+    lower.includes("보호") ||
+    lower.includes("손절") ||
+    lower.includes("익절")
+  ) {
+    return "protection";
+  }
+
+  if (
+    upper.includes("APPROVAL") ||
+    upper.includes("LIVE_ARM") ||
+    upper.includes("LIVE_DISARM") ||
+    upper.includes("LIVE_TRADING_DISABLED") ||
+    upper.includes("LIVE_TRADING_ENV_DISABLED") ||
+    lower.includes("approval window") ||
+    lower.includes("live approval") ||
+    lower.includes("승인") ||
+    lower.includes("실거래")
+  ) {
+    return "approval";
+  }
+
+  if (
+    upper.includes("ENTRY_TRIGGER_NOT_MET") ||
+    upper.includes("TRIGGER_NOT_MET") ||
+    lower.includes("trigger not met") ||
+    lower.includes("진입 조건") ||
+    lower.includes("트리거")
+  ) {
+    return "trigger";
+  }
+
+  if (
+    upper.includes("EXPOSURE") ||
+    upper.includes("DIRECTIONAL") ||
+    upper.includes("SINGLE_POSITION") ||
+    upper.includes("SAME_TIER") ||
+    upper.includes("CORRELATION") ||
+    upper.includes("CONCENTRATION") ||
+    upper.includes("NOTIONAL") ||
+    lower.includes("노출") ||
+    lower.includes("편중") ||
+    lower.includes("집중") ||
+    lower.includes("상관") ||
+    lower.includes("최대 단일") ||
+    lower.includes("총 노출") ||
+    lower.includes("동일 tier") ||
+    lower.includes("동일 티어")
+  ) {
+    return "exposure";
+  }
+
+  return "other";
+}
+
+function groupedRiskReasons(values: string[] | null | undefined) {
+  const groups = new Map<RiskReasonGroupKey, string[]>();
+  const seen = new Set<string>();
+  for (const value of values ?? []) {
+    const reason = typeof value === "string" ? value.trim() : "";
+    if (!reason || seen.has(reason)) {
+      continue;
+    }
+    seen.add(reason);
+    const group = classifyRiskReasonGroup(reason);
+    groups.set(group, [...(groups.get(group) ?? []), reason]);
+  }
+  return riskReasonGroupOrder
+    .map((key) => ({ key, reasons: groups.get(key) ?? [] }))
+    .filter((item) => item.reasons.length > 0);
+}
+
+function RiskReasonGroups({
+  reasons,
+  emptyText = "차단 사유 없음",
+}: {
+  reasons: string[] | null | undefined;
+  emptyText?: string;
+}) {
+  const groups = groupedRiskReasons(reasons);
+  if (groups.length === 0) {
+    return (
+      <div className="rounded-md border border-slate-200 bg-white px-4 py-3 text-sm text-slate-500">
+        {emptyText}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      {groups.map((group) => (
+        <div key={group.key} className="rounded-md border border-slate-200 bg-white px-4 py-3">
+          <p className="text-sm font-semibold text-slate-900">{riskReasonGroupLabels[group.key]}</p>
+          <p className="mt-1 text-xs leading-5 text-slate-500">{riskReasonGroupHints[group.key]}</p>
+          <div className="mt-3 space-y-2">
+            {group.reasons.map((reason) => (
+              <div key={reason} className="rounded-md bg-slate-50 px-3 py-2">
+                <p className="text-sm font-medium text-slate-800">{formatInternalCodeLabel(reason)}</p>
+                <p className="mt-1 break-all font-mono text-[11px] text-slate-500">{reason}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function pendingEntryPlanPresentation(symbol: OperatorSymbol) {
+  const plan = symbol.pending_entry_plan;
+  if (!plan?.plan_id) {
+    return {
+      label: "조건부 진입 대기 없음",
+      detail: "현재 저장된 pending entry plan이 없습니다.",
+      kind: "neutral" as const,
+      planActive: false,
+    };
+  }
+
+  const mode = formatInternalCodeLabel(plan.entry_mode);
+  if (plan.plan_status === "armed") {
+    return {
+      label: "조건부 진입 대기",
+      detail: `AI 판단은 생성되었지만 즉시 주문이 아닙니다. ${mode} 조건 충족 후 risk/execution 재검증이 필요합니다.`,
+      kind: "warn" as const,
+      planActive: true,
+    };
+  }
+  if (plan.plan_status === "triggered") {
+    return {
+      label: "조건 확인 후 실행 경로",
+      detail: "pending plan 조건이 충족된 기록입니다. 실제 주문/체결 여부는 execution 상태에서 별도로 확인합니다.",
+      kind: "warn" as const,
+      planActive: true,
+    };
+  }
+  if (plan.plan_status === "canceled") {
+    return {
+      label: "조건부 진입 취소",
+      detail: plan.canceled_reason ? `취소 사유: ${plan.canceled_reason}` : "pending entry plan이 취소되었습니다.",
+      kind: "neutral" as const,
+      planActive: false,
+    };
+  }
+  if (plan.plan_status === "expired") {
+    return {
+      label: "조건부 진입 만료",
+      detail: "조건 충족 전 pending entry plan이 만료되었습니다.",
+      kind: "neutral" as const,
+      planActive: false,
+    };
+  }
+  return {
+    label: "조건부 진입 상태 확인",
+    detail: "pending entry plan 상태를 확인할 수 없습니다.",
+    kind: "neutral" as const,
+    planActive: true,
+  };
+}
+
+function protectionReviewPresentation(symbol: OperatorSymbol) {
+  const protection = protectionReadModel(symbol);
+  const reason = protection.blocked_reason_code ?? protection.blocked_reason ?? protection.last_error;
+  const deterministicHint = "AI 판단과 별개로 결정론적 보호 주문 점검/복구 경로에서 확인합니다.";
+
+  if (!symbol.open_position.is_open && protection.status === "flat") {
+    return {
+      label: "보호 주문 대상 없음",
+      detail: `오픈 포지션이 없어 보호 주문 점검 대상이 없습니다. ${deterministicHint}`,
+      kind: "neutral" as const,
+    };
+  }
+  if (protection.auto_recovery_active) {
+    return {
+      label: "보호 주문 복구 경로 진행",
+      detail: `${deterministicHint} 복구 상태 ${protection.recovery_status ?? "진행 중"}.`,
+      kind: "warn" as const,
+    };
+  }
+  if (
+    protection.verification_status === "verify_failed" ||
+    protection.blocked_reason_code ||
+    protection.protected === false ||
+    protection.missing_components.length > 0
+  ) {
+    return {
+      label: "보호 주문 점검 필요",
+      detail: `${reason ? `${reason}. ` : ""}보호 주문이 확인되지 않으면 신규 진입은 차단될 수 있습니다.`,
+      kind: "danger" as const,
+    };
+  }
+  if (protection.recovery_status) {
+    return {
+      label: "protection recovery 상태",
+      detail: `${deterministicHint} 현재 상태 ${protection.recovery_status}.`,
+      kind: "neutral" as const,
+    };
+  }
+  if (protection.protected) {
+    return {
+      label: "보호 주문 확인됨",
+      detail: `${deterministicHint} 손절 ${protection.has_stop_loss ? "확인" : "없음"} / 익절 ${
+        protection.has_take_profit ? "확인" : "없음"
+      }.`,
+      kind: "good" as const,
+    };
+  }
+  return {
+    label: "보호 주문 확인 불가",
+    detail: deterministicHint,
+    kind: "neutral" as const,
+  };
 }
 
 function translateOperatingState(value: string | null | undefined) {
@@ -892,12 +1378,13 @@ export function DecisionView({
   const macroEventContext = symbol ? aiMacroEventContext(symbol) : null;
   const macroEventSummary = formatMacroEventContextSummary(macroEventContext);
   const macroEventDetail = formatMacroEventContextDetail(macroEventContext);
+  const effectiveRiskReasons = symbol
+    ? symbol.risk_guard.blocked_reason_codes.length > 0
+      ? symbol.risk_guard.blocked_reason_codes
+      : symbol.blocked_reasons
+    : [];
   const blockedReasonText = symbol
-    ? formatTranslatedCodeList(
-        symbol.risk_guard.blocked_reason_codes.length > 0
-          ? symbol.risk_guard.blocked_reason_codes
-          : symbol.blocked_reasons,
-      )
+    ? formatTranslatedCodeList(effectiveRiskReasons)
     : "-";
   const aiSlotValue = symbol ? symbol.ai_decision.assigned_slot ?? "-" : "-";
   const aiCandidateWeightValue = symbol ? symbol.ai_decision.candidate_weight : null;
@@ -921,12 +1408,8 @@ export function DecisionView({
       symbol.pending_entry_plan?.created_at ??
       null
     : null;
-  const pendingPlanValue = symbol?.pending_entry_plan?.plan_id
-    ? `#${symbol.pending_entry_plan.plan_id} / ${symbol.pending_entry_plan.plan_status ?? "unknown"}`
-    : "없음";
-  const pendingPlanHint = symbol?.pending_entry_plan?.plan_id
-    ? formatInternalCodeLabel(symbol.pending_entry_plan.entry_mode ?? symbol.pending_entry_plan.canceled_reason)
-    : "현재 저장된 진입 대기 플랜이 없습니다.";
+  const pendingPlan = symbol ? pendingEntryPlanPresentation(symbol) : null;
+  const protectionReview = symbol ? protectionReviewPresentation(symbol) : null;
   const decisionTableEmptyDescription = historicalGapNotice
         ? "저장된 판단 기록은 없지만 상단 카드에는 마지막 AI 스냅샷이 남아 있을 수 있습니다. 이번 판단 주기 상태와는 구분해서 보세요."
     : "선택한 심볼 기준으로 아직 저장된 decision row가 없습니다.";
@@ -982,6 +1465,7 @@ export function DecisionView({
             "현재 대시보드 새로고침 기준으로 후보 선정과 실행 상태를 보여줍니다.",
           )}
         </div>
+        <AiDecisionFlowTimeline symbol={symbol} />
         <div className="mt-4 grid gap-4 xl:grid-cols-4">
           <div className="rounded-md border border-slate-200 bg-white p-4">
             <div className="flex flex-wrap items-center gap-2">
@@ -1072,6 +1556,10 @@ export function DecisionView({
                 blockedReasonText,
                 "현재 리스크 가드 기준",
               )}
+              <div>
+                <p className="mb-2 text-xs font-medium text-slate-500">리스크 사유 그룹</p>
+                <RiskReasonGroups reasons={effectiveRiskReasons} />
+              </div>
               {metricCard(
                 "리스크 기준 슬롯",
                 riskSlotValue,
@@ -1086,11 +1574,6 @@ export function DecisionView({
                 "리스크 포트폴리오 한도",
                 symbol.risk_guard.portfolio_slot_soft_cap_applied ? "적용" : "미적용",
                 `수용 한도 ${riskCapacityReasonLabel}`,
-              )}
-              {metricCard(
-                riskOutcome?.label === "신규 진입 대기" ? "대기 사유" : "차단 사유",
-                formatTranslatedCodeList(symbol.risk_guard.blocked_reason_codes),
-                internalCodeHint(symbol.risk_guard.blocked_reason_codes),
               )}
             </div>
             {rawCodeDetails("리스크 내부 코드 보기", [
@@ -1172,7 +1655,15 @@ export function DecisionView({
               {recentExecution
                 ? metricCard("최근 과거 실행 기록", recentExecution.label, recentExecution.detail)
                 : null}
-              {metricCard("진입 대기 플랜", pendingPlanValue, pendingPlanHint, { compact: true })}
+              {metricCard("진입 대기 플랜", pendingPlan?.label ?? "-", pendingPlan?.detail ?? "-", { compact: true })}
+              {pendingPlan?.planActive ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+                  조건부 진입 대기입니다. AI 판단 완료와 실제 주문 실행은 별도 상태이며, 설정된 조건 충족 후 risk/execution 재검증을 거쳐야 합니다.
+                </div>
+              ) : null}
+              {metricCard("보호 주문 점검", protectionReview?.label ?? "-", protectionReview?.detail ?? "-", {
+                compact: true,
+              })}
               {metricCard("하드 스탑", hardStopLabel(symbol), `손절 확대 ${stopWideningLabel(symbol)}`)}
               {metricCard(
                 "오픈 포지션",
@@ -1228,6 +1719,7 @@ export function SchedulerView({
         <h2 className="mt-2 text-xl font-semibold text-slate-950">심볼별 AI 검토 / 생략 상태</h2>
         <p className="mt-2 text-sm leading-6 text-slate-600">
           실제 검토 분류, AI 호출 전 생략 사유, 당시 시장 신호 요약, 이벤트 리스크, 포트폴리오 한도와 차단 사유를 심볼별로 바로 읽을 수 있습니다.
+          보호 상태 점검은 AI가 보호 주문을 직접 생성/복구한다는 뜻이 아니라, 별도 결정론적 protection recovery 상태와 분리해서 봅니다.
         </p>
         <div className="mt-5 grid gap-4 xl:grid-cols-3">
           {operator.symbols.map((symbol) => {
@@ -1439,6 +1931,11 @@ export function RiskView({
                       row.decision_run_id !== null ? "연결된 decision row" : "linked decision 없음",
                     )}
                     {metricCard("생성 시각", formatDateTime(row.created_at), "리스크 점검 기록 생성 시각")}
+                  </div>
+
+                  <div className="mt-4">
+                    <p className="mb-2 text-xs font-medium text-slate-500">리스크 사유 그룹</p>
+                    <RiskReasonGroups reasons={row.reason_codes} />
                   </div>
 
                   {row.payload ? (
