@@ -44,7 +44,7 @@ const passiveBlockers = new Set([
 
 const reasonFallbackMap: Record<string, string> = {
   MANUAL_USER_REQUEST: "운영자가 수동으로 거래를 일시정지했습니다.",
-  TRADING_PAUSED: "거래가 일시정지되어 신규 진입을 차단했습니다.",
+  TRADING_PAUSED: "시스템 가드 모드로 신규 진입을 보류했습니다.",
   PROTECTIVE_ORDER_FAILURE: "보호주문 이상이 있어 신규 진입을 막고 있습니다.",
   MISSING_PROTECTIVE_ORDERS: "미보호 포지션이 있어 보호주문 확인이 필요합니다.",
   PROTECTION_REQUIRED: "보호주문 복구가 끝나기 전까지 신규 진입을 막습니다.",
@@ -211,9 +211,12 @@ function mainState(operator: OperatorDashboardPayload) {
   const passiveRiskOnly = isPassiveRiskOnly(control);
 
   if (control.trading_paused) {
+    const manualPause = control.pause_origin === "manual";
     return {
-      title: "거래 일시정지",
-      detail: translateReasonCode(control.pause_reason_code) || "운영자가 자동 거래를 일시정지했습니다.",
+      title: manualPause ? "거래 일시정지" : "시스템 가드 모드",
+      detail:
+        translateReasonCode(control.pause_reason_code) ||
+        (manualPause ? "운영자가 자동 거래를 일시정지했습니다." : "시스템 보호 조건으로 신규 진입을 보류했습니다."),
       tone: "danger" as const,
     };
   }

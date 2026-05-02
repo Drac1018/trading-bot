@@ -42,6 +42,7 @@ from trading_mvp.services.settings import (
     serialize_settings_ai_usage,
     serialize_settings_cadences,
     serialize_settings_view,
+    set_trading_pause,
     should_call_openai,
     update_settings,
 )
@@ -798,6 +799,39 @@ def test_serialize_settings_includes_pause_and_auto_resume_state(db_session) -> 
     assert serialized["missing_protection_items"] == {}
 
 
+def test_serialize_settings_filters_inactive_control_reasons_from_current_status(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.trading_paused = False
+    row.pause_reason_code = None
+    row.pause_origin = None
+    row.live_execution_armed = True
+    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision="long",
+            allowed=False,
+            reason_codes=["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"reason_codes": ["TRADING_PAUSED", "LIVE_APPROVAL_REQUIRED"]},
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(row)
+    current_reasons = serialized["control_status_summary"]["blocked_reasons_current_cycle"]
+
+    assert serialized["trading_paused"] is False
+    assert serialized["control_status_summary"]["approval_window_open"] is True
+    assert "TRADING_PAUSED" not in current_reasons
+    assert "LIVE_APPROVAL_REQUIRED" not in current_reasons
+    assert "TRADING_PAUSED" not in serialized["latest_blocked_reasons"]
+    assert "LIVE_APPROVAL_REQUIRED" not in serialized["latest_blocked_reasons"]
+    assert serialized["guard_mode_reason_code"] != "TRADING_PAUSED"
+    assert serialized["guard_mode_reason_code"] != "LIVE_APPROVAL_REQUIRED"
+
+
 def test_serialize_settings_includes_operational_summary_sections(db_session) -> None:
     row = get_or_create_settings(db_session)
     now = utcnow_naive()
@@ -1095,6 +1129,55 @@ def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> No
             ).all()
             assert ("trading_paused", "Global trading pause enabled.") in events
             assert ("trading_resumed", "Global trading pause cleared.") in events
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_resume_attempt_endpoint_keeps_non_eligible_system_pause(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'settings_resume_attempt.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestingSessionLocal() as session:
+            update_settings(session, build_settings_payload())
+            set_trading_pause(
+                session,
+                True,
+                reason_code="PROTECTIVE_ORDER_FAILURE",
+                reason_detail={"source": "test"},
+                pause_origin="system",
+            )
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.post("/api/settings/resume/attempt")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["trading_paused"] is True
+        assert payload["pause_reason_code"] == "PROTECTIVE_ORDER_FAILURE"
+        assert payload["auto_resume_status"] == "not_eligible"
+        assert payload["auto_resume_attempt_result"]["status"] == "not_eligible"
+
+        with TestingSessionLocal() as session:
+            events = session.execute(
+                text(
+                    """
+                select event_type, message
+                from audit_events
+                order by id asc
+                """
+                )
+            ).all()
+            assert ("trading_auto_resume_skipped", "Trading auto resume was skipped.") in events
     finally:
         app.dependency_overrides.clear()
 

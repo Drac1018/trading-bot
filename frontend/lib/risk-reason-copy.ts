@@ -1,6 +1,6 @@
 const sharedRiskReasonMap: Record<string, string> = {
-  TRADING_PAUSED: "거래가 일시 중지되어 신규 진입을 차단했습니다.",
-  LIVE_APPROVAL_REQUIRED: "실거래 승인 창이 닫혀 있어 신규 진입 전에 수동 승인이 필요합니다.",
+  TRADING_PAUSED: "시스템 가드 모드로 신규 진입을 보류했습니다.",
+  LIVE_APPROVAL_REQUIRED: "실거래 승인 창이 닫혀 있어 신규 진입을 보류했습니다.",
   LIVE_APPROVAL_POLICY_DISABLED: "실거래 승인 정책이 비활성화되어 있습니다.",
   ENTRY_TRIGGER_NOT_MET: "현재 진입 트리거 조건이 충족되지 않았습니다.",
   ACCOUNT_STATE_STALE: "잔고 표시와 별도로 신규 진입용 계좌 동기화 기준을 다시 확인 중입니다.",
@@ -18,7 +18,7 @@ const sharedRiskReasonMap: Record<string, string> = {
   MAX_CONSECUTIVE_LOSSES_REACHED: "연속 손실 한도에 도달해 보수적 제한이 적용되었습니다.",
   HOLD_DECISION: "현재 AI 판단은 신규 진입 신호가 없어 대기 중입니다.",
   GROSS_EXPOSURE_LIMIT_REACHED: "총 노출 한도를 초과해 신규 진입을 차단했습니다.",
-  LARGEST_POSITION_LIMIT_REACHED: "심볼 집중도 한도 유지",
+  LARGEST_POSITION_LIMIT_REACHED: "요청 수량이 단일 심볼 한도를 초과했습니다.",
   DETERMINISTIC_BASELINE_DISAGREEMENT: "결정론적 기준선 불일치 상태 유지",
   DIRECTIONAL_BIAS_LIMIT_REACHED: "방향 편향 한도를 초과해 신규 진입을 차단했습니다.",
   SAME_TIER_CONCENTRATION_LIMIT_REACHED: "동일 티어 집중도 한도를 초과해 신규 진입을 차단했습니다.",

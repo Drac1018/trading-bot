@@ -779,6 +779,17 @@ def resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
         return serialize_settings_view(row)
 
 
+@app.post("/api/settings/resume/attempt")
+def attempt_resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
+    with _sqlite_write_lock():
+        row = get_or_create_settings(db)
+        result = attempt_auto_resume(db, row, trigger_source="operator_ui")
+        db.commit()
+        payload = serialize_settings_view(row)
+        payload["auto_resume_attempt_result"] = result
+        return payload
+
+
 @app.post("/api/settings/live/arm")
 def arm_live(
     payload: ManualLiveApprovalRequest | None = None,

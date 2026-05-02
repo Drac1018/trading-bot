@@ -81,11 +81,11 @@ test("ui-copy keeps reason codes meaning-first for operator-facing tables", asyn
 
   assert.equal(
     formatDisplayValue("TRADING_PAUSED"),
-    "거래가 일시 중지되어 신규 진입을 차단했습니다.",
+    "시스템 가드 모드로 신규 진입을 보류했습니다.",
   );
   assert.equal(
     formatDisplayValue("LIVE_APPROVAL_REQUIRED"),
-    "실거래 승인 창이 닫혀 있어 신규 진입 전에 수동 승인이 필요합니다.",
+    "실거래 승인 창이 닫혀 있어 신규 진입을 보류했습니다.",
   );
 });
 
@@ -98,7 +98,10 @@ test("ui-copy exposes active-position suppression fields with operator wording",
   assert.equal(translateLabel("allowed_add_on_side"), "허용 add-on 방향");
   assert.equal(formatDisplayValue(true, "suppression_active"), "활성");
   assert.equal(formatDisplayValue(false, "allow_same_side_add_on"), "불가");
-  assert.equal(formatDisplayValue("LARGEST_POSITION_LIMIT_REACHED"), "심볼 집중도 한도 유지");
+  assert.equal(
+    formatDisplayValue("LARGEST_POSITION_LIMIT_REACHED"),
+    "요청 수량이 단일 심볼 한도를 초과했습니다.",
+  );
   assert.equal(
     formatDisplayValue("DETERMINISTIC_BASELINE_DISAGREEMENT"),
     "결정론적 기준선 불일치 상태 유지",

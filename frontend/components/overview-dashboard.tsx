@@ -408,13 +408,13 @@ const operatingStateLabelMap: Record<string, string> = {
   PROTECTION_REQUIRED: "보호 주문 확인 우선",
   DEGRADED_MANAGE_ONLY: "신규 진입 보류",
   EMERGENCY_EXIT: "비상 청산 중",
-  PAUSED: "운영 일시 중지",
+  PAUSED: "시스템 가드 모드",
 };
 
 const reasonCodeLabelMap: Record<string, string> = {
-  TRADING_PAUSED: "운영 중지 상태",
+  TRADING_PAUSED: "시스템 가드 모드",
   HOLD_DECISION: "보류 판단",
-  LIVE_APPROVAL_REQUIRED: "실거래 승인 필요",
+  LIVE_APPROVAL_REQUIRED: "실거래 승인 창 닫힘",
   LIVE_TRADING_DISABLED: "실거래 비활성화",
   PROTECTION_REQUIRED: "보호 주문 복구 필요",
   DEGRADED_MANAGE_ONLY: "신규 진입 보류 상태",
@@ -1177,6 +1177,7 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
 function controlGateCards(control: OperatorDashboardPayload["control"]) {
   const summary = resolveControlStatusSummary(control);
   const primaryBlocker = summary.blocked_reasons_current_cycle[0];
+  const pauseIsManual = control.pause_origin === "manual";
   return [
     {
       title: "실거래 적용 단계",
@@ -1233,11 +1234,11 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
       kind: summary.approval_window_open ? ("good" as const) : ("warn" as const),
     },
     {
-      title: "운영 일시 중지",
-      value: summary.paused ? "중지됨" : "운영 중",
+      title: pauseIsManual ? "운영 일시 중지" : "시스템 가드",
+      value: summary.paused ? (pauseIsManual ? "중지됨" : "가드 모드") : "운영 중",
       hint: summary.paused
         ? translateReasonCode(control.pause_reason_code)
-        : "운영 중지 설정이 걸려 있지 않습니다.",
+        : "운영 중지 또는 시스템 가드가 걸려 있지 않습니다.",
       kind: summary.paused ? ("danger" as const) : ("good" as const),
     },
     {

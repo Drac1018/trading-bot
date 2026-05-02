@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from trading_mvp.models import RiskCheck
-from trading_mvp.services.dashboard import get_operator_dashboard, get_overview
+from trading_mvp.services.dashboard import get_operator_dashboard, get_overview, get_risk_checks
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
 
@@ -77,6 +77,79 @@ def test_overview_latest_risk_passthrough_adds_snapshot_cycle_and_as_of(db_sessi
     assert overview.latest_risk["snapshot_id"] == 654
     assert overview.latest_risk["cycle_id"] == "321"
     assert overview.latest_risk["as_of"] == as_of
+
+
+def test_dashboard_filters_requested_only_auto_resizable_exposure_reason(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    as_of = utcnow_naive() - timedelta(minutes=1)
+    risk_payload = {
+        "allowed": False,
+        "decision": "long",
+        "reason_codes": ["LIVE_APPROVAL_REQUIRED", "LARGEST_POSITION_LIMIT_REACHED"],
+        "blocked_reason_codes": ["LIVE_APPROVAL_REQUIRED", "LARGEST_POSITION_LIMIT_REACHED"],
+        "adjustment_reason_codes": [],
+        "degraded_reason_codes": [],
+        "protection_reason_codes": [],
+        "approved_risk_pct": 0.0,
+        "approved_leverage": 0.0,
+        "raw_projected_notional": 463.863014,
+        "approved_projected_notional": 0.0,
+        "approved_quantity": None,
+        "debug_payload": {
+            "requested_exposure_limit_codes": ["LARGEST_POSITION_LIMIT_REACHED"],
+            "final_exposure_limit_codes": [],
+            "headroom": {
+                "limiting_headroom_notional": 347.897261,
+                "minimum_actionable_notional": 77.4281,
+            },
+        },
+        "snapshot_id": 2671,
+        "cycle_id": "2671",
+        "as_of": as_of.isoformat(),
+    }
+    risk_row = RiskCheck(
+        symbol="BTCUSDT",
+        decision_run_id=2671,
+        market_snapshot_id=2671,
+        allowed=False,
+        decision="long",
+        reason_codes=["LIVE_APPROVAL_REQUIRED", "LARGEST_POSITION_LIMIT_REACHED"],
+        approved_risk_pct=0.0,
+        approved_leverage=0.0,
+        payload=risk_payload,
+    )
+    db_session.add(risk_row)
+    db_session.flush()
+    risk_row.created_at = as_of
+    db_session.add(risk_row)
+    db_session.flush()
+
+    overview = get_overview(db_session)
+    operator_payload = get_operator_dashboard(db_session)
+    btc = next(item for item in operator_payload.symbols if item.symbol == "BTCUSDT")
+
+    assert overview.latest_risk is not None
+    assert overview.latest_risk["reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert overview.latest_risk["blocked_reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert overview.latest_risk["debug_payload"]["requested_exposure_limit_codes"] == [
+        "LARGEST_POSITION_LIMIT_REACHED"
+    ]
+    assert btc.risk_guard.reason_codes == ["LIVE_APPROVAL_REQUIRED"]
+    assert btc.risk_guard.blocked_reason_codes == ["LIVE_APPROVAL_REQUIRED"]
+    assert btc.risk_guard.debug_payload["requested_exposure_limit_codes"] == ["LARGEST_POSITION_LIMIT_REACHED"]
+
+    risk_checks = get_risk_checks(db_session, limit=1, compact=True)
+
+    assert risk_checks[0]["reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert risk_checks[0]["blocked_reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert risk_checks[0]["payload"]["reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert risk_checks[0]["payload"]["blocked_reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert risk_checks[0]["risk_guard_result"]["reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert risk_checks[0]["risk_guard_result"]["blocked_reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
 
 
 def test_operator_dashboard_risk_guard_passthroughs_current_cycle_result_without_recalculation(db_session) -> None:

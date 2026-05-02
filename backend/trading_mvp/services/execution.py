@@ -1118,6 +1118,8 @@ def poll_live_user_stream(
 def _classify_exchange_state_error(exc: Exception, default_reason: str) -> str:
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
         return "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE"
+    if isinstance(exc, BinanceAPIError) and (exc.status_code == 401 or exc.code in {-2014, -2015}):
+        return "EXCHANGE_AUTH_PERMISSION_REJECTED"
     if isinstance(exc, BinanceAPIError) and exc.code in {-1021, -1001, -1007, -1003}:
         return "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE"
     return default_reason

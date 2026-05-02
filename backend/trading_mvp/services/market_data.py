@@ -18,6 +18,7 @@ from trading_mvp.services.event_context import EventContextProvider, build_event
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
+DEFAULT_MARKET_SNAPSHOT_LOOKBACK = 120
 CONTEXT_TIMEFRAME_STALE_GRACE_SECONDS = 300
 LEAD_MARKET_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 LEAD_CONTEXT_OK = "ok"
@@ -331,7 +332,7 @@ def _build_binance_snapshot(
 def build_market_snapshot(
     symbol: str,
     timeframe: str,
-    lookback: int = 60,
+    lookback: int = DEFAULT_MARKET_SNAPSHOT_LOOKBACK,
     upto_index: int | None = None,
     force_stale: bool = False,
     *,
@@ -382,7 +383,7 @@ def build_market_context(
     base_timeframe: str,
     *,
     context_timeframes: tuple[str, ...] = DEFAULT_CONTEXT_TIMEFRAMES,
-    lookback: int = 60,
+    lookback: int = DEFAULT_MARKET_SNAPSHOT_LOOKBACK,
     upto_index: int | None = None,
     force_stale: bool = False,
     use_binance: bool = False,
@@ -437,7 +438,7 @@ def build_lead_market_contexts(
     *,
     lead_symbols: tuple[str, ...] = LEAD_MARKET_SYMBOLS,
     context_timeframes: tuple[str, ...] = DEFAULT_CONTEXT_TIMEFRAMES,
-    lookback: int = 60,
+    lookback: int = DEFAULT_MARKET_SNAPSHOT_LOOKBACK,
     upto_index: int | None = None,
     force_stale: bool = False,
     use_binance: bool = False,

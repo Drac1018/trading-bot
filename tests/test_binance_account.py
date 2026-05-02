@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from trading_mvp.models import Order, PnLSnapshot, Position, RiskCheck
 from trading_mvp.schemas import BinanceAccountAsset, BinanceAccountResponse, BinanceAccountSummary
 from trading_mvp.services.binance_account import (
@@ -406,3 +408,43 @@ def test_binance_account_cache_status_preserves_last_successful_payload(db_sessi
     assert failed["status"] == "failed"
     assert failed["last_error"] == "timeout"
     assert failed["payload"]["summary"]["total_wallet_balance"] == 1250.0
+
+
+def test_binance_account_cache_abandons_stale_pending_status(db_session) -> None:
+    payload = BinanceAccountResponse(
+        summary=BinanceAccountSummary(
+            connected=True,
+            message="live account ok",
+            testnet_enabled=False,
+            futures_enabled=True,
+            can_trade=True,
+            exchange_can_trade=True,
+            total_wallet_balance=1250.0,
+            available_balance=1100.0,
+            total_unrealized_profit=15.0,
+            total_margin_balance=1265.0,
+            asset_count=1,
+        )
+    )
+    store_binance_account_cache_result(db_session, payload, duration_ms=42.4)
+    settings_row = get_or_create_settings(db_session)
+    detail = dict(settings_row.pause_reason_detail or {})
+    cache = dict(detail["binance_account_cache"])
+    cache.update(
+        {
+            "status": "refreshing",
+            "started_at": (utcnow_naive() - timedelta(minutes=30)).isoformat(),
+            "message": "Binance 원본 계정 캐시를 갱신 중입니다.",
+        }
+    )
+    detail["binance_account_cache"] = cache
+    settings_row.pause_reason_detail = detail
+    db_session.add(settings_row)
+    db_session.flush()
+
+    response = get_cached_binance_account_snapshot(db_session)
+
+    assert response["status"] == "ready"
+    assert response["source"] == "cached_live"
+    assert response["last_error"] == "ACCOUNT_CACHE_REFRESH_ABANDONED"
+    assert response["payload"]["summary"]["total_wallet_balance"] == 1250.0

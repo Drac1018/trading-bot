@@ -14,6 +14,7 @@ import { MarketRiskPanel } from "./settings/market-risk-panel";
 import { EventResponseOverviewPanel } from "./settings/event-response-overview-panel";
 import {
   type AIModelRoutingPolicy,
+  type AutoResumeAttemptResult,
   type ControlStatusSummary,
   type EventSourceProvider,
   type LiveSyncResult,
@@ -439,6 +440,7 @@ export function SettingsControls({
   const [manualWindowForm, setManualWindowForm] = useState<ManualWindowFormState>(() => toManualWindowFormState());
   const [feedback, setFeedback] = useState<Partial<Record<FeedbackKey, FeedbackMessage>>>({});
   const [liveSyncResult, setLiveSyncResult] = useState<LiveSyncResult | null>(null);
+  const [resumeAttemptResult, setResumeAttemptResult] = useState<AutoResumeAttemptResult | null>(null);
   const [isPending, startTransition] = useTransition();
   const activeView = normalizeSettingsView(searchParams.get("view") ?? initialView);
   const viewHref = (view: SettingsView) => {
@@ -661,6 +663,19 @@ export function SettingsControls({
     form.live_approval_window_minutes !== state.live_approval_window_minutes ||
     form.default_symbol !== state.default_symbol;
 
+  const attemptResume = () => {
+    runPost(
+      "/api/settings/resume/attempt",
+      "시스템 가드 복구 점검을 실행했습니다.",
+      "live_actions",
+      (result) => {
+        const payload = result as SettingsPayload & { auto_resume_attempt_result?: AutoResumeAttemptResult };
+        setResumeAttemptResult(payload.auto_resume_attempt_result ?? null);
+        syncSettings(payload);
+      },
+    );
+  };
+
   const runPut = (
     path: string,
     successMessage: string,
@@ -864,8 +879,20 @@ export function SettingsControls({
           actionsUseSavedSettings={actionsUseSavedSettings}
           feedback={feedback.live_actions}
           liveSyncResult={liveSyncResult}
-          onPause={() => runPost("/api/settings/pause", "거래를 일시 중지했습니다.", "live_actions", syncSettings)}
-          onResume={() => runPost("/api/settings/resume", "거래 일시 중지를 해제했습니다.", "live_actions", syncSettings)}
+          resumeAttemptResult={resumeAttemptResult}
+          onPause={() =>
+            runPost("/api/settings/pause", "거래를 일시 중지했습니다.", "live_actions", (result) => {
+              setResumeAttemptResult(null);
+              syncSettings(result as SettingsPayload);
+            })
+          }
+          onResume={() =>
+            runPost("/api/settings/resume", "거래 일시 중지를 해제했습니다.", "live_actions", (result) => {
+              setResumeAttemptResult(null);
+              syncSettings(result as SettingsPayload);
+            })
+          }
+          onAttemptResume={attemptResume}
           onArm={() =>
             runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", "live_actions", syncSettings, {
               minutes: state.live_approval_window_minutes,

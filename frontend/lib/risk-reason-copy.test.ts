@@ -12,7 +12,7 @@ test("lookupRiskReasonCode translates common risk_guard codes for operator-facin
 
   assert.equal(
     lookupRiskReasonCode("TRADING_PAUSED"),
-    "거래가 일시 중지되어 신규 진입을 차단했습니다.",
+    "시스템 가드 모드로 신규 진입을 보류했습니다.",
   );
   assert.equal(
     lookupRiskReasonCode("ENTRY_TRIGGER_NOT_MET"),
@@ -20,11 +20,11 @@ test("lookupRiskReasonCode translates common risk_guard codes for operator-facin
   );
   assert.equal(
     lookupRiskReasonCode("PROTECTION_STATE_UNVERIFIED"),
-    "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
+    "보호주문 상태 확인이 끝나지 않아 신규 진입을 잠시 보류합니다.",
   );
   assert.equal(
     lookupRiskReasonCode("LARGEST_POSITION_LIMIT_REACHED"),
-    "심볼 집중도 한도 유지",
+    "요청 수량이 단일 심볼 한도를 초과했습니다.",
   );
   assert.equal(
     lookupRiskReasonCode("DETERMINISTIC_BASELINE_DISAGREEMENT"),

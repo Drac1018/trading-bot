@@ -2,7 +2,7 @@
 
 import { Field, InlineFeedback, StatusPill, Toggle, inputClass, type FeedbackMessage } from "./form-primitives";
 import { formatDisplayValue } from "../../lib/ui-copy";
-import { type ControlStatusSummary, type LiveSyncResult, type RolloutMode } from "./types";
+import { type AutoResumeAttemptResult, type ControlStatusSummary, type LiveSyncResult, type RolloutMode } from "./types";
 
 type LiveControlState = {
   trading_paused: boolean;
@@ -16,7 +16,12 @@ type LiveControlState = {
   operating_state: string;
   protection_recovery_status: string;
   pause_reason_code: string | null;
+  pause_origin: string | null;
+  auto_resume_after: string | null;
+  auto_resume_eligible: boolean;
+  auto_resume_status: string;
   auto_resume_last_blockers: string[];
+  pause_recovery_class: string | null;
   guard_mode_reason_message: string | null;
 };
 
@@ -48,6 +53,39 @@ function rolloutModeLabel(mode: RolloutMode) {
 function formatCodeList(values: string[] | null | undefined, empty = "-") {
   if (!values || values.length === 0) return empty;
   return values.map((item) => formatDisplayValue(item)).join(", ");
+}
+
+function autoResumeAttemptText(result: AutoResumeAttemptResult) {
+  const status = result.status ? formatDisplayValue(result.status) : "미확인";
+  if (result.resumed) {
+    return `복구 점검 통과: 시스템 가드가 해제되었습니다. 상태 ${status}`;
+  }
+  if (result.blockers && result.blockers.length > 0) {
+    return `복구 점검 차단: ${formatCodeList(result.blockers)}`;
+  }
+  return `복구 점검 결과: ${status}`;
+}
+
+function AutoResumeAttemptPanel({ result }: { result: AutoResumeAttemptResult | null }) {
+  if (!result) return null;
+  const tone = result.resumed || result.status === "ready" ? "good" : result.status === "not_eligible" ? "neutral" : "warn";
+  return (
+    <div className="mt-3 rounded-md border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-700">
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusPill tone={tone}>{formatDisplayValue(result.status ?? "unknown")}</StatusPill>
+        {result.reason_code ? <StatusPill tone="neutral">{formatDisplayValue(result.reason_code)}</StatusPill> : null}
+      </div>
+      <p className="mt-2">{autoResumeAttemptText(result)}</p>
+      {result.symbol_blockers && Object.keys(result.symbol_blockers).length > 0 ? (
+        <p className="mt-2 text-xs text-slate-500">
+          심볼별 차단:{" "}
+          {Object.entries(result.symbol_blockers)
+            .map(([symbol, blockers]) => `${symbol}: ${formatCodeList(blockers)}`)
+            .join(" / ")}
+        </p>
+      ) : null}
+    </div>
+  );
 }
 
 function renderMissingProtectionItems(
@@ -373,8 +411,10 @@ export function LiveControlPanel({
   actionsUseSavedSettings,
   feedback,
   liveSyncResult,
+  resumeAttemptResult,
   onPause,
   onResume,
+  onAttemptResume,
   onArm,
   onDisarm,
   onSync,
@@ -388,13 +428,16 @@ export function LiveControlPanel({
   actionsUseSavedSettings: boolean;
   feedback?: FeedbackMessage;
   liveSyncResult: LiveSyncResult | null;
+  resumeAttemptResult: AutoResumeAttemptResult | null;
   onPause: () => void;
   onResume: () => void;
+  onAttemptResume: () => void;
   onArm: () => void;
   onDisarm: () => void;
   onSync: () => void;
   onFieldChange: (field: keyof LiveControlForm, value: LiveControlForm[keyof LiveControlForm]) => void;
 }) {
+  const systemPause = state.trading_paused && state.pause_origin !== "manual";
   return (
     <section className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
@@ -444,10 +487,22 @@ export function LiveControlPanel({
                 <button className="rounded-md bg-rose-600 px-4 py-2 text-sm font-semibold text-white" onClick={onPause} type="button">
                   즉시 중지
                 </button>
+                {systemPause ? (
+                  <button className="rounded-md bg-slate-950 px-4 py-2 text-sm font-semibold text-white" onClick={onAttemptResume} type="button">
+                    복구 점검 후 해제
+                  </button>
+                ) : null}
                 <button className="rounded-md border border-rose-200 bg-white px-4 py-2 text-sm font-semibold text-rose-900" onClick={onResume} type="button">
-                  중지 해제
+                  {systemPause ? "수동 해제" : "중지 해제"}
                 </button>
               </div>
+              {systemPause ? (
+                <p className="mt-3 text-xs leading-5 text-rose-900">
+                  자동 복구 대상 {formatDisplayValue(state.auto_resume_eligible, "auto_resume_eligible")} / 상태{" "}
+                  {formatDisplayValue(state.auto_resume_status, "auto_resume_status")}
+                  {state.auto_resume_after ? ` / 예정 ${formatDisplayValue(state.auto_resume_after, "auto_resume_after")}` : ""}
+                </p>
+              ) : null}
             </div>
             <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
               <p className="text-xs font-semibold text-slate-900">실거래 승인</p>
@@ -479,6 +534,7 @@ export function LiveControlPanel({
           <div className="mt-3">
             <InlineFeedback message={feedback} />
           </div>
+          <AutoResumeAttemptPanel result={resumeAttemptResult} />
           {liveArmBlocked && liveArmDisableReason ? (
             <p className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
               실거래 승인 버튼 비활성화 사유: {liveArmDisableReason}

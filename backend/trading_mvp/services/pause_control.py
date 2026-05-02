@@ -9,7 +9,7 @@ from trading_mvp.config import get_settings
 from trading_mvp.models import Setting
 from trading_mvp.services.account import get_latest_pnl_snapshot, get_open_position
 from trading_mvp.services.audit import record_audit_event, record_health_event
-from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.binance import BinanceAPIError, BinanceClient
 from trading_mvp.services.pause_policy import (
     get_pause_reason_policy,
     pause_reason_recovery_class,
@@ -36,6 +36,14 @@ from trading_mvp.services.settings import (
     set_trading_pause,
 )
 from trading_mvp.time_utils import utcnow_naive
+
+AUTO_RESUME_PAUSE_CLEAR_ONLY_BLOCKERS = {"LIVE_APPROVAL_REQUIRED"}
+
+
+def _classify_exchange_resume_error(exc: Exception, default_reason: str) -> str:
+    if isinstance(exc, BinanceAPIError) and (exc.status_code == 401 or exc.code in {-2014, -2015}):
+        return "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    return default_reason
 
 
 def _recompute_operating_state(symbol_states: dict[str, dict[str, Any]]) -> str:
@@ -353,6 +361,8 @@ def evaluate_auto_resume_safety(
         "attempted": False,
         "resumed": False,
         "allowed": False,
+        "pause_clear_allowed": False,
+        "execution_resume_allowed": False,
         "status": "not_paused",
         "reason_code": reason_code,
         "pause_origin": settings_row.pause_origin,
@@ -461,7 +471,8 @@ def evaluate_auto_resume_safety(
         add_blocker("PORTFOLIO_RISK_UNCERTAIN", detail="Equity dropped materially while paused.", source="pnl")
 
     protective_summary: dict[str, str] = {}
-    if not blockers:
+    safety_blockers = [code for code in blockers if code not in AUTO_RESUME_PAUSE_CLEAR_ONLY_BLOCKERS]
+    if not safety_blockers:
         try:
             client = _build_client(settings_row)
         except Exception:
@@ -487,8 +498,9 @@ def evaluate_auto_resume_safety(
                 session.add(settings_row)
                 session.flush()
             except Exception as exc:
+                reason_code = _classify_exchange_resume_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
                 add_blocker(
-                    "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+                    reason_code,
                     detail=str(exc),
                     source="account",
                 )
@@ -496,7 +508,7 @@ def evaluate_auto_resume_safety(
                     settings_row,
                     scope="account",
                     status="failed",
-                    reason_code="EXCHANGE_ACCOUNT_STATE_UNAVAILABLE",
+                    reason_code=reason_code,
                     observed_at=utcnow_naive(),
                     detail={"source": "auto_resume", "trigger_source": trigger_source},
                 )
@@ -548,8 +560,9 @@ def evaluate_auto_resume_safety(
                     session.add(settings_row)
                     session.flush()
                 except Exception as exc:
+                    reason_code = _classify_exchange_resume_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
                     add_blocker(
-                        "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+                        reason_code,
                         symbol=symbol,
                         detail=str(exc),
                         source="open_orders",
@@ -558,7 +571,7 @@ def evaluate_auto_resume_safety(
                         settings_row,
                         scope="open_orders",
                         status="failed",
-                        reason_code="EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+                        reason_code=reason_code,
                         observed_at=utcnow_naive(),
                         detail={"symbol": symbol, "source": "auto_resume", "trigger_source": trigger_source},
                     )
@@ -573,8 +586,9 @@ def evaluate_auto_resume_safety(
                     remote_positions = client.get_position_information(symbol)
                     has_open_position = any(abs(_to_float(item.get("positionAmt"))) > 0 for item in remote_positions)
                 except Exception as exc:
+                    reason_code = _classify_exchange_resume_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
                     add_blocker(
-                        "EXCHANGE_POSITION_SYNC_FAILED",
+                        reason_code,
                         symbol=symbol,
                         detail=str(exc),
                         source="positions",
@@ -583,7 +597,7 @@ def evaluate_auto_resume_safety(
                         settings_row,
                         scope="positions",
                         status="failed",
-                        reason_code="EXCHANGE_POSITION_SYNC_FAILED",
+                        reason_code=reason_code,
                         observed_at=utcnow_naive(),
                         detail={"symbol": symbol, "source": "auto_resume", "trigger_source": trigger_source},
                     )
@@ -693,8 +707,17 @@ def evaluate_auto_resume_safety(
     result["protective_orders"] = protective_summary
     result["market_data_status"] = market_data_status
     result["sync_status"] = sync_status
-    result["allowed"] = not deduped_blockers
-    result["status"] = "ready" if result["allowed"] else "blocked"
+    result["execution_resume_allowed"] = not deduped_blockers
+    result["pause_clear_allowed"] = not [
+        code for code in deduped_blockers if code not in AUTO_RESUME_PAUSE_CLEAR_ONLY_BLOCKERS
+    ]
+    result["allowed"] = bool(result["execution_resume_allowed"])
+    if result["allowed"]:
+        result["status"] = "ready"
+    elif result["pause_clear_allowed"]:
+        result["status"] = "pause_clear_ready"
+    else:
+        result["status"] = "blocked"
     return result
 
 
@@ -772,6 +795,34 @@ def attempt_auto_resume(
         message="Trading auto resume safety evaluation started.",
         payload=evaluation,
     )
+    if not evaluation["allowed"] and evaluation.get("pause_clear_allowed"):
+        previous_reason = settings_row.pause_reason_code
+        previous_pause_at = settings_row.pause_triggered_at.isoformat() if settings_row.pause_triggered_at else None
+        set_trading_pause(session, False)
+        evaluation["resumed"] = True
+        evaluation["status"] = "pause_cleared_entry_blocked"
+        record_audit_event(
+            session,
+            event_type="trading_auto_pause_cleared",
+            entity_type="settings",
+            entity_id=str(settings_row.id),
+            severity="info",
+            message="Trading pause cleared after system checks recovered; live approval is still required.",
+            payload={
+                **evaluation,
+                "reason_code": previous_reason,
+                "previous_pause_at": previous_pause_at,
+            },
+        )
+        record_health_event(
+            session,
+            component="trading_pause",
+            status="ok",
+            message="Trading pause cleared; live approval remains required.",
+            payload=evaluation,
+        )
+        session.flush()
+        return evaluation
     if not evaluation["allowed"]:
         _write_auto_resume_state(
             session,

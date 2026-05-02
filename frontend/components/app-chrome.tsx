@@ -27,14 +27,6 @@ type ChromeNavItem = {
   icon?: ChromeIcon;
 };
 
-const topNav: ChromeNavItem[] = [
-  { href: "/", label: "대시보드" },
-  { href: "/dashboard/positions", label: "포지션" },
-  { href: "/dashboard/orders", label: "주문 / 체결" },
-  { href: "/dashboard/audit", label: "감사 로그" },
-  { href: "/dashboard/settings", label: "설정" },
-];
-
 const sideNav: ChromeNavItem[] = [
   { href: "/", label: "대시보드", icon: "home" },
   { href: "/dashboard/account", label: "계좌 / 잔고", icon: "wallet" },
@@ -44,7 +36,7 @@ const sideNav: ChromeNavItem[] = [
   { href: "/dashboard/orders", label: "주문 / 체결", icon: "order" },
   { href: "/dashboard/risk", label: "안전 점검", icon: "shield" },
   { href: "/dashboard/scheduler", label: "자동 실행", icon: "clock" },
-  { href: "/dashboard/audit", label: "감사 로그", icon: "clock" },
+  { href: "/dashboard/audit", label: "감사 로그", icon: "list" },
   { href: "/dashboard/settings", label: "설정", icon: "settings" },
 ];
 
@@ -58,10 +50,6 @@ function isActive(pathname: string, href: string) {
 
 function navItemClass(active: boolean) {
   return active ? "bg-blue-50 text-blue-700" : "text-slate-700 hover:bg-slate-50";
-}
-
-function topNavItemClass(active: boolean) {
-  return active ? "border-b-2 border-blue-600 text-blue-700" : "text-slate-700 hover:bg-slate-50";
 }
 
 function Icon({ name, className = "h-5 w-5" }: { name: ChromeIcon; className?: string }) {
@@ -190,37 +178,7 @@ export function AppChrome({ children }: { children: React.ReactNode }) {
             </span>
           </Link>
 
-          <nav className="hidden min-w-0 flex-1 items-center justify-center gap-2 lg:flex" aria-label="상단 메뉴">
-            {topNav.map((item) => (
-              <Link
-                key={item.href}
-                href={item.href}
-                className={`rounded-md px-4 py-3 text-sm font-semibold transition xl:px-5 xl:text-base ${topNavItemClass(
-                  isActive(pathname, item.href),
-                )}`}
-              >
-                {item.label}
-              </Link>
-            ))}
-          </nav>
-
-          <div className="ml-auto flex items-center gap-3">
-            <Link
-              href="/dashboard/audit"
-              aria-label="감사 로그"
-              className="hidden h-11 items-center gap-2 rounded-md border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 md:flex"
-            >
-              <Icon name="bell" className="h-4 w-4" />
-              감사 로그
-            </Link>
-            <Link
-              href="/dashboard/settings"
-              className="hidden h-11 items-center gap-2 rounded-md border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 sm:flex"
-            >
-              <Icon name="user" />
-              운영자
-            </Link>
-          </div>
+          <div className="ml-auto" aria-hidden="true" />
         </div>
       </header>
       <MobileNav items={sideNav} pathname={pathname} />

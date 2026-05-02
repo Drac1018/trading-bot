@@ -97,6 +97,46 @@ def test_http_error_exposes_binance_code_and_message(monkeypatch) -> None:
     assert events[0]["status_code"] == 400
 
 
+def test_auth_permission_error_is_classified_for_request_hook(monkeypatch) -> None:
+    events: list[dict[str, object]] = []
+
+    class ErrorResponse:
+        def raise_for_status(self) -> None:
+            request = httpx.Request("GET", "https://fapi.binance.com/fapi/v1/openOrders")
+            response = httpx.Response(
+                401,
+                request=request,
+                json={"code": -2015, "msg": "Invalid API-key, IP, or permissions for action."},
+            )
+            raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+
+        def json(self) -> dict[str, object]:
+            return {"code": -2015, "msg": "Invalid API-key, IP, or permissions for action."}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def request(self, method, path, params=None, headers=None):
+            return ErrorResponse()
+
+    monkeypatch.setattr("trading_mvp.services.binance.httpx.Client", FakeClient)
+
+    with pytest.raises(RuntimeError, match="Binance error -2015"):
+        BinanceClient(api_key="key", api_secret="secret", request_error_hook=events.append).get_open_orders("BTCUSDT")
+
+    assert events[0]["reason_code"] == "BINANCE_REST_AUTH_PERMISSION_REJECTED"
+    assert events[0]["failure_type"] == "auth_permission"
+    assert events[0]["status_code"] == 401
+    assert events[0]["api_code"] == -2015
+
+
 def test_get_retry_attempts_can_be_capped(monkeypatch) -> None:
     calls = 0
     events: list[dict[str, object]] = []

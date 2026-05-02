@@ -23,6 +23,7 @@ ORDER_SUBMISSION_PATHS = {"/fapi/v1/order", "/fapi/v1/algoOrder"}
 BINANCE_TRANSIENT_API_CODES = {-1001, -1007}
 BINANCE_RATE_LIMIT_API_CODES = {-1003, -1015}
 BINANCE_TIMESTAMP_API_CODES = {-1021}
+BINANCE_AUTH_PERMISSION_API_CODES = {-2014, -2015}
 RequestErrorHook = Callable[[dict[str, object]], None]
 
 
@@ -112,6 +113,9 @@ def classify_binance_rest_exception(
     if api_code in BINANCE_TIMESTAMP_API_CODES:
         reason_code = "BINANCE_REST_TIME_SYNC_REQUIRED"
         failure_type = "time_sync"
+    elif http_status == 401 or api_code in BINANCE_AUTH_PERMISSION_API_CODES:
+        reason_code = "BINANCE_REST_AUTH_PERMISSION_REJECTED"
+        failure_type = "auth_permission"
     elif rate_limited:
         reason_code = "BINANCE_REST_RATE_LIMITED"
         failure_type = "rate_limit"

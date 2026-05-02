@@ -196,6 +196,7 @@ def build_trading_decision_input_payload(
         "derivatives_summary": build_derivatives_summary(features=feature_payload).model_dump(mode="json"),
         "lead_lag_summary": build_lead_lag_summary(features=feature_payload).model_dump(mode="json"),
         "event_context_summary": build_event_context_summary(features=feature_payload).model_dump(mode="json"),
+        "volume_profile_summary": feature_payload.volume_profile.model_dump(mode="json"),
     }
     payload = {
         "market_snapshot": market_snapshot.model_dump(mode="json"),

@@ -1227,6 +1227,7 @@ def test_protection_unverified_keeps_entry_blocked_without_auto_resize(db_sessio
 
 def test_approval_closed_keeps_entry_blocked_without_auto_resize(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.max_largest_position_pct = 1.5
     settings_row.live_trading_enabled = True
     settings_row.manual_live_approval = True
@@ -1252,12 +1253,15 @@ def test_approval_closed_keeps_entry_blocked_without_auto_resize(db_session) -> 
     assert result.allowed is False
     assert result.auto_resized_entry is False
     assert "LIVE_APPROVAL_REQUIRED" in result.reason_codes
+    assert "LARGEST_POSITION_LIMIT_REACHED" not in result.reason_codes
+    assert "LARGEST_POSITION_LIMIT_REACHED" in result.debug_payload["requested_exposure_limit_codes"]
     assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
     assert result.approved_quantity is None
 
 
 def test_trading_pause_keeps_entry_blocked_without_auto_resize(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
     settings_row.max_largest_position_pct = 1.5
     settings_row.live_trading_enabled = True
     settings_row.manual_live_approval = True
@@ -1285,6 +1289,8 @@ def test_trading_pause_keeps_entry_blocked_without_auto_resize(db_session) -> No
     assert result.allowed is False
     assert result.auto_resized_entry is False
     assert "TRADING_PAUSED" in result.reason_codes
+    assert "LARGEST_POSITION_LIMIT_REACHED" not in result.reason_codes
+    assert "LARGEST_POSITION_LIMIT_REACHED" in result.debug_payload["requested_exposure_limit_codes"]
     assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
     assert result.approved_quantity is None
 

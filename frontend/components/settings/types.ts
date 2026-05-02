@@ -48,6 +48,20 @@ export type LiveSyncResult = {
   emergency_actions_taken?: Array<Record<string, unknown>>;
 };
 
+export type AutoResumeAttemptResult = {
+  status?: string;
+  resumed?: boolean;
+  allowed?: boolean;
+  reason_code?: string | null;
+  pause_origin?: string | null;
+  auto_resume_after?: string | null;
+  blockers?: string[];
+  symbol_blockers?: Record<string, string[]>;
+  blocker_details?: Array<Record<string, unknown>>;
+  evaluated_symbols?: string[];
+  health_error?: string | null;
+};
+
 export type SymbolCadenceOverride = {
   symbol: string;
   enabled: boolean;

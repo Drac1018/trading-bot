@@ -121,6 +121,14 @@ class EventContextCandidate:
     priority: int
 
 
+AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
+    "GROSS_EXPOSURE_LIMIT_REACHED",
+    "DIRECTIONAL_BIAS_LIMIT_REACHED",
+    "LARGEST_POSITION_LIMIT_REACHED",
+    "SAME_TIER_CONCENTRATION_LIMIT_REACHED",
+}
+
+
 DISPLAY_MAX_LEVERAGE = 5.0
 DISPLAY_MAX_RISK_PER_TRADE = 0.02
 DISPLAY_MAX_DAILY_LOSS = 0.05
@@ -266,6 +274,7 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "TEMPORARY_SYNC_FAILURE",
     "EXCHANGE_POSITION_SYNC_FAILED",
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+    "EXCHANGE_AUTH_PERMISSION_REJECTED",
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
 }
 SYNC_SCOPE_GUARD_REASON_CODES = {
@@ -276,6 +285,7 @@ SYNC_SCOPE_GUARD_REASON_CODES = {
 }
 STALE_FIRST_REASON_PRIORITY = {
     "BINANCE_REST_CIRCUIT_OPEN": -3,
+    "BINANCE_REST_AUTH_PERMISSION_REJECTED": -3,
     "BINANCE_REST_RECOVERING_SYNC_STALE": -2,
     "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": -1,
     "ACCOUNT_STATE_STALE": 0,
@@ -283,6 +293,7 @@ STALE_FIRST_REASON_PRIORITY = {
     "OPEN_ORDERS_STATE_STALE": 2,
     "PROTECTION_STATE_UNVERIFIED": 3,
     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE": 4,
+    "EXCHANGE_AUTH_PERMISSION_REJECTED": 4,
     "EXCHANGE_POSITION_SYNC_FAILED": 5,
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": 6,
     "TEMPORARY_SYNC_FAILURE": 7,
@@ -294,6 +305,8 @@ STALE_FIRST_REASON_PRIORITY = {
     "MARKET_STATE_INCOMPLETE": 11,
 }
 GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
+    "EXCHANGE_AUTH_PERMISSION_REJECTED": "Binance API 인증 또는 권한이 거절되어 거래소 상태를 신뢰할 수 없습니다.",
+    "BINANCE_REST_AUTH_PERMISSION_REJECTED": "Binance REST 인증 또는 권한 오류가 감지되어 신규 진입을 차단합니다.",
     "TRADING_PAUSED": "거래가 일시 중지되어 가드 모드입니다.",
     "MANUAL_USER_REQUEST": "운영자가 수동으로 거래를 중지해 가드 모드입니다.",
     "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE": "거래소 계좌 상태 동기화 실패로 시스템 pause 상태입니다.",
@@ -1786,7 +1799,48 @@ def _risk_blocked_reason_codes_from_row(latest_risk: RiskCheck) -> list[str]:
         raw_reason_codes = payload.get("reason_codes", [])
     else:
         raw_reason_codes = latest_risk.reason_codes
-    return [str(item) for item in raw_reason_codes if item not in {None, ""}]
+    reason_codes = [str(item) for item in raw_reason_codes if item not in {None, ""}]
+    return _filter_requested_only_exposure_reason_codes(payload, reason_codes)
+
+
+def _float_or_default(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in {None, ""}]
+
+
+def _filter_requested_only_exposure_reason_codes(payload: dict[str, Any], reason_codes: list[str]) -> list[str]:
+    debug_payload = payload.get("debug_payload")
+    if not isinstance(debug_payload, dict):
+        return reason_codes
+    if "requested_exposure_limit_codes" not in debug_payload or "final_exposure_limit_codes" not in debug_payload:
+        return reason_codes
+    headroom = debug_payload.get("headroom")
+    if not isinstance(headroom, dict):
+        return reason_codes
+    minimum_actionable_notional = _float_or_default(headroom.get("minimum_actionable_notional"), default=0.0)
+    limiting_headroom_notional = _float_or_default(headroom.get("limiting_headroom_notional"), default=-1.0)
+    if minimum_actionable_notional <= 0.0 or limiting_headroom_notional < minimum_actionable_notional:
+        return reason_codes
+    requested_codes = set(_string_list(debug_payload.get("requested_exposure_limit_codes")))
+    final_codes = set(_string_list(debug_payload.get("final_exposure_limit_codes")))
+    requested_only_codes = (requested_codes - final_codes) & AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES
+    if not requested_only_codes:
+        return reason_codes
+    return [code for code in reason_codes if code not in requested_only_codes]
 
 
 def get_latest_blocked_reasons(session: Session | None) -> list[str]:
@@ -2215,6 +2269,9 @@ def _derive_binance_rest_blocking_reasons(binance_rest_summary: dict[str, object
     if not isinstance(binance_rest_summary, dict):
         return []
     reason_code = str(binance_rest_summary.get("entry_block_reason_code") or "").strip()
+    current_reason_code = str(binance_rest_summary.get("reason_code") or "").strip()
+    if bool(binance_rest_summary.get("new_entries_blocked")) and current_reason_code == "BINANCE_REST_AUTH_PERMISSION_REJECTED":
+        return [current_reason_code]
     if bool(binance_rest_summary.get("new_entries_blocked")) and reason_code:
         return [reason_code]
     return []
@@ -2260,6 +2317,18 @@ def _prioritize_blocked_reasons(reason_codes: list[str]) -> list[str]:
     )
 
 
+def _filter_inactive_control_reason_codes(settings_row: Setting, reason_codes: list[str]) -> list[str]:
+    approval_window_open, _, _ = get_live_approval_status(settings_row)
+    filtered: list[str] = []
+    for code in reason_codes:
+        if code in {"TRADING_PAUSED", "MANUAL_USER_REQUEST"} and not settings_row.trading_paused:
+            continue
+        if code == "LIVE_APPROVAL_REQUIRED" and approval_window_open:
+            continue
+        filtered.append(code)
+    return filtered
+
+
 def derive_guard_mode_reason(
     settings_row: Setting,
     *,
@@ -2281,7 +2350,10 @@ def derive_guard_mode_reason(
         + market_blocked_reasons
         + user_stream_blocked_reasons
         + binance_rest_blocked_reasons
-        + [str(item) for item in (latest_blocked_reasons or []) if item]
+        + _filter_inactive_control_reason_codes(
+            settings_row,
+            [str(item) for item in (latest_blocked_reasons or []) if item],
+        )
     )
     auto_resume_blockers = [str(item) for item in (auto_resume_last_blockers or []) if item]
     operating_state = str(runtime.get("operating_state", "TRADABLE"))
@@ -2494,7 +2566,18 @@ def build_operational_status_payload(
     live_execution_ready = is_live_execution_ready(settings_row, defaults=app_defaults)
     auto_resume_state = settings_row.pause_reason_detail.get("auto_resume", {}) if settings_row.trading_paused else {}
     auto_resume_last_blockers = [str(item) for item in auto_resume_state.get("blockers", [])]
-    current_cycle_blocked_reasons = [str(item) for item in (blocked_reasons or []) if item not in {None, ""}]
+    current_cycle_blocked_reasons = _filter_inactive_control_reason_codes(
+        settings_row,
+        [str(item) for item in (blocked_reasons or []) if item not in {None, ""}],
+    )
+    explicit_latest_blocked_reasons = (
+        _filter_inactive_control_reason_codes(
+            settings_row,
+            [str(item) for item in latest_blocked_reasons if item not in {None, ""}],
+        )
+        if latest_blocked_reasons is not None
+        else None
+    )
     reconciliation_summary = dict(runtime.get("reconciliation_summary") or {})
     drawdown_state_summary = dict(runtime.get("drawdown_state_summary") or {})
     if not drawdown_state_summary and current_session is not None:
@@ -2506,7 +2589,10 @@ def build_operational_status_payload(
     if risk_allowed is None and current_session is not None:
         risk_allowed, latest_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
         if not current_cycle_blocked_reasons:
-            current_cycle_blocked_reasons = latest_cycle_blocked_reasons
+            current_cycle_blocked_reasons = _filter_inactive_control_reason_codes(
+                settings_row,
+                latest_cycle_blocked_reasons,
+            )
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     user_stream_summary = dict(runtime.get("user_stream_summary") or {})
@@ -2530,9 +2616,12 @@ def build_operational_status_payload(
         + [
             str(item)
             for item in (
-                latest_blocked_reasons
-                if latest_blocked_reasons is not None
-                else (current_cycle_blocked_reasons or get_latest_blocked_reasons(current_session))
+                explicit_latest_blocked_reasons
+                if explicit_latest_blocked_reasons is not None
+                else (
+                    current_cycle_blocked_reasons
+                    or _filter_inactive_control_reason_codes(settings_row, get_latest_blocked_reasons(current_session))
+                )
             )
             if item not in {None, ""}
         ]

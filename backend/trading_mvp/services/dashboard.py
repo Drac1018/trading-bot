@@ -92,10 +92,19 @@ OPERATOR_AUDIT_LIMIT = 4
 SYMBOL_AUDIT_LIMIT = 3
 OPERATOR_PERFORMANCE_WINDOW_LIMIT = 1
 OPERATOR_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (("24h", 24),)
+OPERATOR_PROFITABILITY_COST_WINDOW_SPECS: tuple[tuple[str, int | None], ...] = (
+    ("today", None),
+)
 OPERATOR_PERFORMANCE_ENTRY_LIMIT = 3
 OPERATOR_EXECUTION_PROFILE_LIMIT = 2
 OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 RECENT_FILL_LIMIT = 4
+AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
+    "GROSS_EXPOSURE_LIMIT_REACHED",
+    "DIRECTIONAL_BIAS_LIMIT_REACHED",
+    "LARGEST_POSITION_LIMIT_REACHED",
+    "SAME_TIER_CONCENTRATION_LIMIT_REACHED",
+}
 AI_REVIEW_TYPE_BY_TRIGGER_REASON = {
     "entry_candidate_event": "entry_candidate_review",
     "breakout_exception_event": "breakout_exception_review",
@@ -2346,35 +2355,55 @@ def get_profitability_dashboard(
     *,
     overview: OverviewResponse | None = None,
     performance_window_specs: Sequence[tuple[str, int]] | None = None,
+    cost_window_specs: Sequence[tuple[str, int | None]] | None = None,
 ) -> DashboardProfitabilityResponse:
     overview = overview or get_overview(session)
     now = utcnow_naive()
+    selected_cost_window_specs = tuple(cost_window_specs or PROFITABILITY_COST_WINDOW_SPECS)
     performance_report = build_signal_performance_report(
         session,
         window_specs=performance_window_specs,
     )
     execution_report = get_execution_quality_report(session)
 
+    cost_breakdown_cache: dict[tuple[str, int | None, datetime | None], DashboardProfitabilityCostBreakdown] = {}
+
+    def cost_breakdown_for(
+        *,
+        window_label: str,
+        window_hours: int | None,
+        summary: PerformanceWindowSummary | None,
+    ) -> DashboardProfitabilityCostBreakdown:
+        since = _profitability_window_since(window_label, window_hours, now)
+        cache_key = (window_label, window_hours, since)
+        cached = cost_breakdown_cache.get(cache_key)
+        if cached is None:
+            cached = _build_profitability_cost_breakdown(
+                session,
+                window_label=window_label,
+                window_hours=window_hours,
+                since=since,
+                summary=summary,
+            )
+            cost_breakdown_cache[cache_key] = cached
+        return cached
+
     cost_breakdown_by_label = {
-        window.window_label: _build_profitability_cost_breakdown(
-            session,
+        window.window_label: cost_breakdown_for(
             window_label=window.window_label,
             window_hours=window.window_hours,
-            since=_profitability_window_since(window.window_label, window.window_hours, now),
             summary=window.summary,
         )
         for window in performance_report.windows
     }
     summary_by_label = {window.window_label: window.summary for window in performance_report.windows}
     cost_breakdowns = [
-        _build_profitability_cost_breakdown(
-            session,
+        cost_breakdown_for(
             window_label=window_label,
             window_hours=window_hours,
-            since=_profitability_window_since(window_label, window_hours, now),
             summary=summary_by_label.get(window_label),
         )
-        for window_label, window_hours in PROFITABILITY_COST_WINDOW_SPECS
+        for window_label, window_hours in selected_cost_window_specs
     ]
 
     windows: list[DashboardProfitabilityWindow] = []
@@ -2706,10 +2735,30 @@ def _risk_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
         return []
     payload = row.payload if isinstance(row.payload, dict) else {}
     if "blocked_reason_codes" in payload and isinstance(payload.get("blocked_reason_codes"), list):
-        return _as_string_list(payload.get("blocked_reason_codes"))
+        return _filter_requested_only_exposure_reason_codes(
+            payload,
+            _as_string_list(payload.get("blocked_reason_codes")),
+        )
     if "reason_codes" in payload and isinstance(payload.get("reason_codes"), list):
-        return _as_string_list(payload.get("reason_codes"))
-    return _as_string_list(row.reason_codes)
+        return _filter_requested_only_exposure_reason_codes(payload, _as_string_list(payload.get("reason_codes")))
+    return _filter_requested_only_exposure_reason_codes(payload, _as_string_list(row.reason_codes))
+
+
+def _filter_requested_only_exposure_reason_codes(payload: dict[str, Any], reason_codes: list[str]) -> list[str]:
+    debug_payload = _as_dict(payload.get("debug_payload"))
+    if "requested_exposure_limit_codes" not in debug_payload or "final_exposure_limit_codes" not in debug_payload:
+        return reason_codes
+    headroom = _as_dict(debug_payload.get("headroom"))
+    minimum_actionable_notional = _as_float(headroom.get("minimum_actionable_notional"), default=0.0)
+    limiting_headroom_notional = _as_float(headroom.get("limiting_headroom_notional"), default=-1.0)
+    if minimum_actionable_notional <= 0.0 or limiting_headroom_notional < minimum_actionable_notional:
+        return reason_codes
+    requested_codes = set(_as_string_list(debug_payload.get("requested_exposure_limit_codes")))
+    final_codes = set(_as_string_list(debug_payload.get("final_exposure_limit_codes")))
+    requested_only_codes = (requested_codes - final_codes) & AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES
+    if not requested_only_codes:
+        return reason_codes
+    return [code for code in reason_codes if code not in requested_only_codes]
 
 
 def _risk_adjustment_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
@@ -3628,6 +3677,7 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         session,
         overview=overview,
         performance_window_specs=OPERATOR_PERFORMANCE_WINDOW_SPECS,
+        cost_window_specs=OPERATOR_PROFITABILITY_COST_WINDOW_SPECS,
     )
     latest_scheduler = session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
     symbol_summaries = _build_operator_symbol_summaries(
@@ -3733,6 +3783,13 @@ def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False)
         payload = _serialize_model_row(risk_row)
         macro_event_summary = _decision_macro_event_context_summary(decision_row)
         risk_snapshot = _build_risk_snapshot(risk_row)
+        risk_payload = _dashboard_risk_payload_from_row(risk_row)
+        payload["reason_codes"] = risk_payload["reason_codes"]
+        payload["blocked_reason_codes"] = risk_payload["blocked_reason_codes"]
+        if isinstance(payload.get("payload"), dict):
+            payload["payload"] = dict(payload["payload"])
+            payload["payload"]["reason_codes"] = risk_payload["reason_codes"]
+            payload["payload"]["blocked_reason_codes"] = risk_payload["blocked_reason_codes"]
         payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(decision_row)
         payload["ai_review_type"] = _ai_review_type_from_decision_row(decision_row)
         payload["ai_trigger_reason_codes"] = _ai_trigger_reason_codes_from_decision_row(decision_row)

@@ -7,6 +7,8 @@ import {
   MarketSignalView,
   RiskView,
   SchedulerView,
+  type MarketChartZoomRange,
+  type MarketChartTimeframe,
 } from "../../../components/dashboard-views";
 import { DataTable } from "../../../components/data-table";
 import { LogExplorer, type AuditRow } from "../../../components/log-explorer";
@@ -14,17 +16,61 @@ import { PageShell } from "../../../components/page-shell";
 import { SettingsControls, type SettingsPayload } from "../../../components/settings-controls";
 import { type OperatorDashboardPayload } from "../../../components/overview-dashboard";
 import { fetchJson } from "../../../lib/api";
+import { fetchBinanceChartCandlesBySymbol } from "../../../lib/binance-chart-candles";
 import { normalizeSettingsView } from "../../../lib/page-config";
 import { resolveSelectedSymbol } from "../../../lib/selected-symbol";
 import { dashboardPages } from "../../../lib/page-config";
 
 type Row = Record<string, unknown>;
+type CandleWindow = 120 | 240 | 500 | 1000;
 
 function queryValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
     return value[0] ?? null;
   }
   return value ?? null;
+}
+
+function resolveCandleWindow(value: string | string[] | undefined): CandleWindow {
+  const normalized = queryValue(value);
+  if (normalized === "1000") {
+    return 1000;
+  }
+  if (normalized === "500") {
+    return 500;
+  }
+  if (normalized === "240") {
+    return 240;
+  }
+  if (normalized === "120") {
+    return 120;
+  }
+  return 120;
+}
+
+function resolveMarketTimeframe(value: string | string[] | undefined): MarketChartTimeframe {
+  const normalized = queryValue(value);
+  if (normalized === "1h" || normalized === "60m") {
+    return "1h";
+  }
+  if (normalized === "4h" || normalized === "240m") {
+    return "4h";
+  }
+  return "15m";
+}
+
+function resolveMarketChartZoomRange(value: string | string[] | undefined): MarketChartZoomRange | null {
+  const normalized = queryValue(value);
+  const match = normalized?.match(/^(\d+)-(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) {
+    return null;
+  }
+  return { start, end };
 }
 
 export default async function DashboardPage({
@@ -49,27 +95,34 @@ export default async function DashboardPage({
 
     return (
       <div className="space-y-6">
-        <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} />
+        <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} compact />
         <LogExplorer initialRows={auditRows} initialTab={initialTab} initialLimit={30} />
       </div>
     );
   }
 
-  const settingsPayload = slug === "settings" ? await fetchJson<SettingsPayload>("/api/settings") : null;
-  const operatorPayload =
+  const settingsPayloadPromise = slug === "settings"
+    ? fetchJson<SettingsPayload>("/api/settings")
+    : Promise.resolve<SettingsPayload | null>(null);
+  const operatorPayloadPromise =
     slug === "market" || slug === "decisions" || slug === "scheduler"
-      ? await fetchJson<OperatorDashboardPayload>("/api/dashboard/operator")
-      : null;
+      ? fetchJson<OperatorDashboardPayload>("/api/dashboard/operator")
+      : Promise.resolve<OperatorDashboardPayload | null>(null);
 
-  const sections =
+  const sectionsPromise =
     slug === "settings"
-      ? []
-      : await Promise.all(
+      ? Promise.resolve([])
+      : Promise.all(
           config.sections.map(async (section) => ({
             ...section,
             rows: await fetchJson<Row[] | Row>(section.endpoint),
           })),
         );
+  const [settingsPayload, operatorPayload, sections] = await Promise.all([
+    settingsPayloadPromise,
+    operatorPayloadPromise,
+    sectionsPromise,
+  ]);
 
   const normalizedSections = sections.map((section) => ({
     ...section,
@@ -85,12 +138,29 @@ export default async function DashboardPage({
       operatorPayload.control.default_symbol,
       { mode: "all" },
     );
+    const selectedCandleWindow = resolveCandleWindow(query.candles);
+    const selectedTimeframe = resolveMarketTimeframe(query.timeframe);
+    const selectedChartZoomRange = resolveMarketChartZoomRange(query.zoom);
+    const trackedSymbols =
+      operatorPayload.control.tracked_symbols.length > 0
+        ? operatorPayload.control.tracked_symbols
+        : operatorPayload.symbols.map((symbol) => symbol.symbol);
+    const chartSymbols = selectedSymbol === "ALL" ? trackedSymbols : [selectedSymbol];
+    const chartCandlesBySymbol = await fetchBinanceChartCandlesBySymbol({
+      symbols: chartSymbols,
+      timeframe: selectedTimeframe,
+      limit: selectedCandleWindow,
+    });
     content = (
       <MarketSignalView
         operator={operatorPayload}
         snapshots={normalizedSections[0]?.rows ?? []}
         features={normalizedSections[1]?.rows ?? []}
         selectedSymbol={selectedSymbol}
+        selectedCandleWindow={selectedCandleWindow}
+        selectedTimeframe={selectedTimeframe}
+        selectedChartZoomRange={selectedChartZoomRange}
+        chartCandlesBySymbol={chartCandlesBySymbol}
       />
     );
   } else if (slug === "decisions" && operatorPayload) {
@@ -138,7 +208,7 @@ export default async function DashboardPage({
 
   return (
     <div className="space-y-6">
-      <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} />
+      <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} compact />
 
       {content}
     </div>

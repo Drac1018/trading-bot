@@ -2161,8 +2161,8 @@ def evaluate_risk(
                         else:
                             size_adjustment_ratio = 1.0
             else:
-                blocked_reason_codes.extend(requested_exposure_limit_codes)
                 if max_additional_notional < minimum_actionable_notional:
+                    blocked_reason_codes.extend(requested_exposure_limit_codes)
                     blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
                 approved_projected_notional = 0.0
                 approved_quantity = None

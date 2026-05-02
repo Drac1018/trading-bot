@@ -20,6 +20,8 @@ from trading_mvp.schemas import (
     PullbackContinuationFeatureContext,
     RegimeFeatureContext,
     TimeframeFeatureContext,
+    VolumeProfileFeatureContext,
+    VolumeProfileLevel,
     VolumePersistenceFeatureContext,
 )
 
@@ -207,6 +209,132 @@ def _volume_persistence_context(snapshot: MarketSnapshotPayload, *, recent_windo
         low_volume_bars=low_volume_bars,
         sustained_high_volume=high_volume_bars >= max(2, effective_window - 2),
         sustained_low_volume=low_volume_bars >= max(2, effective_window - 2),
+    )
+
+
+def _volume_profile_context(
+    snapshot: MarketSnapshotPayload,
+    *,
+    bin_count: int = 28,
+    value_area_ratio: float = 0.7,
+) -> VolumeProfileFeatureContext:
+    candles = snapshot.candles
+    if len(candles) < 5:
+        return VolumeProfileFeatureContext(
+            timeframe=snapshot.timeframe,
+            lookback_candles=len(candles),
+            bin_count=0,
+        )
+
+    low = min(float(candle.low) for candle in candles)
+    high = max(float(candle.high) for candle in candles)
+    price_range = high - low
+    latest_price = max(float(candles[-1].close), 0.0000001)
+    if price_range <= 0:
+        return VolumeProfileFeatureContext(
+            available=True,
+            timeframe=snapshot.timeframe,
+            lookback_candles=len(candles),
+            bin_count=1,
+            poc_price=round(latest_price, 4),
+            value_area_low=round(low, 4),
+            value_area_high=round(high, 4),
+            current_position="flat_profile",
+            hvn_levels=[
+                VolumeProfileLevel(
+                    price=round(latest_price, 4),
+                    low=round(low, 4),
+                    high=round(high, 4),
+                    volume_share=1.0,
+                    strength=1.0,
+                )
+            ],
+        )
+
+    resolved_bin_count = max(8, min(bin_count, max(8, len(candles) // 3)))
+    bin_width = price_range / resolved_bin_count
+    bins = [
+        {
+            "low": low + bin_width * index,
+            "high": low + bin_width * (index + 1),
+            "volume": 0.0,
+        }
+        for index in range(resolved_bin_count)
+    ]
+    for candle in candles:
+        typical_price = (float(candle.high) + float(candle.low) + float(candle.close)) / 3.0
+        index = int((typical_price - low) / price_range * resolved_bin_count)
+        index = max(0, min(resolved_bin_count - 1, index))
+        bins[index]["volume"] += float(candle.volume)
+
+    total_volume = sum(item["volume"] for item in bins)
+    if total_volume <= 0:
+        return VolumeProfileFeatureContext(
+            timeframe=snapshot.timeframe,
+            lookback_candles=len(candles),
+            bin_count=resolved_bin_count,
+        )
+
+    max_volume = max(item["volume"] for item in bins) or 1.0
+
+    def level_for_bin(item: dict[str, float]) -> VolumeProfileLevel:
+        return VolumeProfileLevel(
+            price=round((item["low"] + item["high"]) / 2.0, 4),
+            low=round(item["low"], 4),
+            high=round(item["high"], 4),
+            volume_share=round(item["volume"] / total_volume, 4),
+            strength=round(item["volume"] / max_volume, 4),
+        )
+
+    poc_bin = max(bins, key=lambda item: item["volume"])
+    selected_bins: list[dict[str, float]] = []
+    selected_volume = 0.0
+    for item in sorted(bins, key=lambda value: value["volume"], reverse=True):
+        selected_bins.append(item)
+        selected_volume += item["volume"]
+        if selected_volume / total_volume >= value_area_ratio:
+            break
+
+    value_area_low = min(item["low"] for item in selected_bins)
+    value_area_high = max(item["high"] for item in selected_bins)
+    hvn_bins = sorted(bins, key=lambda item: item["volume"], reverse=True)[:3]
+    positive_bins = [item for item in bins if item["volume"] > 0]
+    lvn_bins = sorted(positive_bins, key=lambda item: item["volume"])[:3]
+    support_candidates = [item for item in hvn_bins if ((item["low"] + item["high"]) / 2.0) < latest_price]
+    resistance_candidates = [item for item in hvn_bins if ((item["low"] + item["high"]) / 2.0) > latest_price]
+    nearest_support = max(support_candidates, key=lambda item: (item["low"] + item["high"]) / 2.0, default=None)
+    nearest_resistance = min(resistance_candidates, key=lambda item: (item["low"] + item["high"]) / 2.0, default=None)
+    support_price = (nearest_support["low"] + nearest_support["high"]) / 2.0 if nearest_support else None
+    resistance_price = (nearest_resistance["low"] + nearest_resistance["high"]) / 2.0 if nearest_resistance else None
+    poc_price = (poc_bin["low"] + poc_bin["high"]) / 2.0
+    if latest_price < value_area_low:
+        current_position = "below_value_area"
+    elif latest_price > value_area_high:
+        current_position = "above_value_area"
+    elif latest_price >= poc_price:
+        current_position = "above_poc_inside_value_area"
+    else:
+        current_position = "below_poc_inside_value_area"
+
+    return VolumeProfileFeatureContext(
+        available=True,
+        timeframe=snapshot.timeframe,
+        lookback_candles=len(candles),
+        bin_count=resolved_bin_count,
+        poc_price=round(poc_price, 4),
+        value_area_low=round(value_area_low, 4),
+        value_area_high=round(value_area_high, 4),
+        nearest_support=round(support_price, 4) if support_price is not None else None,
+        nearest_resistance=round(resistance_price, 4) if resistance_price is not None else None,
+        support_distance_pct=round(((latest_price - support_price) / latest_price) * 100, 4)
+        if support_price is not None
+        else None,
+        resistance_distance_pct=round(((resistance_price - latest_price) / latest_price) * 100, 4)
+        if resistance_price is not None
+        else None,
+        current_position=current_position,
+        hvn_levels=[level_for_bin(item) for item in hvn_bins],
+        lvn_levels=[level_for_bin(item) for item in lvn_bins],
     )
 
 
@@ -985,6 +1113,7 @@ def compute_features(
     candle_structure = _candle_structure_context(snapshot)
     location = _location_context(snapshot, breakout)
     volume_persistence = _volume_persistence_context(snapshot)
+    volume_profile = _volume_profile_context(snapshot)
     pullback_context = _pullback_context(
         base_context=base_context,
         regime=regime,
@@ -1053,6 +1182,7 @@ def compute_features(
         candle_structure=candle_structure,
         location=location,
         volume_persistence=volume_persistence,
+        volume_profile=volume_profile,
         pullback_context=pullback_context,
         derivatives=derivatives,
         lead_lag=lead_lag,

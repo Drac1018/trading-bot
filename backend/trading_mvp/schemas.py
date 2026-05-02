@@ -1258,7 +1258,7 @@ class DecisionReferencePayload(StrictBaseModel):
 
 class OperatorControlState(StrictBaseModel):
     generated_at: datetime
-    operational_status: OperationalStatusPayload
+    operational_status: OperationalStatusPayload = Field(exclude=True)
     control_status_summary: ControlStatusSummary | None = None
     can_enter_new_position: bool = False
     mode: str
@@ -1312,8 +1312,8 @@ class OperatorControlState(StrictBaseModel):
     last_decision_snapshot_at: datetime | None = None
     last_decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
-    reconciliation_summary: dict[str, Any] = Field(default_factory=dict)
-    candidate_selection_summary: dict[str, Any] = Field(default_factory=dict)
+    reconciliation_summary: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    candidate_selection_summary: dict[str, Any] = Field(default_factory=dict, exclude=True)
     operator_alert: dict[str, Any] = Field(default_factory=dict)
     limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
 
@@ -2220,6 +2220,31 @@ class VolumePersistenceFeatureContext(StrictBaseModel):
     sustained_low_volume: bool = False
 
 
+class VolumeProfileLevel(StrictBaseModel):
+    price: float = Field(ge=0.0, default=0.0)
+    low: float = Field(ge=0.0, default=0.0)
+    high: float = Field(ge=0.0, default=0.0)
+    volume_share: float = Field(ge=0.0, le=1.0, default=0.0)
+    strength: float = Field(ge=0.0, le=1.0, default=0.0)
+
+
+class VolumeProfileFeatureContext(StrictBaseModel):
+    available: bool = False
+    timeframe: str | None = None
+    lookback_candles: int = Field(ge=0, default=0)
+    bin_count: int = Field(ge=0, default=0)
+    poc_price: float | None = Field(default=None, ge=0.0)
+    value_area_low: float | None = Field(default=None, ge=0.0)
+    value_area_high: float | None = Field(default=None, ge=0.0)
+    nearest_support: float | None = Field(default=None, ge=0.0)
+    nearest_resistance: float | None = Field(default=None, ge=0.0)
+    support_distance_pct: float | None = None
+    resistance_distance_pct: float | None = None
+    current_position: str = "unknown"
+    hvn_levels: list[VolumeProfileLevel] = Field(default_factory=list)
+    lvn_levels: list[VolumeProfileLevel] = Field(default_factory=list)
+
+
 class PullbackContinuationFeatureContext(StrictBaseModel):
     higher_timeframe_bias: Literal["bullish", "bearish", "range", "mixed", "unknown"] = "unknown"
     state: Literal[
@@ -2340,6 +2365,7 @@ class FeaturePayload(StrictBaseModel):
     candle_structure: CandleStructureFeatureContext = Field(default_factory=CandleStructureFeatureContext)
     location: LocationFeatureContext = Field(default_factory=LocationFeatureContext)
     volume_persistence: VolumePersistenceFeatureContext = Field(default_factory=VolumePersistenceFeatureContext)
+    volume_profile: VolumeProfileFeatureContext = Field(default_factory=VolumeProfileFeatureContext)
     pullback_context: PullbackContinuationFeatureContext = Field(default_factory=PullbackContinuationFeatureContext)
     derivatives: DerivativesFeatureContext = Field(default_factory=DerivativesFeatureContext)
     lead_lag: LeadLagFeatureContext = Field(default_factory=LeadLagFeatureContext)

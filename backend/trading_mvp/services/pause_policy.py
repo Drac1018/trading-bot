@@ -75,6 +75,13 @@ PAUSE_REASON_POLICIES: dict[str, PauseReasonPolicy] = {
         auto_resume_eligible=True,
         description="Exchange open order sync failed.",
     ),
+    "EXCHANGE_AUTH_PERMISSION_REJECTED": PauseReasonPolicy(
+        code="EXCHANGE_AUTH_PERMISSION_REJECTED",
+        recovery_class="recoverable_system",
+        severity="warning",
+        auto_resume_eligible=True,
+        description="Exchange API authentication or permission was rejected.",
+    ),
     "MANUAL_USER_REQUEST": PauseReasonPolicy(
         code="MANUAL_USER_REQUEST",
         recovery_class="manual_pause",

@@ -122,6 +122,64 @@ def test_auto_resume_succeeds_for_recoverable_pause_when_state_is_safe(db_sessio
     assert refreshed.trading_paused is False
 
 
+def test_auto_resume_clears_recovered_pause_when_only_live_approval_is_missing(db_session, monkeypatch) -> None:
+    settings_row = _prime_live_ready(db_session, monkeypatch)
+    settings_row.live_execution_armed = False
+    settings_row.live_execution_armed_until = None
+    db_session.flush()
+    paused = set_trading_pause(
+        db_session,
+        True,
+        reason_code="EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+        reason_detail={"source": "exchange"},
+        pause_origin="system",
+        auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+        preserve_live_arm=False,
+    )
+    monkeypatch.setattr("trading_mvp.services.pause_control._build_client", lambda settings: _HealthyClient())
+
+    result = attempt_auto_resume(db_session, paused, trigger_source="test")
+
+    refreshed = get_or_create_settings(db_session)
+    assert result["status"] == "pause_cleared_entry_blocked"
+    assert result["resumed"] is True
+    assert result["allowed"] is False
+    assert result["pause_clear_allowed"] is True
+    assert result["blockers"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert refreshed.trading_paused is False
+    assert refreshed.live_execution_armed is False
+
+
+def test_auto_resume_keeps_pause_when_sync_still_fails_without_live_approval(db_session, monkeypatch) -> None:
+    settings_row = _prime_live_ready(db_session, monkeypatch)
+    settings_row.live_execution_armed = False
+    settings_row.live_execution_armed_until = None
+    db_session.flush()
+    paused = set_trading_pause(
+        db_session,
+        True,
+        reason_code="EXCHANGE_OPEN_ORDERS_SYNC_FAILED",
+        reason_detail={"source": "exchange"},
+        pause_origin="system",
+        auto_resume_after=utcnow_naive() - timedelta(minutes=1),
+        preserve_live_arm=False,
+    )
+
+    class OpenOrdersFailingClient(_HealthyClient):
+        def get_open_orders(self, symbol: str) -> list[dict[str, object]]:
+            raise RuntimeError("open orders still unavailable")
+
+    monkeypatch.setattr("trading_mvp.services.pause_control._build_client", lambda settings: OpenOrdersFailingClient())
+
+    result = attempt_auto_resume(db_session, paused, trigger_source="test")
+
+    assert result["status"] == "blocked"
+    assert result["pause_clear_allowed"] is False
+    assert "LIVE_APPROVAL_REQUIRED" in result["blockers"]
+    assert "EXCHANGE_OPEN_ORDERS_SYNC_FAILED" in result["blockers"]
+    assert get_or_create_settings(db_session).trading_paused is True
+
+
 def test_auto_resume_waits_for_cooldown_when_delay_not_reached(db_session, monkeypatch) -> None:
     _prime_live_ready(db_session, monkeypatch)
     paused = set_trading_pause(

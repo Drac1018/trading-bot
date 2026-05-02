@@ -37,6 +37,8 @@ FINAL_EXCHANGE_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", 
 ACCOUNT_CACHE_DETAIL_KEY = "binance_account_cache"
 DEFAULT_ACCOUNT_READ_TIMEOUT_SECONDS = 5.0
 DEFAULT_ACCOUNT_READ_MAX_GET_ATTEMPTS = 2
+ACCOUNT_CACHE_PENDING_STATUSES = {"queued", "refreshing", "already_running"}
+ACCOUNT_CACHE_PENDING_TIMEOUT_SECONDS = 5 * 60
 
 
 def _env_float(name: str, *, default: float, minimum: float) -> float:
@@ -92,6 +94,48 @@ def _account_cache_detail(settings_row: Setting) -> dict[str, Any]:
     return dict(cache) if isinstance(cache, dict) else {}
 
 
+def _coerce_iso_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed
+
+
+def _normalize_account_cache_for_response(cache: Mapping[str, object]) -> dict[str, object]:
+    normalized_cache = dict(cache)
+    status = str(normalized_cache.get("status") or "")
+    if status not in ACCOUNT_CACHE_PENDING_STATUSES:
+        return normalized_cache
+    pending_at = _coerce_iso_datetime(normalized_cache.get("started_at")) or _coerce_iso_datetime(
+        normalized_cache.get("requested_at")
+    )
+    if pending_at is None:
+        return normalized_cache
+    pending_seconds = max((utcnow_naive() - pending_at).total_seconds(), 0.0)
+    if pending_seconds <= ACCOUNT_CACHE_PENDING_TIMEOUT_SECONDS:
+        return normalized_cache
+    has_payload = isinstance(normalized_cache.get("payload"), dict)
+    normalized_cache["status"] = "ready" if has_payload else "empty"
+    normalized_cache["last_error"] = normalized_cache.get("last_error") or "ACCOUNT_CACHE_REFRESH_ABANDONED"
+    normalized_cache["message"] = (
+        "이전 Binance 원본 계정 캐시 갱신이 완료되지 않아 마지막 사용 가능한 계정 기준을 표시합니다. "
+        "필요하면 다시 갱신 요청할 수 있습니다."
+        if has_payload
+        else "이전 Binance 원본 계정 캐시 갱신이 완료되지 않았고 사용 가능한 원본 캐시가 없습니다. "
+        "최근 로컬 동기화 기준을 표시합니다."
+    )
+    normalized_cache["abandoned_refresh"] = {
+        "previous_status": status,
+        "pending_seconds": round(pending_seconds, 1),
+    }
+    return normalized_cache
+
+
 def _write_account_cache_detail(settings_row: Setting, cache: Mapping[str, object]) -> dict[str, Any]:
     normalized_cache = dict(cache)
     write_runtime_detail_key(settings_row, ACCOUNT_CACHE_DETAIL_KEY, normalized_cache)
@@ -133,7 +177,9 @@ def _cache_response(
     *,
     cache: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    cache_payload = dict(cache) if cache is not None else _account_cache_detail(settings_row)
+    cache_payload = _normalize_account_cache_for_response(
+        dict(cache) if cache is not None else _account_cache_detail(settings_row)
+    )
     cached_account = cache_payload.get("payload")
     has_cached_account = isinstance(cached_account, dict)
 

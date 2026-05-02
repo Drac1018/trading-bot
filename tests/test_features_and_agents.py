@@ -459,6 +459,9 @@ def test_compute_features_adds_structure_location_volume_and_pullback_context() 
     assert features.location.range_position_pct < 1.5
     assert features.location.vwap_distance_pct > 0.0
     assert features.volume_persistence.sustained_high_volume is True
+    assert features.volume_profile.available is True
+    assert features.volume_profile.poc_price is not None
+    assert features.volume_profile.hvn_levels
     assert features.pullback_context.higher_timeframe_bias == "bullish"
     assert features.pullback_context.state == "bullish_continuation"
 
@@ -2386,6 +2389,50 @@ def test_strategy_engine_selector_prefers_continuation_engine_for_bullish_contin
     assert selection.selected_engine.entry_mode == "pullback_confirm"
 
 
+def test_strategy_engine_selector_does_not_make_short_from_bullish_extension_only() -> None:
+    bullish_base = _snapshot(
+        "15m",
+        [100, 100.5, 101.0, 101.6, 102.2, 102.9, 103.5, 104.3, 105.0, 105.8, 106.6, 107.5, 108.3, 109.2, 110.1, 111.0],
+        volumes=[900, 940, 970, 1010, 1040, 1080, 1120, 1160, 1200, 1230, 1260, 1300, 1340, 1370, 1410, 1450],
+    )
+    bullish_features = compute_features(
+        bullish_base,
+        {
+            "1h": _snapshot("1h", [98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113]),
+            "4h": _snapshot("4h", [90, 92, 94, 97, 100, 103, 106, 109, 112, 115, 118, 121, 124, 127, 130, 133]),
+        },
+    )
+    bullish_features.regime.primary_regime = "bullish"
+    bullish_features.regime.trend_alignment = "bullish_aligned"
+    bullish_features.regime.weak_volume = False
+    bullish_features.regime.momentum_state = "overextended"
+    bullish_features.pullback_context.state = "bullish_continuation"
+    bullish_features.location.range_position_pct = 0.97
+    bullish_features.location.vwap_distance_pct = 0.7
+    bullish_features.rsi = 86.0
+    bullish_features.derivatives.available = True
+    bullish_features.derivatives.oi_expanding_with_price = False
+    bullish_features.derivatives.taker_flow_alignment = "bearish"
+    bullish_features.derivatives.top_trader_long_crowded = True
+    bullish_features.derivatives.crowded_long_risk = True
+
+    selection = select_strategy_engine(
+        market_snapshot=bullish_base,
+        features=bullish_features,
+        open_positions=[],
+        risk_context={},
+        long_breakout_allowed=False,
+        short_breakout_allowed=False,
+    )
+    range_candidate = next(
+        candidate for candidate in selection.candidates if candidate.engine_name == "range_mean_reversion_engine"
+    )
+
+    assert selection.selected_engine.decision_hint != "short"
+    assert range_candidate.decision_hint != "short"
+    assert range_candidate.eligible is False
+
+
 def test_strategy_engine_selector_uses_box_edges_for_range_reversion() -> None:
     base, features = _range_reversion_context(side="short")
 
@@ -2867,6 +2914,8 @@ def test_trading_decision_input_payload_exposes_separated_feature_layers() -> No
     assert payload["feature_layers"]["lead_lag_summary"]["leader_bias"] == features.lead_lag.leader_bias
     assert payload["feature_layers"]["event_context_summary"]["next_event_name"] == "FOMC"
     assert payload["feature_layers"]["event_context_summary"]["active_risk_window"] is True
+    assert payload["feature_layers"]["volume_profile_summary"]["available"] is True
+    assert payload["features"]["volume_profile"]["poc_price"] == features.volume_profile.poc_price
 
 
 def test_trade_decision_schema_accepts_event_aware_optional_fields() -> None:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import select
-from trading_mvp.models import SkippedTradeEvent
+from trading_mvp.models import AgentRun, SkippedTradeEvent
 from trading_mvp.schemas import (
     MarketCandle,
     MarketSnapshotPayload,
@@ -187,6 +188,170 @@ def test_rank_candidate_symbols_records_breadth_skip_event(db_session, monkeypat
     assert skip_rows[0].skip_reason == "breadth_veto"
     assert skip_rows[0].market_snapshot_id is not None
     assert skip_rows[0].expected_side == "long"
+
+
+def test_late_long_filter_requires_no_pullback_and_derivatives_headwind() -> None:
+    feature_payload = SimpleNamespace(
+        drawdown_pct=0.2,
+        rsi=84.0,
+        location=SimpleNamespace(
+            range_position_pct=0.94,
+            distance_from_recent_high_pct=-0.1,
+            vwap_distance_pct=0.6,
+        ),
+        regime=SimpleNamespace(momentum_state="overextended"),
+        pullback_context=SimpleNamespace(state="bullish_continuation"),
+        derivatives=SimpleNamespace(
+            available=True,
+            oi_expanding_with_price=False,
+            taker_flow_alignment="bearish",
+            top_trader_long_crowded=True,
+            crowded_long_risk=True,
+            entry_veto_reason_codes=["TOP_TRADER_LONG_CROWDED"],
+            breakout_veto_reason_codes=["BREAKOUT_OI_NOT_EXPANDING"],
+        ),
+        multi_timeframe={"4h": SimpleNamespace(drawdown_pct=0.25)},
+    )
+
+    result = TradingOrchestrator._entry_candidate_late_long_filter(
+        decision="long",
+        entry_mode="pullback_confirm",
+        strategy_engine="trend_continuation_engine",
+        feature_payload=feature_payload,
+    )
+    feature_payload.pullback_context.state = "bullish_pullback"
+    confirmed_pullback_result = TradingOrchestrator._entry_candidate_late_long_filter(
+        decision="long",
+        entry_mode="pullback_confirm",
+        strategy_engine="trend_continuation_engine",
+        feature_payload=feature_payload,
+    )
+
+    assert result["active"] is True
+    assert result["reason_codes"] == ["LATE_LONG_NO_PULLBACK", "LONG_EXTENSION_DERIVATIVES_HEADWIND"]
+    assert confirmed_pullback_result["active"] is False
+
+
+def test_interval_plan_records_late_trend_continuation_long_skip(db_session, monkeypatch) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    snapshot = _snapshot(
+        "BTCUSDT",
+        "15m",
+        [
+            _candle(timestamp=now, open_price=100.0, high=100.7, low=99.8, close=100.5),
+        ],
+    )
+    row = _selection_candidate_row(
+        symbol="BTCUSDT",
+        decision="long",
+        scenario="trend_follow",
+        total_score=0.9,
+        priority=False,
+        weak_volume=False,
+        primary_regime="bullish",
+        trend_alignment="bullish_aligned",
+        snapshot=snapshot,
+        entry_mode="pullback_confirm",
+    )
+    row["strategy_engine"] = "trend_continuation_engine"
+    row["late_long_filter"] = {
+        "active": True,
+        "reason_codes": ["LATE_LONG_NO_PULLBACK", "LONG_EXTENSION_DERIVATIVES_HEADWIND"],
+        "details": {"rsi": 84.0, "pullback_state": "bullish_continuation"},
+    }
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_build_lead_market_features",
+        lambda self, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_build_selection_candidate",
+        lambda self, **kwargs: row,
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"], timeframe="15m")
+
+    skip_row = db_session.scalar(select(SkippedTradeEvent).where(SkippedTradeEvent.symbol == "BTCUSDT"))
+    assert plan["plans"][0]["trigger"] is None
+    assert db_session.scalar(select(AgentRun).limit(1)) is None
+    assert skip_row is not None
+    assert skip_row.skip_source == "selection"
+    assert skip_row.skip_reason == "late_long_no_pullback"
+    assert skip_row.expected_side == "long"
+    assert skip_row.payload["late_long_filter"]["reason_codes"] == [
+        "LATE_LONG_NO_PULLBACK",
+        "LONG_EXTENSION_DERIVATIVES_HEADWIND",
+    ]
+
+
+def test_interval_plan_keeps_confirmed_pullback_long_candidate(db_session, monkeypatch) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    snapshot = _snapshot(
+        "BTCUSDT",
+        "15m",
+        [
+            _candle(timestamp=now, open_price=100.0, high=100.4, low=99.7, close=100.1),
+        ],
+    )
+    row = _selection_candidate_row(
+        symbol="BTCUSDT",
+        decision="long",
+        scenario="pullback_entry",
+        total_score=0.9,
+        priority=False,
+        weak_volume=False,
+        primary_regime="bullish",
+        trend_alignment="bullish_aligned",
+        snapshot=snapshot,
+        entry_mode="pullback_confirm",
+    )
+    row["strategy_engine"] = "trend_pullback_engine"
+    row["late_long_filter"] = {"active": False, "reason_codes": [], "details": {}}
+    row["performance_summary"]["score"] = 0.75
+    row["score"] = TradeDecisionCandidateScore(
+        total_score=0.9,
+        recent_signal_performance=0.75,
+        derivatives_alignment=0.85,
+        lead_lag_alignment=0.85,
+        slippage_sensitivity=0.85,
+        confidence_consistency=0.85,
+    )
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_build_lead_market_features",
+        lambda self, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_build_selection_candidate",
+        lambda self, **kwargs: row,
+    )
+
+    result = TradingOrchestrator(db_session)._rank_candidate_symbols(
+        decision_symbols=["BTCUSDT"],
+        timeframe="15m",
+        upto_index=None,
+        force_stale=False,
+    )
+
+    assert result["selected_symbols"] == ["BTCUSDT"]
+    assert result["rankings"][0]["selected"] is True
+    assert db_session.scalar(select(SkippedTradeEvent).limit(1)) is None
 
 
 def test_skip_quality_followup_evaluation_and_report(db_session) -> None:

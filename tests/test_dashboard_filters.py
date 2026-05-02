@@ -2653,6 +2653,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     payload = response.json()
     assert payload["control"]["default_symbol"] == "BTCUSDT"
     assert payload["control"]["tracked_symbol_count"] == 2
+    assert "operational_status" not in payload["control"]
+    assert "candidate_selection_summary" not in payload["control"]
+    assert "reconciliation_summary" not in payload["control"]
     assert "wallet_balance" in payload["control"]["pnl_summary"]
     assert "available_balance" in payload["control"]["pnl_summary"]
     assert "net_pnl" in payload["control"]["pnl_summary"]
@@ -2662,6 +2665,7 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert payload["market_signal"]["performance_windows"][0]["limited_live_readiness"]["read_only"] is True
     assert "entry_quality" in payload["market_signal"]["performance_windows"][0]
     assert payload["market_signal"]["profitability_cost_breakdowns"][0]["window_label"] == "today"
+    assert [item["window_label"] for item in payload["market_signal"]["profitability_cost_breakdowns"]] == ["today"]
     assert len(payload["symbols"]) == 2
     assert "ai_decision" not in payload
     assert "risk_guard" not in payload
