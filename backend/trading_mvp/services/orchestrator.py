@@ -110,6 +110,7 @@ from trading_mvp.services.runtime_state import (
     set_candidate_selection_detail,
     set_drawdown_state_detail,
     summarize_runtime_state,
+    sync_scope_blocks_new_entry,
 )
 from trading_mvp.services.settings import (
     build_operational_status_payload,
@@ -147,6 +148,7 @@ AI_REVIEW_SOFT_REJECTED_REASONS = frozenset(
         "score_below_threshold",
     }
 )
+SOFT_SIGNAL_AI_REVIEW_MIN_INTERVAL_MINUTES = 15
 ENTRY_CANDIDATE_LATE_LONG_SKIP_REASON = "late_long_no_pullback"
 ENTRY_CANDIDATE_LATE_LONG_REASON_CODE = "LATE_LONG_NO_PULLBACK"
 ENTRY_CANDIDATE_LONG_EXTENSION_DERIVATIVES_REASON_CODE = "LONG_EXTENSION_DERIVATIVES_HEADWIND"
@@ -156,6 +158,8 @@ ENTRY_CANDIDATE_LATE_LONG_MAX_DRAWDOWN_PCT = 0.45
 ENTRY_CANDIDATE_LATE_LONG_RSI = 72.0
 ENTRY_CANDIDATE_LATE_LONG_VWAP_DISTANCE_PCT = 0.35
 ENTRY_PLAN_WATCH_TIMEFRAME = "1m"
+ENTRY_PLAN_AI_RECHECK_TRIGGER_EVENT = "entry_plan_recheck"
+ENTRY_PLAN_AI_RECHECK_COOLDOWN_SECONDS = 300
 CADENCE_IDLE_MODE = "idle"
 CADENCE_WATCH_MODE = "watch"
 CADENCE_ACTIVE_POSITION_MODE = "active_position"
@@ -170,11 +174,33 @@ ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS = {
     "ENTRY_TRIGGER_NOT_MET",
     "SLIPPAGE_THRESHOLD_EXCEEDED",
 }
+ENTRY_PLAN_WATCH_STORAGE_BLOCKERS = {
+    *ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS,
+    "DETERMINISTIC_BASELINE_DISAGREEMENT",
+}
+ENTRY_PLAN_AI_RECHECK_REASON_CODES = (
+    "PENDING_ENTRY_PLAN_RECHECK",
+    "ENTRY_PLAN_ZONE_TOUCHED",
+)
+ENTRY_PLAN_WATCH_REASON_CODE = "AI_WATCH_ENTRY_PLAN"
+ENTRY_PLAN_NO_CAPACITY_CANCEL_REASON_CODE = "PLAN_CANCELED_NO_ENTRY_CAPACITY"
+ENTRY_PLAN_MIN_ACTIONABLE_NOTIONAL_FLOOR = 25.0
 ENTRY_PLAN_SIMULATION_ROLLOUT_MODES = frozenset({"shadow", "live_dry_run"})
 ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES = frozenset(
     {"ROLLOUT_MODE_SHADOW", "ROLLOUT_MODE_LIVE_DRY_RUN"}
 )
 ENTRY_PLAN_SIMULATED_EXECUTION_STATUSES = frozenset({"shadow", "dry_run"})
+TRADE_BLOCKED_ALERT_NON_ACTIONABLE_REASON_CODES = frozenset(
+    {
+        "HOLD_DECISION",
+        "ENTRY_TRIGGER_NOT_MET",
+        "NO_EDGE",
+        "RANGE_CHOP",
+        "WEAK_VOLUME",
+        "MOMENTUM_WEAKENING",
+        "DETERMINISTIC_BASELINE_DISAGREEMENT",
+    }
+)
 ENTRY_PLAN_HOLD_CANCEL_REASON_CODES = frozenset(
     {
         "ENTRY_PLAN_INVALIDATED",
@@ -211,6 +237,17 @@ SETUP_CLUSTER_LOSS_STREAK_THRESHOLD = 3
 SETUP_CLUSTER_SIGNED_SLIPPAGE_BPS_THRESHOLD = 12.0
 SETUP_CLUSTER_COOLDOWN_MINUTES = 180
 SETUP_CLUSTER_HISTORY_LIMIT = 128
+
+
+def _should_create_trade_blocked_alert(decision: str | None, reason_codes: list[str]) -> bool:
+    normalized = {str(code).strip().upper() for code in reason_codes if str(code).strip()}
+    if not normalized:
+        return True
+    if normalized.issubset(TRADE_BLOCKED_ALERT_NON_ACTIONABLE_REASON_CODES):
+        return False
+    return (decision or "").strip().lower() != "hold" or not normalized.issubset(
+        TRADE_BLOCKED_ALERT_NON_ACTIONABLE_REASON_CODES
+    )
 SETUP_CLUSTER_DISABLE_REASON_CODES = {
     "expectancy": "CLUSTER_NEGATIVE_EXPECTANCY",
     "loss_streak": "CLUSTER_LOSS_STREAK",
@@ -2091,6 +2128,241 @@ class TradingOrchestrator:
         )
 
     @staticmethod
+    def _summary_float(value: object, *, digits: int = 6) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return round(float(value), digits)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _distance_bps(cls, *, reference_price: float | None, target_price: float | None) -> float | None:
+        if reference_price is None or target_price is None or reference_price <= 0:
+            return None
+        return cls._summary_float(((target_price - reference_price) / reference_price) * 10000.0)
+
+    @classmethod
+    def _zone_distance_summary(
+        cls,
+        *,
+        latest_price: float | None,
+        zone_min: float | None,
+        zone_max: float | None,
+    ) -> dict[str, object]:
+        if latest_price is None or latest_price <= 0 or zone_min is None or zone_max is None:
+            return {"zone_relation": "unknown", "distance_to_zone_bps": None}
+        lower = min(zone_min, zone_max)
+        upper = max(zone_min, zone_max)
+        if lower <= latest_price <= upper:
+            return {"zone_relation": "inside_zone", "distance_to_zone_bps": 0.0}
+        if latest_price < lower:
+            return {
+                "zone_relation": "below_zone",
+                "distance_to_zone_bps": cls._distance_bps(
+                    reference_price=latest_price,
+                    target_price=lower,
+                ),
+            }
+        return {
+            "zone_relation": "above_zone",
+            "distance_to_zone_bps": cls._distance_bps(
+                reference_price=latest_price,
+                target_price=upper,
+            ),
+        }
+
+    @classmethod
+    def _minimum_actionable_notional_hint(cls, reference_price: float | None) -> float:
+        safe_reference = max(reference_price or 0.0, 1.0)
+        return round(max(ENTRY_PLAN_MIN_ACTIONABLE_NOTIONAL_FLOOR, safe_reference * 0.0005), 6)
+
+    @classmethod
+    def _active_position_ai_summary(
+        cls,
+        *,
+        open_positions: list[Position],
+        position_management_context: dict[str, object],
+    ) -> dict[str, object]:
+        summary: dict[str, object] = {
+            "has_open_position": bool(open_positions),
+            "open_position_count": len(open_positions),
+        }
+        if not open_positions:
+            return summary
+        position = open_positions[0]
+        quantity = cls._summary_float(getattr(position, "quantity", None)) or 0.0
+        entry_price = cls._summary_float(getattr(position, "entry_price", None))
+        mark_price = cls._summary_float(getattr(position, "mark_price", None))
+        stop_loss = cls._summary_float(getattr(position, "stop_loss", None))
+        take_profit = cls._summary_float(getattr(position, "take_profit", None))
+        side = str(getattr(position, "side", "") or "").lower()
+        current_r_multiple = cls._summary_float(position_management_context.get("current_r_multiple"), digits=4)
+        if current_r_multiple is None and entry_price is not None and mark_price is not None and stop_loss is not None:
+            initial_risk = abs(entry_price - stop_loss)
+            if initial_risk > 0:
+                signed_move = mark_price - entry_price if side == "long" else entry_price - mark_price
+                current_r_multiple = cls._summary_float(signed_move / initial_risk, digits=4)
+        metadata = _as_dict(getattr(position, "metadata_json", None))
+        liquidation_price = cls._summary_float(
+            metadata.get("liquidation_price")
+            or metadata.get("exchange_liquidation_price")
+            or metadata.get("liq_price")
+        )
+        summary.update(
+            {
+                "symbol": getattr(position, "symbol", None),
+                "side": side or None,
+                "quantity": quantity,
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+                "position_notional": cls._summary_float(abs(quantity) * (mark_price or entry_price or 0.0)),
+                "leverage": cls._summary_float(getattr(position, "leverage", None), digits=4),
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "unrealized_pnl": cls._summary_float(getattr(position, "unrealized_pnl", None)),
+                "realized_pnl": cls._summary_float(getattr(position, "realized_pnl", None)),
+                "current_r_multiple": current_r_multiple,
+                "stop_distance_bps": cls._distance_bps(reference_price=mark_price, target_price=stop_loss),
+                "take_profit_distance_bps": cls._distance_bps(reference_price=mark_price, target_price=take_profit),
+                "liquidation_price": liquidation_price,
+                "liquidation_distance_bps": cls._distance_bps(
+                    reference_price=mark_price,
+                    target_price=liquidation_price,
+                ),
+                "position_management_enabled": bool(position_management_context.get("enabled", False)),
+                "position_management_status": str(position_management_context.get("status") or "") or None,
+                "holding_profile": str(position_management_context.get("holding_profile") or "") or None,
+                "management_stage": str(position_management_context.get("management_stage") or "") or None,
+                "hard_stop_active": bool(position_management_context.get("hard_stop_active", stop_loss is not None)),
+                "tightened_stop_loss": cls._summary_float(position_management_context.get("tightened_stop_loss")),
+                "partial_take_profit_ready": bool(position_management_context.get("partial_take_profit_ready", False)),
+                "partial_take_profit_taken": bool(position_management_context.get("partial_take_profit_taken", False)),
+                "take_profit_order_mode": str(position_management_context.get("take_profit_order_mode") or "") or None,
+                "reduce_reason_codes": list(position_management_context.get("reduce_reason_codes") or []),
+                "applied_rule_candidates": list(position_management_context.get("applied_rule_candidates") or []),
+            }
+        )
+        return summary
+
+    @classmethod
+    def _pending_entry_plan_ai_summary(
+        cls,
+        *,
+        symbol: str,
+        active_plans: list[PendingEntryPlan],
+        latest_price: float | None,
+        risk_budget: dict[str, object],
+        open_positions: list[Position],
+        now: datetime,
+        include_plan_limit: int = 3,
+    ) -> dict[str, object]:
+        symbol = symbol.upper()
+        same_symbol_plans = [plan for plan in active_plans if str(plan.symbol).upper() == symbol]
+        max_new_position_notional = cls._summary_float(risk_budget.get("max_new_position_notional_for_symbol")) or 0.0
+        minimum_actionable_notional = cls._minimum_actionable_notional_hint(latest_price)
+        side_capacity = {
+            "long": cls._summary_float(risk_budget.get("max_additional_long_notional")) or 0.0,
+            "short": cls._summary_float(risk_budget.get("max_additional_short_notional")) or 0.0,
+        }
+        plans: list[dict[str, object]] = []
+        for plan in same_symbol_plans[:include_plan_limit]:
+            zone = cls._zone_distance_summary(
+                latest_price=latest_price,
+                zone_min=cls._summary_float(plan.entry_zone_min),
+                zone_max=cls._summary_float(plan.entry_zone_max),
+            )
+            side = str(plan.side or "").lower()
+            side_notional = side_capacity.get(side, 0.0)
+            plans.append(
+                {
+                    "plan_id": plan.id,
+                    "symbol": plan.symbol,
+                    "side": side if side in {"long", "short"} else None,
+                    "status": plan.plan_status,
+                    "source_decision_run_id": plan.source_decision_run_id,
+                    "entry_mode": plan.entry_mode,
+                    "entry_zone_min": cls._summary_float(plan.entry_zone_min),
+                    "entry_zone_max": cls._summary_float(plan.entry_zone_max),
+                    "invalidation_price": cls._summary_float(plan.invalidation_price),
+                    "max_chase_bps": cls._summary_float(plan.max_chase_bps),
+                    "stop_loss": cls._summary_float(plan.stop_loss),
+                    "take_profit": cls._summary_float(plan.take_profit),
+                    "risk_pct_cap": cls._summary_float(plan.risk_pct_cap),
+                    "leverage_cap": cls._summary_float(plan.leverage_cap, digits=4),
+                    "rationale_codes": list(plan.rationale_codes or []),
+                    "created_at": plan.created_at.isoformat() if plan.created_at is not None else None,
+                    "expires_at": plan.expires_at.isoformat() if plan.expires_at is not None else None,
+                    "minutes_until_expiry": cls._summary_float(
+                        (plan.expires_at - now).total_seconds() / 60.0 if plan.expires_at is not None else None,
+                        digits=2,
+                    ),
+                    "zone_relation": zone["zone_relation"],
+                    "distance_to_zone_bps": zone["distance_to_zone_bps"],
+                    "side_capacity_notional": side_notional,
+                    "side_capacity_available": side_notional >= minimum_actionable_notional,
+                }
+            )
+        capacity_available = max_new_position_notional >= minimum_actionable_notional
+        return {
+            "active_plan_count": len(active_plans),
+            "same_symbol_plan_count": len(same_symbol_plans),
+            "has_same_symbol_plan": bool(same_symbol_plans),
+            "open_position_count": len(open_positions),
+            "new_entry_capacity_available": capacity_available,
+            "minimum_actionable_notional": minimum_actionable_notional,
+            "max_new_position_notional_for_symbol": max_new_position_notional,
+            "side_capacity_notional": side_capacity,
+            "monitoring_action": (
+                "capacity_blocked_no_new_plan_monitoring"
+                if same_symbol_plans and not capacity_available and not open_positions
+                else "watch_existing_plan"
+                if same_symbol_plans
+                else "no_active_plan"
+            ),
+            "plans": plans,
+        }
+
+    @classmethod
+    def _execution_constraints_ai_summary(
+        cls,
+        *,
+        symbol: str,
+        market_snapshot: MarketSnapshotPayload,
+        risk_context: dict[str, object],
+        settings_row: object,
+        open_positions: list[Position],
+    ) -> dict[str, object]:
+        risk_budget = _as_dict(risk_context.get("risk_budget"))
+        latest_price = cls._summary_float(getattr(market_snapshot, "latest_price", None))
+        minimum_actionable_notional = cls._minimum_actionable_notional_hint(latest_price)
+        max_new_position_notional = cls._summary_float(risk_budget.get("max_new_position_notional_for_symbol")) or 0.0
+        return {
+            "symbol": symbol.upper(),
+            "reference_price": latest_price,
+            "minimum_actionable_notional": minimum_actionable_notional,
+            "minimum_source": "heuristic_hint_only_risk_guard_recomputes_exchange_filters",
+            "max_risk_per_trade": cls._summary_float(risk_context.get("max_risk_per_trade")),
+            "max_leverage": cls._summary_float(risk_context.get("max_leverage"), digits=4),
+            "max_new_position_notional_for_symbol": max_new_position_notional,
+            "max_additional_long_notional": cls._summary_float(risk_budget.get("max_additional_long_notional")),
+            "max_additional_short_notional": cls._summary_float(risk_budget.get("max_additional_short_notional")),
+            "new_entry_capacity_status": (
+                "available"
+                if max_new_position_notional >= minimum_actionable_notional
+                else "below_minimum_actionable_notional"
+            ),
+            "has_open_position": bool(open_positions),
+            "reduce_only_required_for_management": bool(open_positions),
+            "live_trading_enabled": bool(getattr(settings_row, "live_trading_enabled", False)),
+            "rollout_mode": str(getattr(settings_row, "rollout_mode", "") or ""),
+            "live_execution_armed": bool(getattr(settings_row, "live_execution_armed", False)),
+            "limited_live_max_notional": cls._summary_float(getattr(settings_row, "limited_live_max_notional", None)),
+            "risk_guard_final_authority": True,
+            "ai_output_executes_directly": False,
+        }
+
+    @staticmethod
     def _pending_plan_volume_profile_details(feature_payload, decision: TradeDecision) -> dict[str, object]:
         volume_profile = getattr(feature_payload, "volume_profile", None)
         if volume_profile is None or not bool(getattr(volume_profile, "available", False)):
@@ -2299,12 +2571,97 @@ class TradingOrchestrator:
             return True
         return bool(plan.side == "short" and reason_codes & ENTRY_PLAN_SHORT_INVALIDATED_BY_REASON_CODES)
 
-    def _plan_entry_allowed_without_trigger(self, decision: object, risk_result) -> bool:
+    def _plan_entry_allowed_without_trigger(
+        self,
+        decision: object,
+        risk_result,
+        *,
+        watch_entry_plan: bool = False,
+    ) -> bool:
         decision_side = str(getattr(decision, "decision", "") or "")
         if decision_side not in {"long", "short"}:
             return False
         blockers = set(getattr(risk_result, "blocked_reason_codes", []) or getattr(risk_result, "reason_codes", []))
-        return len(blockers - ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS) == 0
+        storage_blockers = ENTRY_PLAN_WATCH_STORAGE_BLOCKERS if watch_entry_plan else ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
+        return len(blockers - storage_blockers) == 0
+
+    @staticmethod
+    def _watch_entry_plan_side_is_consistent(
+        *,
+        side: str,
+        reference_price: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+    ) -> bool:
+        if stop_loss is None or take_profit is None:
+            return False
+        if side == "long":
+            return stop_loss < reference_price < take_profit
+        return take_profit < reference_price < stop_loss
+
+    def _watch_entry_plan_decision(self, decision: TradeDecision) -> TradeDecision | None:
+        watch_plan = getattr(decision, "watch_entry_plan", None)
+        if decision.decision != "hold" or watch_plan is None or bool(decision.should_abstain):
+            return None
+        side = str(getattr(watch_plan, "side", "") or "").lower()
+        if side not in {"long", "short"}:
+            return None
+        entry_zone_min = _safe_float(getattr(watch_plan, "entry_zone_min", None), default=0.0)
+        entry_zone_max = _safe_float(getattr(watch_plan, "entry_zone_max", None), default=0.0)
+        if entry_zone_min <= 0.0 or entry_zone_max <= 0.0:
+            return None
+        stop_loss = getattr(watch_plan, "stop_loss", None)
+        take_profit = getattr(watch_plan, "take_profit", None)
+        reference_price = self._reference_price_from_zone(
+            entry_zone_min=entry_zone_min,
+            entry_zone_max=entry_zone_max,
+            fallback_price=entry_zone_min,
+        )
+        if not self._watch_entry_plan_side_is_consistent(
+            side=side,
+            reference_price=reference_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        ):
+            return None
+        watch_reason_codes = [
+            str(code)
+            for code in getattr(watch_plan, "reason_codes", []) or []
+            if str(code or "").strip()
+        ]
+        rationale_codes = self._unique_reason_codes(
+            [
+                *list(decision.rationale_codes or []),
+                *watch_reason_codes,
+                ENTRY_PLAN_WATCH_REASON_CODE,
+            ]
+        )
+        return decision.model_copy(
+            update={
+                "decision": side,
+                "entry_zone_min": entry_zone_min,
+                "entry_zone_max": entry_zone_max,
+                "entry_mode": getattr(watch_plan, "entry_mode", None) or "pullback_confirm",
+                "watch_entry_plan": None,
+                "invalidation_price": (
+                    getattr(watch_plan, "invalidation_price", None)
+                    or stop_loss
+                    or decision.invalidation_price
+                ),
+                "max_chase_bps": getattr(watch_plan, "max_chase_bps", None) or decision.max_chase_bps or 4.0,
+                "idea_ttl_minutes": getattr(watch_plan, "idea_ttl_minutes", None) or decision.idea_ttl_minutes or 15,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "rationale_codes": rationale_codes,
+                "primary_reason_codes": self._unique_reason_codes(
+                    [*list(decision.primary_reason_codes or []), *watch_reason_codes, ENTRY_PLAN_WATCH_REASON_CODE]
+                ),
+                "no_trade_reason_codes": list(decision.no_trade_reason_codes or []),
+                "abstain_reason_codes": [],
+                "should_abstain": False,
+                "explanation_short": f"Watch {side} entry plan armed for recheck at the zone.",
+            }
+        )
 
     @staticmethod
     def _unique_reason_codes(values: list[object]) -> list[str]:
@@ -2750,6 +3107,571 @@ class TradingOrchestrator:
                 "rationale_codes": list(dict.fromkeys([*source_decision.rationale_codes, "PENDING_ENTRY_PLAN_TRIGGERED"])),
             }
         )
+
+    @staticmethod
+    def _entry_plan_ai_recheck_cooldown_remaining_seconds(
+        *,
+        metadata: dict[str, object],
+        generated_at: datetime,
+    ) -> int:
+        last_recheck_at = _coerce_datetime(metadata.get("last_ai_recheck_at"))
+        if last_recheck_at is None:
+            return 0
+        elapsed_seconds = int((generated_at - last_recheck_at).total_seconds())
+        return max(ENTRY_PLAN_AI_RECHECK_COOLDOWN_SECONDS - elapsed_seconds, 0)
+
+    def _record_entry_plan_ai_recheck_skip(
+        self,
+        *,
+        plan: PendingEntryPlan,
+        reason: str,
+        generated_at: datetime,
+        retry_after_seconds: int = 0,
+        gate_payload: dict[str, object] | None = None,
+        correlation_ids: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        metadata = self._pending_entry_plan_metadata(plan)
+        metadata["last_ai_recheck_skip_at"] = generated_at.isoformat()
+        metadata["last_ai_recheck_skip_reason"] = reason
+        if retry_after_seconds > 0:
+            metadata["last_ai_recheck_retry_after_seconds"] = retry_after_seconds
+        plan.metadata_json = metadata
+        self.session.add(plan)
+        self.session.flush()
+        payload = {
+            "ai_call_event": AI_CALL_EVENT_SKIPPED,
+            "symbol": plan.symbol,
+            "scope": "entry_plan_recheck",
+            "reason": reason,
+            "hard_skip_ai": False,
+            "plan_id": plan.id,
+            "source_decision_run_id": plan.source_decision_run_id,
+            "retry_after_seconds": retry_after_seconds,
+            "gate": dict(gate_payload or {}),
+        }
+        record_audit_event(
+            self.session,
+            event_type="decision_ai_skipped",
+            entity_type="pending_entry_plan",
+            entity_id=str(plan.id),
+            severity="info",
+            message="Pending entry plan AI recheck was skipped before execution.",
+            payload=payload,
+            correlation_ids=correlation_ids,
+        )
+        return {
+            "status": "skipped",
+            "skip_reason": reason,
+            "retry_after_seconds": retry_after_seconds,
+            "ai_call_policy": payload,
+        }
+
+    @staticmethod
+    def _entry_plan_min_actionable_notional(reference_price: float | None) -> float:
+        return round(
+            max(
+                ENTRY_PLAN_MIN_ACTIONABLE_NOTIONAL_FLOOR,
+                max(_safe_float(reference_price, default=0.0) or 0.0, 1.0) * 0.0005,
+            ),
+            6,
+        )
+
+    @classmethod
+    def _entry_plan_no_additional_capacity_detail(
+        cls,
+        *,
+        plan: PendingEntryPlan,
+        open_positions: list[Position],
+        risk_budget: dict[str, object],
+        latest_price: float | None,
+    ) -> dict[str, object] | None:
+        if not open_positions:
+            return None
+        side = str(plan.side or "").strip().lower()
+        if side not in {"long", "short"}:
+            return None
+        side_headroom = max(
+            _safe_float(risk_budget.get(f"max_additional_{side}_notional"), default=0.0) or 0.0,
+            0.0,
+        )
+        single_position_headroom = max(
+            _safe_float(risk_budget.get("single_position_headroom"), default=0.0) or 0.0,
+            0.0,
+        )
+        available_notional = min(side_headroom, single_position_headroom)
+        minimum_actionable_notional = cls._entry_plan_min_actionable_notional(latest_price)
+        if available_notional >= minimum_actionable_notional:
+            return None
+        return {
+            "reason": ENTRY_PLAN_NO_CAPACITY_CANCEL_REASON_CODE,
+            "plan_side": side,
+            "available_additional_notional": round(available_notional, 6),
+            "side_headroom": round(side_headroom, 6),
+            "single_position_headroom": round(single_position_headroom, 6),
+            "minimum_actionable_notional": minimum_actionable_notional,
+            "risk_budget": dict(risk_budget),
+            "open_position_ids": [
+                position.id for position in open_positions if getattr(position, "id", None) is not None
+            ],
+            "open_position_sides": [
+                str(getattr(position, "side", "") or "").lower()
+                for position in open_positions
+                if str(getattr(position, "side", "") or "").lower()
+            ],
+        }
+
+    def _run_entry_plan_ai_recheck(
+        self,
+        *,
+        plan: PendingEntryPlan,
+        source_decision_run: AgentRun,
+        market_snapshot: MarketSnapshotPayload,
+        market_row: MarketSnapshot,
+        runtime_state: dict[str, object],
+        open_positions: list[Position],
+        cadence_profile: dict[str, object],
+        confirm_detail: dict[str, object],
+        trigger_details: dict[str, object],
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        metadata = self._pending_entry_plan_metadata(plan)
+        recheck_cycle_id = f"entry-plan-recheck:{plan.id}:{market_row.id}"
+        correlation_ids = normalize_correlation_ids(
+            cycle_id=recheck_cycle_id,
+            snapshot_id=market_row.id,
+            decision_id=plan.source_decision_run_id,
+        )
+        cooldown_remaining = self._entry_plan_ai_recheck_cooldown_remaining_seconds(
+            metadata=metadata,
+            generated_at=generated_at,
+        )
+        if cooldown_remaining > 0:
+            return self._record_entry_plan_ai_recheck_skip(
+                plan=plan,
+                reason="PLAN_AI_RECHECK_COOLDOWN",
+                generated_at=generated_at,
+                retry_after_seconds=cooldown_remaining,
+                correlation_ids=correlation_ids,
+            )
+
+        openai_gate = get_openai_call_gate(
+            self.session,
+            self.settings_row,
+            AgentRole.TRADING_DECISION.value,
+            ENTRY_PLAN_AI_RECHECK_TRIGGER_EVENT,
+            has_openai_key=bool(self.credentials.openai_api_key),
+            symbol=plan.symbol,
+            cooldown_minutes_override=0,
+            manual_guard_minutes_override=0,
+        )
+        gate_payload = openai_gate.as_metadata()
+        if not openai_gate.allowed:
+            return self._record_entry_plan_ai_recheck_skip(
+                plan=plan,
+                reason=str(openai_gate.reason or "openai_gate_blocked"),
+                generated_at=generated_at,
+                retry_after_seconds=int(openai_gate.retry_after_seconds or 0),
+                gate_payload=gate_payload,
+                correlation_ids=correlation_ids,
+            )
+
+        source_output = (
+            dict(source_decision_run.output_payload)
+            if isinstance(source_decision_run.output_payload, dict)
+            else {}
+        )
+        source_metadata = (
+            dict(source_decision_run.metadata_json)
+            if isinstance(source_decision_run.metadata_json, dict)
+            else {}
+        )
+        source_input = (
+            dict(source_decision_run.input_payload)
+            if isinstance(source_decision_run.input_payload, dict)
+            else {}
+        )
+        strategy_engine_name = _strategy_engine_name_from_payload(source_metadata, source_output)
+        holding_profile = (
+            str(source_metadata.get("holding_profile") or "")
+            or str(source_output.get("holding_profile") or "")
+            or "scalp"
+        )
+        plan_snapshot = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+        recheck_context = {
+            "plan_id": plan.id,
+            "source_decision_run_id": plan.source_decision_run_id,
+            "source_decision_created_at": source_decision_run.created_at.isoformat(),
+            "plan_side": plan.side,
+            "plan_status": plan.plan_status,
+            "entry_zone_min": plan.entry_zone_min,
+            "entry_zone_max": plan.entry_zone_max,
+            "entry_mode": plan.entry_mode,
+            "latest_price": market_snapshot.latest_price,
+            "market_snapshot_id": market_row.id,
+            "market_snapshot_time": market_snapshot.snapshot_time.isoformat(),
+            "confirm_detail": dict(confirm_detail),
+            "trigger_details": dict(trigger_details),
+        }
+        selection_context = {
+            "strategy_engine": strategy_engine_name,
+            "holding_profile": holding_profile,
+            "selection_reason": "pending_entry_plan_zone_touch",
+            "candidate_weight": 1.0,
+            "entry_mode": plan.entry_mode,
+            "candidate": {
+                "decision": plan.side,
+                "symbol": plan.symbol,
+                "timeframe": plan.source_timeframe or market_snapshot.timeframe,
+                "scenario": "pending_entry_plan_recheck",
+                "entry_zone_min": plan.entry_zone_min,
+                "entry_zone_max": plan.entry_zone_max,
+                "stop_loss": plan.stop_loss,
+                "take_profit": plan.take_profit,
+                "risk_pct": plan.risk_pct_cap,
+                "leverage": plan.leverage_cap,
+                "rationale_codes": list(
+                    dict.fromkeys([*list(plan.rationale_codes or []), *ENTRY_PLAN_AI_RECHECK_REASON_CODES])
+                ),
+            },
+            "score": {
+                "total_score": _safe_float(confirm_detail.get("quality_score"), default=0.0),
+                "entry_plan_confirm_quality": _safe_float(confirm_detail.get("quality_score"), default=0.0),
+            },
+            "pending_entry_plan": plan_snapshot,
+            "entry_plan_recheck": recheck_context,
+        }
+        reason_codes = list(
+            dict.fromkeys([*list(plan.rationale_codes or []), *ENTRY_PLAN_AI_RECHECK_REASON_CODES])
+        )
+        review_trigger_payload = self._build_review_trigger_payload(
+            trigger_reason="entry_candidate_event",
+            symbol=plan.symbol,
+            timeframe=market_snapshot.timeframe,
+            strategy_engine=strategy_engine_name or None,
+            holding_profile=holding_profile,
+            assigned_slot=None,
+            candidate_weight=1.0,
+            reason_codes=reason_codes,
+            last_decision_at=source_decision_run.created_at,
+            last_material_review_at=_coerce_datetime(source_metadata.get("last_material_review_at")),
+            triggered_at=generated_at,
+            forced_review_reason="entry_plan_zone_touch",
+            fingerprint_basis={
+                "plan_id": plan.id,
+                "source_decision_run_id": plan.source_decision_run_id,
+                "market_snapshot_id": market_row.id,
+                "latest_price": round(_safe_float(market_snapshot.latest_price), 6),
+                "confirm_reason": confirm_detail.get("reason"),
+            },
+            fingerprint_changed_fields=["entry_plan_zone_touched"],
+            fingerprint_material={
+                "trigger_reason": "entry_candidate_event",
+                "forced_review_reason": "entry_plan_zone_touch",
+                "plan_id": plan.id,
+                "source_decision_run_id": plan.source_decision_run_id,
+                "symbol": plan.symbol,
+                "timeframe": market_snapshot.timeframe,
+                "side": plan.side,
+                "market_snapshot_id": market_row.id,
+                "latest_price": round(_safe_float(market_snapshot.latest_price), 6),
+                "quality_score": round(_safe_float(confirm_detail.get("quality_score"), default=0.0), 6),
+                "reason_codes": sorted(reason_codes),
+            },
+        )
+        feature_payload = compute_features(market_snapshot, {})
+        feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
+        latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
+        effective_leverage_cap = min(
+            self.settings_row.max_leverage,
+            HARD_MAX_GLOBAL_LEVERAGE,
+            get_symbol_leverage_cap(plan.symbol),
+        )
+        drawdown_state = self._sync_drawdown_state(now=generated_at)
+        position_management_context = build_position_management_context(
+            open_positions[0] if open_positions else None,
+            feature_payload=feature_payload,
+            settings_row=self.settings_row,
+        )
+        risk_budget_context = build_ai_risk_budget_context(
+            self.session,
+            self.settings_row,
+            decision_symbol=plan.symbol,
+            equity=latest_pnl.equity,
+        )
+        active_entry_plans = self._active_pending_entry_plans(symbol=plan.symbol)
+        risk_context = {
+            "max_risk_per_trade": min(self.settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE),
+            "max_leverage": effective_leverage_cap,
+            "symbol_risk_tier": get_symbol_risk_tier(plan.symbol),
+            "daily_pnl": latest_pnl.daily_pnl,
+            "consecutive_losses": latest_pnl.consecutive_losses,
+            "drawdown_state": drawdown_state,
+            "operating_state": runtime_state["operating_state"],
+            "protection_recovery_status": runtime_state["protection_recovery_status"],
+            "missing_protection_symbols": runtime_state["missing_protection_symbols"],
+            "missing_protection_items": runtime_state["missing_protection_items"],
+            "risk_budget": risk_budget_context,
+            "position_management_context": position_management_context,
+            "selection_context": selection_context,
+        }
+        risk_context["active_position_summary"] = self._active_position_ai_summary(
+            open_positions=open_positions,
+            position_management_context=position_management_context,
+        )
+        risk_context["pending_entry_plan_summary"] = self._pending_entry_plan_ai_summary(
+            symbol=plan.symbol,
+            active_plans=active_entry_plans,
+            latest_price=self._summary_float(market_snapshot.latest_price),
+            risk_budget=risk_budget_context,
+            open_positions=open_positions,
+            now=generated_at,
+        )
+        risk_context["execution_constraints_summary"] = self._execution_constraints_ai_summary(
+            symbol=plan.symbol,
+            market_snapshot=market_snapshot,
+            risk_context=risk_context,
+            settings_row=self.settings_row,
+            open_positions=open_positions,
+        )
+        decision_reference = self._build_decision_reference_payload(
+            symbol=plan.symbol,
+            timeframe=market_snapshot.timeframe,
+            market_snapshot=market_snapshot,
+            market_row=market_row,
+            runtime_state=runtime_state,
+        )
+        ai_context = build_ai_decision_context(
+            market_snapshot=market_snapshot,
+            features=feature_payload,
+            risk_context=risk_context,
+            selection_context=selection_context,
+            review_trigger=review_trigger_payload,
+            decision_reference=decision_reference,
+            previous_decision_output=source_output,
+            previous_decision_metadata=source_metadata,
+            previous_input_payload=source_input,
+            previous_ai_invoked_at=_coerce_datetime(source_metadata.get("last_ai_invoked_at")),
+        )
+        prior_read_debug: dict[str, object] = {}
+        ai_prior_context = build_ai_prior_context(
+            self.session,
+            ai_context=ai_context,
+            selection_context=selection_context,
+            feature_payload=feature_payload,
+            debug_collector=prior_read_debug,
+        )
+        ai_context = ai_context.model_copy(update={"prior_context": ai_prior_context})
+        ai_context_payload = ai_context.model_dump(mode="json")
+        ai_call_policy = {
+            "ai_call_event": AI_CALL_EVENT_ALLOWED,
+            "ai_call_allowed": True,
+            "skip_ai": False,
+            "reason": None,
+            "scope": "entry_plan_recheck",
+            "hard_skip_ai": False,
+            "skip_category": None,
+            "hard_skip_reason_codes": [],
+            "allow_ai_but_later_risk_check": ["PENDING_ENTRY_PLAN_FINAL_RISK_CHECK"],
+        }
+        decision, provider_name, decision_metadata = self.trading_agent.run(
+            market_snapshot,
+            feature_payload,
+            open_positions,
+            risk_context,
+            use_ai=True,
+            max_input_candles=self.settings_row.ai_max_input_candles,
+            logic_variant="improved",
+            ai_context=ai_context,
+        )
+        decision_generated_at = utcnow_naive()
+        resolved_last_ai_invoked_at = (
+            decision_generated_at
+            if str(decision_metadata.get("source") or "") == "llm"
+            else _coerce_datetime(source_metadata.get("last_ai_invoked_at"))
+        )
+        decision_metadata = {
+            **decision_metadata,
+            "gate": gate_payload,
+            "logic_variant": "entry_plan_recheck",
+            "symbol": plan.symbol,
+            "timeframe": market_snapshot.timeframe,
+            "ai_provider": self.settings_row.ai_provider,
+            "ai_model": self.settings_row.ai_model,
+            "holding_profile": getattr(decision, "holding_profile", "scalp"),
+            "holding_profile_reason": getattr(decision, "holding_profile_reason", None),
+            "cadence": cadence_profile,
+            "ai_skipped_reason": None,
+            "pre_ai_skip_reason": None,
+            "ai_call_policy": ai_call_policy,
+            "ai_call_event": AI_CALL_EVENT_ALLOWED,
+            "hard_skip_ai": False,
+            "hard_skip_ai_reason": None,
+            "allow_ai_but_later_risk_check": list(
+                ai_call_policy["allow_ai_but_later_risk_check"]
+            ),
+            "analysis_context": _decision_analysis_context(feature_payload),
+            "selection_context": selection_context,
+            "ai_context": ai_context_payload,
+            "ai_context_version": ai_context.ai_context_version,
+            "event_risk_active": ai_context.event_risk_active,
+            "event_risk_reason_codes": list(ai_context.event_risk_reason_codes),
+            "event_risk_context": dict(ai_context.event_risk_context),
+            "ai_trigger": review_trigger_payload.model_dump(mode="json"),
+            "last_ai_trigger_reason": review_trigger_payload.trigger_reason,
+            "last_ai_invoked_at": (
+                resolved_last_ai_invoked_at.isoformat()
+                if resolved_last_ai_invoked_at is not None
+                else None
+            ),
+            "next_ai_review_due_at": None,
+            "trigger_deduped": False,
+            "trigger_fingerprint": review_trigger_payload.trigger_fingerprint,
+            "fingerprint_changed_fields": list(review_trigger_payload.fingerprint_changed_fields),
+            "dedupe_reason": None,
+            "last_material_review_at": decision_generated_at.isoformat(),
+            "forced_review_reason": review_trigger_payload.forced_review_reason,
+            "last_ai_skip_reason": None,
+            "pending_entry_plan_recheck": recheck_context,
+            "source_decision_run_id": plan.source_decision_run_id,
+            "source_plan_id": plan.id,
+            "feature_snapshot_id": feature_row.id,
+            "prior_read_path": prior_read_debug.get("prior_read_path"),
+            "cache_applied": bool(prior_read_debug.get("cache_applied", False)),
+            "cache_fallback_used": bool(prior_read_debug.get("cache_fallback_used", False)),
+            "drawdown_state": drawdown_state,
+            "position_management": {"position_management_context": position_management_context},
+            "cycle_id": recheck_cycle_id,
+            "snapshot_id": market_row.id,
+        }
+        usage_payload = (
+            decision_metadata.get("usage")
+            if isinstance(decision_metadata.get("usage"), dict)
+            else None
+        )
+        provider_attempted = provider_name == "openai" or str(decision_metadata.get("source") or "") in {
+            "llm",
+            "llm_fallback",
+        }
+        if provider_attempted:
+            estimated_cost_usd = estimate_ai_usage_cost_usd(
+                model=self.settings_row.ai_model,
+                usage=usage_payload,
+            )
+            decision_metadata["estimated_cost_usd"] = estimated_cost_usd
+            if usage_payload is None:
+                decision_metadata["cost_estimate_status"] = "missing_usage"
+            elif estimated_cost_usd is None:
+                decision_metadata["cost_estimate_status"] = "unknown_model_rate"
+            else:
+                decision_metadata["cost_estimate_status"] = "estimated"
+        intent_semantics = infer_intent_semantics(
+            decision.model_dump(mode="json"),
+            decision_metadata,
+        )
+        decision = decision.model_copy(update=intent_semantics)
+        decision_metadata = {**decision_metadata, **intent_semantics}
+        decision_run = persist_agent_run(
+            self.session,
+            AgentRole.TRADING_DECISION,
+            ENTRY_PLAN_AI_RECHECK_TRIGGER_EVENT,
+            build_trading_decision_input_payload(
+                market_snapshot=market_snapshot,
+                higher_timeframe_context={},
+                feature_payload=feature_payload,
+                risk_context=risk_context,
+                decision_reference=decision_reference,
+                ai_trigger=review_trigger_payload.model_dump(mode="json"),
+                ai_context=ai_context,
+            ),
+            decision,
+            provider_name=provider_name,
+            metadata_json=decision_metadata,
+        )
+        recheck_correlation_ids = normalize_correlation_ids(
+            correlation_ids,
+            decision_id=decision_run.id,
+        )
+        record_audit_event(
+            self.session,
+            event_type="agent_output",
+            entity_type="agent_run",
+            entity_id=str(decision_run.id),
+            severity="info",
+            message="Pending entry plan AI recheck generated a decision.",
+            payload={
+                "provider": provider_name,
+                "decision": decision.model_dump(mode="json"),
+                "ai_call_event": decision_metadata.get("ai_call_event"),
+                "ai_trigger": decision_metadata.get("ai_trigger"),
+                "pending_entry_plan_recheck": recheck_context,
+                "source_decision_run_id": plan.source_decision_run_id,
+                "plan_id": plan.id,
+            },
+            correlation_ids=recheck_correlation_ids,
+        )
+        if str(decision_metadata.get("source") or "") == "llm":
+            record_audit_event(
+                self.session,
+                event_type="decision_ai_invoked",
+                entity_type="decision_run",
+                entity_id=str(decision_run.id),
+                severity="info",
+                message="AI inference was invoked for a pending entry plan recheck.",
+                payload={
+                    "ai_call_event": AI_CALL_EVENT_ALLOWED,
+                    "symbol": plan.symbol,
+                    "provider": provider_name,
+                    "scope": "entry_plan_recheck",
+                    "hard_skip_ai": False,
+                    "snapshot_id": market_row.id,
+                    "trigger": decision_metadata.get("ai_trigger"),
+                    "source_decision_run_id": plan.source_decision_run_id,
+                    "plan_id": plan.id,
+                },
+                correlation_ids=recheck_correlation_ids,
+            )
+            record_audit_event(
+                self.session,
+                event_type="decision_ai_received",
+                entity_type="decision_run",
+                entity_id=str(decision_run.id),
+                severity="info",
+                message="AI decision output was received for pending entry plan recheck.",
+                payload={
+                    "ai_call_event": "AI_DECISION_RECEIVED",
+                    "symbol": plan.symbol,
+                    "provider": provider_name,
+                    "decision_type": decision.decision,
+                    "intent": decision_metadata.get("intent_family"),
+                    "confidence": decision.confidence,
+                    "scope": "entry_plan_recheck",
+                    "snapshot_id": market_row.id,
+                    "trigger": decision_metadata.get("ai_trigger"),
+                    "source_decision_run_id": plan.source_decision_run_id,
+                    "plan_id": plan.id,
+                },
+                correlation_ids=recheck_correlation_ids,
+            )
+
+        metadata = self._pending_entry_plan_metadata(plan)
+        metadata["last_ai_recheck_at"] = generated_at.isoformat()
+        metadata["last_ai_recheck_decision_run_id"] = decision_run.id
+        metadata["last_ai_recheck_decision"] = decision.decision
+        metadata["last_ai_recheck_provider"] = provider_name
+        metadata["last_ai_recheck_source"] = str(decision_metadata.get("source") or "")
+        metadata["last_ai_recheck_fingerprint"] = review_trigger_payload.trigger_fingerprint
+        plan.metadata_json = metadata
+        self.session.add(plan)
+        self.session.flush()
+        return {
+            "status": "received" if str(decision_metadata.get("source") or "") == "llm" else "unavailable",
+            "decision": decision,
+            "decision_run": decision_run,
+            "decision_metadata": decision_metadata,
+            "feature_snapshot_id": feature_row.id,
+            "ai_call_policy": ai_call_policy,
+            "trigger": review_trigger_payload.model_dump(mode="json"),
+        }
 
     def _mark_pending_entry_plan_triggered(
         self,
@@ -4694,6 +5616,7 @@ class TradingOrchestrator:
             entry_control_blocked, entry_control_blocked_reasons = self._entry_plan_control_block(
                 operational_status
             )
+            entry_capacity_risk_budget: dict[str, object] | None = None
             symbol_results: list[dict[str, object]] = []
             for plan in active_plans:
                 metadata = self._pending_entry_plan_metadata(plan)
@@ -4763,6 +5686,50 @@ class TradingOrchestrator:
                     result_item["status"] = "armed_waiting_market"
                     result_item["blocked_reasons"] = ["PLAN_WAITING_FOR_FRESH_MARKET"]
                     result_item["market_reason_codes"] = list(market_stale_reason_codes)
+                    symbol_results.append(result_item)
+                    continue
+                if entry_capacity_risk_budget is None:
+                    latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
+                    entry_capacity_risk_budget = build_ai_risk_budget_context(
+                        self.session,
+                        self.settings_row,
+                        decision_symbol=plan.symbol,
+                        equity=latest_pnl.equity,
+                    )
+                no_capacity_detail = self._entry_plan_no_additional_capacity_detail(
+                    plan=plan,
+                    open_positions=open_positions,
+                    risk_budget=entry_capacity_risk_budget,
+                    latest_price=market_snapshot.latest_price,
+                )
+                if no_capacity_detail is not None:
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason=ENTRY_PLAN_NO_CAPACITY_CANCEL_REASON_CODE,
+                        detail=no_capacity_detail,
+                    )
+                    record_audit_event(
+                        self.session,
+                        event_type="decision_ai_skipped",
+                        entity_type="pending_entry_plan",
+                        entity_id=str(plan.id),
+                        severity="info",
+                        message="Pending entry plan AI recheck was skipped because no additional entry capacity remained.",
+                        payload={
+                            "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                            "symbol": plan.symbol,
+                            "scope": "entry_plan_recheck",
+                            "reason": ENTRY_PLAN_NO_CAPACITY_CANCEL_REASON_CODE,
+                            "hard_skip_ai": True,
+                            "skip_category": "entry_capacity",
+                            "plan_id": plan.id,
+                            "source_decision_run_id": plan.source_decision_run_id,
+                            **no_capacity_detail,
+                        },
+                    )
+                    result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
+                    result_item["status"] = "canceled"
+                    result_item["blocked_reasons"] = [ENTRY_PLAN_NO_CAPACITY_CANCEL_REASON_CODE]
                     symbol_results.append(result_item)
                     continue
                 if entry_control_blocked:
@@ -4861,34 +5828,147 @@ class TradingOrchestrator:
                     result_item["status"] = "canceled"
                     symbol_results.append(result_item)
                     continue
+                ai_recheck = self._run_entry_plan_ai_recheck(
+                    plan=plan,
+                    source_decision_run=source_decision_run,
+                    market_snapshot=market_snapshot,
+                    market_row=market_row,
+                    runtime_state=runtime_state,
+                    open_positions=open_positions,
+                    cadence_profile=cadence_profile,
+                    confirm_detail=confirm_detail,
+                    trigger_details=trigger_details,
+                    generated_at=generated_at,
+                )
+                result_item["ai_recheck"] = {
+                    "status": ai_recheck.get("status"),
+                    "skip_reason": ai_recheck.get("skip_reason"),
+                    "retry_after_seconds": ai_recheck.get("retry_after_seconds"),
+                    "decision_run_id": getattr(ai_recheck.get("decision_run"), "id", None),
+                    "decision": (
+                        ai_recheck["decision"].model_dump(mode="json")
+                        if isinstance(ai_recheck.get("decision"), TradeDecision)
+                        else None
+                    ),
+                    "ai_call_policy": ai_recheck.get("ai_call_policy"),
+                    "trigger": ai_recheck.get("trigger"),
+                }
+                if ai_recheck.get("status") != "received":
+                    result_item["status"] = "armed_waiting_ai_recheck"
+                    result_item["blocked_reasons"] = ["PLAN_AI_RECHECK_PENDING"]
+                    symbol_results.append(result_item)
+                    continue
+                recheck_decision = ai_recheck.get("decision")
+                recheck_decision_run = ai_recheck.get("decision_run")
+                if not isinstance(recheck_decision, TradeDecision) or not isinstance(recheck_decision_run, AgentRun):
+                    result_item["status"] = "armed_waiting_ai_recheck"
+                    result_item["blocked_reasons"] = ["PLAN_AI_RECHECK_RESULT_MISSING"]
+                    symbol_results.append(result_item)
+                    continue
+                if recheck_decision.decision != plan.side:
+                    cancel_reason = (
+                        "PLAN_RECHECK_OPPOSITE_SIDE"
+                        if recheck_decision.decision in {"long", "short"}
+                        else "PLAN_RECHECK_REJECTED"
+                    )
+                    recheck_rejection_correlation_ids = normalize_correlation_ids(
+                        cycle_id=f"entry-plan-recheck:{plan.id}:{market_row.id}",
+                        snapshot_id=market_row.id,
+                        decision_id=recheck_decision_run.id,
+                    )
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason=cancel_reason,
+                        detail={
+                            "recheck_decision": recheck_decision.decision,
+                            "recheck_decision_run_id": recheck_decision_run.id,
+                            "confidence": recheck_decision.confidence,
+                        },
+                        correlation_ids=recheck_rejection_correlation_ids,
+                    )
+                    record_audit_event(
+                        self.session,
+                        event_type="pending_entry_plan_recheck_rejected",
+                        entity_type="pending_entry_plan",
+                        entity_id=str(plan.id),
+                        severity="info",
+                        message="Pending entry plan was rejected by AI recheck at the entry zone.",
+                        payload={
+                            "ai_call_event": "AI_DECISION_RECEIVED",
+                            "symbol": plan.symbol,
+                            "plan_id": plan.id,
+                            "plan_side": plan.side,
+                            "decision": recheck_decision.decision,
+                            "decision_run_id": recheck_decision_run.id,
+                            "confidence": recheck_decision.confidence,
+                            "cancel_reason": cancel_reason,
+                        },
+                        correlation_ids=recheck_rejection_correlation_ids,
+                    )
+                    result_item["status"] = "canceled"
+                    result_item["blocked_reasons"] = [cancel_reason]
+                    symbol_results.append(result_item)
+                    continue
+                risk_pct_candidates = [
+                    value
+                    for value in (
+                        _safe_float(plan.risk_pct_cap, default=0.0),
+                        _safe_float(recheck_decision.risk_pct, default=0.0),
+                    )
+                    if value > 0
+                ]
+                leverage_candidates = [
+                    value
+                    for value in (
+                        _safe_float(plan.leverage_cap, default=0.0),
+                        _safe_float(recheck_decision.leverage, default=0.0),
+                    )
+                    if value > 0
+                ]
+                final_risk_pct = min(risk_pct_candidates) if risk_pct_candidates else 0.0
+                final_leverage = min(leverage_candidates) if leverage_candidates else 0.0
                 source_decision = self._trigger_execution_decision_from_plan(
                     plan,
                     market_snapshot,
-                    source_decision=TradeDecision.model_validate(source_decision_run.output_payload),
+                    source_decision=recheck_decision,
+                ).model_copy(
+                    update={
+                        "risk_pct": final_risk_pct,
+                        "leverage": final_leverage,
+                        "rationale_codes": list(
+                            dict.fromkeys(
+                                [
+                                    *recheck_decision.rationale_codes,
+                                    "PENDING_ENTRY_PLAN_RECHECK_CONFIRMED",
+                                    "PENDING_ENTRY_PLAN_TRIGGERED",
+                                ]
+                            )
+                        )
+                    }
                 )
                 trigger_cycle_id = f"entry-plan-trigger:{plan.id}:{market_row.id}"
                 correlation_ids = normalize_correlation_ids(
                     cycle_id=trigger_cycle_id,
                     snapshot_id=market_row.id,
-                    decision_id=plan.source_decision_run_id,
+                    decision_id=recheck_decision_run.id,
                 )
-                source_decision_metadata = (
-                    source_decision_run.metadata_json
-                    if isinstance(source_decision_run.metadata_json, dict)
-                    else {}
-                )
+                source_decision_metadata = _as_dict(ai_recheck.get("decision_metadata"))
                 source_ai_context = _as_dict(source_decision_metadata.get("ai_context"))
                 source_lead_market_context = _as_dict(source_ai_context.get("lead_lag_summary"))
+                source_event_risk_context = _as_dict(source_ai_context.get("event_risk_context"))
                 self._refresh_runtime_state_before_risk()
                 risk_result, risk_row = evaluate_risk(
                     self.session,
                     self.settings_row,
                     source_decision,
                     market_snapshot,
-                    decision_run_id=plan.source_decision_run_id,
+                    decision_run_id=recheck_decision_run.id,
                     market_snapshot_id=market_row.id,
                     execution_mode="live",
-                    decision_context={"lead_market_context": source_lead_market_context},
+                    decision_context={
+                        "lead_market_context": source_lead_market_context,
+                        "event_risk_context": source_event_risk_context,
+                    },
                 )
                 risk_correlation_ids = normalize_correlation_ids(correlation_ids, risk_id=risk_row.id)
                 record_audit_event(
@@ -4906,16 +5986,61 @@ class TradingOrchestrator:
                     metadata = self._pending_entry_plan_metadata(plan)
                     metadata["last_blocked_reason_codes"] = list(risk_result.blocked_reason_codes)
                     metadata["last_risk_check_id"] = risk_row.id
+                    metadata["last_ai_recheck_risk_blocked_decision_run_id"] = recheck_decision_run.id
                     plan.metadata_json = metadata
                     self.session.add(plan)
                     self.session.flush()
+                    record_audit_event(
+                        self.session,
+                        event_type="decision_risk_blocked",
+                        entity_type="decision_run",
+                        entity_id=str(recheck_decision_run.id),
+                        severity="warning",
+                        message="Pending entry plan AI recheck was blocked by deterministic risk policy.",
+                        payload={
+                            "ai_call_event": "AI_DECISION_BLOCKED_BY_RISK",
+                            "symbol": plan.symbol,
+                            "decision": source_decision.decision,
+                            "scope": "entry_plan_recheck",
+                            "risk_allowed": False,
+                            "risk_check_id": risk_row.id,
+                            "reason_codes": list(risk_result.reason_codes or []),
+                            "blocked_reason_codes": list(
+                                getattr(risk_result, "blocked_reason_codes", []) or []
+                            ),
+                            "plan_id": plan.id,
+                            "source_decision_run_id": plan.source_decision_run_id,
+                        },
+                        correlation_ids=risk_correlation_ids,
+                    )
                     result_item["status"] = "risk_blocked"
                     symbol_results.append(result_item)
                     continue
+                record_audit_event(
+                    self.session,
+                    event_type="decision_risk_approved",
+                    entity_type="decision_run",
+                    entity_id=str(recheck_decision_run.id),
+                    severity="info",
+                    message="Pending entry plan AI recheck was approved by deterministic risk policy.",
+                    payload={
+                        "ai_call_event": "AI_DECISION_APPROVED_BY_RISK",
+                        "symbol": plan.symbol,
+                        "decision": source_decision.decision,
+                        "scope": "entry_plan_recheck",
+                        "risk_allowed": True,
+                        "risk_check_id": risk_row.id,
+                        "approved_risk_pct": risk_result.approved_risk_pct,
+                        "approved_leverage": risk_result.approved_leverage,
+                        "plan_id": plan.id,
+                        "source_decision_run_id": plan.source_decision_run_id,
+                    },
+                    correlation_ids=risk_correlation_ids,
+                )
                 execution_result = execute_live_trade(
                     self.session,
                     self.settings_row,
-                    decision_run_id=plan.source_decision_run_id,
+                    decision_run_id=recheck_decision_run.id,
                     decision=source_decision,
                     market_snapshot=market_snapshot,
                     risk_result=risk_result,
@@ -6110,6 +7235,27 @@ class TradingOrchestrator:
         return None
 
     @staticmethod
+    def _soft_signal_ai_review_cooldown_minutes(effective_settings: object) -> int:
+        base_minutes = max(int(getattr(effective_settings, "ai_call_interval_minutes", 5) or 5), 1)
+        return max(SOFT_SIGNAL_AI_REVIEW_MIN_INTERVAL_MINUTES, base_minutes * 3)
+
+    @staticmethod
+    def _account_untrusted_sync_reason_codes(sync_freshness_summary: dict[str, object]) -> list[str]:
+        reason_codes: list[str] = []
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            scope_payload = _as_dict(sync_freshness_summary.get(scope))
+            if not scope_payload:
+                reason_codes.append(f"{scope}_sync_missing")
+                continue
+            if not sync_scope_blocks_new_entry(sync_freshness_summary, scope):
+                continue
+            if bool(scope_payload.get("stale")):
+                reason_codes.append(f"{scope}_sync_stale")
+            if bool(scope_payload.get("incomplete")):
+                reason_codes.append(f"{scope}_sync_incomplete")
+        return reason_codes
+
+    @staticmethod
     def _ai_review_scope(
         *,
         review_trigger_payload: AIReviewTriggerPayload | None,
@@ -6141,6 +7287,20 @@ class TradingOrchestrator:
         operating_state = str(runtime_state.get("operating_state") or "")
         data_quality = getattr(ai_context, "data_quality", None)
         account_state_trustworthy = bool(getattr(data_quality, "account_state_trustworthy", True))
+        data_quality_reason_codes: list[str] = []
+        if data_quality is not None:
+            data_quality_reason_codes = self._unique_reason_codes(
+                [
+                    *list(getattr(data_quality, "missing_context_flags", []) or []),
+                    *list(getattr(data_quality, "stale_context_flags", []) or []),
+                    "account_state_untrustworthy" if not account_state_trustworthy else "",
+                    (
+                        "market_state_untrustworthy"
+                        if not bool(getattr(data_quality, "market_state_trustworthy", True))
+                        else ""
+                    ),
+                ]
+            )
         hard_skip_ai = False
         skip_category: str | None = None
         reason: str | None = None
@@ -6187,6 +7347,10 @@ class TradingOrchestrator:
 
         if reason is not None:
             hard_skip_reason_codes.append(reason)
+            if hard_skip_ai:
+                hard_skip_reason_codes = self._unique_reason_codes(
+                    [*hard_skip_reason_codes, *data_quality_reason_codes]
+                )
         return {
             "ai_call_event": AI_CALL_EVENT_SKIPPED if reason is not None else AI_CALL_EVENT_ALLOWED,
             "ai_call_allowed": reason is None,
@@ -6271,6 +7435,7 @@ class TradingOrchestrator:
             self.settings_row,
             now=generated_at,
         )
+        account_untrusted_reason_codes = self._account_untrusted_sync_reason_codes(sync_freshness_summary)
         plans: list[dict[str, object]] = []
         for symbol in tracked_symbols:
             effective = effective_lookup.get(symbol)
@@ -6313,6 +7478,7 @@ class TradingOrchestrator:
             selection_context: dict[str, object] | None = None
             trigger_deduped = False
             last_ai_skip_reason: str | None = None
+            plan_ai_call_policy: dict[str, object] | None = None
             dedupe_reason: str | None = None
             latest_metadata = (
                 latest_decision_run.metadata_json
@@ -6537,6 +7703,62 @@ class TradingOrchestrator:
                         },
                     )
 
+            if trigger_payload is not None and not open_positions and account_untrusted_reason_codes:
+                plan_ai_call_policy = {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": "account_untrusted",
+                    "scope": "new_entry",
+                    "hard_skip_ai": True,
+                    "skip_category": "hard_skip_ai",
+                    "hard_skip_reason_codes": ["account_untrusted", *account_untrusted_reason_codes],
+                    "allow_ai_but_later_risk_check": [],
+                }
+                if isinstance(selection_context, dict):
+                    selection_context = {
+                        **selection_context,
+                        "ai_call_policy": plan_ai_call_policy,
+                    }
+                trigger_payload = None
+                last_ai_skip_reason = "account_untrusted"
+
+            if trigger_payload is not None and not open_positions and isinstance(selection_context, dict):
+                soft_rejected_reason = str(
+                    selection_context.get("rejected_reason")
+                    or selection_context.get("selection_reason")
+                    or ""
+                ).strip().lower()
+                if (
+                    soft_rejected_reason in AI_REVIEW_SOFT_REJECTED_REASONS
+                    and last_ai_invoked_at is not None
+                ):
+                    soft_cooldown_minutes = self._soft_signal_ai_review_cooldown_minutes(effective)
+                    retry_at = last_ai_invoked_at + timedelta(minutes=soft_cooldown_minutes)
+                    if retry_at > generated_at:
+                        retry_after_seconds = max(int((retry_at - generated_at).total_seconds()), 1)
+                        plan_ai_call_policy = {
+                            "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                            "ai_call_allowed": False,
+                            "skip_ai": True,
+                            "reason": "soft_signal_review_cooldown_active",
+                            "scope": "new_entry",
+                            "hard_skip_ai": False,
+                            "skip_category": "budget_cooldown_dedup",
+                            "hard_skip_reason_codes": [],
+                            "allow_ai_but_later_risk_check": [SOFT_SIGNAL_AI_REVIEW_REASON_CODE],
+                            "retry_after_seconds": retry_after_seconds,
+                            "cooldown_minutes": soft_cooldown_minutes,
+                            "last_ai_invoked_at": last_ai_invoked_at.isoformat(),
+                            "soft_rejected_reason": soft_rejected_reason,
+                        }
+                        selection_context = {
+                            **selection_context,
+                            "ai_call_policy": plan_ai_call_policy,
+                        }
+                        trigger_payload = None
+                        last_ai_skip_reason = "SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE"
+
             if (
                 trigger_payload is not None
                 and trigger_payload.trigger_reason
@@ -6550,7 +7772,7 @@ class TradingOrchestrator:
                 trigger_payload = trigger_payload.model_copy(update={"dedupe_reason": dedupe_reason})
                 last_ai_skip_reason = "TRIGGER_DEDUPED"
 
-            if trigger_payload is None:
+            if trigger_payload is None and last_ai_skip_reason is None:
                 last_ai_skip_reason = "NO_EVENT"
 
             plans.append(
@@ -6595,6 +7817,7 @@ class TradingOrchestrator:
                         else None
                     ),
                     "last_ai_skip_reason": last_ai_skip_reason,
+                    "ai_call_policy": plan_ai_call_policy,
                     **active_position_suppression_payload,
                 }
             )
@@ -6798,6 +8021,13 @@ class TradingOrchestrator:
             get_symbol_leverage_cap(symbol),
         )
         drawdown_state = self._sync_drawdown_state()
+        risk_budget_context = build_ai_risk_budget_context(
+            self.session,
+            self.settings_row,
+            decision_symbol=symbol,
+            equity=latest_pnl.equity,
+        )
+        active_entry_plans = self._active_pending_entry_plans(symbol=symbol)
         risk_context = {
             "max_risk_per_trade": min(self.settings_row.max_risk_per_trade, HARD_MAX_RISK_PER_TRADE),
             "max_leverage": effective_leverage_cap,
@@ -6809,14 +8039,28 @@ class TradingOrchestrator:
             "protection_recovery_status": runtime_state["protection_recovery_status"],
             "missing_protection_symbols": runtime_state["missing_protection_symbols"],
             "missing_protection_items": runtime_state["missing_protection_items"],
-            "risk_budget": build_ai_risk_budget_context(
-                self.session,
-                self.settings_row,
-                decision_symbol=symbol,
-                equity=latest_pnl.equity,
-            ),
+            "risk_budget": risk_budget_context,
             "position_management_context": position_management_context,
         }
+        risk_context["active_position_summary"] = self._active_position_ai_summary(
+            open_positions=open_positions,
+            position_management_context=position_management_context,
+        )
+        risk_context["pending_entry_plan_summary"] = self._pending_entry_plan_ai_summary(
+            symbol=symbol,
+            active_plans=active_entry_plans,
+            latest_price=self._summary_float(market_snapshot.latest_price),
+            risk_budget=risk_budget_context,
+            open_positions=open_positions,
+            now=utcnow_naive(),
+        )
+        risk_context["execution_constraints_summary"] = self._execution_constraints_ai_summary(
+            symbol=symbol,
+            market_snapshot=market_snapshot,
+            risk_context=risk_context,
+            settings_row=self.settings_row,
+            open_positions=open_positions,
+        )
         if isinstance(selection_context, dict) and selection_context:
             risk_context["universe_breadth"] = selection_context.get("universe_breadth") or {}
             risk_context["selection_context"] = dict(selection_context)
@@ -7443,7 +8687,12 @@ class TradingOrchestrator:
                 },
                 correlation_ids=decision_correlation_ids,
             )
-        if not open_positions and decision.decision == "hold":
+        watch_entry_plan_decision = (
+            self._watch_entry_plan_decision(decision)
+            if trigger_event != "historical_replay" and not open_positions
+            else None
+        )
+        if not open_positions and decision.decision == "hold" and watch_entry_plan_decision is None:
             self._record_decision_skip_event(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -7559,6 +8808,16 @@ class TradingOrchestrator:
                     "exchange_sync": exchange_sync_result,
                 }
         self._refresh_runtime_state_before_risk()
+        risk_decision_context = {
+            "decision_agreement": decision_metadata.get("decision_agreement"),
+            "suppression_context": decision_metadata.get("suppression_context"),
+            "setup_cluster_state": decision_metadata.get("setup_cluster_state"),
+            "meta_gate": decision_metadata.get("meta_gate"),
+            "slot_allocation": decision_metadata.get("slot_allocation"),
+            "holding_profile_context": decision_metadata.get("holding_profile_context"),
+            "lead_market_context": _as_dict(ai_context_payload.get("lead_lag_summary")),
+            "event_risk_context": _as_dict(ai_context_payload.get("event_risk_context")),
+        }
         risk_result, risk_row = evaluate_risk(
             self.session,
             self.settings_row,
@@ -7567,15 +8826,7 @@ class TradingOrchestrator:
             decision_run_id=decision_run.id,
             market_snapshot_id=market_row.id,
             execution_mode="historical_replay" if trigger_event == "historical_replay" else "live",
-            decision_context={
-                "decision_agreement": decision_metadata.get("decision_agreement"),
-                "suppression_context": decision_metadata.get("suppression_context"),
-                "setup_cluster_state": decision_metadata.get("setup_cluster_state"),
-                "meta_gate": decision_metadata.get("meta_gate"),
-                "slot_allocation": decision_metadata.get("slot_allocation"),
-                "holding_profile_context": decision_metadata.get("holding_profile_context"),
-                "lead_market_context": _as_dict(ai_context_payload.get("lead_lag_summary")),
-            },
+            decision_context=risk_decision_context,
         )
         risk_correlation_ids = normalize_correlation_ids(
             decision_correlation_ids,
@@ -7591,6 +8842,84 @@ class TradingOrchestrator:
             payload=risk_result.model_dump(mode="json"),
             correlation_ids=risk_correlation_ids,
         )
+        entry_plan_decision = decision
+        entry_plan_risk_result = risk_result
+        entry_plan_risk_row = risk_row
+        if watch_entry_plan_decision is not None:
+            self._refresh_runtime_state_before_risk()
+            watch_risk_context = {
+                **risk_decision_context,
+                "watch_entry_plan": decision.watch_entry_plan.model_dump(mode="json")
+                if decision.watch_entry_plan is not None
+                else None,
+                "watch_entry_plan_source_decision": decision.decision,
+            }
+            watch_risk_result, watch_risk_row = evaluate_risk(
+                self.session,
+                self.settings_row,
+                watch_entry_plan_decision,
+                market_snapshot,
+                decision_run_id=decision_run.id,
+                market_snapshot_id=market_row.id,
+                execution_mode="live",
+                decision_context=watch_risk_context,
+            )
+            watch_risk_correlation_ids = normalize_correlation_ids(
+                decision_correlation_ids,
+                risk_id=watch_risk_row.id,
+            )
+            record_audit_event(
+                self.session,
+                event_type="risk_check",
+                entity_type="risk_check",
+                entity_id=str(watch_risk_row.id),
+                severity="warning" if not watch_risk_result.allowed else "info",
+                message="Risk check completed for AI watch entry plan.",
+                payload={
+                    **watch_risk_result.model_dump(mode="json"),
+                    "watch_entry_plan": True,
+                    "source_decision": decision.decision,
+                },
+                correlation_ids=watch_risk_correlation_ids,
+            )
+            if str(decision_metadata.get("source") or "") == "llm":
+                watch_risk_event = (
+                    "AI_DECISION_APPROVED_BY_RISK"
+                    if watch_risk_result.allowed
+                    else "AI_DECISION_BLOCKED_BY_RISK"
+                )
+                record_audit_event(
+                    self.session,
+                    event_type=(
+                        "decision_risk_approved"
+                        if watch_risk_result.allowed
+                        else "decision_risk_blocked"
+                    ),
+                    entity_type="decision_run",
+                    entity_id=str(decision_run.id),
+                    severity="info" if watch_risk_result.allowed else "warning",
+                    message="AI watch entry plan was evaluated by deterministic risk policy.",
+                    payload={
+                        "ai_call_event": watch_risk_event,
+                        "symbol": symbol,
+                        "decision": watch_entry_plan_decision.decision,
+                        "intent": "watch_entry_plan",
+                        "risk_allowed": watch_risk_result.allowed,
+                        "risk_check_id": watch_risk_row.id,
+                        "reason_codes": list(watch_risk_result.reason_codes or []),
+                        "blocked_reason_codes": list(
+                            getattr(watch_risk_result, "blocked_reason_codes", []) or []
+                        ),
+                        "approved_risk_pct": watch_risk_result.approved_risk_pct,
+                        "approved_leverage": watch_risk_result.approved_leverage,
+                        "scope": ai_call_policy.get("scope"),
+                        "snapshot_id": market_row.id,
+                    },
+                    correlation_ids=watch_risk_correlation_ids,
+                )
+            entry_plan_decision = watch_entry_plan_decision
+            entry_plan_risk_result = watch_risk_result
+            entry_plan_risk_row = watch_risk_row
         if str(decision_metadata.get("source") or "") == "llm" and decision.decision != "hold":
             risk_event = (
                 "AI_DECISION_APPROVED_BY_RISK"
@@ -7652,14 +8981,18 @@ class TradingOrchestrator:
         if (
             trigger_event != "historical_replay"
             and not open_positions
-            and self._plan_entry_allowed_without_trigger(decision, risk_result)
+            and self._plan_entry_allowed_without_trigger(
+                entry_plan_decision,
+                entry_plan_risk_result,
+                watch_entry_plan=watch_entry_plan_decision is not None,
+            )
         ):
             armed_entry_plan = self._pending_entry_plan_snapshot(
                 self._arm_pending_entry_plan(
-                    decision=decision,
+                    decision=entry_plan_decision,
                     decision_run=decision_run,
-                    risk_result=risk_result,
-                    risk_row_id=risk_row.id,
+                    risk_result=entry_plan_risk_result,
+                    risk_row_id=entry_plan_risk_row.id,
                     feature_payload=feature_payload,
                     cycle_id=cycle_id,
                     snapshot_id=market_row.id,
@@ -7694,8 +9027,18 @@ class TradingOrchestrator:
                 message="Live execution skipped for non-live trigger.",
                 payload={"trigger_event": trigger_event, "symbol": symbol},
             )
-        elif armed_entry_plan is None and not risk_result.allowed:
-            create_alert(self.session, category="risk", severity="warning", title="Trade blocked", message="Deterministic risk policy blocked the execution.", payload={"reason_codes": risk_result.reason_codes, "decision": decision.decision, "symbol": symbol})
+        elif armed_entry_plan is None and not risk_result.allowed and _should_create_trade_blocked_alert(
+            decision.decision,
+            risk_result.reason_codes,
+        ):
+            create_alert(
+                self.session,
+                category="risk",
+                severity="warning",
+                title="Trade blocked",
+                message="Deterministic risk policy blocked the execution.",
+                payload={"reason_codes": risk_result.reason_codes, "decision": decision.decision, "symbol": symbol},
+            )
 
         chief_review, chief_provider_name, chief_metadata = self.chief_review_agent.run(
             decision=decision,

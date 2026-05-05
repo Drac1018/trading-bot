@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -99,6 +99,7 @@ OPERATOR_PERFORMANCE_ENTRY_LIMIT = 3
 OPERATOR_EXECUTION_PROFILE_LIMIT = 2
 OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 RECENT_FILL_LIMIT = 4
+OPERATOR_COMPACT_VIEWS = {"market", "scheduler"}
 AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
     "GROSS_EXPOSURE_LIMIT_REACHED",
     "DIRECTIONAL_BIAS_LIMIT_REACHED",
@@ -374,6 +375,27 @@ def _serialize_model_list(rows: Sequence[object]) -> list[dict[str, object]]:
     return [_serialize_model_row(row) for row in rows]
 
 
+def _serialize_mapping_row(row: Mapping[str, object]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in row.items():
+        values[str(key)] = value.isoformat() if hasattr(value, "isoformat") else value
+    return values
+
+
+def _normalize_symbol_filter(symbol: str | None) -> str | None:
+    if symbol is None:
+        return None
+    normalized = symbol.strip().upper()
+    return normalized or None
+
+
+def _normalize_timeframe_filter(timeframe: str | None) -> str | None:
+    if timeframe is None:
+        return None
+    normalized = timeframe.strip()
+    return normalized or None
+
+
 def _build_position_protection_state(session: Session, position: Position) -> dict[str, object]:
     if position.status != "open" or position.quantity <= 0:
         return {
@@ -442,6 +464,8 @@ def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingE
         side=row.side if row.side in {"long", "short"} else None,
         plan_status=row.plan_status if row.plan_status in {"armed", "triggered", "expired", "canceled"} else None,
         source_decision_run_id=row.source_decision_run_id,
+        source_risk_check_id=_as_int(metadata.get("source_risk_check_id"), default=0) or None,
+        source_blocked_reason_codes=_as_string_list(metadata.get("source_blocked_reason_codes")),
         source_timeframe=row.source_timeframe,
         regime=row.regime,
         posture=row.posture,
@@ -464,6 +488,8 @@ def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingE
         canceled_at=row.canceled_at,
         canceled_reason=row.canceled_reason,
         idempotency_key=row.idempotency_key,
+        last_watch_at=_as_datetime(metadata.get("last_watch_at")),
+        last_watch_snapshot_id=_as_int(metadata.get("last_watch_snapshot_id"), default=0) or None,
         trigger_details=dict(trigger_details) if isinstance(trigger_details, dict) else {},
     )
 
@@ -1889,12 +1915,84 @@ def get_overview(session: Session) -> OverviewResponse:
     )
 
 
-def get_market_snapshots(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(limit))))
+def get_market_snapshots(
+    session: Session,
+    limit: int = 50,
+    *,
+    compact: bool = False,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+) -> list[dict[str, object]]:
+    symbol_filter = _normalize_symbol_filter(symbol)
+    timeframe_filter = _normalize_timeframe_filter(timeframe)
+    if compact:
+        statement = select(
+            MarketSnapshot.id,
+            MarketSnapshot.symbol,
+            MarketSnapshot.timeframe,
+            MarketSnapshot.snapshot_time,
+            MarketSnapshot.latest_price,
+            MarketSnapshot.latest_volume,
+            MarketSnapshot.candle_count,
+            MarketSnapshot.is_stale,
+            MarketSnapshot.is_complete,
+            MarketSnapshot.created_at,
+            MarketSnapshot.updated_at,
+        )
+        if symbol_filter:
+            statement = statement.where(MarketSnapshot.symbol == symbol_filter)
+        if timeframe_filter:
+            statement = statement.where(MarketSnapshot.timeframe == timeframe_filter)
+        rows = session.execute(statement.order_by(desc(MarketSnapshot.snapshot_time)).limit(limit)).mappings()
+        return [_serialize_mapping_row(row) for row in rows]
+
+    statement = select(MarketSnapshot)
+    if symbol_filter:
+        statement = statement.where(MarketSnapshot.symbol == symbol_filter)
+    if timeframe_filter:
+        statement = statement.where(MarketSnapshot.timeframe == timeframe_filter)
+    return _serialize_model_list(list(session.scalars(statement.order_by(desc(MarketSnapshot.snapshot_time)).limit(limit))))
 
 
-def get_feature_snapshots(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(FeatureSnapshot).order_by(desc(FeatureSnapshot.feature_time)).limit(limit))))
+def get_feature_snapshots(
+    session: Session,
+    limit: int = 50,
+    *,
+    compact: bool = False,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+) -> list[dict[str, object]]:
+    symbol_filter = _normalize_symbol_filter(symbol)
+    timeframe_filter = _normalize_timeframe_filter(timeframe)
+    if compact:
+        statement = select(
+            FeatureSnapshot.id,
+            FeatureSnapshot.symbol,
+            FeatureSnapshot.timeframe,
+            FeatureSnapshot.market_snapshot_id,
+            FeatureSnapshot.feature_time,
+            FeatureSnapshot.trend_score,
+            FeatureSnapshot.volatility_pct,
+            FeatureSnapshot.volume_ratio,
+            FeatureSnapshot.drawdown_pct,
+            FeatureSnapshot.rsi,
+            FeatureSnapshot.atr,
+            FeatureSnapshot.created_at,
+            FeatureSnapshot.updated_at,
+        )
+        if symbol_filter:
+            statement = statement.where(FeatureSnapshot.symbol == symbol_filter)
+        if timeframe_filter:
+            statement = statement.where(FeatureSnapshot.timeframe == timeframe_filter)
+        rows = session.execute(statement.order_by(desc(FeatureSnapshot.feature_time)).limit(limit)).mappings()
+        return [_serialize_mapping_row(row) for row in rows]
+
+    statement = select(FeatureSnapshot)
+    if symbol_filter:
+        statement = statement.where(FeatureSnapshot.symbol == symbol_filter)
+    if timeframe_filter:
+        statement = statement.where(FeatureSnapshot.timeframe == timeframe_filter)
+    return _serialize_model_list(list(session.scalars(statement.order_by(desc(FeatureSnapshot.feature_time)).limit(limit))))
 
 
 def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
@@ -3428,16 +3526,36 @@ def _compact_execution_window(window: DashboardExecutionWindowSummary) -> Dashbo
     )
 
 
+def _normalize_operator_dashboard_view(view: str | None) -> str | None:
+    normalized = (view or "").strip().lower()
+    return normalized if normalized in OPERATOR_COMPACT_VIEWS else None
+
+
 def _build_operator_symbol_summaries(
     session: Session,
     *,
     tracked_symbols: list[str],
     overview: OverviewResponse,
+    include_decision_state: bool = True,
+    include_risk_state: bool = True,
+    include_execution_state: bool = True,
+    include_protection_state: bool = True,
+    include_event_operator_control: bool = True,
+    include_audit_events: bool = True,
 ) -> list[OperatorSymbolSummary]:
     now = utcnow_naive()
-    symbol_keys = [item.upper() for item in tracked_symbols if item]
-    settings_row = get_or_create_settings(session)
-    runtime_summary = summarize_runtime_state(settings_row)
+    symbol_keys = list(dict.fromkeys(item.upper() for item in tracked_symbols if item))
+    symbol_key_set = set(symbol_keys)
+    settings_row = (
+        get_or_create_settings(session)
+        if include_event_operator_control or include_protection_state
+        else None
+    )
+    runtime_summary = (
+        summarize_runtime_state(settings_row)
+        if include_protection_state and settings_row is not None
+        else {}
+    )
     protection_recovery_symbols = {
         str(key).upper(): dict(value)
         for key, value in (runtime_summary.get("protection_recovery_symbols") or {}).items()
@@ -3462,52 +3580,61 @@ def _build_operator_symbol_summaries(
         FeatureSnapshot.feature_time,
     )
 
-    latest_decisions: dict[str, AgentRun] = _latest_rows_by_extracted_symbol(
-        session,
-        select(AgentRun)
-        .where(AgentRun.role == "trading_decision")
-        .order_by(desc(AgentRun.created_at)),
-        symbol_keys,
-        _decision_symbol,
-    )
+    latest_decisions: dict[str, AgentRun] = {}
+    if include_decision_state:
+        latest_decisions = _latest_rows_by_extracted_symbol(
+            session,
+            select(AgentRun)
+            .where(AgentRun.role == "trading_decision")
+            .order_by(desc(AgentRun.created_at)),
+            symbol_keys,
+            _decision_symbol,
+        )
 
-    latest_risks: dict[str, RiskCheck] = _latest_rows_by_symbol(
-        session,
-        RiskCheck,
-        symbol_keys,
-        RiskCheck.created_at,
-    )
+    latest_risks: dict[str, RiskCheck] = {}
+    if include_risk_state:
+        latest_risks = _latest_rows_by_symbol(
+            session,
+            RiskCheck,
+            symbol_keys,
+            RiskCheck.created_at,
+        )
 
     active_entry_plans: dict[str, PendingEntryPlan] = {}
-    for row in session.scalars(
-        select(PendingEntryPlan)
-        .where(PendingEntryPlan.symbol.in_(symbol_keys), PendingEntryPlan.plan_status == "armed")
-        .order_by(desc(PendingEntryPlan.created_at))
-    ):
-        symbol = row.symbol.upper()
-        active_entry_plans.setdefault(symbol, row)
+    if include_execution_state:
+        for row in session.scalars(
+            select(PendingEntryPlan)
+            .where(PendingEntryPlan.symbol.in_(symbol_keys), PendingEntryPlan.plan_status == "armed")
+            .order_by(desc(PendingEntryPlan.created_at))
+        ):
+            symbol = row.symbol.upper()
+            active_entry_plans.setdefault(symbol, row)
 
-    latest_orders: dict[str, Order] = _latest_rows_by_symbol(
-        session,
-        Order,
-        symbol_keys,
-        Order.created_at,
-        Order.mode == "live",
-    )
+    latest_orders: dict[str, Order] = {}
+    if include_execution_state:
+        latest_orders = _latest_rows_by_symbol(
+            session,
+            Order,
+            symbol_keys,
+            Order.created_at,
+            Order.mode == "live",
+        )
 
-    latest_interval_reviews: dict[str, SchedulerRun] = _latest_rows_by_extracted_symbol(
-        session,
-        select(SchedulerRun)
-        .where(SchedulerRun.workflow == "interval_decision_cycle")
-        .order_by(desc(SchedulerRun.created_at)),
-        symbol_keys,
-        lambda row: str((row.outcome if isinstance(row.outcome, dict) else {}).get("symbol") or "").upper(),
-    )
+    latest_interval_reviews: dict[str, SchedulerRun] = {}
+    if include_decision_state:
+        latest_interval_reviews = _latest_rows_by_extracted_symbol(
+            session,
+            select(SchedulerRun)
+            .where(SchedulerRun.workflow == "interval_decision_cycle")
+            .order_by(desc(SchedulerRun.created_at)),
+            symbol_keys,
+            lambda row: str((row.outcome if isinstance(row.outcome, dict) else {}).get("symbol") or "").upper(),
+        )
 
     latest_executions_by_order_id: dict[int, Execution] = {}
     recent_executions_by_symbol: dict[str, list[Execution]] = defaultdict(list)
     order_ids = [row.id for row in latest_orders.values()]
-    if order_ids:
+    if include_execution_state and order_ids:
         for row in session.scalars(
             select(Execution)
             .where(Execution.order_id.in_(order_ids))
@@ -3517,22 +3644,28 @@ def _build_operator_symbol_summaries(
                 continue
             latest_executions_by_order_id.setdefault(row.order_id, row)
             symbol_key = str(row.symbol or "").upper()
-            if symbol_key in symbol_keys and len(recent_executions_by_symbol[symbol_key]) < RECENT_FILL_LIMIT:
+            if symbol_key in symbol_key_set and len(recent_executions_by_symbol[symbol_key]) < RECENT_FILL_LIMIT:
                 recent_executions_by_symbol[symbol_key].append(row)
 
-    open_positions = {
-        row.symbol.upper(): row
-        for row in session.scalars(
-            select(Position).where(
-                Position.mode == "live",
-                Position.status == "open",
-                Position.quantity > 0,
-                Position.symbol.in_(symbol_keys),
+    open_positions: dict[str, Position] = {}
+    if include_protection_state:
+        open_positions = {
+            row.symbol.upper(): row
+            for row in session.scalars(
+                select(Position).where(
+                    Position.mode == "live",
+                    Position.status == "open",
+                    Position.quantity > 0,
+                    Position.symbol.in_(symbol_keys),
+                )
             )
-        )
-    }
+        }
 
-    audit_rows = get_audit_timeline(session, limit=max(12, len(symbol_keys) * SYMBOL_AUDIT_LIMIT))
+    audit_rows = (
+        get_audit_timeline(session, limit=max(12, len(symbol_keys) * SYMBOL_AUDIT_LIMIT))
+        if include_audit_events
+        else []
+    )
     audit_entries_by_symbol: dict[str, list[AuditTimelineEntry]] = {symbol: [] for symbol in symbol_keys}
     latest_protection_event_by_symbol: dict[str, AuditTimelineEntry] = {}
     for row in audit_rows:
@@ -3568,28 +3701,42 @@ def _build_operator_symbol_summaries(
         market_context_summary = _extract_symbol_market_context(decision_row, market_row, feature_row)
         derivatives_summary = _extract_symbol_derivatives_summary(decision_row, market_row, feature_row)
         event_context_summary = _extract_symbol_event_context_summary(decision_row, market_row, feature_row)
-        event_operator_control = build_event_operator_control_payload(
-            session=session,
-            settings_row=settings_row,
-            symbol=symbol_key,
-            timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
-            decision_row=decision_row,
-            feature_row=feature_row,
-            market_row=market_row,
+        event_operator_control = (
+            build_event_operator_control_payload(
+                session=session,
+                settings_row=settings_row,
+                symbol=symbol_key,
+                timeframe=_decision_timeframe(decision_row) or (market_row.timeframe if market_row is not None else None),
+                decision_row=decision_row,
+                feature_row=feature_row,
+                market_row=market_row,
+            )
+            if include_event_operator_control and settings_row is not None
+            else None
         )
-        protection_state = (
-            _build_position_protection_state(session, position_row)
-            if position_row is not None
-            else {
-                "status": "flat",
-                "protected": True,
-                "protective_order_count": 0,
-                "has_stop_loss": False,
-                "has_take_profit": False,
-                "missing_components": [],
-                "order_ids": [],
-            }
-        )
+        protection_state = {
+            "status": "unknown",
+            "protected": False,
+            "protective_order_count": 0,
+            "has_stop_loss": False,
+            "has_take_profit": False,
+            "missing_components": [],
+            "order_ids": [],
+        }
+        if include_protection_state:
+            protection_state = (
+                _build_position_protection_state(session, position_row)
+                if position_row is not None
+                else {
+                    "status": "flat",
+                    "protected": True,
+                    "protective_order_count": 0,
+                    "has_stop_loss": False,
+                    "has_take_profit": False,
+                    "missing_components": [],
+                    "order_ids": [],
+                }
+            )
         stale_flags = _build_symbol_stale_flags(overview.sync_freshness_summary, market_row, market_context_summary)
         feature_input_delay_minutes, feature_input_delay_threshold_minutes, feature_input_delayed = (
             _build_feature_input_delay_summary(
@@ -3651,11 +3798,15 @@ def _build_operator_symbol_summaries(
                     recent_fills=recent_executions_by_symbol.get(symbol_key, []),
                 ),
                 open_position=_build_position_snapshot(position_row),
-                protection_status=_build_protection_snapshot(
-                    protection_state,
-                    recovery_state=protection_recovery_symbols.get(symbol_key),
-                    verification_block=protection_verification_blocks.get(symbol_key),
-                    latest_event=latest_protection_event_by_symbol.get(symbol_key),
+                protection_status=(
+                    _build_protection_snapshot(
+                        protection_state,
+                        recovery_state=protection_recovery_symbols.get(symbol_key),
+                        verification_block=protection_verification_blocks.get(symbol_key),
+                        latest_event=latest_protection_event_by_symbol.get(symbol_key),
+                    )
+                    if include_protection_state
+                    else OperatorProtectionSummary()
                 ),
                 blocked_reasons=_risk_reason_codes_from_row(risk_row),
                 candidate_selection=_build_candidate_selection_snapshot(
@@ -3671,30 +3822,61 @@ def _build_operator_symbol_summaries(
     return summaries
 
 
-def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
+def get_operator_dashboard(session: Session, *, view: str | None = None) -> OperatorDashboardResponse:
+    operator_view = _normalize_operator_dashboard_view(view)
     overview = get_overview(session)
-    profitability = get_profitability_dashboard(
-        session,
-        overview=overview,
-        performance_window_specs=OPERATOR_PERFORMANCE_WINDOW_SPECS,
-        cost_window_specs=OPERATOR_PROFITABILITY_COST_WINDOW_SPECS,
+    profitability = (
+        None
+        if operator_view is not None
+        else get_profitability_dashboard(
+            session,
+            overview=overview,
+            performance_window_specs=OPERATOR_PERFORMANCE_WINDOW_SPECS,
+            cost_window_specs=OPERATOR_PROFITABILITY_COST_WINDOW_SPECS,
+        )
     )
-    latest_scheduler = session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
+    latest_scheduler = (
+        None
+        if operator_view == "market"
+        else session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
+    )
+    include_decision_state = operator_view != "market"
+    include_risk_state = operator_view != "market"
+    include_execution_state = operator_view is None
+    include_protection_state = operator_view is None
+    include_event_operator_control = operator_view is None
+    include_audit_events = operator_view is None
     symbol_summaries = _build_operator_symbol_summaries(
         session,
         tracked_symbols=overview.tracked_symbols,
         overview=overview,
+        include_decision_state=include_decision_state,
+        include_risk_state=include_risk_state,
+        include_execution_state=include_execution_state,
+        include_protection_state=include_protection_state,
+        include_event_operator_control=include_event_operator_control,
+        include_audit_events=include_audit_events,
     )
-    compact_performance_windows = [
-        _compact_profitability_window(window)
-        for window in profitability.windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
-    ]
-    compact_execution_windows = [
-        _compact_execution_window(window)
-        for window in profitability.execution_windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
-    ]
-    limited_live_readiness = profitability.limited_live_readiness
-    audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT)
+    compact_performance_windows = (
+        []
+        if profitability is None
+        else [
+            _compact_profitability_window(window)
+            for window in profitability.windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
+        ]
+    )
+    compact_execution_windows = (
+        []
+        if profitability is None
+        else [
+            _compact_execution_window(window)
+            for window in profitability.execution_windows[:OPERATOR_PERFORMANCE_WINDOW_LIMIT]
+        ]
+    )
+    limited_live_readiness = (
+        LimitedLiveReadinessReport() if profitability is None else profitability.limited_live_readiness
+    )
+    audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT) if include_audit_events else []
     return OperatorDashboardResponse(
         generated_at=utcnow_naive(),
         control=OperatorControlState(
@@ -3762,9 +3944,13 @@ def get_operator_dashboard(session: Session) -> OperatorDashboardResponse:
         market_signal=OperatorMarketSignalSummary(
             market_context_summary=_compact_market_context_summary(overview.market_context_summary),
             performance_windows=compact_performance_windows,
-            profitability_cost_breakdowns=profitability.cost_breakdowns,
-            hold_blocked_summary=profitability.hold_blocked_summary,
-            adaptive_signal_summary=_compact_adaptive_signal_summary(profitability.adaptive_signal_summary),
+            profitability_cost_breakdowns=[] if profitability is None else profitability.cost_breakdowns,
+            hold_blocked_summary=(
+                DashboardHoldBlockedSummary() if profitability is None else profitability.hold_blocked_summary
+            ),
+            adaptive_signal_summary=(
+                {} if profitability is None else _compact_adaptive_signal_summary(profitability.adaptive_signal_summary)
+            ),
         ),
         execution_windows=compact_execution_windows,
         audit_events=[_build_operator_audit_entry(item) for item in audit_rows if isinstance(item, dict)],
@@ -3778,6 +3964,22 @@ def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False)
         .order_by(desc(RiskCheck.created_at))
         .limit(limit)
     ).all()
+    decision_ids = [
+        risk_row.decision_run_id
+        for risk_row, _decision_row in rows
+        if risk_row.decision_run_id is not None
+    ]
+    pending_entry_plans_by_decision: dict[int, PendingEntryPlan] = {}
+    if decision_ids:
+        plan_rows = session.scalars(
+            select(PendingEntryPlan)
+            .where(PendingEntryPlan.source_decision_run_id.in_(decision_ids))
+            .order_by(desc(PendingEntryPlan.updated_at), desc(PendingEntryPlan.created_at))
+        )
+        for plan_row in plan_rows:
+            if plan_row.source_decision_run_id is None:
+                continue
+            pending_entry_plans_by_decision.setdefault(plan_row.source_decision_run_id, plan_row)
     payloads: list[dict[str, object]] = []
     for risk_row, decision_row in rows:
         payload = _serialize_model_row(risk_row)
@@ -3802,6 +4004,9 @@ def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False)
         payload["macro_event_context_summary"] = macro_event_summary.model_dump(mode="json")
         payload["macro_event_risk_summary"] = macro_event_summary.model_dump(mode="json")
         payload["risk_guard_result"] = _risk_guard_result_from_snapshot(risk_snapshot).model_dump(mode="json")
+        payload["pending_entry_plan"] = _build_pending_entry_plan_snapshot(
+            pending_entry_plans_by_decision.get(risk_row.decision_run_id)
+        ).model_dump(mode="json")
         if compact:
             payload["payload"] = _compact_dict(payload.get("payload"), allowed_keys=RISK_COMPACT_PAYLOAD_KEYS)
             payload["payload_mode"] = "compact"
@@ -3816,7 +4021,23 @@ def get_agent_runs(session: Session, limit: int = 100, *, compact: bool = False)
     return _serialize_model_list(rows)
 
 
-def get_scheduler_runs(session: Session, limit: int = 50) -> list[dict[str, object]]:
+def get_scheduler_runs(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
+    if compact:
+        rows = session.execute(
+            select(
+                SchedulerRun.id,
+                SchedulerRun.schedule_window,
+                SchedulerRun.workflow,
+                SchedulerRun.status,
+                SchedulerRun.triggered_by,
+                SchedulerRun.next_run_at,
+                SchedulerRun.created_at,
+                SchedulerRun.updated_at,
+            )
+            .order_by(desc(SchedulerRun.created_at))
+            .limit(limit)
+        ).mappings()
+        return [_serialize_mapping_row(row) for row in rows]
     return _serialize_model_list(list(session.scalars(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(limit))))
 
 

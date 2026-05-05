@@ -9,8 +9,39 @@ export type BinanceChartCandle = {
 
 export type BinanceChartTimeframe = "15m" | "1h" | "4h";
 
+type BinanceKlineCacheEntry = {
+  candles: BinanceChartCandle[];
+  expiresAt: number;
+  pending?: Promise<BinanceChartCandle[]>;
+};
+
 const binanceFuturesBaseUrl =
   process.env.BINANCE_FUTURES_PUBLIC_BASE_URL ?? "https://fapi.binance.com";
+const configuredBinanceKlineRevalidateSeconds = Number(process.env.BINANCE_KLINE_REVALIDATE_SECONDS ?? "30");
+const binanceKlineRevalidateSeconds = Number.isFinite(configuredBinanceKlineRevalidateSeconds)
+  ? Math.max(5, Math.min(Math.trunc(configuredBinanceKlineRevalidateSeconds), 300))
+  : 30;
+const binanceKlineCache = new Map<string, BinanceKlineCacheEntry>();
+const binanceKlineCacheMaxEntries = 100;
+
+function trimBinanceKlineCache() {
+  if (binanceKlineCache.size <= binanceKlineCacheMaxEntries) {
+    return;
+  }
+  const now = Date.now();
+  for (const [key, entry] of binanceKlineCache.entries()) {
+    if (entry.expiresAt <= now && !entry.pending) {
+      binanceKlineCache.delete(key);
+    }
+  }
+  while (binanceKlineCache.size > binanceKlineCacheMaxEntries) {
+    const oldestKey = binanceKlineCache.keys().next().value;
+    if (!oldestKey) {
+      return;
+    }
+    binanceKlineCache.delete(oldestKey);
+  }
+}
 
 function finiteNumber(value: unknown) {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -62,23 +93,51 @@ export async function fetchBinanceChartCandles({
     interval: timeframe,
     limit: String(normalizedLimit),
   });
+  const cacheKey = params.toString();
+  const now = Date.now();
+  const cached = binanceKlineCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.candles;
+  }
+  if (cached?.pending) {
+    try {
+      return await cached.pending;
+    } catch {
+      return cached.candles;
+    }
+  }
 
-  try {
+  const pending = (async () => {
     const response = await fetch(`${binanceFuturesBaseUrl}/fapi/v1/klines?${params}`, {
-      cache: "no-store",
+      next: { revalidate: binanceKlineRevalidateSeconds },
     });
     if (!response.ok) {
-      return [];
+      throw new Error(`Binance kline request failed with ${response.status}`);
     }
     const payload = await response.json();
     if (!Array.isArray(payload)) {
-      return [];
+      throw new Error("Binance kline response was not an array");
     }
     return payload
       .map(parseKlineRow)
       .filter((item): item is BinanceChartCandle => item !== null);
+  })();
+  binanceKlineCache.set(cacheKey, {
+    candles: cached?.candles ?? [],
+    expiresAt: now + binanceKlineRevalidateSeconds * 1000,
+    pending,
+  });
+  trimBinanceKlineCache();
+  try {
+    const candles = await pending;
+    binanceKlineCache.set(cacheKey, {
+      candles,
+      expiresAt: Date.now() + binanceKlineRevalidateSeconds * 1000,
+    });
+    return candles;
   } catch {
-    return [];
+    binanceKlineCache.delete(cacheKey);
+    return cached?.candles ?? [];
   }
 }
 

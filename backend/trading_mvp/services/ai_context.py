@@ -23,6 +23,7 @@ from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_SCALP,
     deterministic_stop_management_payload,
 )
+from trading_mvp.services.runtime_state import sync_scope_blocks_new_entry
 
 _DATA_QUALITY_ORDER = {
     "complete": 0,
@@ -77,6 +78,9 @@ EXPECTED_COST_PASSIVE_SLIPPAGE_BPS = 1.0
 EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS = 2.0
 MACRO_EVENT_IMMINENT_MINUTES = 30
 MACRO_EVENT_REACTION_WINDOW_MINUTES = 60
+MACRO_EVENT_RESULT_COMPARISON_KEYS = ("forecast", "consensus", "estimate", "expected", "prior", "previous")
+MACRO_EVENT_RESULT_FORECAST_KEYS = frozenset({"forecast", "consensus", "estimate", "expected"})
+MACRO_EVENT_RESULT_HIGH_SURPRISE_RATIO = 0.03
 MACRO_EVENT_ACTIVE_REASON_CODES = frozenset(
     {
         "MACRO_EVENT_RISK_WINDOW_ACTIVE",
@@ -555,16 +559,21 @@ def build_data_quality_packet(
         missing_flags.append("lead_context_partial")
 
     account_state_trustworthy = True
-    for scope in ("account", "positions", "open_orders", "protective_orders"):
-        scope_payload = _as_dict(sync_freshness_summary.get(scope))
-        if not scope_payload:
-            continue
-        if bool(scope_payload.get("stale")):
-            stale_flags.append(f"{scope}_sync_stale")
-            account_state_trustworthy = False
-        if bool(scope_payload.get("incomplete")):
-            missing_flags.append(f"{scope}_sync_incomplete")
-            account_state_trustworthy = False
+    if sync_freshness_summary:
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            scope_payload = _as_dict(sync_freshness_summary.get(scope))
+            if not scope_payload:
+                missing_flags.append(f"{scope}_sync_missing")
+                account_state_trustworthy = False
+                continue
+            if not sync_scope_blocks_new_entry(sync_freshness_summary, scope):
+                continue
+            if bool(scope_payload.get("stale")):
+                stale_flags.append(f"{scope}_sync_stale")
+                account_state_trustworthy = False
+            if bool(scope_payload.get("incomplete")):
+                missing_flags.append(f"{scope}_sync_incomplete")
+                account_state_trustworthy = False
 
     market_state_trustworthy = not market_snapshot.is_stale and market_snapshot.is_complete
     for flag in feature_flags:
@@ -714,6 +723,160 @@ def _event_scope_matches_symbol(*, affected_assets: list[str], symbol: str) -> b
     return bool(normalized_assets & MACRO_EVENT_RELEVANT_ASSETS)
 
 
+def _event_minutes_to_release(*, event_at: datetime | None, generated_at: datetime | None) -> int | None:
+    if event_at is None or generated_at is None:
+        return None
+    lhs = event_at
+    rhs = generated_at
+    if lhs.tzinfo is not None and rhs.tzinfo is None:
+        lhs = lhs.replace(tzinfo=None)
+    elif lhs.tzinfo is None and rhs.tzinfo is not None:
+        rhs = rhs.replace(tzinfo=None)
+    try:
+        return int((lhs - rhs).total_seconds() // 60)
+    except TypeError:
+        return None
+
+
+def _event_result_policy(*, event_name: str | None, payload: Mapping[str, Any]) -> str:
+    text = " ".join(
+        str(item or "")
+        for item in (
+            event_name,
+            payload.get("headline_metric"),
+            payload.get("metric"),
+            payload.get("series_id"),
+            payload.get("title"),
+        )
+    ).lower()
+    if "unemployment" in text:
+        return "unknown"
+    if any(marker in text for marker in ("cpi", "consumer price", "ppi", "producer price", "inflation", "price index")):
+        return "higher_is_bearish"
+    if any(marker in text for marker in ("average hourly earnings", "nonfarm payroll", "payroll", "employment")):
+        return "higher_is_bearish"
+    if any(marker in text for marker in ("gdp", "gross domestic product")):
+        return "higher_is_bullish"
+    return "unknown"
+
+
+def _event_result_bias(*, policy: str, delta: float) -> str:
+    if abs(delta) < 1e-12 or policy == "unknown":
+        return "neutral"
+    if policy == "higher_is_bearish":
+        return "bearish" if delta > 0 else "bullish"
+    if policy == "higher_is_bullish":
+        return "bullish" if delta > 0 else "bearish"
+    return "neutral"
+
+
+def _event_result_confidence(*, delta: float, reference: float, comparison_key: str) -> float:
+    relative_surprise = abs(delta) / max(abs(reference), 1e-6)
+    confidence = min(1.0, relative_surprise * 6.0)
+    absolute_delta = abs(delta)
+    if absolute_delta >= 0.1:
+        confidence = max(confidence, 0.45)
+    if absolute_delta >= 0.2:
+        confidence = max(confidence, 0.7)
+    if comparison_key not in MACRO_EVENT_RESULT_FORECAST_KEYS:
+        confidence *= 0.75
+    return round(min(max(confidence, 0.0), 1.0), 6)
+
+
+def _build_event_result_context(
+    *,
+    event_context: Any,
+    symbol: str,
+    applies_to_new_entry: bool,
+    source_trustworthy: bool,
+) -> dict[str, Any]:
+    if not applies_to_new_entry or not source_trustworthy:
+        return {"available": False, "reason_codes": []}
+
+    best: dict[str, Any] | None = None
+    for event in getattr(event_context, "events", []) or []:
+        importance = str(getattr(event, "importance", "") or "").lower()
+        if importance != "high":
+            continue
+        affected_assets = list(getattr(event, "affected_assets", []) or getattr(event_context, "affected_assets", []))
+        if not _event_scope_matches_symbol(affected_assets=affected_assets, symbol=symbol):
+            continue
+        minutes_to_event = getattr(event, "minutes_to_event", None)
+        if minutes_to_event is None:
+            minutes_to_event = _event_minutes_to_release(
+                event_at=getattr(event, "event_at", None),
+                generated_at=getattr(event_context, "generated_at", None),
+            )
+        if minutes_to_event is None or minutes_to_event >= 0:
+            continue
+
+        release_enrichment = getattr(event, "release_enrichment", {}) or {}
+        reaction_window_active = -MACRO_EVENT_REACTION_WINDOW_MINUTES <= minutes_to_event < 0
+        for vendor, raw_payload in release_enrichment.items():
+            payload = _as_dict(raw_payload)
+            actual = _safe_float(payload.get("actual"))
+            if actual is None:
+                continue
+            comparison_key = next(
+                (
+                    key
+                    for key in MACRO_EVENT_RESULT_COMPARISON_KEYS
+                    if _safe_float(payload.get(key)) is not None
+                ),
+                None,
+            )
+            if comparison_key is None:
+                continue
+            reference = _safe_float(payload.get(comparison_key))
+            if reference is None:
+                continue
+
+            delta = actual - reference
+            policy = _event_result_policy(event_name=getattr(event, "event_name", None), payload=payload)
+            result_bias = _event_result_bias(policy=policy, delta=delta)
+            confidence = _event_result_confidence(delta=delta, reference=reference, comparison_key=comparison_key)
+            relative_surprise = abs(delta) / max(abs(reference), 1e-6)
+            reason_codes = [
+                "MACRO_EVENT_RESULT_AVAILABLE",
+                "MACRO_EVENT_RESULT_VS_FORECAST"
+                if comparison_key in MACRO_EVENT_RESULT_FORECAST_KEYS
+                else "MACRO_EVENT_RESULT_VS_PRIOR",
+                f"MACRO_EVENT_RESULT_{result_bias.upper()}",
+            ]
+            if relative_surprise >= MACRO_EVENT_RESULT_HIGH_SURPRISE_RATIO:
+                reason_codes.append("MACRO_EVENT_RESULT_SURPRISE_HIGH")
+            if reaction_window_active:
+                reason_codes.append("MACRO_RELEASE_REACTION_WINDOW")
+
+            candidate = {
+                "available": True,
+                "event_name": getattr(event, "event_name", None),
+                "event_importance": importance,
+                "event_minutes_to_event": minutes_to_event,
+                "reaction_window_active": reaction_window_active,
+                "vendor": str(vendor),
+                "metric": payload.get("headline_metric") or payload.get("metric") or payload.get("series_id"),
+                "actual": round(actual, 8),
+                "reference": round(reference, 8),
+                "comparison": comparison_key,
+                "delta": round(delta, 8),
+                "relative_surprise": round(relative_surprise, 8),
+                "event_result_bias": result_bias,
+                "event_result_confidence": confidence,
+                "policy": policy,
+                "reason_codes": _unique_codes(reason_codes),
+            }
+            if best is None:
+                best = candidate
+                continue
+            best_score = (bool(best.get("reaction_window_active")), float(best.get("event_result_confidence") or 0.0))
+            candidate_score = (reaction_window_active, confidence)
+            if candidate_score > best_score:
+                best = candidate
+
+    return best if best is not None else {"available": False, "reason_codes": []}
+
+
 def build_event_risk_context(
     *,
     features: FeaturePayload,
@@ -742,6 +905,14 @@ def build_event_risk_context(
         affected_assets=list(event_context.affected_assets),
         symbol=features.symbol,
     )
+    event_result_context = _build_event_result_context(
+        event_context=event_context,
+        symbol=features.symbol,
+        applies_to_new_entry=applies_to_new_entry,
+        source_trustworthy=source_trustworthy,
+    )
+    if event_result_context.get("available"):
+        reason_codes.extend(_as_list(event_result_context.get("reason_codes")))
     minutes_to_event = event_context.minutes_to_next_event
     if applies_to_new_entry and source_trustworthy and high_impact and asset_relevant:
         if event_context.active_risk_window:
@@ -786,6 +957,7 @@ def build_event_risk_context(
         "event_bias_observed": event_context.event_bias,
         "event_bias_used": event_context.event_bias if event_risk_active and source_trustworthy else None,
         "enrichment_vendors": list(event_context.enrichment_vendors),
+        "event_result_context": event_result_context,
     }
 
 
@@ -1086,6 +1258,9 @@ def build_ai_decision_context(
         resolved_selection_context = _as_dict(resolved_risk_context.get("selection_context"))
     resolved_review_trigger = _review_trigger_payload(review_trigger)
     position_management_context = _as_dict(resolved_risk_context.get("position_management_context"))
+    active_position_summary = _as_dict(resolved_risk_context.get("active_position_summary"))
+    pending_entry_plan_summary = _as_dict(resolved_risk_context.get("pending_entry_plan_summary"))
+    execution_constraints_summary = _as_dict(resolved_risk_context.get("execution_constraints_summary"))
     selection_holding_profile_context = _as_dict(resolved_selection_context.get("holding_profile_context"))
     previous_metadata = _as_dict(previous_decision_metadata)
 
@@ -1238,6 +1413,9 @@ def build_ai_decision_context(
             stop_management_context.get("initial_stop_type")
             or stop_management_defaults["initial_stop_type"]
         ),
+        active_position_summary=active_position_summary,
+        pending_entry_plan_summary=pending_entry_plan_summary,
+        execution_constraints_summary=execution_constraints_summary,
         selection_context_summary=_selection_context_summary(resolved_selection_context),
         prompt_family_hint=prompt_family_hint,
         event_risk_active=bool(event_risk_context.get("event_risk_active")),

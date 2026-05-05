@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import select
-from trading_mvp.models import PendingEntryPlan, RiskCheck
+from trading_mvp.models import AuditEvent, PendingEntryPlan, Position, RiskCheck
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
 from trading_mvp.services.dashboard import get_overview
 from trading_mvp.services.orchestrator import TradingOrchestrator
@@ -30,6 +31,7 @@ def _enable_live_settings(db_session) -> None:
     settings_row.manual_live_approval = True
     settings_row.live_execution_armed = True
     settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.openai_api_key_encrypted = encrypt_secret("openai-key", "change-me-local-dev-secret")
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
     _mark_all_sync_fresh(settings_row)
@@ -226,8 +228,8 @@ def _arm_plan(monkeypatch, db_session, *, snapshot_time=None) -> tuple[TradingOr
     orchestrator = TradingOrchestrator(db_session)
     orchestrator.trading_agent.run = lambda *args, **kwargs: (
         _pullback_long_decision(),
-        "deterministic-mock",
-        {},
+        "openai",
+        {"source": "llm"},
     )
     def fake_evaluate_risk(
         session,
@@ -321,6 +323,65 @@ def test_entry_plan_watcher_executes_after_zone_entry_and_confirm_without_new_ai
     assert trigger_details["quality_state"] == "trigger"
     assert trigger_details["quality_score"] >= trigger_details["quality_threshold"]
     assert trigger_details["quality_components"]["reclaim_signal_strength"] >= 0.55
+
+
+def test_entry_plan_watcher_cancels_when_open_position_has_no_additional_capacity(
+    monkeypatch,
+    db_session,
+) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.022,
+            entry_price=70000.0,
+            mark_price=70000.0,
+            leverage=2.0,
+            stop_loss=68500.0,
+            take_profit=71000.0,
+            unrealized_pnl=10.0,
+        )
+    )
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.get_latest_pnl_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(equity=1000.0),
+    )
+    orchestrator.trading_agent.run = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("AI recheck should be skipped when no add-on capacity remains")
+    )
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive() + timedelta(minutes=1),
+            latest_price=69420.0,
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+    skipped_event = db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "decision_ai_skipped")
+    )
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "canceled"
+    assert watch_result["results"][0]["plans"][0]["blocked_reasons"] == [
+        "PLAN_CANCELED_NO_ENTRY_CAPACITY"
+    ]
+    assert refreshed is not None
+    assert refreshed.plan_status == "canceled"
+    assert refreshed.canceled_reason == "PLAN_CANCELED_NO_ENTRY_CAPACITY"
+    assert refreshed.metadata_json["last_transition_detail"]["available_additional_notional"] == 0.0
+    assert skipped_event is not None
+    assert skipped_event.payload["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert skipped_event.payload["hard_skip_ai"] is True
 
 
 def test_entry_plan_watcher_marks_shadow_execution_terminal(monkeypatch, db_session) -> None:

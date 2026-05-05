@@ -76,6 +76,7 @@ from trading_mvp.services.runtime_state import (
     build_sync_freshness_summary,
     derive_degraded_reason_codes,
     derive_protection_reason_codes,
+    flat_protective_order_staleness_is_safe,
     get_drawdown_state_detail,
     get_sync_state_detail,
     resolve_exchange_connectivity_state,
@@ -283,6 +284,7 @@ SYNC_SCOPE_GUARD_REASON_CODES = {
     "open_orders": "OPEN_ORDERS_STATE_STALE",
     "protective_orders": "PROTECTION_STATE_UNVERIFIED",
 }
+SYNC_GUARD_REASON_CODE_SCOPES = {code: scope for scope, code in SYNC_SCOPE_GUARD_REASON_CODES.items()}
 STALE_FIRST_REASON_PRIORITY = {
     "BINANCE_REST_CIRCUIT_OPEN": -3,
     "BINANCE_REST_AUTH_PERMISSION_REJECTED": -3,
@@ -340,6 +342,17 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "EXCHANGE_POSITION_MODE_UNCLEAR": "거래소 포지션 모드를 확인하지 못해 신규 진입을 차단합니다.",
     "EXCHANGE_POSITION_MODE_MISMATCH": "거래소 Hedge mode가 현재 one-way 로컬 해석과 충돌해 신규 진입을 차단합니다.",
 }
+RISK_STATUS_ONLY_REASON_CODES = frozenset(
+    {
+        "HOLD_DECISION",
+        "ENTRY_TRIGGER_NOT_MET",
+        "NO_EDGE",
+        "RANGE_CHOP",
+        "WEAK_VOLUME",
+        "MOMENTUM_WEAKENING",
+        "DETERMINISTIC_BASELINE_DISAGREEMENT",
+    }
+)
 
 
 def _default_windows(defaults: AppConfig) -> list[str]:
@@ -2207,6 +2220,11 @@ def _derive_sync_blocking_reasons(sync_freshness_summary: dict[str, object]) -> 
         scope_payload = sync_freshness_summary.get(scope)
         if not isinstance(scope_payload, dict):
             continue
+        if scope == "protective_orders" and flat_protective_order_staleness_is_safe(
+            sync_freshness_summary,
+            scope_payload,
+        ):
+            continue
         status = str(scope_payload.get("status") or scope_payload.get("raw_status") or "")
         has_observation = any(
             scope_payload.get(key) not in {None, ""}
@@ -2317,6 +2335,10 @@ def _prioritize_blocked_reasons(reason_codes: list[str]) -> list[str]:
     )
 
 
+def _actionable_guard_reason_codes(reason_codes: list[str]) -> list[str]:
+    return [code for code in reason_codes if code not in RISK_STATUS_ONLY_REASON_CODES]
+
+
 def _filter_inactive_control_reason_codes(settings_row: Setting, reason_codes: list[str]) -> list[str]:
     approval_window_open, _, _ = get_live_approval_status(settings_row)
     filtered: list[str] = []
@@ -2324,6 +2346,24 @@ def _filter_inactive_control_reason_codes(settings_row: Setting, reason_codes: l
         if code in {"TRADING_PAUSED", "MANUAL_USER_REQUEST"} and not settings_row.trading_paused:
             continue
         if code == "LIVE_APPROVAL_REQUIRED" and approval_window_open:
+            continue
+        filtered.append(code)
+    return filtered
+
+
+def _filter_resolved_latest_blocked_reasons(
+    reason_codes: list[str],
+    *,
+    sync_freshness_summary: dict[str, object],
+    market_freshness_summary: dict[str, object],
+) -> list[str]:
+    active_sync_reasons = set(_derive_sync_blocking_reasons(sync_freshness_summary))
+    active_market_reasons = set(_derive_market_blocking_reasons(market_freshness_summary))
+    filtered: list[str] = []
+    for code in reason_codes:
+        if code in SYNC_GUARD_REASON_CODE_SCOPES and code not in active_sync_reasons:
+            continue
+        if code in {"MARKET_STATE_STALE", "MARKET_STATE_INCOMPLETE"} and code not in active_market_reasons:
             continue
         filtered.append(code)
     return filtered
@@ -2355,6 +2395,7 @@ def derive_guard_mode_reason(
             [str(item) for item in (latest_blocked_reasons or []) if item],
         )
     )
+    actionable_blocked_reasons = _prioritize_blocked_reasons(_actionable_guard_reason_codes(blocked_reasons))
     auto_resume_blockers = [str(item) for item in (auto_resume_last_blockers or []) if item]
     operating_state = str(runtime.get("operating_state", "TRADABLE"))
 
@@ -2396,8 +2437,8 @@ def derive_guard_mode_reason(
             "guard_mode_reason_code": code,
             "guard_mode_reason_message": message,
         }
-    if blocked_reasons:
-        code = blocked_reasons[0]
+    if actionable_blocked_reasons:
+        code = actionable_blocked_reasons[0]
         return {
             "guard_mode_reason_category": "risk_block",
             "guard_mode_reason_code": code,
@@ -2476,10 +2517,18 @@ def _build_market_freshness_summary(
 
 
 def _sync_blocks_new_entries(sync_freshness_summary: dict[str, object]) -> bool:
-    return any(
-        isinstance(scope_payload, dict) and (bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete")))
-        for scope_payload in sync_freshness_summary.values()
-    )
+    for scope, scope_payload in sync_freshness_summary.items():
+        if not isinstance(scope_payload, dict):
+            continue
+        if not (bool(scope_payload.get("stale")) or bool(scope_payload.get("incomplete"))):
+            continue
+        if scope == "protective_orders" and flat_protective_order_staleness_is_safe(
+            sync_freshness_summary,
+            scope_payload,
+        ):
+            continue
+        return True
+    return False
 
 
 def _market_blocks_new_entries(market_freshness_summary: dict[str, object]) -> bool:
@@ -2508,7 +2557,8 @@ def _build_control_status_summary(
         resolved_risk_allowed = False
     one_way_reason_code, one_way_reason_message = _one_way_requirement_reason_payload(reconciliation_summary)
     approval_control_blocked_reasons = _prioritize_blocked_reasons(
-        list(current_cycle_blocked_reasons) + ([one_way_reason_code] if one_way_reason_code else [])
+        _actionable_guard_reason_codes(list(current_cycle_blocked_reasons))
+        + ([one_way_reason_code] if one_way_reason_code else [])
     )
     return ControlStatusSummary(
         exchange_can_trade=exchange_can_trade,
@@ -2570,6 +2620,7 @@ def build_operational_status_payload(
         settings_row,
         [str(item) for item in (blocked_reasons or []) if item not in {None, ""}],
     )
+    original_current_cycle_blocked_reasons = list(current_cycle_blocked_reasons)
     explicit_latest_blocked_reasons = (
         _filter_inactive_control_reason_codes(
             settings_row,
@@ -2586,15 +2637,37 @@ def build_operational_status_payload(
             settings_row,
             current_detail=get_drawdown_state_detail(settings_row),
         )
+    sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
+    market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
+    if current_cycle_blocked_reasons:
+        current_cycle_blocked_reasons = _filter_resolved_latest_blocked_reasons(
+            current_cycle_blocked_reasons,
+            sync_freshness_summary=sync_summary,
+            market_freshness_summary=market_summary,
+        )
+    if explicit_latest_blocked_reasons is not None:
+        explicit_latest_blocked_reasons = _filter_resolved_latest_blocked_reasons(
+            explicit_latest_blocked_reasons,
+            sync_freshness_summary=sync_summary,
+            market_freshness_summary=market_summary,
+        )
+    if risk_allowed is False and original_current_cycle_blocked_reasons and not current_cycle_blocked_reasons:
+        risk_allowed = None
+    filtered_latest_cycle_blocked_reasons: list[str] = []
     if risk_allowed is None and current_session is not None:
         risk_allowed, latest_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
+        filtered_latest_cycle_blocked_reasons = _filter_resolved_latest_blocked_reasons(
+            latest_cycle_blocked_reasons,
+            sync_freshness_summary=sync_summary,
+            market_freshness_summary=market_summary,
+        )
+        if risk_allowed is False and latest_cycle_blocked_reasons and not filtered_latest_cycle_blocked_reasons:
+            risk_allowed = None
         if not current_cycle_blocked_reasons:
             current_cycle_blocked_reasons = _filter_inactive_control_reason_codes(
                 settings_row,
-                latest_cycle_blocked_reasons,
+                filtered_latest_cycle_blocked_reasons,
             )
-    sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
-    market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     user_stream_summary = dict(runtime.get("user_stream_summary") or {})
     binance_rest_summary = dict(runtime.get("binance_rest_summary") or {})
     if binance_rest_summary:
@@ -2620,7 +2693,12 @@ def build_operational_status_payload(
                 if explicit_latest_blocked_reasons is not None
                 else (
                     current_cycle_blocked_reasons
-                    or _filter_inactive_control_reason_codes(settings_row, get_latest_blocked_reasons(current_session))
+                    or filtered_latest_cycle_blocked_reasons
+                    or _filter_resolved_latest_blocked_reasons(
+                        _filter_inactive_control_reason_codes(settings_row, get_latest_blocked_reasons(current_session)),
+                        sync_freshness_summary=sync_summary,
+                        market_freshness_summary=market_summary,
+                    )
                 )
             )
             if item not in {None, ""}

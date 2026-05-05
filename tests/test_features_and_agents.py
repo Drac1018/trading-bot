@@ -782,16 +782,32 @@ def test_trading_agent_applies_setup_specific_time_profiles() -> None:
         features=pullback_features,
         entry_mode="breakout_confirm",
     )
+    swing_pullback_timing = _agent()._build_entry_timing_profile(  # type: ignore[attr-defined]
+        "long",
+        market_snapshot=bullish_base,
+        features=pullback_features,
+        entry_mode="pullback_confirm",
+        holding_profile="swing",
+    )
+    swing_breakout_timing = _agent()._build_entry_timing_profile(  # type: ignore[attr-defined]
+        "long",
+        market_snapshot=bullish_base,
+        features=pullback_features,
+        entry_mode="breakout_confirm",
+        holding_profile="swing",
+    )
 
     assert continuation_decision.entry_mode == "pullback_confirm"
     assert continuation_timing["max_holding_minutes"] > 90
-    assert continuation_timing["idea_ttl_minutes"] >= 12
+    assert continuation_timing["idea_ttl_minutes"] >= 30
     assert "SETUP_TIME_PROFILE_CONTINUATION_BALANCED" in continuation_decision.rationale_codes
     assert pullback_defaults["max_holding_minutes"] > continuation_timing["max_holding_minutes"]
     assert pullback_defaults["idea_ttl_minutes"] > continuation_timing["idea_ttl_minutes"]
     assert breakout_timing["max_holding_minutes"] < continuation_timing["max_holding_minutes"]
     assert breakout_timing["idea_ttl_minutes"] < continuation_timing["idea_ttl_minutes"]
     assert breakout_timing["profile_rationale_code"] == "SETUP_TIME_PROFILE_BREAKOUT_FAST"
+    assert swing_pullback_timing["idea_ttl_minutes"] == 120
+    assert 8 <= swing_breakout_timing["idea_ttl_minutes"] <= 15
 
 
 @pytest.mark.parametrize(
@@ -820,11 +836,20 @@ def test_trading_agent_allows_box_range_reversion_with_fast_scalp_profile(
     assert decision.decision == expected_decision
     assert decision.entry_mode == "pullback_confirm"
     assert decision.holding_profile == "scalp"
+    assert 30 <= int(decision.idea_ttl_minutes or 0) <= 45
     assert decision.max_holding_minutes <= 90
     assert expected_rationale in decision.rationale_codes
     assert "SETUP_TIME_PROFILE_RANGE_REVERSION_FAST" in decision.rationale_codes
     assert decision.stop_loss is not None
     assert abs(float(decision.stop_loss) - base.latest_price) <= features.atr
+    swing_timing = _agent()._build_entry_timing_profile(  # type: ignore[attr-defined]
+        expected_decision,
+        market_snapshot=base,
+        features=features,
+        entry_mode="pullback_confirm",
+        holding_profile="swing",
+    )
+    assert 30 <= swing_timing["idea_ttl_minutes"] <= 45
     assert metadata["strategy_engine"]["selected_engine"]["engine_name"] == "range_mean_reversion_engine"
 
 
@@ -1714,6 +1739,40 @@ def test_strategy_engine_selected_entry_is_used_for_ai_agreement_when_baseline_h
     assert agreement["baseline_entry_mode"] == "pullback_confirm"
     assert agreement["level"] == "full_agreement"
     assert agreement["direction_match"] is True
+
+
+def test_hold_baseline_and_hold_ai_output_are_full_agreement() -> None:
+    baseline = TradeDecision(
+        decision="hold",
+        confidence=0.52,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=None,
+        entry_zone_max=None,
+        entry_mode="none",
+        invalidation_price=None,
+        max_chase_bps=None,
+        idea_ttl_minutes=None,
+        stop_loss=None,
+        take_profit=None,
+        max_holding_minutes=120,
+        risk_pct=0.005,
+        leverage=1.0,
+        rationale_codes=["NO_EDGE"],
+        explanation_short="baseline hold",
+        explanation_detailed="Baseline and AI both hold.",
+    )
+    ai_decision = baseline.model_copy(update={"rationale_codes": ["AI_HOLD"]})
+
+    agreement = TradingDecisionAgent._build_decision_agreement(
+        baseline,
+        ai_decision,
+        ai_used=True,
+    )
+
+    assert agreement["level"] == "full_agreement"
+    assert agreement["direction_match"] is True
+    assert agreement["entry_mode_match"] is True
 
 
 def test_trading_agent_holds_when_matching_setup_cluster_is_active() -> None:

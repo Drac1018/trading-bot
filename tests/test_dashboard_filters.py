@@ -2693,6 +2693,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert btc["risk_guard"]["allowed"] is False
     assert btc["risk_guard"]["assigned_slot"] == "slot_1"
     assert btc["risk_guard"]["holding_profile"] == "scalp"
+    assert "debug_payload" not in btc["risk_guard"]
+    assert "current_cycle_result" not in btc["risk_guard"]
+    assert "raw_payload" not in btc["risk_guard"]
     assert btc["risk_guard_result"]["allowed"] is False
     assert btc["risk_guard_result"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
     assert btc["risk_guard_result"]["hold_decision"] is False
@@ -2721,6 +2724,154 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert eth["candidate_selection"]["candidate_weight"] == 0.42
     assert eth["execution"]["symbol"] == "ETHUSDT"
     assert len(payload["audit_events"]) >= 1
+
+
+def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_projection.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        market_response = client.get("/api/dashboard/operator?view=market")
+        scheduler_response = client.get("/api/dashboard/operator?view=scheduler")
+
+    assert market_response.status_code == 200
+    assert scheduler_response.status_code == 200
+
+    market_payload = market_response.json()
+    market_btc = next(item for item in market_payload["symbols"] if item["symbol"] == "BTCUSDT")
+
+    assert market_payload["market_signal"]["performance_windows"] == []
+    assert market_payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert market_payload["execution_windows"] == []
+    assert market_payload["audit_events"] == []
+    assert market_btc["latest_price"] == 70500.0
+    assert market_btc["ai_decision"]["decision_run_id"] is None
+    assert market_btc["risk_guard"]["risk_check_id"] is None
+    assert market_btc["event_operator_control"] is None
+    assert market_btc["audit_events"] == []
+
+    scheduler_payload = scheduler_response.json()
+    scheduler_btc = next(item for item in scheduler_payload["symbols"] if item["symbol"] == "BTCUSDT")
+
+    assert scheduler_payload["market_signal"]["performance_windows"] == []
+    assert scheduler_payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert scheduler_payload["execution_windows"] == []
+    assert scheduler_payload["audit_events"] == []
+    assert scheduler_btc["ai_decision"]["last_ai_trigger_reason"] == "entry_candidate_event"
+    assert scheduler_btc["risk_guard"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert scheduler_btc["candidate_selection"]["assigned_slot"] == "slot_1"
+    assert scheduler_btc["event_operator_control"] is None
+    assert scheduler_btc["execution"]["order_id"] is None
+    assert scheduler_btc["protection_status"]["status"] == "unknown"
+    assert scheduler_btc["audit_events"] == []
+
+
+def test_scheduler_api_compact_omits_outcome(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("scheduler_compact.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        compact_response = client.get("/api/scheduler?limit=20&compact=true")
+        full_response = client.get("/api/scheduler?limit=20")
+
+    assert compact_response.status_code == 200
+    assert full_response.status_code == 200
+    compact_payload = compact_response.json()
+    full_payload = full_response.json()
+
+    assert compact_payload
+    assert full_payload
+    assert "outcome" not in compact_payload[0]
+    assert "outcome" in full_payload[0]
+    assert compact_payload[0]["workflow"] == full_payload[0]["workflow"]
+
+
+def test_market_inputs_api_compact_omits_payload_and_keeps_symbol_filter(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("market_inputs_compact.db")
+    now = utcnow_naive()
+
+    with TestingSessionLocal() as session:
+        btc_market = MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=now,
+            latest_price=70000.0,
+            latest_volume=1200.0,
+            candle_count=1,
+            is_stale=False,
+            is_complete=True,
+            payload={
+                "candles": [
+                    {
+                        "timestamp": now.isoformat(),
+                        "open": 69900.0,
+                        "high": 70100.0,
+                        "low": 69800.0,
+                        "close": 70000.0,
+                        "volume": 1200.0,
+                    }
+                ]
+            },
+        )
+        eth_market = MarketSnapshot(
+            symbol="ETHUSDT",
+            timeframe="15m",
+            snapshot_time=now - timedelta(minutes=1),
+            latest_price=3400.0,
+            latest_volume=900.0,
+            candle_count=1,
+            is_stale=False,
+            is_complete=True,
+            payload={"candles": []},
+        )
+        session.add_all([btc_market, eth_market])
+        session.flush()
+        session.add(
+            FeatureSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                market_snapshot_id=btc_market.id,
+                feature_time=now,
+                trend_score=1.2,
+                volatility_pct=0.02,
+                volume_ratio=1.4,
+                drawdown_pct=0.01,
+                rsi=58.0,
+                atr=120.0,
+                payload={"multi_timeframe": {"1h": {"trend_score": 1.1}}},
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        compact_snapshots = client.get("/api/market/snapshots?limit=20&compact=true")
+        full_btc_snapshots = client.get("/api/market/snapshots?limit=1&symbol=BTCUSDT&timeframe=15m")
+        compact_features = client.get("/api/market/features?limit=20&compact=true")
+        full_btc_features = client.get("/api/market/features?limit=1&symbol=BTCUSDT&timeframe=15m")
+
+    assert compact_snapshots.status_code == 200
+    assert full_btc_snapshots.status_code == 200
+    assert compact_features.status_code == 200
+    assert full_btc_features.status_code == 200
+
+    compact_snapshot_payload = compact_snapshots.json()
+    full_snapshot_payload = full_btc_snapshots.json()
+    compact_feature_payload = compact_features.json()
+    full_feature_payload = full_btc_features.json()
+
+    assert {row["symbol"] for row in compact_snapshot_payload} == {"BTCUSDT", "ETHUSDT"}
+    assert all("payload" not in row for row in compact_snapshot_payload)
+    assert [row["symbol"] for row in full_snapshot_payload] == ["BTCUSDT"]
+    assert full_snapshot_payload[0]["payload"]["candles"][0]["close"] == 70000.0
+    assert all("payload" not in row for row in compact_feature_payload)
+    assert [row["symbol"] for row in full_feature_payload] == ["BTCUSDT"]
+    assert full_feature_payload[0]["payload"]["multi_timeframe"]["1h"]["trend_score"] == 1.1
 
 
 def test_decisions_api_compact_returns_operator_fields_without_raw_features(testclient_db_factory) -> None:

@@ -503,9 +503,9 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.get("/api/dashboard/operator")
-def dashboard_operator(db: Session = Depends(get_db)) -> dict[str, object]:
+def dashboard_operator(view: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
     _refresh_exchange_sync_for_read(triggered_by="api_dashboard_operator")
-    return get_operator_dashboard(db).model_dump(mode="json")
+    return get_operator_dashboard(db, view=view).model_dump(mode="json")
 
 
 @app.get("/api/dashboard/profitability")
@@ -514,13 +514,25 @@ def dashboard_profitability(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.get("/api/market/snapshots")
-def market_snapshots(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_market_snapshots(db, limit=_bounded_limit(limit))
+def market_snapshots(
+    limit: int = 50,
+    compact: bool = False,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_market_snapshots(db, limit=_bounded_limit(limit), compact=compact, symbol=symbol, timeframe=timeframe)
 
 
 @app.get("/api/market/features")
-def feature_snapshots(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_feature_snapshots(db, limit=_bounded_limit(limit))
+def feature_snapshots(
+    limit: int = 50,
+    compact: bool = False,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_feature_snapshots(db, limit=_bounded_limit(limit), compact=compact, symbol=symbol, timeframe=timeframe)
 
 
 @app.get("/api/decisions")
@@ -573,8 +585,8 @@ def agents(limit: int = 100, compact: bool = False, db: Session = Depends(get_db
 
 
 @app.get("/api/scheduler")
-def scheduler(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_scheduler_runs(db, limit=_bounded_limit(limit))
+def scheduler(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_scheduler_runs(db, limit=_bounded_limit(limit), compact=compact)
 
 
 @app.get("/api/audit")

@@ -5,6 +5,7 @@ import {
   AgentDebugView,
   DecisionView,
   MarketSignalView,
+  PositionsView,
   RiskView,
   SchedulerView,
   type MarketChartZoomRange,
@@ -18,11 +19,11 @@ import { type OperatorDashboardPayload } from "../../../components/overview-dash
 import { fetchJson } from "../../../lib/api";
 import { fetchBinanceChartCandlesBySymbol } from "../../../lib/binance-chart-candles";
 import { normalizeSettingsView } from "../../../lib/page-config";
-import { resolveSelectedSymbol } from "../../../lib/selected-symbol";
+import { ALL_SYMBOLS, resolveSelectedSymbol } from "../../../lib/selected-symbol";
 import { dashboardPages } from "../../../lib/page-config";
 
 type Row = Record<string, unknown>;
-type CandleWindow = 120 | 240 | 500 | 1000;
+type CandleWindow = 30 | 60 | 120;
 
 function queryValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
@@ -33,14 +34,11 @@ function queryValue(value: string | string[] | undefined) {
 
 function resolveCandleWindow(value: string | string[] | undefined): CandleWindow {
   const normalized = queryValue(value);
-  if (normalized === "1000") {
-    return 1000;
+  if (normalized === "30") {
+    return 30;
   }
-  if (normalized === "500") {
-    return 500;
-  }
-  if (normalized === "240") {
-    return 240;
+  if (normalized === "60") {
+    return 60;
   }
   if (normalized === "120") {
     return 120;
@@ -71,6 +69,21 @@ function resolveMarketChartZoomRange(value: string | string[] | undefined): Mark
     return null;
   }
   return { start, end };
+}
+
+function resolveDecisionEntryFlowTab(value: string | string[] | undefined): "summary" | "plan" | "execution" {
+  const normalized = queryValue(value);
+  if (normalized === "plan" || normalized === "execution") {
+    return normalized;
+  }
+  return "summary";
+}
+
+function operatorDashboardEndpoint(slug: string) {
+  if (slug === "market" || slug === "scheduler") {
+    return `/api/dashboard/operator?view=${slug}`;
+  }
+  return "/api/dashboard/operator";
 }
 
 export default async function DashboardPage({
@@ -105,8 +118,8 @@ export default async function DashboardPage({
     ? fetchJson<SettingsPayload>("/api/settings")
     : Promise.resolve<SettingsPayload | null>(null);
   const operatorPayloadPromise =
-    slug === "market" || slug === "decisions" || slug === "scheduler"
-      ? fetchJson<OperatorDashboardPayload>("/api/dashboard/operator")
+    slug === "market" || slug === "decisions" || slug === "scheduler" || slug === "risk"
+      ? fetchJson<OperatorDashboardPayload>(operatorDashboardEndpoint(slug))
       : Promise.resolve<OperatorDashboardPayload | null>(null);
 
   const sectionsPromise =
@@ -132,30 +145,49 @@ export default async function DashboardPage({
   let content: ReactNode = null;
 
   if (slug === "market" && operatorPayload) {
-    const selectedSymbol = resolveSelectedSymbol(
-      queryValue(query.symbol),
-      operatorPayload.control.tracked_symbols,
-      operatorPayload.control.default_symbol,
-      { mode: "all" },
-    );
+    const requestedMarketSymbol = queryValue(query.symbol);
+    const selectedSymbol =
+      requestedMarketSymbol?.trim().toUpperCase() === ALL_SYMBOLS
+        ? ALL_SYMBOLS
+        : resolveSelectedSymbol(
+            requestedMarketSymbol,
+            operatorPayload.control.tracked_symbols,
+            operatorPayload.control.default_symbol,
+            { mode: "single" },
+          );
     const selectedCandleWindow = resolveCandleWindow(query.candles);
     const selectedTimeframe = resolveMarketTimeframe(query.timeframe);
     const selectedChartZoomRange = resolveMarketChartZoomRange(query.zoom);
-    const trackedSymbols =
-      operatorPayload.control.tracked_symbols.length > 0
-        ? operatorPayload.control.tracked_symbols
-        : operatorPayload.symbols.map((symbol) => symbol.symbol);
-    const chartSymbols = selectedSymbol === "ALL" ? trackedSymbols : [selectedSymbol];
+    const chartSymbols = selectedSymbol === ALL_SYMBOLS ? [] : [selectedSymbol];
     const chartCandlesBySymbol = await fetchBinanceChartCandlesBySymbol({
       symbols: chartSymbols,
       timeframe: selectedTimeframe,
       limit: selectedCandleWindow,
     });
+    const selectedChartCandles =
+      selectedSymbol === ALL_SYMBOLS ? [] : (chartCandlesBySymbol[selectedSymbol.toUpperCase()] ?? []);
+    const needsChartPayloadFallback = selectedSymbol !== ALL_SYMBOLS && selectedChartCandles.length === 0;
+    const [chartFallbackSnapshots, chartFallbackFeatures] = needsChartPayloadFallback
+      ? await Promise.all([
+          fetchJson<Row[]>(
+            `/api/market/snapshots?limit=1&symbol=${encodeURIComponent(selectedSymbol)}&timeframe=${encodeURIComponent(
+              selectedTimeframe,
+            )}`,
+          ),
+          fetchJson<Row[]>(
+            `/api/market/features?limit=1&symbol=${encodeURIComponent(selectedSymbol)}&timeframe=${encodeURIComponent(
+              selectedTimeframe,
+            )}`,
+          ),
+        ])
+      : [undefined, undefined];
     content = (
       <MarketSignalView
         operator={operatorPayload}
         snapshots={normalizedSections[0]?.rows ?? []}
         features={normalizedSections[1]?.rows ?? []}
+        chartSnapshots={chartFallbackSnapshots}
+        chartFeatures={chartFallbackFeatures}
         selectedSymbol={selectedSymbol}
         selectedCandleWindow={selectedCandleWindow}
         selectedTimeframe={selectedTimeframe}
@@ -175,13 +207,17 @@ export default async function DashboardPage({
         operator={operatorPayload}
         decisionRows={normalizedSections[0]?.rows ?? []}
         selectedSymbol={selectedSymbol}
+        entryFlowTab={resolveDecisionEntryFlowTab(query.flow)}
       />
     );
   } else if (slug === "scheduler" && operatorPayload) {
     content = <SchedulerView operator={operatorPayload} schedulerRows={normalizedSections[0]?.rows ?? []} />;
+  } else if (slug === "positions") {
+    content = <PositionsView positionRows={normalizedSections[0]?.rows ?? []} />;
   } else if (slug === "risk") {
     content = (
       <RiskView
+        operator={operatorPayload}
         riskRows={normalizedSections[0]?.rows ?? []}
         alertRows={normalizedSections[1]?.rows ?? []}
       />

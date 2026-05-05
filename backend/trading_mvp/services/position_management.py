@@ -183,7 +183,7 @@ def seed_position_management_metadata(
     ai_stop_management_allowed: bool = True,
     hard_stop_active: bool = True,
 ) -> dict[str, Any]:
-    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
     management = _management_metadata(position)
     profile = str(holding_profile or HOLDING_PROFILE_SCALP).strip().lower()
     management_policy = resolve_holding_profile_management_policy(profile)
@@ -231,6 +231,8 @@ def seed_position_management_metadata(
             "partial_take_profit_trigger_r": _coerce_float(management_policy.get("partial_take_profit_trigger_r")),
             "partial_take_profit_fraction": _coerce_float(management_policy.get("partial_take_profit_fraction")),
             "trailing_stop_atr_multiplier": _coerce_float(management_policy.get("trailing_stop_atr_multiplier")),
+            "take_profit_order_mode": str(management_policy.get("take_profit_order_mode") or "full_close"),
+            "runner_after_partial_take_profit": bool(management_policy.get("runner_after_partial_take_profit")),
             "early_fail_minutes": time_profile["early_fail_minutes"],
             "early_fail_r_floor": time_profile["early_fail_r_floor"],
             "hold_extension_minutes": time_profile["hold_extension_minutes"],
@@ -245,7 +247,7 @@ def seed_position_management_metadata(
 
 
 def mark_partial_take_profit_taken(position: Position) -> dict[str, Any]:
-    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
     management = _management_metadata(position)
     management["partial_take_profit_taken"] = True
     management["partial_take_profit_taken_at"] = utcnow_naive().isoformat()
@@ -257,7 +259,7 @@ def mark_partial_take_profit_taken(position: Position) -> dict[str, Any]:
 
 
 def mark_time_stop_action(position: Position, *, action: str) -> dict[str, Any]:
-    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
     management = _management_metadata(position)
     management["time_stop_action_taken"] = action
     management["time_stop_action_taken_at"] = utcnow_naive().isoformat()
@@ -276,7 +278,7 @@ def record_add_on_metadata(
     leverage_multiplier: float | None = None,
     notional_multiplier: float | None = None,
 ) -> dict[str, Any]:
-    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
     management = _management_metadata(position)
     add_on_count = int(management.get("add_on_count") or 0) + 1
     now = utcnow_naive().isoformat()
@@ -305,7 +307,7 @@ def record_add_on_metadata(
 
 
 def store_position_management_context(position: Position, context: dict[str, Any]) -> dict[str, Any]:
-    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
     management = _management_metadata(position)
     management["last_context"] = context
     for key in (
@@ -334,6 +336,8 @@ def store_position_management_context(position: Position, context: dict[str, Any
         "partial_take_profit_trigger_r",
         "partial_take_profit_fraction",
         "trailing_stop_atr_multiplier",
+        "take_profit_order_mode",
+        "runner_after_partial_take_profit",
     ):
         if key in context:
             management[key] = context.get(key)
@@ -754,6 +758,16 @@ def build_position_management_context(
         "partial_take_profit_taken": partial_take_profit_taken,
         "partial_take_profit_trigger_r": partial_take_profit_trigger_r,
         "partial_take_profit_fraction": partial_take_profit_fraction,
+        "take_profit_order_mode": str(
+            management.get("take_profit_order_mode")
+            or management_policy.get("take_profit_order_mode")
+            or "full_close"
+        ),
+        "runner_after_partial_take_profit": bool(
+            management.get("runner_after_partial_take_profit")
+            if "runner_after_partial_take_profit" in management
+            else management_policy.get("runner_after_partial_take_profit")
+        ),
         "early_fail_minutes": early_fail_minutes,
         "early_fail_r_floor": early_fail_r_floor,
         "time_to_fail_basis": time_to_fail_basis,

@@ -17,12 +17,14 @@ from trading_mvp.schemas import (
 from trading_mvp.services.binance import BinanceAPIError
 from trading_mvp.services.binance_user_stream import normalize_user_stream_event
 from trading_mvp.services.execution import (
+    _build_protection_state,
     _cancel_exit_orders,
     _cap_quantity_to_approved_notional,
     _record_live_trades,
     _signed_slippage_bps,
     apply_normalized_user_stream_events,
     apply_position_management,
+    apply_user_stream_event,
     build_execution_intent,
     execute_live_trade,
     poll_live_user_stream,
@@ -1212,6 +1214,53 @@ class EntrySuccessClient:
         return {"status": "CANCELED"}
 
 
+class SwingProtectiveClient(EntrySuccessClient):
+    def new_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        stop_price: float | None = None,
+        reduce_only: bool = False,
+        close_position: bool = False,
+        client_order_id: str | None = None,
+        response_type: str = "RESULT",
+        working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
+    ):
+        if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}:
+            order_id = "swing-stop-1" if order_type == "STOP_MARKET" else "swing-tp-1"
+            payload = {
+                "orderId": order_id,
+                "clientOrderId": client_order_id or order_id,
+                "type": order_type,
+                "closePosition": "true" if close_position else "false",
+                "reduceOnly": "true" if reduce_only else "false",
+                "stopPrice": str(stop_price or 0),
+                "origQty": str(quantity or 0.0),
+                "status": "NEW",
+            }
+            self.orders.append(payload)
+            return payload
+        return super().new_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            reduce_only=reduce_only,
+            close_position=close_position,
+            client_order_id=client_order_id,
+            response_type=response_type,
+            working_type=working_type,
+            time_in_force=time_in_force,
+        )
+
+
 class SignedSlippageEntryClient(EntrySuccessClient):
     def __init__(self, *, fill_price: float) -> None:
         super().__init__()
@@ -2234,9 +2283,197 @@ def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_sess
     assert result["position_management"]["metadata"]["initial_stop_type"] == "deterministic_hard_stop"
     assert result["position_management"]["metadata"]["hard_stop_active"] is True
     assert result["position_management"]["metadata"]["stop_widening_allowed"] is False
+    db_session.flush()
+    db_session.expire(position, ["metadata_json"])
+    assert position.metadata_json["position_management"]["initial_stop_loss"] == 69000.0
+    assert position.metadata_json["position_management"]["planned_max_holding_minutes"] == 120
     assert client.account_info_calls >= 3
     assert client.open_orders_calls >= 3
     assert client.position_information_calls >= 3
+
+
+def test_swing_entry_uses_partial_reduce_take_profit_order(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = SwingProtectiveClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    decision = _live_decision("long")
+    decision.holding_profile = "swing"
+    decision.holding_profile_reason = "intraday_alignment_supports_swing"
+    decision.max_holding_minutes = 240
+
+    result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=55,
+        decision=decision,
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    stop_order = db_session.scalar(select(Order).where(Order.order_type == "stop_market"))
+    tp_order = db_session.scalar(select(Order).where(Order.order_type == "take_profit_market"))
+
+    assert result["status"] == "filled"
+    assert result["protective_state"]["status"] == "protected"
+    assert result["position_management"]["metadata"]["holding_profile"] == "swing"
+    assert result["position_management"]["metadata"]["take_profit_order_mode"] == "partial_reduce"
+    assert result["position_management"]["metadata"]["runner_after_partial_take_profit"] is True
+    assert stop_order is not None
+    assert stop_order.close_only is True
+    assert stop_order.reduce_only is True
+    assert tp_order is not None
+    assert tp_order.close_only is False
+    assert tp_order.reduce_only is True
+    assert tp_order.requested_quantity == pytest.approx(0.0025)
+    assert tp_order.metadata_json["take_profit_execution_policy"]["mode"] == "partial_reduce"
+    assert tp_order.metadata_json["take_profit_execution_policy"]["holding_profile"] == "swing"
+    assert [item["closePosition"] for item in client.orders if item["type"] == "TAKE_PROFIT_MARKET"] == ["false"]
+
+
+def test_swing_runner_after_partial_take_profit_requires_only_stop_loss(db_session) -> None:
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=71800.0,
+        leverage=2.0,
+        stop_loss=70500.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=18.0,
+        metadata_json={
+            "position_management": {
+                "holding_profile": "swing",
+                "partial_take_profit_taken": True,
+                "take_profit_order_mode": "partial_reduce",
+                "runner_after_partial_take_profit": True,
+            }
+        },
+    )
+
+    state = _build_protection_state(
+        position,
+        [
+            {
+                "orderId": "stop-1",
+                "clientOrderId": "stop-1",
+                "type": "STOP_MARKET",
+                "closePosition": "true",
+                "reduceOnly": "true",
+                "stopPrice": "70500",
+                "status": "NEW",
+            }
+        ],
+    )
+
+    assert state["status"] == "protected"
+    assert state["has_stop_loss"] is True
+    assert state["has_take_profit"] is False
+    assert state["take_profit_required"] is False
+    assert state["missing_components"] == []
+
+
+def test_user_stream_marks_swing_partial_take_profit_as_taken(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=72000.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        realized_pnl=0.0,
+        unrealized_pnl=20.0,
+        metadata_json={
+            "position_management": {
+                "holding_profile": "swing",
+                "partial_take_profit_taken": False,
+                "take_profit_order_mode": "partial_reduce",
+                "runner_after_partial_take_profit": True,
+            }
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=None,
+        risk_check_id=None,
+        position_id=position.id,
+        side="sell",
+        order_type="take_profit_market",
+        mode="live",
+        status="pending",
+        external_order_id="swing-tp-1",
+        client_order_id="swing-tp-client-1",
+        reduce_only=True,
+        close_only=False,
+        requested_quantity=0.0025,
+        requested_price=72000.0,
+        filled_quantity=0.0,
+        average_fill_price=0.0,
+        reason_codes=[],
+        metadata_json={
+            "take_profit_execution_policy": {
+                "holding_profile": "swing",
+                "mode": "partial_reduce",
+                "partial_take_profit_fraction": 0.25,
+                "runner_after_partial_take_profit": True,
+            }
+        },
+    )
+    db_session.add(order)
+    db_session.flush()
+
+    apply_user_stream_event(
+        db_session,
+        settings_row,
+        event_payload={
+            "e": "ORDER_TRADE_UPDATE",
+            "E": int(utcnow_naive().timestamp() * 1000),
+            "o": {
+                "s": "BTCUSDT",
+                "i": "swing-tp-1",
+                "c": "swing-tp-client-1",
+                "X": "FILLED",
+                "q": "0.0025",
+                "z": "0.0025",
+                "ap": "72000",
+                "p": "0",
+                "sp": "72000",
+                "R": "true",
+                "cp": "false",
+                "o": "TAKE_PROFIT_MARKET",
+                "S": "SELL",
+                "ps": "BOTH",
+                "t": "partial-tp-trade-1",
+                "l": "0.0025",
+                "L": "72000",
+                "n": "0.01",
+                "N": "USDT",
+                "rp": "5.0",
+            },
+        },
+    )
+    db_session.flush()
+
+    refreshed = db_session.get(Position, position.id)
+    event = db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "partial_tp_executed").order_by(AuditEvent.id.desc())
+    )
+
+    assert refreshed is not None
+    assert refreshed.metadata_json["position_management"]["partial_take_profit_taken"] is True
+    assert event is not None
+    assert event.payload["source"] == "exchange_take_profit_order"
 
 
 def test_live_execution_records_signed_slippage_in_result_audit_and_execution(monkeypatch, db_session) -> None:

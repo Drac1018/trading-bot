@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 from trading_mvp.models import AgentRun, MarketSnapshot, Position, SchedulerRun, SystemHealthEvent
 from trading_mvp.services.orchestrator import TradingOrchestrator
-from trading_mvp.services.runtime_state import mark_sync_success
+from trading_mvp.services.runtime_state import build_sync_freshness_summary, mark_sync_success
 from trading_mvp.services.scheduler import (
     abandon_stale_scheduler_runs,
     get_due_interval_decision_symbols,
@@ -24,6 +24,26 @@ def _mark_sync_fresh(settings_row) -> None:
     now = utcnow_naive()
     for scope in ("account", "positions", "open_orders", "protective_orders"):
         mark_sync_success(settings_row, scope=scope, synced_at=now)
+
+
+def test_interval_plan_account_trust_allows_flat_protective_staleness(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    mark_sync_success(settings_row, scope="account", synced_at=now)
+    mark_sync_success(settings_row, scope="positions", synced_at=now)
+    mark_sync_success(settings_row, scope="open_orders", synced_at=now)
+    mark_sync_success(
+        settings_row,
+        scope="protective_orders",
+        synced_at=now - timedelta(seconds=120),
+        stale_after_seconds=90,
+        status="flat",
+    )
+    db_session.flush()
+
+    summary = build_sync_freshness_summary(settings_row)
+
+    assert TradingOrchestrator._account_untrusted_sync_reason_codes(summary) == []
 
 
 def _seed_decision_run(
@@ -459,6 +479,7 @@ def test_time_based_backstop_no_longer_triggers_review(monkeypatch, db_session) 
             "ai_backstop_interval_minutes_override": 30,
         }
     ]
+    _mark_sync_fresh(settings_row)
     db_session.add(settings_row)
     db_session.flush()
 
@@ -477,8 +498,8 @@ def test_time_based_backstop_no_longer_triggers_review(monkeypatch, db_session) 
                 {
                     "symbol": "BTCUSDT",
                     "selected": False,
-                    "selection_reason": "score_below_threshold",
-                    "rejected_reason": "score_below_threshold",
+                    "selection_reason": "underperforming_expectancy_bucket",
+                    "rejected_reason": "underperforming_expectancy_bucket",
                     "entry_mode": "pullback_confirm",
                     "strategy_engine": "trend_pullback_engine",
                     "holding_profile": "scalp",
@@ -796,6 +817,66 @@ def test_interval_scheduler_keeps_ai_invoked_hold_distinct_from_skip(monkeypatch
     assert outcome["last_ai_skip_reason"] is None
     assert outcome["ai_skipped_reason"] is None
     assert outcome["execution"] is None
+
+
+def test_interval_scheduler_rechecks_exchange_sync_before_triggered_decision(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _entry_candidate_interval_plan(now=now),
+    )
+
+    refresh_calls: list[str] = []
+
+    def fake_refresh(session, *, triggered_by: str):  # noqa: ANN001
+        refresh_calls.append(triggered_by)
+        if triggered_by == "scheduler:pre_decision:BTCUSDT":
+            return {"status": "ok", "triggered_by": triggered_by}
+        return None
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness", fake_refresh)
+
+    def fake_run_decision_cycle(self, **kwargs):  # noqa: ANN001
+        assert kwargs["exchange_sync_checked"] is True
+        return {
+            "symbol": "BTCUSDT",
+            "decision_run_id": 101,
+            "risk_check_id": 202,
+            "decision": {"decision": "hold"},
+            "risk_result": {
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            "execution": None,
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": now.isoformat(),
+            "last_ai_skip_reason": None,
+            "ai_skipped_reason": None,
+            "trigger_deduped": False,
+            "trigger_fingerprint": "entry-candidate-fingerprint",
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcome = result["results"][0]["outcome"]
+
+    assert refresh_calls == ["scheduler:pre_decision", "scheduler:pre_decision:BTCUSDT"]
+    assert outcome["pre_decision_exchange_sync"] == {
+        "status": "ok",
+        "triggered_by": "scheduler:pre_decision:BTCUSDT",
+    }
+    assert outcome["last_ai_skip_reason"] is None
 
 
 def test_interval_scheduler_surfaces_preai_weak_volume_skip(monkeypatch, db_session) -> None:

@@ -50,6 +50,7 @@ from trading_mvp.services.runtime_state import (
     get_operating_state,
     get_reconciliation_blocking_reason_codes,
     get_reconciliation_detail,
+    sync_scope_blocks_new_entry,
 )
 from trading_mvp.services.settings import (
     build_event_operator_control_payload,
@@ -88,6 +89,8 @@ EVENT_POLICY_APPROVAL_REASON_CODES = {
     "alignment_not_aligned",
     "alignment_insufficient_data",
 }
+MACRO_EVENT_RESULT_CONFLICT_REASON_CODE = "MACRO_EVENT_RESULT_CONFLICT"
+MACRO_EVENT_RESULT_MIN_CONFLICT_CONFIDENCE = 0.25
 IMMEDIATE_ENTRY_ALLOWED_RATIONALE_CODES = frozenset({"PENDING_ENTRY_PLAN_TRIGGERED"})
 AUTO_RESIZE_REASON_CODE_MAP = {
     "gross_exposure_headroom_notional": "ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT",
@@ -267,11 +270,7 @@ def _market_freshness_reason_codes(market_snapshot: MarketSnapshotPayload) -> li
 def _sync_freshness_reason_codes(sync_freshness_summary: dict[str, Any]) -> list[str]:
     reason_codes: list[str] = []
     for scope, reason_code in SYNC_BLOCKING_REASON_CODES.items():
-        scope_summary = sync_freshness_summary.get(scope)
-        if not isinstance(scope_summary, dict):
-            reason_codes.append(reason_code)
-            continue
-        if bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
+        if sync_scope_blocks_new_entry(sync_freshness_summary, scope):
             reason_codes.append(reason_code)
     return reason_codes
 
@@ -322,6 +321,37 @@ def _as_string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item not in {None, ""}]
+
+
+def _macro_event_result_context(decision_context: dict[str, Any] | None) -> dict[str, Any]:
+    context = _as_dict(decision_context)
+    event_risk_context = _as_dict(context.get("event_risk_context"))
+    event_result_context = _as_dict(event_risk_context.get("event_result_context"))
+    if event_result_context:
+        return event_result_context
+    ai_context = _as_dict(context.get("ai_context"))
+    event_risk_context = _as_dict(ai_context.get("event_risk_context"))
+    return _as_dict(event_risk_context.get("event_result_context"))
+
+
+def _macro_event_result_conflict_reason(
+    *,
+    decision: TradeDecision,
+    event_result_context: dict[str, Any],
+) -> str | None:
+    if not bool(event_result_context.get("available", False)):
+        return None
+    if not bool(event_result_context.get("reaction_window_active", False)):
+        return None
+    bias = str(event_result_context.get("event_result_bias") or "").strip().lower()
+    confidence = _optional_float(event_result_context.get("event_result_confidence")) or 0.0
+    if confidence < MACRO_EVENT_RESULT_MIN_CONFLICT_CONFIDENCE:
+        return None
+    if decision.decision == "long" and bias == "bearish":
+        return MACRO_EVENT_RESULT_CONFLICT_REASON_CODE
+    if decision.decision == "short" and bias == "bullish":
+        return MACRO_EVENT_RESULT_CONFLICT_REASON_CODE
+    return None
 
 
 def _lead_context_payload(decision_context: dict[str, Any] | None) -> dict[str, Any]:
@@ -378,6 +408,15 @@ def _decision_agreement_context(decision_context: dict[str, Any] | None) -> dict
         else {}
     )
     level = str(payload.get("level") or "full_agreement")
+    baseline_decision = payload.get("baseline_decision")
+    final_decision = payload.get("final_decision")
+    same_non_entry_decision = (
+        str(baseline_decision or "").strip().lower()
+        == str(final_decision or "").strip().lower()
+        and str(baseline_decision or "").strip().lower() in {"hold", "reduce", "exit"}
+    )
+    if level == "disagreement" and same_non_entry_decision:
+        level = "full_agreement"
     if level not in DECISION_AGREEMENT_MULTIPLIERS:
         level = "full_agreement"
     ai_used = bool(payload.get("ai_used", False))
@@ -388,11 +427,16 @@ def _decision_agreement_context(decision_context: dict[str, Any] | None) -> dict
         "ai_used": ai_used,
         "comparison_source": str(payload.get("comparison_source") or "unknown"),
         "level": level,
-        "direction_match": bool(payload.get("direction_match", False)),
-        "entry_mode_match": bool(payload.get("entry_mode_match", False)),
-        "baseline_decision": payload.get("baseline_decision"),
+        "direction_match": bool(payload.get("direction_match", False)) or same_non_entry_decision,
+        "entry_mode_match": bool(payload.get("entry_mode_match", False))
+        or (
+            same_non_entry_decision
+            and str(payload.get("baseline_entry_mode") or "none").strip().lower()
+            == str(payload.get("final_entry_mode") or "none").strip().lower()
+        ),
+        "baseline_decision": baseline_decision,
         "baseline_entry_mode": payload.get("baseline_entry_mode"),
-        "final_decision": payload.get("final_decision"),
+        "final_decision": final_decision,
         "final_entry_mode": payload.get("final_entry_mode"),
         "risk_pct_multiplier": float(multiplier_profile["risk_pct_multiplier"]),
         "leverage_multiplier": float(multiplier_profile["leverage_multiplier"]),
@@ -1194,6 +1238,13 @@ def _effective_leverage_cap(settings_row: Setting, symbol: str) -> float:
     return min(HARD_MAX_GLOBAL_LEVERAGE, settings_row.max_leverage, get_symbol_leverage_cap(symbol))
 
 
+def _exchange_leverage_for_risk(approved_leverage: float, effective_leverage_cap: float) -> float:
+    leverage = min(max(approved_leverage, 0.0), max(effective_leverage_cap, 0.0))
+    if leverage <= 0.0:
+        return 0.0
+    return float(max(1, int(leverage)))
+
+
 def _position_notional(quantity: float, price: float) -> float:
     return abs(quantity) * max(price, 0.0)
 
@@ -1795,6 +1846,11 @@ def evaluate_risk(
     setup_cluster_state = _setup_cluster_state_context(decision_context)
     suppression_context = _recent_performance_suppression_context(decision_context, decision)
     meta_gate = _meta_gate_context(decision_context)
+    event_result_context = _macro_event_result_context(decision_context)
+    macro_event_result_conflict_reason = _macro_event_result_conflict_reason(
+        decision=decision,
+        event_result_context=event_result_context,
+    )
     holding_profile = _holding_profile_context(decision, decision_context)
     holding_profile_name = str(holding_profile["holding_profile"])
     holding_profile_policy = (
@@ -1944,6 +2000,8 @@ def evaluate_risk(
         blocked_reason_codes.append(agreement_block_reason_code)
     if is_entry_decision and meta_gate["applies_block"]:
         blocked_reason_codes.extend(list(meta_gate["reject_reason_codes"]))
+    if is_entry_decision and macro_event_result_conflict_reason is not None:
+        blocked_reason_codes.append(macro_event_result_conflict_reason)
     if is_entry_decision and holding_profile_name in {HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}:
         if bool(holding_profile_policy.get("require_meta_gate_pass", False)) and meta_gate["gate_decision"] != "pass":
             blocked_reason_codes.append(HOLDING_PROFILE_REQUIRES_META_GATE_PASS_REASON_CODE)
@@ -2254,6 +2312,14 @@ def evaluate_risk(
 
     approved_risk_pct = 0.0
     approved_leverage = 0.0
+    raw_approved_leverage = 0.0
+    combined_risk_multiplier = 1.0
+    combined_leverage_multiplier = 1.0
+    exchange_leverage_notional_cap = 0.0
+    exchange_leverage_adjusted_notional = 0.0
+    exchange_leverage_adjusted_quantity: float | None = None
+    exchange_leverage_adjustment_reason_code: str | None = None
+    exchange_leverage_reason_code: str | None = None
     if allowed:
         if is_entry_decision and raw_projected_notional > 0:
             combined_risk_multiplier = (
@@ -2281,7 +2347,7 @@ def evaluate_risk(
                 ),
                 6,
             )
-            approved_leverage = round(
+            raw_approved_leverage = round(
                 min(
                     decision.leverage * combined_leverage_multiplier,
                     effective_leverage_cap,
@@ -2289,10 +2355,95 @@ def evaluate_risk(
                 6,
             )
             if same_side_pyramiding and existing_position is not None and existing_position.leverage > 0:
-                approved_leverage = round(min(approved_leverage, float(existing_position.leverage)), 6)
+                raw_approved_leverage = round(min(raw_approved_leverage, float(existing_position.leverage)), 6)
+            approved_leverage = _exchange_leverage_for_risk(raw_approved_leverage, effective_leverage_cap)
         else:
             approved_risk_pct = decision.risk_pct
-            approved_leverage = min(decision.leverage, effective_leverage_cap)
+            raw_approved_leverage = min(decision.leverage, effective_leverage_cap)
+            approved_leverage = raw_approved_leverage
+    if allowed and is_entry_decision and approved_projected_notional > 0.0:
+        exchange_leverage_notional_cap = round(max(latest_pnl.equity, 0.0) * approved_leverage, 6)
+        if approved_leverage <= 0.0 or exchange_leverage_notional_cap <= 0.0:
+            blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
+            approved_projected_notional = 0.0
+            approved_quantity = None
+            approved_risk_pct = 0.0
+            approved_leverage = 0.0
+        elif approved_projected_notional > exchange_leverage_notional_cap + 1e-9:
+            exchange_target_quantity = (
+                min(
+                    approved_quantity or raw_projected_quantity,
+                    exchange_leverage_notional_cap / max(raw_size["entry_price"], 1.0),
+                )
+                if (approved_quantity or raw_projected_quantity) > 0
+                else 0.0
+            )
+            exchange_leverage_payload = _normalize_entry_size_for_risk(
+                settings_row,
+                symbol=decision.symbol,
+                quantity=exchange_target_quantity,
+                reference_price=raw_size["entry_price"],
+                approved_notional=exchange_leverage_notional_cap,
+                exchange_client=exchange_client,
+                enable_exchange_filters=execution_mode == "live" or exchange_client is not None,
+            )
+            exchange_leverage_adjusted_notional = _coerce_float(exchange_leverage_payload.get("notional"))
+            exchange_leverage_adjusted_quantity = (
+                _coerce_float(exchange_leverage_payload.get("quantity"))
+                if _coerce_float(exchange_leverage_payload.get("quantity")) > 0
+                else None
+            )
+            exchange_leverage_reason_code = (
+                str(exchange_leverage_payload.get("reason_code") or "").strip() or None
+            )
+            if exchange_leverage_reason_code is not None:
+                blocked_reason_codes.append("ENTRY_SIZE_BELOW_MIN_NOTIONAL")
+                approved_projected_notional = 0.0
+                approved_quantity = None
+                approved_risk_pct = 0.0
+                approved_leverage = 0.0
+            else:
+                approved_projected_notional = exchange_leverage_adjusted_notional
+                approved_quantity = (
+                    exchange_leverage_adjusted_quantity
+                    if exchange_leverage_adjusted_quantity is not None and exchange_leverage_adjusted_quantity > 0
+                    else None
+                )
+                resized_projected_notional = approved_projected_notional
+                resized_projected_quantity = approved_quantity
+                exposure_metrics = _build_exposure_metrics(
+                    session,
+                    decision.symbol,
+                    latest_pnl.equity,
+                    projected_side=decision.decision,
+                    projected_notional=approved_projected_notional,
+                )
+                approved_risk_pct = round(
+                    min(
+                        decision.risk_pct
+                        * (approved_projected_notional / max(raw_projected_notional, 1e-9))
+                        * combined_risk_multiplier,
+                        effective_risk_cap,
+                    ),
+                    6,
+                )
+                auto_resized_entry = True
+                size_adjustment_ratio = round(
+                    approved_projected_notional / max(raw_projected_notional, 1e-9),
+                    6,
+                )
+                auto_resize_reason = "CLAMPED_TO_EXCHANGE_LEVERAGE"
+                exchange_leverage_adjustment_reason_code = "ENTRY_CLAMPED_TO_EXCHANGE_LEVERAGE"
+                adjustment_reason_codes.extend(["ENTRY_AUTO_RESIZED", exchange_leverage_adjustment_reason_code])
+    blocked_reason_codes = list(dict.fromkeys(blocked_reason_codes))
+    adjustment_reason_codes = list(dict.fromkeys(adjustment_reason_codes))
+    reason_codes = list(blocked_reason_codes)
+    allowed = len(blocked_reason_codes) == 0
+    if not allowed:
+        approved_risk_pct = 0.0
+        approved_leverage = 0.0
+        approved_projected_notional = 0.0
+        approved_quantity = None
     sync_timestamp_debug = {
         "account_sync_at": (
             str(sync_freshness_summary.get("account", {}).get("last_sync_at"))
@@ -2333,6 +2484,18 @@ def evaluate_risk(
         "requested_exchange_quantity": _round_float(requested_exchange_quantity),
         "requested_exchange_reason_code": requested_exchange_reason_code,
         "resized_exchange_reason_code": resized_exchange_reason_code,
+        "exchange_leverage": {
+            "raw_approved_leverage": _round_float(raw_approved_leverage),
+            "approved_exchange_leverage": _round_float(approved_leverage),
+            "notional_cap": _round_float(exchange_leverage_notional_cap),
+            "adjusted_notional": _round_float(
+                exchange_leverage_adjusted_notional if exchange_leverage_adjusted_notional > 0 else None
+            ),
+            "adjusted_quantity": _round_float(exchange_leverage_adjusted_quantity),
+            "adjustment_reason_code": exchange_leverage_adjustment_reason_code,
+            "exchange_reason_code": exchange_leverage_reason_code,
+            "comparison": "approved_notional_capped_to_integer_exchange_leverage",
+        },
         "projected_symbol_notional": (
             _round_float(exposure_metrics.get("decision_symbol_notional", 0.0))
             if is_entry_decision
@@ -2415,6 +2578,11 @@ def evaluate_risk(
             "same_side_pyramiding": same_side_pyramiding,
         },
         "lead_market_context": lead_market_context,
+        "macro_event_result_policy": {
+            "context": event_result_context,
+            "conflict_reason_code": macro_event_result_conflict_reason,
+            "applied": bool(is_entry_decision and macro_event_result_conflict_reason is not None),
+        },
         "suppression_context": suppression_context,
         "setup_cluster_state": setup_cluster_state,
         "adaptive_setup_disable": {

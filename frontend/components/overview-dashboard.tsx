@@ -204,7 +204,7 @@ type OperatorRiskSnapshot = {
   capacity_reason: string | null;
   portfolio_slot_soft_cap_applied: boolean;
   exposure_headroom_snapshot: Record<string, number>;
-  debug_payload: Record<string, unknown>;
+  debug_payload?: Record<string, unknown>;
 };
 
 type ExecutionFillSummary = {
@@ -277,14 +277,37 @@ type OperatorCandidateSelectionSnapshot = {
 
 type OperatorPendingEntryPlanSnapshot = {
   plan_id: number | null;
+  symbol?: string | null;
+  side?: "long" | "short" | null;
   plan_status: string | null;
   source_decision_run_id: number | null;
+  source_risk_check_id?: number | null;
+  source_blocked_reason_codes?: string[];
+  source_timeframe?: string | null;
+  regime?: string | null;
+  posture?: string | null;
+  rationale_codes?: string[];
   entry_mode: string | null;
+  holding_profile?: string | null;
+  holding_profile_reason?: string | null;
+  entry_zone_min?: number | null;
+  entry_zone_max?: number | null;
+  invalidation_price?: number | null;
+  max_chase_bps?: number | null;
+  idea_ttl_minutes?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  risk_pct_cap?: number | null;
+  leverage_cap?: number | null;
   created_at?: string | null;
   expires_at?: string | null;
   triggered_at?: string | null;
   canceled_at?: string | null;
   canceled_reason?: string | null;
+  idempotency_key?: string | null;
+  last_watch_at?: string | null;
+  last_watch_snapshot_id?: number | null;
+  trigger_details?: Record<string, unknown>;
 };
 
 type OperatorProtectionSummary = {
@@ -912,7 +935,7 @@ function translateReasonCode(value: string | null | undefined) {
     ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "단일 포지션 한도에 맞춰 신규 진입 크기를 줄였습니다.",
     ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "같은 티어 집중도를 낮추기 위해 신규 진입 크기를 줄였습니다.",
     LARGEST_POSITION_LIMIT_REACHED: "심볼 집중도 한도 유지",
-    DETERMINISTIC_BASELINE_DISAGREEMENT: "결정론적 기준선 불일치 상태 유지",
+    DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 최종 판단과 기준선 불일치",
     ENTRY_SIZE_BELOW_MIN_NOTIONAL: "거래소 최소 주문 금액보다 작습니다.",
     ENTRY_TRIGGER_NOT_MET: "지금은 진입 조건이 아직 맞지 않습니다.",
     CHASE_LIMIT_EXCEEDED: "추격 진입 한도를 넘었습니다.",

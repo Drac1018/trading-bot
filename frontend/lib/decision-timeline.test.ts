@@ -107,6 +107,25 @@ test("pending entry plan is surfaced before execution is shown as missing", asyn
   assert.ok(execution.detail.includes("조건"));
 });
 
+test("canceled entry plan reason is translated for operators", async () => {
+  const { summarizeExecutionState } = await decisionTimelineModule;
+
+  const symbol = buildSymbol({
+    pending_entry_plan: {
+      plan_id: 43,
+      plan_status: "canceled",
+      entry_mode: "pullback_confirm",
+      canceled_reason: "PLAN_CANCELED_NO_ENTRY_CAPACITY",
+    },
+  });
+
+  const execution = summarizeExecutionState(symbol);
+
+  assert.equal(execution.label, "진입 플랜 취소");
+  assert.ok(execution.detail.includes("추가 진입 여유"));
+  assert.doesNotMatch(execution.detail, /PLAN_CANCELED_NO_ENTRY_CAPACITY/);
+});
+
 test("risk pass remains distinct from order submission", async () => {
   const { summarizeExecutionState, summarizeRiskGate } = await decisionTimelineModule;
 

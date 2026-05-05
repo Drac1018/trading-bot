@@ -87,6 +87,10 @@ test("ui-copy keeps reason codes meaning-first for operator-facing tables", asyn
     formatDisplayValue("LIVE_APPROVAL_REQUIRED"),
     "실거래 승인 창이 닫혀 있어 신규 진입을 보류했습니다.",
   );
+  assert.equal(
+    formatDisplayValue("PLAN_CANCELED_NO_ENTRY_CAPACITY"),
+    "이미 열린 포지션 때문에 추가 진입 여유가 없어 대기 플랜 감시를 중단했습니다.",
+  );
 });
 
 test("ui-copy exposes active-position suppression fields with operator wording", async () => {
@@ -104,7 +108,11 @@ test("ui-copy exposes active-position suppression fields with operator wording",
   );
   assert.equal(
     formatDisplayValue("DETERMINISTIC_BASELINE_DISAGREEMENT"),
-    "결정론적 기준선 불일치 상태 유지",
+    "AI 최종 판단과 결정론적 기준선이 달라 즉시 주문을 보류했습니다.",
+  );
+  assert.equal(
+    formatDisplayValue("REPLACED_BY_NEW_APPROVED_PLAN"),
+    "더 최신 승인 플랜으로 대체되어 이전 대기 플랜 감시를 중단했습니다.",
   );
 });
 

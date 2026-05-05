@@ -448,3 +448,11 @@ def test_binance_account_cache_abandons_stale_pending_status(db_session) -> None
     assert response["source"] == "cached_live"
     assert response["last_error"] == "ACCOUNT_CACHE_REFRESH_ABANDONED"
     assert response["payload"]["summary"]["total_wallet_balance"] == 1250.0
+
+    renewed = mark_binance_account_refresh_requested(db_session)
+
+    assert renewed["status"] == "queued"
+    assert renewed["source"] == "cached_live"
+    assert renewed["started_at"] is None
+    assert renewed["last_error"] is None
+    assert renewed["payload"]["summary"]["total_wallet_balance"] == 1250.0

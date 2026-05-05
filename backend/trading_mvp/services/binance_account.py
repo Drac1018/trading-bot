@@ -416,15 +416,16 @@ def mark_binance_account_refresh_requested(
         if already_running
         else "Binance 원본 계정 캐시 갱신을 요청했습니다."
     )
-    cache.update(
-        {
-            "status": status,
-            "source": cache.get("source") or "cached_live",
-            "requested_at": _iso_now(),
-            "last_error": None,
-            "message": message,
-        }
-    )
+    request_detail = {
+        "status": status,
+        "source": cache.get("source") or "cached_live",
+        "requested_at": _iso_now(),
+        "last_error": None,
+        "message": message,
+    }
+    if not already_running:
+        request_detail["started_at"] = None
+    cache.update(request_detail)
     normalized_cache = _write_account_cache_detail(settings_row, cache)
     session.add(settings_row)
     session.flush()

@@ -1,3 +1,5 @@
+import { describeRiskReasonCode } from "./risk-reason-copy.js";
+
 export type DecisionTimelineTone = "good" | "warn" | "danger" | "neutral";
 
 export type DecisionTimelineSummary = {
@@ -247,7 +249,9 @@ function describePendingPlan(symbol: DecisionTimelineSymbolLike): DecisionTimeli
     case "canceled":
       return {
         label: "진입 플랜 취소",
-        detail: plan.canceled_reason ? `취소 사유: ${plan.canceled_reason}` : "이전 진입 플랜이 취소됐습니다.",
+        detail: plan.canceled_reason
+          ? `취소 사유: ${describeRiskReasonCode(plan.canceled_reason)}`
+          : "이전 진입 플랜이 취소됐습니다.",
         kind: "neutral",
       };
     case "expired":

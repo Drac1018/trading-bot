@@ -299,14 +299,27 @@ def render_prompt_instructions(
     route: PromptRoutePolicy,
 ) -> str:
     contract = json.dumps(route.to_payload(), ensure_ascii=False, separators=(",", ":"))
+    entry_plan_instruction = (
+        "For new-entry routes, distinguish no-trade from a conditional entry plan. "
+        "If a directional thesis is worth monitoring but price must first reach a specific zone, "
+        "return decision='hold' with watch_entry_plan populated with side, entry zone, invalidation, stop, target, chase cap, TTL, and reason codes. "
+        "A watch_entry_plan only arms a pending entry plan; execution still requires zone touch, AI recheck, and risk_guard approval. "
+        "Use decision='long' or decision='short' only when you are endorsing that side as the current trade intent. "
+        "Use decision='hold' with watch_entry_plan=null when no side and zone should be monitored. "
+    ) if route.allow_new_entry else (
+        "This route must not create a watch_entry_plan; keep watch_entry_plan=null. "
+    )
     return (
         "You are the trading decision role inside a risk-controlled live trading system. "
         "Return exactly one structured decision that fits the routing contract. "
         f"{route.family_instruction} "
         f"{route.engine_instruction} "
+        f"{entry_plan_instruction}"
         "Use regime_summary as the descriptive market-structure layer and event_context_summary as the forward-looking event-risk layer. "
         "Event context may justify lower confidence, a no-trade stance, event_risk_acknowledgement, confidence_penalty_reason, or scenario_note, "
         "but it never overrides the routing contract, risk_guard, or execution permissions. "
+        "Use active_position_summary, pending_entry_plan_summary, and execution_constraints_summary to avoid duplicate plans, unsupported add-ons, "
+        "or proposals that have no remaining actionable entry capacity. "
         "Never widen a stop, remove a deterministic hard stop, justify an unprotected position, average down a loser, "
         "or bypass the provided risk budget. Never propose size or leverage beyond the provided risk budget. "
         "If the remaining budget is small or zero, prefer hold. "
@@ -378,6 +391,7 @@ def _fallback_decision(
         "entry_mode": "none" if action in {"hold", "reduce", "exit"} else decision.entry_mode,
         "entry_zone_min": None if action in {"hold", "reduce", "exit"} else decision.entry_zone_min,
         "entry_zone_max": None if action in {"hold", "reduce", "exit"} else decision.entry_zone_max,
+        "watch_entry_plan": None,
         "invalidation_price": decision.invalidation_price if action in {"long", "short"} else None,
         "max_chase_bps": decision.max_chase_bps if action in {"long", "short"} else None,
         "idea_ttl_minutes": decision.idea_ttl_minutes if action in {"long", "short"} else None,
@@ -424,6 +438,13 @@ def bound_trade_decision(
         (ai_context.holding_profile if ai_context is not None else None) or decision.holding_profile or HOLDING_PROFILE_SCALP
     ).strip().lower() or HOLDING_PROFILE_SCALP
     normalized = decision.model_copy(update={"provider_status": provider_status})
+    if (
+        normalized.watch_entry_plan is not None
+        and (not route.allow_new_entry or has_open_position or normalized.decision != "hold")
+    ):
+        bounded_output_applied = True
+        fallback_reason_codes.append("WATCH_ENTRY_PLAN_NOT_ALLOWED_FOR_ROUTE")
+        normalized = normalized.model_copy(update={"watch_entry_plan": None})
 
     if route.data_quality_hold_bias and ai_context is not None:
         if (
@@ -466,7 +487,11 @@ def bound_trade_decision(
         )
 
     proposed_profile = str(normalized.recommended_holding_profile or normalized.holding_profile or "").strip().lower()
-    if proposed_profile and proposed_profile not in set(route.allowed_recommended_holding_profiles):
+    allowed_profiles = set(route.allowed_recommended_holding_profiles)
+    profile_allowed = proposed_profile in allowed_profiles or (
+        normalized.decision == "hold" and proposed_profile == "hold_current"
+    )
+    if proposed_profile and not profile_allowed:
         bounded_output_applied = True
         fallback_reason_codes.append("INVALID_HOLDING_PROFILE_FOR_ENGINE")
         if route.strategy_engine == "breakout_exception_engine" and normalized.decision in NEW_ENTRY_ACTIONS:

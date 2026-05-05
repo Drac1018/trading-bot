@@ -39,12 +39,12 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "시장 스냅샷",
-        endpoint: "/api/market/snapshots?limit=20",
+        endpoint: "/api/market/snapshots?limit=20&compact=true",
         description: "거래소에서 수집한 최신 시장 입력입니다.",
       },
       {
         title: "신호 입력",
-        endpoint: "/api/market/features?limit=20",
+        endpoint: "/api/market/features?limit=20&compact=true",
         description: "추세, 변동성, 거래량, RSI, ATR 등 계산된 지표 입력입니다.",
       },
     ],
@@ -126,7 +126,7 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "스케줄러 실행 기록",
-        endpoint: "/api/scheduler?limit=20",
+        endpoint: "/api/scheduler?limit=20&compact=true",
         description: "주기별 실행 결과와 다음 실행 예정 시각입니다.",
       },
     ],

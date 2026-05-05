@@ -7,7 +7,11 @@ from trading_mvp.schemas import (
     PreviousThesisDeltaPacket,
     TradeDecision,
 )
-from trading_mvp.services.ai_prompt_routing import bound_trade_decision, resolve_prompt_route
+from trading_mvp.services.ai_prompt_routing import (
+    bound_trade_decision,
+    render_prompt_instructions,
+    resolve_prompt_route,
+)
 
 
 def _ai_context(
@@ -116,6 +120,18 @@ def test_engine_trigger_matrix_routes_expected_prompt_families() -> None:
     assert protection_route.prompt_family == "protection_reduce_review"
     assert protection_route.allow_new_entry is False
     assert protection_route.safe_fallback_action == "reduce"
+
+
+def test_new_entry_prompt_explains_watch_entry_plan_contract() -> None:
+    route = resolve_prompt_route(
+        ai_context=_ai_context(trigger_type="entry_candidate_event", strategy_engine="trend_pullback_engine"),
+        has_open_position=False,
+    )
+    instructions = render_prompt_instructions(route=route)
+
+    assert "watch_entry_plan" in instructions
+    assert "zone touch, AI recheck, and risk_guard approval" in instructions
+    assert "watch_entry_plan=null" in instructions
 
 
 def test_invalid_output_bounding_on_protection_review_event() -> None:

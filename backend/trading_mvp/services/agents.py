@@ -382,6 +382,7 @@ class TradingDecisionAgent:
                 "entry_mode": "none",
                 "entry_zone_min": None,
                 "entry_zone_max": None,
+                "watch_entry_plan": None,
                 "invalidation_price": None,
                 "max_chase_bps": None,
                 "idea_ttl_minutes": None,
@@ -579,6 +580,7 @@ class TradingDecisionAgent:
                 "entry_mode": "none",
                 "entry_zone_min": None,
                 "entry_zone_max": None,
+                "watch_entry_plan": None,
                 "invalidation_price": None,
                 "max_chase_bps": None,
                 "idea_ttl_minutes": None,
@@ -1078,6 +1080,7 @@ class TradingDecisionAgent:
             update["entry_mode"] = "none"
             update["entry_zone_min"] = None
             update["entry_zone_max"] = None
+            update["watch_entry_plan"] = None
             update["recommended_holding_profile"] = "hold_current"
             confidence_delta = min(confidence_delta, -0.14)
             abstain_due_to_prior_and_quality = True
@@ -1310,7 +1313,9 @@ class TradingDecisionAgent:
         if range_reversion_setup:
             profile_name = "range_reversion_fast"
             profile_rationale_code = "SETUP_TIME_PROFILE_RANGE_REVERSION_FAST"
-            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 0.75)), 6), 10)
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 2.5)), 30), 45)
+            idea_ttl_floor_minutes = 30
+            idea_ttl_cap_minutes = 45
             max_holding_minutes = min(max(int(round(timeframe_minutes * 5.0)), 45), 90)
             early_fail_minutes = min(max(int(round(max_holding_minutes * 0.2)), 12), 24)
             early_fail_r_floor = -0.05
@@ -1318,7 +1323,9 @@ class TradingDecisionAgent:
         elif entry_mode == "breakout_confirm":
             profile_name = "breakout_fast"
             profile_rationale_code = "SETUP_TIME_PROFILE_BREAKOUT_FAST"
-            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 0.8)), 8), 12)
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 0.8)), 8), 15)
+            idea_ttl_floor_minutes = 8
+            idea_ttl_cap_minutes = 15
             max_holding_minutes = min(max(int(round(timeframe_minutes * 6.0)), 90), 120)
             early_fail_minutes = min(max(int(round(max_holding_minutes * 0.22)), 18), 30)
             early_fail_r_floor = 0.1
@@ -1326,7 +1333,9 @@ class TradingDecisionAgent:
         elif pullback_state in {"bullish_continuation", "bearish_continuation"}:
             profile_name = "continuation_balanced"
             profile_rationale_code = "SETUP_TIME_PROFILE_CONTINUATION_BALANCED"
-            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 1.0)), 12), 16)
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 2.0)), 30), 45)
+            idea_ttl_floor_minutes = 30
+            idea_ttl_cap_minutes = 60
             max_holding_minutes = min(max(int(round(timeframe_minutes * 10.0)), 150), 180)
             early_fail_minutes = min(max(int(round(max_holding_minutes * 0.25)), 30), 45)
             early_fail_r_floor = 0.0
@@ -1334,7 +1343,9 @@ class TradingDecisionAgent:
         else:
             profile_name = "pullback_flexible"
             profile_rationale_code = "SETUP_TIME_PROFILE_PULLBACK_FLEXIBLE"
-            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 1.25)), 15), 20)
+            idea_ttl_minutes = min(max(int(round(timeframe_minutes * 3.0)), 30), 60)
+            idea_ttl_floor_minutes = 30
+            idea_ttl_cap_minutes = 60
             max_holding_minutes = min(max(int(round(timeframe_minutes * 14.0)), 180), 240)
             early_fail_minutes = min(max(int(round(max_holding_minutes * 0.25)), 40), 60)
             early_fail_r_floor = -0.15
@@ -1347,17 +1358,30 @@ class TradingDecisionAgent:
             hold_extension_minutes = max(min(int(round(hold_extension_minutes * 0.7)), hold_extension_minutes), 5)
             profile_name = f"{profile_name}_scalp"
         elif holding_profile == HOLDING_PROFILE_SWING:
-            idea_ttl_minutes = max(int(round(idea_ttl_minutes * 1.15)), idea_ttl_minutes)
+            if not range_reversion_setup and entry_mode != "breakout_confirm":
+                idea_ttl_minutes = min(max(int(round(timeframe_minutes * 8.0)), 120), 240)
+                idea_ttl_floor_minutes = 120
+                idea_ttl_cap_minutes = 240
+            else:
+                idea_ttl_minutes = max(int(round(idea_ttl_minutes * 1.15)), idea_ttl_minutes)
             max_holding_minutes = max(int(round(max_holding_minutes * 1.6)), max_holding_minutes)
             early_fail_minutes = max(int(round(early_fail_minutes * 1.2)), early_fail_minutes)
             hold_extension_minutes = max(int(round(hold_extension_minutes * 1.2)), hold_extension_minutes)
             profile_name = f"{profile_name}_swing"
         elif holding_profile == HOLDING_PROFILE_POSITION:
-            idea_ttl_minutes = max(int(round(idea_ttl_minutes * 1.35)), idea_ttl_minutes)
+            if not range_reversion_setup and entry_mode != "breakout_confirm":
+                idea_ttl_minutes = min(max(int(round(timeframe_minutes * 12.0)), 180), 360)
+                idea_ttl_floor_minutes = 180
+                idea_ttl_cap_minutes = 360
+            else:
+                idea_ttl_minutes = max(int(round(idea_ttl_minutes * 1.35)), idea_ttl_minutes)
             max_holding_minutes = max(int(round(max_holding_minutes * 3.2)), max_holding_minutes)
             early_fail_minutes = max(int(round(early_fail_minutes * 1.6)), early_fail_minutes)
             hold_extension_minutes = max(int(round(hold_extension_minutes * 1.6)), hold_extension_minutes)
             profile_name = f"{profile_name}_position"
+
+        idea_ttl_minutes = max(int(idea_ttl_minutes), idea_ttl_floor_minutes)
+        idea_ttl_minutes = min(idea_ttl_minutes, idea_ttl_cap_minutes)
 
         return {
             "profile_name": profile_name,
@@ -1380,6 +1404,8 @@ class TradingDecisionAgent:
         if decision not in {"long", "short"}:
             return {
                 "entry_mode": "none",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
                 "invalidation_price": None,
                 "max_chase_bps": None,
                 "idea_ttl_minutes": None,
@@ -1621,11 +1647,7 @@ class TradingDecisionAgent:
         final_direction = final_decision.decision
         baseline_entry_mode = baseline.entry_mode or "none"
         final_entry_mode = final_decision.entry_mode or "none"
-        direction_match = (
-            baseline_direction in {"long", "short"}
-            and final_direction in {"long", "short"}
-            and baseline_direction == final_direction
-        )
+        direction_match = baseline_direction == final_direction
         entry_mode_match = direction_match and baseline_entry_mode == final_entry_mode
         if entry_mode_match:
             level = "full_agreement"

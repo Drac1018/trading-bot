@@ -4,14 +4,28 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const pollMs = 15000;
+const logicalCooldownMs = 15 * 60 * 1000;
 const seenStorageKey = "trading-mvp.seen-alert-ids";
+const logicalSeenStorageKey = "trading-mvp.seen-alert-logical";
+const disabledStorageKey = "trading-mvp.alert-notifier-disabled";
+const nonActionableReasonCodes = new Set([
+  "HOLD_DECISION",
+  "ENTRY_TRIGGER_NOT_MET",
+  "NO_EDGE",
+  "RANGE_CHOP",
+  "WEAK_VOLUME",
+  "MOMENTUM_WEAKENING",
+  "DETERMINISTIC_BASELINE_DISAGREEMENT",
+]);
 
 type AlertRow = {
   id: number;
+  category?: string;
   title: string;
   message: string;
   severity: string;
   created_at: string;
+  payload?: Record<string, unknown> | null;
 };
 
 function readSeenIds() {
@@ -36,14 +50,108 @@ function writeSeenIds(ids: Set<number>) {
   window.localStorage.setItem(seenStorageKey, JSON.stringify([...ids]));
 }
 
+function readLogicalSeen() {
+  if (typeof window === "undefined") {
+    return {} as Record<string, number>;
+  }
+  try {
+    const raw = window.localStorage.getItem(logicalSeenStorageKey);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => typeof value === "number" && value > cutoff),
+    ) as Record<string, number>;
+  } catch {
+    return {};
+  }
+}
+
+function writeLogicalSeen(seen: Record<string, number>) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(logicalSeenStorageKey, JSON.stringify(seen));
+}
+
+function readNotifierDisabled() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(disabledStorageKey) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeNotifierDisabled(disabled: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (disabled) {
+    window.localStorage.setItem(disabledStorageKey, "true");
+    return;
+  }
+  window.localStorage.removeItem(disabledStorageKey);
+}
+
+function alertReasonCodes(row: AlertRow) {
+  const raw = row.payload?.reason_codes;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean)
+    .sort();
+}
+
+function alertPayloadString(row: AlertRow, key: string) {
+  const value = row.payload?.[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isOperatorAttentionAlert(row: AlertRow) {
+  if (row.severity === "error" || row.severity === "critical") {
+    return true;
+  }
+  if (row.severity !== "warning") {
+    return false;
+  }
+
+  const reasonCodes = alertReasonCodes(row);
+  const decision = alertPayloadString(row, "decision").toLowerCase();
+  if (decision === "hold" && reasonCodes.every((code) => nonActionableReasonCodes.has(code))) {
+    return false;
+  }
+  if (reasonCodes.length > 0 && reasonCodes.every((code) => nonActionableReasonCodes.has(code))) {
+    return false;
+  }
+  return true;
+}
+
+function alertLogicalKey(row: AlertRow) {
+  const reasonCodes = alertReasonCodes(row);
+  const symbol = alertPayloadString(row, "symbol") || "all";
+  return [row.category ?? "alert", row.severity, row.title, symbol, reasonCodes.join(",")].join("|");
+}
+
 export function AlertNotifier() {
   const [permission, setPermission] = useState<NotificationPermission | "unsupported" | "loading">("loading");
   const [latestAlerts, setLatestAlerts] = useState<AlertRow[]>([]);
   const [expanded, setExpanded] = useState(false);
+  const [notificationsDisabled, setNotificationsDisabled] = useState<boolean | "loading">("loading");
   const seenIdsRef = useRef<Set<number>>(new Set());
+  const logicalSeenRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     seenIdsRef.current = readSeenIds();
+    logicalSeenRef.current = readLogicalSeen();
+    setNotificationsDisabled(readNotifierDisabled());
   }, []);
 
   useEffect(() => {
@@ -61,6 +169,9 @@ export function AlertNotifier() {
     if (typeof window === "undefined") {
       return;
     }
+    if (notificationsDisabled !== false) {
+      return;
+    }
 
     let active = true;
 
@@ -74,14 +185,21 @@ export function AlertNotifier() {
         if (!active) {
           return;
         }
-        setLatestAlerts(rows);
+        const visibleRows = rows.filter(isOperatorAttentionAlert);
+        setLatestAlerts(visibleRows);
 
         if (!("Notification" in window) || window.Notification.permission !== "granted") {
           return;
         }
 
         const nextSeenIds = new Set(seenIdsRef.current);
+        const nextLogicalSeen = { ...logicalSeenRef.current };
+        const now = Date.now();
         for (const row of rows) {
+          if (!isOperatorAttentionAlert(row)) {
+            nextSeenIds.add(row.id);
+            continue;
+          }
           if (!["warning", "error", "critical"].includes(row.severity)) {
             nextSeenIds.add(row.id);
             continue;
@@ -89,14 +207,23 @@ export function AlertNotifier() {
           if (nextSeenIds.has(row.id)) {
             continue;
           }
+          const logicalKey = alertLogicalKey(row);
+          const lastNotifiedAt = nextLogicalSeen[logicalKey] ?? 0;
+          if (now - lastNotifiedAt < logicalCooldownMs) {
+            nextSeenIds.add(row.id);
+            continue;
+          }
           new window.Notification(row.title, {
             body: row.message,
-            tag: `alert-${row.id}`,
+            tag: `alert-${logicalKey}`,
           });
+          nextLogicalSeen[logicalKey] = now;
           nextSeenIds.add(row.id);
         }
         seenIdsRef.current = nextSeenIds;
+        logicalSeenRef.current = nextLogicalSeen;
         writeSeenIds(nextSeenIds);
+        writeLogicalSeen(nextLogicalSeen);
       } catch {
         return;
       }
@@ -111,14 +238,30 @@ export function AlertNotifier() {
       active = false;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [notificationsDisabled]);
+
+  const disableNotifier = () => {
+    const nextSeenIds = new Set(seenIdsRef.current);
+    latestAlerts.forEach((row) => nextSeenIds.add(row.id));
+    seenIdsRef.current = nextSeenIds;
+    writeSeenIds(nextSeenIds);
+    writeNotifierDisabled(true);
+    setLatestAlerts([]);
+    setExpanded(false);
+    setNotificationsDisabled(true);
+  };
 
   const unreadCount = useMemo(
     () => latestAlerts.filter((row) => !seenIdsRef.current.has(row.id)).length,
     [latestAlerts],
   );
 
-  if (permission === "loading" || permission === "unsupported") {
+  if (
+    notificationsDisabled === "loading" ||
+    notificationsDisabled ||
+    permission === "loading" ||
+    permission === "unsupported"
+  ) {
     return null;
   }
 
@@ -169,22 +312,34 @@ export function AlertNotifier() {
           ) : null}
         </div>
       ) : null}
-      <button
-        type="button"
-        aria-expanded={expanded}
-        aria-label="거래 알림"
-        onClick={() => setExpanded((value) => !value)}
-        className="ml-auto flex min-h-11 items-center gap-2 rounded-md border border-slate-200 bg-white/95 px-3 text-sm font-semibold text-slate-800 shadow-sm backdrop-blur transition hover:bg-slate-50"
-      >
-        <span
-          aria-hidden="true"
-          className={`h-2.5 w-2.5 rounded-full ${
-            unreadCount > 0 ? "bg-amber-500" : permission === "granted" ? "bg-emerald-500" : "bg-slate-300"
-          }`}
-        />
-        거래 알림
-        <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-600">{statusLabel}</span>
-      </button>
+      <div className="flex items-center justify-end gap-2">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-label="거래 알림"
+          onClick={() => setExpanded((value) => !value)}
+          className="flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-slate-200 bg-white/95 px-3 text-sm font-semibold text-slate-800 shadow-sm backdrop-blur transition hover:bg-slate-50"
+        >
+          <span
+            aria-hidden="true"
+            className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+              unreadCount > 0 ? "bg-amber-500" : permission === "granted" ? "bg-emerald-500" : "bg-slate-300"
+            }`}
+          />
+          <span className="shrink-0">거래 알림</span>
+          <span className="min-w-0 truncate rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+            {statusLabel}
+          </span>
+        </button>
+        <button
+          type="button"
+          aria-label="거래 알림 종료"
+          onClick={disableNotifier}
+          className="flex min-h-11 shrink-0 items-center rounded-md border border-red-200 bg-white/95 px-3 text-xs font-semibold text-red-600 shadow-sm backdrop-blur transition hover:bg-red-50"
+        >
+          종료
+        </button>
+      </div>
     </div>
   );
 }

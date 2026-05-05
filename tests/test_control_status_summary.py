@@ -5,11 +5,13 @@ from datetime import timedelta
 from trading_mvp.models import MarketSnapshot, RiskCheck
 from trading_mvp.services.dashboard import get_operator_dashboard, get_overview
 from trading_mvp.services.runtime_state import (
+    get_reconciliation_detail,
     mark_sync_success,
     record_binance_rest_issue,
     set_reconciliation_detail,
     set_user_stream_detail,
 )
+from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings, serialize_settings
 from trading_mvp.time_utils import utcnow_naive
 
@@ -80,6 +82,135 @@ def test_control_status_summary_separates_pause_arm_and_current_cycle_risk(db_se
     assert summary["blocked_reason_codes"] == ["ENTRY_TRIGGER_NOT_MET"]
     assert summary["degraded_reason_codes"] == ["PAUSED", "MANUAL_USER_REQUEST"]
     assert summary["protection_reason_codes"] == []
+
+
+def test_hold_decision_does_not_become_guard_mode_reason(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=10)
+    settings_row.live_trading_enabled = True
+    settings_row.trading_paused = False
+    settings_row.pause_reason_code = None
+    settings_row.pause_origin = None
+    _mark_fresh_sync_state(db_session, settings_row, exchange_can_trade=True)
+    _seed_market_snapshot(db_session, settings_row)
+    db_session.add(
+        RiskCheck(
+            symbol=settings_row.default_symbol,
+            decision="hold",
+            allowed=False,
+            reason_codes=["HOLD_DECISION"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"allowed": False, "decision": "hold", "reason_codes": ["HOLD_DECISION"]},
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(settings_row)
+    summary = serialized["operational_status"]["control_status_summary"]
+
+    assert summary["risk_allowed"] is False
+    assert summary["blocked_reasons_current_cycle"] == ["HOLD_DECISION"]
+    assert summary["approval_control_blocked_reasons"] == []
+    assert serialized["guard_mode_reason_code"] != "HOLD_DECISION"
+    assert serialized["guard_mode_reason_category"] != "risk_block"
+
+
+def test_resolved_sync_blockers_from_latest_risk_do_not_remain_current_control_blockers(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=10)
+    settings_row.live_trading_enabled = True
+    settings_row.trading_paused = False
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_fresh_sync_state(db_session, settings_row, exchange_can_trade=True)
+    _seed_market_snapshot(db_session, settings_row)
+    db_session.add(
+        RiskCheck(
+            symbol=settings_row.default_symbol,
+            decision="long",
+            allowed=False,
+            reason_codes=[
+                "ACCOUNT_STATE_STALE",
+                "POSITION_STATE_STALE",
+                "OPEN_ORDERS_STATE_STALE",
+                "PROTECTION_STATE_UNVERIFIED",
+            ],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={
+                "allowed": False,
+                "decision": "long",
+                "reason_codes": [
+                    "ACCOUNT_STATE_STALE",
+                    "POSITION_STATE_STALE",
+                    "OPEN_ORDERS_STATE_STALE",
+                    "PROTECTION_STATE_UNVERIFIED",
+                ],
+            },
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(settings_row)
+    summary = serialized["operational_status"]["control_status_summary"]
+
+    assert serialized["operational_status"]["blocked_reason_codes"] == []
+    assert serialized["guard_mode_reason_code"] not in {
+        "ACCOUNT_STATE_STALE",
+        "POSITION_STATE_STALE",
+        "OPEN_ORDERS_STATE_STALE",
+        "PROTECTION_STATE_UNVERIFIED",
+    }
+    assert summary["risk_allowed"] is None
+    assert summary["blocked_reason_codes"] == []
+    assert summary["blocked_reasons_current_cycle"] == []
+
+
+def test_flat_protective_staleness_does_not_block_operational_new_entries_when_position_scopes_are_fresh(
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=10)
+    settings_row.live_trading_enabled = True
+    settings_row.trading_paused = False
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    now = utcnow_naive()
+    mark_sync_success(settings_row, scope="account", synced_at=now, detail={"exchange_can_trade": True})
+    mark_sync_success(settings_row, scope="positions", synced_at=now)
+    mark_sync_success(settings_row, scope="open_orders", synced_at=now)
+    mark_sync_success(
+        settings_row,
+        scope="protective_orders",
+        synced_at=now - timedelta(seconds=120),
+        stale_after_seconds=90,
+        status="flat",
+    )
+    _seed_market_snapshot(db_session, settings_row)
+    db_session.add(
+        RiskCheck(
+            symbol=settings_row.default_symbol,
+            decision="long",
+            allowed=True,
+            reason_codes=[],
+            approved_risk_pct=0.01,
+            approved_leverage=2.0,
+            payload={"allowed": True, "decision": "long", "reason_codes": []},
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(settings_row)
+
+    assert "PROTECTION_STATE_UNVERIFIED" not in serialized["operational_status"]["blocked_reason_codes"]
+    assert serialized["operational_status"]["can_enter_new_position"] is True
 
 
 def test_control_status_summary_uses_system_approval_grace_window(db_session) -> None:
@@ -200,3 +331,35 @@ def test_control_status_summary_separates_user_stream_rest_and_unresolved_submis
     assert "UNRESOLVED_SUBMISSION_GUARD_ACTIVE" in overview.operational_status.blocked_reasons
     assert "BINANCE_REST_CIRCUIT_OPEN" in overview.operational_status.blocked_reasons
     assert dashboard.control.reconciliation_summary["rest_connectivity"]["reason_code"] == "BINANCE_REST_SERVER_ERROR"
+
+
+def test_reconciliation_mode_guard_reason_clears_when_guard_inactive(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    set_reconciliation_detail(
+        settings_row,
+        mode_guard_active=True,
+        mode_guard_reason_code="EXCHANGE_POSITION_MODE_UNCLEAR",
+        mode_guard_message="position mode unclear",
+    )
+    set_reconciliation_detail(settings_row, mode_guard_active=False)
+    db_session.flush()
+
+    detail = get_reconciliation_detail(settings_row)
+
+    assert detail["mode_guard_active"] is False
+    assert detail["mode_guard_reason_code"] is None
+    assert detail["mode_guard_message"] is None
+
+    runtime_detail = dict(settings_row.pause_reason_detail or {})
+    reconciliation = dict(runtime_detail.get("reconciliation") or {})
+    reconciliation["mode_guard_active"] = False
+    reconciliation["mode_guard_reason_code"] = "EXCHANGE_POSITION_MODE_UNCLEAR"
+    reconciliation["mode_guard_message"] = "position mode unclear"
+    runtime_detail["reconciliation"] = reconciliation
+    settings_row.pause_reason_detail = runtime_detail
+
+    stale_detail = get_reconciliation_detail(settings_row)
+
+    assert stale_detail["mode_guard_active"] is False
+    assert stale_detail["mode_guard_reason_code"] is None
+    assert stale_detail["mode_guard_message"] is None

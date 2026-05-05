@@ -481,7 +481,7 @@ export default function BinanceAccountPage() {
   }, [applyCacheResponse]);
 
   useEffect(() => {
-    if (!cache || autoRefreshRequested || refreshingCache || cache.source === "cached_live") {
+    if (!cache || autoRefreshRequested || refreshingCache) {
       return;
     }
 

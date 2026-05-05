@@ -32,6 +32,7 @@ const tradingSyncBlockers = new Set([
 ]);
 
 const recoverableSyncStatuses = new Set(["stale", "skipped", "unknown"]);
+const entrySyncScopes = ["account", "positions", "open_orders", "protective_orders"] as const;
 
 const passiveBlockers = new Set([
   "HOLD_DECISION",
@@ -40,6 +41,10 @@ const passiveBlockers = new Set([
   "RANGE_CHOP",
   "WEAK_VOLUME",
   "MOMENTUM_WEAKENING",
+]);
+
+const statusOnlyBlockers = new Set([
+  "DETERMINISTIC_BASELINE_DISAGREEMENT",
 ]);
 
 const reasonFallbackMap: Record<string, string> = {
@@ -135,29 +140,34 @@ function nestedNumber(source: Record<string, unknown>, path: string[]) {
   return typeof current === "number" ? current : null;
 }
 
-function controlBlockers(control: OperatorDashboardPayload["control"]) {
+function currentControlBlockers(control: OperatorDashboardPayload["control"]) {
   const currentCycle = control.control_status_summary?.blocked_reasons_current_cycle ?? [];
   const explicitBlockers = control.control_status_summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? [];
   const degraded = control.control_status_summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? [];
   const protection = control.control_status_summary?.protection_reason_codes ?? control.protection_reason_codes ?? [];
-  return unique([
-    ...explicitBlockers,
-    ...currentCycle,
-    ...degraded,
-    ...protection,
-    ...control.latest_blocked_reasons,
-    ...control.auto_resume_last_blockers,
-  ]);
+  return unique([...explicitBlockers, ...currentCycle, ...degraded, ...protection]);
+}
+
+function hasActiveSyncProblem(control: OperatorDashboardPayload["control"]) {
+  return entrySyncScopes.some((scope) => normalizeSyncScopeStatus(control.sync_freshness_summary[scope]) !== "synced");
 }
 
 function importantBlockers(control: OperatorDashboardPayload["control"]) {
-  return controlBlockers(control).filter((code) => !passiveBlockers.has(code));
+  return currentControlBlockers(control).filter((code) => {
+    if (passiveBlockers.has(code) || statusOnlyBlockers.has(code)) {
+      return false;
+    }
+    if (tradingSyncBlockers.has(code) && !hasActiveSyncProblem(control) && control.unprotected_positions === 0) {
+      return false;
+    }
+    return true;
+  });
 }
 
 function currentRiskBlockers(control: OperatorDashboardPayload["control"]) {
   const currentCycle = control.control_status_summary?.blocked_reasons_current_cycle ?? [];
-  const explicitBlockers = control.control_status_summary?.blocked_reason_codes ?? [];
-  return unique([...currentCycle, ...explicitBlockers, ...control.latest_blocked_reasons]);
+  const explicitBlockers = control.control_status_summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? [];
+  return unique([...currentCycle, ...explicitBlockers]);
 }
 
 function isCurrentRiskBlocked(control: OperatorDashboardPayload["control"]) {
@@ -166,7 +176,11 @@ function isCurrentRiskBlocked(control: OperatorDashboardPayload["control"]) {
 
 function isPassiveRiskOnly(control: OperatorDashboardPayload["control"]) {
   const blockers = currentRiskBlockers(control);
-  return blockers.length === 0 || blockers.every((code) => passiveBlockers.has(code));
+  return blockers.length === 0 || blockers.every((code) => passiveBlockers.has(code) || statusOnlyBlockers.has(code));
+}
+
+function hasStatusOnlyRiskBlocker(control: OperatorDashboardPayload["control"]) {
+  return currentRiskBlockers(control).some((code) => statusOnlyBlockers.has(code));
 }
 
 function hasTradingSyncBlocker(control: OperatorDashboardPayload["control"]) {
@@ -223,8 +237,9 @@ function mainState(operator: OperatorDashboardPayload) {
 
   if (isCurrentRiskBlocked(control)) {
     if (passiveRiskOnly) {
+      const statusOnly = hasStatusOnlyRiskBlocker(control);
       return {
-        title: "신규 진입 없음",
+        title: statusOnly ? "신규 진입 대기" : "신규 진입 없음",
         detail: riskBlockers.length > 0 ? translateReasonCode(riskBlockers[0]) : "이번 판단 주기에서 신규 진입 신호가 없습니다.",
         tone: "neutral" as const,
       };
@@ -270,8 +285,7 @@ function mainState(operator: OperatorDashboardPayload) {
 
 function syncSummary(control: OperatorDashboardPayload["control"]) {
   const scopes = control.sync_freshness_summary;
-  const watched = ["account", "positions", "open_orders", "protective_orders"] as const;
-  const statuses = watched.map((key) => normalizeSyncScopeStatus(scopes[key]));
+  const statuses = entrySyncScopes.map((key) => normalizeSyncScopeStatus(scopes[key]));
   if (statuses.some((status) => status === "failed" || status === "incomplete")) {
     return { label: "확인 필요", tone: "danger" as const };
   }
@@ -287,7 +301,7 @@ function entryPermissionStatus(control: OperatorDashboardPayload["control"]) {
   }
   if (isCurrentRiskBlocked(control)) {
     return isPassiveRiskOnly(control)
-      ? { label: "진입 없음", tone: "neutral" as const }
+      ? { label: hasStatusOnlyRiskBlocker(control) ? "대기" : "진입 없음", tone: "neutral" as const }
       : { label: "차단", tone: "danger" as const };
   }
   if (needsSyncCatchUp(control)) {
@@ -344,7 +358,8 @@ function buildActionItems(operator: OperatorDashboardPayload): ActionItem[] {
     });
   }
 
-  for (const [scope, status] of Object.entries(control.sync_freshness_summary)) {
+  for (const scope of entrySyncScopes) {
+    const status = control.sync_freshness_summary[scope];
     const normalized = normalizeSyncScopeStatus(status);
     if (normalized === "synced") {
       continue;

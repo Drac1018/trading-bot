@@ -702,6 +702,72 @@ def test_expected_cost_gate_does_not_block_survival_paths(db_session, decision_n
     assert result.debug_payload["expected_cost_gate"]["applied"] is False
 
 
+def test_macro_event_result_conflict_blocks_only_new_entries(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    event_result_context = {
+        "event_risk_context": {
+            "event_result_context": {
+                "available": True,
+                "event_result_bias": "bearish",
+                "event_result_confidence": 0.8,
+                "reaction_window_active": True,
+                "comparison": "forecast",
+                "event_name": "US CPI",
+            },
+            "reason_codes": [
+                "MACRO_EVENT_RESULT_AVAILABLE",
+                "MACRO_EVENT_RESULT_BEARISH",
+                "MACRO_RELEASE_REACTION_WINDOW",
+            ],
+        },
+        "expected_cost_gate": {
+            "expected_edge_bps": 80.0,
+            "entry_execution_type": "entry_passive_limit",
+        },
+    }
+    entry_decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.02,
+        max_chase_bps=20.0,
+    )
+    reduce_decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["POSITION_MANAGEMENT_TEST"],
+    )
+
+    entry_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        entry_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=event_result_context,
+    )
+    reduce_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=event_result_context,
+    )
+
+    assert entry_result.allowed is False
+    assert "MACRO_EVENT_RESULT_CONFLICT" in entry_result.reason_codes
+    assert entry_result.debug_payload["macro_event_result_policy"]["applied"] is True
+    assert reduce_result.allowed is True
+    assert "MACRO_EVENT_RESULT_CONFLICT" not in reduce_result.reason_codes
+
+
 def test_btc_uses_five_x_hard_cap(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.max_leverage = 5.0
@@ -1014,6 +1080,50 @@ def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_li
     assert result.approved_quantity is not None and result.approved_quantity > 0
 
 
+def test_fractional_approved_leverage_sizes_against_integer_exchange_leverage(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    equity = 233.34635614
+    _seed_account_equity(db_session, equity=equity)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    settings_row.max_leverage = 2.0
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "1m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        timeframe="1m",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price - 7.63,
+        take_profit=entry_price + 8.12,
+        max_chase_bps=20.0,
+    ).model_copy(
+        update={
+            "risk_pct": 0.008919,
+            "leverage": 1.445,
+        }
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is True
+    assert result.approved_leverage == 1.0
+    assert result.approved_projected_notional <= equity + 1e-6
+    assert result.approved_quantity is not None and result.approved_quantity > 0.0
+    assert "ENTRY_CLAMPED_TO_EXCHANGE_LEVERAGE" in result.adjustment_reason_codes
+    assert result.debug_payload["exchange_leverage"]["raw_approved_leverage"] == pytest.approx(1.445)
+    assert result.debug_payload["exchange_leverage"]["approved_exchange_leverage"] == 1.0
+    assert result.debug_payload["exchange_leverage"]["notional_cap"] == pytest.approx(equity)
+
+
 def test_stale_sync_keeps_entry_blocked_without_auto_resize(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.max_largest_position_pct = 1.5
@@ -1223,6 +1333,83 @@ def test_protection_unverified_keeps_entry_blocked_without_auto_resize(db_sessio
     assert "PROTECTION_STATE_UNVERIFIED" in result.reason_codes
     assert "ENTRY_AUTO_RESIZED" not in result.reason_codes
     assert result.approved_quantity is None
+
+
+def test_flat_protective_order_staleness_does_not_block_when_position_scopes_are_fresh(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    now = utcnow_naive()
+    mark_sync_success(settings_row, scope="account", synced_at=now)
+    mark_sync_success(settings_row, scope="positions", synced_at=now)
+    mark_sync_success(settings_row, scope="open_orders", synced_at=now)
+    mark_sync_success(
+        settings_row,
+        scope="protective_orders",
+        synced_at=now - timedelta(seconds=120),
+        stale_after_seconds=90,
+        status="flat",
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=snapshot.latest_price - 25.0,
+        entry_zone_max=snapshot.latest_price + 25.0,
+        stop_loss=snapshot.latest_price - 500.0,
+        take_profit=snapshot.latest_price + 800.0,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is True
+    assert result.sync_freshness_summary["protective_orders"]["stale"] is True
+    assert result.sync_freshness_summary["protective_orders"]["sync_detail_status"] == "flat"
+    assert "PROTECTION_STATE_UNVERIFIED" not in result.reason_codes
+
+
+def test_non_flat_protective_order_staleness_still_blocks_live_entries(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    now = utcnow_naive()
+    mark_sync_success(settings_row, scope="account", synced_at=now)
+    mark_sync_success(settings_row, scope="positions", synced_at=now)
+    mark_sync_success(settings_row, scope="open_orders", synced_at=now)
+    mark_sync_success(
+        settings_row,
+        scope="protective_orders",
+        synced_at=now - timedelta(seconds=120),
+        stale_after_seconds=90,
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        entry_zone_min=snapshot.latest_price - 25.0,
+        entry_zone_max=snapshot.latest_price + 25.0,
+        stop_loss=snapshot.latest_price - 500.0,
+        take_profit=snapshot.latest_price + 800.0,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert result.allowed is False
+    assert "PROTECTION_STATE_UNVERIFIED" in result.reason_codes
 
 
 def test_approval_closed_keeps_entry_blocked_without_auto_resize(db_session) -> None:
@@ -2091,6 +2278,32 @@ def test_disagreement_blocks_new_entry_but_not_survival_path(db_session) -> None
     assert entry_result.debug_payload["decision_agreement"]["blocked_reason_code"] == "DETERMINISTIC_BASELINE_DISAGREEMENT"
     assert reduce_result.allowed is True
     assert "DETERMINISTIC_BASELINE_DISAGREEMENT" not in reduce_result.reason_codes
+
+
+def test_same_hold_agreement_payload_is_not_treated_as_baseline_disagreement(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        _entry_decision(),
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_decision_context(
+            "disagreement",
+            baseline_decision="hold",
+            baseline_entry_mode="none",
+            final_decision="hold",
+            final_entry_mode="none",
+        ),
+    )
+
+    assert "DETERMINISTIC_BASELINE_DISAGREEMENT" not in result.reason_codes
+    assert result.debug_payload["decision_agreement"]["level"] == "full_agreement"
+    assert result.debug_payload["decision_agreement"]["direction_match"] is True
 
 
 def test_meta_gate_soft_pass_downsizes_entry_without_blocking(db_session) -> None:

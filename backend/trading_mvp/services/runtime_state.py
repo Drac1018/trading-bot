@@ -531,6 +531,12 @@ def get_reconciliation_detail(settings_row: Setting) -> dict[str, Any]:
     detail = get_runtime_detail(settings_row)
     payload = _as_dict(detail.get(RECONCILIATION_DETAIL_KEY))
     guarded_symbols = [str(item).upper() for item in payload.get("guarded_symbols", []) if item]
+    mode_guard_active = bool(payload.get("mode_guard_active", False))
+    mode_guard_reason_code = str(payload.get("mode_guard_reason_code") or "") or None
+    mode_guard_message = str(payload.get("mode_guard_message") or "") or None
+    if not mode_guard_active:
+        mode_guard_reason_code = None
+        mode_guard_message = None
     return {
         "status": str(payload.get("status") or "idle"),
         "source": str(payload.get("source") or "rest_polling"),
@@ -543,9 +549,9 @@ def get_reconciliation_detail(settings_row: Setting) -> dict[str, Any]:
         "position_mode": str(payload.get("position_mode") or "unknown"),
         "position_mode_source": str(payload.get("position_mode_source") or "unknown"),
         "position_mode_checked_at": _serialize_datetime(_coerce_datetime(payload.get("position_mode_checked_at"))),
-        "mode_guard_active": bool(payload.get("mode_guard_active", False)),
-        "mode_guard_reason_code": str(payload.get("mode_guard_reason_code") or "") or None,
-        "mode_guard_message": str(payload.get("mode_guard_message") or "") or None,
+        "mode_guard_active": mode_guard_active,
+        "mode_guard_reason_code": mode_guard_reason_code,
+        "mode_guard_message": mode_guard_message,
         "enabled_symbols": [str(item).upper() for item in payload.get("enabled_symbols", []) if item],
         "guarded_symbols": guarded_symbols,
         "guarded_symbols_count": len(guarded_symbols),
@@ -616,6 +622,9 @@ def set_reconciliation_detail(
         payload["position_mode_checked_at"] = position_mode_checked_at.isoformat()
     if mode_guard_active is not None:
         payload["mode_guard_active"] = mode_guard_active
+        if mode_guard_active is False:
+            payload["mode_guard_reason_code"] = None
+            payload["mode_guard_message"] = None
     if mode_guard_reason_code is not None:
         payload["mode_guard_reason_code"] = mode_guard_reason_code
     if mode_guard_message is not None:
@@ -1205,6 +1214,52 @@ def _default_sync_stale_after_seconds(settings_row: Setting, scope: str) -> int:
     if scope == "protective_orders":
         return max(60, int(settings_row.decision_cycle_interval_minutes) * 90)
     return base_seconds
+
+
+def sync_scope_is_fresh_synced(scope_summary: object) -> bool:
+    if not isinstance(scope_summary, dict):
+        return False
+    if bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
+        return False
+    status = str(scope_summary.get("raw_status") or scope_summary.get("status") or "").strip().lower()
+    return status == "synced"
+
+
+def flat_protective_order_staleness_is_safe(
+    sync_freshness_summary: dict[str, Any],
+    scope_summary: dict[str, Any],
+) -> bool:
+    if not bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete")):
+        return False
+    if str(scope_summary.get("raw_status") or "").strip().lower() != "synced":
+        return False
+    if str(scope_summary.get("sync_detail_status") or "").strip().lower() != "flat":
+        return False
+    if str(scope_summary.get("last_attempt_status") or "").strip().lower() != "success":
+        return False
+    if scope_summary.get("last_failure_reason") not in {None, ""}:
+        return False
+    return sync_scope_is_fresh_synced(sync_freshness_summary.get("positions")) and sync_scope_is_fresh_synced(
+        sync_freshness_summary.get("open_orders")
+    )
+
+
+def sync_scope_blocks_new_entry(
+    sync_freshness_summary: dict[str, Any],
+    scope: str,
+) -> bool:
+    scope_summary = sync_freshness_summary.get(scope)
+    if not isinstance(scope_summary, dict):
+        return True
+    if not (bool(scope_summary.get("stale")) or bool(scope_summary.get("incomplete"))):
+        return False
+    return not (
+        scope == "protective_orders"
+        and flat_protective_order_staleness_is_safe(
+            sync_freshness_summary,
+            scope_summary,
+        )
+    )
 
 
 def mark_sync_success(

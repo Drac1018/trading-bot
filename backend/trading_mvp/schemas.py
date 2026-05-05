@@ -100,6 +100,19 @@ def _coerce_required_aware_datetime(value: object) -> datetime:
     return parsed
 
 
+class WatchEntryPlan(StrictBaseModel):
+    side: Literal["long", "short"] | None = None
+    entry_zone_min: float | None = None
+    entry_zone_max: float | None = None
+    entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    invalidation_price: float | None = Field(default=None, gt=0.0)
+    max_chase_bps: float | None = Field(default=None, ge=0.0, le=500.0)
+    idea_ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+
+
 class TradeDecision(StrictBaseModel):
     decision: Literal["hold", "long", "short", "reduce", "exit"]
     confidence: float = Field(ge=0.0, le=1.0)
@@ -108,6 +121,7 @@ class TradeDecision(StrictBaseModel):
     entry_zone_min: float | None = None
     entry_zone_max: float | None = None
     entry_mode: Literal["breakout_confirm", "pullback_confirm", "immediate", "none"] | None = None
+    watch_entry_plan: WatchEntryPlan | None = None
     holding_profile: HoldingProfile = "scalp"
     holding_profile_reason: str | None = None
     invalidation_price: float | None = Field(default=None, gt=0.0)
@@ -383,6 +397,9 @@ class AIDecisionContextPacket(StrictBaseModel):
     hard_stop_active: bool | None = None
     stop_widening_allowed: bool | None = None
     initial_stop_type: str | None = None
+    active_position_summary: dict[str, Any] = Field(default_factory=dict)
+    pending_entry_plan_summary: dict[str, Any] = Field(default_factory=dict)
+    execution_constraints_summary: dict[str, Any] = Field(default_factory=dict)
     selection_context_summary: dict[str, Any] = Field(default_factory=dict)
     prompt_family_hint: str | None = None
     event_risk_active: bool = False
@@ -1438,6 +1455,8 @@ class PendingEntryPlanSnapshot(StrictBaseModel):
     side: Literal["long", "short"] | None = None
     plan_status: PendingEntryPlanStatus | None = None
     source_decision_run_id: int | None = None
+    source_risk_check_id: int | None = None
+    source_blocked_reason_codes: list[str] = Field(default_factory=list)
     source_timeframe: str | None = None
     regime: str | None = None
     posture: str | None = None
@@ -1460,6 +1479,8 @@ class PendingEntryPlanSnapshot(StrictBaseModel):
     canceled_at: datetime | None = None
     canceled_reason: str | None = None
     idempotency_key: str | None = None
+    last_watch_at: datetime | None = None
+    last_watch_snapshot_id: int | None = None
     trigger_details: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1500,9 +1521,9 @@ class OperatorRiskSnapshot(StrictBaseModel):
     capacity_reason: str | None = None
     portfolio_slot_soft_cap_applied: bool = False
     exposure_headroom_snapshot: dict[str, float] = Field(default_factory=dict)
-    debug_payload: dict[str, Any] = Field(default_factory=dict)
-    current_cycle_result: dict[str, Any] = Field(default_factory=dict)
-    raw_payload: dict[str, Any] = Field(default_factory=dict)
+    debug_payload: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    current_cycle_result: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    raw_payload: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class OperatorRiskGuardResultSnapshot(StrictBaseModel):

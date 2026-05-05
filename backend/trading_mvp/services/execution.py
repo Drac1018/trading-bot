@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.config import get_settings
@@ -55,7 +55,12 @@ from trading_mvp.services.execution_policy import (
     select_execution_plan,
     should_fallback_aggressively,
 )
-from trading_mvp.services.holding_profile import deterministic_stop_management_payload
+from trading_mvp.services.holding_profile import (
+    HOLDING_PROFILE_SCALP,
+    HOLDING_PROFILE_SWING,
+    deterministic_stop_management_payload,
+    resolve_holding_profile_management_policy,
+)
 from trading_mvp.services.pause_control import (
     clear_symbol_protection_state,
     mark_manage_only_state,
@@ -137,6 +142,7 @@ POSITION_MODE_MISMATCH_REASON_CODE = "EXCHANGE_POSITION_MODE_MISMATCH"
 FUNDING_LEDGER_SYNC_REASON_CODE = "FUNDING_LEDGER_SYNC_FAILED"
 ROLLOUT_MODE_SHADOW_REASON_CODE = "ROLLOUT_MODE_SHADOW"
 ROLLOUT_MODE_LIVE_DRY_RUN_REASON_CODE = "ROLLOUT_MODE_LIVE_DRY_RUN"
+CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE = "POSITION_CLOSED_PROTECTIVE_ORDER_ORPHANED"
 
 _ACTIVE_SYMBOL_EXECUTION_LOCKS: dict[str, dict[str, object]] = {}
 _ACTIVE_SYMBOL_EXECUTION_LOCKS_GUARD = Lock()
@@ -162,6 +168,106 @@ def _holding_profile_execution_payload(decision: TradeDecision) -> dict[str, obj
         "holding_profile_reason": decision.holding_profile_reason,
         **deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None),
     }
+
+
+def _position_management_metadata_for_execution(position: Position | None) -> dict[str, Any]:
+    if position is None or not isinstance(position.metadata_json, dict):
+        return {}
+    management = position.metadata_json.get("position_management")
+    return dict(management) if isinstance(management, dict) else {}
+
+
+def _take_profit_execution_policy(position: Position | None) -> dict[str, object]:
+    management = _position_management_metadata_for_execution(position)
+    profile = str(management.get("holding_profile") or HOLDING_PROFILE_SCALP).strip().lower()
+    policy = resolve_holding_profile_management_policy(profile)
+    order_mode = str(
+        management.get("take_profit_order_mode")
+        or policy.get("take_profit_order_mode")
+        or "full_close"
+    )
+    partial_fraction = min(
+        max(
+            _to_float(
+                management.get("partial_take_profit_fraction"),
+                _to_float(policy.get("partial_take_profit_fraction"), PARTIAL_TAKE_PROFIT_FRACTION),
+            ),
+            0.01,
+        ),
+        1.0,
+    )
+    if profile != HOLDING_PROFILE_SWING or order_mode != "partial_reduce":
+        order_mode = "full_close"
+        partial_fraction = 1.0
+    return {
+        "holding_profile": profile,
+        "mode": order_mode,
+        "partial_take_profit_fraction": partial_fraction,
+        "runner_after_partial_take_profit": bool(
+            management.get("runner_after_partial_take_profit")
+            if "runner_after_partial_take_profit" in management
+            else policy.get("runner_after_partial_take_profit")
+        ),
+    }
+
+
+def _partial_take_profit_taken(position: Position | None) -> bool:
+    return bool(_position_management_metadata_for_execution(position).get("partial_take_profit_taken"))
+
+
+def _take_profit_required_for_protection(position: Position | None) -> bool:
+    policy = _take_profit_execution_policy(position)
+    return not (
+        policy.get("mode") == "partial_reduce"
+        and bool(policy.get("runner_after_partial_take_profit"))
+        and _partial_take_profit_taken(position)
+    )
+
+
+def _is_partial_take_profit_order(row: Order) -> bool:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    policy = metadata.get("take_profit_execution_policy")
+    if not isinstance(policy, dict):
+        return False
+    return (
+        str(row.order_type or "").lower() == "take_profit_market"
+        and str(policy.get("mode") or "") == "partial_reduce"
+    )
+
+
+def _mark_partial_take_profit_order_filled(
+    session: Session,
+    row: Order,
+    *,
+    symbol: str,
+    fill_quantity: float,
+    fill_price: float,
+) -> None:
+    if row.position_id is None or row.status != "filled" or not _is_partial_take_profit_order(row):
+        return
+    position = session.get(Position, row.position_id)
+    if position is None:
+        return
+    if _partial_take_profit_taken(position):
+        return
+    management = mark_partial_take_profit_taken(position)
+    session.add(position)
+    record_position_management_event(
+        session,
+        event_type="partial_tp_executed",
+        position_id=position.id,
+        severity="info",
+        message="Exchange take-profit order executed a swing partial take profit.",
+        payload={
+            "symbol": symbol,
+            "order_id": row.id,
+            "external_order_id": row.external_order_id,
+            "fill_quantity": fill_quantity,
+            "fill_price": fill_price,
+            "source": "exchange_take_profit_order",
+            "metadata": management,
+        },
+    )
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -726,6 +832,7 @@ def _apply_user_stream_position_payload(
             local.status = "closed"
             local.quantity = 0.0
             local.closed_at = utcnow_naive()
+            local.metadata_json = _as_object_dict(local.metadata_json)
             session.add(local)
             session.flush()
         return None
@@ -767,7 +874,7 @@ def _apply_user_stream_position_payload(
             },
         )
     else:
-        metadata = local.metadata_json if isinstance(local.metadata_json, dict) else {}
+        metadata = _as_object_dict(local.metadata_json)
         metadata["origin"] = "binance_user_stream"
         metadata["exchange_position_side"] = exchange_position_side
         metadata["exchange_position_mode"] = exchange_position_mode
@@ -908,6 +1015,13 @@ def apply_user_stream_event(
                             },
                         )
                     )
+            _mark_partial_take_profit_order_filled(
+                session,
+                row,
+                symbol=symbol,
+                fill_quantity=last_fill_quantity,
+                fill_price=last_fill_price,
+            )
             applied_symbols.append(symbol)
             mark_sync_success(
                 settings_row,
@@ -1497,16 +1611,20 @@ def _build_protection_state(
     protective_orders = [item for item in relevant_orders if _is_protective_order(item)]
     has_stop_loss = any(str(item.get("type", "")).upper().startswith("STOP") for item in protective_orders)
     has_take_profit = any(str(item.get("type", "")).upper().startswith("TAKE_PROFIT") for item in protective_orders)
+    take_profit_required = _take_profit_required_for_protection(position)
+    take_profit_policy = _take_profit_execution_policy(position)
     missing_components: list[str] = []
     if not has_stop_loss:
         missing_components.append("stop_loss")
-    if not has_take_profit:
+    if take_profit_required and not has_take_profit:
         missing_components.append("take_profit")
     return {
         "status": "protected" if not missing_components else "missing",
         "protected": not missing_components,
         "has_stop_loss": has_stop_loss,
         "has_take_profit": has_take_profit,
+        "take_profit_required": take_profit_required,
+        "take_profit_execution_policy": take_profit_policy,
         "protective_order_count": len(protective_orders),
         "protective_order_ids": [str(item.get("orderId", "")) for item in protective_orders if item.get("orderId")],
         "missing_components": missing_components,
@@ -1873,6 +1991,117 @@ def _is_algo_order_payload(order_payload: dict[str, object]) -> bool:
     if _is_protective_order(order_payload):
         return True
     return any(key in order_payload for key in ("algoId", "clientAlgoId"))
+
+
+def _open_order_identity_sets(open_orders: list[dict[str, object]]) -> tuple[set[str], set[str]]:
+    remote_order_ids: set[str] = set()
+    remote_client_order_ids: set[str] = set()
+    for item in open_orders:
+        for key in ("orderId", "algoId"):
+            value = str(item.get(key) or "")
+            if value:
+                remote_order_ids.add(value)
+        for key in ("clientOrderId", "clientAlgoId"):
+            value = str(item.get(key) or "")
+            if value:
+                remote_client_order_ids.add(value)
+    return remote_order_ids, remote_client_order_ids
+
+
+def _local_order_is_present_remotely(
+    order: Order,
+    *,
+    remote_order_ids: set[str],
+    remote_client_order_ids: set[str],
+) -> bool:
+    external_order_id = str(order.external_order_id or "")
+    client_order_id = str(order.client_order_id or "")
+    return bool(
+        (external_order_id and external_order_id in remote_order_ids)
+        or (client_order_id and client_order_id in remote_client_order_ids)
+    )
+
+
+def reconcile_closed_position_protective_orders(
+    session: Session,
+    *,
+    symbol: str,
+    open_orders: list[dict[str, object]],
+    observed_at: datetime | None = None,
+    source: str = "exchange_sync",
+) -> list[Order]:
+    observed_at = observed_at or utcnow_naive()
+    remote_order_ids, remote_client_order_ids = _open_order_identity_sets(open_orders)
+    has_remote_open_orders = bool(open_orders)
+    candidates = list(
+        session.scalars(
+            select(Order)
+            .join(Position, Order.position_id == Position.id)
+            .where(
+                Order.mode == "live",
+                Order.symbol == symbol.upper(),
+                Order.status.notin_(FINAL_ORDER_STATUSES),
+                or_(Order.reduce_only.is_(True), Order.close_only.is_(True)),
+                or_(Position.status != "open", Position.quantity <= 0),
+            )
+        )
+    )
+    reconciled: list[Order] = []
+    for order in candidates:
+        if not _is_protective_order_type_name(order.order_type):
+            continue
+        if _local_order_is_present_remotely(
+            order,
+            remote_order_ids=remote_order_ids,
+            remote_client_order_ids=remote_client_order_ids,
+        ):
+            continue
+        if has_remote_open_orders and not order.external_order_id and not order.client_order_id:
+            continue
+        previous_status = order.status
+        previous_exchange_status = order.exchange_status
+        order.status = "canceled"
+        order.exchange_status = "CANCELED"
+        order.last_exchange_update_at = observed_at
+        reason_codes = [str(code) for code in (order.reason_codes or []) if code]
+        if CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE not in reason_codes:
+            reason_codes.append(CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE)
+        order.reason_codes = reason_codes
+        metadata = _as_object_dict(order.metadata_json)
+        metadata["closed_position_protective_order_reconciliation"] = {
+            "source": source,
+            "reason_code": CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE,
+            "reconciled_at": observed_at.isoformat(),
+            "remote_open_order_absent": True,
+            "previous_status": previous_status,
+            "previous_exchange_status": previous_exchange_status,
+            "position_id": order.position_id,
+        }
+        order.metadata_json = metadata
+        session.add(order)
+        reconciled.append(order)
+        record_audit_event(
+            session,
+            event_type="protective_order_reconciled",
+            entity_type="order",
+            entity_id=str(order.id),
+            severity="info",
+            message="Closed-position protective order was reconciled from local pending state.",
+            payload={
+                "symbol": order.symbol,
+                "position_id": order.position_id,
+                "order_id": order.id,
+                "external_order_id": order.external_order_id,
+                "client_order_id": order.client_order_id,
+                "reason_code": CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE,
+                "source": source,
+                "previous_status": previous_status,
+                "previous_exchange_status": previous_exchange_status,
+            },
+        )
+    if reconciled:
+        session.flush()
+    return reconciled
 
 
 def _fetch_exchange_order(
@@ -3726,7 +3955,7 @@ def sync_live_positions(
             local.status = "closed"
             local.quantity = 0.0
             local.closed_at = utcnow_naive()
-            metadata = local.metadata_json if isinstance(local.metadata_json, dict) else {}
+            metadata = _as_object_dict(local.metadata_json)
             metadata["exchange_position_mode"] = position_mode
             metadata["exchange_position_side"] = "BOTH" if position_mode == POSITION_MODE_ONE_WAY else None
             local.metadata_json = metadata
@@ -3817,7 +4046,7 @@ def sync_live_positions(
         session.add(local)
         session.flush()
     else:
-        metadata = local.metadata_json if isinstance(local.metadata_json, dict) else {}
+        metadata = _as_object_dict(local.metadata_json)
         if "origin" not in metadata:
             metadata["origin"] = "binance_sync"
         metadata["exchange_position_side"] = exchange_position_side
@@ -3892,6 +4121,35 @@ def _cancel_exit_orders(session: Session, client: BinanceClient, symbol: str) ->
             local.last_exchange_update_at = utcnow_naive()
             session.add(local)
     session.flush()
+
+
+def _normalize_partial_take_profit_quantity(
+    client: BinanceClient,
+    *,
+    symbol: str,
+    position: Position,
+    take_profit: float,
+    fraction: float,
+) -> float | None:
+    raw_quantity = max(float(position.quantity) * min(max(float(fraction), 0.01), 0.99), 0.0)
+    if raw_quantity <= 0:
+        return None
+    try:
+        if hasattr(client, "normalize_order_quantity"):
+            normalized = client.normalize_order_quantity(
+                symbol,
+                raw_quantity,
+                reference_price=take_profit,
+                enforce_min_notional=False,
+            )
+        else:
+            normalized = raw_quantity
+    except TypeError:
+        normalized = client.normalize_order_quantity(symbol, raw_quantity)  # type: ignore[call-arg]
+    quantity = min(abs(_to_float(normalized, raw_quantity)), float(position.quantity))
+    if quantity <= 0 or quantity >= float(position.quantity) - 1e-12:
+        return None
+    return quantity
 
 
 def _execute_primary_order_with_policy(
@@ -4337,12 +4595,67 @@ def _create_protective_orders(
     created_ids: list[int] = []
     current_state = _build_protection_state(position, existing_open_orders or [])
     missing_components = _get_string_list(current_state, "missing_components")
-    requested_orders: list[tuple[str, float]] = []
+    take_profit_policy = _take_profit_execution_policy(position)
+    requested_orders: list[dict[str, object]] = []
     if "stop_loss" in missing_components:
-        requested_orders.append(("STOP_MARKET", client.normalize_price(symbol, stop_loss)))
+        requested_orders.append(
+            {
+                "component": "stop_loss",
+                "order_type": "STOP_MARKET",
+                "stop_price": client.normalize_price(symbol, stop_loss),
+                "quantity": None,
+                "reduce_only": True,
+                "close_position": True,
+                "requested_quantity": position.quantity,
+            }
+        )
     if "take_profit" in missing_components:
-        requested_orders.append(("TAKE_PROFIT_MARKET", client.normalize_price(symbol, take_profit)))
-    requested_order_types = [order_type for order_type, _ in requested_orders]
+        normalized_take_profit = client.normalize_price(symbol, take_profit)
+        partial_quantity = (
+            _normalize_partial_take_profit_quantity(
+                client,
+                symbol=symbol,
+                position=position,
+                take_profit=normalized_take_profit,
+                fraction=_to_float(
+                    take_profit_policy.get("partial_take_profit_fraction"),
+                    PARTIAL_TAKE_PROFIT_FRACTION,
+                ),
+            )
+            if take_profit_policy.get("mode") == "partial_reduce"
+            else None
+        )
+        if partial_quantity is not None:
+            requested_orders.append(
+                {
+                    "component": "take_profit",
+                    "order_type": "TAKE_PROFIT_MARKET",
+                    "stop_price": normalized_take_profit,
+                    "quantity": partial_quantity,
+                    "reduce_only": True,
+                    "close_position": False,
+                    "requested_quantity": partial_quantity,
+                    "take_profit_execution_policy": take_profit_policy,
+                }
+            )
+        else:
+            requested_orders.append(
+                {
+                    "component": "take_profit",
+                    "order_type": "TAKE_PROFIT_MARKET",
+                    "stop_price": normalized_take_profit,
+                    "quantity": None,
+                    "reduce_only": True,
+                    "close_position": True,
+                    "requested_quantity": position.quantity,
+                    "take_profit_execution_policy": {
+                        **take_profit_policy,
+                        "mode": "full_close",
+                        "fallback_reason": "partial_take_profit_quantity_unavailable",
+                    },
+                }
+            )
+    requested_order_types = [str(item["order_type"]) for item in requested_orders]
     if requested_orders:
         if protection_lifecycle is not None and protection_lifecycle.state == "none":
             _transition_protection_lifecycle(
@@ -4366,38 +4679,57 @@ def _create_protective_orders(
                 requested_order_types=requested_order_types,
             )
             _persist_protection_lifecycle(session, parent_order, protection_lifecycle)
-    for order_type, stop_price in requested_orders:
+    for order_spec in requested_orders:
+        order_type = str(order_spec["order_type"])
+        stop_price = float(order_spec["stop_price"])
+        close_position = bool(order_spec.get("close_position"))
+        reduce_only = bool(order_spec.get("reduce_only"))
+        quantity = order_spec.get("quantity")
+        requested_quantity = _to_float(order_spec.get("requested_quantity"), position.quantity)
         client_order_id, exchange_order, submit_request, submission_tracking = _safe_submit_order(
             client,
             symbol=symbol,
             side=exit_side,
             order_type=order_type,
+            quantity=float(quantity) if quantity not in {None, ""} else None,
             stop_price=stop_price,
-            close_position=True,
+            reduce_only=reduce_only,
+            close_position=close_position,
             response_type="ACK",
             client_order_id=_build_deterministic_client_order_id(
                 seed=client_order_id_seed,
-                suffix=f"protective-{order_type.lower()}",
+                suffix=f"protective-{order_type.lower()}-{order_spec.get('component')}",
             ),
             reference_price=position.entry_price if position.entry_price > 0 else position.mark_price,
             enforce_min_notional=False,
         )
         normalized_stop_price = _to_float(submit_request.get("stop_price"), stop_price)
+        if not close_position:
+            requested_quantity = _to_float(submit_request.get("quantity"), requested_quantity)
         row = _upsert_exchange_order_row(
             session,
             symbol=symbol,
             requested_price=normalized_stop_price,
-            requested_quantity=position.quantity,
+            requested_quantity=requested_quantity,
             order_type=order_type,
             side=exit_side.lower(),
             exchange_order={**exchange_order, "clientOrderId": client_order_id},
             decision_run_id=decision_run_id,
             risk_row=risk_row,
-            reduce_only=True,
-            close_only=True,
+            reduce_only=reduce_only,
+            close_only=close_position,
             parent_order_id=parent_order.id if parent_order is not None else None,
         )
         row.position_id = position.id
+        row_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        row.metadata_json = {
+            **row_metadata,
+            "protective_component": order_spec.get("component"),
+        }
+        if order_spec.get("take_profit_execution_policy") is not None:
+            row.metadata_json["take_profit_execution_policy"] = dict(
+                order_spec["take_profit_execution_policy"]  # type: ignore[arg-type]
+            )
         _apply_submission_tracking(
             row,
             client_order_id=client_order_id,
@@ -4412,7 +4744,7 @@ def _create_protective_orders(
             symbol=symbol,
             submission_tracking=submission_tracking,
             context="protective_order",
-            requested_quantity=position.quantity,
+            requested_quantity=requested_quantity,
             requested_price=normalized_stop_price,
             correlation_ids=normalize_correlation_ids(correlation_ids, execution_id=row.id),
         )
@@ -5252,6 +5584,7 @@ def sync_live_state(
     symbol_states: dict[str, dict[str, object]] = {}
     unprotected_positions: list[str] = []
     emergency_actions_taken: list[dict[str, object]] = []
+    reconciled_closed_position_protective_orders: list[dict[str, object]] = []
     guarded_symbols = list(symbols) if mode_guard_reason_code is not None else []
     bulk_open_orders: list[dict[str, object]] | None = None
     bulk_remote_positions: list[dict[str, object]] | None = None
@@ -5439,6 +5772,24 @@ def sync_live_state(
                 alert_message="거래소 포지션 상태를 동기화하지 못해 거래를 일시 중지했습니다.",
             )
             raise RuntimeError(f"{reason_code}: {exc}") from exc
+        stale_protective_orders = reconcile_closed_position_protective_orders(
+            session,
+            symbol=item_symbol,
+            open_orders=open_orders,
+            observed_at=reconcile_started_at,
+            source="sync_live_state",
+        )
+        if stale_protective_orders:
+            synced_orders += len(stale_protective_orders)
+            reconciled_closed_position_protective_orders.extend(
+                {
+                    "symbol": order.symbol,
+                    "order_id": order.id,
+                    "position_id": order.position_id,
+                    "reason_code": CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE,
+                }
+                for order in stale_protective_orders
+            )
         position = get_open_position(session, item_symbol)
         symbol_guard_reason_code = str(synced_position.get("guard_reason_code") or "") or None
         symbol_guard_active = bool(mode_guard_reason_code or symbol_guard_reason_code)
@@ -5563,6 +5914,7 @@ def sync_live_state(
             "remote_position_sides": list(synced_position.get("remote_position_sides") or []),
             "open_order_position_sides": list(synced_position.get("open_order_position_sides") or []),
             "open_order_count": len(open_orders),
+            "closed_position_protective_orders_reconciled": len(stale_protective_orders),
             "protection_status": str(symbol_protection_state[item_symbol].get("status") or "unknown"),
             "guard_active": symbol_guard_active,
             "guard_reason_code": mode_guard_reason_code or symbol_guard_reason_code,
@@ -5711,6 +6063,7 @@ def sync_live_state(
         "stream_events": stream_events,
         "stream_issues": [dict(item) for item in stream_poll.get("stream_issues", []) if isinstance(item, dict)],
         "symbol_reconciliation": symbol_states,
+        "reconciled_closed_position_protective_orders": reconciled_closed_position_protective_orders,
     }
 
 

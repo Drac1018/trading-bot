@@ -5,6 +5,7 @@ from datetime import timedelta
 from trading_mvp.schemas import (
     DerivativesContextPayload,
     EventContextPayload,
+    MacroEventPayload,
     MarketCandle,
     MarketSnapshotPayload,
 )
@@ -134,6 +135,7 @@ def _macro_event_context(
     is_complete: bool = True,
     affected_assets: list[str] | None = None,
     enrichment_vendors: list[str] | None = None,
+    events: list[MacroEventPayload] | None = None,
 ) -> EventContextPayload:
     return EventContextPayload(
         source_status=source_status,  # type: ignore[arg-type]
@@ -150,7 +152,7 @@ def _macro_event_context(
         affected_assets=affected_assets or ["USD", "CRYPTO"],
         event_bias="bearish",
         enrichment_vendors=enrichment_vendors or ["bls"],
-        events=[],
+        events=events or [],
     )
 
 
@@ -198,6 +200,40 @@ def test_ai_context_exposes_unavailable_lead_context_status() -> None:
     assert "LEAD_CONTEXT_UNAVAILABLE" in context.lead_lag_summary.reason_codes
     assert "lead_context_unavailable" in context.data_quality.missing_context_flags
     assert "LEAD_CONTEXT_UNAVAILABLE" in context.composite_regime.regime_reason_codes
+
+
+def test_ai_context_exposes_operating_summaries() -> None:
+    snapshot, features = _features()
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={
+            "active_position_summary": {
+                "has_open_position": True,
+                "side": "long",
+                "current_r_multiple": 0.42,
+            },
+            "pending_entry_plan_summary": {
+                "active_plan_count": 1,
+                "same_symbol_plan_count": 1,
+                "plans": [{"plan_id": 7, "side": "long"}],
+            },
+            "execution_constraints_summary": {
+                "minimum_actionable_notional": 25.0,
+                "risk_guard_final_authority": True,
+            },
+        },
+        selection_context={"strategy_engine": "trend_pullback_engine", "holding_profile": "scalp"},
+        decision_reference={},
+    )
+
+    assert context.active_position_summary["has_open_position"] is True
+    assert context.active_position_summary["current_r_multiple"] == 0.42
+    assert context.pending_entry_plan_summary["active_plan_count"] == 1
+    assert context.pending_entry_plan_summary["plans"][0]["plan_id"] == 7
+    assert context.execution_constraints_summary["minimum_actionable_notional"] == 25.0
+    assert context.execution_constraints_summary["risk_guard_final_authority"] is True
 
 
 def test_composite_regime_packet_generation() -> None:
@@ -275,6 +311,34 @@ def test_data_quality_unavailable_and_degraded_classification() -> None:
     assert unavailable_packet.account_state_trustworthy is False
     assert "market_snapshot_stale" in unavailable_packet.stale_context_flags
     assert "positions_sync_incomplete" in unavailable_packet.missing_context_flags
+
+
+def test_data_quality_treats_flat_protective_staleness_as_safe_when_position_scopes_are_fresh() -> None:
+    snapshot, features = _features()
+    packet = build_data_quality_packet(
+        market_snapshot=snapshot,
+        features=features,
+        decision_reference={
+            "sync_freshness_summary": {
+                "account": {"status": "synced", "raw_status": "synced", "stale": False, "incomplete": False},
+                "positions": {"status": "synced", "raw_status": "synced", "stale": False, "incomplete": False},
+                "open_orders": {"status": "synced", "raw_status": "synced", "stale": False, "incomplete": False},
+                "protective_orders": {
+                    "status": "stale",
+                    "raw_status": "synced",
+                    "sync_detail_status": "flat",
+                    "last_attempt_status": "success",
+                    "last_failure_reason": None,
+                    "stale": True,
+                    "incomplete": False,
+                },
+            }
+        },
+    )
+
+    assert packet.account_state_trustworthy is True
+    assert packet.data_quality_grade == "complete"
+    assert "protective_orders_sync_stale" not in packet.stale_context_flags
 
 
 def test_previous_thesis_delta_generation() -> None:
@@ -527,6 +591,55 @@ def test_entry_candidate_ai_context_marks_imminent_high_impact_macro_event() -> 
     assert context.event_risk_context["risk_pct_multiplier"] == 0.5
     assert context.event_risk_context["hold_bias"] == 0.25
     assert context.event_risk_context["event_bias_used"] == "bearish"
+
+
+def test_entry_candidate_ai_context_derives_post_release_macro_result_bias() -> None:
+    snapshot, features = _features()
+    event = MacroEventPayload(
+        event_at=snapshot.snapshot_time - timedelta(minutes=10),
+        event_name="US CPI",
+        importance="high",
+        affected_assets=["USD", "CRYPTO"],
+        event_bias=None,
+        minutes_to_event=-10,
+        active_risk_window=True,
+        enrichment_vendors=["bls"],
+        release_enrichment={
+            "bls": {
+                "headline_metric": "cpi_yoy_pct",
+                "actual": 3.4,
+                "forecast": 3.0,
+                "prior": 3.1,
+            }
+        },
+    )
+    features = features.model_copy(
+        update={
+            "event_context": _macro_event_context(
+                snapshot,
+                minutes_to_event=-10,
+                events=[event],
+            )
+        }
+    )
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context={"strategy_engine": "trend_pullback_engine", "holding_profile": "scalp"},
+        review_trigger=_review_trigger("entry_candidate_event"),
+        decision_reference={},
+    )
+
+    result_context = context.event_risk_context["event_result_context"]
+    assert result_context["available"] is True
+    assert result_context["event_result_bias"] == "bearish"
+    assert result_context["comparison"] == "forecast"
+    assert result_context["reaction_window_active"] is True
+    assert "MACRO_EVENT_RESULT_AVAILABLE" in context.event_risk_reason_codes
+    assert "MACRO_EVENT_RESULT_BEARISH" in context.event_risk_reason_codes
+    assert "MACRO_RELEASE_REACTION_WINDOW" in context.event_risk_reason_codes
 
 
 def test_breakout_exception_ai_context_applies_stronger_macro_hold_bias() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from trading_mvp.models import RiskCheck
+from trading_mvp.models import PendingEntryPlan, RiskCheck
 from trading_mvp.services.dashboard import get_operator_dashboard, get_overview, get_risk_checks
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
@@ -150,6 +150,57 @@ def test_dashboard_filters_requested_only_auto_resizable_exposure_reason(db_sess
     assert risk_checks[0]["payload"]["blocked_reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
     assert risk_checks[0]["risk_guard_result"]["reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
     assert risk_checks[0]["risk_guard_result"]["blocked_reason_codes"] == ["LIVE_APPROVAL_REQUIRED"]
+
+
+def test_risk_checks_include_linked_pending_entry_plan_status(db_session) -> None:
+    decision_run_id = 4262
+    now = utcnow_naive()
+    risk_row = RiskCheck(
+        symbol="SOLUSDT",
+        decision_run_id=decision_run_id,
+        allowed=False,
+        decision="long",
+        reason_codes=["DETERMINISTIC_BASELINE_DISAGREEMENT"],
+        approved_risk_pct=0.0,
+        approved_leverage=0.0,
+        payload={
+            "allowed": False,
+            "decision": "long",
+            "reason_codes": ["DETERMINISTIC_BASELINE_DISAGREEMENT"],
+            "blocked_reason_codes": ["DETERMINISTIC_BASELINE_DISAGREEMENT"],
+        },
+    )
+    plan_row = PendingEntryPlan(
+        symbol="SOLUSDT",
+        side="long",
+        plan_status="canceled",
+        source_decision_run_id=decision_run_id,
+        entry_mode="pullback_confirm",
+        entry_zone_min=84.63,
+        entry_zone_max=84.80,
+        invalidation_price=84.40,
+        max_chase_bps=4.0,
+        idea_ttl_minutes=120,
+        stop_loss=84.40,
+        take_profit=85.60,
+        risk_pct_cap=0.01,
+        leverage_cap=2.0,
+        expires_at=now + timedelta(hours=2),
+        canceled_at=now + timedelta(minutes=25),
+        canceled_reason="REPLACED_BY_NEW_APPROVED_PLAN",
+        idempotency_key="test-solusdt-4262",
+        metadata_json={"source_risk_check_id": 2187},
+    )
+    db_session.add_all([risk_row, plan_row])
+    db_session.flush()
+
+    risk_checks = get_risk_checks(db_session, limit=1, compact=True)
+
+    pending_plan = risk_checks[0]["pending_entry_plan"]
+    assert pending_plan["plan_id"] == plan_row.id
+    assert pending_plan["source_decision_run_id"] == decision_run_id
+    assert pending_plan["plan_status"] == "canceled"
+    assert pending_plan["canceled_reason"] == "REPLACED_BY_NEW_APPROVED_PLAN"
 
 
 def test_operator_dashboard_risk_guard_passthroughs_current_cycle_result_without_recalculation(db_session) -> None:

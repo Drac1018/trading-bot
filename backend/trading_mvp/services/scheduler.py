@@ -28,6 +28,7 @@ INTERVAL_DECISION_WORKFLOW = "interval_decision_cycle"
 ENTRY_PLAN_WATCHER_WORKFLOW = "entry_plan_watcher_cycle"
 RELEASE_ENRICHMENT_WATCH_WORKFLOW = "release_enrichment_watch_cycle"
 READ_REFRESH_SYNC_DEBOUNCE_SECONDS = 30
+PRE_DECISION_SYNC_MIN_FRESH_SECONDS = 60
 RELEASE_ENRICHMENT_RETRY_SECONDS = 15
 RELEASE_ENRICHMENT_WATCH_WINDOW_SECONDS = 120
 STALE_RUNNING_SCHEDULER_RUN_SECONDS = 30 * 60
@@ -240,11 +241,23 @@ def _release_watch_candidate(
     }
 
 
-def _sync_summary_needs_refresh(sync_freshness_summary: dict[str, object]) -> bool:
+def _sync_summary_needs_refresh(
+    sync_freshness_summary: dict[str, object],
+    *,
+    min_fresh_for_seconds: int = 0,
+) -> bool:
     for payload in sync_freshness_summary.values():
         if not isinstance(payload, dict):
             continue
         if bool(payload.get("stale")) or bool(payload.get("incomplete")):
+            return True
+        if min_fresh_for_seconds <= 0:
+            continue
+        freshness_seconds = payload.get("freshness_seconds")
+        stale_after_seconds = payload.get("stale_after_seconds")
+        if not isinstance(freshness_seconds, (int, float)) or not isinstance(stale_after_seconds, (int, float)):
+            continue
+        if int(stale_after_seconds) - int(freshness_seconds) <= min_fresh_for_seconds:
             return True
     return False
 
@@ -529,7 +542,15 @@ def maybe_refresh_exchange_sync_freshness(
     if not settings_row.binance_api_key_encrypted or not settings_row.binance_api_secret_encrypted:
         return None
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
-    if not _sync_summary_needs_refresh(sync_freshness_summary):
+    min_fresh_for_seconds = (
+        PRE_DECISION_SYNC_MIN_FRESH_SECONDS
+        if "pre_decision" in str(triggered_by or "")
+        else 0
+    )
+    if not _sync_summary_needs_refresh(
+        sync_freshness_summary,
+        min_fresh_for_seconds=min_fresh_for_seconds,
+    ):
         return None
     latest_attempt_at = _latest_sync_attempt_at(sync_freshness_summary)
     now = utcnow_naive()
@@ -873,6 +894,10 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             "reason": "AI_DISABLED",
             "auto_resume": auto_resume_result,
         }
+    pre_decision_exchange_sync = maybe_refresh_exchange_sync_freshness(
+        session,
+        triggered_by=f"{triggered_by}:pre_decision",
+    )
     orchestrator = TradingOrchestrator(session)
     results: list[dict[str, object]] = []
     due_effective = []
@@ -956,18 +981,39 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             else []
         )
         last_ai_skip_reason = str(plan.get("last_ai_skip_reason") or "") or None
+        plan_ai_call_policy = (
+            dict(plan.get("ai_call_policy"))
+            if isinstance(plan.get("ai_call_policy"), dict)
+            else {}
+        )
         active_position_suppression_payload = _active_position_suppression_payload_from_plan(plan)
         try:
             if trigger_payload is None:
+                policy_reason = str(plan_ai_call_policy.get("reason") or "") or None
+                audit_event_type = "decision_ai_skipped" if policy_reason else "decision_ai_no_event"
                 record_audit_event(
                     session,
-                    event_type="decision_ai_no_event",
+                    event_type=audit_event_type,
                     entity_type="symbol",
                     entity_id=effective.symbol,
                     severity="info",
-                    message="No deterministic entry or review trigger was detected for this interval cycle.",
+                    message=(
+                        "AI inference was skipped before decision-cycle execution."
+                        if policy_reason
+                        else "No deterministic entry or review trigger was detected for this interval cycle."
+                    ),
                     payload={
                         "symbol": effective.symbol,
+                        "ai_call_event": plan_ai_call_policy.get("ai_call_event"),
+                        "reason": policy_reason,
+                        "hard_skip_ai": plan_ai_call_policy.get("hard_skip_ai"),
+                        "skip_category": plan_ai_call_policy.get("skip_category"),
+                        "scope": plan_ai_call_policy.get("scope"),
+                        "hard_skip_reason_codes": list(
+                            plan_ai_call_policy.get("hard_skip_reason_codes") or []
+                        ),
+                        "last_ai_skip_reason": last_ai_skip_reason or "NO_EVENT",
+                        "ai_call_policy": plan_ai_call_policy or None,
                         "cadence": cadence_profile,
                         "next_ai_review_due_at": next_ai_review_due_at,
                         "last_material_review_at": last_material_review_at,
@@ -987,7 +1033,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         payload={
                             "symbol": effective.symbol,
                             "status": "skipped",
-                            "ai_review_status": "no_event",
+                            "ai_review_status": "skipped" if policy_reason else "no_event",
                             "trigger": None,
                             "last_ai_trigger_reason": None,
                             "last_ai_invoked_at": last_ai_invoked_at,
@@ -1007,6 +1053,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "cadence_profile_summary": cadence_profile_summary,
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
+                            "pre_decision_exchange_sync": pre_decision_exchange_sync,
                         },
                     )
                 )
@@ -1061,10 +1108,15 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "cadence_profile_summary": cadence_profile_summary,
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
+                            "pre_decision_exchange_sync": pre_decision_exchange_sync,
                         },
                     )
                 )
                 continue
+            decision_pre_decision_exchange_sync = maybe_refresh_exchange_sync_freshness(
+                session,
+                triggered_by=f"{triggered_by}:pre_decision:{effective.symbol}",
+            )
             outcome = orchestrator.run_decision_cycle(
                 symbol=effective.symbol,
                 timeframe=effective.timeframe,
@@ -1091,6 +1143,8 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "trigger": trigger_payload,
                         "cadence": cadence_profile,
                         "auto_resume": auto_resume_result,
+                        "pre_decision_exchange_sync": decision_pre_decision_exchange_sync
+                        or pre_decision_exchange_sync,
                     },
                 )
             )
@@ -1105,6 +1159,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "symbol": effective.symbol,
                         "error": str(exc),
                         "trigger": trigger_payload,
+                        "pre_decision_exchange_sync": pre_decision_exchange_sync,
                     },
                 )
             )
@@ -1112,6 +1167,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         "workflow": INTERVAL_DECISION_WORKFLOW,
         "results": results,
         "auto_resume": auto_resume_result,
+        "pre_decision_exchange_sync": pre_decision_exchange_sync,
         "candidate_selection": decision_plan.get("candidate_selection", {}),
     }
 

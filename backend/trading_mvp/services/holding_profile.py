@@ -51,18 +51,24 @@ HOLDING_PROFILE_MANAGEMENT_POLICIES: dict[str, dict[str, Any]] = {
         "partial_take_profit_trigger_r": 1.1,
         "partial_take_profit_fraction": 0.35,
         "trailing_stop_atr_multiplier": 0.95,
+        "take_profit_order_mode": "full_close",
+        "runner_after_partial_take_profit": False,
     },
     HOLDING_PROFILE_SWING: {
         "break_even_trigger_r": 1.0,
         "partial_take_profit_trigger_r": 1.5,
         "partial_take_profit_fraction": 0.25,
         "trailing_stop_atr_multiplier": 1.2,
+        "take_profit_order_mode": "partial_reduce",
+        "runner_after_partial_take_profit": True,
     },
     HOLDING_PROFILE_POSITION: {
         "break_even_trigger_r": 1.2,
         "partial_take_profit_trigger_r": 2.2,
         "partial_take_profit_fraction": 0.18,
         "trailing_stop_atr_multiplier": 1.45,
+        "take_profit_order_mode": "full_close",
+        "runner_after_partial_take_profit": False,
     },
 }
 
