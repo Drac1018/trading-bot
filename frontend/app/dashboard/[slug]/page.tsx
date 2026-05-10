@@ -1,29 +1,21 @@
-import type { ReactNode } from "react";
 import { notFound } from "next/navigation";
 
-import {
-  AgentDebugView,
-  DecisionView,
-  MarketSignalView,
-  PositionsView,
-  RiskView,
-  SchedulerView,
-  type MarketChartZoomRange,
-  type MarketChartTimeframe,
-} from "../../../components/dashboard-views";
-import { DataTable } from "../../../components/data-table";
-import { LogExplorer, type AuditRow } from "../../../components/log-explorer";
+import { DashboardViewLoader } from "./dashboard-view-loader";
+import type {
+  CandleWindow,
+  MarketChartTimeframe,
+  MarketChartZoomRange,
+  MarketDashboardViewData,
+  NormalizedDashboardSection,
+  Row,
+} from "./dashboard-view-types";
+import type { SettingsPayload } from "../../../components/settings-controls";
 import { PageShell } from "../../../components/page-shell";
-import { SettingsControls, type SettingsPayload } from "../../../components/settings-controls";
-import { type OperatorDashboardPayload } from "../../../components/overview-dashboard";
+import type { OperatorDashboardPayload } from "../../../components/overview-dashboard";
 import { fetchJson } from "../../../lib/api";
 import { fetchBinanceChartCandlesBySymbol } from "../../../lib/binance-chart-candles";
-import { normalizeSettingsView } from "../../../lib/page-config";
-import { ALL_SYMBOLS, resolveSelectedSymbol } from "../../../lib/selected-symbol";
 import { dashboardPages } from "../../../lib/page-config";
-
-type Row = Record<string, unknown>;
-type CandleWindow = 30 | 60 | 120;
+import { ALL_SYMBOLS, resolveSelectedSymbol } from "../../../lib/selected-symbol";
 
 function queryValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
@@ -71,14 +63,6 @@ function resolveMarketChartZoomRange(value: string | string[] | undefined): Mark
   return { start, end };
 }
 
-function resolveDecisionEntryFlowTab(value: string | string[] | undefined): "summary" | "plan" | "execution" {
-  const normalized = queryValue(value);
-  if (normalized === "plan" || normalized === "execution") {
-    return normalized;
-  }
-  return "summary";
-}
-
 function operatorDashboardEndpoint(slug: string) {
   if (slug === "market" || slug === "scheduler") {
     return `/api/dashboard/operator?view=${slug}`;
@@ -101,27 +85,14 @@ export default async function DashboardPage({
     notFound();
   }
 
-  // Audit uses the shared explorer component with audit-only data.
-  if (slug === "audit") {
-    const auditRows = await fetchJson<AuditRow[]>("/api/audit?limit=30");
-    const initialTab = typeof query.tab === "string" ? query.tab : "all";
-
-    return (
-      <div className="space-y-6">
-        <PageShell eyebrow={config.eyebrow} title={config.title} description={config.description} compact />
-        <LogExplorer initialRows={auditRows} initialTab={initialTab} initialLimit={30} />
-      </div>
-    );
-  }
-
-  const settingsPayloadPromise = slug === "settings"
-    ? fetchJson<SettingsPayload>("/api/settings")
-    : Promise.resolve<SettingsPayload | null>(null);
+  const settingsPayloadPromise =
+    slug === "settings"
+      ? fetchJson<SettingsPayload>("/api/settings")
+      : Promise.resolve<SettingsPayload | null>(null);
   const operatorPayloadPromise =
     slug === "market" || slug === "decisions" || slug === "scheduler" || slug === "risk"
       ? fetchJson<OperatorDashboardPayload>(operatorDashboardEndpoint(slug))
       : Promise.resolve<OperatorDashboardPayload | null>(null);
-
   const sectionsPromise =
     slug === "settings"
       ? Promise.resolve([])
@@ -131,19 +102,19 @@ export default async function DashboardPage({
             rows: await fetchJson<Row[] | Row>(section.endpoint),
           })),
         );
+
   const [settingsPayload, operatorPayload, sections] = await Promise.all([
     settingsPayloadPromise,
     operatorPayloadPromise,
     sectionsPromise,
   ]);
 
-  const normalizedSections = sections.map((section) => ({
+  const normalizedSections: NormalizedDashboardSection[] = sections.map((section) => ({
     ...section,
     rows: Array.isArray(section.rows) ? section.rows : [section.rows],
   }));
 
-  let content: ReactNode = null;
-
+  let market: MarketDashboardViewData | null = null;
   if (slug === "market" && operatorPayload) {
     const requestedMarketSymbol = queryValue(query.symbol);
     const selectedSymbol =
@@ -181,66 +152,27 @@ export default async function DashboardPage({
           ),
         ])
       : [undefined, undefined];
-    content = (
-      <MarketSignalView
-        operator={operatorPayload}
-        snapshots={normalizedSections[0]?.rows ?? []}
-        features={normalizedSections[1]?.rows ?? []}
-        chartSnapshots={chartFallbackSnapshots}
-        chartFeatures={chartFallbackFeatures}
-        selectedSymbol={selectedSymbol}
-        selectedCandleWindow={selectedCandleWindow}
-        selectedTimeframe={selectedTimeframe}
-        selectedChartZoomRange={selectedChartZoomRange}
-        chartCandlesBySymbol={chartCandlesBySymbol}
-      />
-    );
-  } else if (slug === "decisions" && operatorPayload) {
-    const selectedSymbol = resolveSelectedSymbol(
-      queryValue(query.symbol),
-      operatorPayload.control.tracked_symbols,
-      operatorPayload.control.default_symbol,
-      { mode: "single" },
-    );
-    content = (
-      <DecisionView
-        operator={operatorPayload}
-        decisionRows={normalizedSections[0]?.rows ?? []}
-        selectedSymbol={selectedSymbol}
-        entryFlowTab={resolveDecisionEntryFlowTab(query.flow)}
-      />
-    );
-  } else if (slug === "scheduler" && operatorPayload) {
-    content = <SchedulerView operator={operatorPayload} schedulerRows={normalizedSections[0]?.rows ?? []} />;
-  } else if (slug === "positions") {
-    content = <PositionsView positionRows={normalizedSections[0]?.rows ?? []} />;
-  } else if (slug === "risk") {
-    content = (
-      <RiskView
-        operator={operatorPayload}
-        riskRows={normalizedSections[0]?.rows ?? []}
-        alertRows={normalizedSections[1]?.rows ?? []}
-      />
-    );
-  } else if (slug === "agents") {
-    content = <AgentDebugView agentRows={normalizedSections[0]?.rows ?? []} />;
-  } else if (slug === "settings") {
-    content = settingsPayload ? (
-      <SettingsControls
-        initial={settingsPayload}
-        initialView={normalizeSettingsView(queryValue(query.view))}
-      />
-    ) : null;
-  } else {
-    content = normalizedSections.map((section) => (
-      <DataTable
-        key={section.title}
-        title={section.title}
-        description={section.description}
-        rows={section.rows}
-      />
-    ));
+    market = {
+      selectedSymbol,
+      selectedCandleWindow,
+      selectedTimeframe,
+      selectedChartZoomRange,
+      chartCandlesBySymbol,
+      chartFallbackSnapshots,
+      chartFallbackFeatures,
+    };
   }
+
+  const content = (
+    <DashboardViewLoader
+      slug={slug}
+      query={query}
+      sections={normalizedSections}
+      operatorPayload={operatorPayload}
+      settingsPayload={settingsPayload}
+      market={market}
+    />
+  );
 
   return (
     <div className="space-y-6">

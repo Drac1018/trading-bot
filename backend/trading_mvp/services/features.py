@@ -20,9 +20,9 @@ from trading_mvp.schemas import (
     PullbackContinuationFeatureContext,
     RegimeFeatureContext,
     TimeframeFeatureContext,
+    VolumePersistenceFeatureContext,
     VolumeProfileFeatureContext,
     VolumeProfileLevel,
-    VolumePersistenceFeatureContext,
 )
 
 

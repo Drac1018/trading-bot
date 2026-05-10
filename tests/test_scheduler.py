@@ -5,11 +5,19 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
-from trading_mvp.models import AgentRun, MarketSnapshot, Position, SchedulerRun, SystemHealthEvent
+from trading_mvp.models import (
+    AgentRun,
+    MarketSnapshot,
+    PendingEntryPlan,
+    Position,
+    SchedulerRun,
+    SystemHealthEvent,
+)
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.runtime_state import build_sync_freshness_summary, mark_sync_success
 from trading_mvp.services.scheduler import (
     abandon_stale_scheduler_runs,
+    get_due_entry_plan_symbols,
     get_due_interval_decision_symbols,
     get_due_position_management_symbols,
     run_due_operational_cycles,
@@ -24,6 +32,37 @@ def _mark_sync_fresh(settings_row) -> None:
     now = utcnow_naive()
     for scope in ("account", "positions", "open_orders", "protective_orders"):
         mark_sync_success(settings_row, scope=scope, synced_at=now)
+
+
+def test_due_entry_plan_symbols_keep_future_utc_naive_armed_plan(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    now = utcnow_naive()
+    plan = PendingEntryPlan(
+        symbol="BTCUSDT",
+        side="short",
+        plan_status="armed",
+        source_decision_run_id=173,
+        source_timeframe="15m",
+        entry_mode="pullback_confirm",
+        entry_zone_min=80505.6252,
+        entry_zone_max=80344.7748,
+        invalidation_price=80651.8214,
+        max_chase_bps=4.0,
+        idea_ttl_minutes=120,
+        stop_loss=80651.8214,
+        take_profit=80017.28148,
+        risk_pct_cap=0.02,
+        leverage_cap=3.0,
+        expires_at=now + timedelta(minutes=90),
+        idempotency_key="pending-plan:BTCUSDT:short:173:scheduler-test",
+        metadata_json={},
+    )
+    db_session.add_all([settings_row, plan])
+    db_session.flush()
+
+    assert get_due_entry_plan_symbols(db_session) == ["BTCUSDT"]
+    assert db_session.get(PendingEntryPlan, plan.id).plan_status == "armed"
 
 
 def test_interval_plan_account_trust_allows_flat_protective_staleness(db_session) -> None:

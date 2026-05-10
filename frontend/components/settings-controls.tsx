@@ -48,6 +48,7 @@ import {
   settingsViewTabs,
   type SettingsView,
 } from "../lib/page-config";
+import { filterNonEntryWaitReasonCodesInContext } from "../lib/risk-reason-copy.js";
 import { buildSettingsEventPreviewSummary } from "../lib/settings-event-preview.js";
 import { formatDisplayValue } from "../lib/ui-copy";
 
@@ -415,7 +416,14 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     degraded_reason_codes: dedupeReasons(summary?.degraded_reason_codes ?? []),
     protection_reason_codes: dedupeReasons(summary?.protection_reason_codes ?? []),
     approval_control_blocked_reasons: dedupeReasons(
-      summary?.approval_control_blocked_reasons ?? state.blocked_reasons,
+      filterNonEntryWaitReasonCodesInContext(
+        summary?.approval_control_blocked_reasons ?? state.blocked_reasons,
+        [
+          ...(summary?.approval_control_blocked_reasons ?? []),
+          ...(summary?.blocked_reasons_current_cycle ?? state.latest_blocked_reasons),
+          ...state.blocked_reasons,
+        ],
+      ),
     ),
     live_arm_disabled: summary?.live_arm_disabled ?? liveArmDisabledByPositionMode,
     live_arm_disable_reason_code: summary?.live_arm_disable_reason_code ?? null,

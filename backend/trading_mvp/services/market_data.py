@@ -6,6 +6,7 @@ from math import sin
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from trading_mvp.config import get_settings
 from trading_mvp.models import MarketSnapshot
 from trading_mvp.schemas import (
     DerivativesContextPayload,
@@ -14,7 +15,23 @@ from trading_mvp.schemas import (
     MarketSnapshotPayload,
 )
 from trading_mvp.services.binance import BinanceClient
+from trading_mvp.services.binance_market_stream import (
+    MARKET_STREAM_DATA_SOURCE,
+    MARKET_STREAM_REST_FALLBACK_SOURCE,
+    get_cached_closed_kline,
+    get_market_stream_state,
+    market_stream_stale_after_seconds,
+)
 from trading_mvp.services.event_context import EventContextProvider, build_event_context
+from trading_mvp.services.market_data_cache import (
+    MARKET_DATA_CACHE_BACKEND_PROCESS_LOCAL,
+    MARKET_DATA_CACHE_ENV_MAINNET,
+    MARKET_DATA_CACHE_ENV_TESTNET,
+    MARKET_DATA_CACHE_SCOPE_PROCESS_LOCAL,
+    build_shared_market_cache_state,
+    normalize_market_data_cache_environment,
+    read_closed_kline_from_redis,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_CONTEXT_TIMEFRAMES = ("1h", "4h")
@@ -295,9 +312,143 @@ def _build_seed_snapshot(
         candle_count=len(candles),
         is_stale=force_stale,
         is_complete=len(candles) >= min(lookback, 20),
+        source="seed_fallback",
+        source_status="stale" if force_stale else "fresh",
+        source_detail={"fallback_used": True, "partial_candle_used": False},
         candles=candles,
         derivatives_context=derivatives_context or _seed_derivatives_context(),
     )
+
+
+def _apply_closed_stream_kline(
+    candles: list[MarketCandle],
+    stream_candle: MarketCandle,
+    *,
+    lookback: int,
+) -> list[MarketCandle]:
+    if not candles:
+        return [stream_candle]
+    latest = candles[-1]
+    if stream_candle.timestamp < latest.timestamp:
+        return candles
+    patched = list(candles)
+    if stream_candle.timestamp == latest.timestamp:
+        patched[-1] = stream_candle
+    else:
+        patched.append(stream_candle)
+    return patched[-lookback:]
+
+
+def _copy_cache_state_fields(target: dict[str, object], cache_state: dict[str, object]) -> dict[str, object]:
+    for key in (
+        "cache_backend",
+        "configured_cache_backend",
+        "cache_market_type",
+        "cache_environment",
+        "cache_health",
+        "cache_reject_reason",
+        "cache_scope",
+        "shared_cache_supported",
+        "redis_required",
+        "redis_configured",
+        "redis_connected",
+        "cache_write_status",
+        "last_shared_cache_read_at",
+        "last_shared_cache_write_at",
+        "last_shared_cache_error",
+        "shared_cache_key",
+    ):
+        value = cache_state.get(key)
+        if value not in {None, ""}:
+            target[key] = value
+    shared_cache_state = cache_state.get("shared_cache_state")
+    if isinstance(shared_cache_state, dict):
+        target["shared_cache_state"] = shared_cache_state
+    return target
+
+
+def _active_snapshot_source_for_stream_entry(cache_state: dict[str, object]) -> str:
+    if (
+        str(cache_state.get("cache_backend") or "") == "redis"
+        and str(cache_state.get("cache_scope") or "") == "shared"
+        and str(cache_state.get("cache_health") or "") == "ok"
+    ):
+        return "redis"
+    return MARKET_STREAM_DATA_SOURCE
+
+
+def _market_stream_fallback_reason(stream_state: dict[str, object]) -> str:
+    cache_reject_reason = str(stream_state.get("cache_reject_reason") or "")
+    if cache_reject_reason == "cache_metadata_mismatch":
+        return "market_stream_cache_metadata_mismatch"
+    if cache_reject_reason == "cache_payload_corrupt":
+        return "market_stream_cache_corrupt"
+    if cache_reject_reason == "cache_payload_invalid":
+        return "market_stream_cache_invalid"
+    if cache_reject_reason == "cache_disabled":
+        return "market_stream_cache_disabled"
+    cache_health = str(stream_state.get("cache_health") or "")
+    if cache_health == "stale":
+        return "market_stream_cache_stale"
+    if cache_health == "unavailable":
+        return "market_stream_cache_unavailable"
+    if cache_health == "error":
+        return "market_stream_cache_error"
+    if bool(stream_state.get("stale")):
+        return "market_stream_stale"
+    return "market_stream_missing_or_stale"
+
+
+def _resolve_closed_stream_entry(
+    symbol: str,
+    timeframe: str,
+    *,
+    snapshot_time: datetime,
+    stale_after_seconds: int,
+    testnet_enabled: bool,
+) -> tuple[object | None, dict[str, object], dict[str, object]]:
+    environment = normalize_market_data_cache_environment(
+        MARKET_DATA_CACHE_ENV_TESTNET if testnet_enabled else MARKET_DATA_CACHE_ENV_MAINNET
+    )
+    redis_url = str(get_settings().redis_url or "").strip()
+    shared_cache_read = read_closed_kline_from_redis(
+        symbol,
+        timeframe,
+        redis_url=redis_url,
+        environment=environment,
+        now=snapshot_time,
+        stale_after_seconds=stale_after_seconds,
+    )
+    cache_state = dict(shared_cache_read.state)
+    stream_entry: object | None = shared_cache_read.entry
+    if stream_entry is None:
+        local_entry = get_cached_closed_kline(
+            symbol,
+            timeframe,
+            now=snapshot_time,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if local_entry is not None:
+            configured_cache_backend = (
+                shared_cache_read.state.get("configured_cache_backend")
+                or shared_cache_read.state.get("cache_backend")
+                or MARKET_DATA_CACHE_BACKEND_PROCESS_LOCAL
+            )
+            cache_state = {
+                **build_shared_market_cache_state(
+                    {"cache_health": "ok"},
+                    backend=MARKET_DATA_CACHE_BACKEND_PROCESS_LOCAL,
+                ),
+                "configured_cache_backend": configured_cache_backend,
+                "redis_required": False,
+                "redis_configured": bool(shared_cache_read.state.get("redis_configured", False)),
+                "redis_connected": shared_cache_read.state.get("redis_connected"),
+                "cache_scope": MARKET_DATA_CACHE_SCOPE_PROCESS_LOCAL,
+                "shared_cache_state": shared_cache_read.state,
+            }
+            stream_entry = local_entry
+    stream_state = {**get_market_stream_state(), **cache_state}
+    return stream_entry, stream_state, cache_state
 
 
 def _build_binance_snapshot(
@@ -310,9 +461,108 @@ def _build_binance_snapshot(
     derivatives_context: DerivativesContextPayload | None = None,
 ) -> MarketSnapshotPayload:
     client = BinanceClient(testnet_enabled=testnet_enabled, futures_enabled=True)
-    candles = client.fetch_klines(symbol=symbol, interval=timeframe, limit=lookback)
-    latest = candles[-1]
     snapshot_time = utcnow_naive()
+    stream_stale_after_seconds = market_stream_stale_after_seconds(timeframe)
+    stream_entry, stream_state, stream_cache_state = _resolve_closed_stream_entry(
+        symbol,
+        timeframe,
+        snapshot_time=snapshot_time,
+        stale_after_seconds=stream_stale_after_seconds,
+        testnet_enabled=testnet_enabled,
+    )
+    try:
+        candles = client.fetch_klines(symbol=symbol, interval=timeframe, limit=lookback)
+    except Exception as exc:
+        if stream_entry is None:
+            raise
+        latest = stream_entry.candle
+        source_detail = stream_entry.as_source_detail(
+            now=snapshot_time,
+            stale_after_seconds=stream_stale_after_seconds,
+        )
+        source_detail.update(
+            {
+                "active_snapshot_source": _active_snapshot_source_for_stream_entry(stream_cache_state),
+                "rest_bootstrap_used": False,
+                "rest_fallback_failed": True,
+                "rest_error": str(exc),
+                "stream_only_incomplete": True,
+                "used_fallback": False,
+                "fallback_active": False,
+                "fallback_reason": "rest_failed_stream_only_incomplete",
+                "stale_reason": "market_snapshot_incomplete",
+                "stream": stream_state,
+            }
+        )
+        _copy_cache_state_fields(source_detail, stream_cache_state)
+        staleness_seconds = (snapshot_time - latest.timestamp).total_seconds()
+        return MarketSnapshotPayload(
+            symbol=symbol,
+            timeframe=timeframe,
+            snapshot_time=snapshot_time,
+            latest_price=latest.close,
+            latest_volume=latest.volume,
+            candle_count=1,
+            is_stale=staleness_seconds > stale_threshold_seconds,
+            is_complete=False,
+            source=MARKET_STREAM_DATA_SOURCE,
+            source_status="incomplete",
+            source_detail=source_detail,
+            candles=[latest],
+            derivatives_context=DerivativesContextPayload(source="unavailable", fallback_used=True, fetch_failed=True),
+        )
+    rest_latest = candles[-1]
+    rest_age_seconds = max(int((snapshot_time - rest_latest.timestamp).total_seconds()), 0)
+    source = MARKET_STREAM_REST_FALLBACK_SOURCE
+    source_status = "rest_fallback"
+    fallback_reason = _market_stream_fallback_reason(stream_state)
+    source_detail: dict[str, object] = {
+        "source": MARKET_STREAM_REST_FALLBACK_SOURCE,
+        "active_snapshot_source": MARKET_STREAM_REST_FALLBACK_SOURCE,
+        "rest_bootstrap_used": True,
+        "used_fallback": True,
+        "fallback_active": True,
+        "fallback_reason": fallback_reason,
+        "stale_reason": fallback_reason,
+        "rest_latest_candle_at": rest_latest.timestamp.isoformat(),
+        "source_time": rest_latest.timestamp.isoformat(),
+        "received_at": snapshot_time.isoformat(),
+        "age_seconds": rest_age_seconds,
+        "partial_candle_used": False,
+        "stream": stream_state,
+    }
+    _copy_cache_state_fields(source_detail, stream_cache_state)
+    if stream_entry is not None:
+        stream_detail = stream_entry.as_source_detail(
+            now=snapshot_time,
+            stale_after_seconds=stream_stale_after_seconds,
+        )
+        _copy_cache_state_fields(stream_detail, stream_cache_state)
+        if stream_entry.candle.timestamp >= rest_latest.timestamp:
+            candles = _apply_closed_stream_kline(candles, stream_entry.candle, lookback=lookback)
+            source = MARKET_STREAM_DATA_SOURCE
+            source_status = "fresh"
+            source_detail = {
+                **stream_detail,
+                "active_snapshot_source": _active_snapshot_source_for_stream_entry(stream_cache_state),
+                "rest_bootstrap_used": True,
+                "used_fallback": False,
+                "fallback_active": False,
+                "fallback_reason": None,
+                "stale_reason": None,
+                "rest_latest_candle_at": rest_latest.timestamp.isoformat(),
+                "partial_candle_used": False,
+                "stream": stream_state,
+            }
+        else:
+            source_detail.update(
+                {
+                    "fallback_reason": "market_stream_older_than_rest",
+                    "stale_reason": "market_stream_older_than_rest",
+                    "stream": stream_detail,
+                }
+            )
+    latest = candles[-1]
     staleness_seconds = (snapshot_time - latest.timestamp).total_seconds()
     snapshot_derivatives = derivatives_context or _build_derivatives_context(client, symbol)
     return MarketSnapshotPayload(
@@ -324,6 +574,9 @@ def _build_binance_snapshot(
         candle_count=len(candles),
         is_stale=staleness_seconds > stale_threshold_seconds,
         is_complete=len(candles) >= min(lookback, 20),
+        source=source,
+        source_status=source_status,
+        source_detail=source_detail,
         candles=candles,
         derivatives_context=snapshot_derivatives,
     )

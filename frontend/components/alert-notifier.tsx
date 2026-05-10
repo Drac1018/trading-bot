@@ -2,21 +2,14 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { isEntryWaitReasonCodeInContext } from "../lib/risk-reason-copy.js";
+
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const pollMs = 15000;
 const logicalCooldownMs = 15 * 60 * 1000;
 const seenStorageKey = "trading-mvp.seen-alert-ids";
 const logicalSeenStorageKey = "trading-mvp.seen-alert-logical";
 const disabledStorageKey = "trading-mvp.alert-notifier-disabled";
-const nonActionableReasonCodes = new Set([
-  "HOLD_DECISION",
-  "ENTRY_TRIGGER_NOT_MET",
-  "NO_EDGE",
-  "RANGE_CHOP",
-  "WEAK_VOLUME",
-  "MOMENTUM_WEAKENING",
-  "DETERMINISTIC_BASELINE_DISAGREEMENT",
-]);
 
 type AlertRow = {
   id: number;
@@ -125,10 +118,10 @@ function isOperatorAttentionAlert(row: AlertRow) {
 
   const reasonCodes = alertReasonCodes(row);
   const decision = alertPayloadString(row, "decision").toLowerCase();
-  if (decision === "hold" && reasonCodes.every((code) => nonActionableReasonCodes.has(code))) {
+  if (decision === "hold" && reasonCodes.every((code) => isEntryWaitReasonCodeInContext(code, reasonCodes))) {
     return false;
   }
-  if (reasonCodes.length > 0 && reasonCodes.every((code) => nonActionableReasonCodes.has(code))) {
+  if (reasonCodes.length > 0 && reasonCodes.every((code) => isEntryWaitReasonCodeInContext(code, reasonCodes))) {
     return false;
   }
   return true;

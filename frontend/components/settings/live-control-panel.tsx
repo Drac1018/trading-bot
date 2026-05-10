@@ -1,6 +1,12 @@
 ﻿"use client";
 
 import { Field, InlineFeedback, StatusPill, Toggle, inputClass, type FeedbackMessage } from "./form-primitives";
+import {
+  describeReasonCodeInContext,
+  isEntryWaitReasonCodeInContext,
+  reasonCodeTitleInContext,
+  type ReasonCodeCategory,
+} from "../../lib/risk-reason-copy.js";
 import { formatDisplayValue } from "../../lib/ui-copy";
 import { type AutoResumeAttemptResult, type ControlStatusSummary, type LiveSyncResult, type RolloutMode } from "./types";
 
@@ -52,7 +58,7 @@ function rolloutModeLabel(mode: RolloutMode) {
 
 function formatCodeList(values: string[] | null | undefined, empty = "-") {
   if (!values || values.length === 0) return empty;
-  return values.map((item) => formatDisplayValue(item)).join(", ");
+  return values.map((item) => reasonCodeTitleInContext(item, values)).join(", ");
 }
 
 function autoResumeAttemptText(result: AutoResumeAttemptResult) {
@@ -99,27 +105,50 @@ function renderMissingProtectionItems(
     .join(" / ");
 }
 
-const passiveEntryReasonCodes = new Set([
-  "HOLD_DECISION",
-  "ENTRY_TRIGGER_NOT_MET",
-  "NO_EDGE",
-  "RANGE_CHOP",
-  "WEAK_VOLUME",
-  "MOMENTUM_WEAKENING",
-]);
-
-function isPassiveEntryReason(reason: string | null | undefined) {
-  return reason ? passiveEntryReasonCodes.has(reason) : false;
+function reasonTone(category: ReasonCodeCategory) {
+  if (category === "operational_control") return "danger" as const;
+  if (category === "safety_block") return "danger" as const;
+  if (category === "entry_wait") return "warn" as const;
+  return "neutral" as const;
 }
 
-function passiveEntryReasonText(reason: string | null | undefined) {
-  if (reason === "HOLD_DECISION") {
-    return "현재는 신규 진입 신호가 없어 대기 중입니다. 실거래 승인과 운영 상태는 열려 있으며, 조건이 맞으면 다음 판단 주기에서 다시 검토합니다.";
+function reasonCardClass(category: ReasonCodeCategory) {
+  if (category === "operational_control" || category === "safety_block") {
+    return "border-rose-100 bg-rose-50 text-rose-950";
   }
-  if (reason === "ENTRY_TRIGGER_NOT_MET") {
-    return "진입 트리거가 아직 충족되지 않아 대기 중입니다. 조건이 맞으면 다음 판단 주기에서 다시 검토합니다.";
+  if (category === "entry_wait") {
+    return "border-amber-100 bg-amber-50 text-amber-950";
   }
-  return `${formatDisplayValue(reason, "blocked_reason_codes")} 조건이 개선되면 다음 판단 주기에서 다시 검토합니다.`;
+  return "border-slate-200 bg-slate-50 text-slate-800";
+}
+
+function reasonSummaryText(reason: string | null | undefined, allReasonCodes?: string[] | null) {
+  const copy = describeReasonCodeInContext(reason, allReasonCodes);
+  return `${copy.title_ko} ${copy.auto_clear_hint_ko}`;
+}
+
+function ReasonExplanationCard({ reason, allReasonCodes }: { reason: string; allReasonCodes?: string[] | null }) {
+  const copy = describeReasonCodeInContext(reason, allReasonCodes);
+  return (
+    <div className={`rounded-2xl border px-4 py-3 text-sm leading-6 ${reasonCardClass(copy.category)}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="font-semibold">{copy.title_ko}</p>
+        <StatusPill tone={reasonTone(copy.category)}>
+          {copy.category === "entry_wait"
+            ? "진입 대기"
+            : copy.category === "operational_control"
+              ? "운영 제어"
+              : copy.category === "safety_block"
+                ? "안전 차단"
+                : "확인 필요"}
+        </StatusPill>
+      </div>
+      <p className="mt-1">{copy.detail_ko}</p>
+      <p className="mt-2 text-xs text-slate-600">자동 해소: {copy.auto_clear_hint_ko}</p>
+      <p className="mt-1 text-xs text-slate-600">확인 위치: {copy.check_location_ko}</p>
+      <p className="mt-1 break-all font-mono text-[11px] text-slate-500">raw: {copy.raw_code || "-"}</p>
+    </div>
+  );
 }
 
 function ControlStatusPanel({
@@ -131,10 +160,15 @@ function ControlStatusPanel({
 }) {
   const currentCycleBlockedReasons = summary.blocked_reasons_current_cycle;
   const approvalBlockedReasons = summary.approval_control_blocked_reasons ?? [];
-  const hardApprovalBlockedReasons = approvalBlockedReasons.filter((reason) => !isPassiveEntryReason(reason));
-  const waitingApprovalReasons = approvalBlockedReasons.filter(isPassiveEntryReason);
+  const approvalReasonContext = [...approvalBlockedReasons, ...currentCycleBlockedReasons, ...(summary.blocked_reason_codes ?? [])];
+  const hardApprovalBlockedReasons = approvalBlockedReasons.filter(
+    (reason) => !isEntryWaitReasonCodeInContext(reason, approvalReasonContext),
+  );
+  const waitingApprovalReasons = approvalBlockedReasons.filter((reason) =>
+    isEntryWaitReasonCodeInContext(reason, approvalReasonContext),
+  );
   const primaryBlocker = currentCycleBlockedReasons[0];
-  const primaryBlockerIsPassive = isPassiveEntryReason(primaryBlocker);
+  const primaryBlockerIsEntryWait = isEntryWaitReasonCodeInContext(primaryBlocker, currentCycleBlockedReasons);
   const cards = [
     {
       label: "운영 모드",
@@ -197,7 +231,7 @@ function ControlStatusPanel({
           ? "미평가"
           : summary.risk_allowed
             ? "허용"
-            : primaryBlockerIsPassive
+            : primaryBlockerIsEntryWait
               ? "대기"
               : "차단",
       detail:
@@ -205,17 +239,17 @@ function ControlStatusPanel({
           ? "이번 판단 주기 리스크 결과가 아직 집계되지 않았습니다."
           : summary.risk_allowed
             ? "이번 판단 주기 리스크 가드가 신규 진입을 허용했습니다."
-            : primaryBlockerIsPassive
-              ? passiveEntryReasonText(primaryBlocker)
+            : primaryBlockerIsEntryWait
+              ? reasonSummaryText(primaryBlocker, currentCycleBlockedReasons)
             : primaryBlocker
-              ? formatDisplayValue(primaryBlocker, "blocked_reason_codes")
+              ? reasonSummaryText(primaryBlocker, currentCycleBlockedReasons)
               : state.guard_mode_reason_message ?? "이번 판단 주기 리스크 가드가 신규 진입을 차단했습니다.",
       tone:
         summary.risk_allowed === null
           ? ("neutral" as const)
           : summary.risk_allowed
             ? ("good" as const)
-            : primaryBlockerIsPassive
+            : primaryBlockerIsEntryWait
               ? ("warn" as const)
               : ("danger" as const),
     },
@@ -254,9 +288,7 @@ function ControlStatusPanel({
             </div>
           ) : (
             currentCycleBlockedReasons.map((reason) => (
-              <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm leading-6 text-slate-800">
-                {isPassiveEntryReason(reason) ? passiveEntryReasonText(reason) : formatDisplayValue(reason, "blocked_reason_codes")}
-              </div>
+              <ReasonExplanationCard key={reason} reason={reason} allReasonCodes={currentCycleBlockedReasons} />
             ))
           )}
         </div>
@@ -279,37 +311,32 @@ function ControlStatusPanel({
             tone={
               hardApprovalBlockedReasons.length > 0
                 ? "danger"
-                : waitingApprovalReasons.length > 0
-                  ? "warn"
-                  : "good"
+                : "good"
             }
           >
             {hardApprovalBlockedReasons.length > 0
               ? `${hardApprovalBlockedReasons.length}건`
-              : waitingApprovalReasons.length > 0
-                ? `대기 ${waitingApprovalReasons.length}건`
-                : "정상"}
+              : "정상"}
           </StatusPill>
         </div>
         <div className="mt-4 space-y-2">
-          {hardApprovalBlockedReasons.length === 0 && waitingApprovalReasons.length === 0 ? (
+          {hardApprovalBlockedReasons.length === 0 ? (
             <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
               승인/운영 제어 관점에서 즉시 차단 사유가 없습니다.
             </div>
           ) : (
-            <>
-              {hardApprovalBlockedReasons.map((reason) => (
-                <div key={reason} className="rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-900">
-                  {formatDisplayValue(reason, "blocked_reason_codes")}
-                </div>
-              ))}
-              {waitingApprovalReasons.map((reason) => (
-                <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
-                  {passiveEntryReasonText(reason)}
-                </div>
-              ))}
-            </>
+            hardApprovalBlockedReasons.map((reason) => (
+              <ReasonExplanationCard key={reason} reason={reason} allReasonCodes={approvalReasonContext} />
+            ))
           )}
+          {waitingApprovalReasons.length > 0 ? (
+            <div className="rounded-2xl border border-dashed border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950">
+              <p className="font-semibold">진입 대기 사유 {waitingApprovalReasons.length}건은 운영 중지나 승인 차단이 아닙니다.</p>
+              <p className="mt-1 text-xs text-slate-600">
+                {waitingApprovalReasons.map((reason) => `${reasonCodeTitleInContext(reason, approvalReasonContext)} (raw: ${reason})`).join(" / ")}
+              </p>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

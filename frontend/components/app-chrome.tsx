@@ -30,6 +30,7 @@ type ChromeNavItem = {
 const sideNav: ChromeNavItem[] = [
   { href: "/", label: "대시보드", icon: "home" },
   { href: "/dashboard/account", label: "계좌 / 잔고", icon: "wallet" },
+  { href: "/dashboard/cost-breakdown", label: "비용 분해", icon: "pie" },
   { href: "/dashboard/market", label: "시장 상태", icon: "market" },
   { href: "/dashboard/decisions", label: "AI 판단", icon: "brain" },
   { href: "/dashboard/positions", label: "포지션", icon: "pie" },

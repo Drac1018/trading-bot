@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker
 
+from trading_mvp.config import get_settings
 from trading_mvp.database import Base, engine, get_db
 from trading_mvp.schemas import (
     AppSettingsUpdateRequest,
@@ -35,6 +36,10 @@ from trading_mvp.services.binance_account import (
     store_binance_account_cache_failure,
     store_binance_account_cache_result,
 )
+from trading_mvp.services.binance_market_stream import (
+    BinanceMarketStreamListener,
+    build_market_stream_state,
+)
 from trading_mvp.services.connectivity import (
     check_binance_connection,
     check_openai_connection,
@@ -42,6 +47,7 @@ from trading_mvp.services.connectivity import (
 from trading_mvp.services.dashboard import (
     get_agent_runs,
     get_alerts,
+    get_analytics_cost_breakdown,
     get_audit_timeline,
     get_decisions,
     get_execution_quality_report,
@@ -61,10 +67,21 @@ from trading_mvp.services.execution import (
     run_live_test_order,
     sync_live_state,
 )
+from trading_mvp.services.market_data_cache import (
+    MARKET_DATA_CACHE_BACKEND_PROCESS_LOCAL,
+    MARKET_DATA_CACHE_BACKEND_REDIS,
+    MARKET_DATA_CACHE_ENV_MAINNET,
+    MARKET_DATA_CACHE_ENV_TESTNET,
+    MARKET_DATA_CACHE_MARKET_TYPE_USDM_FUTURES,
+    MARKET_DATA_CACHE_SCOPE_PROCESS_LOCAL,
+    MARKET_DATA_CACHE_SCOPE_SHARED,
+    write_closed_kline_event_to_redis,
+)
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.replay_validation import build_replay_validation_report
+from trading_mvp.services.runtime_state import replace_market_stream_detail
 from trading_mvp.services.scheduler import (
     abandon_stale_scheduler_runs,
     maybe_refresh_exchange_sync_freshness,
@@ -125,6 +142,36 @@ def _background_user_stream_enabled() -> bool:
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM", default=default)
 
 
+def _background_market_stream_enabled() -> bool:
+    default = engine.dialect.name != "sqlite"
+    return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_MARKET_STREAM", default=default)
+
+
+def _market_stream_runtime_config_fields(config: dict[str, object]) -> dict[str, object]:
+    enabled = bool(config.get("enabled"))
+    redis_url = str(config.get("redis_url") or "").strip()
+    shared_cache_enabled = bool(redis_url)
+    cache_environment = MARKET_DATA_CACHE_ENV_TESTNET if bool(config.get("testnet_enabled")) else MARKET_DATA_CACHE_ENV_MAINNET
+    configured_cache_backend = (
+        MARKET_DATA_CACHE_BACKEND_REDIS if shared_cache_enabled else MARKET_DATA_CACHE_BACKEND_PROCESS_LOCAL
+    )
+    return {
+        "stream_enabled": enabled,
+        "background_enabled": enabled,
+        "database_dialect": engine.dialect.name,
+        "cache_backend": configured_cache_backend,
+        "configured_cache_backend": configured_cache_backend,
+        "cache_market_type": MARKET_DATA_CACHE_MARKET_TYPE_USDM_FUTURES,
+        "cache_environment": cache_environment,
+        "cache_scope": MARKET_DATA_CACHE_SCOPE_SHARED if shared_cache_enabled else MARKET_DATA_CACHE_SCOPE_PROCESS_LOCAL,
+        "shared_cache_supported": shared_cache_enabled,
+        "redis_required": False,
+        "redis_configured": shared_cache_enabled,
+        "redis_connected": None if shared_cache_enabled else False,
+        "sqlite_default_disabled": bool(config.get("sqlite_default_disabled")),
+    }
+
+
 def _manual_pause_active(settings_row) -> bool:
     return bool(settings_row.trading_paused) and settings_row.pause_origin == "manual"
 
@@ -169,6 +216,62 @@ async def _background_user_stream_loop() -> None:
             1,
         )
         await asyncio.sleep(sleep_seconds)
+
+
+async def _background_market_stream_loop() -> None:
+    state: dict[str, object] = {}
+    while True:
+        config = await asyncio.to_thread(_load_background_market_stream_config)
+        if not bool(config.get("enabled")):
+            state = build_market_stream_state(
+                {
+                    **state,
+                    **_market_stream_runtime_config_fields(config),
+                    "status": "unavailable",
+                    "stream_enabled": False,
+                    "background_enabled": False,
+                    "last_error": config.get("disabled_reason"),
+                    "reason_code": config.get("disabled_reason"),
+                    "subscribed_symbols": config.get("symbols", []),
+                    "subscribed_timeframes": config.get("timeframes", []),
+                    "stream_count": 0,
+                }
+            )
+            await asyncio.to_thread(_persist_background_market_stream_state, state, [])
+            await asyncio.sleep(15)
+            continue
+        listener = BinanceMarketStreamListener(
+            symbols=[str(item) for item in config.get("symbols", [])],
+            timeframes=[str(item) for item in config.get("timeframes", [])],
+            testnet_enabled=bool(config.get("testnet_enabled")),
+        )
+        result = await listener.collect_once(
+            max_events=64,
+            idle_timeout_seconds=30.0,
+            state=state,
+        )
+        shared_cache_state: dict[str, object] = {}
+        redis_url = str(config.get("redis_url") or "").strip()
+        cache_environment = (
+            MARKET_DATA_CACHE_ENV_TESTNET if bool(config.get("testnet_enabled")) else MARKET_DATA_CACHE_ENV_MAINNET
+        )
+        for event in result.get("events", []):
+            if not isinstance(event, dict) or not bool(event.get("closed")):
+                continue
+            shared_cache_state = write_closed_kline_event_to_redis(
+                event,
+                redis_url=redis_url,
+                environment=cache_environment,
+            )
+        state = build_market_stream_state(
+            {
+                **dict(result.get("state") or {}),
+                **shared_cache_state,
+                **_market_stream_runtime_config_fields(config),
+            }
+        )
+        await asyncio.to_thread(_persist_background_market_stream_state, state, result.get("issues", []))
+        await asyncio.sleep(1 if state.get("status") == "connected" else 5)
 
 
 def _run_background_tick_with_sqlite_guard(tick: Callable[[], int], blocked_sleep_seconds: int) -> int:
@@ -322,6 +425,94 @@ def _run_background_user_stream_tick() -> int:
         return sleep_seconds
 
 
+def _market_stream_configured_timeframes(settings_row) -> list[str]:
+    candidates: list[str] = ["1m", str(settings_row.default_timeframe or "15m"), "1h", "4h"]
+    for item in settings_row.symbol_cadence_overrides or []:
+        if isinstance(item, dict):
+            timeframe = str(item.get("timeframe_override") or "").strip()
+            if timeframe:
+                candidates.append(timeframe)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        ordered.append(value)
+        seen.add(value)
+    return ordered
+
+
+def _load_background_market_stream_config() -> dict[str, object]:
+    app_settings = get_settings()
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    with polling_session_factory() as session:
+        settings_row = get_or_create_settings(session)
+        symbols = [
+            str(symbol or "").strip().upper()
+            for symbol in (settings_row.tracked_symbols or [settings_row.default_symbol])
+            if str(symbol or "").strip()
+        ]
+        timeframes = _market_stream_configured_timeframes(settings_row)
+        enabled = bool(settings_row.binance_market_data_enabled and settings_row.binance_futures_enabled and symbols and timeframes)
+        disabled_reason = None
+        if not settings_row.binance_market_data_enabled:
+            disabled_reason = "BINANCE_MARKET_DATA_DISABLED"
+        elif not settings_row.binance_futures_enabled:
+            disabled_reason = "BINANCE_FUTURES_DISABLED"
+        elif not symbols or not timeframes:
+            disabled_reason = "NO_MARKET_STREAMS_CONFIGURED"
+        return {
+            "enabled": enabled,
+            "disabled_reason": disabled_reason,
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "testnet_enabled": bool(settings_row.binance_testnet_enabled),
+            "redis_url": app_settings.redis_url,
+            "database_dialect": engine.dialect.name,
+            "cache_backend": MARKET_DATA_CACHE_BACKEND_REDIS
+            if app_settings.redis_url
+            else MARKET_DATA_CACHE_BACKEND_PROCESS_LOCAL,
+            "cache_market_type": MARKET_DATA_CACHE_MARKET_TYPE_USDM_FUTURES,
+            "cache_environment": MARKET_DATA_CACHE_ENV_TESTNET
+            if settings_row.binance_testnet_enabled
+            else MARKET_DATA_CACHE_ENV_MAINNET,
+            "cache_scope": MARKET_DATA_CACHE_SCOPE_SHARED
+            if app_settings.redis_url
+            else MARKET_DATA_CACHE_SCOPE_PROCESS_LOCAL,
+            "shared_cache_supported": bool(app_settings.redis_url),
+            "sqlite_default_disabled": engine.dialect.name == "sqlite"
+            and os.getenv("TRADING_MVP_ENABLE_BACKGROUND_MARKET_STREAM") is None,
+        }
+
+
+def _persist_background_market_stream_state(state: dict[str, object], issues: object) -> None:
+    polling_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    with polling_session_factory() as session:
+        try:
+            settings_row = get_or_create_settings(session)
+            replace_market_stream_detail(settings_row, state)
+            for issue in list(issues or [])[:3]:
+                if not isinstance(issue, dict):
+                    continue
+                record_audit_event(
+                    session,
+                    event_type="market_stream_issue",
+                    entity_type="binance",
+                    entity_id="market_stream",
+                    severity=str(issue.get("severity") or "warning"),
+                    message=str(issue.get("message") or "Binance futures market stream issue."),
+                    payload={
+                        "reason_code": issue.get("reason_code"),
+                        "payload": issue.get("payload"),
+                    },
+                )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
@@ -331,6 +522,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         tasks.append(asyncio.create_task(_background_scheduler_loop()))
     if _background_user_stream_enabled():
         tasks.append(asyncio.create_task(_background_user_stream_loop()))
+    if _background_market_stream_enabled():
+        tasks.append(asyncio.create_task(_background_market_stream_loop()))
     try:
         yield
     finally:
@@ -391,6 +584,12 @@ def _run_exchange_sync_read_refresh(triggered_by: str) -> None:
 
 
 def _read_trigger_refresh_enabled() -> bool:
+    # Read-triggered exchange sync is optional. Scheduler cadence owns routine
+    # sync, and dashboard GET paths should not enqueue settings-row writes by
+    # default.
+    enabled = os.getenv("TRADING_MVP_ENABLE_READ_TRIGGER_EXCHANGE_SYNC", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
     # SQLite local/test environments are write-contention-prone, so read paths
     # must not enqueue background sync writes from GET requests.
     return engine.dialect.name != "sqlite"
@@ -511,6 +710,20 @@ def dashboard_operator(view: str | None = None, db: Session = Depends(get_db)) -
 @app.get("/api/dashboard/profitability")
 def dashboard_profitability(db: Session = Depends(get_db)) -> dict[str, object]:
     return get_profitability_dashboard(db).model_dump(mode="json")
+
+
+@app.get("/api/analytics/cost-breakdown")
+def analytics_cost_breakdown(
+    period: str = "today",
+    year: int | None = None,
+    month: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        payload = get_analytics_cost_breakdown(db, period=period, year=year, month=month)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return payload.model_dump(mode="json")
 
 
 @app.get("/api/market/snapshots")

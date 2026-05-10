@@ -78,6 +78,7 @@ from trading_mvp.services.runtime_state import (
     derive_protection_reason_codes,
     flat_protective_order_staleness_is_safe,
     get_drawdown_state_detail,
+    get_market_stream_detail,
     get_sync_state_detail,
     resolve_exchange_connectivity_state,
     summarize_runtime_state,
@@ -162,6 +163,7 @@ RUNTIME_STATE_DETAIL_KEYS = {
     "protection_recovery",
     "exchange_sync",
     "user_stream",
+    "market_stream",
     "reconciliation",
     "candidate_selection",
     "binance_rest",
@@ -2464,16 +2466,45 @@ def _build_market_freshness_summary(
 ) -> dict[str, object]:
     symbol = settings_row.default_symbol.upper()
     timeframe = settings_row.default_timeframe
+    market_stream_summary = get_market_stream_detail(settings_row)
+    market_stream_fields = {
+        "stream_status": market_stream_summary.get("status"),
+        "stream_enabled": market_stream_summary.get("stream_enabled"),
+        "stream_running": market_stream_summary.get("stream_running"),
+        "cache_backend": market_stream_summary.get("cache_backend"),
+        "configured_cache_backend": market_stream_summary.get("configured_cache_backend")
+        or market_stream_summary.get("cache_backend"),
+        "cache_market_type": market_stream_summary.get("cache_market_type"),
+        "cache_environment": market_stream_summary.get("cache_environment"),
+        "cache_health": market_stream_summary.get("cache_health"),
+        "cache_reject_reason": market_stream_summary.get("cache_reject_reason"),
+        "cache_scope": market_stream_summary.get("cache_scope"),
+        "shared_cache_supported": market_stream_summary.get("shared_cache_supported"),
+        "redis_required": market_stream_summary.get("redis_required"),
+        "redis_configured": market_stream_summary.get("redis_configured"),
+        "redis_connected": market_stream_summary.get("redis_connected"),
+        "last_shared_cache_read_at": market_stream_summary.get("last_shared_cache_read_at"),
+        "last_shared_cache_write_at": market_stream_summary.get("last_shared_cache_write_at"),
+        "last_shared_cache_error": market_stream_summary.get("last_shared_cache_error"),
+        "shared_cache_key": market_stream_summary.get("shared_cache_key"),
+    }
     if session is None:
         return {
             "symbol": symbol,
             "timeframe": timeframe,
             "source": "snapshot",
+            "active_snapshot_source": "none",
             "status": "unknown",
             "snapshot_at": None,
             "stale": True,
             "incomplete": True,
             "latest_price": None,
+            "used_fallback": False,
+            "fallback_active": False,
+            "fallback_reason": None,
+            "stale_reason": "market_snapshot_missing",
+            "stream": market_stream_summary,
+            **market_stream_fields,
         }
 
     latest_market = session.scalar(
@@ -2490,15 +2521,63 @@ def _build_market_freshness_summary(
             "symbol": symbol,
             "timeframe": timeframe,
             "source": "snapshot",
+            "active_snapshot_source": "none",
             "status": "missing",
             "snapshot_at": None,
             "stale": True,
             "incomplete": True,
             "latest_price": None,
+            "used_fallback": False,
+            "fallback_active": False,
+            "fallback_reason": None,
+            "stale_reason": "market_snapshot_missing",
+            "stream": market_stream_summary,
+            **market_stream_fields,
         }
 
+    now = utcnow_naive()
+    snapshot_age_seconds = max(int((now - latest_market.snapshot_time).total_seconds()), 0)
+    stale_after_seconds = max(int(settings_row.stale_market_seconds or 0), 1)
+    payload = latest_market.payload if isinstance(latest_market.payload, dict) else {}
+    source = str(payload.get("source") or "snapshot")
+    source_status = str(payload.get("source_status") or "") or None
+    source_detail = payload.get("source_detail") if isinstance(payload.get("source_detail"), dict) else {}
+    source_cache_fields = dict(market_stream_fields)
+    for key in (
+        "cache_backend",
+        "configured_cache_backend",
+        "cache_market_type",
+        "cache_environment",
+        "cache_health",
+        "cache_reject_reason",
+        "cache_scope",
+        "shared_cache_supported",
+        "redis_required",
+        "redis_configured",
+        "redis_connected",
+        "last_shared_cache_read_at",
+        "last_shared_cache_write_at",
+        "last_shared_cache_error",
+        "shared_cache_key",
+    ):
+        value = source_detail.get(key)
+        if value is not None and value != "":
+            source_cache_fields[key] = value
+    fallback_reason = source_detail.get("fallback_reason")
+    stale_reason = source_detail.get("stale_reason")
+    active_snapshot_source = source_detail.get("active_snapshot_source")
+    if not isinstance(active_snapshot_source, str) or not active_snapshot_source:
+        active_snapshot_source = source
+    configured_cache_backend = source_cache_fields.get("configured_cache_backend") or source_cache_fields.get(
+        "cache_backend"
+    )
+    fallback_active = source_detail.get("fallback_active")
+    if not isinstance(fallback_active, bool):
+        fallback_active = bool(source_detail.get("used_fallback", False))
+    source_time = source_detail.get("source_time") or source_detail.get("close_time") or source_detail.get("event_time")
+    received_at = source_detail.get("received_at")
     is_incomplete = not latest_market.is_complete
-    is_stale = bool(latest_market.is_stale)
+    is_stale = bool(latest_market.is_stale) or snapshot_age_seconds > stale_after_seconds
     status = "fresh"
     if is_incomplete:
         status = "incomplete"
@@ -2507,12 +2586,27 @@ def _build_market_freshness_summary(
     return {
         "symbol": symbol,
         "timeframe": timeframe,
-        "source": "snapshot",
+        "source": source,
+        "active_snapshot_source": active_snapshot_source,
+        "source_status": source_status,
         "status": status,
         "snapshot_at": latest_market.snapshot_time,
         "stale": is_stale,
         "incomplete": is_incomplete,
         "latest_price": latest_market.latest_price,
+        "snapshot_age_seconds": snapshot_age_seconds,
+        "age_seconds": source_detail.get("age_seconds") or source_detail.get("freshness_seconds") or snapshot_age_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "source_time": source_time if isinstance(source_time, str) else None,
+        "received_at": received_at if isinstance(received_at, str) else None,
+        "source_detail": source_detail,
+        "used_fallback": bool(source_detail.get("used_fallback", False)),
+        "fallback_active": fallback_active,
+        "fallback_reason": fallback_reason if isinstance(fallback_reason, str) else None,
+        "stale_reason": stale_reason if isinstance(stale_reason, str) else None,
+        "configured_cache_backend": configured_cache_backend,
+        "stream": market_stream_summary,
+        **source_cache_fields,
     }
 
 

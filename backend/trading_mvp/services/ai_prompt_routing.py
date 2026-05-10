@@ -304,6 +304,7 @@ def render_prompt_instructions(
         "If a directional thesis is worth monitoring but price must first reach a specific zone, "
         "return decision='hold' with watch_entry_plan populated with side, entry zone, invalidation, stop, target, chase cap, TTL, and reason codes. "
         "A watch_entry_plan only arms a pending entry plan; execution still requires zone touch, AI recheck, and risk_guard approval. "
+        "For same-direction re-entry after a recent take-profit close, only consider a new watch_entry_plan when fresh edge clearly exceeds estimated fees and slippage. "
         "Use decision='long' or decision='short' only when you are endorsing that side as the current trade intent. "
         "Use decision='hold' with watch_entry_plan=null when no side and zone should be monitored. "
     ) if route.allow_new_entry else (

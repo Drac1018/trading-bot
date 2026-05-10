@@ -87,6 +87,13 @@ from trading_mvp.services.market_data import (
 )
 from trading_mvp.services.meta_gate import evaluate_meta_gate
 from trading_mvp.services.pause_control import attempt_auto_resume
+from trading_mvp.services.pending_entry_time import (
+    pending_entry_expires_at,
+    pending_entry_expiry_context,
+    pending_entry_plan_is_expired,
+    pending_entry_remaining_ttl_seconds,
+    pending_entry_utc_naive,
+)
 from trading_mvp.services.performance_reporting import _extract_analysis_context
 from trading_mvp.services.position_management import build_position_management_context
 from trading_mvp.services.risk import (
@@ -190,6 +197,14 @@ ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES = frozenset(
     {"ROLLOUT_MODE_SHADOW", "ROLLOUT_MODE_LIVE_DRY_RUN"}
 )
 ENTRY_PLAN_SIMULATED_EXECUTION_STATUSES = frozenset({"shadow", "dry_run"})
+ENTRY_PLAN_CONTROL_BLOCKERS_ALLOW_LOCAL_EXPIRY = frozenset(
+    {
+        "LIVE_APPROVAL_REQUIRED",
+        "LIVE_EXECUTION_NOT_READY",
+        "MANUAL_USER_REQUEST",
+        "TRADING_PAUSED",
+    }
+)
 TRADE_BLOCKED_ALERT_NON_ACTIONABLE_REASON_CODES = frozenset(
     {
         "HOLD_DECISION",
@@ -2096,6 +2111,7 @@ class TradingOrchestrator:
             else {}
         )
         trigger_details = metadata.get("trigger_details")
+        expiry_context = pending_entry_expiry_context(plan.expires_at)
         return PendingEntryPlanSnapshot(
             plan_id=plan.id,
             symbol=plan.symbol,
@@ -2120,6 +2136,10 @@ class TradingOrchestrator:
             leverage_cap=plan.leverage_cap,
             created_at=plan.created_at,
             expires_at=plan.expires_at,
+            expires_at_time_basis=str(expiry_context["expires_at_time_basis"]),
+            app_utc_now=expiry_context["app_utc_now"],
+            remaining_ttl_seconds=expiry_context["remaining_ttl_seconds"],
+            expired_by_app_utc_now=bool(expiry_context["expired_by_app_utc_now"]),
             triggered_at=plan.triggered_at,
             canceled_at=plan.canceled_at,
             canceled_reason=plan.canceled_reason,
@@ -2294,7 +2314,11 @@ class TradingOrchestrator:
                     "created_at": plan.created_at.isoformat() if plan.created_at is not None else None,
                     "expires_at": plan.expires_at.isoformat() if plan.expires_at is not None else None,
                     "minutes_until_expiry": cls._summary_float(
-                        (plan.expires_at - now).total_seconds() / 60.0 if plan.expires_at is not None else None,
+                        (
+                            pending_entry_remaining_ttl_seconds(plan.expires_at, now=now) / 60.0
+                            if plan.expires_at is not None
+                            else None
+                        ),
                         digits=2,
                     ),
                     "zone_relation": zone["zone_relation"],
@@ -2501,9 +2525,13 @@ class TradingOrchestrator:
         remaining_extension_seconds = max(max_extension_seconds - current_extension_seconds, 0)
         cadence_extension_seconds = min(60, elapsed_since_last_watch_seconds)
         catch_up_seconds = 0
-        if plan.expires_at <= generated_at and elapsed_since_last_watch_seconds > 0:
+        if (
+            pending_entry_plan_is_expired(plan.expires_at, now=generated_at)
+            and elapsed_since_last_watch_seconds > 0
+        ):
             minimum_wait_until = generated_at + timedelta(seconds=60)
-            catch_up_needed_seconds = max(int((minimum_wait_until - plan.expires_at).total_seconds()), 0)
+            normalized_expires_at = pending_entry_utc_naive(plan.expires_at)
+            catch_up_needed_seconds = max(int((minimum_wait_until - normalized_expires_at).total_seconds()), 0)
             catch_up_budget_seconds = (
                 catch_up_needed_seconds
                 if last_watch_at is None
@@ -2515,7 +2543,7 @@ class TradingOrchestrator:
             remaining_extension_seconds,
         )
         if extension_seconds > 0:
-            plan.expires_at = plan.expires_at + timedelta(seconds=extension_seconds)
+            plan.expires_at = pending_entry_utc_naive(plan.expires_at) + timedelta(seconds=extension_seconds)
             current_extension_seconds += extension_seconds
         wait_detail = dict(detail or {})
         if extension_seconds > 0:
@@ -2734,7 +2762,7 @@ class TradingOrchestrator:
     ) -> PendingEntryPlan:
         symbol = decision.symbol.upper()
         side = str(decision.decision)
-        expires_at = decision_run.created_at + timedelta(minutes=max(int(decision.idea_ttl_minutes or 15), 1))
+        expires_at = pending_entry_expires_at(decision_run.created_at, decision.idea_ttl_minutes)
         idempotency_key = self._pending_entry_plan_idempotency_key(
             symbol=symbol,
             side=side,
@@ -3841,7 +3869,8 @@ class TradingOrchestrator:
         market_freshness_summary = {
             "symbol": symbol,
             "timeframe": timeframe,
-            "source": "decision_cycle",
+            "source": market_snapshot.source,
+            "source_status": market_snapshot.source_status,
             "status": "fresh"
             if not market_snapshot.is_stale and market_snapshot.is_complete
             else ("stale" if market_snapshot.is_stale else "incomplete"),
@@ -3850,6 +3879,7 @@ class TradingOrchestrator:
             "incomplete": not market_snapshot.is_complete,
             "latest_price": market_snapshot.latest_price,
             "snapshot_id": market_row.id,
+            "source_detail": dict(market_snapshot.source_detail),
         }
         sync_freshness_summary = {
             str(scope): dict(payload)
@@ -3863,7 +3893,7 @@ class TradingOrchestrator:
         return {
             "market_snapshot_id": market_row.id,
             "market_snapshot_at": market_snapshot.snapshot_time.isoformat(),
-            "market_snapshot_source": "refreshed",
+            "market_snapshot_source": market_snapshot.source,
             "market_snapshot_stale": market_snapshot.is_stale,
             "market_snapshot_incomplete": not market_snapshot.is_complete,
             "account_sync_at": (
@@ -3910,7 +3940,14 @@ class TradingOrchestrator:
                 entity_type="market_snapshot",
                 entity_id=str(market_row.id),
                 message="Market snapshot collected.",
-                payload={"symbol": symbol, "timeframe": timeframe},
+                payload={
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "source": market_snapshot.source,
+                    "source_status": market_snapshot.source_status,
+                    "is_stale": market_snapshot.is_stale,
+                    "is_complete": market_snapshot.is_complete,
+                },
             )
         # Market snapshots are followed by additional context/exchange reads; commit
         # the observed fact first so safety-control writes are not blocked.
@@ -5732,6 +5769,23 @@ class TradingOrchestrator:
                     result_item["blocked_reasons"] = [ENTRY_PLAN_NO_CAPACITY_CANCEL_REASON_CODE]
                     symbol_results.append(result_item)
                     continue
+                expiry_takes_precedence = (
+                    not entry_control_blocked
+                    or any(
+                        reason in ENTRY_PLAN_CONTROL_BLOCKERS_ALLOW_LOCAL_EXPIRY
+                        for reason in entry_control_blocked_reasons
+                    )
+                )
+                if pending_entry_plan_is_expired(plan.expires_at, now=generated_at) and expiry_takes_precedence:
+                    self._cancel_pending_entry_plan(
+                        plan,
+                        reason="PLAN_TTL_EXPIRED",
+                        cancel_status="expired",
+                        detail={"observed_at": generated_at.isoformat()},
+                    )
+                    result_item["status"] = "expired"
+                    symbol_results.append(result_item)
+                    continue
                 if entry_control_blocked:
                     self._defer_pending_entry_plan(
                         plan,
@@ -5743,16 +5797,6 @@ class TradingOrchestrator:
                     result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
                     result_item["status"] = "control_blocked"
                     result_item["blocked_reasons"] = list(entry_control_blocked_reasons)
-                    symbol_results.append(result_item)
-                    continue
-                if plan.expires_at <= generated_at:
-                    self._cancel_pending_entry_plan(
-                        plan,
-                        reason="PLAN_TTL_EXPIRED",
-                        cancel_status="expired",
-                        detail={"observed_at": generated_at.isoformat()},
-                    )
-                    result_item["status"] = "expired"
                     symbol_results.append(result_item)
                     continue
                 if self._plan_invalidation_broken(plan, market_snapshot):

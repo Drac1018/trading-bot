@@ -76,6 +76,14 @@ EXPECTED_COST_MAKER_FEE_BPS = 2.0
 EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS = 3.0
 EXPECTED_COST_PASSIVE_SLIPPAGE_BPS = 1.0
 EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS = 2.0
+TAKE_PROFIT_CLOSE_REASON_MARKERS = frozenset({"tp", "take_profit", "take-profit", "take profit"})
+RECENT_TP_CONTEXT_NESTED_KEYS = (
+    "same_direction_reentry_context",
+    "recent_same_direction_tp_context",
+    "recent_same_direction_tp_close",
+    "recent_closed_position_summary",
+    "last_closed_position_summary",
+)
 MACRO_EVENT_IMMINENT_MINUTES = 30
 MACRO_EVENT_REACTION_WINDOW_MINUTES = 60
 MACRO_EVENT_RESULT_COMPARISON_KEYS = ("forecast", "consensus", "estimate", "expected", "prior", "previous")
@@ -285,6 +293,132 @@ def build_expected_cost_context(
         },
         "operator_note": "Costs are informational here; risk_guard performs the hard gate.",
     }
+
+
+def _as_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _recent_tp_context_candidates(*containers: Mapping[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for container in containers:
+        if not isinstance(container, Mapping):
+            continue
+        direct = dict(container)
+        if any(key in direct for key in {
+            "recent_same_direction_tp_close",
+            "same_direction_tp_recent",
+            "minutes_since_recent_same_direction_tp",
+            "close_reason",
+            "exit_reason",
+            "close_component",
+        }):
+            candidates.append(direct)
+        for key in RECENT_TP_CONTEXT_NESTED_KEYS:
+            nested = container.get(key)
+            if isinstance(nested, Mapping):
+                candidates.append(dict(nested))
+    return candidates
+
+
+def _is_take_profit_close(source: Mapping[str, Any]) -> bool:
+    explicit = _as_bool(source.get("take_profit_close"))
+    if explicit is not None:
+        return explicit
+    for key in ("close_reason", "exit_reason", "close_component", "order_type", "protective_component"):
+        value = str(source.get(key) or "").strip().lower()
+        if value and any(marker in value for marker in TAKE_PROFIT_CLOSE_REASON_MARKERS):
+            return True
+    return False
+
+
+def build_same_direction_reentry_warning(
+    *,
+    market_snapshot: MarketSnapshotPayload,
+    features: FeaturePayload,
+    risk_context: Mapping[str, Any],
+    selection_context: Mapping[str, Any],
+    execution_constraints_summary: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    side = _candidate_side(selection_context, features)
+    if side not in {"long", "short"}:
+        return None
+    symbol = str(market_snapshot.symbol or "").upper()
+    for source in _recent_tp_context_candidates(risk_context, selection_context, execution_constraints_summary):
+        source_symbol = str(
+            source.get("symbol")
+            or source.get("closed_symbol")
+            or source.get("position_symbol")
+            or ""
+        ).upper()
+        source_side = str(
+            source.get("side")
+            or source.get("direction")
+            or source.get("position_side")
+            or ""
+        ).strip().lower()
+        if source_symbol != symbol or source_side != side:
+            continue
+        recent_flag = _as_bool(
+            source.get("recent_same_direction_tp_close")
+            if "recent_same_direction_tp_close" in source
+            else source.get("same_direction_tp_recent")
+        )
+        if recent_flag is not True or not _is_take_profit_close(source):
+            continue
+        gross_pnl = _safe_float(
+            source.get("recent_tp_gross_pnl")
+            if "recent_tp_gross_pnl" in source
+            else source.get("gross_pnl"),
+            default=None,
+        )
+        fee = _safe_float(
+            source.get("recent_tp_fee")
+            if "recent_tp_fee" in source
+            else source.get("fee"),
+            default=None,
+        )
+        fee_to_gross_ratio = _safe_float(
+            source.get("recent_tp_fee_to_gross_ratio")
+            if "recent_tp_fee_to_gross_ratio" in source
+            else source.get("fee_to_gross_ratio"),
+            default=None,
+        )
+        if fee_to_gross_ratio is None and gross_pnl is not None and gross_pnl > 0 and fee is not None:
+            fee_to_gross_ratio = fee / gross_pnl
+        return {
+            "recent_same_direction_tp_close": True,
+            "minutes_since_recent_same_direction_tp": _safe_float(
+                source.get("minutes_since_recent_same_direction_tp")
+                if "minutes_since_recent_same_direction_tp" in source
+                else source.get("minutes_since_close"),
+                default=None,
+            ),
+            "recent_tp_gross_pnl": gross_pnl,
+            "recent_tp_net_pnl": _safe_float(
+                source.get("recent_tp_net_pnl")
+                if "recent_tp_net_pnl" in source
+                else source.get("net_pnl"),
+                default=None,
+            ),
+            "recent_tp_fee": fee,
+            "recent_tp_fee_to_gross_ratio": fee_to_gross_ratio,
+            "same_direction_reentry_note": str(
+                source.get("same_direction_reentry_note")
+                or "Recent same-symbol same-direction take-profit close is informational only; consider re-entry only when fresh edge clearly exceeds estimated fees and slippage."
+            ),
+        }
+    return None
 
 
 def _lead_context_status(*, available: bool, missing_symbols: list[str]) -> LeadContextStatus:
@@ -1373,10 +1507,19 @@ def build_ai_decision_context(
         features=features,
         selection_context=resolved_selection_context,
     )
+    same_direction_reentry_warning = build_same_direction_reentry_warning(
+        market_snapshot=market_snapshot,
+        features=features,
+        risk_context=resolved_risk_context,
+        selection_context=resolved_selection_context,
+        execution_constraints_summary=execution_constraints_summary,
+    )
     strategy_engine_context = {
         **strategy_engine_context,
         "expected_cost_context": expected_cost_context,
     }
+    if same_direction_reentry_warning is not None:
+        strategy_engine_context["same_direction_reentry_warning"] = same_direction_reentry_warning
     return AIDecisionContextPacket(
         symbol=market_snapshot.symbol,
         timeframe=market_snapshot.timeframe,

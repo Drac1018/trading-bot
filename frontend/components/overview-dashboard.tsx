@@ -12,7 +12,12 @@ import {
 } from "../lib/sync-freshness";
 import { type EventOperatorControlPayload } from "../lib/event-operator-control.js";
 import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
-import { lookupRiskReasonCode } from "../lib/risk-reason-copy.js";
+import {
+  describeReasonCode,
+  describeReasonCodeInContext,
+  isEntryWaitReasonCodeInContext,
+  lookupRiskReasonCode,
+} from "../lib/risk-reason-copy.js";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const refreshIntervalMs = 15000;
@@ -389,6 +394,7 @@ export type OperatorDashboardPayload = {
     latest_blocked_reasons: string[];
     control_status_summary?: ControlStatusSummary | null;
     sync_freshness_summary: Record<string, SyncScopeStatus>;
+    market_freshness_summary: Record<string, unknown>;
     protection_recovery_status: string;
     protected_positions: number;
     unprotected_positions: number;
@@ -928,6 +934,10 @@ function translateReasonCode(value: string | null | undefined) {
   if (!value) {
     return "-";
   }
+  const sharedCopy = describeReasonCode(value);
+  if (sharedCopy.known && sharedCopy.raw_code) {
+    return sharedCopy.title_ko;
+  }
   const extraReasonCodeLabelMap: Record<string, string> = {
     ENTRY_AUTO_RESIZED: "신규 진입 크기를 자동으로 줄였습니다.",
     ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT: "전체 노출 한도에 맞춰 신규 진입 크기를 줄였습니다.",
@@ -935,10 +945,10 @@ function translateReasonCode(value: string | null | undefined) {
     ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "단일 포지션 한도에 맞춰 신규 진입 크기를 줄였습니다.",
     ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "같은 티어 집중도를 낮추기 위해 신규 진입 크기를 줄였습니다.",
     LARGEST_POSITION_LIMIT_REACHED: "심볼 집중도 한도 유지",
-    DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 최종 판단과 기준선 불일치",
+    DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 판단과 기준선 판단이 달라 즉시 주문을 보류했습니다",
     ENTRY_SIZE_BELOW_MIN_NOTIONAL: "거래소 최소 주문 금액보다 작습니다.",
-    ENTRY_TRIGGER_NOT_MET: "지금은 진입 조건이 아직 맞지 않습니다.",
-    CHASE_LIMIT_EXCEEDED: "추격 진입 한도를 넘었습니다.",
+    ENTRY_TRIGGER_NOT_MET: "진입 조건이 아직 충족되지 않았습니다",
+    CHASE_LIMIT_EXCEEDED: "가격이 이미 지나가 추격 진입을 막았습니다",
     INVALID_INVALIDATION_PRICE: "무효화 가격 기준이 맞지 않습니다.",
   };
   return extraReasonCodeLabelMap[value] ?? lookupRiskReasonCode(value) ?? reasonCodeLabelMap[value] ?? value;
@@ -1003,6 +1013,11 @@ function approvalWindowHint(control: OperatorDashboardPayload["control"], summar
     return "수동 승인 절차를 사용하지 않는 설정입니다.";
   }
   return "신규 진입 전에 실거래 승인 창을 다시 열어야 합니다.";
+}
+
+function reasonDisplaySummary(value: string | null | undefined, allReasonCodes?: string[] | null) {
+  const copy = describeReasonCodeInContext(value, allReasonCodes);
+  return `${copy.title_ko} ${copy.auto_clear_hint_ko}`;
 }
 
 function translateAuditPayloadLabel(value: string): string {
@@ -1200,6 +1215,7 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
 function controlGateCards(control: OperatorDashboardPayload["control"]) {
   const summary = resolveControlStatusSummary(control);
   const primaryBlocker = summary.blocked_reasons_current_cycle[0];
+  const primaryBlockerIsEntryWait = isEntryWaitReasonCodeInContext(primaryBlocker, summary.blocked_reasons_current_cycle);
   const pauseIsManual = control.pause_origin === "manual";
   return [
     {
@@ -1279,21 +1295,25 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
           ? "판단 전"
           : summary.risk_allowed
             ? "허용"
-            : "차단",
+            : primaryBlockerIsEntryWait
+              ? "대기"
+              : "차단",
       hint:
         summary.risk_allowed === null
           ? "이번 판단 주기의 신규 진입 결과가 아직 집계되지 않았습니다."
           : summary.risk_allowed
             ? "이번 판단 주기 기준으로 신규 진입이 가능합니다."
             : primaryBlocker
-              ? translateReasonCode(primaryBlocker)
+              ? reasonDisplaySummary(primaryBlocker, summary.blocked_reasons_current_cycle)
               : control.guard_mode_reason_message ?? "이번 판단 주기 기준으로 신규 진입이 막혀 있습니다.",
       kind:
         summary.risk_allowed === null
           ? ("neutral" as const)
           : summary.risk_allowed
             ? ("good" as const)
-            : ("danger" as const),
+            : primaryBlockerIsEntryWait
+              ? ("warn" as const)
+              : ("danger" as const),
     },
   ];
 }
@@ -1438,6 +1458,8 @@ function GlobalOperatorSummary({
 }) {
   const controlSummary = resolveControlStatusSummary(control);
   const currentCycleBlockedReasons = controlSummary.blocked_reasons_current_cycle;
+  const primaryCycleReason = currentCycleBlockedReasons[0];
+  const primaryCycleIsEntryWait = isEntryWaitReasonCodeInContext(primaryCycleReason, currentCycleBlockedReasons);
   const gateCards = controlGateCards(control);
   const status = controlSummary.paused
     ? {
@@ -1454,9 +1476,9 @@ function GlobalOperatorSummary({
       : controlSummary.risk_allowed === false
           ? {
               kind: "warn" as const,
-              label: "신규 진입 차단",
-              detail: currentCycleBlockedReasons[0]
-                ? translateReasonCode(currentCycleBlockedReasons[0])
+              label: primaryCycleIsEntryWait ? "신규 진입 대기" : "신규 진입 차단",
+              detail: primaryCycleReason
+                ? reasonDisplaySummary(primaryCycleReason, currentCycleBlockedReasons)
                 : control.guard_mode_reason_message ?? "이번 판단 주기 기준으로 신규 진입이 막혀 있습니다.",
             }
           : control.live_execution_ready
@@ -1635,16 +1657,29 @@ function GlobalOperatorSummary({
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-4">
-          <h3 className="text-sm font-semibold text-slate-950">지금 신규 진입이 막힌 이유</h3>
+          <h3 className="text-sm font-semibold text-slate-950">이번 판단 주기 신규 진입 상태</h3>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            이번 판단 주기와 전역 제어 상태 기준으로 실제로 신규 진입을 막는 이유만 보여줍니다.
+            운영 중지와 실거래 승인 상태는 위 카드에서 보고, 여기서는 진입 조건 대기와 안전 차단 사유를 분리해 봅니다.
           </p>
           <div className="mt-4 space-y-2">
-            {currentCycleBlockedReasons.map((reason) => (
-                <div key={reason} className="rounded-2xl bg-amber-50 px-4 py-3 text-sm text-slate-800">
-                  {translateReasonCode(reason)}
+            {currentCycleBlockedReasons.map((reason) => {
+              const copy = describeReasonCodeInContext(reason, currentCycleBlockedReasons);
+              const isEntryWait = copy.category === "entry_wait";
+              return (
+                <div
+                  key={reason}
+                  className={`rounded-2xl px-4 py-3 text-sm leading-6 ${
+                    isEntryWait ? "bg-amber-50 text-amber-950" : "bg-rose-50 text-rose-950"
+                  }`}
+                >
+                  <p className="font-semibold">{copy.title_ko}</p>
+                  <p className="mt-1">{copy.detail_ko}</p>
+                  <p className="mt-2 text-xs text-slate-600">자동 해소: {copy.auto_clear_hint_ko}</p>
+                  <p className="mt-1 text-xs text-slate-600">확인 위치: {copy.check_location_ko}</p>
+                  <p className="mt-1 break-all font-mono text-[11px] text-slate-500">raw: {copy.raw_code}</p>
                 </div>
-              ))}
+              );
+            })}
             {currentCycleBlockedReasons.length === 0 ? (
               <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-500">
                 이번 판단 주기 기준으로는 막힌 이유가 없습니다.

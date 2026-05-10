@@ -131,6 +131,7 @@ def test_new_entry_prompt_explains_watch_entry_plan_contract() -> None:
 
     assert "watch_entry_plan" in instructions
     assert "zone touch, AI recheck, and risk_guard approval" in instructions
+    assert "fresh edge clearly exceeds estimated fees and slippage" in instructions
     assert "watch_entry_plan=null" in instructions
 
 

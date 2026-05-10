@@ -32,6 +32,7 @@ def testclient_db_factory(monkeypatch, tmp_path):
 
     monkeypatch.setattr("trading_mvp.main._background_scheduler_loop", _noop_background_loop)
     monkeypatch.setattr("trading_mvp.main._background_user_stream_loop", _noop_background_loop)
+    monkeypatch.setattr("trading_mvp.main._background_market_stream_loop", _noop_background_loop)
 
     def factory(db_name: str):
         test_engine = create_engine(

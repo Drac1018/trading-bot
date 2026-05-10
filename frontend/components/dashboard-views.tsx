@@ -1,11 +1,18 @@
-﻿import Link from "next/link";
+﻿import type { ReactNode } from "react";
+import Link from "next/link";
 
 import type { OperatorDashboardPayload } from "./overview-dashboard";
 import { DataTable } from "./data-table";
-import { MarketChartAutoRefresh } from "./market-chart-auto-refresh";
-import { MarketChartZoomShell } from "./market-chart-zoom-shell";
+import type { ClientMarketCandlestickModel } from "./market-candlestick-chart-client";
 import type { BinanceChartCandle } from "../lib/binance-chart-candles";
 import { getSelectedSymbolPolicyHint } from "../lib/selected-symbol";
+import {
+  describeReasonCode,
+  describeReasonCodeInContext,
+  isEntryWaitReasonCode,
+  isEntryWaitReasonCodeInContext,
+  type ReasonCodeCategory,
+} from "../lib/risk-reason-copy.js";
 import {
   describeAiTriggerReason,
   describeHistoricalDecisionGap,
@@ -22,6 +29,10 @@ import {
   formatMacroEventContextSummary,
   type MacroEventContextSummary,
 } from "../lib/ui-copy";
+import {
+  summarizeSettlementDisplay,
+  type OrderSettlementInput,
+} from "../lib/order-settlement";
 
 type Row = Record<string, unknown>;
 type AiReviewReadModel = {
@@ -110,16 +121,84 @@ type TimelineStage = {
   kind: "good" | "warn" | "danger" | "neutral";
 };
 type EntryLifecycleTab = "summary" | "plan" | "execution";
+type OrderLifecycleTab = "summary" | "orders" | "executions";
 type InternalCodeBadge = {
   key: string;
   label: string;
   count: number;
   codes: string[];
 };
+type OrderHistoryRow = {
+  id: number | null;
+  symbol: string;
+  positionId: number | null;
+  parentOrderId: number | null;
+  decisionRunId: number | null;
+  riskCheckId: number | null;
+  side: string | null;
+  orderType: string | null;
+  status: string | null;
+  exchangeStatus: string | null;
+  mode: string | null;
+  reduceOnly: boolean | null;
+  closeOnly: boolean | null;
+  requestedQuantity: number | null;
+  requestedPrice: number | null;
+  filledQuantity: number | null;
+  averageFillPrice: number | null;
+  externalOrderId: string | null;
+  clientOrderId: string | null;
+  reasonCodes: string[];
+  pnlSource: string | null;
+  closeExecutionSyncStatus: string | null;
+  realizedPnlConfirmed: boolean | null;
+  missingCloseExecution: boolean | null;
+  feeSource: string | null;
+  feeConfirmed: boolean | null;
+  warningMessage: string | null;
+  feeWarningMessage: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  lastExchangeUpdateAt: string | null;
+};
+type ExecutionHistoryRow = {
+  id: number | null;
+  orderId: number | null;
+  positionId: number | null;
+  symbol: string;
+  status: string | null;
+  orderType: string | null;
+  orderStatus: string | null;
+  fillPrice: number | null;
+  fillQuantity: number | null;
+  feePaid: number | null;
+  realizedPnl: number | null;
+  externalTradeId: string | null;
+  commissionAsset: string | null;
+  reduceOnly: boolean | null;
+  closeOnly: boolean | null;
+  decisionRunId: number | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+type PositionHistoryGroup = {
+  key: string;
+  positionId: number | null;
+  symbol: string;
+  orders: OrderHistoryRow[];
+  executions: ExecutionHistoryRow[];
+  createdAt: string | null;
+  updatedAt: string | null;
+};
 type RiskReasonGroupKey = "freshness" | "exposure" | "approval" | "protection" | "trigger" | "other";
 type CandleWindow = 30 | 60 | 120;
 export type MarketChartTimeframe = "15m" | "1h" | "4h";
 export type MarketChartZoomRange = { start: number; end: number };
+type MarketAutoRefreshRenderer = (props: {
+  latestCandleTime: string | null;
+  timeframe: MarketChartTimeframe;
+}) => ReactNode;
+type MarketCandlestickRenderer = (model: ClientMarketCandlestickModel) => ReactNode;
 type MarketOverlayKey = "close" | "volume" | "levels" | "averageVolume";
 type CandlePoint = {
   timestamp: string;
@@ -232,7 +311,7 @@ const reasonCodeLabelMap: Record<string, string> = {
   POSITION_STATE_STALE: "포지션 상태 stale",
   OPEN_ORDERS_STATE_STALE: "오더 상태 stale",
   PROTECTION_STATE_UNVERIFIED: "보호 주문 검증 불가",
-  DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 최종 판단과 기준선 불일치",
+  DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 판단과 기준선 판단이 달라 즉시 주문을 보류했습니다",
   UNRESOLVED_SUBMISSION_GUARD_ACTIVE: "미해결 주문 제출 가드",
   UNRESOLVED_SUBMISSION_DEADLINE_EXCEEDED: "미해결 주문 확인 초과",
   LIVE_ORDER_SUBMISSION_UNKNOWN: "주문 제출 결과 불명확",
@@ -308,15 +387,6 @@ const riskReasonGroupOrder: RiskReasonGroupKey[] = [
   "other",
 ];
 
-const passiveEntryReasonCodes = new Set([
-  "HOLD_DECISION",
-  "ENTRY_TRIGGER_NOT_MET",
-  "NO_EDGE",
-  "RANGE_CHOP",
-  "WEAK_VOLUME",
-  "MOMENTUM_WEAKENING",
-]);
-
 function asNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -326,12 +396,12 @@ function asStringArray(value: unknown) {
 }
 
 function isPassiveEntryReason(value: string | null | undefined) {
-  return value ? passiveEntryReasonCodes.has(value.trim().toUpperCase()) : false;
+  return isEntryWaitReasonCode(value);
 }
 
 function hasOnlyPassiveEntryReasons(values: string[] | null | undefined) {
   const reasons = values?.filter((value) => value.trim().length > 0) ?? [];
-  return reasons.length > 0 && reasons.every(isPassiveEntryReason);
+  return reasons.length > 0 && reasons.every((reason) => isEntryWaitReasonCodeInContext(reason, reasons));
 }
 
 function asMacroEventContextSummary(value: unknown): MacroEventContextSummary | null {
@@ -458,6 +528,147 @@ function formatRatio(value: number | null | undefined) {
     minimumFractionDigits: 0,
     maximumFractionDigits: 2,
   })}%`;
+}
+
+function marketDataSourceLabel(source: string | null | undefined) {
+  switch (source) {
+    case "redis":
+      return "Redis shared cache";
+    case "binance_ws_final_kline":
+      return "WebSocket final kline";
+    case "binance_rest":
+      return "REST fallback";
+    case "seed_fallback":
+      return "seed fallback";
+    case "snapshot":
+      return "snapshot";
+    default:
+      return source ?? "unknown";
+  }
+}
+
+function marketDataStatusLabel(status: string | null | undefined) {
+  switch (status) {
+    case "fresh":
+      return "정상";
+    case "stale":
+      return "stale";
+    case "incomplete":
+      return "incomplete";
+    case "rest_fallback":
+      return "REST fallback";
+    case "unavailable":
+      return "unavailable";
+    default:
+      return status ?? "unknown";
+  }
+}
+
+function marketFreshnessDisplay(summary: Record<string, unknown> | null) {
+  const stream = asRecord(summary?.stream);
+  const sourceDetail = asRecord(summary?.source_detail);
+  const source = typeof summary?.source === "string" ? summary.source : null;
+  const activeSnapshotSource =
+    typeof summary?.active_snapshot_source === "string"
+      ? summary.active_snapshot_source
+      : typeof sourceDetail?.active_snapshot_source === "string"
+        ? sourceDetail.active_snapshot_source
+        : source;
+  const status = typeof summary?.status === "string" ? summary.status : null;
+  const sourceStatus = typeof summary?.source_status === "string" ? summary.source_status : null;
+  const snapshotAt = typeof summary?.snapshot_at === "string" ? summary.snapshot_at : null;
+  const sourceTime = typeof summary?.source_time === "string" ? summary.source_time : typeof sourceDetail?.source_time === "string" ? sourceDetail.source_time : null;
+  const receivedAt = typeof summary?.received_at === "string" ? summary.received_at : typeof sourceDetail?.received_at === "string" ? sourceDetail.received_at : null;
+  const streamStatus = typeof stream?.status === "string" ? stream.status : null;
+  const streamReason = typeof stream?.reason_code === "string" ? stream.reason_code : null;
+  const configuredCacheBackend =
+    typeof summary?.configured_cache_backend === "string"
+      ? summary.configured_cache_backend
+      : typeof sourceDetail?.configured_cache_backend === "string"
+        ? sourceDetail.configured_cache_backend
+        : typeof stream?.configured_cache_backend === "string"
+          ? stream.configured_cache_backend
+          : typeof summary?.cache_backend === "string"
+            ? summary.cache_backend
+            : typeof sourceDetail?.cache_backend === "string"
+              ? sourceDetail.cache_backend
+              : typeof stream?.cache_backend === "string"
+                ? stream.cache_backend
+                : null;
+  const cacheHealth =
+    typeof summary?.cache_health === "string"
+      ? summary.cache_health
+      : typeof sourceDetail?.cache_health === "string"
+        ? sourceDetail.cache_health
+        : typeof stream?.cache_health === "string"
+          ? stream.cache_health
+          : null;
+  const cacheScope = typeof summary?.cache_scope === "string" ? summary.cache_scope : typeof stream?.cache_scope === "string" ? stream.cache_scope : null;
+  const fallbackReason =
+    typeof summary?.fallback_reason === "string"
+      ? summary.fallback_reason
+      : typeof sourceDetail?.fallback_reason === "string"
+        ? sourceDetail.fallback_reason
+        : null;
+  const staleReason =
+    typeof summary?.stale_reason === "string"
+      ? summary.stale_reason
+      : typeof sourceDetail?.stale_reason === "string"
+        ? sourceDetail.stale_reason
+        : null;
+  const fallbackActive =
+    typeof summary?.fallback_active === "boolean"
+      ? summary.fallback_active
+      : typeof summary?.used_fallback === "boolean"
+        ? summary.used_fallback
+        : sourceDetail?.fallback_active === true || sourceDetail?.used_fallback === true;
+  const redisRequired = typeof summary?.redis_required === "boolean" ? summary.redis_required : stream?.redis_required === true;
+  const redisConfigured =
+    typeof summary?.redis_configured === "boolean" ? summary.redis_configured : stream?.redis_configured === true;
+  const redisConnected =
+    typeof summary?.redis_connected === "boolean"
+      ? summary.redis_connected
+      : typeof stream?.redis_connected === "boolean"
+        ? stream.redis_connected
+        : null;
+  const age = asFiniteNumber(summary?.age_seconds ?? summary?.snapshot_age_seconds);
+  const staleAfter = asFiniteNumber(summary?.stale_after_seconds);
+
+  return {
+    sourceLabel: marketDataSourceLabel(activeSnapshotSource),
+    sourceHint:
+      [
+        source && source !== activeSnapshotSource ? `payload source ${source}` : null,
+        fallbackActive ? "REST fallback operating" : "fallback inactive",
+        fallbackReason ? `reason ${fallbackReason}` : null,
+        staleReason ? `stale ${staleReason}` : null,
+      ]
+        .filter(Boolean)
+        .join(" / ") || "backend active_snapshot_source 기준",
+    statusLabel: marketDataStatusLabel(status ?? sourceStatus),
+    statusHint:
+      [
+        snapshotAt ? `snapshot ${formatDateTime(snapshotAt)}` : null,
+        sourceTime ? `source ${formatDateTime(sourceTime)}` : null,
+        receivedAt ? `received ${formatDateTime(receivedAt)}` : null,
+        age !== null ? `${Math.round(age)}s old` : null,
+        staleAfter !== null ? `limit ${Math.round(staleAfter)}s` : null,
+      ]
+        .filter(Boolean)
+        .join(" / ") || "backend market_freshness_summary 기준",
+    streamLabel: marketDataStatusLabel(streamStatus),
+    streamHint:
+      [
+        configuredCacheBackend ? `configured ${configuredCacheBackend}` : null,
+        cacheHealth ? `health ${cacheHealth}` : null,
+        cacheScope ? `scope ${cacheScope}` : null,
+        redisConfigured ? `redis connected ${redisConnected === null ? "unknown" : String(redisConnected)}` : null,
+        redisRequired ? "redis required" : "redis optional",
+        streamReason ? `reason ${streamReason}` : null,
+      ]
+        .filter(Boolean)
+        .join(" / ") || "pause_reason_detail.market_stream 기준",
+  };
 }
 
 function badgeClass(kind: "good" | "warn" | "danger" | "neutral") {
@@ -1124,6 +1335,28 @@ function aiChartDecisionRows(symbol: OperatorSymbol, priceDigits: number) {
   return rows;
 }
 
+function buildMarketCandlestickClientModel(model: MarketChartModel): ClientMarketCandlestickModel {
+  const latestClose = model.candles[model.candles.length - 1]?.close;
+  const priceDigits = marketPriceDigits(model.latestPrice ?? latestClose);
+  return {
+    symbol: model.symbol,
+    timeframe: model.timeframe,
+    latestPrice: model.latestPrice,
+    candles: model.candles,
+    baseCandleCount: model.baseCandleCount,
+    visibleStartIndex: model.visibleStartIndex,
+    visibleEndIndex: model.visibleEndIndex,
+    stats: model.stats,
+    backendVolumeProfile: featureVolumeProfile(model),
+    aiTooltipRows: aiChartDecisionRows(model.symbolState, priceDigits),
+    volumeProfileTooltipRows: volumeProfileTooltipRows(
+      planVolumeProfileDetails(model.symbolState),
+      priceDigits,
+    ),
+    events: model.events,
+  };
+}
+
 function candleTooltipRows(
   candle: CandlePoint,
   priceDigits: number,
@@ -1734,7 +1967,7 @@ function MarketCandlestickSvg({
       </svg>
     </div>
   );
-  return compact ? chart : <MarketChartZoomShell>{chart}</MarketChartZoomShell>;
+  return chart;
 }
 
 function formatUnsignedPercent(value: number | null | undefined, digits = 2) {
@@ -1998,17 +2231,21 @@ function MarketChartSection({
   selectedCandleWindow,
   selectedTimeframe,
   timeframeAvailability,
+  renderAutoRefresh,
+  renderCandlestickChart,
 }: {
   models: MarketChartModel[];
   selectedSymbol: string;
   selectedCandleWindow: CandleWindow;
   selectedTimeframe: MarketChartTimeframe;
   timeframeAvailability: Map<MarketChartTimeframe, { enabled: boolean; detail: string }>;
+  renderAutoRefresh?: MarketAutoRefreshRenderer;
+  renderCandlestickChart?: MarketCandlestickRenderer;
 }) {
   const latestCandleTime = latestCandleTimestampForModels(models);
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-      <MarketChartAutoRefresh latestCandleTime={latestCandleTime} timeframe={selectedTimeframe} />
+      {renderAutoRefresh?.({ latestCandleTime, timeframe: selectedTimeframe })}
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">시장 차트</p>
@@ -2104,7 +2341,7 @@ function MarketChartSection({
               </div>
               <MarketChartStatsStrip model={model} />
               <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
-                <MarketCandlestickSvg model={model} />
+                {renderCandlestickChart?.(buildMarketCandlestickClientModel(model))}
                 <div className="space-y-4">
                   <MarketChartAiSummary model={model} />
                   <MarketEntryFlowSummary model={model} />
@@ -2870,10 +3107,14 @@ function EntryLifecycleExecutionPanel({ symbol }: { symbol: OperatorSymbol }) {
   );
 }
 
-function classifyRiskReasonGroup(value: string): RiskReasonGroupKey {
+function classifyRiskReasonGroup(value: string, allReasonCodes: string[] | null | undefined): RiskReasonGroupKey {
   const normalized = value.trim();
   const upper = normalized.toUpperCase();
   const lower = normalized.toLowerCase();
+
+  if (isEntryWaitReasonCodeInContext(normalized, allReasonCodes)) {
+    return "trigger";
+  }
 
   if (
     upper.includes("STALE") ||
@@ -2955,18 +3196,32 @@ function classifyRiskReasonGroup(value: string): RiskReasonGroupKey {
 function groupedRiskReasons(values: string[] | null | undefined) {
   const groups = new Map<RiskReasonGroupKey, string[]>();
   const seen = new Set<string>();
+  const contextReasons = values?.filter((value) => value.trim().length > 0) ?? [];
   for (const value of values ?? []) {
     const reason = typeof value === "string" ? value.trim() : "";
     if (!reason || seen.has(reason)) {
       continue;
     }
     seen.add(reason);
-    const group = classifyRiskReasonGroup(reason);
+    const group = classifyRiskReasonGroup(reason, contextReasons);
     groups.set(group, [...(groups.get(group) ?? []), reason]);
   }
   return riskReasonGroupOrder
     .map((key) => ({ key, reasons: groups.get(key) ?? [] }))
     .filter((item) => item.reasons.length > 0);
+}
+
+function reasonCategoryBadge(category: ReasonCodeCategory) {
+  if (category === "entry_wait") return "진입 대기";
+  if (category === "operational_control") return "운영 제어";
+  if (category === "safety_block") return "안전 차단";
+  return "확인 필요";
+}
+
+function reasonCategoryTone(category: ReasonCodeCategory) {
+  if (category === "entry_wait") return "warn" as const;
+  if (category === "operational_control" || category === "safety_block") return "danger" as const;
+  return "neutral" as const;
 }
 
 function RiskReasonGroups({
@@ -2977,6 +3232,7 @@ function RiskReasonGroups({
   emptyText?: string;
 }) {
   const groups = groupedRiskReasons(reasons);
+  const contextReasons = reasons?.filter((reason) => reason.trim().length > 0) ?? [];
   if (groups.length === 0) {
     return (
       <div className="rounded-md border border-slate-200 bg-white px-4 py-3 text-sm text-slate-500">
@@ -2991,12 +3247,23 @@ function RiskReasonGroups({
           <p className="text-sm font-semibold text-slate-900">{riskReasonGroupLabels[group.key]}</p>
           <p className="mt-1 text-xs leading-5 text-slate-500">{riskReasonGroupHints[group.key]}</p>
           <div className="mt-3 space-y-2">
-            {group.reasons.map((reason) => (
-              <div key={reason} className="rounded-md bg-slate-50 px-3 py-2">
-                <p className="text-sm font-medium text-slate-800">{formatInternalCodeLabel(reason)}</p>
-                <p className="mt-1 break-all font-mono text-[11px] text-slate-500">{reason}</p>
-              </div>
-            ))}
+            {group.reasons.map((reason) => {
+              const copy = describeReasonCodeInContext(reason, contextReasons);
+              return (
+                <div key={reason} className="rounded-md bg-slate-50 px-3 py-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-medium text-slate-800">{copy.title_ko}</p>
+                    <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${badgeClass(reasonCategoryTone(copy.category))}`}>
+                      {reasonCategoryBadge(copy.category)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-slate-600">{copy.detail_ko}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">자동 해소: {copy.auto_clear_hint_ko}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">확인 위치: {copy.check_location_ko}</p>
+                  <p className="mt-1 break-all font-mono text-[11px] text-slate-500">raw: {copy.raw_code}</p>
+                </div>
+              );
+            })}
           </div>
         </div>
       ))}
@@ -3163,6 +3430,477 @@ function positionPnlClass(value: number | null) {
     return "text-slate-950";
   }
   return value > 0 ? "text-emerald-700" : "text-rose-700";
+}
+
+const orderLifecycleTabs: Array<{ key: OrderLifecycleTab; label: string; description: string }> = [
+  {
+    key: "summary",
+    label: "요약",
+    description: "포지션 단위 주문, 보호 주문, 체결 요약",
+  },
+  {
+    key: "orders",
+    label: "주문",
+    description: "진입, 손절, 익절 주문 상태",
+  },
+  {
+    key: "executions",
+    label: "체결",
+    description: "실제 execution row와 수수료, 실현손익",
+  },
+];
+
+function historyTimestampMs(value: string | null | undefined) {
+  if (!value) {
+    return 0;
+  }
+  const parsed = new Date(value.endsWith("Z") ? value : `${value}Z`).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function latestHistoryTimestamp(values: Array<string | null>) {
+  const latest = values.reduce((max, value) => Math.max(max, historyTimestampMs(value)), 0);
+  return latest > 0 ? new Date(latest).toISOString() : null;
+}
+
+function earliestHistoryTimestamp(values: Array<string | null>) {
+  const timestamps = values.map(historyTimestampMs).filter((value) => value > 0);
+  if (timestamps.length === 0) {
+    return null;
+  }
+  return new Date(Math.min(...timestamps)).toISOString();
+}
+
+function historyGroupKey(positionId: number | null, symbol: string, fallbackId: number | null, source: string) {
+  if (positionId !== null) {
+    return `position:${positionId}`;
+  }
+  if (fallbackId !== null) {
+    return `${source}:${symbol}:${fallbackId}`;
+  }
+  return `unlinked:${symbol}`;
+}
+
+function asOrderHistoryRow(row: Row): OrderHistoryRow {
+  return {
+    id: rowNumber(row, "id"),
+    symbol: rowString(row, "symbol") ?? "UNKNOWN",
+    positionId: rowNumber(row, "position_id"),
+    parentOrderId: rowNumber(row, "parent_order_id"),
+    decisionRunId: rowNumber(row, "decision_run_id"),
+    riskCheckId: rowNumber(row, "risk_check_id"),
+    side: rowString(row, "side"),
+    orderType: rowString(row, "order_type"),
+    status: rowString(row, "status"),
+    exchangeStatus: rowString(row, "exchange_status"),
+    mode: rowString(row, "mode"),
+    reduceOnly: rowBoolean(row, "reduce_only"),
+    closeOnly: rowBoolean(row, "close_only"),
+    requestedQuantity: rowNumber(row, "requested_quantity"),
+    requestedPrice: rowNumber(row, "requested_price"),
+    filledQuantity: rowNumber(row, "filled_quantity"),
+    averageFillPrice: rowNumber(row, "average_fill_price"),
+    externalOrderId: rowString(row, "external_order_id"),
+    clientOrderId: rowString(row, "client_order_id"),
+    reasonCodes: asStringArray(row.reason_codes),
+    pnlSource: rowString(row, "pnl_source"),
+    closeExecutionSyncStatus: rowString(row, "close_execution_sync_status"),
+    realizedPnlConfirmed: rowBoolean(row, "realized_pnl_confirmed"),
+    missingCloseExecution: rowBoolean(row, "missing_close_execution"),
+    feeSource: rowString(row, "fee_source"),
+    feeConfirmed: rowBoolean(row, "fee_confirmed"),
+    warningMessage: rowString(row, "warning_message") ?? rowString(row, "blocked_reason"),
+    feeWarningMessage: rowString(row, "fee_warning_message"),
+    createdAt: rowString(row, "created_at"),
+    updatedAt: rowString(row, "updated_at"),
+    lastExchangeUpdateAt: rowString(row, "last_exchange_update_at"),
+  };
+}
+
+function asExecutionHistoryRow(row: Row, ordersById: Map<number, OrderHistoryRow>): ExecutionHistoryRow {
+  const orderId = rowNumber(row, "order_id");
+  const matchedOrder = orderId !== null ? ordersById.get(orderId) : null;
+  return {
+    id: rowNumber(row, "id"),
+    orderId,
+    positionId: rowNumber(row, "position_id") ?? matchedOrder?.positionId ?? null,
+    symbol: rowString(row, "symbol") ?? matchedOrder?.symbol ?? "UNKNOWN",
+    status: rowString(row, "status"),
+    orderType: rowString(row, "order_type") ?? matchedOrder?.orderType ?? null,
+    orderStatus: rowString(row, "order_status") ?? matchedOrder?.status ?? null,
+    fillPrice: rowNumber(row, "fill_price"),
+    fillQuantity: rowNumber(row, "fill_quantity"),
+    feePaid: rowNumber(row, "fee_paid"),
+    realizedPnl: rowNumber(row, "realized_pnl"),
+    externalTradeId: rowString(row, "external_trade_id"),
+    commissionAsset: rowString(row, "commission_asset"),
+    reduceOnly: matchedOrder?.reduceOnly ?? null,
+    closeOnly: matchedOrder?.closeOnly ?? null,
+    decisionRunId: rowNumber(row, "decision_run_id") ?? matchedOrder?.decisionRunId ?? null,
+    createdAt: rowString(row, "created_at"),
+    updatedAt: rowString(row, "updated_at"),
+  };
+}
+
+function buildPositionHistoryGroups(orderRows: Row[], executionRows: Row[]) {
+  const orders = orderRows.map(asOrderHistoryRow);
+  const ordersById = new Map<number, OrderHistoryRow>();
+  orders.forEach((order) => {
+    if (order.id !== null) {
+      ordersById.set(order.id, order);
+    }
+  });
+  const executions = executionRows.map((row) => asExecutionHistoryRow(row, ordersById));
+  const groups = new Map<string, PositionHistoryGroup>();
+
+  const ensureGroup = (key: string, symbol: string, positionId: number | null) => {
+    const existing = groups.get(key);
+    if (existing) {
+      return existing;
+    }
+    const group: PositionHistoryGroup = {
+      key,
+      positionId,
+      symbol,
+      orders: [],
+      executions: [],
+      createdAt: null,
+      updatedAt: null,
+    };
+    groups.set(key, group);
+    return group;
+  };
+
+  orders.forEach((order) => {
+    const key = historyGroupKey(order.positionId, order.symbol, order.parentOrderId ?? order.id, "order");
+    ensureGroup(key, order.symbol, order.positionId).orders.push(order);
+  });
+
+  executions.forEach((execution) => {
+    const matchedOrder = execution.orderId !== null ? ordersById.get(execution.orderId) : null;
+    const key = historyGroupKey(
+      execution.positionId,
+      execution.symbol,
+      matchedOrder?.parentOrderId ?? execution.orderId ?? execution.id,
+      "order",
+    );
+    ensureGroup(key, execution.symbol, execution.positionId).executions.push(execution);
+  });
+
+  const result = [...groups.values()].map((group) => {
+    group.orders.sort((left, right) => historyTimestampMs(left.createdAt) - historyTimestampMs(right.createdAt));
+    group.executions.sort((left, right) => historyTimestampMs(left.createdAt) - historyTimestampMs(right.createdAt));
+    group.createdAt = earliestHistoryTimestamp([
+      ...group.orders.map((order) => order.createdAt),
+      ...group.executions.map((execution) => execution.createdAt),
+    ]);
+    group.updatedAt = latestHistoryTimestamp([
+      ...group.orders.map((order) => order.updatedAt ?? order.createdAt),
+      ...group.executions.map((execution) => execution.updatedAt ?? execution.createdAt),
+    ]);
+    return group;
+  });
+
+  return result.sort((left, right) => historyTimestampMs(right.updatedAt) - historyTimestampMs(left.updatedAt));
+}
+
+function sumHistory(values: Array<number | null>) {
+  return values.reduce<number>((total, value) => total + (value ?? 0), 0);
+}
+
+function orderSettlementInputs(orders: OrderHistoryRow[]): OrderSettlementInput[] {
+  return orders.map((order) => ({
+    closeExecutionSyncStatus: order.closeExecutionSyncStatus,
+    missingCloseExecution: order.missingCloseExecution,
+    realizedPnlConfirmed: order.realizedPnlConfirmed,
+    pnlSource: order.pnlSource,
+    feeSource: order.feeSource,
+    feeConfirmed: order.feeConfirmed,
+    warningMessage: order.warningMessage,
+    feeWarningMessage: order.feeWarningMessage,
+  }));
+}
+
+function orderIntentLabel(order: OrderHistoryRow) {
+  const type = order.orderType?.toLowerCase() ?? "";
+  if (order.reduceOnly || order.closeOnly) {
+    if (type.includes("take_profit")) {
+      return "익절 보호";
+    }
+    if (type.includes("stop")) {
+      return "손절 보호";
+    }
+    return "청산/감소";
+  }
+  return "진입";
+}
+
+function isCloseExecutionHistory(execution: ExecutionHistoryRow) {
+  const type = execution.orderType?.toLowerCase() ?? "";
+  return Boolean(execution.reduceOnly || execution.closeOnly || type.includes("stop") || type.includes("take_profit"));
+}
+
+function orderStatusTone(status: string | null | undefined) {
+  const normalized = status?.trim().toLowerCase();
+  if (normalized === "filled") {
+    return "good" as const;
+  }
+  if (normalized === "rejected") {
+    return "danger" as const;
+  }
+  if (normalized === "pending" || normalized === "partially_filled" || normalized === "new") {
+    return "warn" as const;
+  }
+  return "neutral" as const;
+}
+
+function positionHistoryStatus(group: PositionHistoryGroup) {
+  const settlement = summarizeSettlementDisplay(orderSettlementInputs(group.orders));
+  if (settlement.realizedPnlDisplayMode === "pending") {
+    return {
+      label: settlement.badgeLabel ?? "정산 동기화 대기",
+      detail: settlement.warningMessage ?? settlement.realizedPnlDetail,
+      kind: settlement.badgeTone === "danger" ? ("danger" as const) : ("warn" as const),
+    };
+  }
+  const reasonCodes = group.orders.flatMap((order) => order.reasonCodes);
+  if (group.orders.some((order) => order.status?.toLowerCase() === "rejected")) {
+    return {
+      label: "주문 거절 있음",
+      detail: "같은 포지션 묶음 안에 거래소 제출 실패 또는 거절 주문이 있습니다.",
+      kind: "danger" as const,
+    };
+  }
+  if (reasonCodes.includes("POSITION_CLOSED_PROTECTIVE_ORDER_ORPHANED")) {
+    return {
+      label: "보호 주문 정리됨",
+      detail: "포지션 종료 후 거래소 오픈 주문 목록에서 사라진 보호 주문을 로컬에서 정리했습니다. 실제 청산 체결 누락 여부는 체결 탭에서 확인합니다.",
+      kind: "warn" as const,
+    };
+  }
+  if (group.orders.some((order) => order.status?.toLowerCase() === "pending")) {
+    return {
+      label: "미종결 주문 있음",
+      detail: "아직 pending 상태인 주문이 있습니다.",
+      kind: "warn" as const,
+    };
+  }
+  if (group.executions.length > 0) {
+    return {
+      label: "체결 기록 있음",
+      detail: "execution row가 연결되어 있어 실제 체결 수량과 수수료를 확인할 수 있습니다.",
+      kind: "good" as const,
+    };
+  }
+  return {
+    label: "주문 기록만 있음",
+    detail: "이 묶음에는 주문 row만 있고 execution row는 없습니다.",
+    kind: "neutral" as const,
+  };
+}
+
+function OrderLifecycleTabLinks({ activeTab }: { activeTab: OrderLifecycleTab }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {orderLifecycleTabs.map((tab) => {
+        const active = tab.key === activeTab;
+        const href = tab.key === "summary" ? "/dashboard/orders" : `/dashboard/orders?tab=${tab.key}`;
+        return (
+          <Link
+            key={tab.key}
+            href={href}
+            className={`rounded-full border px-4 py-2 text-sm font-semibold transition ${
+              active
+                ? "border-blue-600 bg-blue-600 text-white"
+                : "border-slate-200 bg-white text-slate-700 hover:border-blue-200 hover:bg-blue-50"
+            }`}
+          >
+            {tab.label}
+          </Link>
+        );
+      })}
+    </div>
+  );
+}
+
+function PositionHistorySummaryPanel({ group }: { group: PositionHistoryGroup }) {
+  const entryOrders = group.orders.filter((order) => !order.reduceOnly && !order.closeOnly);
+  const protectiveOrders = group.orders.filter((order) => order.reduceOnly || order.closeOnly);
+  const filledQuantity = sumHistory(group.executions.map((execution) => execution.fillQuantity));
+  const feeTotal = sumHistory(group.executions.map((execution) => execution.feePaid));
+  const realizedPnl = sumHistory(group.executions.map((execution) => execution.realizedPnl));
+  const settlement = summarizeSettlementDisplay(orderSettlementInputs(group.orders));
+  const realizedPnlLabel =
+    settlement.realizedPnlDisplayMode === "pending"
+      ? settlement.realizedPnlLabel ?? "동기화 대기"
+      : formatUsdtValue(realizedPnl, 4);
+  const reasonCodes = [...new Set(group.orders.flatMap((order) => order.reasonCodes))];
+  const latestExecution = group.executions.at(-1);
+  const latestOrder = group.orders.at(-1);
+
+  return (
+    <div className="grid gap-3 lg:grid-cols-3">
+      {metricCard("주문 구성", `진입 ${entryOrders.length} / 보호 ${protectiveOrders.length}`, "같은 position_id 기준")}
+      {metricCard("체결 합계", formatNumber(filledQuantity, 6), `${group.executions.length}개 execution row 기준`)}
+      {metricCard(
+        "수수료 / 실현손익",
+        `${formatUsdtValue(feeTotal, 4)} / ${realizedPnlLabel}`,
+        `${settlement.feeDetail} / 손익: ${settlement.realizedPnlDetail}`,
+      )}
+      {settlement.badgeLabel
+        ? metricCard("정산/체결 동기화", settlement.badgeLabel, settlement.warningMessage ?? settlement.realizedPnlDetail, {
+            compact: true,
+          })
+        : null}
+      {metricCard(
+        "최근 주문",
+        latestOrder ? `#${latestOrder.id ?? "-"} ${formatDisplayValue(latestOrder.status ?? "-", "status")}` : "-",
+        latestOrder ? `${orderIntentLabel(latestOrder)} / ${formatDateTime(latestOrder.updatedAt ?? latestOrder.createdAt)}` : "주문 없음",
+        { compact: true },
+      )}
+      {metricCard(
+        "최근 체결",
+        latestExecution ? `#${latestExecution.id ?? "-"} ${formatPriceValue(latestExecution.fillPrice)}` : "-",
+        latestExecution
+          ? `${formatNumber(latestExecution.fillQuantity, 6)} / ${formatDateTime(latestExecution.createdAt)}`
+          : "체결 없음",
+        { compact: true },
+      )}
+      {metricCard("정리 코드", formatTranslatedCodeList(reasonCodes), "비어 있으면 별도 reason code 없음", { compact: true })}
+    </div>
+  );
+}
+
+function PositionHistoryOrdersPanel({ group }: { group: PositionHistoryGroup }) {
+  if (group.orders.length === 0) {
+    return (
+      <div className="rounded-md border border-dashed border-slate-300 bg-white px-4 py-6 text-sm text-slate-500">
+        이 포지션 묶음에는 주문 row가 없습니다.
+      </div>
+    );
+  }
+
+  return (
+    <div className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
+      {group.orders.map((order, index) => (
+        <div key={order.id ?? `${group.key}-order-${index}`} className="px-4 py-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-slate-950">
+                #{order.id ?? "-"} {orderIntentLabel(order)} / {formatDisplayValue(order.orderType ?? "-", "order_type")}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-slate-500">
+                생성 {formatDateTime(order.createdAt)} / 갱신 {formatDateTime(order.updatedAt)}
+              </p>
+            </div>
+            <span className={`w-fit rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(orderStatusTone(order.status))}`}>
+              {formatDisplayValue(order.status ?? "-", "status")}
+            </span>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {metricCard(
+              "수량 / 체결",
+              `${formatNumber(order.requestedQuantity, 6)} / ${formatNumber(order.filledQuantity, 6)}`,
+              `평균 체결가 ${formatPriceValue(order.averageFillPrice)}`,
+              { compact: true },
+            )}
+            {metricCard("요청 가격", formatPriceValue(order.requestedPrice), `방향 ${order.side ?? "-"}`, { compact: true })}
+            {metricCard(
+              "거래소 상태",
+              formatDisplayValue(order.exchangeStatus ?? "-", "exchange_status"),
+              `거래소 ID ${order.externalOrderId ?? "-"}`,
+              { compact: true },
+            )}
+            {metricCard(
+              "연결 ID",
+              `decision #${order.decisionRunId ?? "-"}`,
+              `risk #${order.riskCheckId ?? "-"} / parent #${order.parentOrderId ?? "-"}`,
+              { compact: true },
+            )}
+          </div>
+          {order.reasonCodes.length > 0 ? (
+            <p className="mt-3 break-words rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
+              reason: {formatTranslatedCodeList(order.reasonCodes)}
+            </p>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PositionHistoryExecutionsPanel({ group }: { group: PositionHistoryGroup }) {
+  const settlement = summarizeSettlementDisplay(orderSettlementInputs(group.orders));
+  if (group.executions.length === 0) {
+    return (
+      <div className="rounded-md border border-dashed border-slate-300 bg-white px-4 py-6 text-sm text-slate-500">
+        {settlement.realizedPnlDisplayMode === "pending"
+          ? "청산 execution row가 없어 거래소 손익이 아직 반영되지 않았습니다."
+          : "이 포지션 묶음에는 execution row가 없습니다."}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-slate-200 bg-white">
+      {settlement.realizedPnlDisplayMode === "pending" ? (
+        <div className="border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">
+          {settlement.warningMessage ?? "청산 체결 누락"} / {settlement.feeDetail}
+        </div>
+      ) : null}
+      <div className="divide-y divide-slate-200">
+      {group.executions.map((execution, index) => {
+        const entryOnlyWhileCloseMissing =
+          settlement.realizedPnlDisplayMode === "pending" && !isCloseExecutionHistory(execution);
+        return (
+        <div key={execution.id ?? `${group.key}-execution-${index}`} className="px-4 py-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-slate-950">
+                execution #{execution.id ?? "-"} / 주문 #{execution.orderId ?? "-"}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-slate-500">
+                체결 기록 {formatDateTime(execution.createdAt)} / trade {execution.externalTradeId ?? "-"}
+              </p>
+            </div>
+            <span className={`w-fit rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(orderStatusTone(execution.status))}`}>
+              {formatDisplayValue(execution.status ?? "-", "status")}
+            </span>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {metricCard(
+              "체결가 / 수량",
+              `${formatPriceValue(execution.fillPrice)} / ${formatNumber(execution.fillQuantity, 6)}`,
+              formatDisplayValue(execution.orderType ?? "-", "order_type"),
+              { compact: true },
+            )}
+                {metricCard(
+              "수수료",
+              formatUsdtValue(execution.feePaid, 4),
+              entryOnlyWhileCloseMissing
+                ? `자산 ${execution.commissionAsset ?? "-"} / 청산 수수료 미반영`
+                : execution.commissionAsset ? `자산 ${execution.commissionAsset}` : "수수료 자산 미확인",
+              { compact: true },
+            )}
+            {metricCard(
+              "실현손익",
+              entryOnlyWhileCloseMissing ? "포지션 손익 미반영" : formatUsdtValue(execution.realizedPnl, 4),
+              entryOnlyWhileCloseMissing ? "진입 execution row 기준 0은 최종 손익 아님" : "execution.realized_pnl 기준",
+              { compact: true },
+            )}
+            {metricCard(
+              "연결 상태",
+              execution.positionId !== null ? `position #${execution.positionId}` : "position 미연결",
+              `decision #${execution.decisionRunId ?? "-"} / 주문 상태 ${formatDisplayValue(execution.orderStatus ?? "-", "status")}`,
+              { compact: true },
+            )}
+          </div>
+        </div>
+        );
+      })}
+      </div>
+    </div>
+  );
 }
 
 function formatPlanDistance(currentPrice: number | null, zoneMin: number | null, zoneMax: number | null) {
@@ -3609,6 +4347,10 @@ function translateReasonCode(value: string | null | undefined) {
   if (!value) {
     return "-";
   }
+  const sharedCopy = describeReasonCode(value);
+  if (sharedCopy.known && sharedCopy.raw_code) {
+    return sharedCopy.title_ko;
+  }
   const extraReasonCodeLabelMap: Record<string, string> = {
     ENTRY_AUTO_RESIZED: "진입 수량이 자동 축소 승인되었습니다.",
     ENTRY_CLAMPED_TO_GROSS_EXPOSURE_LIMIT: "총 노출 한도에 맞게 진입 수량이 축소되었습니다.",
@@ -3616,9 +4358,9 @@ function translateReasonCode(value: string | null | undefined) {
     ENTRY_CLAMPED_TO_SINGLE_POSITION_LIMIT: "최대 단일 포지션 한도에 맞게 진입 수량이 축소되었습니다.",
     ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "동일 티어 집중도 한도에 맞게 진입 수량이 축소되었습니다.",
     ENTRY_SIZE_BELOW_MIN_NOTIONAL: "최소 실행 가능 주문 미만",
-    ENTRY_TRIGGER_NOT_MET: "진입 트리거 미충족",
+    ENTRY_TRIGGER_NOT_MET: "진입 조건이 아직 충족되지 않았습니다",
     MACRO_EVENT_RESULT_CONFLICT: "발표 결과와 진입 방향 충돌",
-    CHASE_LIMIT_EXCEEDED: "추격 진입 한도 초과",
+    CHASE_LIMIT_EXCEEDED: "가격이 이미 지나가 추격 진입을 막았습니다",
     INVALID_INVALIDATION_PRICE: "무효화 가격 기준 이상",
     ENGINE_TREND_PULLBACK_ENGINE: "눌림목 진입 엔진",
     ENGINE_TREND_CONTINUATION_ENGINE: "추세 지속 엔진 기준",
@@ -3662,7 +4404,7 @@ function formatTranslatedCodeList(values: string[] | null | undefined) {
   if (!values || values.length === 0) {
     return "-";
   }
-  return values.map(formatInternalCodeLabel).join(", ");
+  return values.map((value) => formatInternalCodeLabelInContext(value, values)).join(", ");
 }
 
 function internalCodeHint(values: string[] | null | undefined) {
@@ -3707,6 +4449,17 @@ function formatInternalCodeLabel(value: string | null | undefined) {
     return displayValue;
   }
   return "내부 조건 확인";
+}
+
+function formatInternalCodeLabelInContext(value: string | null | undefined, allReasonCodes: string[] | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  const copy = describeReasonCodeInContext(value, allReasonCodes);
+  if (copy.known && copy.raw_code) {
+    return copy.title_ko;
+  }
+  return formatInternalCodeLabel(value);
 }
 
 function summarizeInternalCodeBadges(values: string[] | null | undefined) {
@@ -3990,6 +4743,8 @@ export function MarketSignalView({
   selectedTimeframe,
   selectedChartZoomRange,
   chartCandlesBySymbol = {},
+  renderAutoRefresh,
+  renderCandlestickChart,
 }: {
   operator: OperatorDashboardPayload;
   snapshots: Row[];
@@ -4001,6 +4756,8 @@ export function MarketSignalView({
   selectedTimeframe: MarketChartTimeframe;
   selectedChartZoomRange: MarketChartZoomRange | null;
   chartCandlesBySymbol?: MarketChartCandlesBySymbol;
+  renderAutoRefresh?: MarketAutoRefreshRenderer;
+  renderCandlestickChart?: MarketCandlestickRenderer;
 }) {
   const trackedSymbols = Array.isArray(operator.control.tracked_symbols)
     ? operator.control.tracked_symbols
@@ -4022,6 +4779,7 @@ export function MarketSignalView({
   const chartSourceFeatures = chartFeatures ?? filteredFeatures;
   const timeframeAvailability = availableMarketTimeframes(chartSourceSnapshots, chartSourceFeatures);
   const effectiveTimeframe = timeframeAvailability.get(selectedTimeframe)?.enabled ? selectedTimeframe : "15m";
+  const marketFreshness = marketFreshnessDisplay(asRecord(operator.control.market_freshness_summary));
   const chartModels =
     selectedSymbol === "ALL"
       ? []
@@ -4066,6 +4824,11 @@ export function MarketSignalView({
             }}
           />
         </div>
+        <div className="mt-4 grid gap-3 lg:grid-cols-3">
+          {metricCard("시장 데이터 소스", marketFreshness.sourceLabel, marketFreshness.sourceHint, { compact: true })}
+          {metricCard("시장 데이터 상태", marketFreshness.statusLabel, marketFreshness.statusHint, { compact: true })}
+          {metricCard("public market stream", marketFreshness.streamLabel, marketFreshness.streamHint, { compact: true })}
+        </div>
       </section>
 
       {selectedSymbol === "ALL" ? (
@@ -4081,6 +4844,8 @@ export function MarketSignalView({
           selectedCandleWindow={selectedCandleWindow}
           selectedTimeframe={effectiveTimeframe}
           timeframeAvailability={timeframeAvailability}
+          renderAutoRefresh={renderAutoRefresh}
+          renderCandlestickChart={renderCandlestickChart}
         />
       )}
 
@@ -4410,6 +5175,91 @@ export function SchedulerView({
         emptyStateTitle="표시할 스케줄러 기록이 없습니다."
         emptyStateDescription="아직 scheduler run이 저장되지 않았습니다."
       />
+    </div>
+  );
+}
+
+export function OrdersView({
+  orderRows,
+  executionRows,
+  activeTab,
+}: {
+  orderRows: Row[];
+  executionRows: Row[];
+  activeTab: OrderLifecycleTab;
+}) {
+  const groups = buildPositionHistoryGroups(orderRows, executionRows);
+  const activeTabMeta = orderLifecycleTabs.find((tab) => tab.key === activeTab) ?? orderLifecycleTabs[0];
+  const orderCount = groups.reduce((total, group) => total + group.orders.length, 0);
+  const executionCount = groups.reduce((total, group) => total + group.executions.length, 0);
+
+  return (
+    <div className="space-y-6">
+      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">주문 / 체결</p>
+            <h2 className="mt-2 text-xl font-semibold text-slate-950">포지션 단위 실행 이력</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-600">
+              같은 position_id에서 발생한 진입 주문, 보호 주문, execution row를 한 묶음으로 표시합니다. 포지션 연결이
+              없는 행은 주문 ID 기준으로 별도 묶음에 남깁니다.
+            </p>
+          </div>
+          <div className="w-fit rounded-md bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+            묶음 {groups.length}개 / 주문 {orderCount}건 / 체결 {executionCount}건
+          </div>
+        </div>
+        <div className="mt-5">
+          <OrderLifecycleTabLinks activeTab={activeTab} />
+        </div>
+        <p className="mt-3 text-xs leading-5 text-slate-500">{activeTabMeta.description}</p>
+      </section>
+
+      {groups.length === 0 ? (
+        <section className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
+          <p className="font-semibold text-slate-700">표시할 주문/체결 이력이 없습니다.</p>
+          <p className="mt-2 leading-6">저장된 live 주문과 execution row가 아직 없습니다.</p>
+        </section>
+      ) : (
+        <section className="space-y-4">
+          {groups.map((group) => {
+            const status = positionHistoryStatus(group);
+            return (
+              <article key={group.key} className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <h3 className="text-base font-semibold text-slate-950">
+                      {group.symbol} / {group.positionId !== null ? `position #${group.positionId}` : "position 미연결"}
+                    </h3>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">
+                      시작 {formatDateTime(group.createdAt)} / 최근 갱신 {formatDateTime(group.updatedAt)}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${badgeClass(status.kind)}`}>
+                      {status.label}
+                    </span>
+                    <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
+                      주문 {group.orders.length} / 체결 {group.executions.length}
+                    </span>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs leading-5 text-slate-600">{status.detail}</p>
+
+                <div className="mt-4">
+                  {activeTab === "summary" ? (
+                    <PositionHistorySummaryPanel group={group} />
+                  ) : activeTab === "orders" ? (
+                    <PositionHistoryOrdersPanel group={group} />
+                  ) : (
+                    <PositionHistoryExecutionsPanel group={group} />
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </section>
+      )}
     </div>
   );
 }

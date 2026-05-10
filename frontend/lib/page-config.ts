@@ -80,12 +80,12 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "실거래 주문",
-        endpoint: "/api/orders?limit=20",
+        endpoint: "/api/orders?limit=80",
         description: "주문 상태, 외부 주문 ID, 보호 주문 연관 관계를 표시합니다.",
       },
       {
         title: "실거래 체결",
-        endpoint: "/api/executions?limit=20",
+        endpoint: "/api/executions?limit=80",
         description: "부분 체결을 포함한 실제 체결 기록입니다.",
       },
     ],

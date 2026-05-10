@@ -234,6 +234,46 @@ def test_ai_context_exposes_operating_summaries() -> None:
     assert context.pending_entry_plan_summary["plans"][0]["plan_id"] == 7
     assert context.execution_constraints_summary["minimum_actionable_notional"] == 25.0
     assert context.execution_constraints_summary["risk_guard_final_authority"] is True
+    assert "same_direction_reentry_warning" not in context.strategy_engine_context
+
+
+def test_ai_context_adds_same_direction_tp_reentry_warning_when_provided() -> None:
+    snapshot, features = _features()
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={
+            "recent_closed_position_summary": {
+                "symbol": "BTCUSDT",
+                "side": "short",
+                "close_reason": "take_profit_market",
+                "recent_same_direction_tp_close": True,
+                "minutes_since_recent_same_direction_tp": 4.5,
+                "recent_tp_gross_pnl": 1.2,
+                "recent_tp_net_pnl": 0.82,
+                "recent_tp_fee": 0.18,
+            },
+        },
+        selection_context={
+            "strategy_engine": "trend_pullback_engine",
+            "holding_profile": "scalp",
+            "candidate": {
+                "decision": "short",
+                "entry_mode": "pullback_confirm",
+            },
+        },
+        decision_reference={},
+    )
+
+    warning = context.strategy_engine_context["same_direction_reentry_warning"]
+    assert warning["recent_same_direction_tp_close"] is True
+    assert warning["minutes_since_recent_same_direction_tp"] == 4.5
+    assert warning["recent_tp_gross_pnl"] == 1.2
+    assert warning["recent_tp_net_pnl"] == 0.82
+    assert warning["recent_tp_fee"] == 0.18
+    assert warning["recent_tp_fee_to_gross_ratio"] == 0.15
+    assert "fresh edge" in warning["same_direction_reentry_note"]
 
 
 def test_composite_regime_packet_generation() -> None:

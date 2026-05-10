@@ -1,10 +1,16 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import type { EntryQualityBreakdown, OperatorDashboardPayload, ProfitabilityCostBreakdown } from "./overview-dashboard";
 import { formatAuditEntityType, formatAuditRowTitle } from "../lib/audit-log";
-import { lookupRiskReasonCode } from "../lib/risk-reason-copy.js";
+import {
+  describeReasonCode,
+  describeReasonCodeInContext,
+  isEntryWaitReasonCodeInContext,
+  lookupRiskReasonCode,
+} from "../lib/risk-reason-copy.js";
 import { normalizeSyncScopeStatus } from "../lib/sync-freshness";
 
 type Tone = "safe" | "warn" | "danger" | "neutral" | "info";
@@ -34,19 +40,6 @@ const tradingSyncBlockers = new Set([
 const recoverableSyncStatuses = new Set(["stale", "skipped", "unknown"]);
 const entrySyncScopes = ["account", "positions", "open_orders", "protective_orders"] as const;
 
-const passiveBlockers = new Set([
-  "HOLD_DECISION",
-  "ENTRY_TRIGGER_NOT_MET",
-  "NO_EDGE",
-  "RANGE_CHOP",
-  "WEAK_VOLUME",
-  "MOMENTUM_WEAKENING",
-]);
-
-const statusOnlyBlockers = new Set([
-  "DETERMINISTIC_BASELINE_DISAGREEMENT",
-]);
-
 const reasonFallbackMap: Record<string, string> = {
   MANUAL_USER_REQUEST: "운영자가 수동으로 거래를 일시정지했습니다.",
   TRADING_PAUSED: "시스템 가드 모드로 신규 진입을 보류했습니다.",
@@ -67,7 +60,16 @@ function translateReasonCode(value: string | null | undefined) {
   if (!value) {
     return "추가 사유 없음";
   }
-  return lookupRiskReasonCode(value) ?? reasonFallbackMap[value] ?? value;
+  const copy = describeReasonCode(value);
+  return copy.known ? copy.title_ko : lookupRiskReasonCode(value) ?? reasonFallbackMap[value] ?? value;
+}
+
+function translateReasonCodeInContext(value: string | null | undefined, allReasonCodes: string[] | null | undefined) {
+  if (!value) {
+    return "추가 사유 없음";
+  }
+  const copy = describeReasonCodeInContext(value, allReasonCodes);
+  return copy.known ? copy.title_ko : lookupRiskReasonCode(value) ?? reasonFallbackMap[value] ?? value;
 }
 
 function formatDateTime(value: string | null | undefined, options?: { seconds?: boolean }) {
@@ -153,8 +155,9 @@ function hasActiveSyncProblem(control: OperatorDashboardPayload["control"]) {
 }
 
 function importantBlockers(control: OperatorDashboardPayload["control"]) {
-  return currentControlBlockers(control).filter((code) => {
-    if (passiveBlockers.has(code) || statusOnlyBlockers.has(code)) {
+  const blockers = currentControlBlockers(control);
+  return blockers.filter((code) => {
+    if (isEntryWaitReasonCodeInContext(code, blockers)) {
       return false;
     }
     if (tradingSyncBlockers.has(code) && !hasActiveSyncProblem(control) && control.unprotected_positions === 0) {
@@ -176,11 +179,12 @@ function isCurrentRiskBlocked(control: OperatorDashboardPayload["control"]) {
 
 function isPassiveRiskOnly(control: OperatorDashboardPayload["control"]) {
   const blockers = currentRiskBlockers(control);
-  return blockers.length === 0 || blockers.every((code) => passiveBlockers.has(code) || statusOnlyBlockers.has(code));
+  return blockers.length === 0 || blockers.every((code) => isEntryWaitReasonCodeInContext(code, blockers));
 }
 
 function hasStatusOnlyRiskBlocker(control: OperatorDashboardPayload["control"]) {
-  return currentRiskBlockers(control).some((code) => statusOnlyBlockers.has(code));
+  const blockers = currentRiskBlockers(control);
+  return blockers.some((code) => isEntryWaitReasonCodeInContext(code, blockers));
 }
 
 function hasTradingSyncBlocker(control: OperatorDashboardPayload["control"]) {
@@ -198,7 +202,7 @@ function needsSyncCatchUp(control: OperatorDashboardPayload["control"]) {
 }
 
 function syncBlockerDetail(code: string) {
-  const base = translateReasonCode(code);
+  const base = describeReasonCode(code).detail_ko;
   if (tradingSyncBlockers.has(code)) {
     return `${base} 잔고 표시와 별도로 포지션/주문 기준을 자동으로 다시 맞추는 중입니다.`;
   }
@@ -240,14 +244,14 @@ function mainState(operator: OperatorDashboardPayload) {
       const statusOnly = hasStatusOnlyRiskBlocker(control);
       return {
         title: statusOnly ? "신규 진입 대기" : "신규 진입 없음",
-        detail: riskBlockers.length > 0 ? translateReasonCode(riskBlockers[0]) : "이번 판단 주기에서 신규 진입 신호가 없습니다.",
+        detail: riskBlockers.length > 0 ? translateReasonCodeInContext(riskBlockers[0], riskBlockers) : "이번 판단 주기에서 신규 진입 신호가 없습니다.",
         tone: "neutral" as const,
       };
     }
 
     return {
       title: "신규 진입 차단",
-      detail: riskBlockers.length > 0 ? translateReasonCode(riskBlockers[0]) : "이번 판단 주기에서 리스크 기준이 신규 진입을 막았습니다.",
+      detail: riskBlockers.length > 0 ? translateReasonCodeInContext(riskBlockers[0], riskBlockers) : "이번 판단 주기에서 리스크 기준이 신규 진입을 막았습니다.",
       tone: "danger" as const,
     };
   }
@@ -675,7 +679,20 @@ function ProfitabilityCostPanel({
   const visibleEntryQuality = entryQuality.filter((item) => item.trade_count > 0);
 
   return (
-    <Panel title="수익성 비용 분해" action={<StatusPill tone={tone}>{statusLabel}</StatusPill>}>
+    <Panel
+      title="수익성 비용 분해"
+      action={
+        <div className="flex flex-wrap items-center gap-2">
+          <Link
+            href="/dashboard/cost-breakdown"
+            className="inline-flex min-h-9 items-center rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+          >
+            기간별 보기
+          </Link>
+          <StatusPill tone={tone}>{statusLabel}</StatusPill>
+        </div>
+      }
+    >
       <p className="mt-4 text-sm leading-6 text-slate-600">
         거래 확대 판단용 화면이 아니라 gross PnL이 수수료, funding, 불리한 체결에 먹히는지 확인하는 화면입니다.
       </p>

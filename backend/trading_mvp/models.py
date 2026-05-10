@@ -237,6 +237,7 @@ class PendingEntryPlan(TimestampMixin, Base):
 
 class Position(TimestampMixin, Base):
     __tablename__ = "positions"
+    __table_args__ = (Index("ix_positions_mode_closed_at", "mode", "closed_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(30), index=True)
@@ -258,6 +259,7 @@ class Position(TimestampMixin, Base):
 
 class Order(TimestampMixin, Base):
     __tablename__ = "orders"
+    __table_args__ = (Index("ix_orders_mode_created_at", "mode", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(30), index=True)
@@ -285,6 +287,7 @@ class Order(TimestampMixin, Base):
 
 class Execution(TimestampMixin, Base):
     __tablename__ = "executions"
+    __table_args__ = (Index("ix_executions_created_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
@@ -381,7 +384,10 @@ class Alert(TimestampMixin, Base):
 
 class SchedulerRun(TimestampMixin, Base):
     __tablename__ = "scheduler_runs"
-    __table_args__ = (Index("ix_scheduler_runs_created_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_scheduler_runs_created_at", "created_at"),
+        Index("ix_scheduler_runs_workflow_created_at", "workflow", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     schedule_window: Mapped[str] = mapped_column(String(20), index=True)

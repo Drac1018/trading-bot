@@ -1136,6 +1136,53 @@ class DashboardProfitabilityCostBreakdown(StrictBaseModel):
     basis: str = "decision_performance_summary_plus_execution_ledger"
 
 
+class AnalyticsCostBreakdownSummary(StrictBaseModel):
+    net_pnl_usdt: float = 0.0
+    gross_pnl_usdt: float = 0.0
+    fee_usdt: float = 0.0
+    funding_usdt: float = 0.0
+    total_cost_usdt: float = 0.0
+    fee_ratio_pct: float | None = None
+    total_cost_ratio_pct: float | None = None
+    signed_slippage_bps: float | None = None
+    adverse_slippage_bps: float | None = None
+
+
+class AnalyticsCostBreakdownBucket(StrictBaseModel):
+    label: str
+    start_at: datetime
+    end_at: datetime
+    net_pnl_usdt: float = 0.0
+    gross_pnl_usdt: float = 0.0
+    fee_usdt: float = 0.0
+    funding_usdt: float = 0.0
+    total_cost_usdt: float = 0.0
+    fee_ratio_pct: float | None = None
+    total_cost_ratio_pct: float | None = None
+    signed_slippage_bps: float | None = None
+    adverse_slippage_bps: float | None = None
+
+
+class AnalyticsCostBreakdownDataQuality(StrictBaseModel):
+    realized_pnl_confirmed: bool = True
+    execution_sync_status: str = "COMPLETE"
+    funding_sync_status: str = "UNKNOWN"
+    slippage_data_status: str = "UNKNOWN"
+    missing_close_execution_count: int = Field(default=0, ge=0)
+    slippage_weighting: str = "quantity"
+
+
+class AnalyticsCostBreakdownResponse(StrictBaseModel):
+    period: Literal["today", "month", "year"]
+    timezone: str
+    start_at: datetime
+    end_at: datetime
+    summary: AnalyticsCostBreakdownSummary
+    buckets: list[AnalyticsCostBreakdownBucket] = Field(default_factory=list)
+    data_quality: AnalyticsCostBreakdownDataQuality
+    warnings: list[str] = Field(default_factory=list)
+
+
 class DashboardProfitabilityWindow(StrictBaseModel):
     window_label: str
     window_hours: int = Field(ge=1, le=24 * 30)
@@ -1475,6 +1522,10 @@ class PendingEntryPlanSnapshot(StrictBaseModel):
     leverage_cap: float | None = None
     created_at: datetime | None = None
     expires_at: datetime | None = None
+    expires_at_time_basis: Literal["app_utc_naive"] = "app_utc_naive"
+    app_utc_now: datetime | None = None
+    remaining_ttl_seconds: int | None = None
+    expired_by_app_utc_now: bool = False
     triggered_at: datetime | None = None
     canceled_at: datetime | None = None
     canceled_reason: str | None = None
@@ -2183,6 +2234,9 @@ class MarketSnapshotPayload(StrictBaseModel):
     candle_count: int = Field(ge=1)
     is_stale: bool
     is_complete: bool
+    source: str = "unknown"
+    source_status: str = "unknown"
+    source_detail: dict[str, Any] = Field(default_factory=dict)
     candles: list[MarketCandle]
     derivatives_context: DerivativesContextPayload = Field(default_factory=DerivativesContextPayload)
     event_context: EventContextPayload = Field(

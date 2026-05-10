@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import timedelta
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import desc, select
 from trading_mvp.main import app
 from trading_mvp.models import (
     AccountLedgerEntry,
@@ -13,12 +15,15 @@ from trading_mvp.models import (
     FeatureSnapshot,
     MarketSnapshot,
     Order,
+    PendingEntryPlan,
     Position,
     RiskCheck,
     SchedulerRun,
 )
 from trading_mvp.services.dashboard import (
+    OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
     OPERATOR_RECENT_ROW_SCAN_LIMIT,
+    _latest_rows_by_extracted_symbol,
     _latest_rows_by_symbol,
     classify_audit_event,
     get_audit_timeline,
@@ -32,6 +37,7 @@ from trading_mvp.services.dashboard import (
 )
 from trading_mvp.services.runtime_state import (
     mark_sync_success,
+    replace_market_stream_detail,
     set_candidate_selection_detail,
     set_reconciliation_detail,
     set_user_stream_detail,
@@ -375,6 +381,54 @@ def test_latest_rows_by_symbol_uses_recent_scan_with_offset_fallback(db_session)
     )
 
     assert rows["BTCUSDT"].id == target.id
+
+
+def test_latest_rows_by_extracted_symbol_bounds_offset_fallback(db_session) -> None:
+    now = utcnow_naive()
+    within_fallback_offset = OPERATOR_RECENT_ROW_SCAN_LIMIT + 5
+    outside_fallback_offset = OPERATOR_RECENT_ROW_SCAN_LIMIT + OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT + 5
+    noise_rows = [
+        SchedulerRun(
+            schedule_window="15m",
+            workflow="interval_decision_cycle",
+            status="success",
+            triggered_by="scheduler",
+            outcome={"symbol": f"NOISE{i}USDT"},
+            created_at=now - timedelta(seconds=i),
+        )
+        for i in range(outside_fallback_offset + 3)
+        if i not in {within_fallback_offset, outside_fallback_offset}
+    ]
+    within = SchedulerRun(
+        schedule_window="15m",
+        workflow="interval_decision_cycle",
+        status="success",
+        triggered_by="scheduler",
+        outcome={"symbol": "BTCUSDT"},
+        created_at=now - timedelta(seconds=within_fallback_offset),
+    )
+    outside = SchedulerRun(
+        schedule_window="15m",
+        workflow="interval_decision_cycle",
+        status="success",
+        triggered_by="scheduler",
+        outcome={"symbol": "ETHUSDT"},
+        created_at=now - timedelta(seconds=outside_fallback_offset),
+    )
+    db_session.add_all([*noise_rows, within, outside])
+    db_session.flush()
+
+    rows = _latest_rows_by_extracted_symbol(
+        db_session,
+        select(SchedulerRun)
+        .where(SchedulerRun.workflow == "interval_decision_cycle")
+        .order_by(desc(SchedulerRun.created_at)),
+        ["BTCUSDT", "ETHUSDT"],
+        lambda row: str((row.outcome if isinstance(row.outcome, dict) else {}).get("symbol") or "").upper(),
+    )
+
+    assert rows["BTCUSDT"].id == within.id
+    assert "ETHUSDT" not in rows
 
 
 def _seed_multi_symbol_operator_rows(db_session) -> None:
@@ -1039,6 +1093,177 @@ def test_order_and_execution_filters(db_session) -> None:
     assert filtered_executions[0]["symbol"] == "BTCUSDT"
 
 
+def test_orders_mark_missing_close_execution_for_finished_protective_order(db_session) -> None:
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="short",
+        status="closed",
+        quantity=0.0,
+        entry_price=81536.6,
+        mark_price=81089.0,
+        leverage=1.0,
+        stop_loss=82000.0,
+        take_profit=81089.0,
+    )
+    db_session.add(position)
+    db_session.flush()
+    entry_order = Order(
+        symbol="BTCUSDT",
+        position_id=position.id,
+        side="sell",
+        order_type="limit",
+        mode="live",
+        status="filled",
+        exchange_status="FILLED",
+        external_order_id="1005147990724",
+        requested_quantity=0.001,
+        requested_price=81536.6,
+        filled_quantity=0.001,
+        average_fill_price=81536.6,
+    )
+    protective_order = Order(
+        symbol="BTCUSDT",
+        position_id=position.id,
+        side="buy",
+        order_type="take_profit_market",
+        mode="live",
+        status="expired",
+        exchange_status="FINISHED",
+        external_order_id="2000000895228311",
+        client_order_id="protective-btc-1",
+        reduce_only=True,
+        close_only=True,
+        requested_quantity=0.001,
+        requested_price=81089.0,
+        reason_codes=[],
+    )
+    db_session.add_all([entry_order, protective_order])
+    db_session.flush()
+    db_session.add(
+        Execution(
+            order_id=entry_order.id,
+            position_id=position.id,
+            symbol="BTCUSDT",
+            status="filled",
+            external_trade_id="7635750097",
+            fill_price=81536.6,
+            fill_quantity=0.001,
+            fee_paid=0.0407683,
+            commission_asset="USDT",
+            realized_pnl=0.0,
+            payload={},
+        )
+    )
+    db_session.flush()
+
+    rows = get_orders(db_session, symbol="BTCUSDT")
+    by_order_id = {row["id"]: row for row in rows}
+
+    assert by_order_id[entry_order.id]["missing_close_execution"] is True
+    assert by_order_id[entry_order.id]["close_execution_sync_status"] == "MISSING"
+    assert by_order_id[entry_order.id]["realized_pnl_confirmed"] is False
+    assert by_order_id[entry_order.id]["pnl_source"] == "UNKNOWN"
+    assert by_order_id[entry_order.id]["fee_source"] == "LOCAL_EXECUTIONS"
+    assert by_order_id[entry_order.id]["fee_confirmed"] is False
+    assert by_order_id[entry_order.id]["fee_warning_message"] == "청산 수수료 미반영"
+    assert by_order_id[protective_order.id]["missing_close_execution"] is True
+
+
+def test_orders_mark_realized_pnl_confirmed_after_close_execution_backfill(db_session) -> None:
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="short",
+        status="closed",
+        quantity=0.0,
+        entry_price=81536.6,
+        mark_price=81089.0,
+        leverage=1.0,
+        stop_loss=82000.0,
+        take_profit=81089.0,
+    )
+    db_session.add(position)
+    db_session.flush()
+    entry_order = Order(
+        symbol="BTCUSDT",
+        position_id=position.id,
+        side="sell",
+        order_type="limit",
+        mode="live",
+        status="filled",
+        exchange_status="FILLED",
+        external_order_id="1005147990724",
+        requested_quantity=0.001,
+        requested_price=81536.6,
+        filled_quantity=0.001,
+        average_fill_price=81536.6,
+    )
+    protective_order = Order(
+        symbol="BTCUSDT",
+        position_id=position.id,
+        side="buy",
+        order_type="take_profit_market",
+        mode="live",
+        status="filled",
+        exchange_status="FINISHED",
+        external_order_id="2000000895228311",
+        client_order_id="protective-btc-1",
+        reduce_only=True,
+        close_only=True,
+        requested_quantity=0.001,
+        requested_price=81089.0,
+        filled_quantity=0.001,
+        average_fill_price=81089.0,
+    )
+    db_session.add_all([entry_order, protective_order])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Execution(
+                order_id=entry_order.id,
+                position_id=position.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="7635750097",
+                fill_price=81536.6,
+                fill_quantity=0.001,
+                fee_paid=0.0407683,
+                commission_asset="USDT",
+                realized_pnl=0.0,
+                payload={},
+            ),
+            Execution(
+                order_id=protective_order.id,
+                position_id=position.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="7635814641",
+                fill_price=81089.0,
+                fill_quantity=0.001,
+                fee_paid=0.04054449,
+                commission_asset="USDT",
+                realized_pnl=0.4476,
+                payload={
+                    "exchange": "BINANCE",
+                    "source": "EXCHANGE_BACKFILL",
+                    "trade": {"realizedPnl": "0.44760000"},
+                },
+            ),
+        ]
+    )
+    db_session.flush()
+
+    rows = get_orders(db_session, symbol="BTCUSDT")
+    by_order_id = {row["id"]: row for row in rows}
+
+    assert by_order_id[entry_order.id]["missing_close_execution"] is False
+    assert by_order_id[entry_order.id]["close_execution_sync_status"] == "COMPLETE"
+    assert by_order_id[entry_order.id]["realized_pnl_confirmed"] is True
+    assert by_order_id[entry_order.id]["pnl_source"] == "EXCHANGE"
+    assert by_order_id[protective_order.id]["close_execution_sync_status"] == "COMPLETE"
+
+
 def test_audit_filters(db_session) -> None:
     db_session.add_all(
         [
@@ -1336,6 +1561,47 @@ def test_operator_dashboard_exposes_sync_freshness_summary(db_session) -> None:
     assert payload.control.sync_freshness_summary["account"]["stale"] is False
     assert payload.control.sync_freshness_summary["protective_orders"]["stale"] is True
     assert payload.control.can_enter_new_position is False
+
+
+def test_operator_pending_plan_snapshot_uses_utc_naive_remaining_ttl(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    settings.tracked_symbols = ["BTCUSDT"]
+    now = utcnow_naive()
+    plan = PendingEntryPlan(
+        symbol="BTCUSDT",
+        side="short",
+        plan_status="armed",
+        source_decision_run_id=173,
+        source_timeframe="15m",
+        entry_mode="pullback_confirm",
+        entry_zone_min=80505.6252,
+        entry_zone_max=80344.7748,
+        invalidation_price=80651.8214,
+        max_chase_bps=4.0,
+        idea_ttl_minutes=120,
+        stop_loss=80651.8214,
+        take_profit=80017.28148,
+        risk_pct_cap=0.02,
+        leverage_cap=3.0,
+        expires_at=now + timedelta(minutes=90),
+        idempotency_key="pending-plan:BTCUSDT:short:173:test",
+        metadata_json={},
+    )
+    db_session.add_all([settings, plan])
+    db_session.flush()
+
+    payload = get_operator_dashboard(db_session)
+    symbol = next(item for item in payload.symbols if item.symbol == "BTCUSDT")
+    pending_plan = symbol.pending_entry_plan
+
+    assert pending_plan is not None
+    assert pending_plan.plan_id == plan.id
+    assert pending_plan.expires_at_time_basis == "app_utc_naive"
+    assert pending_plan.app_utc_now is not None
+    assert pending_plan.remaining_ttl_seconds is not None
+    assert 0 < pending_plan.remaining_ttl_seconds <= 90 * 60
+    assert pending_plan.expired_by_app_utc_now is False
+    assert db_session.get(PendingEntryPlan, plan.id).plan_status == "armed"
 
 
 def test_overview_and_operator_expose_stream_reconcile_and_candidate_selection_summaries(db_session) -> None:
@@ -3057,6 +3323,227 @@ def test_operator_api_does_not_refresh_stale_exchange_sync_on_read_for_sqlite(
     assert payload["control"]["sync_freshness_summary"]["account"]["stale"] is True
     assert payload["control"]["sync_freshness_summary"]["protective_orders"]["stale"] is True
     assert refresh_started.wait(timeout=0.2) is False
+
+
+def test_operator_dashboard_read_refresh_is_opt_in_for_postgres(monkeypatch) -> None:
+    import trading_mvp.main as main_module
+
+    started_threads: list[str] = []
+
+    class _ThreadProbe:
+        def __init__(self, *args, **kwargs) -> None:
+            del args
+            started_threads.append(str(kwargs.get("name") or "unnamed"))
+
+        def start(self) -> None:
+            started_threads.append("started")
+
+    class _Payload:
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {"ok": True}
+
+    monkeypatch.delenv("TRADING_MVP_ENABLE_READ_TRIGGER_EXCHANGE_SYNC", raising=False)
+    monkeypatch.setattr(main_module, "engine", SimpleNamespace(dialect=SimpleNamespace(name="postgresql")))
+    monkeypatch.setattr(main_module.threading, "Thread", _ThreadProbe)
+    monkeypatch.setattr(main_module, "get_operator_dashboard", lambda db, view=None: _Payload())
+
+    assert main_module.dashboard_operator(view="risk", db=object()) == {"ok": True}
+    assert started_threads == []
+
+
+def test_operator_dashboard_exposes_market_stream_source_truth(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BTCUSDT"
+    settings.default_timeframe = "15m"
+    replace_market_stream_detail(
+        settings,
+        {
+            "status": "degraded",
+            "source": "binance_futures_market_stream",
+            "stream_source": "binance_ws_final_kline",
+            "subscribed_symbols": ["BTCUSDT"],
+            "subscribed_timeframes": ["1m", "15m"],
+            "stream_count": 2,
+            "last_error": "socket dropped",
+            "reason_code": "MARKET_STREAM_CONNECTION_DROPPED",
+            "stream_enabled": True,
+            "stream_running": False,
+            "cache_backend": "redis",
+            "configured_cache_backend": "redis",
+            "cache_market_type": "usd_m_futures",
+            "cache_environment": "mainnet",
+            "cache_health": "unavailable",
+            "cache_scope": "shared",
+            "shared_cache_supported": True,
+            "redis_required": False,
+            "redis_configured": True,
+            "redis_connected": False,
+            "last_shared_cache_error": "redis down",
+        },
+    )
+    db_session.add(
+        MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=utcnow_naive(),
+            latest_price=70000.0,
+            latest_volume=1200.0,
+            candle_count=120,
+            is_stale=False,
+            is_complete=True,
+            payload={
+                "source": "binance_ws_final_kline",
+                "source_status": "fresh",
+                "source_detail": {
+                    "active_snapshot_source": "redis",
+                    "rest_bootstrap_used": True,
+                    "partial_candle_used": False,
+                    "used_fallback": False,
+                    "fallback_active": False,
+                    "fallback_reason": None,
+                    "stale_reason": None,
+                    "cache_backend": "redis",
+                    "configured_cache_backend": "redis",
+                    "cache_market_type": "usd_m_futures",
+                    "cache_environment": "mainnet",
+                    "cache_health": "ok",
+                    "cache_scope": "shared",
+                    "shared_cache_supported": True,
+                    "redis_required": False,
+                    "redis_configured": True,
+                    "redis_connected": True,
+                    "source_time": "2026-05-05T12:00:00",
+                    "received_at": "2026-05-05T12:00:02",
+                    "age_seconds": 2,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    dashboard = get_operator_dashboard(db_session, view="market")
+    summary = dashboard.control.market_freshness_summary
+
+    assert summary["source"] == "binance_ws_final_kline"
+    assert summary["active_snapshot_source"] == "redis"
+    assert summary["source_status"] == "fresh"
+    assert summary["source_detail"]["rest_bootstrap_used"] is True
+    assert summary["stream"]["status"] == "degraded"
+    assert summary["stream"]["reason_code"] == "MARKET_STREAM_CONNECTION_DROPPED"
+    assert summary["stream_status"] == "degraded"
+    assert summary["stream_enabled"] is True
+    assert summary["stream_running"] is False
+    assert summary["cache_backend"] == "redis"
+    assert summary["configured_cache_backend"] == "redis"
+    assert summary["cache_market_type"] == "usd_m_futures"
+    assert summary["cache_environment"] == "mainnet"
+    assert summary["cache_health"] == "ok"
+    assert summary["cache_scope"] == "shared"
+    assert summary["shared_cache_supported"] is True
+    assert summary["redis_required"] is False
+    assert summary["redis_configured"] is True
+    assert summary["redis_connected"] is True
+    assert summary["source_time"] == "2026-05-05T12:00:00"
+    assert summary["received_at"] == "2026-05-05T12:00:02"
+    assert summary["age_seconds"] == 2
+    assert summary["used_fallback"] is False
+    assert summary["fallback_active"] is False
+    assert summary["fallback_reason"] is None
+    assert summary["stale_reason"] is None
+
+
+def test_operator_dashboard_distinguishes_configured_redis_from_rest_fallback_source(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BTCUSDT"
+    settings.default_timeframe = "15m"
+    replace_market_stream_detail(
+        settings,
+        {
+            "status": "degraded",
+            "source": "binance_futures_market_stream",
+            "stream_source": "binance_ws_final_kline",
+            "reason_code": "MARKET_STREAM_STALE",
+            "stream_enabled": True,
+            "stream_running": False,
+            "cache_backend": "redis",
+            "configured_cache_backend": "redis",
+            "cache_health": "unavailable",
+            "cache_scope": "shared",
+            "shared_cache_supported": True,
+            "redis_required": False,
+            "redis_configured": True,
+            "redis_connected": False,
+            "last_shared_cache_error": "Timeout connecting to server",
+        },
+    )
+    db_session.add(
+        MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=utcnow_naive(),
+            latest_price=70000.0,
+            latest_volume=1200.0,
+            candle_count=120,
+            is_stale=False,
+            is_complete=True,
+            payload={
+                "source": "binance_rest",
+                "source_status": "rest_fallback",
+                "source_detail": {
+                    "source": "binance_rest",
+                    "active_snapshot_source": "binance_rest",
+                    "rest_bootstrap_used": True,
+                    "used_fallback": True,
+                    "fallback_active": True,
+                    "fallback_reason": "market_stream_cache_unavailable",
+                    "stale_reason": "market_stream_cache_unavailable",
+                    "cache_backend": "redis",
+                    "configured_cache_backend": "redis",
+                    "cache_health": "unavailable",
+                    "cache_scope": "shared",
+                    "shared_cache_supported": True,
+                    "redis_required": False,
+                    "redis_configured": True,
+                    "redis_connected": False,
+                    "partial_candle_used": False,
+                    "stream": {
+                        "status": "degraded",
+                        "reason_code": "MARKET_STREAM_STALE",
+                        "cache_backend": "redis",
+                        "configured_cache_backend": "redis",
+                        "cache_health": "unavailable",
+                        "cache_scope": "shared",
+                        "redis_required": False,
+                        "redis_configured": True,
+                        "redis_connected": False,
+                    },
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    dashboard = get_operator_dashboard(db_session, view="market")
+    summary = dashboard.control.market_freshness_summary
+
+    assert summary["source"] == "binance_rest"
+    assert summary["active_snapshot_source"] == "binance_rest"
+    assert summary["source_status"] == "rest_fallback"
+    assert summary["status"] == "fresh"
+    assert summary["stale"] is False
+    assert summary["incomplete"] is False
+    assert summary["configured_cache_backend"] == "redis"
+    assert summary["cache_backend"] == "redis"
+    assert summary["cache_health"] == "unavailable"
+    assert summary["cache_scope"] == "shared"
+    assert summary["redis_required"] is False
+    assert summary["redis_configured"] is True
+    assert summary["redis_connected"] is False
+    assert summary["used_fallback"] is True
+    assert summary["fallback_active"] is True
+    assert summary["fallback_reason"] == "market_stream_cache_unavailable"
+    assert summary["stale_reason"] == "market_stream_cache_unavailable"
 
 
 def test_audit_api_returns_event_category(testclient_db_factory) -> None:

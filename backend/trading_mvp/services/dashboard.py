@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, cast, desc, func, or_, select
 from sqlalchemy.orm import Session
@@ -22,8 +23,13 @@ from trading_mvp.models import (
     Position,
     RiskCheck,
     SchedulerRun,
+    Setting,
 )
 from trading_mvp.schemas import (
+    AnalyticsCostBreakdownBucket,
+    AnalyticsCostBreakdownDataQuality,
+    AnalyticsCostBreakdownResponse,
+    AnalyticsCostBreakdownSummary,
     AuditTimelineEntry,
     DashboardExecutionProfileSummary,
     DashboardExecutionWindowSummary,
@@ -55,9 +61,11 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.audit import compact_audit_payload
 from trading_mvp.services.intent_semantics import infer_intent_semantics
+from trading_mvp.services.pending_entry_time import pending_entry_expiry_context
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
+    build_sync_freshness_summary,
     derive_degraded_reason_codes,
     derive_protection_reason_codes,
     summarize_runtime_state,
@@ -75,12 +83,18 @@ from trading_mvp.time_utils import utcnow_naive
 FINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "finished"}
 FINAL_EXCHANGE_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "FINISHED"}
 PROTECTIVE_ORDER_TYPES = {"stop_market", "take_profit_market"}
+PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE = "PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED"
+PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE = "PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING"
+CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE = "POSITION_CLOSED_PROTECTIVE_ORDER_ORPHANED"
+UNCONFIRMED_CLOSE_EXECUTION_STATUSES = {"MISSING", "PENDING", "FAILED"}
 PROFITABILITY_COST_WINDOW_SPECS: tuple[tuple[str, int | None], ...] = (
     ("today", None),
     ("7d", 24 * 7),
     ("30d", 24 * 30),
     ("all_time", None),
 )
+ANALYTICS_COST_BREAKDOWN_TIMEZONE = "Asia/Seoul"
+ANALYTICS_COST_BREAKDOWN_PERIODS = {"today", "month", "year"}
 MARKETABLE_ENTRY_WARNING_RATIO = 0.7
 AUDIT_CATEGORY_RISK = "risk"
 AUDIT_CATEGORY_EXECUTION = "execution"
@@ -98,6 +112,7 @@ OPERATOR_PROFITABILITY_COST_WINDOW_SPECS: tuple[tuple[str, int | None], ...] = (
 OPERATOR_PERFORMANCE_ENTRY_LIMIT = 3
 OPERATOR_EXECUTION_PROFILE_LIMIT = 2
 OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
+OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT = 900
 RECENT_FILL_LIMIT = 4
 OPERATOR_COMPACT_VIEWS = {"market", "scheduler"}
 AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
@@ -458,6 +473,7 @@ def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingE
         return PendingEntryPlanSnapshot()
     metadata = dict(row.metadata_json) if isinstance(row.metadata_json, dict) else {}
     trigger_details = metadata.get("trigger_details")
+    expiry_context = pending_entry_expiry_context(row.expires_at)
     return PendingEntryPlanSnapshot(
         plan_id=row.id,
         symbol=row.symbol,
@@ -484,6 +500,10 @@ def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingE
         leverage_cap=row.leverage_cap,
         created_at=row.created_at,
         expires_at=row.expires_at,
+        expires_at_time_basis=str(expiry_context["expires_at_time_basis"]),
+        app_utc_now=expiry_context["app_utc_now"],
+        remaining_ttl_seconds=expiry_context["remaining_ttl_seconds"],
+        expired_by_app_utc_now=bool(expiry_context["expired_by_app_utc_now"]),
         triggered_at=row.triggered_at,
         canceled_at=row.canceled_at,
         canceled_reason=row.canceled_reason,
@@ -591,6 +611,10 @@ def _is_entry_order(order_row: Order) -> bool:
     return order_type not in PROTECTIVE_ORDER_TYPES
 
 
+def _is_close_order(order_row: Order) -> bool:
+    return not _is_entry_order(order_row)
+
+
 def _entry_order_style(order_row: Order) -> str:
     metadata = _as_dict(order_row.metadata_json)
     policy = _as_dict(metadata.get("execution_policy"))
@@ -631,12 +655,14 @@ def _profitability_window_since(window_label: str, window_hours: int | None, now
     return None
 
 
-def _funding_total_for_window(session: Session, since: datetime | None) -> float:
+def _funding_total_for_window(session: Session, since: datetime | None, until: datetime | None = None) -> float:
     statement = select(func.coalesce(func.sum(AccountLedgerEntry.amount), 0.0)).where(
         AccountLedgerEntry.entry_type == "funding"
     )
     if since is not None:
         statement = statement.where(AccountLedgerEntry.occurred_at >= since)
+    if until is not None:
+        statement = statement.where(AccountLedgerEntry.occurred_at < until)
     return _as_float(session.scalar(statement), default=0.0)
 
 
@@ -646,11 +672,14 @@ def _build_profitability_cost_breakdown(
     window_label: str,
     window_hours: int | None,
     since: datetime | None,
+    until: datetime | None = None,
     summary: PerformanceWindowSummary | None = None,
 ) -> DashboardProfitabilityCostBreakdown:
     order_statement = select(Order).where(Order.mode == "live")
     if since is not None:
         order_statement = order_statement.where(Order.created_at >= since)
+    if until is not None:
+        order_statement = order_statement.where(Order.created_at < until)
     order_rows = list(session.scalars(order_statement))
     entry_rows = [row for row in order_rows if _is_entry_order(row)]
     marketable_entry_count = 0
@@ -669,6 +698,8 @@ def _build_profitability_cost_breakdown(
     )
     if since is not None:
         execution_statement = execution_statement.where(Execution.created_at >= since)
+    if until is not None:
+        execution_statement = execution_statement.where(Execution.created_at < until)
     execution_rows = list(session.execute(execution_statement))
 
     signed_weighted_sum = 0.0
@@ -702,7 +733,7 @@ def _build_profitability_cost_breakdown(
         realized_pnl = sum(_as_float(row.realized_pnl, default=0.0) for row, _order in execution_rows)
         gross_pnl = realized_pnl
         fee = sum(abs(_as_float(row.fee_paid, default=0.0)) for row, _order in execution_rows)
-        funding = _funding_total_for_window(session, since)
+        funding = _funding_total_for_window(session, since, until)
         net_pnl_excluding_funding = realized_pnl - fee
         net_pnl_including_funding = net_pnl_excluding_funding + funding
         data_count = len(order_rows) + len(execution_rows)
@@ -754,6 +785,514 @@ def _build_profitability_cost_breakdown(
         total_cost=total_cost,
         warning_codes=warning_codes,
         basis=basis,
+    )
+
+
+def _analytics_cost_timezone() -> ZoneInfo:
+    return ZoneInfo(ANALYTICS_COST_BREAKDOWN_TIMEZONE)
+
+
+def _next_month_start(value: datetime) -> datetime:
+    if value.month == 12:
+        return datetime(value.year + 1, 1, 1, tzinfo=value.tzinfo)
+    return datetime(value.year, value.month + 1, 1, tzinfo=value.tzinfo)
+
+
+def _normalize_cost_breakdown_period(period: str | None) -> str:
+    normalized = str(period or "today").strip().lower()
+    if normalized not in ANALYTICS_COST_BREAKDOWN_PERIODS:
+        raise ValueError("period must be one of: today, month, year")
+    return normalized
+
+
+def _analytics_period_bounds(
+    *,
+    period: str,
+    year: int | None,
+    month: int | None,
+) -> tuple[datetime, datetime]:
+    timezone = _analytics_cost_timezone()
+    now = datetime.now(timezone)
+    if period == "today":
+        start_at = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_at, start_at + timedelta(days=1)
+
+    resolved_year = year or now.year
+    if resolved_year < 2000 or resolved_year > 2100:
+        raise ValueError("year must be between 2000 and 2100")
+    if period == "month":
+        resolved_month = month or now.month
+        if resolved_month < 1 or resolved_month > 12:
+            raise ValueError("month must be between 1 and 12")
+        start_at = datetime(resolved_year, resolved_month, 1, tzinfo=timezone)
+        return start_at, _next_month_start(start_at)
+
+    start_at = datetime(resolved_year, 1, 1, tzinfo=timezone)
+    return start_at, datetime(resolved_year + 1, 1, 1, tzinfo=timezone)
+
+
+def _analytics_bucket_bounds(
+    *,
+    period: str,
+    start_at: datetime,
+    end_at: datetime,
+) -> list[tuple[str, datetime, datetime]]:
+    if period == "year":
+        buckets: list[tuple[str, datetime, datetime]] = []
+        cursor = start_at
+        while cursor < end_at:
+            next_at = min(_next_month_start(cursor), end_at)
+            buckets.append((cursor.strftime("%Y-%m"), cursor, next_at))
+            cursor = next_at
+        return buckets
+    if period == "month":
+        buckets = []
+        cursor = start_at
+        while cursor < end_at:
+            next_at = min(cursor + timedelta(days=1), end_at)
+            buckets.append((cursor.strftime("%Y-%m-%d"), cursor, next_at))
+            cursor = next_at
+        return buckets
+    return [(start_at.strftime("%Y-%m-%d"), start_at, end_at)]
+
+
+def _to_utc_naive(value: datetime) -> datetime:
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _live_execution_rows_for_range(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> list[tuple[Execution, Order]]:
+    statement = (
+        select(Execution, Order)
+        .join(Order, Order.id == Execution.order_id)
+        .where(
+            Order.mode == "live",
+            Execution.created_at >= start_at,
+            Execution.created_at < end_at,
+        )
+        .order_by(Execution.created_at.asc(), Execution.id.asc())
+    )
+    return [(execution_row, order_row) for execution_row, order_row in session.execute(statement)]
+
+
+def _execution_commission_asset(execution_row: Execution) -> str:
+    payload = _as_dict(execution_row.payload)
+    asset = execution_row.commission_asset or payload.get("commissionAsset") or payload.get("commission_asset") or "USDT"
+    return str(asset or "USDT").upper()
+
+
+def _funding_rows_for_range(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> list[AccountLedgerEntry]:
+    return list(
+        session.scalars(
+            select(AccountLedgerEntry)
+            .where(
+                AccountLedgerEntry.entry_type == "funding",
+                AccountLedgerEntry.occurred_at >= start_at,
+                AccountLedgerEntry.occurred_at < end_at,
+            )
+            .order_by(AccountLedgerEntry.occurred_at.asc(), AccountLedgerEntry.id.asc())
+        )
+    )
+
+
+def _analytics_slippage_metrics(
+    execution_rows: Sequence[tuple[Execution, Order]],
+) -> tuple[float | None, float | None, str, int]:
+    if not execution_rows:
+        return None, None, "UNKNOWN", 0
+
+    signed_weighted_sum = 0.0
+    adverse_weighted_sum = 0.0
+    signed_weight = 0.0
+    missing_count = 0
+    for execution_row, order_row in execution_rows:
+        signed_bps = _execution_signed_slippage_bps(execution_row, order_row)
+        if signed_bps is None:
+            missing_count += 1
+            continue
+        weight = abs(_as_float(execution_row.fill_quantity, default=0.0)) or 1.0
+        signed_weighted_sum += signed_bps * weight
+        adverse_weighted_sum += max(signed_bps, 0.0) * weight
+        signed_weight += weight
+
+    if signed_weight <= 0:
+        return None, None, "INCOMPLETE", missing_count
+    status = "COMPLETE" if missing_count == 0 else "INCOMPLETE"
+    return signed_weighted_sum / signed_weight, adverse_weighted_sum / signed_weight, status, missing_count
+
+
+def _analytics_cost_summary_for_range(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> tuple[AnalyticsCostBreakdownSummary, str, list[str]]:
+    execution_rows, funding_rows = _analytics_cost_source_rows_for_range(session, start_at=start_at, end_at=end_at)
+    return _analytics_cost_summary_from_rows(execution_rows=execution_rows, funding_rows=funding_rows)
+
+
+def _analytics_cost_source_rows_for_range(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> tuple[list[tuple[Execution, Order]], list[AccountLedgerEntry]]:
+    return (
+        _live_execution_rows_for_range(session, start_at=start_at, end_at=end_at),
+        _funding_rows_for_range(session, start_at=start_at, end_at=end_at),
+    )
+
+
+def _analytics_cost_summary_from_rows(
+    *,
+    execution_rows: Sequence[tuple[Execution, Order]],
+    funding_rows: Sequence[AccountLedgerEntry],
+) -> tuple[AnalyticsCostBreakdownSummary, str, list[str]]:
+    warnings: list[str] = []
+
+    gross_pnl = sum(_as_float(execution_row.realized_pnl, default=0.0) for execution_row, _order_row in execution_rows)
+    fee = 0.0
+    skipped_fee_assets: set[str] = set()
+    for execution_row, _order_row in execution_rows:
+        asset = _execution_commission_asset(execution_row)
+        if asset != "USDT":
+            skipped_fee_assets.add(asset)
+            continue
+        fee += abs(_as_float(execution_row.fee_paid, default=0.0))
+
+    funding = 0.0
+    skipped_funding_assets: set[str] = set()
+    for funding_row in funding_rows:
+        asset = str(funding_row.asset or "USDT").upper()
+        if asset != "USDT":
+            skipped_funding_assets.add(asset)
+            continue
+        funding += _as_float(funding_row.amount, default=0.0)
+
+    signed_slippage_bps, adverse_slippage_bps, slippage_status, _missing_slippage_count = _analytics_slippage_metrics(
+        execution_rows
+    )
+    total_cost = fee + max(-funding, 0.0)
+    fee_ratio_pct = (fee / gross_pnl) * 100.0 if gross_pnl > 0 else None
+    total_cost_ratio_pct = (total_cost / gross_pnl) * 100.0 if gross_pnl > 0 else None
+
+    for asset in sorted(skipped_fee_assets):
+        warnings.append(f"fee_asset_conversion_unavailable:{asset}")
+    for asset in sorted(skipped_funding_assets):
+        warnings.append(f"funding_asset_conversion_unavailable:{asset}")
+
+    return (
+        AnalyticsCostBreakdownSummary(
+            net_pnl_usdt=gross_pnl - fee + funding,
+            gross_pnl_usdt=gross_pnl,
+            fee_usdt=fee,
+            funding_usdt=funding,
+            total_cost_usdt=total_cost,
+            fee_ratio_pct=fee_ratio_pct,
+            total_cost_ratio_pct=total_cost_ratio_pct,
+            signed_slippage_bps=signed_slippage_bps,
+            adverse_slippage_bps=adverse_slippage_bps,
+        ),
+        slippage_status,
+        warnings,
+    )
+
+
+def _latest_settings_row(session: Session) -> Setting | None:
+    return session.scalar(select(Setting).order_by(Setting.id.asc()).limit(1))
+
+
+def _analytics_funding_sync_status(settings_row: Setting | None) -> str:
+    if settings_row is None:
+        return "UNKNOWN"
+    account_sync = _as_dict(build_sync_freshness_summary(settings_row).get("account"))
+    status = str(account_sync.get("status") or "unknown").lower()
+    if status == "synced":
+        return "COMPLETE"
+    if status == "stale":
+        return "STALE"
+    if status == "unknown":
+        return "UNKNOWN"
+    if status in {"failed", "incomplete", "skipped"}:
+        return "INCOMPLETE"
+    return status.upper()
+
+
+def _position_ids_for_cost_period(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> list[int]:
+    position_ids: set[int] = set(
+        session.scalars(
+            select(Position.id).where(
+                Position.mode == "live",
+                Position.closed_at >= start_at,
+                Position.closed_at < end_at,
+            )
+        )
+    )
+    position_ids.update(
+        row_id
+        for row_id in session.scalars(
+            select(Order.position_id).where(
+                Order.mode == "live",
+                Order.position_id.is_not(None),
+                Order.created_at >= start_at,
+                Order.created_at < end_at,
+            )
+        )
+        if row_id is not None
+    )
+    position_ids.update(
+        row_id
+        for row_id in session.scalars(
+            select(Execution.position_id).where(
+                Execution.position_id.is_not(None),
+                Execution.created_at >= start_at,
+                Execution.created_at < end_at,
+            )
+        )
+        if row_id is not None
+    )
+    return sorted(position_ids)
+
+
+def _missing_close_execution_count_for_range(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> int:
+    position_ids = _position_ids_for_cost_period(session, start_at=start_at, end_at=end_at)
+    if not position_ids:
+        return 0
+
+    positions_by_id = {
+        row.id: row
+        for row in session.scalars(select(Position).where(Position.id.in_(position_ids)))
+    }
+    position_orders = list(
+        session.scalars(
+            select(Order)
+            .where(Order.position_id.in_(position_ids), Order.mode == "live")
+            .order_by(Order.created_at.asc(), Order.id.asc())
+        )
+    )
+    orders_by_position: dict[int, list[Order]] = defaultdict(list)
+    order_ids: list[int] = []
+    for order_row in position_orders:
+        if order_row.position_id is not None:
+            orders_by_position[order_row.position_id].append(order_row)
+        if order_row.id is not None:
+            order_ids.append(order_row.id)
+
+    execution_filters = [Execution.position_id.in_(position_ids)]
+    if order_ids:
+        execution_filters.append(Execution.order_id.in_(order_ids))
+    execution_statement = (
+        select(Execution, Order)
+        .outerjoin(Order, Order.id == Execution.order_id)
+        .where(or_(*execution_filters))
+        .order_by(Execution.created_at.asc(), Execution.id.asc())
+    )
+    executions_by_position: dict[int, list[tuple[Execution, Order | None]]] = defaultdict(list)
+    for execution_row, order_row in session.execute(execution_statement):
+        position_id = execution_row.position_id or (order_row.position_id if order_row is not None else None)
+        if position_id is not None:
+            executions_by_position[position_id].append((execution_row, order_row))
+
+    missing_count = 0
+    for position_id in position_ids:
+        payload = _close_execution_sync_payload(
+            position=positions_by_id.get(position_id),
+            orders=orders_by_position.get(position_id, []),
+            execution_rows=executions_by_position.get(position_id, []),
+        )
+        if bool(payload.get("missing_close_execution")):
+            missing_count += 1
+    return missing_count
+
+
+def _analytics_data_quality(
+    session: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+    slippage_status: str,
+) -> AnalyticsCostBreakdownDataQuality:
+    missing_close_execution_count = _missing_close_execution_count_for_range(session, start_at=start_at, end_at=end_at)
+    return AnalyticsCostBreakdownDataQuality(
+        realized_pnl_confirmed=missing_close_execution_count == 0,
+        execution_sync_status="INCOMPLETE" if missing_close_execution_count > 0 else "COMPLETE",
+        funding_sync_status=_analytics_funding_sync_status(_latest_settings_row(session)),
+        slippage_data_status=slippage_status,
+        missing_close_execution_count=missing_close_execution_count,
+        slippage_weighting="quantity",
+    )
+
+
+def _analytics_cost_bucket_from_summary(
+    *,
+    label: str,
+    start_at: datetime,
+    end_at: datetime,
+    summary: AnalyticsCostBreakdownSummary,
+) -> AnalyticsCostBreakdownBucket:
+    return (
+        AnalyticsCostBreakdownBucket(
+            label=label,
+            start_at=start_at,
+            end_at=end_at,
+            net_pnl_usdt=summary.net_pnl_usdt,
+            gross_pnl_usdt=summary.gross_pnl_usdt,
+            fee_usdt=summary.fee_usdt,
+            funding_usdt=summary.funding_usdt,
+            total_cost_usdt=summary.total_cost_usdt,
+            fee_ratio_pct=summary.fee_ratio_pct,
+            total_cost_ratio_pct=summary.total_cost_ratio_pct,
+            signed_slippage_bps=summary.signed_slippage_bps,
+            adverse_slippage_bps=summary.adverse_slippage_bps,
+        )
+    )
+
+
+def _append_unique_warnings(target: list[str], warnings: Sequence[str]) -> None:
+    for warning in warnings:
+        if warning not in target:
+            target.append(warning)
+
+
+def _normalize_analytics_row_timestamp(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return _to_utc_naive(value)
+    return value
+
+
+def _analytics_bucket_label_for_timestamp(
+    value: datetime | None,
+    bucket_bounds: Sequence[tuple[str, datetime, datetime]],
+) -> str | None:
+    timestamp = _normalize_analytics_row_timestamp(value)
+    if timestamp is None:
+        return None
+    for label, start_at, end_at in bucket_bounds:
+        if start_at <= timestamp < end_at:
+            return label
+    return None
+
+
+def _analytics_cost_rows_by_bucket(
+    *,
+    execution_rows: Sequence[tuple[Execution, Order]],
+    funding_rows: Sequence[AccountLedgerEntry],
+    bucket_bounds: Sequence[tuple[str, datetime, datetime]],
+) -> tuple[dict[str, list[tuple[Execution, Order]]], dict[str, list[AccountLedgerEntry]]]:
+    execution_rows_by_bucket: dict[str, list[tuple[Execution, Order]]] = {
+        label: [] for label, _start_at, _end_at in bucket_bounds
+    }
+    funding_rows_by_bucket: dict[str, list[AccountLedgerEntry]] = {
+        label: [] for label, _start_at, _end_at in bucket_bounds
+    }
+
+    for execution_row, order_row in execution_rows:
+        label = _analytics_bucket_label_for_timestamp(execution_row.created_at, bucket_bounds)
+        if label is not None:
+            execution_rows_by_bucket[label].append((execution_row, order_row))
+
+    for funding_row in funding_rows:
+        label = _analytics_bucket_label_for_timestamp(funding_row.occurred_at, bucket_bounds)
+        if label is not None:
+            funding_rows_by_bucket[label].append(funding_row)
+
+    return execution_rows_by_bucket, funding_rows_by_bucket
+
+
+def get_analytics_cost_breakdown(
+    session: Session,
+    *,
+    period: str = "today",
+    year: int | None = None,
+    month: int | None = None,
+) -> AnalyticsCostBreakdownResponse:
+    normalized_period = _normalize_cost_breakdown_period(period)
+    start_at, end_at = _analytics_period_bounds(period=normalized_period, year=year, month=month)
+    start_at_utc = _to_utc_naive(start_at)
+    end_at_utc = _to_utc_naive(end_at)
+    execution_rows, funding_rows = _analytics_cost_source_rows_for_range(
+        session, start_at=start_at_utc, end_at=end_at_utc
+    )
+    summary, slippage_status, warnings = _analytics_cost_summary_from_rows(
+        execution_rows=execution_rows,
+        funding_rows=funding_rows,
+    )
+    data_quality = _analytics_data_quality(
+        session,
+        start_at=start_at_utc,
+        end_at=end_at_utc,
+        slippage_status=slippage_status,
+    )
+    if data_quality.missing_close_execution_count > 0:
+        warnings.append(f"missing_close_execution_count:{data_quality.missing_close_execution_count}")
+    if data_quality.funding_sync_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
+        warnings.append(f"funding_sync_status:{data_quality.funding_sync_status}")
+    if data_quality.slippage_data_status in {"INCOMPLETE", "UNKNOWN"}:
+        warnings.append(f"slippage_data_status:{data_quality.slippage_data_status}")
+
+    bucket_bounds = _analytics_bucket_bounds(
+        period=normalized_period,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    bucket_bounds_utc = [
+        (label, _to_utc_naive(bucket_start_at), _to_utc_naive(bucket_end_at))
+        for label, bucket_start_at, bucket_end_at in bucket_bounds
+    ]
+    execution_rows_by_bucket, funding_rows_by_bucket = _analytics_cost_rows_by_bucket(
+        execution_rows=execution_rows,
+        funding_rows=funding_rows,
+        bucket_bounds=bucket_bounds_utc,
+    )
+
+    buckets: list[AnalyticsCostBreakdownBucket] = []
+    for label, bucket_start_at, bucket_end_at in bucket_bounds:
+        bucket_summary, _bucket_slippage_status, bucket_warnings = _analytics_cost_summary_from_rows(
+            execution_rows=execution_rows_by_bucket.get(label, []),
+            funding_rows=funding_rows_by_bucket.get(label, []),
+        )
+        buckets.append(
+            _analytics_cost_bucket_from_summary(
+                label=label,
+                start_at=bucket_start_at,
+                end_at=bucket_end_at,
+                summary=bucket_summary,
+            )
+        )
+        _append_unique_warnings(warnings, bucket_warnings)
+
+    deduped_warnings: list[str] = []
+    _append_unique_warnings(deduped_warnings, warnings)
+    return AnalyticsCostBreakdownResponse(
+        period=normalized_period,  # type: ignore[arg-type]
+        timezone=ANALYTICS_COST_BREAKDOWN_TIMEZONE,
+        start_at=start_at,
+        end_at=end_at,
+        summary=summary,
+        buckets=buckets,
+        data_quality=data_quality,
+        warnings=deduped_warnings,
     )
 
 
@@ -1601,7 +2140,7 @@ def _compact_risk_debug_payload(value: object) -> dict[str, Any]:
 def _compact_decision_reference(reference: DecisionReferencePayload) -> DecisionReferencePayload:
     compact_market_freshness = _compact_dict(
         reference.market_freshness_summary,
-        allowed_keys=("symbol", "timeframe", "status", "snapshot_at", "stale", "incomplete"),
+        allowed_keys=("symbol", "timeframe", "source", "source_status", "status", "snapshot_at", "stale", "incomplete"),
     )
     return reference.model_copy(
         update={
@@ -2046,6 +2585,162 @@ def get_positions(session: Session, limit: int = 50) -> list[dict[str, object]]:
     return payloads
 
 
+def _default_close_execution_sync_payload() -> dict[str, object]:
+    return {
+        "pnl_source": "LOCAL_EXECUTIONS",
+        "close_execution_sync_status": "UNKNOWN",
+        "realized_pnl_confirmed": True,
+        "missing_close_execution": False,
+        "fee_source": "LOCAL_EXECUTIONS",
+        "fee_confirmed": True,
+        "warning_message": None,
+        "blocked_reason": None,
+        "fee_warning_message": None,
+    }
+
+
+def _protective_backfill_status(order_row: Order) -> str | None:
+    metadata = _as_dict(order_row.metadata_json)
+    state = _as_dict(metadata.get("protective_close_fill_backfill"))
+    status = str(state.get("status") or "").upper()
+    return status or None
+
+
+def _is_finished_protective_order(order_row: Order) -> bool:
+    if str(order_row.order_type or "").lower() not in PROTECTIVE_ORDER_TYPES:
+        return False
+    exchange_status = str(order_row.exchange_status or "").upper()
+    local_status = str(order_row.status or "").lower()
+    return exchange_status == "FINISHED" or local_status == "filled"
+
+
+def _execution_uses_exchange_pnl(execution_row: Execution) -> bool:
+    payload = _as_dict(execution_row.payload)
+    trade_payload = _as_dict(payload.get("trade"))
+    return bool(
+        str(payload.get("source") or "").upper() == "EXCHANGE_BACKFILL"
+        or str(payload.get("exchange") or "").upper() == "BINANCE"
+        or payload.get("realized_pnl_source") == "binance_user_trades"
+        or "realizedPnl" in trade_payload
+    )
+
+
+def _close_execution_sync_payload(
+    *,
+    position: Position | None,
+    orders: Sequence[Order],
+    execution_rows: Sequence[tuple[Execution, Order | None]],
+) -> dict[str, object]:
+    payload = _default_close_execution_sync_payload()
+    entry_execution_exists = any(order_row is not None and _is_entry_order(order_row) for _execution, order_row in execution_rows)
+    close_executions = [
+        execution_row
+        for execution_row, order_row in execution_rows
+        if order_row is not None and _is_close_order(order_row)
+    ]
+    close_execution_exists = bool(close_executions)
+    position_closed = bool(position is not None and (position.status != "open" or _as_float(position.quantity) <= 0))
+    protective_finished = any(_is_finished_protective_order(order_row) for order_row in orders)
+    needs_close_execution = entry_execution_exists and (position_closed or protective_finished)
+    if not entry_execution_exists:
+        return payload
+    if close_execution_exists:
+        pnl_source = "EXCHANGE" if any(_execution_uses_exchange_pnl(row) for row in close_executions) else "LOCAL_EXECUTIONS"
+        return {
+            **payload,
+            "pnl_source": pnl_source,
+            "close_execution_sync_status": "COMPLETE",
+            "realized_pnl_confirmed": True,
+            "fee_confirmed": True,
+        }
+    if not needs_close_execution:
+        return payload
+
+    reason_codes = {
+        code
+        for order_row in orders
+        for code in _as_string_list(order_row.reason_codes)
+    }
+    backfill_statuses = {_protective_backfill_status(order_row) for order_row in orders}
+    if (
+        PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE in reason_codes
+        or "FAILED" in backfill_statuses
+    ):
+        status = "FAILED"
+        warning_message = "정산/청산 체결 동기화 실패"
+    elif (
+        PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE in reason_codes
+        or "PENDING" in backfill_statuses
+    ):
+        status = "PENDING"
+        warning_message = "정산/청산 체결 동기화 미완료"
+    else:
+        status = "MISSING"
+        warning_message = "청산 체결 누락: 거래소 손익 미반영"
+    return {
+        **payload,
+        "pnl_source": "UNKNOWN",
+        "close_execution_sync_status": status,
+        "realized_pnl_confirmed": False,
+        "missing_close_execution": True,
+        "fee_confirmed": False,
+        "warning_message": warning_message,
+        "blocked_reason": warning_message,
+        "fee_warning_message": "청산 수수료 미반영",
+    }
+
+
+def _close_execution_sync_payloads_by_position(
+    session: Session,
+    rows: Sequence[Order],
+) -> dict[int, dict[str, object]]:
+    position_ids = sorted({row.position_id for row in rows if row.position_id is not None})
+    if not position_ids:
+        return {}
+    positions_by_id = {
+        row.id: row
+        for row in session.scalars(select(Position).where(Position.id.in_(position_ids)))
+    }
+    position_orders = list(
+        session.scalars(
+            select(Order)
+            .where(Order.position_id.in_(position_ids), Order.mode == "live")
+            .order_by(Order.created_at.asc(), Order.id.asc())
+        )
+    )
+    orders_by_position: dict[int, list[Order]] = defaultdict(list)
+    order_ids: list[int] = []
+    for order_row in position_orders:
+        if order_row.position_id is not None:
+            orders_by_position[order_row.position_id].append(order_row)
+        if order_row.id is not None:
+            order_ids.append(order_row.id)
+    execution_statement = (
+        select(Execution, Order)
+        .outerjoin(Order, Order.id == Execution.order_id)
+        .where(
+            or_(
+                Execution.position_id.in_(position_ids),
+                Execution.order_id.in_(order_ids),
+            )
+        )
+        .order_by(Execution.created_at.asc(), Execution.id.asc())
+    )
+    executions_by_position: dict[int, list[tuple[Execution, Order | None]]] = defaultdict(list)
+    for execution_row, order_row in session.execute(execution_statement):
+        position_id = execution_row.position_id or (order_row.position_id if order_row is not None else None)
+        if position_id is not None:
+            executions_by_position[position_id].append((execution_row, order_row))
+    return {
+        position_id: _close_execution_sync_payload(
+            position=positions_by_id.get(position_id),
+            orders=orders_by_position.get(position_id, []),
+            execution_rows=executions_by_position.get(position_id, []),
+        )
+        for position_id in position_ids
+    }
+
+
 def get_orders(
     session: Session,
     limit: int = 50,
@@ -2073,7 +2768,14 @@ def get_orders(
             )
         )
     statement = statement.order_by(desc(Order.created_at)).limit(limit)
-    return _serialize_model_list(list(session.scalars(statement)))
+    rows = list(session.scalars(statement))
+    close_sync_by_position = _close_execution_sync_payloads_by_position(session, rows)
+    payloads = _serialize_model_list(rows)
+    for payload, row in zip(payloads, rows, strict=False):
+        payload.update(
+            close_sync_by_position.get(row.position_id, _default_close_execution_sync_payload())
+        )
+    return payloads
 
 
 def get_executions(
@@ -3406,7 +4108,8 @@ def _latest_rows_by_extracted_symbol(
     limited_rows = list(session.scalars(statement.limit(OPERATOR_RECENT_ROW_SCAN_LIMIT)))
     if consume(limited_rows) or len(limited_rows) < OPERATOR_RECENT_ROW_SCAN_LIMIT:
         return rows
-    consume(list(session.scalars(statement.offset(OPERATOR_RECENT_ROW_SCAN_LIMIT))))
+    fallback_limit = max(OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT, len(symbol_set))
+    consume(list(session.scalars(statement.offset(OPERATOR_RECENT_ROW_SCAN_LIMIT).limit(fallback_limit))))
     return rows
 
 

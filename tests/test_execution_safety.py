@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import httpx
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from trading_mvp.models import AuditEvent, Execution, Order, Position, SystemHealthEvent
 from trading_mvp.schemas import (
@@ -1447,6 +1448,30 @@ class StreamPrimarySyncClient:
             "totalUnrealizedProfit": "0.0",
             "totalMarginBalance": "100.0",
         }
+
+
+class SettingsFlushProbeSyncClient(StreamPrimarySyncClient):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    def get_position_mode(self):
+        self.events.append("get_position_mode")
+        return {"mode": "one_way", "dual_side_position": False}
+
+    def get_open_orders(self, symbol: str):
+        del symbol
+        self.events.append("get_open_orders")
+        return []
+
+    def get_position_information(self, symbol: str):
+        del symbol
+        self.events.append("get_position_information")
+        return []
+
+    def get_account_info(self):
+        self.events.append("get_account_info")
+        return super().get_account_info()
 
 
 class RestFallbackSyncClient(StreamPrimarySyncClient):
@@ -3032,6 +3057,36 @@ def test_sync_live_state_dedupes_stream_and_rest_fallback_trade_by_external_trad
     assert executions[0].fill_quantity == pytest.approx(0.01)
     assert executions[0].fee_paid == pytest.approx(0.03)
     assert executions[0].realized_pnl == pytest.approx(1.2)
+
+
+def test_sync_live_state_defers_settings_flush_until_exchange_sync_io_finishes(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    events: list[str] = []
+    client = SettingsFlushProbeSyncClient(events)
+
+    def _poll_without_flush_state(session, row, **kwargs):
+        del session, row
+        events.append(f"poll_flush_state={kwargs.get('flush_state')}")
+        return _connected_user_stream_payload()
+
+    def _capture_settings_update(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("UPDATE SETTINGS"):
+            events.append("update_settings")
+
+    bind = db_session.get_bind()
+    sqlalchemy_event.listen(bind, "before_cursor_execute", _capture_settings_update)
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr("trading_mvp.services.execution.poll_live_user_stream", _poll_without_flush_state)
+    try:
+        result = sync_live_state(db_session, settings_row, symbol="BTCUSDT")
+    finally:
+        sqlalchemy_event.remove(bind, "before_cursor_execute", _capture_settings_update)
+
+    assert result["symbols"] == ["BTCUSDT"]
+    assert "poll_flush_state=False" in events
+    assert "update_settings" in events
+    assert events.index("get_account_info") < events.index("update_settings")
 
 
 def test_sync_live_state_skips_rest_order_lookup_when_user_stream_is_primary(monkeypatch, db_session) -> None:

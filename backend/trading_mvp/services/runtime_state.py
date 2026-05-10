@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any, Literal
 
@@ -9,6 +9,12 @@ from sqlalchemy.orm import object_session
 from sqlalchemy.orm.attributes import flag_modified
 
 from trading_mvp.models import Setting
+from trading_mvp.services.binance_market_stream import (
+    MARKET_STREAM_DETAIL_KEY as MARKET_STREAM_RUNTIME_DETAIL_KEY,
+)
+from trading_mvp.services.binance_market_stream import (
+    build_market_stream_state,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 OperatingState = Literal[
@@ -88,6 +94,7 @@ PROTECTION_RECOVERY_THRESHOLD = 2
 SYNC_STATE_DETAIL_KEY = "exchange_sync"
 EXECUTION_GUARD_DETAIL_KEY = "execution_guard"
 USER_STREAM_DETAIL_KEY = "user_stream"
+MARKET_STREAM_DETAIL_KEY = MARKET_STREAM_RUNTIME_DETAIL_KEY
 RECONCILIATION_DETAIL_KEY = "reconciliation"
 CANDIDATE_SELECTION_DETAIL_KEY = "candidate_selection"
 DRAWDOWN_STATE_DETAIL_KEY = "drawdown_state"
@@ -413,6 +420,17 @@ def get_user_stream_detail(settings_row: Setting) -> dict[str, Any]:
     }
 
 
+def get_market_stream_detail(settings_row: Setting) -> dict[str, Any]:
+    detail = get_runtime_detail(settings_row)
+    return build_market_stream_state(_as_dict(detail.get(MARKET_STREAM_DETAIL_KEY)))
+
+
+def replace_market_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
+    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail[MARKET_STREAM_DETAIL_KEY] = build_market_stream_state(payload)
+    _write_runtime_detail(settings_row, runtime_detail)
+
+
 def set_user_stream_detail(
     settings_row: Setting,
     *,
@@ -503,10 +521,11 @@ def should_use_rest_order_reconciliation(
     *,
     active_order_count: int,
     now: datetime | None = None,
+    user_stream_summary: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     if active_order_count <= 0:
         return False, "NO_ACTIVE_LIVE_ORDERS"
-    summary = get_user_stream_detail(settings_row)
+    summary = dict(user_stream_summary) if user_stream_summary is not None else get_user_stream_detail(settings_row)
     if str(summary.get("status") or "") != "connected":
         return True, "USER_STREAM_UNAVAILABLE"
     if not bool(summary.get("heartbeat_ok", False)):
@@ -1482,6 +1501,7 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
     recovery = get_protection_recovery_detail(settings_row)
     sync_freshness_summary = build_sync_freshness_summary(settings_row)
     user_stream_summary = get_user_stream_detail(settings_row)
+    market_stream_summary = get_market_stream_detail(settings_row)
     reconciliation_summary = get_reconciliation_detail(settings_row)
     binance_rest_summary = get_binance_rest_detail(
         settings_row,
@@ -1528,6 +1548,7 @@ def summarize_runtime_state(settings_row: Setting) -> dict[str, Any]:
             else None
         ),
         "user_stream_summary": user_stream_summary,
+        "market_stream_summary": market_stream_summary,
         "reconciliation_summary": reconciliation_summary,
         "binance_rest_summary": binance_rest_summary,
         "candidate_selection_summary": candidate_selection_summary,

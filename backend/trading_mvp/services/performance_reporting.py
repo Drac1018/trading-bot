@@ -48,7 +48,8 @@ DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
     ("7d", 24 * 7),
     ("30d", 24 * 30),
 )
-SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS = 15.0
+SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS = 120.0
+SIGNAL_PERFORMANCE_PNL_SOURCE_BUCKET_SECONDS = 60
 
 
 @dataclass(slots=True)
@@ -2310,6 +2311,12 @@ def _latest_scalar(session: Session, statement: Any) -> object:
     return session.scalar(statement)
 
 
+def _bucket_source_datetime(value: object, bucket_seconds: int) -> object:
+    if not isinstance(value, datetime) or bucket_seconds <= 0:
+        return value
+    return int(value.timestamp()) // bucket_seconds
+
+
 def _signal_performance_source_key(session: Session) -> tuple[object, ...]:
     safety_event_types = tuple(READINESS_AUDIT_SAFETY_EVENT_TYPES)
     latest_safety_audit = None
@@ -2328,7 +2335,10 @@ def _signal_performance_source_key(session: Session) -> tuple[object, ...]:
         _latest_scalar(session, select(func.max(Order.id))),
         _latest_scalar(session, select(func.max(Execution.id))),
         _latest_scalar(session, select(func.max(AccountLedgerEntry.id))),
-        _latest_scalar(session, select(func.max(PnLSnapshot.created_at))),
+        _bucket_source_datetime(
+            _latest_scalar(session, select(func.max(PnLSnapshot.created_at))),
+            SIGNAL_PERFORMANCE_PNL_SOURCE_BUCKET_SECONDS,
+        ),
         latest_safety_audit,
     )
 

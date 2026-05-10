@@ -754,6 +754,8 @@ staged rollout semantics:
   - `entry_zone_min`, `entry_zone_max`, `invalidation_price`, `max_chase_bps`
   - `idea_ttl_minutes`, `stop_loss`, `take_profit`, `risk_pct_cap`, `leverage_cap`
   - `created_at`, `expires_at`, `idempotency_key`, `metadata`
+  - `expires_at` is stored as UTC-naive. Use `app_utc_now`, `remaining_ttl_seconds`,
+    `expired_by_app_utc_now`, and `expires_at_time_basis=app_utc_naive` for operator TTL checks.
 - `live_execution_ready`
 - `trading_paused`
 - `guard_mode_reason_*`
@@ -1035,6 +1037,9 @@ staged rollout semantics:
 - `reduce / exit / protection / emergency` 계열은 이 trigger 때문에 막지 않습니다.
 
 ### Pending entry plan lifecycle
+
+- `expires_at` is UTC-naive app time. Watcher expiry and smoke checks must compare it against app UTC-naive now, not raw DB local `now()`.
+- PostgreSQL smoke SQL must use `expires_at < timezone('UTC', now())`; do not use bare `expires_at < now()` when the DB timezone may be `Asia/Seoul`.
 
 - 15분 decision cycle은 신규 `long / short` 아이디어를 즉시 주문으로 연결하지 않고, 조건부 진입이면 `PendingEntryPlan`을 `armed` 상태로 저장할 수 있습니다.
 - plan은 `symbol + side` 기준 active 1개만 유지하며, 같은 실행 시도는 `symbol + side + source_decision_run_id + expires_at` 기반 `idempotency_key`로 중복을 억제합니다.

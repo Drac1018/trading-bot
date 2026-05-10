@@ -70,6 +70,7 @@ def _write_runtime_state(
     auto_recovery_active: bool,
     symbol_states: dict[str, dict[str, Any]],
     last_error: str | None = None,
+    flush_state: bool = True,
 ) -> None:
     detail = runtime_detail_for_update(settings_row)
     existing_recovery = dict(detail.get("protection_recovery") or {})
@@ -107,7 +108,8 @@ def _write_runtime_state(
     }
     write_runtime_detail(settings_row, detail)
     session.add(settings_row)
-    session.flush()
+    if flush_state:
+        session.flush()
 
 
 def set_symbol_protection_state(
@@ -123,6 +125,7 @@ def set_symbol_protection_state(
     last_error: str | None = None,
     emergency_action: dict[str, object] | None = None,
     reset_failures: bool = False,
+    flush_state: bool = True,
 ) -> dict[str, Any]:
     current_summary = summarize_runtime_state(settings_row)
     recovery = get_protection_recovery_detail(settings_row)
@@ -167,6 +170,7 @@ def set_symbol_protection_state(
         auto_recovery_active=auto_recovery_active if operating_state != TRADABLE_STATE else False,
         symbol_states=symbol_states,
         last_error=last_error,
+        flush_state=flush_state,
     )
 
     next_summary = summarize_runtime_state(settings_row)
@@ -197,6 +201,7 @@ def clear_symbol_protection_state(
     *,
     symbol: str,
     trigger_source: str,
+    flush_state: bool = True,
 ) -> dict[str, Any]:
     return set_symbol_protection_state(
         session,
@@ -209,6 +214,7 @@ def clear_symbol_protection_state(
         recovery_status="restored",
         last_error=None,
         reset_failures=True,
+        flush_state=flush_state,
     )
 
 

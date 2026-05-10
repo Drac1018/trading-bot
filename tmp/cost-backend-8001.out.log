@@ -1,0 +1,7 @@
+INFO:     127.0.0.1:50977 - "GET /api/analytics/cost-breakdown?period=month&year=2026&month=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50998 - "GET /api/analytics/cost-breakdown?period=month&year=2026&month=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56047 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56048 - "GET /api/settings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56052 - "GET /api/dashboard/operator?view=market HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56056 - "GET /api/dashboard/operator?view=scheduler HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56060 - "GET /api/dashboard/operator?view=risk HTTP/1.1" 200 OK

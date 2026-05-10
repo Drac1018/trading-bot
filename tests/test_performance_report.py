@@ -796,6 +796,29 @@ def test_build_signal_performance_report_reuses_cached_subreport(db_session, mon
     assert second.windows[0].summary.snapshot_net_pnl_estimate == 20.0
 
 
+def test_signal_performance_source_key_buckets_pnl_snapshot_timestamp(db_session) -> None:
+    _seed_performance_rows(db_session)
+    bucket_anchor = utcnow_naive().replace(second=10, microsecond=0)
+    for row in db_session.query(PnLSnapshot):
+        row.created_at = bucket_anchor
+    db_session.flush()
+
+    first_key = performance_reporting._signal_performance_source_key(db_session)
+
+    latest = db_session.scalar(select(PnLSnapshot).order_by(PnLSnapshot.created_at.desc()).limit(1))
+    assert latest is not None
+    latest.created_at = bucket_anchor + timedelta(seconds=20)
+    db_session.flush()
+    same_bucket_key = performance_reporting._signal_performance_source_key(db_session)
+
+    latest.created_at = bucket_anchor + timedelta(seconds=60)
+    db_session.flush()
+    next_bucket_key = performance_reporting._signal_performance_source_key(db_session)
+
+    assert same_bucket_key == first_key
+    assert next_bucket_key != first_key
+
+
 def test_build_signal_performance_report_loads_pnl_snapshots_once(db_session, monkeypatch) -> None:
     _seed_performance_rows(db_session)
     cache_loads: list[object] = []

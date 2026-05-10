@@ -143,6 +143,10 @@ FUNDING_LEDGER_SYNC_REASON_CODE = "FUNDING_LEDGER_SYNC_FAILED"
 ROLLOUT_MODE_SHADOW_REASON_CODE = "ROLLOUT_MODE_SHADOW"
 ROLLOUT_MODE_LIVE_DRY_RUN_REASON_CODE = "ROLLOUT_MODE_LIVE_DRY_RUN"
 CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE = "POSITION_CLOSED_PROTECTIVE_ORDER_ORPHANED"
+PROTECTIVE_CLOSE_FILL_BACKFILL_SOURCE = "EXCHANGE_BACKFILL"
+PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE = "PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING"
+PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE = "PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED"
+PROTECTIVE_CLOSE_FILL_BACKFILL_CLOSED_STATUSES = {"FINISHED", "FILLED", "CLOSED"}
 
 _ACTIVE_SYMBOL_EXECUTION_LOCKS: dict[str, dict[str, object]] = {}
 _ACTIVE_SYMBOL_EXECUTION_LOCKS_GUARD = Lock()
@@ -775,12 +779,14 @@ def _ensure_user_stream_registration(
     settings_row: Setting,
     *,
     client: BinanceClient,
+    flush_state: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     listener = BinanceUserStreamListener(client)
     state, issues = listener.ensure_registration(get_user_stream_detail(settings_row))
     replace_user_stream_detail(settings_row, state)
     session.add(settings_row)
-    session.flush()
+    if flush_state:
+        session.flush()
     return get_user_stream_detail(settings_row), [dict(item) for item in issues if isinstance(item, dict)]
 
 
@@ -1114,6 +1120,7 @@ def _drain_user_stream_events(
     client: BinanceClient,
     max_events: int = 8,
     idle_timeout_seconds: float = 0.15,
+    flush_state: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     listener = BinanceUserStreamListener(client)
 
@@ -1133,7 +1140,8 @@ def _drain_user_stream_events(
     state = build_user_stream_state(collected.get("state"))
     _persist_user_stream_state(settings_row, state)
     session.add(settings_row)
-    session.flush()
+    if flush_state:
+        session.flush()
 
     normalized_events = [
         dict(item)
@@ -1157,6 +1165,7 @@ def poll_live_user_stream(
     client: BinanceClient | None = None,
     max_events: int = 8,
     idle_timeout_seconds: float = 1.0,
+    flush_state: bool = True,
 ) -> dict[str, object]:
     stream_client = client
     if stream_client is None:
@@ -1171,7 +1180,8 @@ def poll_live_user_stream(
                 stream_source="rest_polling_fallback",
             )
             session.add(settings_row)
-            session.flush()
+            if flush_state:
+                session.flush()
             user_stream_summary = get_user_stream_detail(settings_row)
             return {
                 "user_stream_summary": user_stream_summary,
@@ -1182,7 +1192,12 @@ def poll_live_user_stream(
                 "stream_events": [],
             }
         stream_client = _build_client(settings_row)
-    user_stream_summary, stream_issues = _ensure_user_stream_registration(session, settings_row, client=stream_client)
+    user_stream_summary, stream_issues = _ensure_user_stream_registration(
+        session,
+        settings_row,
+        client=stream_client,
+        flush_state=flush_state,
+    )
     stream_events: list[dict[str, Any]] = []
     if str(user_stream_summary.get("status") or "") != "degraded":
         try:
@@ -1192,6 +1207,7 @@ def poll_live_user_stream(
                 client=stream_client,
                 max_events=max_events,
                 idle_timeout_seconds=idle_timeout_seconds,
+                flush_state=flush_state,
             )
             stream_issues.extend(drain_issues)
         except Exception as exc:
@@ -1208,7 +1224,8 @@ def poll_live_user_stream(
                 stream_source=USER_STREAM_FALLBACK_SOURCE,
             )
             session.add(settings_row)
-            session.flush()
+            if flush_state:
+                session.flush()
             stream_issues.append(
                 {
                     "severity": "warning",
@@ -2033,19 +2050,20 @@ def reconcile_closed_position_protective_orders(
     observed_at = observed_at or utcnow_naive()
     remote_order_ids, remote_client_order_ids = _open_order_identity_sets(open_orders)
     has_remote_open_orders = bool(open_orders)
-    candidates = list(
-        session.scalars(
-            select(Order)
-            .join(Position, Order.position_id == Position.id)
-            .where(
-                Order.mode == "live",
-                Order.symbol == symbol.upper(),
-                Order.status.notin_(FINAL_ORDER_STATUSES),
-                or_(Order.reduce_only.is_(True), Order.close_only.is_(True)),
-                or_(Position.status != "open", Position.quantity <= 0),
+    with session.no_autoflush:
+        candidates = list(
+            session.scalars(
+                select(Order)
+                .join(Position, Order.position_id == Position.id)
+                .where(
+                    Order.mode == "live",
+                    Order.symbol == symbol.upper(),
+                    Order.status.notin_(FINAL_ORDER_STATUSES),
+                    or_(Order.reduce_only.is_(True), Order.close_only.is_(True)),
+                    or_(Position.status != "open", Position.quantity <= 0),
+                )
             )
         )
-    )
     reconciled: list[Order] = []
     for order in candidates:
         if not _is_protective_order_type_name(order.order_type):
@@ -2226,6 +2244,7 @@ def _record_sync_success(
     scope: str,
     detail: dict[str, object] | None = None,
     status: str = "synced",
+    flush_state: bool = True,
 ) -> None:
     mark_sync_success(settings_row, scope=scope, detail=detail, status=status)
     record_binance_rest_success(
@@ -2234,7 +2253,8 @@ def _record_sync_success(
         detail={"scope": scope},
     )
     session.add(settings_row)
-    session.flush()
+    if flush_state:
+        session.flush()
 
 
 def _record_sync_issue(
@@ -2285,8 +2305,10 @@ def _record_user_stream_order_sync_fallback(
     *,
     symbol: str,
     reason_code: str,
+    user_stream_summary: dict[str, Any] | None = None,
+    flush_state: bool = True,
 ) -> dict[str, Any]:
-    user_stream_summary = get_user_stream_detail(settings_row)
+    user_stream_summary = dict(user_stream_summary) if user_stream_summary is not None else get_user_stream_detail(settings_row)
     if str(user_stream_summary.get("status") or "") == "connected":
         set_user_stream_detail(
             settings_row,
@@ -2297,7 +2319,8 @@ def _record_user_stream_order_sync_fallback(
             last_disconnected_at=utcnow_naive(),
         )
         session.add(settings_row)
-        session.flush()
+        if flush_state:
+            session.flush()
         user_stream_summary = get_user_stream_detail(settings_row)
     payload = {
         "symbol": symbol,
@@ -2824,7 +2847,17 @@ def _entry_execution_type_for_plan(
     return ENTRY_EXECUTION_TYPE_UNKNOWN
 
 
-def _record_live_trades(session: Session, order: Order, trades: list[dict[str, object]]) -> tuple[float, float]:
+def _record_live_trades(
+    session: Session,
+    order: Order,
+    trades: list[dict[str, object]],
+    *,
+    source: str = "LIVE_ORDER_TRADE_LOOKUP",
+    exchange_order: dict[str, object] | None = None,
+    exchange_order_id: str | None = None,
+    client_order_id: str | None = None,
+    linked_protective_order_id: int | None = None,
+) -> tuple[float, float]:
     fee_total = 0.0
     realized_total = 0.0
     for trade in trades:
@@ -2844,6 +2877,39 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
             requested_price=order.requested_price,
             fill_price=fill_price,
         )
+        trade_order_id = str(trade.get("orderId") or exchange_order_id or order.external_order_id or "") or None
+        trade_client_order_id = (
+            str(trade.get("clientOrderId") or client_order_id or order.client_order_id or "") or None
+        )
+        execution_payload = {
+            "exchange": "BINANCE",
+            "source": source,
+            "trade": trade,
+            "trade_id": trade_id,
+            "exchange_trade_id": trade_id,
+            "order_id": order.id,
+            "local_order_id": order.id,
+            "exchange_order_id": trade_order_id,
+            "client_order_id": trade_client_order_id,
+            "side": trade.get("side") or order.side,
+            "position_side": trade.get("positionSide") or trade.get("position_side"),
+            "trade_time": trade.get("time"),
+            "is_maker": trade.get("maker"),
+            "maker": trade.get("maker"),
+            "buyer": trade.get("buyer"),
+            "requested_price": order.requested_price,
+            "requested_quantity": order.requested_quantity,
+            "order_type": order.order_type,
+            "execution_policy": metadata.get("execution_policy"),
+            "entry_execution_type": metadata.get("entry_execution_type", ENTRY_EXECUTION_TYPE_UNKNOWN),
+            "signed_slippage_pct": signed_slippage_bps / 10000.0,
+            "signed_slippage_bps": signed_slippage_bps,
+            "realized_pnl_source": "binance_user_trades" if "realizedPnl" in trade else "local_default",
+        }
+        if exchange_order is not None:
+            execution_payload["exchange_order"] = exchange_order
+        if linked_protective_order_id is not None:
+            execution_payload["linked_protective_order_id"] = linked_protective_order_id
         execution = Execution(
             order_id=order.id,
             position_id=order.position_id,
@@ -2856,16 +2922,7 @@ def _record_live_trades(session: Session, order: Order, trades: list[dict[str, o
             commission_asset=str(trade.get("commissionAsset", "")) or None,
             slippage_pct=abs(fill_price - order.requested_price) / max(order.requested_price, 1.0),
             realized_pnl=realized_pnl,
-            payload={
-                "trade": trade,
-                "requested_price": order.requested_price,
-                "requested_quantity": order.requested_quantity,
-                "order_type": order.order_type,
-                "execution_policy": metadata.get("execution_policy"),
-                "entry_execution_type": metadata.get("entry_execution_type", ENTRY_EXECUTION_TYPE_UNKNOWN),
-                "signed_slippage_pct": signed_slippage_bps / 10000.0,
-                "signed_slippage_bps": signed_slippage_bps,
-            },
+            payload=execution_payload,
         )
         session.add(execution)
         fee_total += fee_paid
@@ -2978,6 +3035,434 @@ def _sync_closed_position_pnl(session: Session, position: Position) -> None:
     position.realized_pnl = gross_realized
     position.unrealized_pnl = 0.0
     position.metadata_json = metadata
+
+
+def _protective_close_fill_status(exchange_order: dict[str, object]) -> str | None:
+    for key in ("algoStatus", "status"):
+        status = str(exchange_order.get(key) or "").upper()
+        if status in PROTECTIVE_CLOSE_FILL_BACKFILL_CLOSED_STATUSES:
+            return status
+    return None
+
+
+def _protective_close_actual_order_id(exchange_order: dict[str, object]) -> str | None:
+    for key in ("actualOrderId", "actual_order_id", "orderId"):
+        value = str(exchange_order.get(key) or "")
+        if value and value != "0":
+            return value
+    return None
+
+
+def _protective_close_actual_quantity(order: Order, exchange_order: dict[str, object]) -> float:
+    for key in ("actualQty", "executedQty", "quantity", "origQty"):
+        quantity = _to_float(exchange_order.get(key))
+        if quantity > 0:
+            return abs(quantity)
+    return abs(_to_float(order.requested_quantity))
+
+
+def _protective_close_actual_price(exchange_order: dict[str, object], trades: list[dict[str, object]]) -> float:
+    for key in ("actualPrice", "avgPrice", "price"):
+        price = _to_float(exchange_order.get(key))
+        if price > 0:
+            return price
+    quantity = _sum_trade_quantity(trades)
+    if quantity <= 0:
+        return 0.0
+    notional = sum(abs(_to_float(trade.get("qty"))) * _to_float(trade.get("price")) for trade in trades)
+    return notional / quantity if notional > 0 else 0.0
+
+
+def _payload_time_ms(payload: dict[str, object]) -> int | None:
+    for key in ("updateTime", "transactTime", "triggerTime", "workingTime", "time"):
+        value = _optional_int(payload.get(key))
+        if value:
+            return value
+    return None
+
+
+def _matches_protective_close_trade(
+    trade: dict[str, object],
+    *,
+    order: Order,
+    exchange_order: dict[str, object],
+    actual_order_id: str | None,
+) -> bool:
+    trade_order_id = str(trade.get("orderId") or "")
+    if actual_order_id and trade_order_id and trade_order_id != actual_order_id:
+        return False
+    expected_side = str(exchange_order.get("side") or order.side or "").upper()
+    trade_side = str(trade.get("side") or "").upper()
+    if expected_side and trade_side and trade_side != expected_side:
+        return False
+    expected_quantity = _protective_close_actual_quantity(order, exchange_order)
+    trade_quantity = abs(_to_float(trade.get("qty")))
+    if expected_quantity > 0 and trade_quantity > 0:
+        tolerance = max(1e-9, expected_quantity * 0.000001)
+        if abs(trade_quantity - expected_quantity) > tolerance:
+            return False
+    reference_time_ms = _payload_time_ms(exchange_order)
+    trade_time_ms = _optional_int(trade.get("time"))
+    return not (
+        reference_time_ms
+        and trade_time_ms
+        and abs(trade_time_ms - reference_time_ms) > 10 * 60 * 1000
+    )
+
+
+def _filter_protective_close_trades(
+    trades: list[dict[str, object]],
+    *,
+    order: Order,
+    exchange_order: dict[str, object],
+    actual_order_id: str | None,
+) -> list[dict[str, object]]:
+    return [
+        trade
+        for trade in trades
+        if _matches_protective_close_trade(
+            trade,
+            order=order,
+            exchange_order=exchange_order,
+            actual_order_id=actual_order_id,
+        )
+    ]
+
+
+def _set_protective_close_fill_backfill_state(
+    order: Order,
+    *,
+    status: str,
+    source: str,
+    reason_code: str | None = None,
+    exchange_order: dict[str, object] | None = None,
+    exchange_order_id: str | None = None,
+    lookup_method: str | None = None,
+    trade_count: int = 0,
+    inserted_trade_count: int = 0,
+    filled_quantity: float = 0.0,
+    fees: float = 0.0,
+    realized_pnl: float = 0.0,
+    error: str | None = None,
+) -> None:
+    updated_at = utcnow_naive()
+    metadata = _as_object_dict(order.metadata_json)
+    detail: dict[str, object] = {
+        "status": status,
+        "source": source,
+        "updated_at": updated_at.isoformat(),
+        "exchange_order_id": exchange_order_id,
+        "lookup_method": lookup_method,
+        "trade_count": trade_count,
+        "inserted_trade_count": inserted_trade_count,
+        "filled_quantity": filled_quantity,
+        "fees": fees,
+        "realized_pnl": realized_pnl,
+    }
+    if reason_code:
+        detail["reason_code"] = reason_code
+    if error:
+        detail["error"] = error
+    if exchange_order is not None:
+        detail["exchange_status"] = _protective_close_fill_status(exchange_order) or exchange_order.get("status")
+        detail["exchange_order"] = exchange_order
+    metadata["protective_close_fill_backfill"] = detail
+    order.metadata_json = metadata
+    remove_reason_codes = {
+        PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE,
+        PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE,
+    }
+    if status == "backfilled":
+        remove_reason_codes.add(CLOSED_POSITION_PROTECTIVE_ORDER_RECONCILED_REASON_CODE)
+    reason_codes = [
+        str(code)
+        for code in (order.reason_codes or [])
+        if code and str(code) not in remove_reason_codes
+    ]
+    if reason_code and reason_code not in reason_codes:
+        reason_codes.append(reason_code)
+    order.reason_codes = reason_codes
+
+
+def _fetch_protective_close_trades(
+    client: BinanceClient,
+    *,
+    order: Order,
+    exchange_order: dict[str, object],
+    actual_order_id: str | None,
+) -> tuple[list[dict[str, object]], str | None]:
+    if actual_order_id:
+        trades = client.get_account_trades(symbol=order.symbol, order_id=actual_order_id)
+        if trades:
+            return trades, "order_id"
+    recent_trades = client.get_account_trades(symbol=order.symbol, limit=50)
+    return (
+        _filter_protective_close_trades(
+            recent_trades,
+            order=order,
+            exchange_order=exchange_order,
+            actual_order_id=actual_order_id,
+        ),
+        "symbol_recent",
+    )
+
+
+def _backfill_finished_protective_order_trades(
+    session: Session,
+    settings_row: Setting,
+    client: BinanceClient,
+    order: Order,
+    exchange_order: dict[str, object],
+    *,
+    source: str = PROTECTIVE_CLOSE_FILL_BACKFILL_SOURCE,
+) -> int:
+    if not _is_protective_order_type_name(order.order_type):
+        return 0
+    closed_status = _protective_close_fill_status(exchange_order)
+    if closed_status is None:
+        return 0
+    actual_order_id = _protective_close_actual_order_id(exchange_order)
+    try:
+        trades, lookup_method = _fetch_protective_close_trades(
+            client,
+            order=order,
+            exchange_order=exchange_order,
+            actual_order_id=actual_order_id,
+        )
+    except Exception as exc:
+        _set_protective_close_fill_backfill_state(
+            order,
+            status="failed",
+            source=source,
+            reason_code=PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE,
+            exchange_order=exchange_order,
+            exchange_order_id=actual_order_id,
+            error=str(exc),
+        )
+        session.add(order)
+        record_audit_event(
+            session,
+            event_type="protective_close_fill_backfill_failed",
+            entity_type="order",
+            entity_id=str(order.id),
+            severity="warning",
+            message="Finished protective order close-fill backfill failed.",
+            payload={
+                "symbol": order.symbol,
+                "order_id": order.id,
+                "position_id": order.position_id,
+                "exchange_order_id": actual_order_id,
+                "client_order_id": order.client_order_id,
+                "exchange_status": closed_status,
+                "source": source,
+                "reason_code": PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE,
+                "error": str(exc),
+            },
+        )
+        session.flush()
+        return 0
+    if not trades:
+        _set_protective_close_fill_backfill_state(
+            order,
+            status="pending",
+            source=source,
+            reason_code=PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE,
+            exchange_order=exchange_order,
+            exchange_order_id=actual_order_id,
+            lookup_method=lookup_method,
+        )
+        session.add(order)
+        record_audit_event(
+            session,
+            event_type="protective_close_fill_backfill_pending",
+            entity_type="order",
+            entity_id=str(order.id),
+            severity="warning",
+            message="Finished protective order had no close-fill trades available during backfill.",
+            payload={
+                "symbol": order.symbol,
+                "order_id": order.id,
+                "position_id": order.position_id,
+                "exchange_order_id": actual_order_id,
+                "client_order_id": order.client_order_id,
+                "exchange_status": closed_status,
+                "source": source,
+                "reason_code": PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE,
+                "lookup_method": lookup_method,
+            },
+        )
+        session.flush()
+        return 0
+    trade_ids = {str(trade.get("id") or "") for trade in trades if str(trade.get("id") or "")}
+    existing_trade_ids = set(
+        session.scalars(select(Execution.external_trade_id).where(Execution.external_trade_id.in_(trade_ids)))
+    ) if trade_ids else set()
+    inserted_fee_paid, inserted_realized_pnl = _record_live_trades(
+        session,
+        order,
+        trades,
+        source=PROTECTIVE_CLOSE_FILL_BACKFILL_SOURCE,
+        exchange_order=exchange_order,
+        exchange_order_id=actual_order_id,
+        client_order_id=order.client_order_id,
+        linked_protective_order_id=order.id,
+    )
+    inserted_trade_count = len(trade_ids - existing_trade_ids)
+    filled_quantity = _sum_trade_quantity(trades)
+    fee_paid = sum(abs(_to_float(trade.get("commission"))) for trade in trades)
+    realized_pnl = sum(_to_float(trade.get("realizedPnl")) for trade in trades)
+    average_fill_price = _protective_close_actual_price(exchange_order, trades)
+    if filled_quantity > 0:
+        order.filled_quantity = filled_quantity
+    if average_fill_price > 0:
+        order.average_fill_price = average_fill_price
+    order.status = "filled"
+    order.exchange_status = closed_status
+    order.last_exchange_update_at = utcnow_naive()
+    _set_protective_close_fill_backfill_state(
+        order,
+        status="backfilled",
+        source=source,
+        exchange_order=exchange_order,
+        exchange_order_id=actual_order_id,
+        lookup_method=lookup_method,
+        trade_count=len(trades),
+        inserted_trade_count=inserted_trade_count,
+        filled_quantity=filled_quantity,
+        fees=fee_paid,
+        realized_pnl=realized_pnl,
+    )
+    session.add(order)
+    if order.position_id is not None:
+        position = session.get(Position, order.position_id)
+        if position is not None:
+            _sync_closed_position_pnl(session, position)
+            session.add(position)
+    if inserted_trade_count:
+        create_exchange_pnl_snapshot(session, settings_row)
+    record_audit_event(
+        session,
+        event_type="protective_close_fill_backfilled",
+        entity_type="order",
+        entity_id=str(order.id),
+        severity="info",
+        message="Finished protective order close-fill executions were backfilled from exchange trades.",
+        payload={
+            "symbol": order.symbol,
+            "order_id": order.id,
+            "position_id": order.position_id,
+            "exchange_order_id": actual_order_id,
+            "client_order_id": order.client_order_id,
+            "exchange_status": closed_status,
+            "source": source,
+            "lookup_method": lookup_method,
+            "trade_count": len(trades),
+            "inserted_trade_count": inserted_trade_count,
+            "filled_quantity": filled_quantity,
+            "fees": fee_paid,
+            "realized_pnl": realized_pnl,
+            "inserted_fees": inserted_fee_paid,
+            "inserted_realized_pnl": inserted_realized_pnl,
+        },
+    )
+    session.flush()
+    return inserted_trade_count
+
+
+def _backfill_missing_finished_protective_order_trades(
+    session: Session,
+    settings_row: Setting,
+    client: BinanceClient,
+    *,
+    symbol: str,
+    observed_at: datetime | None = None,
+    source: str = "sync_live_state",
+) -> int:
+    observed_at = observed_at or utcnow_naive()
+    with session.no_autoflush:
+        candidates = list(
+            session.scalars(
+                select(Order)
+                .join(Position, Order.position_id == Position.id)
+                .where(
+                    Order.mode == "live",
+                    Order.symbol == symbol.upper(),
+                    or_(Order.reduce_only.is_(True), Order.close_only.is_(True)),
+                    or_(Position.status != "open", Position.quantity <= 0),
+                    ~Order.id.in_(select(Execution.order_id).where(Execution.order_id.is_not(None))),
+                )
+                .order_by(Order.updated_at.desc(), Order.id.desc())
+                .limit(100)
+            )
+        )
+    backfilled = 0
+    for order in candidates:
+        if not _is_protective_order_type_name(order.order_type):
+            continue
+        if not order.external_order_id and not order.client_order_id:
+            continue
+        try:
+            exchange_order = _fetch_exchange_order(
+                client,
+                symbol=order.symbol,
+                order_type=order.order_type,
+                order_id=order.external_order_id,
+                client_order_id=order.client_order_id,
+            )
+        except Exception as exc:
+            _set_protective_close_fill_backfill_state(
+                order,
+                status="failed",
+                source=source,
+                reason_code=PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE,
+                exchange_order_id=order.external_order_id,
+                error=str(exc),
+            )
+            order.last_exchange_update_at = observed_at
+            session.add(order)
+            record_audit_event(
+                session,
+                event_type="protective_close_fill_backfill_failed",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="warning",
+                message="Finished protective order lookup failed during close-fill backfill.",
+                payload={
+                    "symbol": order.symbol,
+                    "order_id": order.id,
+                    "position_id": order.position_id,
+                    "exchange_order_id": order.external_order_id,
+                    "client_order_id": order.client_order_id,
+                    "source": source,
+                    "reason_code": PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE,
+                    "error": str(exc),
+                },
+            )
+            continue
+        closed_status = _protective_close_fill_status(exchange_order)
+        if closed_status is None:
+            continue
+        _apply_exchange_order_state(
+            order,
+            exchange_order,
+            requested_quantity_fallback=order.requested_quantity,
+            requested_price_fallback=order.requested_price,
+            reduce_only_fallback=order.reduce_only,
+            close_only_fallback=order.close_only,
+            updated_at=observed_at,
+        )
+        session.add(order)
+        backfilled += _backfill_finished_protective_order_trades(
+            session,
+            settings_row,
+            client,
+            order,
+            exchange_order,
+            source=source,
+        )
+    if candidates:
+        session.flush()
+    return backfilled
 
 
 def _upsert_exchange_order_row(
@@ -3935,12 +4420,14 @@ def sync_live_positions(
     open_orders: list[dict[str, object]] | None = None,
     remote_positions: list[dict[str, object]] | None = None,
     position_mode: str = POSITION_MODE_ONE_WAY,
+    flush_state: bool = True,
 ) -> dict[str, object]:
     client = client or _build_client(settings_row)
     open_orders = open_orders if open_orders is not None else client.get_open_orders(symbol)
     remote_positions = remote_positions if remote_positions is not None else client.get_position_information(symbol)
     mapping = _resolve_remote_position_mapping(remote_positions)
-    local = get_open_position(session, symbol)
+    with session.no_autoflush:
+        local = get_open_position(session, symbol)
     order_position_sides = _symbol_order_position_sides(open_orders)
     position_side_conflict = False
     position_mode_reason_code = _position_mode_guard_reason_code(position_mode)
@@ -3961,7 +4448,7 @@ def sync_live_positions(
             local.metadata_json = metadata
             _sync_closed_position_pnl(session, local)
             session.add(local)
-            session.flush()
+            session.flush([local])
         _record_sync_success(
             session,
             settings_row,
@@ -3973,6 +4460,7 @@ def sync_live_positions(
                 "remote_position_sides": mapping.get("remote_position_sides", []),
                 "open_order_position_sides": order_position_sides,
             },
+            flush_state=flush_state,
         )
         return {
             "symbol": symbol,
@@ -4044,7 +4532,7 @@ def sync_live_positions(
             },
         )
         session.add(local)
-        session.flush()
+        session.flush([local])
     else:
         metadata = _as_object_dict(local.metadata_json)
         if "origin" not in metadata:
@@ -4063,10 +4551,10 @@ def sync_live_positions(
         local.take_profit = take_profit or local.take_profit or mark_price
         local.closed_at = None
         session.add(local)
-        session.flush()
+        session.flush([local])
     local.unrealized_pnl = (mark_price - entry_price) * quantity if side == "long" else (entry_price - mark_price) * quantity
     session.add(local)
-    session.flush()
+    session.flush([local])
     _record_sync_success(
         session,
         settings_row,
@@ -4081,6 +4569,7 @@ def sync_live_positions(
             "open_order_position_sides": order_position_sides,
             "position_mode_guard_reason_code": position_mode_reason_code,
         },
+        flush_state=flush_state,
     )
     return {
         "symbol": symbol,
@@ -5517,6 +6006,7 @@ def sync_live_state(
         client=client,
         max_events=max(4, len(symbols) * 4),
         idle_timeout_seconds=0.1,
+        flush_state=False,
     )
     stream_events = [dict(item) for item in stream_poll.get("stream_events", []) if isinstance(item, dict)]
     user_stream_summary = (
@@ -5524,10 +6014,8 @@ def sync_live_state(
         if isinstance(stream_poll.get("user_stream_summary"), dict)
         else get_user_stream_detail(settings_row)
     )
-    replace_user_stream_detail(settings_row, build_user_stream_state(user_stream_summary))
-    session.add(settings_row)
-    session.flush()
-    user_stream_summary = get_user_stream_detail(settings_row)
+    pending_user_stream_state = build_user_stream_state(user_stream_summary)
+    user_stream_summary = dict(pending_user_stream_state)
     reconcile_started_at = utcnow_naive()
     position_mode = POSITION_MODE_ONE_WAY
     position_mode_source = "assumed_default"
@@ -5551,33 +6039,6 @@ def sync_live_state(
         symbol=symbol,
         now=reconcile_started_at,
     )
-    set_reconciliation_detail(
-        settings_row,
-        status="running",
-        source="rest_polling_reconciliation",
-        last_reconciled_at=reconcile_started_at,
-        last_symbol=symbols[0] if len(symbols) == 1 else None,
-        stream_fallback_active=stream_fallback_active,
-        reconcile_source=reconcile_source,
-        position_mode=position_mode,
-        position_mode_source=position_mode_source,
-        position_mode_checked_at=reconcile_started_at,
-        enabled_symbols=symbols,
-        unresolved_submission_badge=bool(unresolved_submission_summary.get("unresolved_submission_badge", False)),
-        unresolved_submission_count=int(unresolved_submission_summary.get("unresolved_submission_count") or 0),
-        unresolved_submission_symbols=[
-            str(item)
-            for item in unresolved_submission_summary.get("unresolved_submission_symbols", [])
-            if item
-        ],
-        unresolved_submissions=[
-            dict(item)
-            for item in unresolved_submission_summary.get("unresolved_submissions", [])
-            if isinstance(item, dict)
-        ],
-    )
-    session.add(settings_row)
-    session.flush()
     synced_orders = 0
     synced_positions = 0
     symbol_protection_state: dict[str, dict[str, object]] = {}
@@ -5616,6 +6077,7 @@ def sync_live_state(
             settings_row,
             active_order_count=len(live_orders),
             now=reconcile_started_at,
+            user_stream_summary=user_stream_summary,
         )
         if use_rest_order_fallback and live_orders:
             stream_fallback_active = True
@@ -5625,6 +6087,8 @@ def sync_live_state(
                 settings_row,
                 symbol=item_symbol,
                 reason_code=fallback_reason,
+                user_stream_summary=user_stream_summary,
+                flush_state=False,
             )
             for order in live_orders:
                 if not order.external_order_id and not order.client_order_id:
@@ -5669,6 +6133,14 @@ def sync_live_state(
                 )
                 session.add(order)
                 if _is_protective_order_type_name(order.order_type):
+                    _backfill_finished_protective_order_trades(
+                        session,
+                        settings_row,
+                        client,
+                        order,
+                        exchange_order,
+                        source=reconcile_source,
+                    )
                     synced_orders += 1
                     continue
                 try:
@@ -5721,6 +6193,7 @@ def sync_live_state(
                     "open_order_count": len(open_orders),
                     "position_mode": position_mode,
                 },
+                flush_state=False,
             )
         except Exception as exc:
             reason_code = _classify_exchange_state_error(exc, "EXCHANGE_OPEN_ORDERS_SYNC_FAILED")
@@ -5757,6 +6230,7 @@ def sync_live_state(
                     else None
                 ),
                 position_mode=position_mode,
+                flush_state=False,
             )
         except Exception as exc:
             reason_code = _classify_exchange_state_error(exc, "EXCHANGE_POSITION_SYNC_FAILED")
@@ -5772,6 +6246,14 @@ def sync_live_state(
                 alert_message="거래소 포지션 상태를 동기화하지 못해 거래를 일시 중지했습니다.",
             )
             raise RuntimeError(f"{reason_code}: {exc}") from exc
+        synced_orders += _backfill_missing_finished_protective_order_trades(
+            session,
+            settings_row,
+            client,
+            symbol=item_symbol,
+            observed_at=reconcile_started_at,
+            source="sync_live_state",
+        )
         stale_protective_orders = reconcile_closed_position_protective_orders(
             session,
             symbol=item_symbol,
@@ -5790,7 +6272,8 @@ def sync_live_state(
                 }
                 for order in stale_protective_orders
             )
-        position = get_open_position(session, item_symbol)
+        with session.no_autoflush:
+            position = get_open_position(session, item_symbol)
         symbol_guard_reason_code = str(synced_position.get("guard_reason_code") or "") or None
         symbol_guard_active = bool(mode_guard_reason_code or symbol_guard_reason_code)
         if symbol_guard_reason_code and item_symbol not in guarded_symbols:
@@ -5872,6 +6355,7 @@ def sync_live_state(
                             "symbol": item_symbol,
                             "status": protection_result["protection_state"].get("status", "protected"),
                         },
+                        flush_state=False,
                     )
             else:
                 record_audit_event(
@@ -5893,6 +6377,7 @@ def sync_live_state(
                 settings_row,
                 scope="protective_orders",
                 detail={"symbol": item_symbol, "status": protection_state["status"]},
+                flush_state=False,
             )
             if protection_state["status"] in {"flat", "protected"}:
                 _clear_symbol_protection_verify_block(
@@ -5905,6 +6390,7 @@ def sync_live_state(
                 settings_row,
                 symbol=item_symbol,
                 trigger_source="sync_live_state:protected_or_flat",
+                flush_state=False,
             )
         symbol_states[item_symbol] = {
             "symbol": item_symbol,
@@ -5921,11 +6407,12 @@ def sync_live_state(
             "position_side_conflict": bool(synced_position.get("position_side_conflict", False)),
         }
         synced_positions += 1
-    latest_prices = {
-        item_symbol: position.mark_price
-        for item_symbol in symbols
-        if (position := get_open_position(session, item_symbol)) is not None
-    }
+    with session.no_autoflush:
+        latest_prices = {
+            item_symbol: position.mark_price
+            for item_symbol in symbols
+            if (position := get_open_position(session, item_symbol)) is not None
+        }
     if latest_prices:
         refresh_open_position_marks(session, latest_prices)
     account_symbol = symbols[0] if symbols else settings_row.default_symbol.upper()
@@ -5973,6 +6460,7 @@ def sync_live_state(
             "available_balance": pnl_snapshot.available_balance,
             "funding_sync": funding_sync,
         },
+        flush_state=False,
     )
     reconciled_at = utcnow_naive()
     if position_mode_lookup_error and mode_guard_reason_code is None:
@@ -5998,6 +6486,7 @@ def sync_live_state(
             "symbol_states": symbol_states,
         },
     )
+    replace_user_stream_detail(settings_row, build_user_stream_state(user_stream_summary))
     set_reconciliation_detail(
         settings_row,
         status="synced",

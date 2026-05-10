@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -8,6 +8,12 @@ from trading_mvp.models import AuditEvent, PendingEntryPlan, Position, RiskCheck
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
 from trading_mvp.services.dashboard import get_overview
 from trading_mvp.services.orchestrator import TradingOrchestrator
+from trading_mvp.services.pending_entry_time import (
+    PENDING_ENTRY_DB_UTC_NOW_EXPRESSION,
+    PENDING_ENTRY_EXPIRED_SMOKE_SQL,
+    pending_entry_plan_is_expired,
+    pending_entry_remaining_ttl_seconds,
+)
 from trading_mvp.services.runtime_state import (
     mark_sync_issue,
     mark_sync_success,
@@ -37,6 +43,21 @@ def _enable_live_settings(db_session) -> None:
     _mark_all_sync_fresh(settings_row)
     db_session.add(settings_row)
     db_session.flush()
+
+
+def test_pending_entry_expiry_uses_app_utc_naive_not_db_local_wall_clock() -> None:
+    db_now_kst = datetime(2026, 5, 7, 23, 26, 26, tzinfo=timezone(timedelta(hours=9)))
+    expires_at = datetime(2026, 5, 7, 15, 54, 58)
+
+    assert expires_at < db_now_kst.replace(tzinfo=None)
+    assert pending_entry_plan_is_expired(expires_at, now=db_now_kst) is False
+    assert pending_entry_remaining_ttl_seconds(expires_at, now=db_now_kst) == 5312
+
+
+def test_pending_entry_smoke_sql_uses_utc_naive_db_expression() -> None:
+    assert PENDING_ENTRY_DB_UTC_NOW_EXPRESSION == "timezone('UTC', now())"
+    assert "expires_at < timezone('UTC', now())" in PENDING_ENTRY_EXPIRED_SMOKE_SQL
+    assert "expires_at < now()" not in PENDING_ENTRY_EXPIRED_SMOKE_SQL
 
 
 def _snapshot(
@@ -285,6 +306,8 @@ def test_decision_cycle_arms_pullback_entry_plan_without_immediate_order(monkeyp
     assert "ENTRY_TRIGGER_NOT_MET" in result["risk_result"]["blocked_reason_codes"]
     assert plan is not None
     assert plan.plan_status == "armed"
+    assert plan.expires_at.tzinfo is None
+    assert plan.expires_at > utcnow_naive()
     assert plan.idempotency_key.startswith("pending-plan:BTCUSDT:long:")
 
 
@@ -564,6 +587,37 @@ def test_entry_plan_watcher_expires_plan_without_execution(monkeypatch, db_sessi
     assert execute_called is False
     assert refreshed is not None
     assert refreshed.plan_status == "expired"
+
+
+def test_entry_plan_watcher_keeps_future_utc_naive_plan_despite_kst_wall_clock(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    app_now = utcnow_naive()
+    db_now_kst = app_now.replace(tzinfo=UTC).astimezone(timezone(timedelta(hours=9)))
+    plan.expires_at = app_now + timedelta(minutes=90)
+    db_session.add(plan)
+    db_session.flush()
+
+    assert plan.expires_at < db_now_kst.replace(tzinfo=None)
+    assert pending_entry_plan_is_expired(plan.expires_at, now=db_now_kst) is False
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.execute_live_trade",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("future plan must not execute in this test")),
+    )
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot_chase_without_rr_collapse(snapshot_time=app_now),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] != "expired"
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
 
 
 def test_entry_plan_watcher_waits_on_stale_market_before_invalidating_or_expiring(monkeypatch, db_session) -> None:
@@ -1020,13 +1074,16 @@ def test_entry_plan_watcher_respects_approval_and_prevents_duplicate_execution(m
     assert len(overview.active_entry_plans) == 0
 
 
-def test_entry_plan_watcher_waits_on_entry_control_before_expiring_plan(monkeypatch, db_session) -> None:
+def test_entry_plan_watcher_expires_plan_before_pause_entry_control(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
     assert plan is not None
     plan.expires_at = utcnow_naive() - timedelta(seconds=1)
     original_expires_at = plan.expires_at
     settings_row = get_or_create_settings(db_session)
+    settings_row.trading_paused = True
+    settings_row.pause_reason_code = "MANUAL_USER_REQUEST"
+    settings_row.pause_origin = "manual"
     settings_row.live_execution_armed = False
     settings_row.live_execution_armed_until = None
     db_session.add_all([plan, settings_row])
@@ -1048,14 +1105,21 @@ def test_entry_plan_watcher_waits_on_entry_control_before_expiring_plan(monkeypa
     )
     db_session.flush()
     refreshed = db_session.get(PendingEntryPlan, plan.id)
+    expired_event = db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == "pending_entry_plan_expired",
+            AuditEvent.entity_id == str(plan.id),
+        )
+    )
 
-    assert blocked_result["results"][0]["plans"][0]["status"] == "control_blocked"
-    assert blocked_result["results"][0]["plans"][0]["blocked_reasons"] == ["LIVE_APPROVAL_REQUIRED"]
+    assert blocked_result["results"][0]["plans"][0]["status"] == "expired"
     assert execution_calls == 0
     assert refreshed is not None
-    assert refreshed.plan_status == "armed"
-    assert refreshed.canceled_reason is None
-    assert refreshed.expires_at > original_expires_at
+    assert refreshed.plan_status == "expired"
+    assert refreshed.canceled_reason == "PLAN_TTL_EXPIRED"
+    assert refreshed.expires_at == original_expires_at
+    assert expired_event is not None
+    assert expired_event.payload["reason"] == "PLAN_TTL_EXPIRED"
 
 
 def test_entry_plan_watcher_reports_armed_entry_plan_cadence(monkeypatch, db_session) -> None:
