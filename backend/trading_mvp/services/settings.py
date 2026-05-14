@@ -25,6 +25,7 @@ from trading_mvp.models import (
 from trading_mvp.schemas import (
     SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES,
     AIEventViewPayload,
+    AppSettingsExecutionRiskProfilePolicy,
     AppSettingsAIUsageResponse,
     AppSettingsCadenceResponse,
     AppSettingsResponse,
@@ -169,7 +170,61 @@ RUNTIME_STATE_DETAIL_KEYS = {
     "binance_rest",
 }
 EVENT_OPERATOR_CONTROL_DETAIL_KEY = "event_operator_control"
-PRESERVED_SETTINGS_DETAIL_KEYS = {*RUNTIME_STATE_DETAIL_KEYS, EVENT_OPERATOR_CONTROL_DETAIL_KEY}
+AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY = "ai_market_settings_advisor"
+AI_MARKET_SETTINGS_POLICY_DETAIL_KEY = "ai_market_settings_policy"
+SAFE_PROFILE_SELECTOR_DETAIL_KEY = "safe_profile_selector"
+AI_MARKET_SETTINGS_AUTO_APPLY_MODES = {"off", "shadow", "conservative_only", "manual_approval"}
+EXECUTION_RISK_PROFILE_DESCRIPTIONS = (
+    {
+        "profile_id": "NORMAL",
+        "severity": 0,
+        "label": "Normal",
+        "description": "기본 시장 상태입니다. 추가 프로파일 차단 없이 일반 risk_guard 결과를 따릅니다.",
+        "new_entry_policy": "일반 신규 진입 검토 가능",
+    },
+    {
+        "profile_id": "CAUTION",
+        "severity": 1,
+        "label": "Caution",
+        "description": "불확실성이 올라간 상태입니다. AI 추천은 더 보수적인 검토 신호로만 사용합니다.",
+        "new_entry_policy": "신규 진입은 risk_guard 최종 검증 후에만 가능",
+    },
+    {
+        "profile_id": "HIGH_VOLATILITY",
+        "severity": 2,
+        "label": "High volatility",
+        "description": "변동성 확대 또는 range break가 감지된 상태입니다. 추격 진입보다 확인 절차를 우선합니다.",
+        "new_entry_policy": "신규 진입은 더 보수적인 확인 상태로 분류",
+    },
+    {
+        "profile_id": "THIN_LIQUIDITY",
+        "severity": 2,
+        "label": "Thin liquidity",
+        "description": "스프레드/유동성 상태가 불리한 상태입니다. 비용과 체결 품질 리스크를 더 크게 봅니다.",
+        "new_entry_policy": "신규 진입은 더 보수적인 확인 상태로 분류",
+    },
+    {
+        "profile_id": "STRESS",
+        "severity": 3,
+        "label": "Stress",
+        "description": "시장/운영 리스크가 높은 상태입니다. 적용 모드에서는 신규 진입 차단 프로파일입니다.",
+        "new_entry_policy": "적용 모드에서 신규 진입 차단",
+    },
+    {
+        "profile_id": "DEGRADED",
+        "severity": 4,
+        "label": "Degraded",
+        "description": "데이터, 동기화, 보호주문, pause/live 상태에 hard condition이 있는 상태입니다.",
+        "new_entry_policy": "적용 모드에서 신규 진입 차단, reduce/exit/emergency 경로는 분리",
+    },
+)
+PRESERVED_SETTINGS_DETAIL_KEYS = {
+    *RUNTIME_STATE_DETAIL_KEYS,
+    EVENT_OPERATOR_CONTROL_DETAIL_KEY,
+    AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY,
+    AI_MARKET_SETTINGS_POLICY_DETAIL_KEY,
+    SAFE_PROFILE_SELECTOR_DETAIL_KEY,
+}
 
 
 def build_ai_model_routing_policy(settings_row: Setting) -> dict[str, Any]:
@@ -546,6 +601,200 @@ def _serialize_operator_event_view_payload(view: OperatorEventViewPayload | None
     if view is None:
         return None
     return view.model_dump(mode="json")
+
+
+def _settings_int(defaults: AppConfig, name: str, fallback: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(getattr(defaults, name, fallback))
+    except (TypeError, ValueError):
+        value = fallback
+    return max(value, minimum)
+
+
+def _settings_float(defaults: AppConfig, name: str, fallback: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(getattr(defaults, name, fallback))
+    except (TypeError, ValueError):
+        value = fallback
+    return max(value, minimum)
+
+
+def _default_execution_risk_profile_policy(defaults: AppConfig | None = None) -> dict[str, object]:
+    defaults = defaults or get_settings()
+    auto_apply_mode = str(getattr(defaults, "ai_market_settings_auto_apply_mode", "shadow") or "shadow").strip()
+    if auto_apply_mode not in AI_MARKET_SETTINGS_AUTO_APPLY_MODES:
+        auto_apply_mode = "shadow"
+    return {
+        "advisor_enabled": bool(getattr(defaults, "ai_market_settings_advisor_enabled", True)),
+        "advisor_shadow_mode": bool(getattr(defaults, "ai_market_settings_advisor_shadow", True)),
+        "auto_apply_mode": auto_apply_mode,
+        "normal_interval_seconds": _settings_int(
+            defaults,
+            "ai_market_settings_advisor_normal_interval_seconds",
+            900,
+            minimum=60,
+        ),
+        "elevated_interval_seconds": _settings_int(
+            defaults,
+            "ai_market_settings_advisor_elevated_interval_seconds",
+            300,
+            minimum=60,
+        ),
+        "min_recheck_interval_seconds": _settings_int(
+            defaults,
+            "ai_market_settings_advisor_min_recheck_interval_seconds",
+            300,
+            minimum=60,
+        ),
+        "recommendation_ttl_seconds": _settings_int(
+            defaults,
+            "ai_market_settings_advisor_recommendation_ttl_seconds",
+            900,
+            minimum=60,
+        ),
+        "min_confidence_to_apply": _settings_float(
+            defaults,
+            "ai_market_settings_advisor_min_confidence_to_apply",
+            0.70,
+            minimum=0.50,
+        ),
+        "relax_requires_consecutive_confirmations": _settings_int(
+            defaults,
+            "ai_market_settings_relax_requires_consecutive_confirmations",
+            2,
+            minimum=1,
+        ),
+        "min_profile_dwell_seconds": _settings_int(
+            defaults,
+            "ai_market_settings_min_profile_dwell_seconds",
+            900,
+            minimum=0,
+        ),
+    }
+
+
+def normalize_execution_risk_profile_policy(
+    policy: AppSettingsExecutionRiskProfilePolicy | dict[str, Any] | None,
+    *,
+    defaults: AppConfig | None = None,
+) -> dict[str, object]:
+    base = _default_execution_risk_profile_policy(defaults)
+    if policy is None:
+        return base
+    raw = policy.model_dump(mode="python") if isinstance(policy, AppSettingsExecutionRiskProfilePolicy) else dict(policy)
+    candidate = {**base, **{key: raw[key] for key in base if key in raw}}
+    try:
+        return AppSettingsExecutionRiskProfilePolicy.model_validate(candidate).model_dump(mode="python")
+    except Exception:
+        return base
+
+
+def get_execution_risk_profile_policy(
+    settings_row: Setting,
+    *,
+    defaults: AppConfig | None = None,
+) -> dict[str, object]:
+    detail = dict(settings_row.pause_reason_detail or {})
+    raw_policy = detail.get(AI_MARKET_SETTINGS_POLICY_DETAIL_KEY)
+    return normalize_execution_risk_profile_policy(
+        raw_policy if isinstance(raw_policy, dict) else None,
+        defaults=defaults,
+    )
+
+
+def _write_execution_risk_profile_policy(
+    settings_row: Setting,
+    policy: AppSettingsExecutionRiskProfilePolicy | None,
+    *,
+    defaults: AppConfig | None = None,
+) -> None:
+    detail = dict(settings_row.pause_reason_detail or {})
+    if policy is None:
+        detail.pop(AI_MARKET_SETTINGS_POLICY_DETAIL_KEY, None)
+    else:
+        detail[AI_MARKET_SETTINGS_POLICY_DETAIL_KEY] = normalize_execution_risk_profile_policy(
+            policy,
+            defaults=defaults,
+        )
+    settings_row.pause_reason_detail = detail
+
+
+def build_execution_risk_profile_settings_payload(
+    settings_row: Setting,
+    *,
+    defaults: AppConfig | None = None,
+) -> dict[str, object]:
+    defaults = defaults or get_settings()
+    detail = dict(settings_row.pause_reason_detail or {})
+    policy = get_execution_risk_profile_policy(settings_row, defaults=defaults)
+    selector_state = dict(detail.get(SAFE_PROFILE_SELECTOR_DETAIL_KEY) or {})
+    last_selection = dict(selector_state.get("last_selection") or {})
+    advisor_state = dict(detail.get(AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY) or {})
+    latest_recommendation = dict(advisor_state.get("latest") or {})
+    active_profile = last_selection.get("final_active_profile") or selector_state.get("active_profile")
+    deterministic_profile = last_selection.get("deterministic_profile") or selector_state.get("deterministic_profile")
+    ai_profile = (
+        last_selection.get("ai_recommended_profile")
+        or selector_state.get("ai_recommended_profile")
+        or latest_recommendation.get("recommended_profile_id")
+    )
+    return {
+        **policy,
+        "blocking_severity": 3,
+        "allowed_profiles": [
+            {
+                **profile,
+                "blocks_new_entry_when_active": int(profile["severity"]) >= 3,
+            }
+            for profile in EXECUTION_RISK_PROFILE_DESCRIPTIONS
+        ],
+        "allowed_new_entry_policies": [
+            {
+                "policy_id": "NORMAL_ALLOWED",
+                "description": "일반 신규 진입 검토를 허용하는 추천 정책입니다.",
+            },
+            {
+                "policy_id": "PULLBACK_ONLY",
+                "description": "추격 진입보다 pullback 확인 후보만 우선 검토하라는 추천 정책입니다.",
+            },
+            {
+                "policy_id": "STRICT_CONFIRMATION_ONLY",
+                "description": "더 강한 확인 조건이 있는 후보만 검토하라는 추천 정책입니다.",
+            },
+            {
+                "policy_id": "NO_NEW_ENTRY",
+                "description": "신규 진입을 피하라는 추천 정책입니다. 실제 차단은 deterministic selector/risk_guard가 결정합니다.",
+            },
+        ],
+        "current_state": {
+            "deterministic_profile": deterministic_profile,
+            "ai_recommended_profile": ai_profile,
+            "final_active_profile": active_profile,
+            "shadow_final_profile": last_selection.get("shadow_final_profile"),
+            "selection_mode": last_selection.get("selection_mode") or selector_state.get("selection_mode"),
+            "selected_reason": last_selection.get("selected_reason") or selector_state.get("selected_reason"),
+            "active_profile_blocks_new_entry": bool(last_selection.get("active_profile_blocks_new_entry", False)),
+            "was_tightened_by_ai": bool(last_selection.get("was_tightened_by_ai", False)),
+            "was_relaxation_blocked": bool(last_selection.get("was_relaxation_blocked", False)),
+            "ai_recommendation_status": advisor_state.get("status"),
+            "ai_recommendation_id": (
+                last_selection.get("ai_recommendation_id") or latest_recommendation.get("recommendation_id")
+            ),
+            "ai_recommendation_confidence": (
+                last_selection.get("confidence") or latest_recommendation.get("confidence")
+            ),
+            "ai_recommendation_valid_until": (
+                last_selection.get("valid_until") or latest_recommendation.get("valid_until")
+            ),
+        },
+        "operation": {
+            "advisor_runs_during_decision_cycle": True,
+            "selector_runs_during_risk_guard": True,
+            "manual_cycle_endpoint": "/api/cycles/run",
+            "manual_cycle_can_reach_live_execution": True,
+            "survival_paths_remain_allowed": True,
+        },
+    }
 
 
 def _deserialize_operator_event_view_payload(settings_row: Setting) -> OperatorEventViewPayload | None:
@@ -3389,6 +3638,10 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         tracked_symbols=get_effective_symbols(settings_row),
         default_timeframe=settings_row.default_timeframe,
         event_operator_control=event_operator_control,
+        execution_risk_profile_settings=build_execution_risk_profile_settings_payload(
+            settings_row,
+            defaults=defaults,
+        ),
         exchange_sync_interval_seconds=settings_row.exchange_sync_interval_seconds,
         market_refresh_interval_minutes=settings_row.market_refresh_interval_minutes,
         position_management_interval_seconds=settings_row.position_management_interval_seconds,
@@ -3658,6 +3911,12 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.ai_model = payload.ai_model
     row.ai_call_interval_minutes = payload.ai_call_interval_minutes
     row.decision_cycle_interval_minutes = payload.decision_cycle_interval_minutes
+    if "execution_risk_profile_settings" in fields_set:
+        _write_execution_risk_profile_policy(
+            row,
+            payload.execution_risk_profile_settings,
+            defaults=defaults,
+        )
     row.ai_max_input_candles = payload.ai_max_input_candles
     row.ai_temperature = payload.ai_temperature
     row.binance_market_data_enabled = payload.binance_market_data_enabled

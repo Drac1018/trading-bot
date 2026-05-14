@@ -5,12 +5,12 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from threading import Lock
+from threading import Lock, Thread
 from time import monotonic
 from typing import Any
 
 from sqlalchemy import Text, cast, desc, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from trading_mvp.models import (
     AccountLedgerEntry,
@@ -50,6 +50,7 @@ DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
 )
 SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS = 120.0
 SIGNAL_PERFORMANCE_PNL_SOURCE_BUCKET_SECONDS = 60
+SIGNAL_PERFORMANCE_REPORT_REFRESH_DEBOUNCE_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -57,6 +58,7 @@ class _CachedSignalPerformanceReport:
     stored_at: float
     source_key: tuple[object, ...]
     payload: SignalPerformanceReportResponse
+    refresh_started_at: float | None = None
 
 
 _signal_performance_report_cache: dict[tuple[object, ...], _CachedSignalPerformanceReport] = {}
@@ -2317,6 +2319,127 @@ def _bucket_source_datetime(value: object, bucket_seconds: int) -> object:
     return int(value.timestamp()) // bucket_seconds
 
 
+def _cache_age_seconds(cached: _CachedSignalPerformanceReport, now_monotonic: float) -> float:
+    return max(0.0, now_monotonic - cached.stored_at)
+
+
+def _cache_refresh_pending(cached: _CachedSignalPerformanceReport, now_monotonic: float) -> bool:
+    return (
+        cached.refresh_started_at is not None
+        and now_monotonic - cached.refresh_started_at <= SIGNAL_PERFORMANCE_REPORT_REFRESH_DEBOUNCE_SECONDS
+    )
+
+
+def _copy_report_with_cache_state(
+    cached: _CachedSignalPerformanceReport,
+    *,
+    status: str,
+    now_monotonic: float,
+    rebuild_pending: bool,
+) -> SignalPerformanceReportResponse:
+    return cached.payload.model_copy(
+        update={
+            "cache_status": status,
+            "cache_age_seconds": _cache_age_seconds(cached, now_monotonic),
+            "cache_rebuild_pending": rebuild_pending,
+        },
+    )
+
+
+def _store_signal_performance_report(
+    cache_key: tuple[object, ...],
+    *,
+    source_key: tuple[object, ...],
+    payload: SignalPerformanceReportResponse,
+) -> None:
+    with _signal_performance_report_cache_lock:
+        if len(_signal_performance_report_cache) > 16:
+            _signal_performance_report_cache.clear()
+        _signal_performance_report_cache[cache_key] = _CachedSignalPerformanceReport(
+            stored_at=monotonic(),
+            source_key=source_key,
+            payload=payload.model_copy(
+                update={
+                    "cache_status": "fresh",
+                    "cache_age_seconds": 0.0,
+                    "cache_rebuild_pending": False,
+                },
+            ),
+        )
+
+
+def _finish_signal_performance_background_refresh(cache_key: tuple[object, ...]) -> None:
+    with _signal_performance_report_cache_lock:
+        cached = _signal_performance_report_cache.get(cache_key)
+        if cached is not None:
+            cached.refresh_started_at = None
+
+
+def _rebuild_signal_performance_report_cache(
+    bind: Any,
+    *,
+    cache_key: tuple[object, ...],
+    window_hours: int,
+    limit: int,
+    selected_window_specs: tuple[tuple[str, int], ...],
+) -> None:
+    try:
+        refresh_session_factory = sessionmaker(
+            bind=bind,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
+        with refresh_session_factory() as refresh_session:
+            source_key = _signal_performance_source_key(refresh_session)
+            payload = _build_signal_performance_report_uncached(
+                refresh_session,
+                window_hours=window_hours,
+                limit=limit,
+                selected_window_specs=selected_window_specs,
+            )
+            _store_signal_performance_report(cache_key, source_key=source_key, payload=payload)
+    finally:
+        _finish_signal_performance_background_refresh(cache_key)
+
+
+def _start_signal_performance_background_refresh(
+    session: Session,
+    *,
+    cache_key: tuple[object, ...],
+    window_hours: int,
+    limit: int,
+    selected_window_specs: tuple[tuple[str, int], ...],
+) -> bool:
+    now_monotonic = monotonic()
+    with _signal_performance_report_cache_lock:
+        cached = _signal_performance_report_cache.get(cache_key)
+        if cached is None:
+            return False
+        if _cache_refresh_pending(cached, now_monotonic):
+            return False
+        cached.refresh_started_at = now_monotonic
+
+    bind = session.get_bind()
+    if bind is None:
+        _finish_signal_performance_background_refresh(cache_key)
+        return False
+
+    Thread(
+        target=_rebuild_signal_performance_report_cache,
+        kwargs={
+            "bind": bind,
+            "cache_key": cache_key,
+            "window_hours": window_hours,
+            "limit": limit,
+            "selected_window_specs": selected_window_specs,
+        },
+        daemon=True,
+        name="signal-performance-report-refresh",
+    ).start()
+    return True
+
+
 def _signal_performance_source_key(session: Session) -> tuple[object, ...]:
     safety_event_types = tuple(READINESS_AUDIT_SAFETY_EVENT_TYPES)
     latest_safety_audit = None
@@ -2357,17 +2480,51 @@ def build_signal_performance_report(
         limit,
         selected_window_specs,
     )
-    source_key = _signal_performance_source_key(session)
     now_monotonic = monotonic()
     with _signal_performance_report_cache_lock:
         cached = _signal_performance_report_cache.get(cache_key)
-        if (
-            cached is not None
-            and cached.source_key == source_key
-            and now_monotonic - cached.stored_at <= SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS
-        ):
-            return cached.payload.model_copy(deep=True)
+    if cached is not None:
+        cache_age_seconds = _cache_age_seconds(cached, now_monotonic)
+        if cache_age_seconds <= SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS:
+            return _copy_report_with_cache_state(
+                cached,
+                status="fresh",
+                now_monotonic=now_monotonic,
+                rebuild_pending=False,
+            )
+        started = _start_signal_performance_background_refresh(
+            session,
+            cache_key=cache_key,
+            window_hours=window_hours,
+            limit=limit,
+            selected_window_specs=selected_window_specs,
+        )
+        rebuild_pending = started or _cache_refresh_pending(cached, monotonic())
+        return _copy_report_with_cache_state(
+            cached,
+            status="stale_revalidating" if rebuild_pending else "stale",
+            now_monotonic=now_monotonic,
+            rebuild_pending=rebuild_pending,
+        )
 
+    source_key = _signal_performance_source_key(session)
+    payload = _build_signal_performance_report_uncached(
+        session,
+        window_hours=window_hours,
+        limit=limit,
+        selected_window_specs=selected_window_specs,
+    )
+    _store_signal_performance_report(cache_key, source_key=source_key, payload=payload)
+    return payload
+
+
+def _build_signal_performance_report_uncached(
+    session: Session,
+    *,
+    window_hours: int,
+    limit: int,
+    selected_window_specs: tuple[tuple[str, int], ...],
+) -> SignalPerformanceReportResponse:
     max_window_hours = max((window_hour_count for _window_label, window_hour_count in selected_window_specs), default=window_hours)
     max_since = utcnow_naive() - timedelta(hours=max_window_hours)
     decision_contexts = _load_decision_performance_contexts(session, max_since)
@@ -2432,14 +2589,6 @@ def build_signal_performance_report(
         items=items[:limit],
         windows=windows,
     )
-    with _signal_performance_report_cache_lock:
-        if len(_signal_performance_report_cache) > 16:
-            _signal_performance_report_cache.clear()
-        _signal_performance_report_cache[cache_key] = _CachedSignalPerformanceReport(
-            stored_at=monotonic(),
-            source_key=source_key,
-            payload=payload.model_copy(deep=True),
-        )
     return payload
 
 

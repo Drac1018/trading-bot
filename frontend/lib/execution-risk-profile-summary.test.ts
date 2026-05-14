@@ -1,0 +1,119 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+type ExecutionRiskProfileSummaryModule = typeof import("./execution-risk-profile-summary");
+
+const executionRiskProfileSummaryModule = import(
+  new URL("./execution-risk-profile-summary.ts", import.meta.url).href,
+) as Promise<ExecutionRiskProfileSummaryModule>;
+
+const baseControl = {
+  can_enter_new_position: true,
+  deterministic_market_profile: "NORMAL",
+  ai_recommended_profile: "CAUTION",
+  ai_recommendation_id: "rec-1",
+  ai_recommendation_confidence: 0.81,
+  ai_recommendation_valid_until: "2026-05-13T12:15:00",
+  ai_recommendation_reason_codes: ["VOLATILITY_ELEVATED"],
+  ai_recommendation_status: "shadow_generated",
+  final_active_execution_profile: "CAUTION",
+  shadow_final_execution_profile: null,
+  profile_selection_mode: "conservative_only",
+  profile_selected_reason: "ai_tightened_conservative_only",
+  was_tightened_by_ai: true,
+  was_relaxation_blocked: false,
+  relaxation_block_reason: null,
+  relaxation_block_reason_codes: [],
+  ai_recommendation_ignored_reason_codes: [],
+  next_ai_settings_review_at: "2026-05-13T12:15:00",
+  ai_settings_shadow_mode: false,
+  ai_settings_auto_apply_mode: "conservative_only",
+  profile_new_entry_blocked: false,
+  profile_survival_paths_allowed: true,
+};
+
+test("valid conservative AI recommendation is shown as applied tighten", async () => {
+  const { buildExecutionRiskProfileSummary } = await executionRiskProfileSummaryModule;
+
+  const summary = buildExecutionRiskProfileSummary(baseControl);
+
+  assert.equal(summary.applicationStatus, "applied_tighten");
+  assert.equal(summary.deterministicProfile, "NORMAL");
+  assert.equal(summary.aiRecommendedProfile, "CAUTION");
+  assert.equal(summary.finalActiveProfile, "CAUTION");
+  assert.equal(summary.newEntryLabel, "신규 진입 가능");
+  assert.equal(summary.survivalPathLabel, "허용");
+});
+
+test("expired and low confidence recommendations are shown as ignored", async () => {
+  const { buildExecutionRiskProfileSummary } = await executionRiskProfileSummaryModule;
+
+  const summary = buildExecutionRiskProfileSummary({
+    ...baseControl,
+    ai_recommendation_status: "ignored",
+    was_tightened_by_ai: false,
+    ai_recommendation_ignored_reason_codes: [
+      "AI_MARKET_SETTINGS_RECOMMENDATION_EXPIRED",
+      "AI_MARKET_SETTINGS_RECOMMENDATION_LOW_CONFIDENCE",
+    ],
+  });
+
+  assert.equal(summary.applicationStatus, "ignored");
+  assert.deepEqual(summary.ignoredReasonCodes, [
+    "AI_MARKET_SETTINGS_RECOMMENDATION_EXPIRED",
+    "AI_MARKET_SETTINGS_RECOMMENDATION_LOW_CONFIDENCE",
+  ]);
+});
+
+test("AI relaxation is shown as blocked when deterministic profile is stricter", async () => {
+  const { buildExecutionRiskProfileSummary } = await executionRiskProfileSummaryModule;
+
+  const summary = buildExecutionRiskProfileSummary({
+    ...baseControl,
+    deterministic_market_profile: "HIGH_VOLATILITY",
+    ai_recommended_profile: "NORMAL",
+    final_active_execution_profile: "HIGH_VOLATILITY",
+    profile_selected_reason: "ai_relaxation_blocked",
+    was_tightened_by_ai: false,
+    was_relaxation_blocked: true,
+    relaxation_block_reason_codes: ["PROFILE_RELAXATION_CONSECUTIVE_CONFIRMATIONS"],
+  });
+
+  assert.equal(summary.applicationStatus, "relaxation_blocked");
+  assert.deepEqual(summary.relaxationBlockReasonCodes, ["PROFILE_RELAXATION_CONSECUTIVE_CONFIRMATIONS"]);
+  assert.equal(summary.finalActiveProfile, "HIGH_VOLATILITY");
+});
+
+test("shadow mode does not look like an active block", async () => {
+  const { buildExecutionRiskProfileSummary } = await executionRiskProfileSummaryModule;
+
+  const summary = buildExecutionRiskProfileSummary({
+    ...baseControl,
+    profile_selection_mode: "shadow",
+    ai_settings_auto_apply_mode: "shadow",
+    was_tightened_by_ai: false,
+    shadow_final_execution_profile: "STRESS",
+    final_active_execution_profile: "NORMAL",
+    profile_new_entry_blocked: false,
+  });
+
+  assert.equal(summary.applicationStatus, "shadow");
+  assert.equal(summary.shadowFinalProfile, "STRESS");
+  assert.equal(summary.finalActiveProfile, "NORMAL");
+  assert.equal(summary.newEntryLabel, "신규 진입 가능");
+});
+
+test("backend profile block is displayed separately from survival paths", async () => {
+  const { buildExecutionRiskProfileSummary } = await executionRiskProfileSummaryModule;
+
+  const summary = buildExecutionRiskProfileSummary({
+    ...baseControl,
+    can_enter_new_position: false,
+    final_active_execution_profile: "DEGRADED",
+    profile_new_entry_blocked: true,
+    profile_survival_paths_allowed: true,
+  });
+
+  assert.equal(summary.newEntryLabel, "신규 진입 차단");
+  assert.equal(summary.survivalPathLabel, "허용");
+});

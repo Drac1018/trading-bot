@@ -1,0 +1,21 @@
+⨯ [TypeError: fetch failed] {
+  digest: '3227098399',
+  [cause]: Error: connect ECONNREFUSED 127.0.0.1:8000
+      at <unknown> (Error: connect ECONNREFUSED 127.0.0.1:8000) {
+    errno: -4078,
+    code: 'ECONNREFUSED',
+    syscall: 'connect',
+    address: '127.0.0.1',
+    port: 8000
+  }
+}
+⨯ Error: Module 55730 was instantiated because it was required from module 84501, but the module factory is not available.
+    at instantiateModule (C:\my-trading-bot\frontend\.next\server\chunks\ssr\[turbopack]_runtime.js:845:15)
+    at getOrInstantiateModuleFromParent (C:\my-trading-bot\frontend\.next\server\chunks\ssr\[turbopack]_runtime.js:877:12)
+    at Context.esmImport [as i] (C:\my-trading-bot\frontend\.next\server\chunks\ssr\[turbopack]_runtime.js:281:20)
+    at module evaluation (C:\my-trading-bot\frontend\.next\server\chunks\ssr\components_operator-friendly-dashboard_tsx_06t9mlh._.js:1:87)
+    at instantiateModule (C:\my-trading-bot\frontend\.next\server\chunks\ssr\[turbopack]_runtime.js:853:9)
+    at getOrInstantiateModuleFromParent (C:\my-trading-bot\frontend\.next\server\chunks\ssr\[turbopack]_runtime.js:877:12)
+    at Context.commonJsRequire [as r] (C:\my-trading-bot\frontend\.next\server\chunks\ssr\[turbopack]_runtime.js:302:12) {
+  digest: '4064707464'
+}

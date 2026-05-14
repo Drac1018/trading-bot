@@ -27,6 +27,7 @@ export function MarketView({
       selectedTimeframe={market.selectedTimeframe}
       selectedChartZoomRange={market.selectedChartZoomRange}
       chartCandlesBySymbol={market.chartCandlesBySymbol}
+      chartMarkers={market.chartMarkers}
       renderAutoRefresh={(props) => <MarketChartAutoRefresh {...props} />}
       renderCandlestickChart={(model) => <MarketCandlestickChartIsland model={model} />}
     />

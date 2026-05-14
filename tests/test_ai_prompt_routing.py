@@ -135,6 +135,37 @@ def test_new_entry_prompt_explains_watch_entry_plan_contract() -> None:
     assert "watch_entry_plan=null" in instructions
 
 
+def test_trading_decision_prompt_defines_senior_quant_risk_reviewer_contract() -> None:
+    route = resolve_prompt_route(
+        ai_context=_ai_context(trigger_type="entry_candidate_event", strategy_engine="trend_pullback_engine"),
+        has_open_position=False,
+    )
+    instructions = render_prompt_instructions(route=route)
+
+    assert instructions.startswith(
+        "You are a Senior Quant Risk Reviewer for a Binance Futures short-term trading system."
+    )
+    assert "no authority to execute orders" in instructions
+    assert "deterministic risk_guard validation" in instructions
+    assert "HOLD is the default when data is uncertain, stale, incomplete" in instructions
+    assert "entry-zone confirmation, pullback confirmation, 1m confirmation" in instructions
+    assert "expected RR, estimated slippage, fees, and invalidation level" in instructions
+    assert "protective orders are missing" in instructions
+    assert "hard risk policy wins" in instructions
+    for field_name in (
+        "strategy_id",
+        "regime",
+        "reason_summary",
+        "entry_intent",
+        "entry_zone",
+        "invalidation_level",
+        "risk_notes",
+        "required_confirmations",
+        "hard_blocks_observed",
+    ):
+        assert field_name in instructions
+
+
 def test_invalid_output_bounding_on_protection_review_event() -> None:
     ai_context = _ai_context(trigger_type="protection_review_event", strategy_engine="trend_pullback_engine")
     route = resolve_prompt_route(ai_context=ai_context, has_open_position=True)

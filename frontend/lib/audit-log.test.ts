@@ -32,11 +32,31 @@ const rows: AuditRow[] = [
 ];
 
 test("parseAuditTab falls back to all for unknown values", async () => {
-  const { parseAuditTab } = await auditLogModule;
+  const { parseAuditLimit, parseAuditSort, parseAuditTab } = await auditLogModule;
 
   assert.equal(parseAuditTab("execution"), "execution");
   assert.equal(parseAuditTab("unknown"), "all");
   assert.equal(parseAuditTab(undefined), "all");
+  assert.equal(parseAuditSort("severity"), "severity");
+  assert.equal(parseAuditSort("unknown"), "newest");
+  assert.equal(parseAuditLimit("50"), 50);
+  assert.equal(parseAuditLimit("999"), 30);
+});
+
+test("buildAuditListEndpoint sends filters as API query", async () => {
+  const { buildAuditDetailEndpoint, buildAuditListEndpoint } = await auditLogModule;
+
+  assert.equal(
+    buildAuditListEndpoint({
+      tab: "risk",
+      severity: "warning",
+      q: "BTCUSDT",
+      sort: "oldest",
+      limit: "50",
+    }),
+    "/api/audit?limit=50&sort=oldest&compact=true&tab=risk&severity=warning&q=BTCUSDT",
+  );
+  assert.equal(buildAuditDetailEndpoint(123), "/api/audit/123");
 });
 
 test("getAuditEventCategory and counts stay deterministic", async () => {
@@ -110,6 +130,18 @@ test("describeAuditLegacyReview marks legacy time-based trigger rows separately"
   assert.equal(presentation?.badge, "과거 정책 기록");
   assert.equal(presentation?.rawTriggerReason, "periodic_backstop_due");
   assert.equal(presentation?.legacy, true);
+});
+
+test("describeAuditLegacyReview accepts compact legacy trigger projection", async () => {
+  const { describeAuditLegacyReview } = await auditLogModule;
+
+  const presentation = describeAuditLegacyReview({
+    event_category: "ai_decision",
+    event_type: "agent_output",
+    legacy_review_trigger_reason: "periodic_backstop_due",
+  });
+
+  assert.equal(presentation?.rawTriggerReason, "periodic_backstop_due");
 });
 
 test("describeAuditLegacyReview ignores current runtime trigger reasons", async () => {

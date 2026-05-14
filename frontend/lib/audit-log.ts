@@ -232,6 +232,10 @@ function findLegacyTriggerReason(
 }
 
 export function extractLegacyReviewTriggerReason(row: AuditRow): string | null {
+  const explicit = stringValue(row.legacy_review_trigger_reason);
+  if (legacyReviewTriggerReasons.has(explicit)) {
+    return explicit;
+  }
   return findLegacyTriggerReason(row, new Set<object>(), 0);
 }
 
@@ -260,6 +264,59 @@ export function parseAuditTab(value: string | null | undefined): AuditTab {
     return "all";
   }
   return AUDIT_TAB_ORDER.includes(value as AuditTab) ? (value as AuditTab) : "all";
+}
+
+export function parseAuditSort(value: string | null | undefined): SortMode {
+  if (value === "oldest" || value === "severity") {
+    return value;
+  }
+  return "newest";
+}
+
+export function parseAuditLimit(value: string | number | null | undefined, fallback = 30): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return parsed === 50 || parsed === 100 || parsed === 30 ? parsed : fallback;
+}
+
+function queryValue(value: string | string[] | number | boolean | null | undefined): string | null {
+  if (Array.isArray(value)) {
+    return value[0] ?? null;
+  }
+  return value === null || value === undefined ? null : String(value);
+}
+
+export function buildAuditListEndpoint(
+  query: Record<string, string | string[] | number | boolean | null | undefined>,
+  options: { compact?: boolean } = {},
+): string {
+  const tab = parseAuditTab(queryValue(query.tab));
+  const severity = queryValue(query.severity)?.trim();
+  const search = (queryValue(query.q) ?? queryValue(query.search))?.trim();
+  const sort = parseAuditSort(queryValue(query.sort));
+  const limit = parseAuditLimit(queryValue(query.limit), 30);
+  const params = new URLSearchParams({
+    limit: String(limit),
+    sort,
+  });
+
+  if (options.compact ?? true) {
+    params.set("compact", "true");
+  }
+  if (tab !== "all") {
+    params.set("tab", tab);
+  }
+  if (severity) {
+    params.set("severity", severity);
+  }
+  if (search) {
+    params.set("q", search);
+  }
+
+  return `/api/audit?${params.toString()}`;
+}
+
+export function buildAuditDetailEndpoint(id: string | number): string {
+  return `/api/audit/${encodeURIComponent(String(id))}`;
 }
 
 function normalizeEventCategory(value: string | null | undefined): Exclude<AuditTab, "all"> {

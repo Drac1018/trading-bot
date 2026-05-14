@@ -4,7 +4,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from trading_mvp.models import (
     AgentRun,
     MarketSnapshot,
@@ -20,6 +20,7 @@ from trading_mvp.services.scheduler import (
     get_due_entry_plan_symbols,
     get_due_interval_decision_symbols,
     get_due_position_management_symbols,
+    maybe_refresh_exchange_sync_freshness,
     run_due_operational_cycles,
     run_interval_decision_cycle,
     run_release_enrichment_watch_cycle,
@@ -241,6 +242,63 @@ def _entry_candidate_interval_plan(
     }
 
 
+def _multi_symbol_entry_candidate_interval_plan(*, now, symbols: list[str]) -> dict[str, object]:
+    plans = []
+    for symbol in symbols:
+        trigger = {
+            "trigger_reason": "entry_candidate_event",
+            "symbol": symbol,
+            "timeframe": "15m",
+            "strategy_engine": "trend_pullback_engine",
+            "holding_profile": "scalp",
+            "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+            "trigger_fingerprint": f"{symbol}:entry-candidate-fingerprint",
+            "fingerprint_basis": {"position_state_bucket": "flat"},
+            "fingerprint_changed_fields": [],
+            "last_decision_at": None,
+            "last_material_review_at": now.isoformat(),
+            "forced_review_reason": None,
+            "applied_review_cadence_minutes": 15,
+            "review_cadence_source": "holding_profile_cadence_hint",
+            "holding_profile_cadence_hint": {"holding_profile": "scalp", "decision_interval_minutes": 15},
+            "max_review_age_minutes": 45,
+            "triggered_at": now.isoformat(),
+        }
+        plans.append(
+            {
+                "symbol": symbol,
+                "timeframe": "15m",
+                "cadence": {
+                    "mode": "watch",
+                    "effective_cadence": {
+                        "decision_cycle_interval_minutes": 15,
+                        "ai_call_interval_minutes": 15,
+                    },
+                },
+                "selection_context": {"assigned_slot": "slot_1", "candidate_weight": 0.64},
+                "trigger": trigger,
+                "trigger_deduped": False,
+                "last_decision_at": None,
+                "last_ai_invoked_at": None,
+                "last_material_review_at": now.isoformat(),
+                "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                "applied_review_cadence_minutes": 15,
+                "review_cadence_source": "holding_profile_cadence_hint",
+                "holding_profile_cadence_hint": {"holding_profile": "scalp", "decision_interval_minutes": 15},
+                "max_review_age_minutes": 45,
+                "fingerprint_changed_fields": [],
+                "dedupe_reason": None,
+                "forced_review_reason": None,
+                "last_ai_skip_reason": None,
+            }
+        )
+    return {
+        "generated_at": now.isoformat(),
+        "candidate_selection": {"rankings": []},
+        "plans": plans,
+    }
+
+
 def test_run_due_operational_cycles_isolates_background_workflow_failure(monkeypatch, db_session) -> None:
     calls: list[str] = []
 
@@ -317,6 +375,349 @@ def test_run_due_operational_cycles_can_use_isolated_sessions(monkeypatch, db_se
     assert result == [{"workflow": "position_management_cycle", "results": [{"status": "ok"}]}]
     assert health_event is not None
     assert health_event.payload["workflow"] == "market_refresh_cycle"
+
+
+def test_run_due_operational_cycles_closes_isolated_sessions_on_success_and_failure(
+    monkeypatch,
+    db_session,
+) -> None:
+    calls: list[str] = []
+    opened_session_ids: list[int] = []
+    closed_session_ids: list[int] = []
+
+    class TrackingSession(Session):
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            super().__init__(*args, **kwargs)
+            opened_session_ids.append(id(self))
+
+        def close(self) -> None:
+            closed_session_ids.append(id(self))
+            super().close()
+
+    SessionFactory = sessionmaker(
+        bind=db_session.get_bind(),
+        class_=TrackingSession,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    def fail_market_refresh(session, triggered_by="scheduler"):
+        calls.append("market")
+        raise RuntimeError("market failed")
+
+    def run_release_watch(session, triggered_by="scheduler"):
+        calls.append("release")
+        return {"workflow": "release_enrichment_watch_cycle", "results": []}
+
+    def run_position_management(session, triggered_by="scheduler"):
+        calls.append("position_management")
+        return {"workflow": "position_management_cycle", "results": [{"status": "ok"}]}
+
+    def run_entry_plan_watcher(session):
+        calls.append("entry_plan_watcher")
+        return {"workflow": "entry_plan_watcher_cycle", "results": []}
+
+    def run_decision(session):
+        calls.append("decision")
+        return {"workflow": "interval_decision_cycle", "results": []}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_market_refresh_cycle", fail_market_refresh)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_release_enrichment_watch_cycle", run_release_watch)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_position_management_cycle", run_position_management)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_entry_plan_watcher_cycle", run_entry_plan_watcher)
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_interval_decision_cycle", run_decision)
+
+    result = run_due_operational_cycles(
+        db_session,
+        include_exchange_sync=False,
+        continue_on_error=True,
+        session_factory=SessionFactory,
+    )
+
+    assert calls == ["market", "release", "position_management", "entry_plan_watcher", "decision"]
+    assert result == [{"workflow": "position_management_cycle", "results": [{"status": "ok"}]}]
+    assert len(opened_session_ids) == 5
+    assert sorted(closed_session_ids) == sorted(opened_session_ids)
+
+
+def test_maybe_refresh_exchange_sync_commits_before_external_sync(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = "encrypted-key"
+    settings_row.binance_api_secret_encrypted = "encrypted-secret"
+    db_session.add(settings_row)
+    db_session.flush()
+
+    observed: dict[str, bool] = {}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler._sync_summary_needs_refresh", lambda *args, **kwargs: True)
+    monkeypatch.setattr("trading_mvp.services.scheduler._latest_sync_attempt_at", lambda summary: None)
+
+    def fake_run_exchange_sync(session, triggered_by="scheduler"):  # noqa: ANN001
+        observed["in_transaction"] = session.in_transaction()
+        return {"status": "ok", "triggered_by": triggered_by}
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_exchange_sync_cycle", fake_run_exchange_sync)
+
+    result = maybe_refresh_exchange_sync_freshness(db_session, triggered_by="scheduler:pre_decision")
+
+    assert result == {"status": "ok", "triggered_by": "scheduler:pre_decision"}
+    assert observed == {"in_transaction": False}
+
+
+def test_maybe_refresh_exchange_sync_rolls_back_and_reraises(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = "encrypted-key"
+    settings_row.binance_api_secret_encrypted = "encrypted-secret"
+    db_session.add(settings_row)
+    db_session.flush()
+
+    monkeypatch.setattr("trading_mvp.services.scheduler._sync_summary_needs_refresh", lambda *args, **kwargs: True)
+    monkeypatch.setattr("trading_mvp.services.scheduler._latest_sync_attempt_at", lambda summary: None)
+
+    def fail_exchange_sync(session, triggered_by="scheduler"):  # noqa: ANN001
+        assert session.in_transaction() is False
+        raise RuntimeError("exchange sync failed")
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_exchange_sync_cycle", fail_exchange_sync)
+
+    with pytest.raises(RuntimeError, match="exchange sync failed"):
+        maybe_refresh_exchange_sync_freshness(db_session, triggered_by="scheduler:pre_decision")
+
+    assert db_session.in_transaction() is False
+
+
+def test_interval_scheduler_records_cycle_pre_sync_failure_without_blocking_decision(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: {"generated_at": now.isoformat(), "candidate_selection": {}, "plans": []},
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness",
+        lambda session, *, triggered_by: (_ for _ in ()).throw(RuntimeError("cycle sync failed")),
+    )
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcome = result["results"][0]["outcome"]
+    health_event = db_session.scalar(select(SystemHealthEvent).order_by(SystemHealthEvent.id.desc()).limit(1))
+
+    assert result["pre_decision_exchange_sync_error"] == "cycle sync failed"
+    assert outcome["ai_review_status"] == "no_event"
+    assert outcome["pre_decision_exchange_sync_error"] == "cycle sync failed"
+    assert health_event is not None
+    assert health_event.payload["workflow"] == "interval_decision_cycle"
+    assert health_event.payload["symbol"] is None
+    assert health_event.payload["stage"] == "cycle_pre_decision_exchange_sync"
+
+
+def test_interval_scheduler_records_plan_build_failure_without_poisoning_session(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness",
+        lambda session, *, triggered_by: None,
+    )
+
+    def fail_build_plan(self, **kwargs):  # noqa: ANN001, ARG001
+        raise RuntimeError("decision plan build failed")
+
+    monkeypatch.setattr(TradingOrchestrator, "build_interval_decision_plan", fail_build_plan)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
+    health_event = db_session.scalar(select(SystemHealthEvent).order_by(SystemHealthEvent.id.desc()).limit(1))
+
+    assert result["results"][0]["status"] == "failed"
+    assert result["results"][0]["stage"] == "decision_plan_build"
+    assert result["decision_plan_error"] == "decision plan build failed"
+    assert scheduler_run is not None
+    assert scheduler_run.status == "failed"
+    assert scheduler_run.outcome["stage"] == "decision_plan_build"
+    assert health_event is not None
+    assert health_event.payload["workflow"] == "interval_decision_cycle"
+    assert health_event.payload["stage"] == "decision_plan_build"
+    assert db_session.in_transaction() is True
+    db_session.rollback()
+    assert db_session.in_transaction() is False
+
+
+def test_interval_scheduler_commits_started_run_before_triggered_decision(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    now = utcnow_naive()
+    observed: dict[str, bool] = {}
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _entry_candidate_interval_plan(now=now),
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness",
+        lambda session, *, triggered_by: None,
+    )
+
+    def fake_run_decision_cycle(self, **kwargs):  # noqa: ANN001
+        observed["in_transaction"] = self.session.in_transaction()
+        return {
+            "symbol": "BTCUSDT",
+            "decision_run_id": 101,
+            "risk_check_id": 202,
+            "decision": {"decision": "hold"},
+            "risk_result": {
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            "execution": None,
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": now.isoformat(),
+            "last_ai_skip_reason": None,
+            "ai_skipped_reason": None,
+            "trigger_deduped": False,
+            "trigger_fingerprint": "entry-candidate-fingerprint",
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+
+    assert result["results"][0]["outcome"]["decision"]["decision"] == "hold"
+    assert observed == {"in_transaction": False}
+
+
+def test_interval_scheduler_symbol_sync_failure_does_not_block_next_symbol_or_tick(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT"]
+    _mark_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+    db_session.commit()
+
+    SessionFactory = sessionmaker(
+        bind=db_session.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    now = utcnow_naive()
+    refresh_failures = {"BTCUSDT": 1}
+    decision_symbols: list[str] = []
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _multi_symbol_entry_candidate_interval_plan(
+            now=now,
+            symbols=["BTCUSDT", "ETHUSDT"],
+        ),
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.run_market_refresh_cycle",
+        lambda session, triggered_by="scheduler": {"workflow": "market_refresh_cycle", "results": []},
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.run_release_enrichment_watch_cycle",
+        lambda session, triggered_by="scheduler": {"workflow": "release_enrichment_watch_cycle", "results": []},
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.run_position_management_cycle",
+        lambda session, triggered_by="scheduler": {"workflow": "position_management_cycle", "results": []},
+    )
+    monkeypatch.setattr("trading_mvp.services.scheduler.run_due_entry_plan_watcher_cycle", lambda session: None)
+
+    def fake_refresh(session, *, triggered_by: str):  # noqa: ANN001
+        if triggered_by == "scheduler:pre_decision:BTCUSDT" and refresh_failures["BTCUSDT"] > 0:
+            refresh_failures["BTCUSDT"] -= 1
+            raise RuntimeError("BTCUSDT sync failed")
+        return None
+
+    def fake_run_decision_cycle(self, **kwargs):  # noqa: ANN001
+        symbol = kwargs["symbol"]
+        decision_symbols.append(symbol)
+        return {
+            "symbol": symbol,
+            "decision_run_id": 101,
+            "risk_check_id": 202,
+            "decision": {"decision": "hold"},
+            "risk_result": {
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            "execution": None,
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": now.isoformat(),
+            "last_ai_skip_reason": None,
+            "ai_skipped_reason": None,
+            "trigger_deduped": False,
+            "trigger_fingerprint": f"{symbol}:entry-candidate-fingerprint",
+        }
+
+    monkeypatch.setattr("trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness", fake_refresh)
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    first_result = run_due_operational_cycles(
+        db_session,
+        include_exchange_sync=False,
+        continue_on_error=True,
+        session_factory=SessionFactory,
+    )
+    second_result = run_due_operational_cycles(
+        db_session,
+        include_exchange_sync=False,
+        continue_on_error=True,
+        session_factory=SessionFactory,
+    )
+
+    scheduler_runs = list(
+        db_session.scalars(
+            select(SchedulerRun)
+            .where(SchedulerRun.workflow == "interval_decision_cycle")
+            .order_by(SchedulerRun.id)
+        )
+    )
+    health_event = db_session.scalar(select(SystemHealthEvent).order_by(SystemHealthEvent.id.desc()).limit(1))
+
+    assert decision_symbols == ["ETHUSDT", "BTCUSDT"]
+    assert first_result[0]["results"][0]["status"] == "failed"
+    assert first_result[0]["results"][0]["stage"] == "symbol_pre_decision_exchange_sync"
+    assert first_result[0]["results"][1]["status"] == "success"
+    assert second_result[0]["results"][0]["status"] == "success"
+    assert [row.status for row in scheduler_runs] == ["failed", "success", "success"]
+    assert health_event is not None
+    assert health_event.payload["workflow"] == "interval_decision_cycle"
+    assert health_event.payload["symbol"] == "BTCUSDT"
+    assert health_event.payload["stage"] == "symbol_pre_decision_exchange_sync"
 
 
 def test_abandon_stale_scheduler_runs_marks_only_old_running_rows(db_session) -> None:

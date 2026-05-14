@@ -407,6 +407,27 @@ export type OperatorDashboardPayload = {
     scheduler_status: string | null;
     scheduler_window: string | null;
     scheduler_next_run_at: string | null;
+    deterministic_market_profile: string | null;
+    ai_recommended_profile: string | null;
+    ai_recommendation_id: string | null;
+    ai_recommendation_confidence: number | null;
+    ai_recommendation_valid_until: string | null;
+    ai_recommendation_reason_codes: string[];
+    ai_recommendation_status: string;
+    final_active_execution_profile: string | null;
+    shadow_final_execution_profile: string | null;
+    profile_selection_mode: string;
+    profile_selected_reason: string | null;
+    was_tightened_by_ai: boolean;
+    was_relaxation_blocked: boolean;
+    relaxation_block_reason: string | null;
+    relaxation_block_reason_codes: string[];
+    ai_recommendation_ignored_reason_codes: string[];
+    next_ai_settings_review_at: string | null;
+    ai_settings_shadow_mode: boolean;
+    ai_settings_auto_apply_mode: string;
+    profile_new_entry_blocked: boolean;
+    profile_survival_paths_allowed: boolean;
   };
   symbols: OperatorSymbolSummary[];
   market_signal: {

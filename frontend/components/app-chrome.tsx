@@ -27,23 +27,37 @@ type ChromeNavItem = {
   icon?: ChromeIcon;
 };
 
-const sideNav: ChromeNavItem[] = [
-  { href: "/", label: "대시보드", icon: "home" },
-  { href: "/dashboard/account", label: "계좌 / 잔고", icon: "wallet" },
-  { href: "/dashboard/cost-breakdown", label: "비용 분해", icon: "pie" },
-  { href: "/dashboard/market", label: "시장 상태", icon: "market" },
-  { href: "/dashboard/decisions", label: "AI 판단", icon: "brain" },
-  { href: "/dashboard/positions", label: "포지션", icon: "pie" },
-  { href: "/dashboard/orders", label: "주문 / 체결", icon: "order" },
-  { href: "/dashboard/risk", label: "안전 점검", icon: "shield" },
-  { href: "/dashboard/scheduler", label: "자동 실행", icon: "clock" },
-  { href: "/dashboard/audit", label: "감사 로그", icon: "list" },
-  { href: "/dashboard/settings", label: "설정", icon: "settings" },
+type ChromeNavGroup = {
+  label: string;
+  items: ChromeNavItem[];
+};
+
+const navGroups: ChromeNavGroup[] = [
+  {
+    label: "운영",
+    items: [
+      { href: "/", label: "운영 개요", icon: "home" },
+      { href: "/dashboard/operations", label: "운영 판단", icon: "brain" },
+      { href: "/dashboard/trading", label: "거래 상태", icon: "order" },
+      { href: "/dashboard/market", label: "시장 상태", icon: "market" },
+    ],
+  },
+  {
+    label: "분석 / 추적",
+    items: [
+      { href: "/dashboard/analytics", label: "비용 분석", icon: "pie" },
+      { href: "/dashboard/audit", label: "감사 / 디버그", icon: "list" },
+    ],
+  },
+  {
+    label: "설정",
+    items: [
+      { href: "/dashboard/settings", label: "설정", icon: "settings" },
+    ],
+  },
 ];
 
-const debugNav: ChromeNavItem[] = [
-  { href: "/dashboard/agents", label: "고급 디버그", icon: "debug" },
-];
+const navItems = navGroups.flatMap((group) => group.items);
 
 function isActive(pathname: string, href: string) {
   return href === "/" ? pathname === href : pathname.startsWith(href);
@@ -111,11 +125,11 @@ function SideNavGroup({
   );
 }
 
-function MobileNav({ items, pathname }: { items: ChromeNavItem[]; pathname: string }) {
+function MobileNav({ groups, pathname }: { groups: ChromeNavGroup[]; pathname: string }) {
   const [open, setOpen] = useState(false);
-  const currentItem = items.find((item) => isActive(pathname, item.href)) ?? {
+  const currentItem = navItems.find((item) => isActive(pathname, item.href)) ?? {
     href: "/",
-    label: "대시보드",
+    label: "운영 개요",
     icon: "home" as const,
   };
 
@@ -139,19 +153,28 @@ function MobileNav({ items, pathname }: { items: ChromeNavItem[]; pathname: stri
         </button>
 
         {open ? (
-          <div id="mobile-nav-panel" className="mt-3 grid gap-2 sm:grid-cols-2">
-            {items.map((item) => (
-              <Link
-                key={item.href}
-                href={item.href}
-                onClick={() => setOpen(false)}
-                className={`flex min-h-11 items-center gap-3 rounded-md border border-slate-200 px-4 text-sm font-semibold transition ${navItemClass(
-                  isActive(pathname, item.href),
-                )}`}
-              >
-                {item.icon ? <Icon name={item.icon} className="h-4 w-4 shrink-0" /> : null}
-                <span>{item.label}</span>
-              </Link>
+          <div id="mobile-nav-panel" className="mt-3 space-y-4">
+            {groups.map((group) => (
+              <div key={group.label}>
+                <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">
+                  {group.label}
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {group.items.map((item) => (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      onClick={() => setOpen(false)}
+                      className={`flex min-h-11 items-center gap-3 rounded-md border border-slate-200 px-4 text-sm font-semibold transition ${navItemClass(
+                        isActive(pathname, item.href),
+                      )}`}
+                    >
+                      {item.icon ? <Icon name={item.icon} className="h-4 w-4 shrink-0" /> : null}
+                      <span>{item.label}</span>
+                    </Link>
+                  ))}
+                </div>
+              </div>
             ))}
           </div>
         ) : null}
@@ -182,16 +205,19 @@ export function AppChrome({ children }: { children: React.ReactNode }) {
           <div className="ml-auto" aria-hidden="true" />
         </div>
       </header>
-      <MobileNav items={sideNav} pathname={pathname} />
+      <MobileNav groups={navGroups} pathname={pathname} />
 
       <div className="mx-auto grid max-w-[1680px] gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[230px_minmax(0,1fr)] lg:px-8">
         <aside className="hidden lg:block">
           <nav className="sticky top-28 rounded-lg border border-slate-200 bg-white p-4 shadow-sm" aria-label="좌측 메뉴">
-            <SideNavGroup items={sideNav} pathname={pathname} />
-            <div className="mt-5 border-t border-slate-200 pt-4">
-              <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">디버그</p>
-              <SideNavGroup items={debugNav} pathname={pathname} />
-            </div>
+            {navGroups.map((group, index) => (
+              <div key={group.label} className={index === 0 ? "" : "mt-5 border-t border-slate-200 pt-4"}>
+                <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">
+                  {group.label}
+                </p>
+                <SideNavGroup items={group.items} pathname={pathname} />
+              </div>
+            ))}
           </nav>
         </aside>
         <main className="min-w-0 space-y-6 pb-8 lg:pb-10">{children}</main>

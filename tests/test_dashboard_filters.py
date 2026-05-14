@@ -27,6 +27,7 @@ from trading_mvp.services.dashboard import (
     _latest_rows_by_symbol,
     classify_audit_event,
     get_audit_timeline,
+    get_audit_event_detail,
     get_executions,
     get_operator_dashboard,
     get_orders,
@@ -1093,6 +1094,108 @@ def test_order_and_execution_filters(db_session) -> None:
     assert filtered_executions[0]["symbol"] == "BTCUSDT"
 
 
+def test_order_and_execution_position_filter_compact_payload(db_session) -> None:
+    primary_position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=65000.0,
+        mark_price=65100.0,
+        leverage=1.0,
+        stop_loss=64500.0,
+        take_profit=66000.0,
+    )
+    secondary_position = Position(
+        symbol="ETHUSDT",
+        mode="live",
+        side="short",
+        status="open",
+        quantity=0.2,
+        entry_price=3200.0,
+        mark_price=3190.0,
+        leverage=1.0,
+        stop_loss=3250.0,
+        take_profit=3100.0,
+    )
+    db_session.add_all([primary_position, secondary_position])
+    db_session.flush()
+
+    primary_order = Order(
+        symbol="BTCUSDT",
+        position_id=primary_position.id,
+        side="buy",
+        order_type="market",
+        mode="live",
+        status="filled",
+        external_order_id="btc-position-order",
+        requested_quantity=0.01,
+        requested_price=65000.0,
+        metadata_json={"raw_exchange_response": {"large": "payload"}},
+    )
+    secondary_order = Order(
+        symbol="ETHUSDT",
+        position_id=secondary_position.id,
+        side="sell",
+        order_type="market",
+        mode="live",
+        status="filled",
+        external_order_id="eth-position-order",
+        requested_quantity=0.2,
+        requested_price=3200.0,
+        metadata_json={"raw_exchange_response": {"large": "payload"}},
+    )
+    db_session.add_all([primary_order, secondary_order])
+    db_session.flush()
+
+    db_session.add_all(
+        [
+            Execution(
+                order_id=primary_order.id,
+                position_id=primary_position.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="btc-position-trade",
+                fill_price=65005.0,
+                fill_quantity=0.01,
+                fee_paid=0.1,
+                payload={"raw": {"large": "payload"}},
+            ),
+            Execution(
+                order_id=secondary_order.id,
+                position_id=secondary_position.id,
+                symbol="ETHUSDT",
+                status="filled",
+                external_trade_id="eth-position-trade",
+                fill_price=3195.0,
+                fill_quantity=0.2,
+                fee_paid=0.12,
+                payload={"raw": {"large": "payload"}},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    order_rows = get_orders(db_session, position_id=primary_position.id, compact=True, limit=20)
+    execution_rows = get_executions(db_session, position_id=primary_position.id, compact=True, limit=20)
+
+    assert len(order_rows) == 1
+    assert order_rows[0]["position_id"] == primary_position.id
+    assert order_rows[0]["payload_mode"] == "compact"
+    assert order_rows[0]["close_execution_sync_status"] == "UNKNOWN"
+    assert "metadata_json" not in order_rows[0]
+    assert "raw_exchange_response" not in order_rows[0]
+
+    assert len(execution_rows) == 1
+    assert execution_rows[0]["position_id"] == primary_position.id
+    assert execution_rows[0]["payload_mode"] == "compact"
+    assert execution_rows[0]["external_trade_id"] == "btc-position-trade"
+    assert "payload" not in execution_rows[0]
+    assert "execution_policy" not in execution_rows[0]
+    assert "decision_summary" not in execution_rows[0]
+
+
 def test_orders_mark_missing_close_execution_for_finished_protective_order(db_session) -> None:
     position = Position(
         symbol="BTCUSDT",
@@ -1292,6 +1395,57 @@ def test_audit_filters(db_session) -> None:
     assert len(filtered) == 1
     assert filtered[0]["event_type"] == "scheduler_run_failed"
     assert filtered[0]["event_category"] == "health_system"
+
+
+def test_audit_compact_list_filters_and_detail_lazy_payload(db_session) -> None:
+    risk_event = AuditEvent(
+        event_type="risk_blocked",
+        entity_type="risk_check",
+        entity_id="123",
+        severity="warning",
+        message="Risk guard blocked the entry.",
+        payload={
+            "risk_id": 123,
+            "symbol": "BTCUSDT",
+            "blocked_reason": "POSITION_STATE_STALE",
+            "raw_request": {"large": "payload"},
+        },
+    )
+    execution_event = AuditEvent(
+        event_type="live_execution",
+        entity_type="order",
+        entity_id="456",
+        severity="info",
+        message="Live order filled.",
+        payload={"order_id": 456, "symbol": "ETHUSDT", "raw_response": {"large": "payload"}},
+    )
+    db_session.add_all([risk_event, execution_event])
+    db_session.flush()
+
+    rows = get_audit_timeline(
+        db_session,
+        event_category="risk",
+        severity="warning",
+        search="risk",
+        sort="oldest",
+        compact=True,
+        limit=10,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == risk_event.id
+    assert rows[0]["event_category"] == "risk"
+    assert rows[0]["related_type"] == "risk_id"
+    assert rows[0]["related_id"] == 123
+    assert rows[0]["has_payload"] is True
+    assert "payload" not in rows[0]
+    assert "raw_request" not in rows[0]
+
+    detail = get_audit_event_detail(db_session, risk_event.id)
+
+    assert detail is not None
+    assert detail["payload"]["raw_request"]["large"] == "payload"
+    assert detail["event_category"] == "risk"
 
 
 def test_audit_timeline_projects_active_position_suppression_without_fingerprint(db_session) -> None:
@@ -3035,6 +3189,132 @@ def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db
     assert scheduler_btc["audit_events"] == []
 
 
+def test_scheduler_operator_projection_uses_decision_fact_for_deep_history(db_session) -> None:
+    from trading_mvp.models import AgentRun, DecisionPerformanceFact
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BTCUSDT"
+    settings.tracked_symbols = ["BTCUSDT"]
+    settings.default_timeframe = "15m"
+    db_session.add(settings)
+
+    target_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="deep btc long",
+        input_payload={
+            "features": {
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volatility_regime": "normal",
+                }
+            }
+        },
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "long",
+            "confidence": 0.74,
+            "rationale_codes": ["TREND_UP"],
+            "explanation_short": "Deep history decision should come from fact lookup.",
+        },
+        metadata_json={
+            "source": "llm",
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "trigger_fingerprint": "btc-deep-history-fingerprint",
+        },
+        schema_valid=True,
+        created_at=now - timedelta(hours=3),
+        updated_at=now - timedelta(hours=3),
+    )
+    db_session.add(target_run)
+    db_session.flush()
+
+    db_session.add(
+        DecisionPerformanceFact(
+            decision_run_id=target_run.id,
+            provider_name="openai",
+            symbol="BTCUSDT",
+            timeframe="15m",
+            decision="long",
+            rationale_codes=["TREND_UP"],
+            regime="bullish",
+            trend_alignment="bullish_aligned",
+            telemetry_metadata={"source": "llm"},
+            telemetry_output={"decision": "long"},
+            created_at=target_run.created_at,
+            updated_at=target_run.updated_at,
+        )
+    )
+    db_session.add(
+        MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=now - timedelta(minutes=1),
+            latest_price=70500.0,
+            latest_volume=1200.0,
+            candle_count=120,
+            is_stale=False,
+            is_complete=True,
+            payload={},
+        )
+    )
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision_run_id=target_run.id,
+            allowed=False,
+            decision="long",
+            reason_codes=["POSITION_STATE_STALE"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={"blocked_reason_codes": ["POSITION_STATE_STALE"]},
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    noise_count = OPERATOR_RECENT_ROW_SCAN_LIMIT + OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT + 5
+    db_session.add_all(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="deterministic-mock",
+            summary=f"noise {index}",
+            input_payload={},
+            output_payload={
+                "symbol": f"NOISE{index}USDT",
+                "timeframe": "15m",
+                "decision": "hold",
+                "rationale_codes": ["NOISE"],
+            },
+            metadata_json={},
+            schema_valid=True,
+            created_at=now - timedelta(seconds=index),
+            updated_at=now - timedelta(seconds=index),
+        )
+        for index in range(noise_count)
+    )
+    db_session.flush()
+
+    payload = get_operator_dashboard(db_session, view="scheduler")
+    btc = next(item for item in payload.symbols if item.symbol == "BTCUSDT")
+
+    assert btc.ai_decision.decision_run_id == target_run.id
+    assert btc.ai_decision.last_ai_trigger_reason == "entry_candidate_event"
+    assert btc.ai_decision.decision == "long"
+    assert btc.risk_guard.blocked_reason_codes == ["POSITION_STATE_STALE"]
+    assert btc.event_operator_control is None
+    assert btc.execution.order_id is None
+    assert btc.protection_status.status == "unknown"
+    assert btc.audit_events == []
+
+
 def test_scheduler_api_compact_omits_outcome(testclient_db_factory) -> None:
     TestingSessionLocal = testclient_db_factory("scheduler_compact.db")
 
@@ -3110,7 +3390,12 @@ def test_market_inputs_api_compact_omits_payload_and_keeps_symbol_filter(testcli
                 drawdown_pct=0.01,
                 rsi=58.0,
                 atr=120.0,
-                payload={"multi_timeframe": {"1h": {"trend_score": 1.1}}},
+                payload={
+                    "multi_timeframe": {
+                        "1h": {"trend_score": 1.1},
+                        "4h": {"trend_score": 0.9},
+                    }
+                },
             )
         )
         session.commit()
@@ -3136,6 +3421,7 @@ def test_market_inputs_api_compact_omits_payload_and_keeps_symbol_filter(testcli
     assert [row["symbol"] for row in full_snapshot_payload] == ["BTCUSDT"]
     assert full_snapshot_payload[0]["payload"]["candles"][0]["close"] == 70000.0
     assert all("payload" not in row for row in compact_feature_payload)
+    assert compact_feature_payload[0]["available_timeframes"] == ["15m", "1h", "4h"]
     assert [row["symbol"] for row in full_feature_payload] == ["BTCUSDT"]
     assert full_feature_payload[0]["payload"]["multi_timeframe"]["1h"]["trend_score"] == 1.1
 
@@ -3569,3 +3855,37 @@ def test_audit_api_returns_event_category(testclient_db_factory) -> None:
     payload = response.json()
     assert payload[0]["event_type"] == "live_execution_rejected"
     assert payload[0]["event_category"] == "execution"
+
+
+def test_audit_api_compact_list_omits_payload_and_detail_returns_it(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("audit_compact_detail.db")
+
+    with TestingSessionLocal() as session:
+        event = AuditEvent(
+            event_type="risk_blocked",
+            entity_type="risk_check",
+            entity_id="789",
+            severity="warning",
+            message="Risk guard blocked the entry.",
+            payload={"risk_id": 789, "symbol": "BTCUSDT", "raw": {"large": "payload"}},
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+    with TestClient(app) as client:
+        list_response = client.get("/api/audit?tab=risk&severity=warning&q=risk&limit=5&compact=true")
+        detail_response = client.get(f"/api/audit/{event_id}")
+
+    assert list_response.status_code == 200
+    list_payload = list_response.json()
+    assert len(list_payload) == 1
+    assert list_payload[0]["id"] == event_id
+    assert list_payload[0]["event_category"] == "risk"
+    assert list_payload[0]["related_type"] == "risk_id"
+    assert "payload" not in list_payload[0]
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert detail_payload["payload"]["raw"]["large"] == "payload"
+    assert detail_payload["event_category"] == "risk"

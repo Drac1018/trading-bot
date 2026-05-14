@@ -1,33 +1,23 @@
 "use client";
 
 import { OrdersView } from "../../../../components/dashboard-views";
+import { resolveOrdersQuery } from "../../../../lib/orders-query";
 
-import type { DashboardViewModuleProps, OrderLifecycleTab } from "../dashboard-view-types";
-
-function queryValue(value: string | string[] | undefined) {
-  if (Array.isArray(value)) {
-    return value[0] ?? null;
-  }
-  return value ?? null;
-}
-
-function resolveOrderLifecycleTab(value: string | string[] | undefined): OrderLifecycleTab {
-  const normalized = queryValue(value);
-  if (normalized === "orders" || normalized === "executions") {
-    return normalized;
-  }
-  return "summary";
-}
+import type { DashboardViewModuleProps } from "../dashboard-view-types";
 
 export function OrdersDashboardView({
   query,
   sections,
 }: DashboardViewModuleProps) {
+  const ordersQuery = resolveOrdersQuery(query);
+
   return (
     <OrdersView
       orderRows={sections[0]?.rows ?? []}
       executionRows={sections[1]?.rows ?? []}
-      activeTab={resolveOrderLifecycleTab(query.tab)}
+      activeTab={ordersQuery.tab}
+      selectedSymbol={ordersQuery.symbol}
+      selectedPositionId={ordersQuery.positionId}
     />
   );
 }

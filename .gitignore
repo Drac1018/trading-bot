@@ -1,4 +1,5 @@
 .venv/
+.tools/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -15,5 +16,5 @@ data/
 *.sqlite3
 .env
 .logs/
+tmp/*.log
 frontend/tsconfig.tsbuildinfo
-

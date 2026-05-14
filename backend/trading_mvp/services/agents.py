@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
+from trading_mvp.config import get_settings
 from trading_mvp.enums import AgentRole, OperatingMode, PriorityLevel
 from trading_mvp.models import (
     AgentRun,
@@ -17,11 +22,13 @@ from trading_mvp.providers import ProviderResult, StructuredModelProvider
 from trading_mvp.schemas import (
     AgentRunRecord,
     AIDecisionContextPacket,
+    AIMarketSettingsRecommendation,
     ChiefReviewSummary,
     FeaturePayload,
     MarketSnapshotPayload,
     RiskCheckResult,
     TradeDecision,
+    WatchEntryPlan,
 )
 from trading_mvp.services.adaptive_signal import (
     ADAPTIVE_SETUP_DISABLE_REASON_CODE,
@@ -37,6 +44,15 @@ from trading_mvp.services.ai_prompt_routing import (
     bound_trade_decision,
     render_prompt_instructions,
     resolve_prompt_route,
+)
+from trading_mvp.services.cost_model import (
+    ENTRY_EXECUTION_TYPE_MARKETABLE,
+    ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT,
+    ENTRY_EXECUTION_TYPE_UNKNOWN,
+    CostEstimate,
+    calculate_expected_trade_cost,
+    normalize_entry_execution_type,
+    resolve_cost_model_config,
 )
 from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_POSITION,
@@ -67,6 +83,40 @@ SETUP_CLUSTER_EXEMPT_RATIONALE_CODES = {
     "PROTECTION_RECOVERY",
     "PROTECTION_RESTORE",
 }
+BRACKET_TP_WIDENED_FOR_COST_REASON_CODE = "bracket_tp_widened_for_cost"
+BRACKET_DEMOTED_TO_WATCH_REASON_CODE = "bracket_demoted_to_watch_due_to_thin_net_edge"
+BRACKET_EXPECTED_GROSS_TOO_TIGHT_REASON_CODE = "expected_gross_bps_too_tight"
+BRACKET_EXPECTED_NET_TOO_LOW_REASON_CODE = "expected_net_bps_too_low"
+BRACKET_FEE_TO_GROSS_TOO_HIGH_REASON_CODE = "fee_to_gross_ratio_too_high"
+BRACKET_BTC_LONG_TP_TOO_TIGHT_REASON_CODE = "btc_long_tp_too_tight"
+BRACKET_MIN_GROSS_BPS_DEFAULT = 40.0
+BRACKET_MAX_FEE_TO_GROSS_RATIO_DEFAULT = 0.30
+BRACKET_MIN_RISK_REWARD_RATIO = 1.25
+BRACKET_SYMBOL_SIDE_MIN_GROSS_BPS_DEFAULTS = {
+    "BTCUSDT:long": 40.0,
+    "ETHUSDT:long": 0.0,
+}
+SIZE_REDUCED_LOW_NET_EDGE_REASON_CODE = "size_reduced_due_to_low_net_edge"
+SIZE_CAPPED_HIGH_FEE_REASON_CODE = "size_capped_due_to_high_fee_to_gross"
+SIZE_CAPPED_TIGHT_GROSS_REASON_CODE = "size_capped_due_to_tight_gross_bps"
+NET_EDGE_SIZING_MIN_MULTIPLIER_DEFAULT = 0.45
+NET_EDGE_SIZING_HIGH_FEE_CAP_DEFAULT = 0.65
+NET_EDGE_SIZING_TIGHT_GROSS_CAP_DEFAULT = 0.70
+NET_EDGE_SIZING_TIGHT_GROSS_BPS_DEFAULT = 60.0
+
+
+@dataclass(frozen=True)
+class BracketCostGuardResult:
+    stop_loss: float
+    take_profit: float
+    initial_take_profit: float
+    initial_cost: CostEstimate
+    cost: CostEstimate
+    effective_min_tp_bps: float
+    max_fee_to_gross_ratio: float
+    reason_codes: list[str]
+    widened: bool = False
+    demote_to_watch: bool = False
 
 
 def _summary_from_output(output: BaseModel | dict[str, Any]) -> str:
@@ -96,7 +146,7 @@ def persist_agent_run(
     status: str = "completed",
 ) -> AgentRun:
     now = utcnow_naive()
-    metadata = metadata_json or {}
+    metadata = dict(metadata_json or {})
     derived_status = status
     source = metadata.get("source")
     gate = metadata.get("gate")
@@ -106,6 +156,11 @@ def persist_agent_run(
         elif isinstance(gate, dict) and gate.get("allowed") is False:
             derived_status = "skipped"
     output_payload = output.model_dump(mode="json") if isinstance(output, BaseModel) else output
+    if role == AgentRole.TRADING_DECISION:
+        metadata.setdefault("generated_at", now.isoformat())
+        validity_payload = dict(metadata.get("ai_decision_validity") or {})
+        validity_payload.setdefault("generated_at", metadata["generated_at"])
+        metadata["ai_decision_validity"] = validity_payload
     row = AgentRun(
         role=role.value,
         trigger_event=trigger_event,
@@ -179,6 +234,115 @@ def _setup_cluster_key(
     trend_alignment: str,
 ) -> str:
     return f"{symbol.upper()}|{timeframe}|{scenario}|{entry_mode}|{regime}|{trend_alignment}"
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _settings_float(defaults: object, name: str, fallback: float, *, minimum: float | None = None) -> float:
+    parsed = _optional_float(getattr(defaults, name, None))
+    if parsed is None:
+        parsed = fallback
+    if minimum is not None:
+        parsed = max(parsed, minimum)
+    return parsed
+
+
+def _symbol_side_key(symbol: str, side: str) -> str:
+    return f"{str(symbol or '').upper()}:{str(side or '').lower()}"
+
+
+def _normalize_symbol_side_key(value: object) -> str | None:
+    text = str(value or "").strip()
+    if ":" not in text:
+        return None
+    symbol, side = text.split(":", 1)
+    symbol = symbol.strip().upper()
+    side = side.strip().lower()
+    if not symbol or side not in {"long", "short"}:
+        return None
+    return f"{symbol}:{side}"
+
+
+def _parse_symbol_side_float_map(value: object) -> dict[str, float]:
+    raw = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            raw = {}
+            for item in text.split(","):
+                if "=" not in item:
+                    continue
+                key, raw_value = item.split("=", 1)
+                normalized_key = _normalize_symbol_side_key(key)
+                parsed = _optional_float(raw_value)
+                if normalized_key is not None and parsed is not None and parsed >= 0.0:
+                    raw[normalized_key] = parsed
+    if not isinstance(raw, dict):
+        return {}
+    parsed_map: dict[str, float] = {}
+    for key, raw_value in raw.items():
+        normalized_key = _normalize_symbol_side_key(key)
+        parsed = _optional_float(raw_value)
+        if normalized_key is not None and parsed is not None and parsed >= 0.0:
+            parsed_map[normalized_key] = parsed
+    return parsed_map
+
+
+def _bracket_profitability_thresholds(*, symbol: str, side: str) -> dict[str, Any]:
+    defaults = get_settings()
+    symbol_side_min_tp_bps = dict(BRACKET_SYMBOL_SIDE_MIN_GROSS_BPS_DEFAULTS)
+    symbol_side_min_tp_bps.update(
+        _parse_symbol_side_float_map(getattr(defaults, "symbol_side_min_expected_gross_bps", None))
+    )
+    key = _symbol_side_key(symbol, side)
+    min_default = _settings_float(
+        defaults,
+        "min_expected_gross_bps_default",
+        BRACKET_MIN_GROSS_BPS_DEFAULT,
+        minimum=0.0,
+    )
+    return {
+        "settings": defaults,
+        "symbol_side_key": key,
+        "symbol_side_min_tp_bps": symbol_side_min_tp_bps,
+        "effective_min_tp_bps": symbol_side_min_tp_bps.get(key, min_default),
+        "max_fee_to_gross_ratio": _settings_float(
+            defaults,
+            "max_fee_to_gross_ratio",
+            BRACKET_MAX_FEE_TO_GROSS_RATIO_DEFAULT,
+            minimum=0.0,
+        ),
+    }
+
+
+def _expected_gross_bps_for_tp(*, side: str, entry_price: float, take_profit: float) -> float | None:
+    if entry_price <= 0.0:
+        return None
+    if side == "long" and take_profit > entry_price:
+        return ((take_profit - entry_price) / entry_price) * 10_000
+    if side == "short" and take_profit < entry_price:
+        return ((entry_price - take_profit) / entry_price) * 10_000
+    return None
+
+
+def _take_profit_for_gross_bps(*, side: str, entry_price: float, gross_bps: float) -> float | None:
+    if entry_price <= 0.0 or gross_bps <= 0.0:
+        return None
+    if side == "long":
+        return round(entry_price * (1.0 + gross_bps / 10_000), 2)
+    target = entry_price * (1.0 - gross_bps / 10_000)
+    return round(target, 2) if target > 0.0 else None
 
 
 def build_trading_decision_input_payload(
@@ -274,6 +438,87 @@ class TradingDecisionAgent:
                 seen.add(normalized)
                 ordered.append(normalized)
         return ordered
+
+    @staticmethod
+    def _spread_cost_bps_for_bracket(
+        *,
+        market_snapshot: MarketSnapshotPayload | None,
+        features: FeaturePayload,
+    ) -> float:
+        spread_bps = _optional_float(features.derivatives.spread_bps)
+        if spread_bps is not None:
+            return max(spread_bps, 0.0)
+        if market_snapshot is not None:
+            spread_bps = _optional_float(market_snapshot.derivatives_context.spread_bps)
+            if spread_bps is not None:
+                return max(spread_bps, 0.0)
+            best_bid = _optional_float(features.derivatives.best_bid) or _optional_float(
+                market_snapshot.derivatives_context.best_bid
+            )
+            best_ask = _optional_float(features.derivatives.best_ask) or _optional_float(
+                market_snapshot.derivatives_context.best_ask
+            )
+            if best_bid is not None and best_ask is not None and best_bid > 0.0 and best_ask > best_bid:
+                midpoint = (best_bid + best_ask) / 2.0
+                return ((best_ask - best_bid) / midpoint) * 10_000
+        return 0.0
+
+    @staticmethod
+    def _entry_execution_type_for_bracket(entry_mode: str | None) -> str:
+        normalized = normalize_entry_execution_type(entry_mode)
+        if normalized is not None:
+            return normalized
+        entry_mode_text = str(entry_mode or "").strip().lower()
+        if entry_mode_text in {"immediate", "breakout_confirm"}:
+            return ENTRY_EXECUTION_TYPE_MARKETABLE
+        if entry_mode_text == "pullback_confirm":
+            return ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+        return ENTRY_EXECUTION_TYPE_UNKNOWN
+
+    @staticmethod
+    def _bracket_cost_failure_reasons(
+        *,
+        cost: CostEstimate,
+        symbol_side_key: str,
+        effective_min_tp_bps: float,
+        max_fee_to_gross_ratio: float,
+    ) -> list[str]:
+        reason_codes: list[str] = []
+        expected_gross_bps = cost.expected_gross_bps
+        if expected_gross_bps is None or expected_gross_bps <= 0.0:
+            reason_codes.append(BRACKET_EXPECTED_GROSS_TOO_TIGHT_REASON_CODE)
+        else:
+            if expected_gross_bps < effective_min_tp_bps:
+                reason_codes.append(BRACKET_EXPECTED_GROSS_TOO_TIGHT_REASON_CODE)
+                if symbol_side_key == "BTCUSDT:long":
+                    reason_codes.append(BRACKET_BTC_LONG_TP_TOO_TIGHT_REASON_CODE)
+            if cost.expected_net_bps is None or cost.expected_net_bps < cost.min_required_net_bps:
+                reason_codes.append(BRACKET_EXPECTED_NET_TOO_LOW_REASON_CODE)
+            if (
+                cost.fee_to_gross_ratio is not None
+                and max_fee_to_gross_ratio >= 0.0
+                and cost.fee_to_gross_ratio > max_fee_to_gross_ratio
+            ):
+                reason_codes.append(BRACKET_FEE_TO_GROSS_TOO_HIGH_REASON_CODE)
+        return TradingDecisionAgent._unique_reason_codes(reason_codes)
+
+    @staticmethod
+    def _planned_rr_for_bracket(
+        *,
+        side: Literal["long", "short"],
+        price: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> float | None:
+        if side == "long":
+            risk = price - stop_loss
+            reward = take_profit - price
+        else:
+            risk = stop_loss - price
+            reward = price - take_profit
+        if risk <= 0.0 or reward <= 0.0:
+            return None
+        return reward / risk
 
     @staticmethod
     def _data_quality_penalty_level(ai_context: AIDecisionContextPacket | None) -> str:
@@ -640,6 +885,177 @@ class TradingDecisionAgent:
             return round(safe_price - safe_atr * stop_multiple, 2), round(safe_price + safe_atr * take_multiple, 2)
         return round(safe_price + safe_atr * stop_multiple, 2), round(safe_price - safe_atr * take_multiple, 2)
 
+    def _adaptive_brackets_with_cost_guard(
+        self,
+        side: Literal["long", "short"],
+        *,
+        symbol: str,
+        price: float,
+        atr: float,
+        features: FeaturePayload,
+        market_snapshot: MarketSnapshotPayload | None = None,
+        entry_mode: str | None = None,
+    ) -> BracketCostGuardResult:
+        stop_loss, take_profit = self._adaptive_brackets(side, price=price, atr=atr, features=features)
+        return self._evaluate_bracket_cost_guard(
+            side,
+            symbol=symbol,
+            price=price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            features=features,
+            market_snapshot=market_snapshot,
+            entry_mode=entry_mode,
+        )
+
+    def _evaluate_bracket_cost_guard(
+        self,
+        side: Literal["long", "short"],
+        *,
+        symbol: str,
+        price: float,
+        stop_loss: float,
+        take_profit: float,
+        features: FeaturePayload,
+        market_snapshot: MarketSnapshotPayload | None = None,
+        entry_mode: str | None = None,
+    ) -> BracketCostGuardResult:
+        thresholds = _bracket_profitability_thresholds(symbol=symbol, side=side)
+        effective_min_tp_bps = float(thresholds["effective_min_tp_bps"])
+        max_fee_to_gross_ratio = float(thresholds["max_fee_to_gross_ratio"])
+        symbol_side_key = str(thresholds["symbol_side_key"])
+        cost_model_config = resolve_cost_model_config(thresholds["settings"])
+        entry_execution_type = self._entry_execution_type_for_bracket(entry_mode)
+        spread_cost_bps = self._spread_cost_bps_for_bracket(
+            market_snapshot=market_snapshot,
+            features=features,
+        )
+        expected_gross_bps = _expected_gross_bps_for_tp(
+            side=side,
+            entry_price=price,
+            take_profit=take_profit,
+        )
+        initial_cost = calculate_expected_trade_cost(
+            entry_execution_type=entry_execution_type,
+            expected_gross_bps=expected_gross_bps,
+            spread_cost_bps=spread_cost_bps,
+            config=cost_model_config,
+        )
+        initial_reason_codes = self._bracket_cost_failure_reasons(
+            cost=initial_cost,
+            symbol_side_key=symbol_side_key,
+            effective_min_tp_bps=effective_min_tp_bps,
+            max_fee_to_gross_ratio=max_fee_to_gross_ratio,
+        )
+        if not initial_reason_codes:
+            return BracketCostGuardResult(
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                initial_take_profit=take_profit,
+                initial_cost=initial_cost,
+                cost=initial_cost,
+                effective_min_tp_bps=effective_min_tp_bps,
+                max_fee_to_gross_ratio=max_fee_to_gross_ratio,
+                reason_codes=[],
+            )
+
+        required_gross_bps = max(
+            effective_min_tp_bps,
+            initial_cost.expected_cost_bps + initial_cost.min_required_net_bps,
+        )
+        if max_fee_to_gross_ratio > 0.0:
+            required_gross_bps = max(required_gross_bps, initial_cost.round_trip_fee_bps / max_fee_to_gross_ratio)
+        else:
+            required_gross_bps = float("inf")
+        if initial_cost.expected_gross_bps is not None:
+            required_gross_bps = max(required_gross_bps, initial_cost.expected_gross_bps)
+
+        widened_take_profit = (
+            _take_profit_for_gross_bps(
+                side=side,
+                entry_price=price,
+                gross_bps=required_gross_bps + 1.0,
+            )
+            if required_gross_bps < 10_000.0
+            else None
+        )
+        widened_rr = (
+            self._planned_rr_for_bracket(
+                side=side,
+                price=price,
+                stop_loss=stop_loss,
+                take_profit=widened_take_profit,
+            )
+            if widened_take_profit is not None
+            else None
+        )
+        if widened_take_profit is None or widened_rr is None or widened_rr < BRACKET_MIN_RISK_REWARD_RATIO:
+            demote_reasons = self._unique_reason_codes(
+                initial_reason_codes,
+                [BRACKET_DEMOTED_TO_WATCH_REASON_CODE],
+            )
+            return BracketCostGuardResult(
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                initial_take_profit=take_profit,
+                initial_cost=initial_cost,
+                cost=initial_cost,
+                effective_min_tp_bps=effective_min_tp_bps,
+                max_fee_to_gross_ratio=max_fee_to_gross_ratio,
+                reason_codes=demote_reasons,
+                demote_to_watch=True,
+            )
+
+        widened_gross_bps = _expected_gross_bps_for_tp(
+            side=side,
+            entry_price=price,
+            take_profit=widened_take_profit,
+        )
+        widened_cost = calculate_expected_trade_cost(
+            entry_execution_type=entry_execution_type,
+            expected_gross_bps=widened_gross_bps,
+            spread_cost_bps=spread_cost_bps,
+            config=cost_model_config,
+        )
+        widened_reason_codes = self._bracket_cost_failure_reasons(
+            cost=widened_cost,
+            symbol_side_key=symbol_side_key,
+            effective_min_tp_bps=effective_min_tp_bps,
+            max_fee_to_gross_ratio=max_fee_to_gross_ratio,
+        )
+        if widened_reason_codes:
+            demote_reasons = self._unique_reason_codes(
+                initial_reason_codes,
+                widened_reason_codes,
+                [BRACKET_DEMOTED_TO_WATCH_REASON_CODE],
+            )
+            return BracketCostGuardResult(
+                stop_loss=stop_loss,
+                take_profit=widened_take_profit,
+                initial_take_profit=take_profit,
+                initial_cost=initial_cost,
+                cost=widened_cost,
+                effective_min_tp_bps=effective_min_tp_bps,
+                max_fee_to_gross_ratio=max_fee_to_gross_ratio,
+                reason_codes=demote_reasons,
+                demote_to_watch=True,
+            )
+
+        return BracketCostGuardResult(
+            stop_loss=stop_loss,
+            take_profit=widened_take_profit,
+            initial_take_profit=take_profit,
+            initial_cost=initial_cost,
+            cost=widened_cost,
+            effective_min_tp_bps=effective_min_tp_bps,
+            max_fee_to_gross_ratio=max_fee_to_gross_ratio,
+            reason_codes=self._unique_reason_codes(
+                initial_reason_codes,
+                [BRACKET_TP_WIDENED_FOR_COST_REASON_CODE],
+            ),
+            widened=True,
+        )
+
     @staticmethod
     def _confidence(features: FeaturePayload) -> float:
         confidence = 0.22 + min(abs(features.trend_score) / 2.5, 0.32)
@@ -887,12 +1303,39 @@ class TradingDecisionAgent:
         update: dict[str, Any] = {}
         if decision.prompt_family_hint is None and ai_context.prompt_family_hint is not None:
             update["prompt_family_hint"] = ai_context.prompt_family_hint
+        if decision.strategy_id is None and ai_context.strategy_engine is not None:
+            update["strategy_id"] = ai_context.strategy_engine
+        if decision.regime is None:
+            update["regime"] = (
+                f"{ai_context.composite_regime.structure_regime}:"
+                f"{ai_context.composite_regime.direction_regime}:"
+                f"{ai_context.composite_regime.volatility_regime}"
+            )
         if decision.regime_transition_risk is None:
             update["regime_transition_risk"] = ai_context.composite_regime.transition_risk
         if not decision.data_quality_penalty_applied:
             update["data_quality_penalty_applied"] = ai_context.data_quality.data_quality_grade != "complete"
         if decision.quality_penalty_level == "none":
             update["quality_penalty_level"] = self._data_quality_penalty_level(ai_context)
+        observed_blocks = list(dict.fromkeys([*ai_context.blocked_reason_codes, *ai_context.data_quality.stale_context_flags]))
+        if ai_context.data_quality.data_quality_grade in {"degraded", "unavailable"}:
+            observed_blocks.append(f"DATA_QUALITY_{ai_context.data_quality.data_quality_grade.upper()}")
+        if not ai_context.data_quality.account_state_trustworthy:
+            observed_blocks.append("ACCOUNT_STATE_UNTRUSTWORTHY")
+        if not ai_context.data_quality.market_state_trustworthy:
+            observed_blocks.append("MARKET_STATE_UNTRUSTWORTHY")
+        observed_blocks = list(dict.fromkeys(observed_blocks))
+        if not decision.hard_blocks_observed and observed_blocks:
+            update["hard_blocks_observed"] = observed_blocks
+        if not decision.risk_notes and observed_blocks:
+            update["risk_notes"] = observed_blocks
+        if not decision.required_confirmations and decision.decision in {"long", "short"}:
+            update["required_confirmations"] = [
+                "entry_zone_confirmation",
+                "pullback_or_breakout_confirmation",
+                "rr_after_cost_preserved",
+                "risk_guard_final_approval",
+            ]
         if not decision.invalidation_reason_codes and decision.decision in {"long", "short"} and decision.invalidation_price is not None:
             update["invalidation_reason_codes"] = ["INVALIDATION_PRICE_BREACH"]
         if decision.decision in {"long", "short"}:
@@ -1628,11 +2071,257 @@ class TradingDecisionAgent:
         normalized_rationale_codes = list(
             dict.fromkeys(list(decision.rationale_codes) + ["DETERMINISTIC_HARD_STOP_ACTIVE"])
         )
-        return decision.model_copy(
+        updated_decision = decision.model_copy(
             update={
                 "stop_loss": deterministic_stop_loss,
                 "take_profit": take_profit,
                 "rationale_codes": normalized_rationale_codes,
+            }
+        )
+        return self._apply_bracket_cost_guard_to_decision(
+            updated_decision,
+            market_snapshot=market_snapshot,
+            features=features,
+        )
+
+    def _apply_bracket_cost_guard_to_decision(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+    ) -> TradeDecision:
+        if decision.decision not in {"long", "short"}:
+            return decision
+        if set(decision.rationale_codes) & SETUP_CLUSTER_EXEMPT_RATIONALE_CODES:
+            return decision
+        if decision.stop_loss is None or decision.take_profit is None:
+            return decision
+        reference_price = self._deterministic_entry_reference_price(
+            decision,
+            market_snapshot=market_snapshot,
+        )
+        bracket_guard = self._evaluate_bracket_cost_guard(
+            decision.decision,
+            symbol=decision.symbol,
+            price=reference_price,
+            stop_loss=decision.stop_loss,
+            take_profit=decision.take_profit,
+            features=features,
+            market_snapshot=market_snapshot,
+            entry_mode=decision.entry_mode,
+        )
+        if not bracket_guard.reason_codes:
+            return decision
+
+        reason_codes = self._unique_reason_codes(decision.rationale_codes, bracket_guard.reason_codes)
+        if not bracket_guard.demote_to_watch:
+            return decision.model_copy(
+                update={
+                    "take_profit": bracket_guard.take_profit,
+                    "rationale_codes": reason_codes,
+                    "primary_reason_codes": self._unique_reason_codes(
+                        decision.primary_reason_codes,
+                        bracket_guard.reason_codes,
+                    ),
+                }
+            )
+
+        watch_reason_codes = self._unique_reason_codes(
+            bracket_guard.reason_codes,
+            ["AI_WATCH_ENTRY_PLAN"],
+        )
+        watch_entry_plan = WatchEntryPlan(
+            side=decision.decision,
+            entry_zone_min=decision.entry_zone_min,
+            entry_zone_max=decision.entry_zone_max,
+            entry_mode=decision.entry_mode or "pullback_confirm",
+            invalidation_price=decision.invalidation_price or bracket_guard.stop_loss,
+            max_chase_bps=decision.max_chase_bps,
+            idea_ttl_minutes=decision.idea_ttl_minutes or 15,
+            stop_loss=bracket_guard.stop_loss,
+            take_profit=bracket_guard.take_profit,
+            reason_codes=watch_reason_codes,
+        )
+        return decision.model_copy(
+            update={
+                "decision": "hold",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
+                "entry_mode": "none",
+                "invalidation_price": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "watch_entry_plan": watch_entry_plan,
+                "rationale_codes": reason_codes,
+                "primary_reason_codes": self._unique_reason_codes(
+                    decision.primary_reason_codes,
+                    bracket_guard.reason_codes,
+                ),
+                "no_trade_reason_codes": self._unique_reason_codes(
+                    decision.no_trade_reason_codes,
+                    bracket_guard.reason_codes,
+                ),
+                "explanation_short": "Bracket net edge is too thin for a confirmed entry.",
+                "explanation_detailed": (
+                    "The generated take-profit bracket did not clear the shared cost model after fees, "
+                    "slippage, and spread. The idea is kept as a watch entry plan instead of a confirmed entry."
+                ),
+            }
+        )
+
+    def _cost_estimate_for_decision_entry(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+    ) -> tuple[CostEstimate, dict[str, Any]] | None:
+        if decision.decision not in {"long", "short"}:
+            return None
+        if decision.take_profit is None:
+            return None
+        reference_price = self._deterministic_entry_reference_price(
+            decision,
+            market_snapshot=market_snapshot,
+        )
+        expected_gross_bps = _expected_gross_bps_for_tp(
+            side=decision.decision,
+            entry_price=reference_price,
+            take_profit=decision.take_profit,
+        )
+        thresholds = _bracket_profitability_thresholds(symbol=decision.symbol, side=decision.decision)
+        cost = calculate_expected_trade_cost(
+            entry_execution_type=self._entry_execution_type_for_bracket(decision.entry_mode),
+            expected_gross_bps=expected_gross_bps,
+            spread_cost_bps=self._spread_cost_bps_for_bracket(
+                market_snapshot=market_snapshot,
+                features=features,
+            ),
+            config=resolve_cost_model_config(thresholds["settings"]),
+        )
+        return cost, thresholds
+
+    def _apply_net_edge_sizing_to_decision(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+    ) -> TradeDecision:
+        if decision.decision not in {"long", "short"}:
+            return decision
+        if set(decision.rationale_codes) & SETUP_CLUSTER_EXEMPT_RATIONALE_CODES:
+            return decision
+
+        cost_context = self._cost_estimate_for_decision_entry(
+            decision,
+            market_snapshot=market_snapshot,
+            features=features,
+        )
+        if cost_context is None:
+            return decision
+        cost, thresholds = cost_context
+        if cost.expected_gross_bps is None:
+            return decision
+
+        defaults = thresholds["settings"]
+        min_multiplier = self._clamp(
+            _settings_float(
+                defaults,
+                "net_edge_sizing_min_multiplier",
+                NET_EDGE_SIZING_MIN_MULTIPLIER_DEFAULT,
+                minimum=0.0,
+            ),
+            0.0,
+            1.0,
+        )
+        high_fee_cap = self._clamp(
+            _settings_float(
+                defaults,
+                "net_edge_sizing_high_fee_cap",
+                NET_EDGE_SIZING_HIGH_FEE_CAP_DEFAULT,
+                minimum=0.0,
+            ),
+            0.0,
+            1.0,
+        )
+        tight_gross_cap = self._clamp(
+            _settings_float(
+                defaults,
+                "net_edge_sizing_tight_gross_cap",
+                NET_EDGE_SIZING_TIGHT_GROSS_CAP_DEFAULT,
+                minimum=0.0,
+            ),
+            0.0,
+            1.0,
+        )
+        configured_tight_gross_bps = _settings_float(
+            defaults,
+            "net_edge_sizing_tight_gross_bps",
+            NET_EDGE_SIZING_TIGHT_GROSS_BPS_DEFAULT,
+            minimum=0.0,
+        )
+        tight_gross_bps = max(configured_tight_gross_bps, float(thresholds["effective_min_tp_bps"]))
+
+        multiplier = 1.0
+        reason_codes: list[str] = []
+        expected_net_bps = cost.expected_net_bps
+        min_required_net_bps = max(float(cost.min_required_net_bps), 0.0)
+        if expected_net_bps is not None:
+            if expected_net_bps <= min_required_net_bps:
+                multiplier = min(multiplier, min_multiplier)
+                reason_codes.append(SIZE_REDUCED_LOW_NET_EDGE_REASON_CODE)
+            elif min_required_net_bps > 0.0 and expected_net_bps < min_required_net_bps * 2.0:
+                net_edge_progress = self._clamp(
+                    (expected_net_bps - min_required_net_bps) / min_required_net_bps,
+                    0.0,
+                    1.0,
+                )
+                net_edge_multiplier = min_multiplier + ((1.0 - min_multiplier) * net_edge_progress)
+                if net_edge_multiplier < 0.999:
+                    multiplier = min(multiplier, net_edge_multiplier)
+                    reason_codes.append(SIZE_REDUCED_LOW_NET_EDGE_REASON_CODE)
+
+        max_fee_to_gross_ratio = float(thresholds["max_fee_to_gross_ratio"])
+        if cost.fee_to_gross_ratio is not None and max_fee_to_gross_ratio > 0.0:
+            high_fee_trigger = max_fee_to_gross_ratio * 0.7
+            if cost.fee_to_gross_ratio >= high_fee_trigger:
+                multiplier = min(multiplier, high_fee_cap)
+                reason_codes.append(SIZE_CAPPED_HIGH_FEE_REASON_CODE)
+
+        if tight_gross_bps > 0.0 and cost.expected_gross_bps < tight_gross_bps:
+            multiplier = min(multiplier, tight_gross_cap)
+            reason_codes.append(SIZE_CAPPED_TIGHT_GROSS_REASON_CODE)
+
+        reason_codes = self._unique_reason_codes(reason_codes)
+        if not reason_codes:
+            return decision
+
+        adjusted_risk_pct = round(max(float(decision.risk_pct) * multiplier, 0.001), 4)
+        payoff_summary = dict(decision.expected_payoff_efficiency_hint_summary or {})
+        payoff_summary.update(
+            {
+                "expected_gross_bps": cost.expected_gross_bps,
+                "round_trip_fee_bps": cost.round_trip_fee_bps,
+                "expected_slippage_bps": cost.expected_slippage_bps,
+                "spread_cost_bps": cost.spread_cost_bps,
+                "expected_net_bps": cost.expected_net_bps,
+                "fee_to_gross_ratio": cost.fee_to_gross_ratio,
+                "min_required_net_bps": cost.min_required_net_bps,
+                "net_edge_size_multiplier": round(multiplier, 6),
+                "risk_pct_before_net_edge_sizing": round(float(decision.risk_pct), 6),
+                "risk_pct_after_net_edge_sizing": adjusted_risk_pct,
+            }
+        )
+        return decision.model_copy(
+            update={
+                "risk_pct": adjusted_risk_pct,
+                "rationale_codes": self._unique_reason_codes(decision.rationale_codes, reason_codes),
+                "primary_reason_codes": self._unique_reason_codes(decision.primary_reason_codes, reason_codes),
+                "expected_payoff_efficiency_hint_summary": payoff_summary,
             }
         )
 
@@ -2543,7 +3232,7 @@ class TradingDecisionAgent:
             stop_loss = open_position.stop_loss
             take_profit = open_position.take_profit
 
-        return self._normalize_entry_trigger_fields(
+        normalized_decision = self._normalize_entry_trigger_fields(
             TradeDecision(
                 decision=decision,
                 confidence=round(confidence, 4),
@@ -2563,6 +3252,13 @@ class TradingDecisionAgent:
             market_snapshot=market_snapshot,
             features=features,
         )
+        if open_position is None:
+            normalized_decision = self._apply_bracket_cost_guard_to_decision(
+                normalized_decision,
+                market_snapshot=market_snapshot,
+                features=features,
+            )
+        return normalized_decision
 
     def _deterministic_decision_baseline_old(
         self,
@@ -2708,7 +3404,7 @@ class TradingDecisionAgent:
             stop_loss = open_position.stop_loss
             take_profit = open_position.take_profit
 
-        return self._normalize_entry_trigger_fields(
+        normalized_decision = self._normalize_entry_trigger_fields(
             TradeDecision(
                 decision=decision,
                 confidence=round(confidence, 4),
@@ -2728,6 +3424,13 @@ class TradingDecisionAgent:
             market_snapshot=market_snapshot,
             features=features,
         )
+        if open_position is None:
+            normalized_decision = self._apply_bracket_cost_guard_to_decision(
+                normalized_decision,
+                market_snapshot=market_snapshot,
+                features=features,
+            )
+        return normalized_decision
 
     def _deterministic_decision(
         self,
@@ -2819,6 +3522,11 @@ class TradingDecisionAgent:
             )
             decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
             decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
+            decision = self._apply_net_edge_sizing_to_decision(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+            )
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -2887,6 +3595,11 @@ class TradingDecisionAgent:
             decision = decision.model_copy(update={"provider_status": "deterministic"})
             decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
             decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
+            decision = self._apply_net_edge_sizing_to_decision(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+            )
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -3077,6 +3790,39 @@ class TradingDecisionAgent:
                     "explanation_short": baseline.explanation_short,
                 },
                 "strategy_engine_selection": strategy_engine_selection,
+                "ai_response_contract": {
+                    "decision_authority": "intent_only_no_order_execution",
+                    "final_execution_gate": "deterministic_risk_guard",
+                    "default_when_uncertain": "hold",
+                    "review_required": [
+                        "regime",
+                        "volatility",
+                        "liquidity",
+                        "trend_alignment",
+                        "range_structure",
+                        "momentum",
+                        "vwap_context",
+                        "expected_rr",
+                        "slippage",
+                        "fees",
+                        "invalidation_level",
+                        "protective_order_state",
+                    ],
+                    "preferred_schema_fields": [
+                        "decision",
+                        "symbol",
+                        "strategy_id",
+                        "regime",
+                        "confidence",
+                        "reason_summary",
+                        "entry_intent",
+                        "entry_zone",
+                        "invalidation_level",
+                        "risk_notes",
+                        "required_confirmations",
+                        "hard_blocks_observed",
+                    ],
+                },
                 "logic_variant": logic_variant,
             }
             if ai_context_payload is not None:
@@ -3132,6 +3878,11 @@ class TradingDecisionAgent:
                 provider_status="ok",
             )
             decision = bounded_result.decision
+            decision = self._apply_net_edge_sizing_to_decision(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+            )
             agreement_baseline, agreement_baseline_source = self._agreement_baseline_from_strategy_engine(
                 baseline,
                 strategy_engine_selection,
@@ -3212,6 +3963,11 @@ class TradingDecisionAgent:
                 decision = decision.model_copy(update={"provider_status": provider_status})
             decision = self._apply_ai_schema_fields(decision, ai_context=resolved_ai_context)
             decision = decision.model_copy(update={key: value for key, value in prior_metadata.items() if key in TradeDecision.model_fields})
+            decision = self._apply_net_edge_sizing_to_decision(
+                decision,
+                market_snapshot=market_snapshot,
+                features=features,
+            )
             decision_agreement = self._build_decision_agreement(
                 baseline,
                 decision,
@@ -3252,6 +4008,228 @@ class TradingDecisionAgent:
             )
             metadata.update(prior_metadata)
             return decision, "deterministic-mock", metadata
+
+
+MARKET_SETTINGS_ALLOWED_PROFILES = (
+    "NORMAL",
+    "CAUTION",
+    "HIGH_VOLATILITY",
+    "THIN_LIQUIDITY",
+    "STRESS",
+    "DEGRADED",
+)
+MARKET_SETTINGS_ALLOWED_NEW_ENTRY_POLICIES = (
+    "NORMAL_ALLOWED",
+    "PULLBACK_ONLY",
+    "STRICT_CONFIRMATION_ONLY",
+    "NO_NEW_ENTRY",
+)
+
+
+def render_market_settings_advisor_instructions() -> str:
+    return (
+        "You are a Senior Quant Risk Reviewer for a Binance Futures short-term trading system. "
+        "You are the AI Market Settings Advisor, separate from the Trading Decision AI. "
+        "Your only task is to recommend one predefined execution risk profile from the allowed profile_id list. "
+        "You must not output, invent, tune, or request raw settings values such as slippage, leverage, position size, "
+        "RR thresholds, loss limits, strategy thresholds, or fee thresholds. "
+        "You have no order execution authority. Your recommendation cannot bypass deterministic risk_guard, "
+        "pause/live control, protective-order checks, or the settings controller. "
+        "If market data is stale or incomplete, sync is untrusted, protective orders are missing or uncertain, "
+        "liquidity is thin, or volatility expands abruptly, prefer a conservative profile and NO_NEW_ENTRY. "
+        "When uncertain, do not relax to NORMAL; evaluate CAUTION, STRESS, DEGRADED, or NO_NEW_ENTRY first. "
+        f"Allowed profile_id values: {', '.join(MARKET_SETTINGS_ALLOWED_PROFILES)}. "
+        f"Allowed suggested_new_entry_policy values: {', '.join(MARKET_SETTINGS_ALLOWED_NEW_ENTRY_POLICIES)}. "
+        "Set do_not_relax=true. Return exactly one JSON object matching the schema."
+    )
+
+
+def build_market_settings_advisor_input_payload(
+    *,
+    market_snapshot: MarketSnapshotPayload,
+    features: FeaturePayload,
+    runtime_state: dict[str, Any],
+    settings_policy: dict[str, Any],
+    observed_risk_flags: list[str],
+    previous_recommendation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "advisor_role": "market_settings_advisor",
+        "authority": {
+            "can_execute_orders": False,
+            "can_change_raw_settings": False,
+            "can_bypass_risk_guard": False,
+            "allowed_profiles": list(MARKET_SETTINGS_ALLOWED_PROFILES),
+            "allowed_new_entry_policies": list(MARKET_SETTINGS_ALLOWED_NEW_ENTRY_POLICIES),
+            "mode": "shadow",
+        },
+        "market_snapshot": market_snapshot.model_dump(mode="json"),
+        "features": {
+            "symbol": features.symbol,
+            "timeframe": features.timeframe,
+            "trend_score": features.trend_score,
+            "volatility_pct": features.volatility_pct,
+            "volume_ratio": features.volume_ratio,
+            "rsi": features.rsi,
+            "atr_pct": features.atr_pct,
+            "momentum_score": features.momentum_score,
+            "regime": features.regime.model_dump(mode="json"),
+            "breakout": features.breakout.model_dump(mode="json"),
+            "derivatives": features.derivatives.model_dump(mode="json"),
+            "event_context": features.event_context.model_dump(mode="json"),
+            "data_quality_flags": list(features.data_quality_flags),
+        },
+        "runtime_state": dict(runtime_state),
+        "settings_policy": dict(settings_policy),
+        "observed_risk_flags": list(observed_risk_flags),
+        "previous_recommendation": previous_recommendation or None,
+    }
+
+
+class MarketSettingsAdvisorAgent:
+    def __init__(self, provider: StructuredModelProvider | None = None) -> None:
+        self.provider = provider
+
+    @staticmethod
+    def _deterministic_recommendation(
+        *,
+        symbol_scope: list[str],
+        generated_at: datetime,
+        ttl_seconds: int,
+        observed_risk_flags: list[str],
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+    ) -> AIMarketSettingsRecommendation:
+        flags = set(observed_risk_flags)
+        valid_until = generated_at + timedelta(seconds=max(int(ttl_seconds), 1))
+        profile = "NORMAL"
+        policy = "NORMAL_ALLOWED"
+        confidence = 0.6
+        summary = "Market conditions are normal enough for the baseline shadow recommendation."
+        reason_codes = ["NORMAL_MARKET_CONDITIONS"]
+        if {"STALE_MARKET_DATA", "INCOMPLETE_MARKET_DATA", "SYNC_UNTRUSTED"} & flags:
+            profile = "DEGRADED"
+            policy = "NO_NEW_ENTRY"
+            confidence = 0.82
+            reason_codes = ["DATA_OR_SYNC_UNTRUSTED"]
+            summary = "Data or sync quality is not trustworthy, so the shadow recommendation is degraded."
+        elif {"PROTECTIVE_ORDER_UNCERTAIN", "RANGE_BREAK"} & flags:
+            profile = "STRESS"
+            policy = "NO_NEW_ENTRY"
+            confidence = 0.78
+            reason_codes = ["STRUCTURE_OR_PROTECTION_STRESS"]
+            summary = "Structure or protection state is stressed, so fresh entry should remain restricted."
+        elif "SPREAD_STRESS" in flags or "THIN_LIQUIDITY" in flags:
+            profile = "THIN_LIQUIDITY"
+            policy = "STRICT_CONFIRMATION_ONLY"
+            confidence = 0.74
+            reason_codes = ["LIQUIDITY_STRESS"]
+            summary = "Liquidity or spread quality is degraded, so strict confirmation is preferred."
+        elif "HIGH_VOLATILITY" in flags:
+            profile = "HIGH_VOLATILITY"
+            policy = "PULLBACK_ONLY"
+            confidence = 0.72
+            reason_codes = ["VOLATILITY_EXPANDED"]
+            summary = "Volatility is expanded, so pullback-only entry posture is preferred."
+        elif (
+            features.regime.primary_regime == "transition"
+            or features.regime.trend_alignment == "mixed"
+            or market_snapshot.is_stale
+            or not market_snapshot.is_complete
+        ):
+            profile = "CAUTION"
+            policy = "STRICT_CONFIRMATION_ONLY"
+            confidence = 0.68
+            reason_codes = ["REGIME_OR_DATA_CAUTION"]
+            summary = "Market structure is not clean enough to relax beyond caution."
+
+        return AIMarketSettingsRecommendation(
+            recommendation_id=f"amsa-{uuid4().hex}",
+            generated_at=generated_at.isoformat(),
+            valid_until=valid_until.isoformat(),
+            symbol_scope=symbol_scope,
+            recommended_profile_id=profile,  # type: ignore[arg-type]
+            confidence=confidence,
+            reason_summary=summary,
+            reason_codes=reason_codes,
+            observed_risk_flags=observed_risk_flags,
+            suggested_new_entry_policy=policy,  # type: ignore[arg-type]
+            do_not_relax=True,
+        )
+
+    def run(
+        self,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        runtime_state: dict[str, Any],
+        settings_policy: dict[str, Any],
+        observed_risk_flags: list[str],
+        previous_recommendation: dict[str, Any] | None = None,
+        use_ai: bool,
+    ) -> tuple[AIMarketSettingsRecommendation | None, str, dict[str, Any]]:
+        generated_at = datetime.now(UTC)
+        ttl_seconds = int(settings_policy.get("recommendation_ttl_seconds") or 900)
+        symbol_scope = [
+            str(item).upper()
+            for item in settings_policy.get("symbol_scope", [market_snapshot.symbol])
+            if str(item or "").strip()
+        ] or [market_snapshot.symbol.upper()]
+        baseline = self._deterministic_recommendation(
+            symbol_scope=symbol_scope,
+            generated_at=generated_at,
+            ttl_seconds=ttl_seconds,
+            observed_risk_flags=observed_risk_flags,
+            market_snapshot=market_snapshot,
+            features=features,
+        )
+        payload = build_market_settings_advisor_input_payload(
+            market_snapshot=market_snapshot,
+            features=features,
+            runtime_state=runtime_state,
+            settings_policy=settings_policy,
+            observed_risk_flags=observed_risk_flags,
+            previous_recommendation=previous_recommendation,
+        )
+        if not use_ai or self.provider is None:
+            return baseline, "deterministic-mock", {
+                "source": "deterministic_shadow",
+                "schema_status": "valid",
+                "shadow": True,
+                "baseline_used": True,
+            }
+
+        provider_result: ProviderResult | None = None
+        try:
+            provider_result = self.provider.generate(
+                AgentRole.MARKET_SETTINGS_ADVISOR.value,
+                payload,
+                response_model=AIMarketSettingsRecommendation,
+                instructions=render_market_settings_advisor_instructions(),
+            )
+            recommendation = AIMarketSettingsRecommendation.model_validate(provider_result.output)
+            return recommendation, provider_result.provider, {
+                **_provider_metadata(provider_result, source="llm"),
+                "schema_status": "valid",
+                "shadow": True,
+                "baseline_recommendation": baseline.model_dump(mode="json"),
+            }
+        except Exception as exc:
+            provider_name = provider_result.provider if provider_result is not None else (
+                self.provider.name if self.provider is not None else "deterministic-mock"
+            )
+            raw_output = provider_result.output if provider_result is not None else None
+            return None, provider_name, {
+                **_provider_metadata(provider_result, source="llm_ignored"),
+                "schema_status": "invalid" if isinstance(exc, ValidationError) else "provider_error",
+                "ignored_reason_code": "AI_MARKET_SETTINGS_SCHEMA_INVALID"
+                if isinstance(exc, ValidationError)
+                else "AI_MARKET_SETTINGS_PROVIDER_ERROR",
+                "error": str(exc),
+                "raw_output": raw_output,
+                "shadow": True,
+                "baseline_recommendation": baseline.model_dump(mode="json"),
+            }
 
 
 class ChiefReviewAgent:

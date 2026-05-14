@@ -346,6 +346,78 @@ def _start_scheduler_run(
     return row
 
 
+def _commit_before_external_scheduler_work(session: Session) -> None:
+    if session.in_transaction():
+        session.commit()
+
+
+def _rollback_scheduler_session(session: Session) -> None:
+    try:
+        session.rollback()
+    except Exception:
+        pass
+
+
+def _record_interval_decision_sync_failure(
+    session: Session,
+    *,
+    symbol: str | None,
+    stage: str,
+    error: Exception,
+) -> None:
+    payload = {
+        "workflow": INTERVAL_DECISION_WORKFLOW,
+        "symbol": symbol,
+        "stage": stage,
+        "error": str(error),
+    }
+    entity_type = "symbol" if symbol else "scheduler"
+    entity_id = symbol or INTERVAL_DECISION_WORKFLOW
+    for _attempt in range(2):
+        _rollback_scheduler_session(session)
+        try:
+            record_audit_event(
+                session,
+                event_type="interval_decision_pre_sync_failed",
+                entity_type=entity_type,
+                entity_id=entity_id,
+                severity="warning",
+                message="Interval decision pre-decision exchange sync failed.",
+                payload=payload,
+            )
+            record_health_event(
+                session,
+                component="scheduler",
+                status="error",
+                message="Interval decision pre-decision exchange sync failed.",
+                payload=payload,
+            )
+            session.flush()
+            return
+        except Exception:
+            continue
+    _rollback_scheduler_session(session)
+
+
+def _try_pre_decision_exchange_sync(
+    session: Session,
+    *,
+    triggered_by: str,
+    symbol: str | None,
+    stage: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        return maybe_refresh_exchange_sync_freshness(session, triggered_by=triggered_by), None
+    except Exception as exc:
+        _record_interval_decision_sync_failure(
+            session,
+            symbol=symbol,
+            stage=stage,
+            error=exc,
+        )
+        return None, str(exc)
+
+
 def _finish_scheduler_run(
     session: Session,
     *,
@@ -374,7 +446,7 @@ def _finish_scheduler_run(
             component="scheduler",
             status="error",
             message=message,
-            payload=payload,
+            payload={"workflow": row.workflow, **payload},
         )
     session.flush()
     result = {
@@ -556,7 +628,12 @@ def maybe_refresh_exchange_sync_freshness(
     now = utcnow_naive()
     if latest_attempt_at is not None and (now - latest_attempt_at).total_seconds() < READ_REFRESH_SYNC_DEBOUNCE_SECONDS:
         return None
-    return run_exchange_sync_cycle(session, triggered_by=triggered_by)
+    _commit_before_external_scheduler_work(session)
+    try:
+        return run_exchange_sync_cycle(session, triggered_by=triggered_by)
+    except Exception:
+        session.rollback()
+        raise
 
 
 def get_due_market_refresh_symbols(session: Session) -> list[str]:
@@ -894,9 +971,11 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             "reason": "AI_DISABLED",
             "auto_resume": auto_resume_result,
         }
-    pre_decision_exchange_sync = maybe_refresh_exchange_sync_freshness(
+    pre_decision_exchange_sync, pre_decision_exchange_sync_error = _try_pre_decision_exchange_sync(
         session,
         triggered_by=f"{triggered_by}:pre_decision",
+        symbol=None,
+        stage="cycle_pre_decision_exchange_sync",
     )
     orchestrator = TradingOrchestrator(session)
     results: list[dict[str, object]] = []
@@ -926,10 +1005,52 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         if not _is_due(latest, timedelta(minutes=cadence_minutes)):
             continue
         due_effective.append((effective, cadence_profile, cadence_minutes, schedule_details))
-    decision_plan = orchestrator.build_interval_decision_plan(
-        symbols=[effective.symbol for effective, _cadence, _minutes, _details in due_effective],
-        triggered_at=utcnow_naive(),
-    )
+    plan_symbols = [effective.symbol for effective, _cadence, _minutes, _details in due_effective]
+    try:
+        _commit_before_external_scheduler_work(session)
+        decision_plan = orchestrator.build_interval_decision_plan(
+            symbols=plan_symbols,
+            triggered_at=utcnow_naive(),
+        )
+    except Exception as exc:
+        _rollback_scheduler_session(session)
+        decision_plan_error = str(exc)
+        for effective, _cadence_profile, cadence_minutes, _schedule_details in due_effective:
+            row = _start_scheduler_run(
+                session,
+                workflow=INTERVAL_DECISION_WORKFLOW,
+                schedule_window=_symbol_schedule_window(
+                    interval_minutes=cadence_minutes
+                ),
+                triggered_by=triggered_by,
+                symbol=effective.symbol,
+                next_run_at=utcnow_naive(),
+            )
+            results.append(
+                _finish_scheduler_run(
+                    session,
+                    row=row,
+                    success=False,
+                    message="Interval decision cycle failed while building decision plan.",
+                    payload={
+                        "symbol": effective.symbol,
+                        "stage": "decision_plan_build",
+                        "error": decision_plan_error,
+                        "auto_resume": auto_resume_result,
+                        "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                        "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
+                    },
+                )
+            )
+        return {
+            "workflow": INTERVAL_DECISION_WORKFLOW,
+            "results": results,
+            "auto_resume": auto_resume_result,
+            "pre_decision_exchange_sync": pre_decision_exchange_sync,
+            "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
+            "decision_plan_error": decision_plan_error,
+            "candidate_selection": {},
+        }
     plan_lookup = {
         str(item.get("symbol") or "").upper(): dict(item)
         for item in decision_plan.get("plans", [])
@@ -1054,6 +1175,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
                             "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                            "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
                         },
                     )
                 )
@@ -1109,14 +1231,41 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "cadence": cadence_profile,
                             "auto_resume": auto_resume_result,
                             "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                            "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
                         },
                     )
                 )
                 continue
-            decision_pre_decision_exchange_sync = maybe_refresh_exchange_sync_freshness(
+            _commit_before_external_scheduler_work(session)
+            (
+                decision_pre_decision_exchange_sync,
+                decision_pre_decision_exchange_sync_error,
+            ) = _try_pre_decision_exchange_sync(
                 session,
                 triggered_by=f"{triggered_by}:pre_decision:{effective.symbol}",
+                symbol=effective.symbol,
+                stage="symbol_pre_decision_exchange_sync",
             )
+            if decision_pre_decision_exchange_sync_error is not None:
+                row.next_run_at = utcnow_naive()
+                results.append(
+                    _finish_scheduler_run(
+                        session,
+                        row=row,
+                        success=False,
+                        message="Interval decision cycle failed during pre-decision exchange sync.",
+                        payload={
+                            "symbol": effective.symbol,
+                            "stage": "symbol_pre_decision_exchange_sync",
+                            "error": decision_pre_decision_exchange_sync_error,
+                            "trigger": trigger_payload,
+                            "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                            "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
+                        },
+                    )
+                )
+                continue
+            _commit_before_external_scheduler_work(session)
             outcome = orchestrator.run_decision_cycle(
                 symbol=effective.symbol,
                 timeframe=effective.timeframe,
@@ -1145,10 +1294,13 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "auto_resume": auto_resume_result,
                         "pre_decision_exchange_sync": decision_pre_decision_exchange_sync
                         or pre_decision_exchange_sync,
+                        "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
                     },
                 )
             )
         except Exception as exc:
+            _rollback_scheduler_session(session)
+            row.next_run_at = utcnow_naive()
             results.append(
                 _finish_scheduler_run(
                     session,
@@ -1157,9 +1309,11 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                     message="Interval decision cycle failed.",
                     payload={
                         "symbol": effective.symbol,
+                        "stage": "decision_cycle",
                         "error": str(exc),
                         "trigger": trigger_payload,
                         "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                        "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
                     },
                 )
             )
@@ -1168,6 +1322,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         "results": results,
         "auto_resume": auto_resume_result,
         "pre_decision_exchange_sync": pre_decision_exchange_sync,
+        "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
         "candidate_selection": decision_plan.get("candidate_selection", {}),
     }
 

@@ -9,11 +9,13 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import String, cast, desc, func, or_, select
 from sqlalchemy.orm import Session
 
+from trading_mvp.config import get_settings
 from trading_mvp.models import (
     AccountLedgerEntry,
     AgentRun,
     Alert,
     AuditEvent,
+    DecisionPerformanceFact,
     Execution,
     FeatureSnapshot,
     MarketSnapshot,
@@ -71,10 +73,13 @@ from trading_mvp.services.runtime_state import (
     summarize_runtime_state,
 )
 from trading_mvp.services.settings import (
+    AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY,
+    SAFE_PROFILE_SELECTOR_DETAIL_KEY,
     build_event_operator_control_payload,
     build_operational_status_payload,
     extract_freshest_raw_event_context,
     get_effective_symbols,
+    get_execution_risk_profile_policy,
     get_or_create_settings,
     serialize_settings_runtime_summary,
 )
@@ -316,6 +321,61 @@ EXECUTION_QUALITY_SUMMARY_KEYS = (
     "fees_total",
     "net_realized_pnl_total",
 )
+ORDER_HISTORY_COMPACT_KEYS = (
+    "id",
+    "symbol",
+    "position_id",
+    "parent_order_id",
+    "decision_run_id",
+    "risk_check_id",
+    "side",
+    "order_type",
+    "status",
+    "exchange_status",
+    "mode",
+    "reduce_only",
+    "close_only",
+    "requested_quantity",
+    "requested_price",
+    "filled_quantity",
+    "average_fill_price",
+    "external_order_id",
+    "client_order_id",
+    "reason_codes",
+    "pnl_source",
+    "close_execution_sync_status",
+    "realized_pnl_confirmed",
+    "missing_close_execution",
+    "fee_source",
+    "fee_confirmed",
+    "warning_message",
+    "blocked_reason",
+    "fee_warning_message",
+    "created_at",
+    "updated_at",
+    "last_exchange_update_at",
+)
+EXECUTION_HISTORY_COMPACT_KEYS = (
+    "id",
+    "order_id",
+    "position_id",
+    "symbol",
+    "status",
+    "fill_price",
+    "fill_quantity",
+    "fee_paid",
+    "realized_pnl",
+    "external_trade_id",
+    "commission_asset",
+    "created_at",
+    "updated_at",
+    "mode",
+    "order_type",
+    "order_status",
+    "requested_quantity",
+    "requested_price",
+    "decision_run_id",
+)
 RISK_DEBUG_NUMERIC_KEYS = (
     "requested_notional",
     "resized_notional",
@@ -376,6 +436,49 @@ AUDIT_HEALTH_SYSTEM_EVENT_TYPES = {
     "scheduler_run",
     "scheduler_run_failed",
 }
+AUDIT_CATEGORY_VALUES = {
+    AUDIT_CATEGORY_RISK,
+    AUDIT_CATEGORY_EXECUTION,
+    AUDIT_CATEGORY_APPROVAL_CONTROL,
+    AUDIT_CATEGORY_PROTECTION,
+    AUDIT_CATEGORY_HEALTH_SYSTEM,
+    AUDIT_CATEGORY_AI_DECISION,
+}
+AUDIT_RELATED_ID_KEYS = (
+    "risk_id",
+    "risk_check_id",
+    "execution_id",
+    "order_id",
+    "position_id",
+    "decision_id",
+    "decision_run_id",
+    "agent_run_id",
+    "scheduler_run_id",
+    "snapshot_id",
+    "cycle_id",
+)
+AUDIT_LEGACY_TRIGGER_REASONS = {"open_position_recheck_due", "periodic_backstop_due"}
+AUDIT_COMPACT_ROW_KEYS = (
+    "id",
+    "event_type",
+    "event_category",
+    "entity_type",
+    "entity_id",
+    "severity",
+    "message",
+    "message_summary",
+    "related_type",
+    "related_id",
+    "has_payload",
+    "payload_keys",
+    "suppression_active",
+    "suppression_reason_code",
+    "allow_same_side_add_on",
+    "allowed_add_on_side",
+    "legacy_review_trigger_reason",
+    "created_at",
+    "updated_at",
+)
 
 
 def _serialize_model_row(row: object) -> dict[str, object]:
@@ -1356,7 +1459,7 @@ def _as_datetime(value: object) -> datetime | None:
         return value
     if isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value)
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
     return None
@@ -1366,6 +1469,45 @@ def _as_dict(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {str(key): item for key, item in value.items()}
+
+
+def _as_optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _string_or_none(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _bool_value(value: object, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if value is None or value == "":
+        return default
+    return bool(value)
+
+
+def _first_string(values: Sequence[str]) -> str | None:
+    return values[0] if values else None
 
 
 def _active_position_suppression_projection(value: object) -> dict[str, object]:
@@ -1546,6 +1688,18 @@ def _compact_agent_run_row(row: AgentRun) -> dict[str, object]:
     )
     payload["payload_mode"] = "compact"
     return payload
+
+
+def _compact_order_history_payload(payload: dict[str, object]) -> dict[str, object]:
+    compact = _compact_dict(payload, allowed_keys=ORDER_HISTORY_COMPACT_KEYS)
+    compact["payload_mode"] = "compact"
+    return compact
+
+
+def _compact_execution_history_payload(payload: dict[str, object]) -> dict[str, object]:
+    compact = _compact_dict(payload, allowed_keys=EXECUTION_HISTORY_COMPACT_KEYS)
+    compact["payload_mode"] = "compact"
+    return compact
 
 
 def _ai_trigger_reason_from_decision_row(row: AgentRun | None) -> str | None:
@@ -2493,6 +2647,29 @@ def get_market_snapshots(
     return _serialize_model_list(list(session.scalars(statement.order_by(desc(MarketSnapshot.snapshot_time)).limit(limit))))
 
 
+def _feature_available_timeframes(payload: object, direct_timeframe: object) -> list[str]:
+    timeframes: list[str] = []
+    direct = str(direct_timeframe or "").strip()
+    if direct:
+        timeframes.append(direct)
+    multi_timeframe = _as_dict(_as_dict(payload).get("multi_timeframe"))
+    for key in multi_timeframe:
+        timeframe = str(key).strip()
+        if timeframe and timeframe not in timeframes:
+            timeframes.append(timeframe)
+    return timeframes
+
+
+def _compact_feature_snapshot_row(row: Mapping[str, object]) -> dict[str, object]:
+    payload = _serialize_mapping_row(row)
+    raw_feature_payload = payload.pop("payload", None)
+    payload["available_timeframes"] = _feature_available_timeframes(
+        raw_feature_payload,
+        payload.get("timeframe"),
+    )
+    return payload
+
+
 def get_feature_snapshots(
     session: Session,
     limit: int = 50,
@@ -2516,6 +2693,7 @@ def get_feature_snapshots(
             FeatureSnapshot.drawdown_pct,
             FeatureSnapshot.rsi,
             FeatureSnapshot.atr,
+            FeatureSnapshot.payload,
             FeatureSnapshot.created_at,
             FeatureSnapshot.updated_at,
         )
@@ -2524,7 +2702,7 @@ def get_feature_snapshots(
         if timeframe_filter:
             statement = statement.where(FeatureSnapshot.timeframe == timeframe_filter)
         rows = session.execute(statement.order_by(desc(FeatureSnapshot.feature_time)).limit(limit)).mappings()
-        return [_serialize_mapping_row(row) for row in rows]
+        return [_compact_feature_snapshot_row(row) for row in rows]
 
     statement = select(FeatureSnapshot)
     if symbol_filter:
@@ -2532,6 +2710,374 @@ def get_feature_snapshots(
     if timeframe_filter:
         statement = statement.where(FeatureSnapshot.timeframe == timeframe_filter)
     return _serialize_model_list(list(session.scalars(statement.order_by(desc(FeatureSnapshot.feature_time)).limit(limit))))
+
+
+MARKET_CHART_TRADE_DECISIONS = {"long", "short", "enter_long", "enter_short", "reduce", "exit"}
+
+
+def _market_chart_timestamp(value: object) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    text = str(value).strip()
+    return text or None
+
+
+def _market_chart_optional_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _market_chart_first_price(*values: object) -> float | None:
+    for value in values:
+        price = _market_chart_optional_float(value)
+        if price is not None:
+            return price
+    return None
+
+
+def _market_chart_zone_price(min_price: object, max_price: object) -> float | None:
+    zone_min = _market_chart_optional_float(min_price)
+    zone_max = _market_chart_optional_float(max_price)
+    if zone_min is not None and zone_max is not None:
+        return (zone_min + zone_max) / 2
+    return zone_min or zone_max
+
+
+def _market_chart_source_id(prefix: str, row_id: object) -> str | None:
+    if row_id is None:
+        return None
+    return f"{prefix}:{row_id}"
+
+
+def _market_chart_reason_codes(*values: object) -> list[str]:
+    codes: list[str] = []
+    for value in values:
+        for code in _as_string_list(value):
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _market_chart_marker(
+    *,
+    timestamp: object,
+    kind: str,
+    label: str,
+    detail: str,
+    symbol: str,
+    action: str,
+    price: float | None,
+    status_label: str,
+    reason_codes: Sequence[str] | None = None,
+    source_id: str | None = None,
+) -> dict[str, object] | None:
+    normalized_timestamp = _market_chart_timestamp(timestamp)
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_timestamp or not normalized_symbol:
+        return None
+    codes = list(reason_codes or [])
+    reason_label = ", ".join(codes) if codes else None
+    return {
+        "timestamp": normalized_timestamp,
+        "kind": kind,
+        "label": label,
+        "detail": detail,
+        "symbol": normalized_symbol,
+        "action": action,
+        "price": price,
+        "statusLabel": status_label,
+        "reasonLabel": reason_label,
+        "reasonCodes": codes,
+        "sourceId": source_id,
+    }
+
+
+def _market_chart_decision_price(row: DecisionPerformanceFact) -> float | None:
+    telemetry = _as_dict(row.telemetry_output)
+    return _market_chart_first_price(
+        telemetry.get("entry_price"),
+        telemetry.get("recommended_entry_price"),
+        telemetry.get("reference_price"),
+        telemetry.get("latest_price"),
+        _market_chart_zone_price(row.entry_zone_min, row.entry_zone_max),
+        row.stop_loss,
+        row.take_profit,
+    )
+
+
+def _market_chart_decision_markers(
+    session: Session,
+    *,
+    symbol: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(DecisionPerformanceFact)
+            .where(DecisionPerformanceFact.symbol == symbol)
+            .order_by(desc(DecisionPerformanceFact.created_at), desc(DecisionPerformanceFact.id))
+            .limit(limit)
+        )
+    )
+    markers: list[dict[str, object]] = []
+    for row in rows:
+        decision = str(row.decision or "").strip().lower()
+        if decision not in MARKET_CHART_TRADE_DECISIONS:
+            continue
+        telemetry = _as_dict(row.telemetry_output)
+        confidence = _market_chart_optional_float(telemetry.get("confidence"))
+        detail = decision if confidence is None else f"{decision} / confidence {confidence:.2f}"
+        marker = _market_chart_marker(
+            timestamp=row.created_at,
+            kind="ai",
+            label="AI",
+            detail=detail,
+            symbol=row.symbol,
+            action=decision,
+            price=_market_chart_decision_price(row),
+            status_label="AI recommendation",
+            reason_codes=_market_chart_reason_codes(row.rationale_codes, telemetry.get("rationale_codes")),
+            source_id=_market_chart_source_id("ai", row.decision_run_id),
+        )
+        if marker is not None:
+            markers.append(marker)
+    return markers
+
+
+def _market_chart_pending_plans_by_decision(
+    session: Session,
+    decision_ids: Sequence[int | None],
+) -> dict[int, PendingEntryPlan]:
+    normalized_ids = [decision_id for decision_id in decision_ids if decision_id is not None]
+    if not normalized_ids:
+        return {}
+    plans = session.scalars(
+        select(PendingEntryPlan)
+        .where(PendingEntryPlan.source_decision_run_id.in_(normalized_ids))
+        .order_by(desc(PendingEntryPlan.updated_at), desc(PendingEntryPlan.created_at), desc(PendingEntryPlan.id))
+    )
+    by_decision: dict[int, PendingEntryPlan] = {}
+    for plan in plans:
+        if plan.source_decision_run_id is not None:
+            by_decision.setdefault(plan.source_decision_run_id, plan)
+    return by_decision
+
+
+def _market_chart_risk_price(row: RiskCheck, plan: PendingEntryPlan | None) -> float | None:
+    payload = _as_dict(row.payload)
+    debug_payload = _as_dict(payload.get("debug_payload"))
+    entry_trigger = _as_dict(debug_payload.get("entry_trigger"))
+    price = _market_chart_first_price(
+        payload.get("reference_price"),
+        payload.get("latest_price"),
+        payload.get("mark_price"),
+        payload.get("entry_price"),
+        debug_payload.get("reference_price"),
+        entry_trigger.get("reference_price"),
+        entry_trigger.get("latest_price"),
+        payload.get("approved_entry_price"),
+    )
+    if price is not None:
+        return price
+    if plan is None:
+        return None
+    return _market_chart_zone_price(plan.entry_zone_min, plan.entry_zone_max)
+
+
+def _market_chart_risk_markers(
+    session: Session,
+    *,
+    symbol: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(RiskCheck)
+            .where(RiskCheck.symbol == symbol)
+            .order_by(desc(RiskCheck.created_at), desc(RiskCheck.id))
+            .limit(limit)
+        )
+    )
+    plans_by_decision = _market_chart_pending_plans_by_decision(
+        session,
+        [row.decision_run_id for row in rows],
+    )
+    markers: list[dict[str, object]] = []
+    for row in rows:
+        payload = _as_dict(row.payload)
+        decision = str(row.decision or payload.get("decision") or "").strip().lower()
+        reason_codes = _market_chart_reason_codes(
+            payload.get("blocked_reason_codes"),
+            row.reason_codes,
+            payload.get("reason_codes"),
+        )
+        if decision not in MARKET_CHART_TRADE_DECISIONS and all(code == "HOLD_DECISION" for code in reason_codes):
+            continue
+        blocked = row.allowed is not True
+        marker = _market_chart_marker(
+            timestamp=row.created_at,
+            kind="risk_blocked" if blocked else "risk_approved",
+            label="blocked" if blocked else "approved",
+            detail=f"{decision or 'unknown'} risk {'blocked' if blocked else 'approved'}",
+            symbol=row.symbol,
+            action=decision or "unknown",
+            price=_market_chart_risk_price(row, plans_by_decision.get(row.decision_run_id)),
+            status_label="risk blocked" if blocked else "risk approved",
+            reason_codes=reason_codes if blocked else [],
+            source_id=_market_chart_source_id("risk", row.id),
+        )
+        if marker is not None:
+            markers.append(marker)
+    return markers
+
+
+def _market_chart_order_price(row: Order) -> float | None:
+    metadata = _as_dict(row.metadata_json)
+    exchange_order = _as_dict(metadata.get("exchange_order"))
+    submit_request = _as_dict(metadata.get("submit_request"))
+    return _market_chart_first_price(
+        row.average_fill_price,
+        row.requested_price,
+        exchange_order.get("actualPrice"),
+        exchange_order.get("stopPrice"),
+        submit_request.get("reference_price"),
+    )
+
+
+def _market_chart_execution_price(row: Execution) -> float | None:
+    payload = _as_dict(row.payload)
+    trade = _as_dict(payload.get("trade"))
+    return _market_chart_first_price(
+        row.fill_price,
+        trade.get("price"),
+        payload.get("requested_price"),
+    )
+
+
+def _market_chart_execution_markers(
+    session: Session,
+    *,
+    symbol: str,
+    limit: int,
+) -> tuple[list[dict[str, object]], set[int]]:
+    rows = session.execute(
+        select(Execution, Order)
+        .outerjoin(Order, Order.id == Execution.order_id)
+        .where(Execution.symbol == symbol, Order.mode == "live")
+        .order_by(desc(Execution.created_at), desc(Execution.id))
+        .limit(limit)
+    ).all()
+    markers: list[dict[str, object]] = []
+    order_ids: set[int] = set()
+    for execution, order in rows:
+        if execution.order_id is not None:
+            order_ids.add(execution.order_id)
+        payload = _as_dict(execution.payload)
+        trade = _as_dict(payload.get("trade"))
+        action_parts = [
+            str(order.side if order is not None else payload.get("side") or trade.get("side") or "").strip(),
+            str(order.order_type if order is not None else payload.get("order_type") or "").strip(),
+        ]
+        action = " ".join(part for part in action_parts if part) or "execution"
+        marker = _market_chart_marker(
+            timestamp=execution.created_at,
+            kind="execution",
+            label="fill",
+            detail=f"execution {execution.status}",
+            symbol=execution.symbol,
+            action=action,
+            price=_market_chart_execution_price(execution),
+            status_label="execution",
+            source_id=_market_chart_source_id("execution", execution.id),
+        )
+        if marker is not None:
+            markers.append(marker)
+    return markers, order_ids
+
+
+def _market_chart_order_markers(
+    session: Session,
+    *,
+    symbol: str,
+    limit: int,
+    execution_order_ids: set[int],
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(Order)
+            .where(Order.mode == "live", Order.symbol == symbol)
+            .order_by(desc(Order.created_at), desc(Order.id))
+            .limit(limit)
+        )
+    )
+    markers: list[dict[str, object]] = []
+    for row in rows:
+        status = str(row.status or row.exchange_status or "").strip().lower()
+        if row.id in execution_order_ids and status == "filled":
+            continue
+        price = _market_chart_order_price(row)
+        if price is None:
+            continue
+        action = " ".join(part for part in (row.side, row.order_type) if str(part or "").strip()) or "order"
+        marker = _market_chart_marker(
+            timestamp=row.created_at,
+            kind="execution",
+            label="order",
+            detail=f"order {status or 'unknown'}",
+            symbol=row.symbol,
+            action=action,
+            price=price,
+            status_label="execution",
+            reason_codes=_market_chart_reason_codes(row.reason_codes),
+            source_id=_market_chart_source_id("order", row.id),
+        )
+        if marker is not None:
+            markers.append(marker)
+    return markers
+
+
+def get_market_chart_markers(
+    session: Session,
+    *,
+    symbol: str,
+    limit: int = 80,
+) -> list[dict[str, object]]:
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        return []
+    decision_markers = _market_chart_decision_markers(session, symbol=normalized_symbol, limit=limit)
+    risk_markers = _market_chart_risk_markers(session, symbol=normalized_symbol, limit=limit)
+    execution_markers, execution_order_ids = _market_chart_execution_markers(
+        session,
+        symbol=normalized_symbol,
+        limit=limit,
+    )
+    order_markers = _market_chart_order_markers(
+        session,
+        symbol=normalized_symbol,
+        limit=limit,
+        execution_order_ids=execution_order_ids,
+    )
+    markers = decision_markers + risk_markers + execution_markers + order_markers
+    seen: set[str] = set()
+    deduped: list[dict[str, object]] = []
+    for marker in sorted(markers, key=lambda item: str(item.get("timestamp") or "")):
+        key = str(
+            marker.get("sourceId")
+            or f"{marker.get('kind')}:{marker.get('symbol')}:{marker.get('timestamp')}:{marker.get('action')}:{marker.get('price')}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(marker)
+    return deduped
 
 
 def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
@@ -2748,11 +3294,15 @@ def get_orders(
     symbol: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    position_id: int | None = None,
+    compact: bool = False,
 ) -> list[dict[str, object]]:
     selected_mode = mode or "live"
     statement = select(Order).where(Order.mode == selected_mode)
     if symbol:
         statement = statement.where(Order.symbol == symbol.upper())
+    if position_id is not None:
+        statement = statement.where(Order.position_id == position_id)
     if status:
         statement = statement.where(Order.status == status)
     if search:
@@ -2770,11 +3320,15 @@ def get_orders(
     statement = statement.order_by(desc(Order.created_at)).limit(limit)
     rows = list(session.scalars(statement))
     close_sync_by_position = _close_execution_sync_payloads_by_position(session, rows)
-    payloads = _serialize_model_list(rows)
-    for payload, row in zip(payloads, rows, strict=False):
+    payloads: list[dict[str, object]] = []
+    for row in rows:
+        payload = _serialize_model_row(row)
         payload.update(
             close_sync_by_position.get(row.position_id, _default_close_execution_sync_payload())
         )
+        if compact:
+            payload = _compact_order_history_payload(payload)
+        payloads.append(payload)
     return payloads
 
 
@@ -2785,6 +3339,8 @@ def get_executions(
     symbol: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    position_id: int | None = None,
+    compact: bool = False,
 ) -> list[dict[str, object]]:
     selected_mode = mode or "live"
     statement = (
@@ -2795,6 +3351,13 @@ def get_executions(
     )
     if symbol:
         statement = statement.where(Execution.symbol == symbol.upper())
+    if position_id is not None:
+        statement = statement.where(
+            or_(
+                Execution.position_id == position_id,
+                Order.position_id == position_id,
+            )
+        )
     if status:
         statement = statement.where(Execution.status == status)
     if search:
@@ -2831,6 +3394,8 @@ def get_executions(
             "confidence": decision_payload.get("confidence"),
             "rationale_codes": decision_payload.get("rationale_codes", []),
         }
+        if compact:
+            values = _compact_execution_history_payload(values)
         payloads.append(values)
     return payloads
 
@@ -4087,11 +4652,87 @@ def _latest_rows_by_symbol(
     return rows
 
 
+def _latest_decision_rows_by_symbol_from_facts(
+    session: Session,
+    symbols: Sequence[str],
+) -> dict[str, AgentRun]:
+    symbol_keys = list(dict.fromkeys(str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()))
+    if not symbol_keys:
+        return {}
+
+    ranked_facts = (
+        select(
+            DecisionPerformanceFact.symbol.label("symbol"),
+            DecisionPerformanceFact.decision_run_id.label("decision_run_id"),
+            func.row_number()
+            .over(
+                partition_by=DecisionPerformanceFact.symbol,
+                order_by=(desc(DecisionPerformanceFact.created_at), desc(DecisionPerformanceFact.id)),
+            )
+            .label("row_rank"),
+        )
+        .where(DecisionPerformanceFact.symbol.in_(symbol_keys))
+        .subquery()
+    )
+    fact_refs = list(
+        session.execute(
+            select(ranked_facts.c.symbol, ranked_facts.c.decision_run_id).where(ranked_facts.c.row_rank == 1)
+        )
+    )
+    decision_ids = [int(decision_run_id) for _symbol, decision_run_id in fact_refs if decision_run_id is not None]
+    if not decision_ids:
+        return {}
+
+    rows_by_id = {
+        int(row.id): row
+        for row in session.scalars(select(AgentRun).where(AgentRun.id.in_(decision_ids)))
+        if row.id is not None
+    }
+    return {
+        str(symbol or "").upper(): rows_by_id[int(decision_run_id)]
+        for symbol, decision_run_id in fact_refs
+        if decision_run_id is not None and int(decision_run_id) in rows_by_id
+    }
+
+
+def _latest_decision_rows_by_symbol(
+    session: Session,
+    symbols: Sequence[str],
+    *,
+    prefer_fact_lookup: bool,
+    fallback_scan_limit: int | None,
+) -> dict[str, AgentRun]:
+    symbol_keys = list(dict.fromkeys(str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()))
+    if not symbol_keys:
+        return {}
+
+    rows: dict[str, AgentRun] = {}
+    if prefer_fact_lookup:
+        rows.update(_latest_decision_rows_by_symbol_from_facts(session, symbol_keys))
+
+    missing_symbols = [symbol for symbol in symbol_keys if symbol not in rows]
+    if missing_symbols:
+        rows.update(
+            _latest_rows_by_extracted_symbol(
+                session,
+                select(AgentRun)
+                .where(AgentRun.role == "trading_decision")
+                .order_by(desc(AgentRun.created_at)),
+                missing_symbols,
+                _decision_symbol,
+                fallback_scan_limit=fallback_scan_limit,
+            )
+        )
+    return rows
+
+
 def _latest_rows_by_extracted_symbol(
     session: Session,
     statement: Any,
     symbols: Sequence[str],
     symbol_for_row: Callable[[Any], str | None],
+    *,
+    fallback_scan_limit: int | None = OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
 ) -> dict[str, Any]:
     symbol_set = {symbol.upper() for symbol in symbols}
     rows: dict[str, Any] = {}
@@ -4108,7 +4749,9 @@ def _latest_rows_by_extracted_symbol(
     limited_rows = list(session.scalars(statement.limit(OPERATOR_RECENT_ROW_SCAN_LIMIT)))
     if consume(limited_rows) or len(limited_rows) < OPERATOR_RECENT_ROW_SCAN_LIMIT:
         return rows
-    fallback_limit = max(OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT, len(symbol_set))
+    if fallback_scan_limit is None or fallback_scan_limit <= 0:
+        return rows
+    fallback_limit = max(fallback_scan_limit, len(symbol_set))
     consume(list(session.scalars(statement.offset(OPERATOR_RECENT_ROW_SCAN_LIMIT).limit(fallback_limit))))
     return rows
 
@@ -4245,6 +4888,8 @@ def _build_operator_symbol_summaries(
     include_protection_state: bool = True,
     include_event_operator_control: bool = True,
     include_audit_events: bool = True,
+    prefer_fact_decision_lookup: bool = False,
+    extracted_symbol_fallback_limit: int | None = OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
 ) -> list[OperatorSymbolSummary]:
     now = utcnow_naive()
     symbol_keys = list(dict.fromkeys(item.upper() for item in tracked_symbols if item))
@@ -4285,13 +4930,11 @@ def _build_operator_symbol_summaries(
 
     latest_decisions: dict[str, AgentRun] = {}
     if include_decision_state:
-        latest_decisions = _latest_rows_by_extracted_symbol(
+        latest_decisions = _latest_decision_rows_by_symbol(
             session,
-            select(AgentRun)
-            .where(AgentRun.role == "trading_decision")
-            .order_by(desc(AgentRun.created_at)),
             symbol_keys,
-            _decision_symbol,
+            prefer_fact_lookup=prefer_fact_decision_lookup,
+            fallback_scan_limit=extracted_symbol_fallback_limit,
         )
 
     latest_risks: dict[str, RiskCheck] = {}
@@ -4332,6 +4975,7 @@ def _build_operator_symbol_summaries(
             .order_by(desc(SchedulerRun.created_at)),
             symbol_keys,
             lambda row: str((row.outcome if isinstance(row.outcome, dict) else {}).get("symbol") or "").upper(),
+            fallback_scan_limit=extracted_symbol_fallback_limit,
         )
 
     latest_executions_by_order_id: dict[int, Execution] = {}
@@ -4525,9 +5169,112 @@ def _build_operator_symbol_summaries(
     return summaries
 
 
+def _naive_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _ai_settings_next_review_at(
+    *,
+    advisor_state: Mapping[str, Any],
+    latest_recommendation: Mapping[str, Any],
+    policy: Mapping[str, object],
+) -> datetime | None:
+    basis = _naive_utc(_as_datetime(advisor_state.get("updated_at"))) or _naive_utc(
+        _as_datetime(latest_recommendation.get("generated_at"))
+    )
+    if basis is None:
+        return None
+    observed_risk_flags = _as_string_list(latest_recommendation.get("observed_risk_flags"))
+    normal_interval = max(int(policy.get("normal_interval_seconds") or 900), 1)
+    elevated_interval = max(int(policy.get("elevated_interval_seconds") or 300), 1)
+    min_recheck = max(int(policy.get("min_recheck_interval_seconds") or 300), 1)
+    interval = elevated_interval if observed_risk_flags else normal_interval
+    return basis + timedelta(seconds=max(interval, min_recheck))
+
+
+def _operator_execution_profile_state(settings_row: Setting) -> dict[str, Any]:
+    defaults = get_settings()
+    policy = get_execution_risk_profile_policy(settings_row, defaults=defaults)
+    auto_apply_mode = str(policy.get("auto_apply_mode") or "shadow")
+    detail = _as_dict(settings_row.pause_reason_detail)
+    selector_state = _as_dict(detail.get(SAFE_PROFILE_SELECTOR_DETAIL_KEY))
+    selection = {
+        **selector_state,
+        **_as_dict(selector_state.get("last_selection")),
+    }
+    advisor_state = _as_dict(detail.get(AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY))
+    latest_recommendation = _as_dict(advisor_state.get("latest")) or advisor_state
+
+    selection_ignored_codes = _as_string_list(selection.get("ignored_reason_codes"))
+    latest_ignored_codes = _as_string_list(latest_recommendation.get("ignored_reason_codes"))
+    ignored_reason_codes = list(dict.fromkeys([*selection_ignored_codes, *latest_ignored_codes]))
+    relaxation_block_reason_codes = _as_string_list(selection.get("relaxation_block_reason_codes"))
+    ai_status = _string_or_none(advisor_state.get("status") or latest_recommendation.get("status"))
+    if ignored_reason_codes:
+        ai_status = "ignored"
+
+    final_profile = _string_or_none(selection.get("final_active_profile") or selector_state.get("active_profile"))
+    blocking_active = _bool_value(
+        selection.get("blocking_active"),
+        default=auto_apply_mode in {"conservative_only", "manual_approval"},
+    )
+    profile_new_entry_blocked = _bool_value(selection.get("active_profile_blocks_new_entry"), default=False)
+    if "active_profile_blocks_new_entry" not in selection and blocking_active and final_profile in {"STRESS", "DEGRADED"}:
+        profile_new_entry_blocked = True
+
+    confidence = _as_optional_float(selection.get("confidence"))
+    if confidence is None:
+        confidence = _as_optional_float(latest_recommendation.get("confidence"))
+
+    valid_until = _naive_utc(_as_datetime(selection.get("valid_until"))) or _naive_utc(
+        _as_datetime(latest_recommendation.get("valid_until"))
+    )
+
+    return {
+        "deterministic_market_profile": _string_or_none(
+            selection.get("deterministic_profile") or selector_state.get("deterministic_profile")
+        ),
+        "ai_recommended_profile": _string_or_none(
+            selection.get("ai_recommended_profile") or latest_recommendation.get("recommended_profile_id")
+        ),
+        "ai_recommendation_id": _string_or_none(
+            selection.get("ai_recommendation_id") or latest_recommendation.get("recommendation_id")
+        ),
+        "ai_recommendation_confidence": confidence,
+        "ai_recommendation_valid_until": valid_until,
+        "ai_recommendation_reason_codes": _as_string_list(latest_recommendation.get("reason_codes")),
+        "ai_recommendation_status": ai_status or "unknown",
+        "final_active_execution_profile": final_profile,
+        "shadow_final_execution_profile": _string_or_none(selection.get("shadow_final_profile")),
+        "profile_selection_mode": _string_or_none(selection.get("selection_mode")) or auto_apply_mode,
+        "profile_selected_reason": _string_or_none(selection.get("selected_reason")),
+        "was_tightened_by_ai": _bool_value(selection.get("was_tightened_by_ai"), default=False),
+        "was_relaxation_blocked": _bool_value(selection.get("was_relaxation_blocked"), default=False),
+        "relaxation_block_reason": _first_string(relaxation_block_reason_codes),
+        "relaxation_block_reason_codes": relaxation_block_reason_codes,
+        "ai_recommendation_ignored_reason_codes": ignored_reason_codes,
+        "next_ai_settings_review_at": _ai_settings_next_review_at(
+            advisor_state=advisor_state,
+            latest_recommendation=latest_recommendation,
+            policy=policy,
+        ),
+        "ai_settings_shadow_mode": bool(policy.get("advisor_shadow_mode", True)),
+        "ai_settings_auto_apply_mode": auto_apply_mode,
+        "profile_new_entry_blocked": profile_new_entry_blocked,
+        "profile_survival_paths_allowed": True,
+    }
+
+
 def get_operator_dashboard(session: Session, *, view: str | None = None) -> OperatorDashboardResponse:
     operator_view = _normalize_operator_dashboard_view(view)
+    scheduler_projection = operator_view == "scheduler"
     overview = get_overview(session)
+    settings_row = get_or_create_settings(session)
+    execution_profile_state = _operator_execution_profile_state(settings_row)
     profitability = (
         None
         if operator_view is not None
@@ -4559,6 +5306,10 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
         include_protection_state=include_protection_state,
         include_event_operator_control=include_event_operator_control,
         include_audit_events=include_audit_events,
+        prefer_fact_decision_lookup=scheduler_projection,
+        extracted_symbol_fallback_limit=0
+        if scheduler_projection
+        else OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
     )
     compact_performance_windows = (
         []
@@ -4638,6 +5389,7 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
             scheduler_triggered_by=latest_scheduler.triggered_by if latest_scheduler is not None else None,
             scheduler_last_run_at=latest_scheduler.created_at if latest_scheduler is not None else None,
             scheduler_next_run_at=latest_scheduler.next_run_at if latest_scheduler is not None else None,
+            **execution_profile_state,
             last_market_refresh_at=overview.last_market_refresh_at,
             last_decision_at=overview.last_decision_at,
             last_decision_snapshot_at=overview.last_decision_snapshot_at,
@@ -4661,11 +5413,17 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
 
 
 def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
+    recent_risk_ids = (
+        select(RiskCheck.id)
+        .order_by(desc(RiskCheck.created_at), desc(RiskCheck.id))
+        .limit(limit)
+        .subquery()
+    )
     rows = session.execute(
         select(RiskCheck, AgentRun)
+        .join(recent_risk_ids, RiskCheck.id == recent_risk_ids.c.id)
         .outerjoin(AgentRun, AgentRun.id == RiskCheck.decision_run_id)
-        .order_by(desc(RiskCheck.created_at))
-        .limit(limit)
+        .order_by(desc(RiskCheck.created_at), desc(RiskCheck.id))
     ).all()
     decision_ids = [
         risk_row.decision_run_id
@@ -4744,13 +5502,156 @@ def get_scheduler_runs(session: Session, limit: int = 50, *, compact: bool = Fal
     return _serialize_model_list(list(session.scalars(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(limit))))
 
 
+def _audit_related_id(payload: dict[str, Any]) -> tuple[str | None, object | None]:
+    for key in AUDIT_RELATED_ID_KEYS:
+        value = payload.get(key)
+        if value not in {None, ""}:
+            return key, value
+    return None, None
+
+
+def _audit_message_summary(value: object, *, limit: int = 160) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
+def _audit_legacy_trigger_reason(value: object, *, depth: int = 0, seen: set[int] | None = None) -> str | None:
+    if depth > 6 or not isinstance(value, (dict, list)):
+        return None
+    seen = seen or set()
+    marker = id(value)
+    if marker in seen:
+        return None
+    seen.add(marker)
+    if isinstance(value, list):
+        for item in value:
+            nested = _audit_legacy_trigger_reason(item, depth=depth + 1, seen=seen)
+            if nested:
+                return nested
+        return None
+    for key, nested_value in value.items():
+        if (
+            key in {"trigger_reason", "last_ai_trigger_reason"}
+            and isinstance(nested_value, str)
+            and nested_value in AUDIT_LEGACY_TRIGGER_REASONS
+        ):
+            return nested_value
+        nested = _audit_legacy_trigger_reason(nested_value, depth=depth + 1, seen=seen)
+        if nested:
+            return nested
+    return None
+
+
+def _audit_severity_rank(value: object) -> int:
+    return {
+        "critical": 0,
+        "error": 1,
+        "warning": 2,
+        "info": 3,
+    }.get(str(value or "").lower(), 99)
+
+
+def _audit_sort_key(row: dict[str, object], sort: str) -> tuple[object, ...]:
+    created_at = str(row.get("created_at") or "")
+    if sort == "oldest":
+        return (created_at, int(row.get("id") or 0))
+    if sort == "severity":
+        return (_audit_severity_rank(row.get("severity")), created_at)
+    return (created_at, int(row.get("id") or 0))
+
+
+def _audit_has_value(value: object) -> bool:
+    if value is None or value == "":
+        return False
+    return not (isinstance(value, (list, dict)) and not value)
+
+
+def _compact_audit_timeline_row(row: dict[str, object]) -> dict[str, object]:
+    return {
+        key: row[key]
+        for key in AUDIT_COMPACT_ROW_KEYS
+        if key in row and _audit_has_value(row[key])
+    }
+
+
+def _project_audit_rows(
+    session: Session,
+    rows: Sequence[AuditEvent],
+    *,
+    compact: bool = False,
+) -> list[dict[str, object]]:
+    payloads = _serialize_model_list(rows)
+    suppression_context_by_decision_id = _decision_run_suppression_context_by_id(
+        session,
+        [
+            decision_run_id
+            for row in payloads
+            if isinstance(row, dict)
+            for decision_run_id in [_decision_run_id_from_audit_row(row)]
+            if decision_run_id is not None
+        ],
+    )
+    projected_rows: list[dict[str, object]] = []
+    for row in payloads:
+        if not isinstance(row, dict):
+            continue
+        payload = _as_dict(row.get("payload"))
+        payload_has_suppression_source = _has_active_position_suppression_source(payload)
+        decision_run_id = _decision_run_id_from_audit_row(row)
+        fallback_context = suppression_context_by_decision_id.get(decision_run_id)
+        suppression_projection = (
+            _active_position_suppression_projection(payload)
+            if payload_has_suppression_source
+            else _active_position_suppression_projection(fallback_context)
+        )
+        if payload_has_suppression_source or fallback_context:
+            row.update(suppression_projection)
+            payload = {
+                **payload,
+                **suppression_projection,
+            }
+            row["payload"] = payload
+        category = classify_audit_event(
+            event_type=str(row.get("event_type") or "unknown"),
+            entity_type=str(row.get("entity_type") or "unknown"),
+            payload=payload,
+        )
+        related_type, related_id = _audit_related_id(payload)
+        row["event_category"] = category
+        row["message_summary"] = _audit_message_summary(row.get("message"))
+        row["related_type"] = related_type
+        row["related_id"] = related_id
+        row["has_payload"] = bool(payload)
+        row["payload_keys"] = list(payload.keys())[:12]
+        legacy_trigger_reason = _audit_legacy_trigger_reason(payload)
+        if legacy_trigger_reason:
+            row["legacy_review_trigger_reason"] = legacy_trigger_reason
+        projected_rows.append(_compact_audit_timeline_row(row) if compact else row)
+    return projected_rows
+
+
+def _normalized_audit_category(value: str | None) -> str | None:
+    normalized = str(value or "").strip()
+    if normalized == "all":
+        return None
+    return normalized if normalized in AUDIT_CATEGORY_VALUES else None
+
+
 def get_audit_timeline(
     session: Session,
     limit: int = 100,
     event_type: str | None = None,
     severity: str | None = None,
     search: str | None = None,
+    event_category: str | None = None,
+    sort: str = "newest",
+    compact: bool = False,
 ) -> list[dict[str, object]]:
+    category_filter = _normalized_audit_category(event_category)
+    selected_sort = sort if sort in {"newest", "oldest", "severity"} else "newest"
+    candidate_limit = min(max(limit * 5, limit), 500) if category_filter else limit
     statement = select(AuditEvent)
     if event_type:
         statement = statement.where(AuditEvent.event_type == event_type)
@@ -4767,41 +5668,27 @@ def get_audit_timeline(
                 func.lower(AuditEvent.severity).like(token),
             )
         )
-    statement = statement.order_by(desc(AuditEvent.created_at)).limit(limit)
-    rows = _serialize_model_list(list(session.scalars(statement)))
-    suppression_context_by_decision_id = _decision_run_suppression_context_by_id(
-        session,
-        [
-            decision_run_id
-            for row in rows
-            if isinstance(row, dict)
-            for decision_run_id in [_decision_run_id_from_audit_row(row)]
-            if decision_run_id is not None
-        ],
+    if selected_sort == "oldest":
+        statement = statement.order_by(AuditEvent.created_at.asc(), AuditEvent.id.asc())
+    else:
+        statement = statement.order_by(desc(AuditEvent.created_at), desc(AuditEvent.id))
+    rows = _project_audit_rows(session, list(session.scalars(statement.limit(candidate_limit))), compact=compact)
+    if category_filter:
+        rows = [row for row in rows if row.get("event_category") == category_filter]
+    rows = sorted(
+        rows,
+        key=lambda row: _audit_sort_key(row, selected_sort),
+        reverse=selected_sort == "newest",
     )
-    for row in rows:
-        if isinstance(row, dict):
-            payload = _as_dict(row.get("payload"))
-            payload_has_suppression_source = _has_active_position_suppression_source(payload)
-            decision_run_id = _decision_run_id_from_audit_row(row)
-            fallback_context = suppression_context_by_decision_id.get(decision_run_id)
-            suppression_projection = (
-                _active_position_suppression_projection(payload)
-                if payload_has_suppression_source
-                else _active_position_suppression_projection(fallback_context)
-            )
-            if payload_has_suppression_source or fallback_context:
-                row.update(suppression_projection)
-                row["payload"] = {
-                    **payload,
-                    **suppression_projection,
-                }
-            row["event_category"] = classify_audit_event(
-                event_type=str(row.get("event_type") or "unknown"),
-                entity_type=str(row.get("entity_type") or "unknown"),
-                payload=_as_dict(row.get("payload", {})),
-            )
-    return rows
+    return rows[:limit]
+
+
+def get_audit_event_detail(session: Session, audit_event_id: int) -> dict[str, object] | None:
+    row = session.get(AuditEvent, audit_event_id)
+    if row is None:
+        return None
+    rows = _project_audit_rows(session, [row], compact=False)
+    return rows[0] if rows else None
 
 
 def get_alerts(session: Session, limit: int = 50) -> list[dict[str, object]]:

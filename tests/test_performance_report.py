@@ -788,12 +788,43 @@ def test_build_signal_performance_report_reuses_cached_subreport(db_session, mon
     def fail_on_rebuild(*_args, **_kwargs):
         raise AssertionError("unexpected performance subreport rebuild")
 
+    def fail_on_source_key(*_args, **_kwargs):
+        raise AssertionError("unexpected performance source-key probe on fresh cache hit")
+
     monkeypatch.setattr(performance_reporting, "_load_pnl_snapshot_cache", fail_on_rebuild)
+    monkeypatch.setattr(performance_reporting, "_signal_performance_source_key", fail_on_source_key)
 
     second = build_signal_performance_report(db_session)
 
     assert second.generated_at == first.generated_at
     assert second.windows[0].summary.snapshot_net_pnl_estimate == 20.0
+    assert second.cache_status == "fresh"
+
+
+def test_build_signal_performance_report_returns_stale_cache_while_revalidating(db_session, monkeypatch) -> None:
+    _seed_performance_rows(db_session)
+
+    first = build_signal_performance_report(db_session)
+    refresh_calls: list[dict[str, object]] = []
+
+    def start_refresh(*_args, **kwargs):
+        refresh_calls.append(kwargs)
+        return True
+
+    def fail_on_rebuild(*_args, **_kwargs):
+        raise AssertionError("stale cache response should not rebuild inline")
+
+    monkeypatch.setattr(performance_reporting, "SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS", -1.0)
+    monkeypatch.setattr(performance_reporting, "_start_signal_performance_background_refresh", start_refresh)
+    monkeypatch.setattr(performance_reporting, "_load_pnl_snapshot_cache", fail_on_rebuild)
+
+    second = build_signal_performance_report(db_session)
+
+    assert second.generated_at == first.generated_at
+    assert second.cache_status == "stale_revalidating"
+    assert second.cache_rebuild_pending is True
+    assert second.cache_age_seconds >= 0.0
+    assert len(refresh_calls) == 1
 
 
 def test_signal_performance_source_key_buckets_pnl_snapshot_timestamp(db_session) -> None:

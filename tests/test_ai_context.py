@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from trading_mvp.schemas import (
     DerivativesContextPayload,
     EventContextPayload,
@@ -15,6 +16,7 @@ from trading_mvp.services.ai_context import (
     build_composite_regime_packet,
     build_data_quality_packet,
 )
+from trading_mvp.services.cost_model import calculate_expected_trade_cost
 from trading_mvp.services.features import compute_features
 from trading_mvp.time_utils import utcnow_naive
 
@@ -235,6 +237,43 @@ def test_ai_context_exposes_operating_summaries() -> None:
     assert context.execution_constraints_summary["minimum_actionable_notional"] == 25.0
     assert context.execution_constraints_summary["risk_guard_final_authority"] is True
     assert "same_direction_reentry_warning" not in context.strategy_engine_context
+
+
+def test_ai_context_expected_cost_context_uses_shared_cost_model() -> None:
+    snapshot, features = _features()
+    selection_context = {
+        "decision": "long",
+        "entry_mode": "pullback_confirm",
+        "expected_gross_bps": 35.0,
+        "expected_cost_gate": {
+            "expected_slippage_bps": 3.0,
+            "spread_cost_bps": 5.5,
+        },
+    }
+
+    context = build_ai_decision_context(
+        market_snapshot=snapshot,
+        features=features,
+        risk_context={},
+        selection_context=selection_context,
+        decision_reference={},
+    )
+
+    expected_cost = context.strategy_engine_context["expected_cost_context"]
+    shared = calculate_expected_trade_cost(
+        entry_execution_type="entry_passive_limit",
+        expected_gross_bps=35.0,
+        explicit_slippage_bps=3.0,
+        spread_cost_bps=5.5,
+    )
+
+    assert expected_cost["expected_gross_bps"] == pytest.approx(shared.expected_gross_bps)
+    assert expected_cost["round_trip_fee_bps"] == pytest.approx(shared.round_trip_fee_bps)
+    assert expected_cost["expected_slippage_bps"] == pytest.approx(shared.expected_slippage_bps)
+    assert expected_cost["spread_cost_bps"] == pytest.approx(shared.spread_cost_bps)
+    assert expected_cost["expected_net_bps"] == pytest.approx(shared.expected_net_bps)
+    assert expected_cost["fee_to_gross_ratio"] == pytest.approx(shared.fee_to_gross_ratio)
+    assert expected_cost["min_required_net_bps"] == pytest.approx(shared.min_required_net_bps)
 
 
 def test_ai_context_adds_same_direction_tp_reentry_warning_when_provided() -> None:

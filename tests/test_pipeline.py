@@ -403,6 +403,16 @@ def _patch_entry_plan_decision_flow(monkeypatch, orchestrator: TradingOrchestrat
     monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", _entry_plan_fake_evaluate_risk)
 
 
+def _decision_funnel_events(db_session) -> list[AuditEvent]:
+    return list(
+        db_session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.event_type == "decision_funnel_audit")
+            .order_by(AuditEvent.id)
+        )
+    )
+
+
 def _patch_entry_plan_recheck_dependencies(
     monkeypatch,
     settings_row,
@@ -1049,6 +1059,176 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     assert db_session.scalar(select(AuditEvent).limit(1)) is not None
 
 
+def test_decision_funnel_audit_records_entry_waiting_plan(monkeypatch, db_session) -> None:
+    settings_row = _prepare_live_entry_plan_settings(db_session)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_exchange_sync_cycle",
+        lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
+    )
+
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("entry waiting plan must not submit immediately")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+    orchestrator = TradingOrchestrator(db_session)
+    _patch_entry_plan_decision_flow(monkeypatch, orchestrator)
+
+    result = orchestrator.run_decision_cycle(
+        trigger_event="manual",
+        upto_index=140,
+        exchange_sync_checked=True,
+        auto_resume_checked=True,
+    )
+    db_session.flush()
+
+    funnel_events = _decision_funnel_events(db_session)
+    assert result["status"] == "entry_plan_armed"
+    assert any(event.payload["entry_plan_status"] == "armed" for event in funnel_events)
+    summary_event = funnel_events[-1]
+    assert summary_event.payload["status"] == "entry_plan_armed"
+    assert summary_event.payload["blocked_reason"] == "ENTRY_TRIGGER_NOT_MET"
+    assert summary_event.payload["order_status"] == "not_submitted"
+
+
+def test_decision_funnel_audit_records_no_candidate(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    db_session.add(settings_row)
+    db_session.flush()
+
+    TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["NOTINBOOK"], timeframe="15m")
+    db_session.flush()
+
+    event = _decision_funnel_events(db_session)[-1]
+    assert event.payload["cycle_id"].startswith("decision-plan:all:")
+    assert event.payload["status"] == "no_candidate"
+    assert event.payload["entry_plan_status"] == "not_created"
+    assert event.payload["blocked_reason"] == "no_eligible_symbol"
+    assert event.payload["order_status"] == "not_submitted"
+
+
+def test_decision_funnel_audit_records_ai_hold_reason(monkeypatch, db_session) -> None:
+    settings_row = _prepare_live_entry_plan_settings(db_session)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_exchange_sync_cycle",
+        lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
+    )
+
+    def fake_agent_run(*args, **kwargs):
+        return (
+            _entry_plan_test_decision().model_copy(
+                update={
+                    "decision": "hold",
+                    "entry_mode": "none",
+                    "entry_zone_min": None,
+                    "entry_zone_max": None,
+                    "invalidation_price": None,
+                    "max_chase_bps": None,
+                    "idea_ttl_minutes": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "rationale_codes": ["NO_VALID_ENTRY_SETUP"],
+                    "no_trade_reason_codes": ["NO_VALID_ENTRY_SETUP"],
+                    "explanation_short": "No valid entry setup.",
+                }
+            ),
+            "openai",
+            {"source": "llm"},
+        )
+
+    def fake_evaluate_risk(session, settings_row, decision, market_snapshot, **kwargs):
+        result = RiskCheckResult(
+            allowed=False,
+            decision="hold",
+            reason_codes=["HOLD_DECISION"],
+            blocked_reason_codes=["HOLD_DECISION"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            operating_mode="hold",
+            effective_leverage_cap=5.0,
+            symbol_risk_tier="btc",
+            exposure_metrics={},
+        )
+        row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=kwargs.get("decision_run_id"),
+            market_snapshot_id=kwargs.get("market_snapshot_id"),
+            allowed=False,
+            decision="hold",
+            reason_codes=list(result.reason_codes),
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload=result.model_dump(mode="json"),
+        )
+        session.add(row)
+        session.flush()
+        return result, row
+
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("hold decision must not submit an order")
+
+    orchestrator = TradingOrchestrator(db_session)
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_agent_run)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_evaluate_risk)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+
+    result = orchestrator.run_decision_cycle(
+        trigger_event="manual",
+        upto_index=140,
+        exchange_sync_checked=True,
+        auto_resume_checked=True,
+    )
+    db_session.flush()
+
+    event = _decision_funnel_events(db_session)[-1]
+    assert result["decision"]["decision"] == "hold"
+    assert event.payload["status"] == "hold"
+    assert event.payload["hold_reason"] == "NO_VALID_ENTRY_SETUP"
+    assert "HOLD_DECISION" in event.payload["hold_reason_codes"]
+    assert event.payload["order_status"] == "not_submitted"
+
+
+def test_decision_funnel_audit_records_risk_blocked_reason(monkeypatch, db_session) -> None:
+    settings_row = _prepare_live_entry_plan_settings(db_session)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_exchange_sync_cycle",
+        lambda self, **kwargs: {"status": "ok", "symbols": [settings_row.default_symbol]},
+    )
+
+    def fake_agent_run(*args, **kwargs):
+        return (
+            _entry_plan_test_decision().model_copy(update={"entry_mode": "immediate"}),
+            "openai",
+            {"source": "llm"},
+        )
+
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("risk-blocked decision must not submit an order")
+
+    orchestrator = TradingOrchestrator(db_session)
+    monkeypatch.setattr(orchestrator.trading_agent, "run", fake_agent_run)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", _entry_plan_fake_evaluate_risk_block_immediate)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+
+    result = orchestrator.run_decision_cycle(
+        trigger_event="manual",
+        upto_index=140,
+        exchange_sync_checked=True,
+        auto_resume_checked=True,
+    )
+    db_session.flush()
+
+    event = _decision_funnel_events(db_session)[-1]
+    assert result["risk_result"]["allowed"] is False
+    assert event.payload["status"] == "risk_blocked"
+    assert event.payload["final_risk_status"] == "blocked"
+    assert event.payload["blocked_reason"] == "MAX_LEVERAGE_EXCEEDED"
+    assert event.payload["entry_plan_status"] == "not_created"
+
+
 def test_entry_plan_watcher_ai_rechecks_zone_touch_before_execution(monkeypatch, db_session) -> None:
     settings_row = _prepare_live_entry_plan_settings(db_session)
 
@@ -1139,6 +1319,15 @@ def test_entry_plan_watcher_ai_rechecks_zone_touch_before_execution(monkeypatch,
     )
     assert risk_approved is not None
     assert risk_approved.payload["ai_call_event"] == "AI_DECISION_APPROVED_BY_RISK"
+    funnel_event = next(
+        event
+        for event in reversed(_decision_funnel_events(db_session))
+        if event.payload["stage"] == "entry_plan_triggered"
+    )
+    assert funnel_event.payload["entry_plan_status"] == "triggered"
+    assert funnel_event.payload["m1_confirmation_status"] == "passed"
+    assert funnel_event.payload["final_risk_status"] == "approved"
+    assert funnel_event.payload["order_status"] == "filled"
 
 
 def test_entry_plan_watcher_cancels_when_ai_recheck_holds(monkeypatch, db_session) -> None:
@@ -1262,6 +1451,15 @@ def test_entry_plan_watcher_does_not_execute_when_recheck_risk_blocks(monkeypatc
     assert pending_plan.metadata_json["last_ai_recheck_risk_blocked_decision_run_id"] == recheck_run_id
     assert risk_blocked is not None
     assert risk_blocked.payload["ai_call_event"] == "AI_DECISION_BLOCKED_BY_RISK"
+    funnel_event = next(
+        event
+        for event in reversed(_decision_funnel_events(db_session))
+        if event.payload["stage"] == "final_risk_guard"
+    )
+    assert funnel_event.payload["status"] == "final_risk_blocked"
+    assert funnel_event.payload["final_risk_status"] == "blocked"
+    assert funnel_event.payload["blocked_reason"] == "MAX_LEVERAGE_EXCEEDED"
+    assert funnel_event.payload["order_status"] == "not_submitted"
     assert db_session.scalar(select(Order).limit(1)) is None
 
 

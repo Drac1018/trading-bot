@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from trading_mvp.models import AgentRun, Execution, Order, Position, RiskCheck
+from trading_mvp.config import get_settings
+from trading_mvp.models import AgentRun, AuditEvent, Execution, Order, Position, RiskCheck
 from trading_mvp.providers import ProviderResult
 from trading_mvp.schemas import (
     AIDecisionContextPacket,
@@ -28,9 +29,16 @@ from trading_mvp.services.adaptive_signal import (
     build_adaptive_signal_context,
     compute_adaptive_adjustment,
 )
-from trading_mvp.services.agents import TradingDecisionAgent, build_trading_decision_input_payload
+from trading_mvp.services.agents import (
+    MarketSettingsAdvisorAgent,
+    TradingDecisionAgent,
+    build_trading_decision_input_payload,
+)
 from trading_mvp.services.features import compute_features, summarize_universe_breadth
 from trading_mvp.services.intent_semantics import infer_intent_semantics
+from trading_mvp.services.orchestrator import TradingOrchestrator
+from trading_mvp.services.secret_store import encrypt_secret
+from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.services.strategy_engines import select_strategy_engine
 from trading_mvp.time_utils import utcnow_naive
 
@@ -111,6 +119,15 @@ def _risk_budget(
         "directional_bias_headroom": directional_headroom,
         "single_position_headroom": single_position_headroom,
         "total_exposure_headroom": total_exposure_headroom,
+    }
+
+
+def _advisor_policy() -> dict[str, object]:
+    return {
+        "shadow": True,
+        "recommendation_ttl_seconds": 900,
+        "min_confidence_to_apply": 0.70,
+        "symbol_scope": ["BTCUSDT"],
     }
 
 
@@ -2898,7 +2915,18 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert captured_payloads[0]["ai_context"]["holding_profile"] == "swing"
     assert captured_payloads[0]["ai_context"]["event_context_summary"]["active_risk_window"] is True
     assert captured_payloads[0]["ai_context"]["prior_context"]["engine_prior_classification"] == "strong"
+    assert captured_payloads[0]["ai_response_contract"]["decision_authority"] == "intent_only_no_order_execution"
+    assert captured_payloads[0]["ai_response_contract"]["final_execution_gate"] == "deterministic_risk_guard"
+    assert "protective_order_state" in captured_payloads[0]["ai_response_contract"]["review_required"]
     assert decision.prompt_family_hint == "entry_candidate_event:trend_pullback_engine"
+    assert decision.strategy_id == "trend_pullback_engine"
+    assert decision.regime == "trend:bullish:fast"
+    assert decision.reason_summary == "ai context propagation test"
+    assert decision.entry_intent == "new_entry"
+    assert decision.entry_zone is not None
+    assert decision.entry_zone.low == decision.entry_zone_min
+    assert decision.invalidation_level == decision.invalidation_price
+    assert "risk_guard_final_approval" in decision.required_confirmations
     assert decision.regime_transition_risk == "medium"
     assert decision.data_quality_penalty_applied is True
     assert decision.event_risk_acknowledgement is None
@@ -2922,6 +2950,224 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert metadata["session_time_penalty_applied"] is False
     assert metadata["allowed_actions"] == ["hold", "long", "short"]
     assert metadata["bounded_output_applied"] is False
+
+
+def test_market_settings_advisor_accepts_allowed_profile_recommendation() -> None:
+    generated_at = datetime.now(UTC)
+    captured_payloads: list[dict[str, object]] = []
+
+    class NormalAdvisorProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            captured_payloads.append(dict(payload))
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": "advisor-normal-001",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": ["BTCUSDT"],
+                    "recommended_profile_id": "NORMAL",
+                    "confidence": 0.77,
+                    "reason_summary": "Normal market structure with acceptable liquidity.",
+                    "reason_codes": ["NORMAL_MARKET_CONDITIONS"],
+                    "observed_risk_flags": [],
+                    "suggested_new_entry_policy": "NORMAL_ALLOWED",
+                    "do_not_relax": True,
+                },
+                usage={"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+            )
+
+    base = _snapshot("15m", [100, 101, 102, 103, 104, 105, 106, 107])
+    features = compute_features(base, {})
+    recommendation, provider_name, metadata = MarketSettingsAdvisorAgent(NormalAdvisorProvider()).run(
+        market_snapshot=base,
+        features=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        settings_policy=_advisor_policy(),
+        observed_risk_flags=[],
+        use_ai=True,
+    )
+
+    assert provider_name == "openai"
+    assert recommendation is not None
+    assert recommendation.recommended_profile_id == "NORMAL"
+    assert recommendation.suggested_new_entry_policy == "NORMAL_ALLOWED"
+    assert metadata["schema_status"] == "valid"
+    assert captured_payloads[0]["authority"]["can_change_raw_settings"] is False
+    assert "NORMAL" in captured_payloads[0]["authority"]["allowed_profiles"]
+
+
+def test_market_settings_advisor_accepts_high_volatility_profile() -> None:
+    generated_at = datetime.now(UTC)
+
+    class HighVolProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            assert role == "market_settings_advisor"
+            assert "slippage" in instructions
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": "advisor-stress-001",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": ["BTCUSDT"],
+                    "recommended_profile_id": "STRESS",
+                    "confidence": 0.81,
+                    "reason_summary": "Volatility expansion and range break require conservative posture.",
+                    "reason_codes": ["VOLATILITY_EXPANDED", "RANGE_BREAK"],
+                    "observed_risk_flags": ["HIGH_VOLATILITY", "RANGE_BREAK"],
+                    "suggested_new_entry_policy": "NO_NEW_ENTRY",
+                    "do_not_relax": True,
+                },
+            )
+
+    base = _snapshot("15m", [100, 102, 99, 105, 96, 108, 94, 111])
+    features = compute_features(base, {})
+    features.regime.volatility_regime = "expanded"
+    features.breakout.range_breakout_direction = "up"
+
+    recommendation, _, _ = MarketSettingsAdvisorAgent(HighVolProvider()).run(
+        market_snapshot=base,
+        features=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        settings_policy=_advisor_policy(),
+        observed_risk_flags=["HIGH_VOLATILITY", "RANGE_BREAK"],
+        use_ai=True,
+    )
+
+    assert recommendation is not None
+    assert recommendation.recommended_profile_id == "STRESS"
+    assert recommendation.suggested_new_entry_policy == "NO_NEW_ENTRY"
+
+
+def test_market_settings_advisor_rejects_unknown_profile_id() -> None:
+    generated_at = datetime.now(UTC)
+
+    class UnknownProfileProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": "advisor-invalid-001",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": ["BTCUSDT"],
+                    "recommended_profile_id": "RELAXED",
+                    "confidence": 0.91,
+                    "reason_summary": "Invalid relaxed profile should be ignored.",
+                    "reason_codes": ["BAD_PROFILE"],
+                    "observed_risk_flags": [],
+                    "suggested_new_entry_policy": "NORMAL_ALLOWED",
+                    "do_not_relax": True,
+                },
+            )
+
+    base = _snapshot("15m", [100, 101, 102, 103, 104, 105, 106, 107])
+    features = compute_features(base, {})
+
+    recommendation, provider_name, metadata = MarketSettingsAdvisorAgent(UnknownProfileProvider()).run(
+        market_snapshot=base,
+        features=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        settings_policy=_advisor_policy(),
+        observed_risk_flags=[],
+        use_ai=True,
+    )
+
+    assert recommendation is None
+    assert provider_name == "openai"
+    assert metadata["schema_status"] == "invalid"
+    assert metadata["ignored_reason_code"] == "AI_MARKET_SETTINGS_SCHEMA_INVALID"
+
+
+def test_market_settings_advisor_low_confidence_is_ignored_and_audited(db_session) -> None:
+    generated_at = datetime.now(UTC)
+
+    class LowConfidenceProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": "advisor-low-confidence-001",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": ["BTCUSDT"],
+                    "recommended_profile_id": "CAUTION",
+                    "confidence": 0.42,
+                    "reason_summary": "Low confidence recommendation should be ignored.",
+                    "reason_codes": ["LOW_CONFIDENCE_TEST"],
+                    "observed_risk_flags": ["HIGH_VOLATILITY"],
+                    "suggested_new_entry_policy": "STRICT_CONFIRMATION_ONLY",
+                    "do_not_relax": True,
+                },
+            )
+
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_provider = "openai"
+    settings_row.openai_api_key_encrypted = encrypt_secret("sk-test", get_settings().app_secret_seed)
+    db_session.flush()
+    orchestrator = TradingOrchestrator(db_session)
+    orchestrator.market_settings_advisor = MarketSettingsAdvisorAgent(LowConfidenceProvider())
+    base = _snapshot("15m", [100, 101, 99, 103, 98, 104, 97, 105])
+    features = compute_features(base, {})
+    features.regime.volatility_regime = "expanded"
+
+    result = orchestrator._maybe_run_market_settings_advisor(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot=base,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        cycle_id="cycle-test",
+        snapshot_id=123,
+        force=True,
+    )
+
+    assert result is not None
+    assert result["status"] == "ignored"
+    assert result["risk_guard_unchanged"] is True
+    assert result["ignored_reason_codes"] == ["AI_MARKET_SETTINGS_LOW_CONFIDENCE"]
+    assert db_session.query(RiskCheck).count() == 0
+    event = db_session.query(AuditEvent).filter_by(
+        event_type="ai_market_settings_recommendation_ignored"
+    ).one()
+    assert event.payload["recommendation_id"] == "advisor-low-confidence-001"
+    assert event.payload["recommended_profile_id"] == "CAUTION"
+    assert event.payload["confidence"] == 0.42
+    assert event.payload["ignored_reason_code"] == "AI_MARKET_SETTINGS_LOW_CONFIDENCE"
+
+
+def test_market_settings_advisor_flags_stale_incomplete_data_as_degraded() -> None:
+    base = _snapshot("15m", [100, 101, 102, 103], stale=True, complete=False)
+    features = compute_features(base, {})
+    flags = TradingOrchestrator._market_settings_observed_risk_flags(
+        market_snapshot=base,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        previous_state=None,
+    )
+    recommendation = MarketSettingsAdvisorAgent._deterministic_recommendation(
+        symbol_scope=["BTCUSDT"],
+        generated_at=datetime.now(UTC),
+        ttl_seconds=900,
+        observed_risk_flags=flags,
+        market_snapshot=base,
+        features=features,
+    )
+
+    assert "STALE_MARKET_DATA" in flags
+    assert "INCOMPLETE_MARKET_DATA" in flags
+    assert recommendation.recommended_profile_id == "DEGRADED"
+    assert recommendation.suggested_new_entry_policy == "NO_NEW_ENTRY"
 
 
 def test_trading_decision_input_payload_exposes_separated_feature_layers() -> None:
@@ -3104,3 +3350,213 @@ def test_trading_agent_bounds_degraded_long_horizon_entry_to_hold() -> None:
     assert metadata["provider_status"] == "ok"
     assert metadata["provider_not_called_due_to_quality"] is False
     assert metadata["abstain_due_to_data_quality"] is True
+
+
+def _cost_guard_fixture(*, symbol: str = "BTCUSDT", atr: float = 0.2) -> tuple[MarketSnapshotPayload, FeaturePayload]:
+    base = _snapshot(
+        "15m",
+        [100.0, 100.1, 99.9, 100.0, 100.1, 99.9, 100.0, 100.1, 99.9, 100.0, 100.1, 99.9, 100.0, 100.1, 99.9, 100.0],
+    ).model_copy(update={"symbol": symbol})
+    context = {
+        "1h": _snapshot("1h", [100.0, 100.1, 99.9, 100.0, 100.1, 99.9, 100.0, 100.1]).model_copy(
+            update={"symbol": symbol}
+        ),
+        "4h": _snapshot("4h", [100.0, 100.1, 99.9, 100.0, 100.1, 99.9, 100.0, 100.1]).model_copy(
+            update={"symbol": symbol}
+        ),
+    }
+    features = compute_features(base, context)
+    features.symbol = symbol
+    features.atr = atr
+    features.regime.primary_regime = "range"
+    features.regime.trend_alignment = "range"
+    features.regime.volatility_regime = "normal"
+    features.regime.momentum_state = "stable"
+    features.regime.weak_volume = False
+    return base, features
+
+
+def test_adaptive_brackets_widen_btc_long_tight_range_tp_for_cost() -> None:
+    base, features = _cost_guard_fixture(symbol="BTCUSDT", atr=0.2)
+    result = _agent()._adaptive_brackets_with_cost_guard(  # type: ignore[attr-defined]
+        "long",
+        symbol="BTCUSDT",
+        price=100.0,
+        atr=features.atr,
+        features=features,
+        market_snapshot=base,
+        entry_mode="pullback_confirm",
+    )
+
+    assert result.initial_cost.expected_gross_bps == pytest.approx(28.0)
+    assert result.cost.expected_gross_bps is not None
+    assert result.cost.expected_gross_bps >= 40.0
+    assert result.widened is True
+    assert result.demote_to_watch is False
+    assert "bracket_tp_widened_for_cost" in result.reason_codes
+    assert "btc_long_tp_too_tight" in result.reason_codes
+
+
+def test_adaptive_brackets_do_not_blanket_block_eth_long_35bps_when_net_passes() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT", atr=0.25)
+    result = _agent()._adaptive_brackets_with_cost_guard(  # type: ignore[attr-defined]
+        "long",
+        symbol="ETHUSDT",
+        price=100.0,
+        atr=features.atr,
+        features=features,
+        market_snapshot=base,
+        entry_mode="pullback_confirm",
+    )
+
+    assert result.initial_cost.expected_gross_bps == pytest.approx(35.0)
+    assert result.initial_cost.expected_net_bps is not None
+    assert result.initial_cost.expected_net_bps >= result.initial_cost.min_required_net_bps
+    assert result.initial_cost.fee_to_gross_ratio is not None
+    assert result.initial_cost.fee_to_gross_ratio <= result.max_fee_to_gross_ratio
+    assert result.widened is False
+    assert result.demote_to_watch is False
+    assert result.reason_codes == []
+
+
+def test_adaptive_brackets_widen_high_fee_ratio_before_confirming_entry() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT", atr=0.2)
+    result = _agent()._adaptive_brackets_with_cost_guard(  # type: ignore[attr-defined]
+        "long",
+        symbol="ETHUSDT",
+        price=100.0,
+        atr=features.atr,
+        features=features,
+        market_snapshot=base,
+        entry_mode="pullback_confirm",
+    )
+
+    assert result.initial_cost.expected_gross_bps == pytest.approx(28.0)
+    assert result.initial_cost.fee_to_gross_ratio is not None
+    assert result.initial_cost.fee_to_gross_ratio > result.max_fee_to_gross_ratio
+    assert result.cost.fee_to_gross_ratio is not None
+    assert result.cost.fee_to_gross_ratio <= result.max_fee_to_gross_ratio
+    assert result.take_profit > result.initial_take_profit
+    assert "fee_to_gross_ratio_too_high" in result.reason_codes
+    assert "bracket_tp_widened_for_cost" in result.reason_codes
+
+
+def test_trading_agent_demotes_entry_to_watch_when_bracket_net_edge_cannot_clear_costs() -> None:
+    base, features = _cost_guard_fixture(symbol="BTCUSDT", atr=0.2)
+    features.derivatives.spread_bps = 9999.0
+    decision = TradeDecision(
+        decision="short",
+        confidence=0.8,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=100.02,
+        entry_zone_max=100.08,
+        entry_mode="pullback_confirm",
+        stop_loss=100.16,
+        take_profit=99.72,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=1.5,
+        rationale_codes=["TEST_SHORT"],
+        explanation_short="short candidate",
+        explanation_detailed="short candidate",
+    )
+
+    updated = _agent()._apply_bracket_cost_guard_to_decision(  # type: ignore[attr-defined]
+        decision,
+        market_snapshot=base,
+        features=features,
+    )
+
+    assert updated.decision == "hold"
+    assert updated.take_profit is None
+    assert updated.watch_entry_plan is not None
+    assert updated.watch_entry_plan.side == "short"
+    assert "bracket_demoted_to_watch_due_to_thin_net_edge" in updated.rationale_codes
+    assert "expected_net_bps_too_low" in updated.rationale_codes
+    assert "AI_WATCH_ENTRY_PLAN" in updated.watch_entry_plan.reason_codes
+
+
+def _sizing_decision(
+    *,
+    symbol: str = "ETHUSDT",
+    side: str = "long",
+    take_profit: float = 100.9,
+    risk_pct: float = 0.01,
+    leverage: float = 5.0,
+) -> TradeDecision:
+    return TradeDecision(
+        decision=side,  # type: ignore[arg-type]
+        confidence=0.9,
+        symbol=symbol,
+        timeframe="15m",
+        entry_zone_min=99.95,
+        entry_zone_max=100.05,
+        entry_mode="pullback_confirm",
+        stop_loss=99.5 if side == "long" else 100.5,
+        take_profit=take_profit,
+        max_holding_minutes=120,
+        risk_pct=risk_pct,
+        leverage=leverage,
+        rationale_codes=["TEST_ENTRY"],
+        explanation_short="entry candidate",
+        explanation_detailed="entry candidate for net edge sizing",
+    )
+
+
+def test_net_edge_sizing_reduces_risk_pct_when_net_edge_is_near_minimum() -> None:
+    base, low_edge_features = _cost_guard_fixture(symbol="ETHUSDT", atr=0.4)
+    low_edge_features.derivatives.spread_bps = 20.0
+    low_edge_decision = _sizing_decision(symbol="ETHUSDT", take_profit=100.5, risk_pct=0.01)
+    low_edge = _agent()._apply_net_edge_sizing_to_decision(  # type: ignore[attr-defined]
+        low_edge_decision,
+        market_snapshot=base,
+        features=low_edge_features,
+    )
+
+    _, strong_edge_features = _cost_guard_fixture(symbol="ETHUSDT", atr=0.4)
+    strong_edge_features.derivatives.spread_bps = 0.0
+    strong_edge_decision = _sizing_decision(symbol="ETHUSDT", take_profit=100.9, risk_pct=0.01)
+    strong_edge = _agent()._apply_net_edge_sizing_to_decision(  # type: ignore[attr-defined]
+        strong_edge_decision,
+        market_snapshot=base,
+        features=strong_edge_features,
+    )
+
+    assert low_edge.risk_pct < strong_edge.risk_pct
+    assert low_edge.risk_pct < low_edge_decision.risk_pct
+    assert strong_edge.risk_pct == pytest.approx(strong_edge_decision.risk_pct)
+    assert "size_reduced_due_to_low_net_edge" in low_edge.rationale_codes
+    assert low_edge.expected_payoff_efficiency_hint_summary["expected_net_bps"] == pytest.approx(19.0)
+
+
+def test_net_edge_sizing_caps_high_fee_to_gross_ratio() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT", atr=0.4)
+    features.derivatives.spread_bps = 0.0
+    decision = _sizing_decision(symbol="ETHUSDT", take_profit=100.45, risk_pct=0.01)
+
+    updated = _agent()._apply_net_edge_sizing_to_decision(  # type: ignore[attr-defined]
+        decision,
+        market_snapshot=base,
+        features=features,
+    )
+
+    assert updated.risk_pct == pytest.approx(0.0065)
+    assert "size_capped_due_to_high_fee_to_gross" in updated.rationale_codes
+    assert updated.expected_payoff_efficiency_hint_summary["fee_to_gross_ratio"] == pytest.approx(10.0 / 45.0)
+
+
+def test_net_edge_sizing_caps_tight_gross_bps_without_changing_leverage() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT", atr=0.4)
+    features.derivatives.spread_bps = 0.0
+    decision = _sizing_decision(symbol="ETHUSDT", take_profit=100.55, risk_pct=0.01, leverage=5.0)
+
+    updated = _agent()._apply_net_edge_sizing_to_decision(  # type: ignore[attr-defined]
+        decision,
+        market_snapshot=base,
+        features=features,
+    )
+
+    assert updated.risk_pct == pytest.approx(0.007)
+    assert updated.leverage == decision.leverage
+    assert "size_capped_due_to_tight_gross_bps" in updated.rationale_codes

@@ -11,6 +11,7 @@ import {
   isEntryWaitReasonCodeInContext,
   lookupRiskReasonCode,
 } from "../lib/risk-reason-copy.js";
+import { buildExecutionRiskProfileSummary } from "../lib/execution-risk-profile-summary";
 import { normalizeSyncScopeStatus } from "../lib/sync-freshness";
 
 type Tone = "safe" | "warn" | "danger" | "neutral" | "info";
@@ -683,10 +684,10 @@ function ProfitabilityCostPanel({
       title="수익성 비용 분해"
       action={
         <div className="flex flex-wrap items-center gap-2">
-          <Link
-            href="/dashboard/cost-breakdown"
-            className="inline-flex min-h-9 items-center rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
-          >
+            <Link
+              href="/dashboard/analytics?section=cost"
+              className="inline-flex min-h-9 items-center rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+            >
             기간별 보기
           </Link>
           <StatusPill tone={tone}>{statusLabel}</StatusPill>
@@ -924,6 +925,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   const profitabilityCost = primaryProfitabilityCost(operator);
   const entryQuality = primaryEntryQuality(operator);
   const openPositionCount = operator.symbols.filter((symbol) => symbol.open_position.is_open).length;
+  const executionProfile = buildExecutionRiskProfileSummary(operator.control);
 
   const toggleChecked = (id: string) => {
     setCheckedIds((current) =>
@@ -1012,6 +1014,11 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                     value: entryPermission.label,
                     tone: entryPermission.tone,
                   },
+                  {
+                    label: "실행 프로파일",
+                    value: executionProfile.finalActiveProfile,
+                    tone: operator.control.profile_new_entry_blocked ? "danger" as const : "info" as const,
+                  },
                   { label: "보호주문 상태", value: protection.label, tone: protection.tone },
                   { label: "계좌/주문 동기화", value: sync.label, tone: sync.tone },
                 ].map((row) => (
@@ -1089,6 +1096,52 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                   <p className="text-sm leading-6 text-slate-600">
                     위 수치는 백엔드가 계산한 최신 노출/여유 값입니다. 보호주문, 동기화, 승인 상태를 통과해야 새 포지션을 열 수 있습니다.
                   </p>
+                </div>
+              </Panel>
+
+              <Panel title="AI 실행 리스크 프로파일">
+                <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                  {[
+                    ["deterministic", executionProfile.deterministicProfile, "deterministic profile"],
+                    ["AI 추천", executionProfile.aiRecommendedProfile, executionProfile.recommendationStatusLabel],
+                    ["최종 active", executionProfile.finalActiveProfile, executionProfile.selectedReason],
+                  ].map(([label, value, detail]) => (
+                    <div key={label} className="rounded-md border border-slate-100 bg-slate-50 p-4">
+                      <p className="text-sm text-slate-500">{label}</p>
+                      <p className="mt-2 text-lg font-semibold text-slate-950">{value}</p>
+                      <p className="mt-1 break-words text-xs text-slate-500">{detail}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-md border border-slate-100 bg-slate-50 p-4">
+                    <p className="text-sm text-slate-500">AI 추천 반영</p>
+                    <p className="mt-2 text-base font-semibold text-slate-950">{executionProfile.applicationLabel}</p>
+                    <p className="mt-1 break-words text-xs leading-5 text-slate-500">{executionProfile.applicationDetail}</p>
+                  </div>
+                  <div className="rounded-md border border-slate-100 bg-slate-50 p-4">
+                    <p className="text-sm text-slate-500">진입/생존 경로</p>
+                    <p className="mt-2 text-base font-semibold text-slate-950">
+                      {executionProfile.newEntryLabel} / 생존 경로 {executionProfile.survivalPathLabel}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">{executionProfile.survivalPathDetail}</p>
+                  </div>
+                </div>
+                <div className="mt-4 rounded-md border border-slate-100 bg-slate-50 px-4 py-3">
+                  <p className="text-sm leading-6 text-slate-600">
+                    profile selector {executionProfile.selectionMode} / 추천 ID {executionProfile.recommendationId} /
+                    confidence {executionProfile.confidenceLabel} / 다음 검토 {formatDateTime(executionProfile.nextReviewAt)}
+                  </p>
+                  {executionProfile.isProfileSelectorShadow ? (
+                    <p className="mt-2 text-sm leading-6 text-blue-800">
+                      shadow mode에서는 AI 추천이 실제 active profile 변경이나 신규 진입 차단처럼 표시되지 않습니다.
+                    </p>
+                  ) : null}
+                  {executionProfile.ignoredReasonCodes.length > 0 ? (
+                    <p className="mt-2 break-words text-sm leading-6 text-amber-800">
+                      무시 사유 {executionProfile.ignoredReasonCodes.join(", ")}
+                    </p>
+                  ) : null}
                 </div>
               </Panel>
 

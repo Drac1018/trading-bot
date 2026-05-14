@@ -47,12 +47,14 @@ from trading_mvp.services.connectivity import (
 from trading_mvp.services.dashboard import (
     get_agent_runs,
     get_alerts,
+    get_audit_event_detail,
     get_analytics_cost_breakdown,
     get_audit_timeline,
     get_decisions,
     get_execution_quality_report,
     get_executions,
     get_feature_snapshots,
+    get_market_chart_markers,
     get_market_snapshots,
     get_operator_dashboard,
     get_orders,
@@ -82,6 +84,7 @@ from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.performance_reporting import build_signal_performance_report
 from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.runtime_state import replace_market_stream_detail
+from trading_mvp.services.safety_checks import get_safety_check_detail, get_safety_check_summaries
 from trading_mvp.services.scheduler import (
     abandon_stale_scheduler_runs,
     maybe_refresh_exchange_sync_freshness,
@@ -748,6 +751,15 @@ def feature_snapshots(
     return get_feature_snapshots(db, limit=_bounded_limit(limit), compact=compact, symbol=symbol, timeframe=timeframe)
 
 
+@app.get("/api/market/chart-markers")
+def market_chart_markers(
+    symbol: str,
+    limit: int = 80,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_market_chart_markers(db, symbol=symbol, limit=_bounded_limit(limit, default=80, maximum=120))
+
+
 @app.get("/api/decisions")
 def decisions(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
     return get_decisions(db, limit=_bounded_limit(limit), compact=compact)
@@ -764,10 +776,21 @@ def orders(
     symbol: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    position_id: int | None = None,
+    compact: bool = False,
     limit: int = 50,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    return get_orders(db, mode=mode, symbol=symbol, status=status, search=search, limit=_bounded_limit(limit))
+    return get_orders(
+        db,
+        mode=mode,
+        symbol=symbol,
+        status=status,
+        search=search,
+        position_id=position_id,
+        compact=compact,
+        limit=_bounded_limit(limit),
+    )
 
 
 @app.get("/api/executions")
@@ -776,10 +799,21 @@ def executions(
     symbol: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    position_id: int | None = None,
+    compact: bool = False,
     limit: int = 50,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    return get_executions(db, mode=mode, symbol=symbol, status=status, search=search, limit=_bounded_limit(limit))
+    return get_executions(
+        db,
+        mode=mode,
+        symbol=symbol,
+        status=status,
+        search=search,
+        position_id=position_id,
+        compact=compact,
+        limit=_bounded_limit(limit),
+    )
 
 
 @app.get("/api/executions/report")
@@ -790,6 +824,19 @@ def execution_quality_report(db: Session = Depends(get_db)) -> dict[str, object]
 @app.get("/api/risk/checks")
 def risk_checks(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
     return get_risk_checks(db, limit=_bounded_limit(limit), compact=compact)
+
+
+@app.get("/api/risk/checks/summary")
+def risk_check_summaries(limit: int = 20, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return get_safety_check_summaries(db, limit=_bounded_limit(limit, default=20, maximum=20))
+
+
+@app.get("/api/risk/checks/{risk_check_id}")
+def risk_check_detail(risk_check_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    detail = get_safety_check_detail(db, risk_check_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Risk check not found")
+    return detail
 
 
 @app.get("/api/agents")
@@ -805,12 +852,34 @@ def scheduler(limit: int = 50, compact: bool = False, db: Session = Depends(get_
 @app.get("/api/audit")
 def audit(
     event_type: str | None = None,
+    tab: str | None = None,
+    category: str | None = None,
     severity: str | None = None,
     search: str | None = None,
+    q: str | None = None,
+    sort: str = "newest",
+    compact: bool = False,
     limit: int = 100,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    return get_audit_timeline(db, event_type=event_type, severity=severity, search=search, limit=_bounded_limit(limit, default=100))
+    return get_audit_timeline(
+        db,
+        event_type=event_type,
+        event_category=category or tab,
+        severity=severity,
+        search=search or q,
+        sort=sort,
+        compact=compact,
+        limit=_bounded_limit(limit, default=100),
+    )
+
+
+@app.get("/api/audit/{audit_event_id}")
+def audit_detail(audit_event_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    detail = get_audit_event_detail(db, audit_event_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Audit event not found")
+    return detail
 
 
 @app.get("/api/alerts")

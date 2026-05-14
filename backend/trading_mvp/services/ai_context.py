@@ -19,6 +19,14 @@ from trading_mvp.schemas import (
     PreviousThesisDeltaPacket,
     RegimeSummaryPayload,
 )
+from trading_mvp.services.cost_model import (
+    ENTRY_EXECUTION_TYPE_MARKETABLE,
+    ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT,
+    ENTRY_EXECUTION_TYPE_UNKNOWN,
+    calculate_expected_trade_cost,
+    normalize_entry_execution_type,
+    recent_execution_cost_estimate_from_context,
+)
 from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_SCALP,
     deterministic_stop_management_payload,
@@ -68,14 +76,9 @@ MACRO_EVENT_RELEVANT_ASSETS = frozenset(
         "RISK_ASSETS",
     }
 )
-EXPECTED_COST_ENTRY_MARKETABLE = "entry_marketable"
-EXPECTED_COST_ENTRY_PASSIVE_LIMIT = "entry_passive_limit"
-EXPECTED_COST_ENTRY_UNKNOWN = "entry_unknown"
-EXPECTED_COST_TAKER_FEE_BPS = 4.0
-EXPECTED_COST_MAKER_FEE_BPS = 2.0
-EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS = 3.0
-EXPECTED_COST_PASSIVE_SLIPPAGE_BPS = 1.0
-EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS = 2.0
+EXPECTED_COST_ENTRY_MARKETABLE = ENTRY_EXECUTION_TYPE_MARKETABLE
+EXPECTED_COST_ENTRY_PASSIVE_LIMIT = ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
+EXPECTED_COST_ENTRY_UNKNOWN = ENTRY_EXECUTION_TYPE_UNKNOWN
 TAKE_PROFIT_CLOSE_REASON_MARKERS = frozenset({"tp", "take_profit", "take-profit", "take profit"})
 RECENT_TP_CONTEXT_NESTED_KEYS = (
     "same_direction_reentry_context",
@@ -142,26 +145,7 @@ def _unique_codes(*groups: list[str]) -> list[str]:
 
 
 def _normalize_expected_entry_type(value: object) -> str | None:
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    if text in {EXPECTED_COST_ENTRY_MARKETABLE, "marketable", "market", "aggressive", "immediate"}:
-        return EXPECTED_COST_ENTRY_MARKETABLE
-    if text in {
-        EXPECTED_COST_ENTRY_PASSIVE_LIMIT,
-        "passive",
-        "passive_limit",
-        "maker",
-        "post_only",
-        "post-only",
-        "pullback_confirm",
-    }:
-        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
-    if "marketable" in text or "market" in text or "aggressive" in text:
-        return EXPECTED_COST_ENTRY_MARKETABLE
-    if "passive" in text or "maker" in text or "post_only" in text or "post-only" in text:
-        return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
-    return None
+    return normalize_entry_execution_type(value)
 
 
 def _expected_entry_execution_type(selection_context: Mapping[str, Any]) -> str:
@@ -191,15 +175,6 @@ def _expected_entry_execution_type(selection_context: Mapping[str, Any]) -> str:
     if entry_mode == "pullback_confirm":
         return EXPECTED_COST_ENTRY_PASSIVE_LIMIT
     return EXPECTED_COST_ENTRY_UNKNOWN
-
-
-def _expected_fee_bps(entry_execution_type: str) -> float:
-    entry_fee_bps = (
-        EXPECTED_COST_MAKER_FEE_BPS
-        if entry_execution_type == EXPECTED_COST_ENTRY_PASSIVE_LIMIT
-        else EXPECTED_COST_TAKER_FEE_BPS
-    )
-    return entry_fee_bps + EXPECTED_COST_TAKER_FEE_BPS
 
 
 def _cost_context_spread_bps(
@@ -253,6 +228,74 @@ def _candidate_side(selection_context: Mapping[str, Any], features: FeaturePaylo
     return "unknown"
 
 
+def _first_positive_float(*values: object) -> float | None:
+    for value in values:
+        parsed = _safe_float(value)
+        if parsed is not None and parsed > 0.0:
+            return parsed
+    return None
+
+
+def _expected_gross_bps_for_context(
+    *,
+    side: str,
+    market_snapshot: MarketSnapshotPayload,
+    selection_context: Mapping[str, Any],
+) -> tuple[float | None, str]:
+    selection = _as_dict(selection_context)
+    expected_cost_gate = _as_dict(selection.get("expected_cost_gate"))
+    strategy_engine_context = _as_dict(selection.get("strategy_engine_context"))
+    candidate = _as_dict(selection.get("candidate"))
+    value = _first_positive_float(
+        expected_cost_gate.get("expected_gross_bps"),
+        expected_cost_gate.get("expected_edge_bps"),
+        expected_cost_gate.get("take_profit_bps"),
+        expected_cost_gate.get("target_profit_bps"),
+        expected_cost_gate.get("tp_bps"),
+        selection.get("expected_gross_bps"),
+        selection.get("expected_edge_bps"),
+        selection.get("take_profit_bps"),
+        selection.get("target_profit_bps"),
+        selection.get("tp_bps"),
+        candidate.get("expected_gross_bps"),
+        candidate.get("expected_edge_bps"),
+        candidate.get("take_profit_bps"),
+        candidate.get("target_profit_bps"),
+        candidate.get("tp_bps"),
+        candidate.get("target_move_bps"),
+        candidate.get("expected_move_bps"),
+        strategy_engine_context.get("expected_gross_bps"),
+        strategy_engine_context.get("expected_edge_bps"),
+        strategy_engine_context.get("take_profit_bps"),
+        strategy_engine_context.get("target_profit_bps"),
+        strategy_engine_context.get("tp_bps"),
+        strategy_engine_context.get("target_move_bps"),
+    )
+    if value is not None:
+        return value, "selection_context"
+    entry_price = _first_positive_float(
+        expected_cost_gate.get("entry_price"),
+        selection.get("entry_price"),
+        candidate.get("entry_price"),
+        market_snapshot.latest_price,
+    )
+    target_price = _first_positive_float(
+        expected_cost_gate.get("target_price"),
+        expected_cost_gate.get("take_profit"),
+        selection.get("target_price"),
+        selection.get("take_profit"),
+        candidate.get("target_price"),
+        candidate.get("take_profit"),
+    )
+    if entry_price is None or target_price is None or entry_price <= 0.0:
+        return None, "missing_target_or_entry"
+    if side == "long" and target_price > entry_price:
+        return ((target_price - entry_price) / entry_price) * 10_000, "target_price_distance"
+    if side == "short" and target_price < entry_price:
+        return ((entry_price - target_price) / entry_price) * 10_000, "target_price_distance"
+    return None, "invalid_target_direction"
+
+
 def build_expected_cost_context(
     *,
     market_snapshot: MarketSnapshotPayload,
@@ -261,35 +304,82 @@ def build_expected_cost_context(
 ) -> dict[str, Any]:
     side = _candidate_side(selection_context, features)
     entry_execution_type = _expected_entry_execution_type(selection_context)
-    fee_bps = _expected_fee_bps(entry_execution_type)
-    slippage_bps = EXPECTED_COST_UNKNOWN_SLIPPAGE_BPS
-    if entry_execution_type == EXPECTED_COST_ENTRY_MARKETABLE:
-        slippage_bps = EXPECTED_COST_MARKETABLE_SLIPPAGE_BPS
-    elif entry_execution_type == EXPECTED_COST_ENTRY_PASSIVE_LIMIT:
-        slippage_bps = EXPECTED_COST_PASSIVE_SLIPPAGE_BPS
+    expected_gross_bps, expected_gross_source = _expected_gross_bps_for_context(
+        side=side,
+        market_snapshot=market_snapshot,
+        selection_context=selection_context,
+    )
     spread_bps, spread_source = _cost_context_spread_bps(
         market_snapshot=market_snapshot,
         features=features,
     )
+    selection = _as_dict(selection_context)
+    expected_cost_gate = _as_dict(selection.get("expected_cost_gate"))
+    explicit_spread_bps = _safe_float(
+        expected_cost_gate.get("spread_cost_bps")
+        or expected_cost_gate.get("spread_bps")
+        or selection.get("spread_cost_bps")
+        or selection.get("spread_bps")
+    )
+    if explicit_spread_bps is not None:
+        spread_bps = max(explicit_spread_bps, 0.0)
+        spread_source = "selection_context"
     funding_headwind_bps, funding_source = _cost_context_funding_headwind_bps(
         side=side,
         market_snapshot=market_snapshot,
         features=features,
     )
-    expected_cost_bps = fee_bps + slippage_bps + spread_bps + funding_headwind_bps
+    recent_estimate = recent_execution_cost_estimate_from_context(selection)
+    cost_estimate = calculate_expected_trade_cost(
+        entry_execution_type=entry_execution_type,
+        expected_gross_bps=expected_gross_bps,
+        spread_cost_bps=spread_bps,
+        recent_estimate=recent_estimate,
+        explicit_round_trip_fee_bps=_safe_float(
+            expected_cost_gate.get("round_trip_fee_bps")
+            or expected_cost_gate.get("fee_bps")
+            or selection.get("round_trip_fee_bps")
+            or selection.get("fee_bps")
+        ),
+        explicit_entry_fee_bps=_safe_float(expected_cost_gate.get("entry_fee_bps") or selection.get("entry_fee_bps")),
+        explicit_exit_fee_bps=_safe_float(expected_cost_gate.get("exit_fee_bps") or selection.get("exit_fee_bps")),
+        explicit_slippage_bps=_safe_float(
+            expected_cost_gate.get("expected_slippage_bps") or selection.get("expected_slippage_bps")
+        ),
+    )
+    cost_payload = cost_estimate.to_payload()
+    expected_cost_bps = cost_estimate.expected_cost_bps + funding_headwind_bps
     return {
         "status": "estimated" if side in {"long", "short"} else "side_unknown",
-        "basis": "pre_decision_cost_pressure_hint_only_risk_guard_recomputes",
+        "basis": "shared_cost_model_pre_decision_hint_risk_guard_reuses_same_model",
         "candidate_side": side,
         "entry_execution_type": entry_execution_type,
+        "expected_gross_bps": cost_payload["expected_gross_bps"],
+        "expected_gross_source": expected_gross_source,
+        "round_trip_fee_bps": cost_payload["round_trip_fee_bps"],
+        "expected_slippage_bps": cost_payload["expected_slippage_bps"],
+        "spread_cost_bps": cost_payload["spread_cost_bps"],
+        "expected_net_bps": cost_payload["expected_net_bps"],
+        "fee_to_gross_ratio": cost_payload["fee_to_gross_ratio"],
+        "min_required_net_bps": cost_payload["min_required_net_bps"],
         "expected_cost_bps": round(expected_cost_bps, 6),
         "cost_components": {
-            "fee_bps": round(fee_bps, 6),
-            "slippage_bps": round(slippage_bps, 6),
+            "maker_fee_bps": cost_payload["maker_fee_bps"],
+            "taker_fee_bps": cost_payload["taker_fee_bps"],
+            "fee_bps": cost_payload["round_trip_fee_bps"],
+            "round_trip_fee_bps": cost_payload["round_trip_fee_bps"],
+            "entry_fee_bps": cost_payload["entry_fee_bps"],
+            "exit_fee_bps": cost_payload["exit_fee_bps"],
+            "fee_source": cost_payload["fee_source"],
+            "slippage_bps": cost_payload["expected_slippage_bps"],
+            "expected_slippage_bps": cost_payload["expected_slippage_bps"],
+            "slippage_source": cost_payload["slippage_source"],
             "spread_bps": round(spread_bps, 6),
+            "spread_cost_bps": round(spread_bps, 6),
             "spread_source": spread_source,
             "funding_headwind_bps": round(funding_headwind_bps, 6),
             "funding_source": funding_source,
+            "recent_estimate": cost_payload["recent_estimate"],
         },
         "operator_note": "Costs are informational here; risk_guard performs the hard gate.",
     }

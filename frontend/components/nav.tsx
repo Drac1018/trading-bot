@@ -24,20 +24,15 @@ type NavItem = {
 
 const operatorItems: NavItem[] = [
   { href: "/", label: "운영 개요", icon: "home" },
-  { href: "/dashboard/account", label: "계좌 / 잔고", icon: "wallet" },
+  { href: "/dashboard/operations", label: "운영 판단", icon: "brain" },
+  { href: "/dashboard/trading", label: "거래 상태", icon: "order" },
   { href: "/dashboard/market", label: "시장 상태", icon: "market" },
-  { href: "/dashboard/decisions", label: "AI 판단", icon: "brain" },
-  { href: "/dashboard/positions", label: "포지션", icon: "position" },
-  { href: "/dashboard/orders", label: "주문 내역", icon: "order" },
-  { href: "/dashboard/risk", label: "안전 점검", icon: "shield" },
-  { href: "/dashboard/scheduler", label: "자동 실행", icon: "clock" },
-  { href: "/dashboard/audit", label: "감사 기록", icon: "audit" },
+  { href: "/dashboard/analytics", label: "비용 분석", icon: "position" },
+  { href: "/dashboard/audit", label: "감사 / 디버그", icon: "audit" },
   { href: "/dashboard/settings", label: "설정", icon: "settings" },
 ];
 
-const debugItems: NavItem[] = [
-  { href: "/dashboard/agents", label: "고급 디버그", icon: "debug" },
-];
+const debugItems: NavItem[] = [];
 
 function itemClass(active: boolean) {
   return active
@@ -138,20 +133,24 @@ export function AppNav() {
           </div>
         </div>
 
-        <div className="mt-4 px-1">
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">디버그</p>
-          <NavItemLinks items={debugItems} pathname={pathname} compact />
-        </div>
+        {debugItems.length > 0 ? (
+          <div className="mt-4 px-1">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">디버그</p>
+            <NavItemLinks items={debugItems} pathname={pathname} compact />
+          </div>
+        ) : null}
       </div>
 
       <div className="mt-4 hidden lg:block">
         <NavItemLinks items={operatorItems} pathname={pathname} />
       </div>
 
-      <div className="mt-5 hidden border-t border-slate-200 pt-4 lg:block">
-        <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">디버그</p>
-        <NavItemLinks items={debugItems} pathname={pathname} />
-      </div>
+      {debugItems.length > 0 ? (
+        <div className="mt-5 hidden border-t border-slate-200 pt-4 lg:block">
+          <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">디버그</p>
+          <NavItemLinks items={debugItems} pathname={pathname} />
+        </div>
+      ) : null}
     </nav>
   );
 }

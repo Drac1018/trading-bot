@@ -16,7 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from trading_mvp.config import get_settings
-from trading_mvp.models import Execution, Order, PnLSnapshot, Position, RiskCheck, Setting
+from trading_mvp.models import AgentRun, Execution, Order, PnLSnapshot, Position, RiskCheck, Setting
 from trading_mvp.schemas import (
     ExecutionIntent,
     FeaturePayload,
@@ -42,6 +42,7 @@ from trading_mvp.services.audit import (
     record_audit_event,
     record_health_event,
     record_position_management_event,
+    record_protective_order_health_event,
 )
 from trading_mvp.services.binance import BinanceAPIError, BinanceClient
 from trading_mvp.services.binance_user_stream import (
@@ -75,7 +76,12 @@ from trading_mvp.services.position_management import (
     seed_position_management_metadata,
     store_position_management_context,
 )
-from trading_mvp.services.risk import evaluate_risk, is_survival_path_decision
+from trading_mvp.services.range_mr_cooldown import record_range_mr_trade_result
+from trading_mvp.services.risk import (
+    evaluate_breakeven_stop_move_risk_guard,
+    evaluate_risk,
+    is_survival_path_decision,
+)
 from trading_mvp.services.runtime_state import (
     DEGRADED_MANAGE_ONLY_STATE,
     EMERGENCY_EXIT_STATE,
@@ -126,6 +132,18 @@ PROTECTION_VERIFY_DEADLINE_SECONDS = 30
 PROTECTION_VERIFY_FETCH_ATTEMPTS = 2
 PROTECTION_VERIFY_FAILED_REASON_CODE = "PROTECTION_VERIFY_FAILED"
 PROTECTION_VERIFY_BLOCKING_INTENT_TYPES = {"entry", "scale_in"}
+PROTECTIVE_STOP_LOSS_MISSING_REASON_CODE = "PROTECTIVE_STOP_LOSS_MISSING"
+PROTECTIVE_TAKE_PROFIT_MISSING_REASON_CODE = "PROTECTIVE_TAKE_PROFIT_MISSING"
+PROTECTIVE_ORDER_QUANTITY_MISMATCH_REASON_CODE = "PROTECTIVE_ORDER_QUANTITY_MISMATCH"
+PROTECTIVE_ORDER_REDUCE_ONLY_MISSING_REASON_CODE = "PROTECTIVE_ORDER_REDUCE_ONLY_MISSING"
+PROTECTIVE_ORDER_SIDE_MISMATCH_REASON_CODE = "PROTECTIVE_ORDER_SIDE_MISMATCH"
+PROTECTIVE_ORDER_HEALTH_REASON_CODES = {
+    PROTECTIVE_STOP_LOSS_MISSING_REASON_CODE,
+    PROTECTIVE_TAKE_PROFIT_MISSING_REASON_CODE,
+    PROTECTIVE_ORDER_QUANTITY_MISMATCH_REASON_CODE,
+    PROTECTIVE_ORDER_REDUCE_ONLY_MISSING_REASON_CODE,
+    PROTECTIVE_ORDER_SIDE_MISMATCH_REASON_CODE,
+}
 INACTIVE_PROTECTIVE_ORDER_STATUSES = {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
 DUPLICATE_EXECUTION_SUPPRESSED_REASON_CODE = "DUPLICATE_EXECUTION_SUPPRESSED"
 UNKNOWN_SUBMISSION_REASON_CODE = "LIVE_ORDER_SUBMISSION_UNKNOWN"
@@ -147,6 +165,7 @@ PROTECTIVE_CLOSE_FILL_BACKFILL_SOURCE = "EXCHANGE_BACKFILL"
 PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING_REASON_CODE = "PROTECTIVE_CLOSE_FILL_BACKFILL_PENDING"
 PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED_REASON_CODE = "PROTECTIVE_CLOSE_FILL_BACKFILL_FAILED"
 PROTECTIVE_CLOSE_FILL_BACKFILL_CLOSED_STATUSES = {"FINISHED", "FILLED", "CLOSED"}
+TIGHT_TP_BPS_THRESHOLD = 40.0
 
 _ACTIVE_SYMBOL_EXECUTION_LOCKS: dict[str, dict[str, object]] = {}
 _ACTIVE_SYMBOL_EXECUTION_LOCKS_GUARD = Lock()
@@ -215,6 +234,74 @@ def _take_profit_execution_policy(position: Position | None) -> dict[str, object
     }
 
 
+def _execution_setting_bool(settings_row: Setting, name: str, fallback: bool) -> bool:
+    app_settings = get_settings()
+    configured = getattr(settings_row, name, None)
+    if configured in {None, ""}:
+        configured = getattr(app_settings, name, fallback)
+    return _to_bool(configured, fallback)
+
+
+def _execution_setting_float(settings_row: Setting, name: str, fallback: float, *, minimum: float = 0.0) -> float:
+    app_settings = get_settings()
+    configured = getattr(settings_row, name, None)
+    if configured in {None, ""}:
+        configured = getattr(app_settings, name, fallback)
+    return max(_to_float(configured, fallback), minimum)
+
+
+def _take_profit_distance_bps(position: Position | None, take_profit: float | None) -> float | None:
+    if position is None or take_profit is None:
+        return None
+    reference_price = position.entry_price if position.entry_price > 0 else position.mark_price
+    if reference_price <= 0:
+        return None
+    if position.side == "long" and take_profit > reference_price:
+        return ((take_profit - reference_price) / reference_price) * 10_000
+    if position.side == "short" and take_profit < reference_price:
+        return ((reference_price - take_profit) / reference_price) * 10_000
+    return None
+
+
+def _take_profit_limit_policy(
+    settings_row: Setting,
+    position: Position,
+    *,
+    take_profit: float,
+) -> dict[str, object]:
+    tp_distance_bps = _take_profit_distance_bps(position, take_profit)
+    threshold_bps = _execution_setting_float(
+        settings_row,
+        "tight_tp_bps_threshold",
+        TIGHT_TP_BPS_THRESHOLD,
+        minimum=0.0,
+    )
+    setting_enabled = _execution_setting_bool(settings_row, "use_limit_take_profit_for_tight_tp", True)
+    post_only = _execution_setting_bool(settings_row, "tp_limit_post_only", True)
+    limit_enabled = bool(
+        setting_enabled
+        and tp_distance_bps is not None
+        and tp_distance_bps <= threshold_bps
+        and position.quantity > 0
+    )
+    fallback_reason: str | None = None
+    if not setting_enabled:
+        fallback_reason = "limit_take_profit_setting_disabled"
+    elif tp_distance_bps is None:
+        fallback_reason = "take_profit_distance_unavailable"
+    elif tp_distance_bps > threshold_bps:
+        fallback_reason = "take_profit_not_tight"
+    elif position.quantity <= 0:
+        fallback_reason = "take_profit_quantity_unavailable"
+    return {
+        "tp_limit_enabled": limit_enabled,
+        "tp_limit_post_only": bool(post_only and limit_enabled),
+        "tight_tp_bps_threshold": threshold_bps,
+        "take_profit_distance_bps": round(tp_distance_bps, 6) if tp_distance_bps is not None else None,
+        "tp_market_fallback_reason": fallback_reason,
+    }
+
+
 def _partial_take_profit_taken(position: Position | None) -> bool:
     return bool(_position_management_metadata_for_execution(position).get("partial_take_profit_taken"))
 
@@ -233,8 +320,10 @@ def _is_partial_take_profit_order(row: Order) -> bool:
     policy = metadata.get("take_profit_execution_policy")
     if not isinstance(policy, dict):
         return False
+    order_type = str(row.order_type or "").lower()
+    protective_component = str(metadata.get("protective_component") or "")
     return (
-        str(row.order_type or "").lower() == "take_profit_market"
+        (order_type.startswith("take_profit") or (order_type == "limit" and protective_component == "take_profit"))
         and str(policy.get("mode") or "") == "partial_reduce"
     )
 
@@ -284,6 +373,306 @@ def _to_float(value: object, default: float = 0.0) -> float:
 
 def _as_object_dict(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+TRADE_PERFORMANCE_TAG_KEYS = (
+    "strategy_id",
+    "strategy_engine",
+    "regime_id",
+    "regime_label",
+    "range_id",
+    "range_low",
+    "range_high",
+    "range_width_pct",
+    "entry_confirmation_type",
+    "risk_mode",
+)
+
+
+def _first_text(*values: object, default: str = "") -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return default
+
+
+def _is_present_value(value: object) -> bool:
+    if value is None:
+        return False
+    return not (isinstance(value, str) and not value.strip())
+
+
+def _trade_performance_tags_from_metadata(metadata: object) -> dict[str, Any]:
+    payload = _as_object_dict(metadata)
+    tags = _as_object_dict(payload.get("trade_performance_tags"))
+    if tags:
+        return dict(tags)
+    derived: dict[str, Any] = {}
+    for key in TRADE_PERFORMANCE_TAG_KEYS:
+        if _is_present_value(payload.get(key)):
+            derived[key] = payload[key]
+    return derived
+
+
+def _trade_performance_payload(tags: dict[str, Any] | None) -> dict[str, Any]:
+    if not tags:
+        return {}
+    cleaned = {key: value for key, value in tags.items() if _is_present_value(value)}
+    payload: dict[str, Any] = {"trade_performance_tags": cleaned}
+    for key in TRADE_PERFORMANCE_TAG_KEYS:
+        if cleaned.get(key) not in {None, ""}:
+            payload[key] = cleaned[key]
+    return payload
+
+
+def _merge_trade_performance_tags(
+    metadata: object,
+    tags: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = _as_object_dict(metadata)
+    existing = _trade_performance_tags_from_metadata(payload)
+    if not tags and not existing:
+        return payload
+    merged = {
+        **existing,
+        **{key: value for key, value in (tags or {}).items() if _is_present_value(value)},
+    }
+    return {
+        **payload,
+        **_trade_performance_payload(merged),
+    }
+
+
+def _risk_mode_from_drawdown_state(drawdown_state: dict[str, Any]) -> str:
+    state = str(drawdown_state.get("current_drawdown_state") or drawdown_state.get("drawdown_state") or "normal").strip().lower()
+    if state == "recovery":
+        return "drawdown_recovery"
+    return state or "normal"
+
+
+def _strategy_engine_name_from_decision_payload(
+    metadata: dict[str, Any],
+    input_payload: dict[str, Any],
+    output_payload: dict[str, Any],
+) -> str:
+    existing_tags = _trade_performance_tags_from_metadata(metadata)
+    if existing_tags.get("strategy_id"):
+        return str(existing_tags["strategy_id"])
+    ai_context = _as_object_dict(input_payload.get("ai_context"))
+    selection_context = _as_object_dict(metadata.get("selection_context"))
+    for value in (
+        metadata.get("strategy_id"),
+        metadata.get("strategy_engine"),
+        selection_context.get("strategy_engine"),
+        ai_context.get("strategy_engine"),
+        output_payload.get("strategy_id"),
+        output_payload.get("strategy_engine"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for container in (
+        metadata.get("strategy_engine"),
+        selection_context.get("strategy_engine_context"),
+        ai_context.get("strategy_engine_context"),
+        output_payload.get("strategy_engine_context"),
+    ):
+        payload = _as_object_dict(container)
+        selected = _as_object_dict(payload.get("selected_engine"))
+        engine_name = _first_text(selected.get("engine_name"), payload.get("strategy_engine"))
+        if engine_name:
+            return engine_name
+    entry_mode = str(output_payload.get("entry_mode") or "").lower()
+    decision = str(output_payload.get("decision") or "").lower()
+    rationale_codes = {str(code) for code in output_payload.get("rationale_codes") or [] if code}
+    if rationale_codes & {"PROTECTION_REQUIRED", "PROTECTION_RECOVERY", "PROTECTION_RESTORE"}:
+        return "protection_reduce_engine"
+    if entry_mode == "breakout_confirm":
+        return "breakout_exception_engine"
+    if any("CONTINUATION" in code for code in rationale_codes):
+        return "trend_continuation_engine"
+    if entry_mode == "pullback_confirm":
+        return "trend_pullback_engine"
+    if decision in {"reduce", "exit"}:
+        return "protection_reduce_engine"
+    return "unspecified_engine"
+
+
+def _regime_tags_from_decision_payload(
+    metadata: dict[str, Any],
+    input_payload: dict[str, Any],
+) -> dict[str, Any]:
+    ai_context = _as_object_dict(input_payload.get("ai_context"))
+    feature_layers = _as_object_dict(input_payload.get("feature_layers"))
+    features = _as_object_dict(input_payload.get("features"))
+    feature_regime = _as_object_dict(features.get("regime"))
+    regime_summary = (
+        _as_object_dict(ai_context.get("regime_summary"))
+        or _as_object_dict(feature_layers.get("regime_summary"))
+        or _as_object_dict(metadata.get("regime_summary"))
+    )
+    composite_regime = _as_object_dict(ai_context.get("composite_regime"))
+    primary_regime = _first_text(
+        regime_summary.get("primary_regime"),
+        feature_regime.get("primary_regime"),
+        composite_regime.get("structure_regime"),
+        metadata.get("regime"),
+        default="unknown",
+    )
+    direction_regime = _first_text(
+        composite_regime.get("direction_regime"),
+        regime_summary.get("trend_alignment"),
+        feature_regime.get("trend_alignment"),
+        default="unknown",
+    )
+    regime_id = primary_regime
+    if direction_regime and direction_regime != "unknown":
+        regime_id = f"{primary_regime}:{direction_regime}"
+    return {
+        "regime_id": regime_id,
+        "regime_label": primary_regime,
+        "regime_summary": regime_summary,
+        "composite_regime": composite_regime,
+    }
+
+
+def _entry_confirmation_type(
+    *,
+    strategy_id: str,
+    decision: TradeDecision,
+    output_payload: dict[str, Any],
+) -> str:
+    existing = _trade_performance_tags_from_metadata(output_payload).get("entry_confirmation_type")
+    if existing:
+        return str(existing)
+    if strategy_id == "range_mean_reversion_engine":
+        return "range_edge_confirm"
+    entry_mode = _first_text(output_payload.get("entry_mode"), decision.entry_mode, default="none").lower()
+    if entry_mode in {"breakout_confirm", "pullback_confirm", "immediate", "none"}:
+        return entry_mode
+    return "none"
+
+
+def _risk_tag_payload(
+    *,
+    decision: TradeDecision,
+    requested_price: float,
+    requested_quantity: float,
+    risk_result: RiskCheckResult,
+) -> dict[str, Any]:
+    stop_loss = _to_float(decision.stop_loss)
+    take_profit = _to_float(decision.take_profit)
+    risk_per_unit = abs(requested_price - stop_loss) if requested_price > 0 and stop_loss > 0 else 0.0
+    initial_risk_usdt = risk_per_unit * abs(requested_quantity) if risk_per_unit > 0 and requested_quantity > 0 else 0.0
+    return {
+        "entry_price": requested_price if requested_price > 0 else None,
+        "stop_loss": stop_loss if stop_loss > 0 else None,
+        "take_profit": take_profit if take_profit > 0 else None,
+        "risk_per_unit": risk_per_unit if risk_per_unit > 0 else None,
+        "initial_quantity": abs(requested_quantity) if requested_quantity > 0 else None,
+        "initial_risk_usdt": initial_risk_usdt if initial_risk_usdt > 0 else None,
+        "approved_risk_pct": risk_result.approved_risk_pct,
+        "approved_leverage": risk_result.approved_leverage,
+        "approved_projected_notional": risk_result.approved_projected_notional,
+        "approved_quantity": risk_result.approved_quantity,
+    }
+
+
+def _build_trade_performance_tags(
+    session: Session,
+    *,
+    decision_run_id: int | None,
+    decision: TradeDecision,
+    market_snapshot: MarketSnapshotPayload,
+    risk_result: RiskCheckResult,
+    risk_row: RiskCheck | None,
+    intent_type: str,
+    requested_price: float,
+    requested_quantity: float,
+    execution_plan: ExecutionPlan | None = None,
+    existing_position: Position | None = None,
+) -> dict[str, Any]:
+    if decision.decision in {"reduce", "exit"} and existing_position is not None:
+        position_tags = _trade_performance_tags_from_metadata(existing_position.metadata_json)
+        if position_tags:
+            return {
+                **position_tags,
+                "exit_decision_run_id": decision_run_id,
+                "exit_decision": decision.decision,
+                "exit_intent_type": intent_type,
+            }
+
+    decision_run = session.get(AgentRun, decision_run_id) if decision_run_id is not None else None
+    metadata = _as_object_dict(decision_run.metadata_json if decision_run is not None else None)
+    existing_tags = _trade_performance_tags_from_metadata(metadata)
+    input_payload = _as_object_dict(decision_run.input_payload if decision_run is not None else None)
+    output_payload = _as_object_dict(decision_run.output_payload if decision_run is not None else None)
+    if not output_payload:
+        output_payload = decision.model_dump(mode="json")
+    strategy_id = _strategy_engine_name_from_decision_payload(metadata, input_payload, output_payload)
+    regime_tags = _regime_tags_from_decision_payload(metadata, input_payload)
+    risk_debug_payload = _as_object_dict(risk_result.debug_payload)
+    if not risk_debug_payload and risk_row is not None:
+        risk_debug_payload = _as_object_dict(_as_object_dict(risk_row.payload).get("debug_payload"))
+    drawdown_state = _as_object_dict(risk_debug_payload.get("drawdown_state"))
+    risk_payload = _risk_tag_payload(
+        decision=decision,
+        requested_price=requested_price if requested_price > 0 else market_snapshot.latest_price,
+        requested_quantity=requested_quantity,
+        risk_result=risk_result,
+    )
+    return {
+        **existing_tags,
+        "strategy_id": strategy_id,
+        "strategy_engine": strategy_id,
+        "regime_id": regime_tags["regime_id"],
+        "regime_label": regime_tags["regime_label"],
+        "entry_confirmation_type": _entry_confirmation_type(
+            strategy_id=strategy_id,
+            decision=decision,
+            output_payload=output_payload,
+        ),
+        "risk_mode": _risk_mode_from_drawdown_state(drawdown_state),
+        "current_drawdown_state": drawdown_state.get("current_drawdown_state") or drawdown_state.get("drawdown_state") or "normal",
+        "drawdown_state": drawdown_state,
+        "regime_summary": regime_tags["regime_summary"],
+        "composite_regime": regime_tags["composite_regime"],
+        "symbol": decision.symbol,
+        "timeframe": decision.timeframe,
+        "decision": decision.decision,
+        "intent_type": intent_type,
+        "source_decision_run_id": decision_run_id,
+        "source_risk_check_id": risk_row.id if risk_row is not None else None,
+        "execution_policy_name": execution_plan.policy_name if execution_plan is not None else None,
+        "risk": risk_payload,
+        "risk_per_unit": risk_payload.get("risk_per_unit"),
+        "initial_risk_usdt": risk_payload.get("initial_risk_usdt"),
+    }
+
+
+def _execution_r_multiple_payload(
+    *,
+    tags: dict[str, Any],
+    fill_quantity: float,
+    realized_pnl: float,
+    fee_paid: float,
+) -> dict[str, float]:
+    risk = _as_object_dict(tags.get("risk"))
+    risk_per_unit = _to_float(tags.get("risk_per_unit") or risk.get("risk_per_unit"))
+    risk_amount = risk_per_unit * abs(fill_quantity) if risk_per_unit > 0 and fill_quantity > 0 else 0.0
+    if risk_amount <= 0:
+        risk_amount = _to_float(tags.get("initial_risk_usdt") or risk.get("initial_risk_usdt"))
+    if risk_amount <= 0:
+        return {}
+    return {
+        "risk_amount_usdt": risk_amount,
+        "gross_r_multiple": realized_pnl / risk_amount,
+        "net_r_multiple": (realized_pnl - fee_paid) / risk_amount,
+    }
 
 
 def _to_bool(value: object, default: bool = False) -> bool:
@@ -1500,6 +1889,46 @@ def _classify_execution_intent(
     return "entry"
 
 
+def _execution_order_policy_from_risk_result(
+    risk_result: RiskCheckResult,
+    *,
+    intent_type: str,
+) -> tuple[str, bool, str | None]:
+    if intent_type != "entry":
+        return "market_allowed", True, None
+    debug_payload = _as_object_dict(risk_result.debug_payload)
+    expected_cost_gate = _as_object_dict(debug_payload.get("expected_cost_gate"))
+    required_order_policy = str(
+        expected_cost_gate.get("required_order_policy")
+        or debug_payload.get("required_order_policy")
+        or "market_allowed"
+    )
+    if required_order_policy not in {
+        "market_allowed",
+        "limit_only",
+        "limit_only_or_post_only",
+        "block_or_pending",
+    }:
+        required_order_policy = "market_allowed"
+    raw_allow_market_fallback = expected_cost_gate.get(
+        "allow_market_fallback",
+        expected_cost_gate.get("market_fallback_allowed", debug_payload.get("allow_market_fallback")),
+    )
+    allow_market_fallback = _to_bool(
+        raw_allow_market_fallback,
+        default=required_order_policy == "market_allowed",
+    )
+    if required_order_policy in {"limit_only", "limit_only_or_post_only", "block_or_pending"}:
+        allow_market_fallback = False
+    order_policy_reason = (
+        expected_cost_gate.get("order_policy_reason")
+        or debug_payload.get("order_policy_reason")
+        or expected_cost_gate.get("market_fallback_violation_source")
+    )
+    order_policy_reason = None if order_policy_reason in {None, ""} else str(order_policy_reason)
+    return required_order_policy, allow_market_fallback, order_policy_reason
+
+
 def _reduce_fraction_for_decision(decision: TradeDecision, settings_row: Setting) -> float:
     rationale_codes = set(decision.rationale_codes)
     if "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT" in rationale_codes:
@@ -1604,6 +2033,109 @@ def _is_protective_order(order_payload: dict[str, object]) -> bool:
     return order_type.startswith("STOP") or order_type.startswith("TAKE_PROFIT")
 
 
+def _protective_order_identity(order_payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "order_id": order_payload.get("orderId") or order_payload.get("order_id"),
+        "client_order_id": order_payload.get("clientOrderId") or order_payload.get("client_order_id"),
+        "type": str(order_payload.get("type") or "").upper(),
+        "side": str(order_payload.get("side") or "").upper() or None,
+        "position_side": _exchange_order_position_side(order_payload),
+        "reduce_only": _to_bool(order_payload.get("reduceOnly") or order_payload.get("reduce_only")),
+        "close_position": _to_bool(order_payload.get("closePosition") or order_payload.get("close_position")),
+        "quantity": _protective_order_quantity(order_payload),
+    }
+
+
+def _expected_protective_order_side(position: Position) -> str | None:
+    if position.side == "long":
+        return "SELL"
+    if position.side == "short":
+        return "BUY"
+    return None
+
+
+def _protective_order_quantity(order_payload: dict[str, object]) -> float:
+    for key in ("origQty", "quantity", "qty", "q"):
+        quantity = _to_float(order_payload.get(key), 0.0)
+        if quantity > 0:
+            return quantity
+    return 0.0
+
+
+def _protective_quantity_matches_position(
+    position: Position,
+    order_payload: dict[str, object],
+    *,
+    bucket: str | None = None,
+) -> bool:
+    if _to_bool(order_payload.get("closePosition") or order_payload.get("close_position")):
+        return True
+    quantity = _protective_order_quantity(order_payload)
+    if quantity <= 0:
+        return False
+    expected_quantity = abs(position.quantity)
+    if bucket == "take_profit":
+        take_profit_policy = _take_profit_execution_policy(position)
+        if take_profit_policy.get("mode") == "partial_reduce":
+            expected_quantity = abs(position.quantity) * max(
+                min(_to_float(take_profit_policy.get("partial_take_profit_fraction"), PARTIAL_TAKE_PROFIT_FRACTION), 0.99),
+                0.01,
+            )
+    tolerance = max(expected_quantity * 0.001, 1e-8)
+    return abs(quantity - expected_quantity) <= tolerance
+
+
+def _protective_order_has_reduce_only_guard(order_payload: dict[str, object]) -> bool:
+    return any(
+        _to_bool(order_payload.get(key))
+        for key in ("reduceOnly", "reduce_only", "closePosition", "close_position", "closeOnly", "close_only")
+    )
+
+
+def _protective_order_side_matches_position(
+    position: Position,
+    order_payload: dict[str, object],
+) -> bool:
+    expected_side = _expected_protective_order_side(position)
+    if expected_side is None:
+        return True
+    order_side = str(order_payload.get("side") or "").strip().upper()
+    if not order_side:
+        return True
+    return order_side == expected_side
+
+
+def _is_reduce_only_take_profit_limit(position: Position, order_payload: dict[str, object]) -> bool:
+    order_type = str(order_payload.get("type", "")).upper()
+    if order_type != "LIMIT" or not _to_bool(order_payload.get("reduceOnly")):
+        return False
+    price = _to_float(order_payload.get("price"))
+    if price <= 0:
+        return False
+    configured_take_profit = _to_float(position.take_profit)
+    if configured_take_profit > 0:
+        distance_bps = abs(price - configured_take_profit) / configured_take_profit * 10_000
+        if distance_bps > 2.0:
+            return False
+    reference_price = position.entry_price if position.entry_price > 0 else position.mark_price
+    if reference_price <= 0:
+        return False
+    if position.side == "long":
+        return price > reference_price
+    if position.side == "short":
+        return price < reference_price
+    return False
+
+
+def _protective_bucket_for_position(position: Position, order_payload: dict[str, object]) -> str | None:
+    bucket = _protective_bucket(order_payload)
+    if bucket is not None:
+        return bucket
+    if _is_reduce_only_take_profit_limit(position, order_payload):
+        return "take_profit"
+    return None
+
+
 def _build_protection_state(
     position: Position | None,
     open_orders: list[dict[str, object]],
@@ -1625,19 +2157,82 @@ def _build_protection_state(
         position_mode=position_mode,
         exchange_position_side=_position_metadata_side(position),
     )
-    protective_orders = [item for item in relevant_orders if _is_protective_order(item)]
-    has_stop_loss = any(str(item.get("type", "")).upper().startswith("STOP") for item in protective_orders)
-    has_take_profit = any(str(item.get("type", "")).upper().startswith("TAKE_PROFIT") for item in protective_orders)
+    active_relevant_orders = [
+        item
+        for item in relevant_orders
+        if str(item.get("status") or item.get("X") or "").upper() not in INACTIVE_PROTECTIVE_ORDER_STATUSES
+    ]
+    protective_orders = [
+        item for item in active_relevant_orders if _protective_bucket_for_position(position, item) is not None
+    ]
+    has_stop_loss = any(_protective_bucket_for_position(position, item) == "stop_loss" for item in protective_orders)
+    has_take_profit = any(_protective_bucket_for_position(position, item) == "take_profit" for item in protective_orders)
     take_profit_required = _take_profit_required_for_protection(position)
     take_profit_policy = _take_profit_execution_policy(position)
     missing_components: list[str] = []
+    reason_codes: list[str] = []
+    health_issues: list[dict[str, object]] = []
     if not has_stop_loss:
         missing_components.append("stop_loss")
+        reason_codes.append(PROTECTIVE_STOP_LOSS_MISSING_REASON_CODE)
     if take_profit_required and not has_take_profit:
         missing_components.append("take_profit")
+        reason_codes.append(PROTECTIVE_TAKE_PROFIT_MISSING_REASON_CODE)
+
+    for item in protective_orders:
+        bucket = _protective_bucket_for_position(position, item)
+        order_identity = _protective_order_identity(item)
+        if not _protective_order_has_reduce_only_guard(item):
+            health_issues.append(
+                {
+                    "reason_code": PROTECTIVE_ORDER_REDUCE_ONLY_MISSING_REASON_CODE,
+                    "component": bucket or "protective_order",
+                    "order": order_identity,
+                }
+            )
+            reason_codes.append(PROTECTIVE_ORDER_REDUCE_ONLY_MISSING_REASON_CODE)
+        if not _protective_order_side_matches_position(position, item):
+            health_issues.append(
+                {
+                    "reason_code": PROTECTIVE_ORDER_SIDE_MISMATCH_REASON_CODE,
+                    "component": bucket or "protective_order",
+                    "expected_side": _expected_protective_order_side(position),
+                    "order": order_identity,
+                }
+            )
+            reason_codes.append(PROTECTIVE_ORDER_SIDE_MISMATCH_REASON_CODE)
+        if not _protective_quantity_matches_position(position, item, bucket=bucket):
+            health_issues.append(
+                {
+                    "reason_code": PROTECTIVE_ORDER_QUANTITY_MISMATCH_REASON_CODE,
+                    "component": bucket or "protective_order",
+                    "expected_quantity": position.quantity,
+                    "order": order_identity,
+                }
+            )
+            reason_codes.append(PROTECTIVE_ORDER_QUANTITY_MISMATCH_REASON_CODE)
+
+    reason_codes = list(dict.fromkeys(reason_codes))
+    health_components = list(
+        dict.fromkeys(
+            [
+                *missing_components,
+                *[
+                    str(item.get("component") or "protective_order")
+                    for item in health_issues
+                    if item.get("component") not in {None, ""}
+                ],
+            ]
+        )
+    )
+    status = "protected"
+    if missing_components:
+        status = "missing"
+    elif health_issues:
+        status = "invalid"
     return {
-        "status": "protected" if not missing_components else "missing",
-        "protected": not missing_components,
+        "status": status,
+        "protected": status == "protected",
         "has_stop_loss": has_stop_loss,
         "has_take_profit": has_take_profit,
         "take_profit_required": take_profit_required,
@@ -1645,6 +2240,10 @@ def _build_protection_state(
         "protective_order_count": len(protective_orders),
         "protective_order_ids": [str(item.get("orderId", "")) for item in protective_orders if item.get("orderId")],
         "missing_components": missing_components,
+        "health_components": health_components,
+        "health_issues": health_issues,
+        "reason_codes": reason_codes,
+        "critical_reason_codes": reason_codes,
         "exchange_position_side": _position_metadata_side(position),
         "position_mode": position_mode,
     }
@@ -1671,6 +2270,72 @@ def _build_unverified_protection_state(
         "verification_deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
         "exchange_position_side": _position_metadata_side(position),
     }
+
+
+def _protection_state_blocks_entry(protection_state: dict[str, object]) -> bool:
+    return str(protection_state.get("status") or "").lower() not in {"flat", "protected"}
+
+
+def _protection_state_reason_codes(protection_state: dict[str, object]) -> list[str]:
+    raw_codes = protection_state.get("reason_codes")
+    reason_codes = [
+        str(item)
+        for item in (raw_codes if isinstance(raw_codes, list) else [])
+        if str(item or "").strip()
+    ]
+    missing_components = {
+        str(item)
+        for item in _get_string_list(protection_state, "missing_components")
+        if str(item or "").strip()
+    }
+    if "stop_loss" in missing_components:
+        reason_codes.append(PROTECTIVE_STOP_LOSS_MISSING_REASON_CODE)
+    if "take_profit" in missing_components:
+        reason_codes.append(PROTECTIVE_TAKE_PROFIT_MISSING_REASON_CODE)
+    return list(dict.fromkeys(reason_codes))
+
+
+def _protection_state_blocking_components(protection_state: dict[str, object]) -> list[str]:
+    components = _get_string_list(protection_state, "health_components")
+    if not components:
+        components = _get_string_list(protection_state, "missing_components")
+    if not components:
+        components = _protection_state_reason_codes(protection_state)
+    return list(dict.fromkeys(components))
+
+
+def _record_protection_health_failure(
+    session: Session,
+    settings_row: Setting,
+    *,
+    symbol: str,
+    position: Position | None,
+    protection_state: dict[str, object],
+    trigger_source: str,
+    correlation_ids: dict[str, Any] | None = None,
+) -> None:
+    if not _protection_state_blocks_entry(protection_state):
+        return
+    reason_codes = _protection_state_reason_codes(protection_state)
+    payload = {
+        "symbol": symbol,
+        "trigger_source": trigger_source,
+        "reason_code": "PROTECTION_STATE_UNVERIFIED",
+        "reason_codes": reason_codes,
+        "position_id": position.id if position is not None else None,
+        "position_side": position.side if position is not None else None,
+        "position_quantity": position.quantity if position is not None else 0.0,
+        "protection_state": protection_state,
+    }
+    record_protective_order_health_event(
+        session,
+        symbol=symbol,
+        entity_id=str(position.id if position is not None else symbol),
+        severity="critical",
+        message="Live position protective order health check failed.",
+        payload=payload,
+        correlation_ids=correlation_ids,
+    )
 
 
 def _get_string_list(payload: dict[str, object], key: str) -> list[str]:
@@ -1936,7 +2601,7 @@ def _verify_created_protective_orders(
                 verification_error = f"VERIFY_LOOKUP_FAILED:{exc}"
                 continue
 
-            if not _is_protective_order(payload):
+            if not _is_protective_order(payload) and not _is_local_protective_order_row(row):
                 verification_error = "VERIFY_LOOKUP_RETURNED_NON_PROTECTIVE_ORDER"
                 continue
             if str(payload.get("type", "")).upper() != row.order_type.upper():
@@ -2004,6 +2669,13 @@ def _is_protective_order_type_name(order_type: str | None) -> bool:
     return normalized.startswith("STOP") or normalized.startswith("TAKE_PROFIT")
 
 
+def _is_local_protective_order_row(order: Order) -> bool:
+    if _is_protective_order_type_name(order.order_type):
+        return True
+    metadata = order.metadata_json if isinstance(order.metadata_json, dict) else {}
+    return str(metadata.get("protective_component") or "") in {"stop_loss", "take_profit"}
+
+
 def _is_algo_order_payload(order_payload: dict[str, object]) -> bool:
     if _is_protective_order(order_payload):
         return True
@@ -2063,10 +2735,10 @@ def reconcile_closed_position_protective_orders(
                     or_(Position.status != "open", Position.quantity <= 0),
                 )
             )
-        )
+    )
     reconciled: list[Order] = []
     for order in candidates:
-        if not _is_protective_order_type_name(order.order_type):
+        if not _is_local_protective_order_row(order):
             continue
         if _local_order_is_present_remotely(
             order,
@@ -2197,12 +2869,13 @@ def _cancel_duplicate_protective_orders(
     *,
     symbol: str,
     open_orders: list[dict[str, object]],
+    position: Position | None = None,
     preferred_order_ids: list[int] | None = None,
 ) -> None:
     preferred = {str(item) for item in (preferred_order_ids or [])}
     orders_by_bucket: dict[str, list[dict[str, object]]] = {"stop_loss": [], "take_profit": []}
     for item in open_orders:
-        bucket = _protective_bucket(item)
+        bucket = _protective_bucket_for_position(position, item) if position is not None else _protective_bucket(item)
         if bucket is None:
             continue
         orders_by_bucket[bucket].append(item)
@@ -2367,6 +3040,63 @@ def _is_more_protective_stop(side: str, current_stop: float | None, candidate_st
     return candidate_stop < current_stop - 1e-9
 
 
+def _is_break_even_stop_tighten_candidate(context: dict[str, object], tightened_stop_loss: float | None) -> bool:
+    break_even_stop = _to_float(context.get("break_even_stop_loss"))
+    if _is_effectively_zero(break_even_stop) or _is_effectively_zero(tightened_stop_loss):
+        return False
+    candidates = set(_get_string_list(context, "applied_rule_candidates"))
+    return (
+        "POSITION_MANAGEMENT_BREAK_EVEN" in candidates
+        and abs(float(tightened_stop_loss) - float(break_even_stop)) <= 1e-9
+    )
+
+
+def _breakeven_event_payload(
+    position: Position,
+    context: dict[str, object],
+    *,
+    status: str,
+    candidate_stop_loss: float | None,
+    reason_codes: list[str] | None = None,
+    risk_result: RiskCheckResult | None = None,
+    risk_row: RiskCheck | None = None,
+    protection_state: dict[str, object] | None = None,
+    shadow: bool | None = None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "symbol": position.symbol,
+        "status": status,
+        "reason_code": reason_codes[0] if reason_codes else None,
+        "reason_codes": list(reason_codes or []),
+        "risk_check_id": risk_row.id if risk_row is not None else None,
+        "position_id": position.id,
+        "position_side": position.side,
+        "entry_price": position.entry_price,
+        "mark_price": position.mark_price,
+        "current_stop_loss": position.stop_loss,
+        "candidate_stop_loss": candidate_stop_loss,
+        "current_r_multiple": context.get("current_r_multiple"),
+        "trigger_r": context.get("break_even_trigger_r"),
+        "breakeven_lock_bps": context.get("breakeven_lock_bps"),
+        "breakeven_min_hold_seconds": context.get("breakeven_min_hold_seconds"),
+        "shadow": shadow,
+        "would_move": status == "shadow_would_move",
+        "approved": bool(risk_result.allowed) if risk_result is not None else None,
+    }
+    if risk_result is not None:
+        payload["risk_guard"] = {
+            "allowed": risk_result.allowed,
+            "reason_codes": list(risk_result.reason_codes),
+            "blocked_reason_codes": list(risk_result.blocked_reason_codes),
+        }
+    if protection_state is not None:
+        payload["protective_state"] = protection_state
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 def _replace_stop_loss_order(
     session: Session,
     *,
@@ -2412,6 +3142,7 @@ def _replace_stop_loss_order(
         side=exit_side,
         order_type="STOP_MARKET",
         stop_price=stop_loss,
+        reduce_only=True,
         close_position=True,
         response_type="ACK",
         reference_price=position.entry_price if position.entry_price > 0 else position.mark_price,
@@ -2508,6 +3239,70 @@ def apply_position_management(
     open_orders = client.get_open_orders(symbol)
     protection_state = _build_protection_state(position, open_orders)
     tightened_stop_loss = _to_float(context.get("tightened_stop_loss"))
+    break_even_stop = _to_float(context.get("break_even_stop_loss"))
+    break_even_stop_candidate = _is_break_even_stop_tighten_candidate(context, tightened_stop_loss)
+    if break_even_stop_candidate and _protection_state_blocks_entry(protection_state):
+        _record_protection_health_failure(
+            session,
+            settings_row,
+            symbol=symbol,
+            position=position,
+            protection_state=protection_state,
+            trigger_source="position_management:breakeven",
+        )
+        protection_result: dict[str, object] | None = None
+        if str(protection_state.get("status") or "").lower() == "missing":
+            protection_result = _ensure_protected_position(
+                session,
+                settings_row,
+                client,
+                symbol=symbol,
+                position=position,
+                stop_loss=position.stop_loss,
+                take_profit=position.take_profit,
+                decision_run_id=decision_run_id,
+                risk_row=risk_row,
+                parent_order=None,
+                trigger_source="position_management:breakeven",
+                pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+            )
+            protection_state = dict(protection_result.get("protection_state") or protection_state)
+        reason_codes = list(
+            dict.fromkeys(
+                [
+                    "BREAKEVEN_PROTECTIVE_RECOVERY_REQUIRED",
+                    *_protection_state_reason_codes(protection_state),
+                ]
+            )
+        )
+        record_position_management_event(
+            session,
+            event_type="breakeven_stop_move_cancelled",
+            position_id=position.id,
+            severity="critical",
+            message="Break-even stop move was cancelled because protective order recovery has priority.",
+            payload=_breakeven_event_payload(
+                position,
+                context,
+                status="protective_recovery_required",
+                candidate_stop_loss=break_even_stop,
+                reason_codes=reason_codes,
+                protection_state=protection_state,
+                extra={"protection_result": protection_result or {}},
+            ),
+        )
+        session.flush()
+        return {
+            "status": "protective_recovery_required",
+            "position_management_context": context,
+            "position_management_action": {
+                "status": "protective_recovery_required",
+                "reason_codes": reason_codes,
+                "candidate_stop_loss": break_even_stop,
+            },
+            "protection_state": protection_state,
+            "protection_result": protection_result,
+        }
     stop_can_tighten = (
         protection_state["status"] == "protected"
         and bool(protection_state.get("has_stop_loss"))
@@ -2515,6 +3310,216 @@ def apply_position_management(
         and _is_more_protective_stop(position.side, position.stop_loss, tightened_stop_loss)
     )
     if stop_can_tighten:
+        if break_even_stop_candidate:
+            breakeven_risk_result, breakeven_risk_row = evaluate_breakeven_stop_move_risk_guard(
+                session,
+                settings_row,
+                position,
+                candidate_stop_loss=float(break_even_stop),
+                context=context,
+                protection_state=protection_state,
+                decision_run_id=decision_run_id,
+            )
+            record_position_management_event(
+                session,
+                event_type="breakeven_stop_move_evaluated",
+                position_id=position.id,
+                severity="info" if breakeven_risk_result.allowed else "warning",
+                message="Risk guard evaluated a break-even stop move candidate.",
+                payload=_breakeven_event_payload(
+                    position,
+                    context,
+                    status="risk_approved" if breakeven_risk_result.allowed else "risk_blocked",
+                    candidate_stop_loss=break_even_stop,
+                    reason_codes=list(breakeven_risk_result.blocked_reason_codes),
+                    risk_result=breakeven_risk_result,
+                    risk_row=breakeven_risk_row,
+                    protection_state=protection_state,
+                ),
+            )
+            if not breakeven_risk_result.allowed:
+                session.flush()
+                return {
+                    "status": "blocked",
+                    "position_management_context": context,
+                    "protection_state": protection_state,
+                    "position_management_action": {
+                        "status": "risk_blocked",
+                        "reason_codes": list(breakeven_risk_result.blocked_reason_codes),
+                        "risk_result": breakeven_risk_result.model_dump(mode="json"),
+                    },
+                    "risk_result": breakeven_risk_result.model_dump(mode="json"),
+                }
+
+            breakeven_shadow = _flag_enabled(getattr(get_settings(), "breakeven_shadow", True))
+            if breakeven_shadow:
+                record_position_management_event(
+                    session,
+                    event_type="breakeven_stop_move_would_move",
+                    position_id=position.id,
+                    severity="info",
+                    message="Break-even stop move candidate would move the stop; shadow mode left orders unchanged.",
+                    payload=_breakeven_event_payload(
+                        position,
+                        context,
+                        status="shadow_would_move",
+                        candidate_stop_loss=break_even_stop,
+                        risk_result=breakeven_risk_result,
+                        risk_row=breakeven_risk_row,
+                        protection_state=protection_state,
+                        shadow=True,
+                    ),
+                )
+                session.flush()
+                return {
+                    "status": "monitoring",
+                    "position_management_context": context,
+                    "protection_state": protection_state,
+                    "position_management_action": {
+                        "status": "shadow_would_move",
+                        "candidate_stop_loss": break_even_stop,
+                        "risk_result": breakeven_risk_result.model_dump(mode="json"),
+                    },
+                    "risk_result": breakeven_risk_result.model_dump(mode="json"),
+                }
+
+            record_position_management_event(
+                session,
+                event_type="breakeven_stop_move_attempted",
+                position_id=position.id,
+                severity="info",
+                message="Attempting to move the live stop to break-even after risk guard approval.",
+                payload=_breakeven_event_payload(
+                    position,
+                    context,
+                    status="attempted",
+                    candidate_stop_loss=break_even_stop,
+                    risk_result=breakeven_risk_result,
+                    risk_row=breakeven_risk_row,
+                    protection_state=protection_state,
+                    shadow=False,
+                ),
+            )
+            try:
+                applied = _replace_stop_loss_order(
+                    session,
+                    client=client,
+                    position=position,
+                    symbol=symbol,
+                    stop_loss=float(tightened_stop_loss),
+                    decision_run_id=decision_run_id,
+                    risk_row=breakeven_risk_row,
+                    trigger_source="breakeven",
+                    open_orders=open_orders,
+                )
+            except Exception as exc:
+                failure_payload = _breakeven_event_payload(
+                    position,
+                    context,
+                    status="failed",
+                    candidate_stop_loss=break_even_stop,
+                    reason_codes=["BREAKEVEN_STOP_MOVE_FAILED"],
+                    risk_result=breakeven_risk_result,
+                    risk_row=breakeven_risk_row,
+                    protection_state=protection_state,
+                    shadow=False,
+                    extra={"error": str(exc)},
+                )
+                record_position_management_event(
+                    session,
+                    event_type="breakeven_stop_move_failed",
+                    position_id=position.id,
+                    severity="critical",
+                    message="Break-even stop move failed after risk guard approval.",
+                    payload=failure_payload,
+                )
+                record_health_event(
+                    session,
+                    component="position_management",
+                    status="critical",
+                    message="Break-even stop move failed after risk guard approval.",
+                    payload=failure_payload,
+                )
+                create_alert(
+                    session,
+                    category="position_management",
+                    severity="critical",
+                    title="Break-even stop move failed",
+                    message="Risk-approved break-even stop move failed; position protection requires operator review.",
+                    payload=failure_payload,
+                )
+                session.flush()
+                return {
+                    "status": "failed",
+                    "position_management_context": context,
+                    "protection_state": protection_state,
+                    "position_management_action": {
+                        "status": "failed",
+                        "reason_codes": ["BREAKEVEN_STOP_MOVE_FAILED"],
+                        "error": str(exc),
+                    },
+                    "risk_result": breakeven_risk_result.model_dump(mode="json"),
+                }
+            record_position_management_event(
+                session,
+                event_type="breakeven_stop_move_applied",
+                position_id=position.id,
+                severity="info",
+                message="Break-even stop move was applied after risk guard approval.",
+                payload=_breakeven_event_payload(
+                    position,
+                    context,
+                    status="applied",
+                    candidate_stop_loss=break_even_stop,
+                    risk_result=breakeven_risk_result,
+                    risk_row=breakeven_risk_row,
+                    protection_state=protection_state,
+                    shadow=False,
+                    extra={
+                        "new_stop_loss": applied["tightened_stop_loss"],
+                        "cancelled_order_ids": applied.get("cancelled_order_ids", []),
+                        "new_order_id": applied.get("order_id"),
+                    },
+                ),
+            )
+            record_position_management_event(
+                session,
+                event_type="moved_stop_to_breakeven",
+                position_id=position.id,
+                severity="info",
+                message="Position management moved the live stop to break-even.",
+                payload={
+                    "symbol": symbol,
+                    "decision_run_id": decision_run_id,
+                    "risk_check_id": breakeven_risk_row.id,
+                    "tightened_stop_loss": applied["tightened_stop_loss"],
+                    "break_even_trigger_r": context.get("break_even_trigger_r"),
+                    "breakeven_lock_bps": context.get("breakeven_lock_bps"),
+                },
+            )
+            refreshed_open_orders = client.get_open_orders(symbol)
+            protection_result = _ensure_protected_position(
+                session,
+                settings_row,
+                client,
+                symbol=symbol,
+                position=position,
+                stop_loss=position.stop_loss,
+                take_profit=position.take_profit,
+                decision_run_id=decision_run_id,
+                risk_row=breakeven_risk_row,
+                parent_order=None,
+                trigger_source="breakeven",
+                pause_reason_code="MISSING_PROTECTIVE_ORDERS",
+            )
+            return {
+                "status": "applied",
+                "position_management_context": context,
+                "position_management_action": applied,
+                "protection_state": _build_protection_state(position, refreshed_open_orders),
+                "protection_result": protection_result,
+                "risk_result": breakeven_risk_result.model_dump(mode="json"),
+            }
         applied = _replace_stop_loss_order(
             session,
             client=client,
@@ -2769,6 +3774,10 @@ def build_execution_intent(
                     _quantity_for_notional(risk_result.approved_projected_notional, entry_price),
                 )
         leverage = min(risk_result.approved_leverage, settings_row.max_leverage)
+    required_order_policy, allow_market_fallback, order_policy_reason = _execution_order_policy_from_risk_result(
+        risk_result,
+        intent_type=intent_type,
+    )
     return ExecutionIntent(
         symbol=decision.symbol,
         action=decision.decision,  # type: ignore[arg-type]
@@ -2787,6 +3796,9 @@ def build_execution_intent(
         close_only=decision.decision == "exit",
         holding_profile=decision.holding_profile,
         holding_profile_reason=decision.holding_profile_reason,
+        required_order_policy=required_order_policy,  # type: ignore[arg-type]
+        allow_market_fallback=allow_market_fallback,
+        order_policy_reason=order_policy_reason,
     )
 
 
@@ -2872,6 +3884,7 @@ def _record_live_trades(
         fee_paid = abs(_to_float(trade.get("commission")))
         realized_pnl = _to_float(trade.get("realizedPnl"))
         metadata = _as_object_dict(order.metadata_json)
+        performance_tags = _trade_performance_tags_from_metadata(metadata)
         signed_slippage_bps = _signed_slippage_bps(
             side=order.side,
             requested_price=order.requested_price,
@@ -2905,7 +3918,19 @@ def _record_live_trades(
             "signed_slippage_pct": signed_slippage_bps / 10000.0,
             "signed_slippage_bps": signed_slippage_bps,
             "realized_pnl_source": "binance_user_trades" if "realizedPnl" in trade else "local_default",
+            **_trade_performance_payload(performance_tags),
         }
+        r_multiple_payload = _execution_r_multiple_payload(
+            tags=performance_tags,
+            fill_quantity=fill_quantity,
+            realized_pnl=realized_pnl,
+            fee_paid=fee_paid,
+        )
+        if r_multiple_payload:
+            execution_payload["r_multiple"] = r_multiple_payload
+            execution_payload["gross_r_multiple"] = r_multiple_payload["gross_r_multiple"]
+            execution_payload["net_r_multiple"] = r_multiple_payload["net_r_multiple"]
+            execution_payload["risk_amount_usdt"] = r_multiple_payload["risk_amount_usdt"]
         if exchange_order is not None:
             execution_payload["exchange_order"] = exchange_order
         if linked_protective_order_id is not None:
@@ -3025,16 +4050,32 @@ def _sync_closed_position_pnl(session: Session, position: Position) -> None:
     gross_realized = float(totals[0] or 0.0)
     fee_total = float(totals[1] or 0.0)
     metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
-    metadata["closed_position_pnl"] = {
+    performance_tags = _trade_performance_tags_from_metadata(metadata)
+    closed_position_pnl: dict[str, object] = {
         "gross_realized_pnl": gross_realized,
         "fee_total": fee_total,
         "net_realized_pnl": gross_realized - fee_total,
         "source": "executions",
         "updated_at": utcnow_naive().isoformat(),
     }
+    risk = _as_object_dict(performance_tags.get("risk"))
+    risk_amount = _to_float(performance_tags.get("initial_risk_usdt") or risk.get("initial_risk_usdt"))
+    if risk_amount <= 0:
+        risk_per_unit = _to_float(performance_tags.get("risk_per_unit") or risk.get("risk_per_unit"))
+        initial_quantity = _to_float(risk.get("initial_quantity"))
+        if risk_per_unit > 0 and initial_quantity > 0:
+            risk_amount = risk_per_unit * initial_quantity
+    if risk_amount > 0:
+        closed_position_pnl["risk_amount_usdt"] = risk_amount
+        closed_position_pnl["gross_r_multiple"] = gross_realized / risk_amount
+        closed_position_pnl["net_r_multiple"] = (gross_realized - fee_total) / risk_amount
+    if performance_tags:
+        closed_position_pnl.update(_trade_performance_payload(performance_tags))
+    metadata["closed_position_pnl"] = closed_position_pnl
     position.realized_pnl = gross_realized
     position.unrealized_pnl = 0.0
     position.metadata_json = metadata
+    record_range_mr_trade_result(session, position)
 
 
 def _protective_close_fill_status(exchange_order: dict[str, object]) -> str | None:
@@ -3216,7 +4257,7 @@ def _backfill_finished_protective_order_trades(
     *,
     source: str = PROTECTIVE_CLOSE_FILL_BACKFILL_SOURCE,
 ) -> int:
-    if not _is_protective_order_type_name(order.order_type):
+    if not _is_local_protective_order_row(order):
         return 0
     closed_status = _protective_close_fill_status(exchange_order)
     if closed_status is None:
@@ -3394,10 +4435,10 @@ def _backfill_missing_finished_protective_order_trades(
                 .order_by(Order.updated_at.desc(), Order.id.desc())
                 .limit(100)
             )
-        )
+    )
     backfilled = 0
     for order in candidates:
-        if not _is_protective_order_type_name(order.order_type):
+        if not _is_local_protective_order_row(order):
             continue
         if not order.external_order_id and not order.client_order_id:
             continue
@@ -4330,11 +5371,16 @@ def _protective_prices(
         exchange_position_side=_position_metadata_side(existing),
     )
     for item in relevant_orders:
+        order_type = str(item.get("type", "")).upper()
+        if existing is not None and _is_reduce_only_take_profit_limit(existing, item):
+            price = _to_float(item.get("price"))
+            if price > 0:
+                take_profit = price
+            continue
         stop_price_raw = item.get("stopPrice")
         if stop_price_raw in {None, "", "0", 0}:
             continue
         stop_price = _to_float(stop_price_raw)
-        order_type = str(item.get("type", "")).upper()
         if order_type.startswith("STOP"):
             stop_loss = stop_price
         elif order_type.startswith("TAKE_PROFIT"):
@@ -4659,6 +5705,8 @@ def _execute_primary_order_with_policy(
     approved_notional_cap: float | None = None,
     client_order_id_seed: str | None = None,
     correlation_ids: dict[str, Any] | None = None,
+    trade_performance_tags: dict[str, Any] | None = None,
+    position_id: int | None = None,
 ) -> dict[str, Any]:
     root_order: Order | None = None
     final_order: Order | None = None
@@ -4718,15 +5766,20 @@ def _execute_primary_order_with_policy(
             close_only=close_only,
             parent_order_id=parent_order_id,
         )
-        order.metadata_json = {
-            **(order.metadata_json or {}),
-            "execution_policy": execution_plan.to_payload(),
-            "entry_execution_type": _entry_execution_type_for_plan(
-                execution_plan,
-                order_type=current_order_type,
-            ),
-            "execution_attempt": attempt_index + 1,
-        }
+        if position_id is not None:
+            order.position_id = position_id
+        order.metadata_json = _merge_trade_performance_tags(
+            {
+                **(order.metadata_json or {}),
+                "execution_policy": execution_plan.to_payload(),
+                "entry_execution_type": _entry_execution_type_for_plan(
+                    execution_plan,
+                    order_type=current_order_type,
+                ),
+                "execution_attempt": attempt_index + 1,
+            },
+            trade_performance_tags,
+        )
         _apply_submission_tracking(
             order,
             client_order_id=client_order_id,
@@ -4881,16 +5934,19 @@ def _execute_primary_order_with_policy(
                 "timed_out": timed_out,
             }
         )
-        order.metadata_json = {
-            **(order.metadata_json or {}),
-            "execution_policy": execution_plan.to_payload(),
-            "entry_execution_type": _entry_execution_type_for_plan(
-                execution_plan,
-                order_type=current_order_type,
-            ),
-            "execution_attempt": attempt_index + 1,
-            "execution_attempts": execution_attempts,
-        }
+        order.metadata_json = _merge_trade_performance_tags(
+            {
+                **(order.metadata_json or {}),
+                "execution_policy": execution_plan.to_payload(),
+                "entry_execution_type": _entry_execution_type_for_plan(
+                    execution_plan,
+                    order_type=current_order_type,
+                ),
+                "execution_attempt": attempt_index + 1,
+                "execution_attempts": execution_attempts,
+            },
+            trade_performance_tags,
+        )
         session.add(order)
         session.flush()
 
@@ -4936,6 +5992,49 @@ def _execute_primary_order_with_policy(
             fallback_price=submitted_price,
         )
         current_slippage_pct = abs(live_reference_price - max(submitted_price, 1.0)) / max(live_reference_price, 1.0)
+        fallback_skip_reason = None
+        if current_order_type == "LIMIT" and execution_plan.fallback_order_type != "MARKET":
+            if attempt_index >= execution_plan.max_requotes:
+                fallback_skip_reason = "max_requotes_exhausted"
+            elif (
+                remaining_ratio is not None
+                and filled_quantity > 0
+                and remaining_ratio <= execution_plan.fallback_after_partial_fill_ratio
+            ):
+                fallback_skip_reason = "partial_fill_market_fallback_disallowed"
+            elif current_slippage_pct >= max(
+                settings_row.slippage_threshold_pct * 1.5,
+                execution_plan.estimated_slippage_pct * 1.5,
+            ):
+                fallback_skip_reason = "slippage_market_fallback_disallowed"
+            else:
+                volatility_multiplier = 1.15 if execution_plan.urgency == "high" else 1.25
+                if execution_plan.volatility_pct >= max(
+                    settings_row.slippage_threshold_pct * 6.0,
+                    execution_plan.volatility_pct * volatility_multiplier,
+                ):
+                    fallback_skip_reason = "volatility_market_fallback_disallowed"
+        if fallback_skip_reason is not None:
+            record_audit_event(
+                session,
+                event_type="live_limit_market_fallback_skipped",
+                entity_type="order",
+                entity_id=str(order.id),
+                severity="info",
+                message="Market fallback was skipped by execution policy.",
+                payload={
+                    "symbol": symbol,
+                    "intent_type": intent_type,
+                    "attempt": attempt_index + 1,
+                    "reason_code": fallback_skip_reason,
+                    "remaining_quantity": remaining_quantity,
+                    "current_slippage_pct": current_slippage_pct,
+                    "remaining_ratio": remaining_ratio,
+                    "execution_policy": execution_plan.to_payload(),
+                },
+                correlation_ids=normalize_correlation_ids(correlation_ids, execution_id=order.id),
+            )
+            break
         if should_fallback_aggressively(
             execution_plan,
             reprice_attempt=attempt_index,
@@ -5036,17 +6135,20 @@ def _execute_primary_order_with_policy(
         slippage_threshold_pct=settings_row.slippage_threshold_pct,
         aggressive_fallback_used=aggressive_fallback_used,
     )
-    final_order.metadata_json = {
-        **(final_order.metadata_json or {}),
-        "execution_policy": execution_plan.to_payload(),
-        "entry_execution_type": _entry_execution_type_for_plan(
-            execution_plan,
-            order_type=final_order.order_type,
-            execution_quality=execution_quality,
-        ),
-        "execution_attempts": execution_attempts,
-        "execution_quality": execution_quality,
-    }
+    final_order.metadata_json = _merge_trade_performance_tags(
+        {
+            **(final_order.metadata_json or {}),
+            "execution_policy": execution_plan.to_payload(),
+            "entry_execution_type": _entry_execution_type_for_plan(
+                execution_plan,
+                order_type=final_order.order_type,
+                execution_quality=execution_quality,
+            ),
+            "execution_attempts": execution_attempts,
+            "execution_quality": execution_quality,
+        },
+        trade_performance_tags,
+    )
     session.add(final_order)
     session.flush()
 
@@ -5066,6 +6168,7 @@ def _create_protective_orders(
     session: Session,
     client: BinanceClient,
     *,
+    settings_row: Setting,
     decision_run_id: int | None,
     risk_row: RiskCheck | None,
     symbol: str,
@@ -5080,6 +6183,9 @@ def _create_protective_orders(
 ) -> list[int]:
     if position is None or stop_loss is None or take_profit is None:
         return []
+    performance_tags = _trade_performance_tags_from_metadata(parent_order.metadata_json if parent_order is not None else {})
+    if not performance_tags:
+        performance_tags = _trade_performance_tags_from_metadata(position.metadata_json)
     exit_side = "SELL" if position.side == "long" else "BUY"
     created_ids: list[int] = []
     current_state = _build_protection_state(position, existing_open_orders or [])
@@ -5100,6 +6206,11 @@ def _create_protective_orders(
         )
     if "take_profit" in missing_components:
         normalized_take_profit = client.normalize_price(symbol, take_profit)
+        tp_limit_policy = _take_profit_limit_policy(
+            settings_row,
+            position,
+            take_profit=normalized_take_profit,
+        )
         partial_quantity = (
             _normalize_partial_take_profit_quantity(
                 client,
@@ -5114,17 +6225,60 @@ def _create_protective_orders(
             if take_profit_policy.get("mode") == "partial_reduce"
             else None
         )
-        if partial_quantity is not None:
+        limit_quantity = partial_quantity if partial_quantity is not None else position.quantity
+        tp_limit_enabled = bool(tp_limit_policy.get("tp_limit_enabled")) and limit_quantity > 0
+        tp_policy_payload = {
+            **take_profit_policy,
+            **tp_limit_policy,
+            "mode": take_profit_policy.get("mode") if partial_quantity is not None else "full_close",
+            "take_profit_order_type": "LIMIT" if tp_limit_enabled else "TAKE_PROFIT_MARKET",
+        }
+        if tp_limit_enabled:
+            market_fallback_spec = {
+                "component": "take_profit",
+                "order_type": "TAKE_PROFIT_MARKET",
+                "stop_price": normalized_take_profit,
+                "price": None,
+                "time_in_force": None,
+                "quantity": partial_quantity,
+                "reduce_only": True,
+                "close_position": partial_quantity is None,
+                "requested_quantity": partial_quantity if partial_quantity is not None else position.quantity,
+                "take_profit_execution_policy": {
+                    **tp_policy_payload,
+                    "take_profit_order_type": "TAKE_PROFIT_MARKET",
+                    "tp_limit_enabled": False,
+                    "tp_market_fallback_reason": "tp_limit_submit_failed",
+                },
+            }
+            requested_orders.append(
+                {
+                    "component": "take_profit",
+                    "order_type": "LIMIT",
+                    "stop_price": None,
+                    "price": normalized_take_profit,
+                    "time_in_force": "GTX" if bool(tp_limit_policy.get("tp_limit_post_only")) else "GTC",
+                    "quantity": limit_quantity,
+                    "reduce_only": True,
+                    "close_position": False,
+                    "requested_quantity": limit_quantity,
+                    "take_profit_execution_policy": tp_policy_payload,
+                    "market_fallback_spec": market_fallback_spec,
+                }
+            )
+        elif partial_quantity is not None:
             requested_orders.append(
                 {
                     "component": "take_profit",
                     "order_type": "TAKE_PROFIT_MARKET",
                     "stop_price": normalized_take_profit,
+                    "price": None,
+                    "time_in_force": None,
                     "quantity": partial_quantity,
                     "reduce_only": True,
                     "close_position": False,
                     "requested_quantity": partial_quantity,
-                    "take_profit_execution_policy": take_profit_policy,
+                    "take_profit_execution_policy": tp_policy_payload,
                 }
             )
         else:
@@ -5133,14 +6287,19 @@ def _create_protective_orders(
                     "component": "take_profit",
                     "order_type": "TAKE_PROFIT_MARKET",
                     "stop_price": normalized_take_profit,
+                    "price": None,
+                    "time_in_force": None,
                     "quantity": None,
                     "reduce_only": True,
                     "close_position": True,
                     "requested_quantity": position.quantity,
                     "take_profit_execution_policy": {
-                        **take_profit_policy,
-                        "mode": "full_close",
-                        "fallback_reason": "partial_take_profit_quantity_unavailable",
+                        **tp_policy_payload,
+                        "fallback_reason": (
+                            "partial_take_profit_quantity_unavailable"
+                            if take_profit_policy.get("mode") == "partial_reduce"
+                            else tp_limit_policy.get("tp_market_fallback_reason")
+                        ),
                     },
                 }
             )
@@ -5169,36 +6328,69 @@ def _create_protective_orders(
             )
             _persist_protection_lifecycle(session, parent_order, protection_lifecycle)
     for order_spec in requested_orders:
-        order_type = str(order_spec["order_type"])
-        stop_price = float(order_spec["stop_price"])
-        close_position = bool(order_spec.get("close_position"))
-        reduce_only = bool(order_spec.get("reduce_only"))
-        quantity = order_spec.get("quantity")
-        requested_quantity = _to_float(order_spec.get("requested_quantity"), position.quantity)
-        client_order_id, exchange_order, submit_request, submission_tracking = _safe_submit_order(
-            client,
-            symbol=symbol,
-            side=exit_side,
-            order_type=order_type,
-            quantity=float(quantity) if quantity not in {None, ""} else None,
-            stop_price=stop_price,
-            reduce_only=reduce_only,
-            close_position=close_position,
-            response_type="ACK",
-            client_order_id=_build_deterministic_client_order_id(
-                seed=client_order_id_seed,
-                suffix=f"protective-{order_type.lower()}-{order_spec.get('component')}",
-            ),
-            reference_price=position.entry_price if position.entry_price > 0 else position.mark_price,
-            enforce_min_notional=False,
+        while True:
+            order_type = str(order_spec["order_type"])
+            price = _to_float(order_spec.get("price"))
+            stop_price = _to_float(order_spec.get("stop_price"))
+            close_position = bool(order_spec.get("close_position"))
+            reduce_only = bool(order_spec.get("reduce_only"))
+            quantity = order_spec.get("quantity")
+            requested_quantity = _to_float(order_spec.get("requested_quantity"), position.quantity)
+            reference_price = price or stop_price or position.entry_price or position.mark_price
+            try:
+                client_order_id, exchange_order, submit_request, submission_tracking = _safe_submit_order(
+                    client,
+                    symbol=symbol,
+                    side=exit_side,
+                    order_type=order_type,
+                    quantity=float(quantity) if quantity not in {None, ""} else None,
+                    price=price if price > 0 else None,
+                    stop_price=stop_price if stop_price > 0 else None,
+                    reduce_only=reduce_only,
+                    close_position=close_position,
+                    response_type="ACK",
+                    time_in_force=str(order_spec.get("time_in_force") or "") or None,
+                    client_order_id=_build_deterministic_client_order_id(
+                        seed=client_order_id_seed,
+                        suffix=f"protective-{order_type.lower()}-{order_spec.get('component')}",
+                    ),
+                    reference_price=reference_price,
+                    enforce_min_notional=False,
+                )
+                break
+            except Exception as exc:
+                fallback_spec = order_spec.get("market_fallback_spec")
+                if order_type != "LIMIT" or not isinstance(fallback_spec, dict):
+                    raise
+                record_audit_event(
+                    session,
+                    event_type="protective_take_profit_limit_fallback",
+                    entity_type="position",
+                    entity_id=str(position.id) if position.id is not None else symbol,
+                    severity="warning",
+                    message="Limit take-profit protective order failed; falling back to TAKE_PROFIT_MARKET.",
+                    payload={
+                        "symbol": symbol,
+                        "take_profit_order_type": order_type,
+                        "fallback_order_type": fallback_spec.get("order_type"),
+                        "tp_limit_enabled": True,
+                        "tp_market_fallback_reason": "tp_limit_submit_failed",
+                        "error": str(exc),
+                    },
+                    correlation_ids=correlation_ids,
+                )
+                session.flush()
+                order_spec = dict(fallback_spec)
+        normalized_order_price = _to_float(
+            submit_request.get("price"),
+            _to_float(submit_request.get("stop_price"), price or stop_price),
         )
-        normalized_stop_price = _to_float(submit_request.get("stop_price"), stop_price)
         if not close_position:
             requested_quantity = _to_float(submit_request.get("quantity"), requested_quantity)
         row = _upsert_exchange_order_row(
             session,
             symbol=symbol,
-            requested_price=normalized_stop_price,
+            requested_price=normalized_order_price,
             requested_quantity=requested_quantity,
             order_type=order_type,
             side=exit_side.lower(),
@@ -5211,10 +6403,13 @@ def _create_protective_orders(
         )
         row.position_id = position.id
         row_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
-        row.metadata_json = {
-            **row_metadata,
-            "protective_component": order_spec.get("component"),
-        }
+        row.metadata_json = _merge_trade_performance_tags(
+            {
+                **row_metadata,
+                "protective_component": order_spec.get("component"),
+            },
+            performance_tags,
+        )
         if order_spec.get("take_profit_execution_policy") is not None:
             row.metadata_json["take_profit_execution_policy"] = dict(
                 order_spec["take_profit_execution_policy"]  # type: ignore[arg-type]
@@ -5234,9 +6429,37 @@ def _create_protective_orders(
             submission_tracking=submission_tracking,
             context="protective_order",
             requested_quantity=requested_quantity,
-            requested_price=normalized_stop_price,
+            requested_price=normalized_order_price,
             correlation_ids=normalize_correlation_ids(correlation_ids, execution_id=row.id),
         )
+        if order_spec.get("component") == "take_profit":
+            tp_policy = (
+                dict(order_spec["take_profit_execution_policy"])
+                if isinstance(order_spec.get("take_profit_execution_policy"), dict)
+                else {}
+            )
+            record_audit_event(
+                session,
+                event_type="protective_take_profit_order_created",
+                entity_type="position",
+                entity_id=str(position.id) if position.id is not None else symbol,
+                severity="info",
+                message="Protective take-profit order was created.",
+                payload={
+                    "symbol": symbol,
+                    "order_id": row.id,
+                    "take_profit_order_type": order_type,
+                    "tp_limit_enabled": bool(tp_policy.get("tp_limit_enabled")),
+                    "tp_limit_post_only": bool(tp_policy.get("tp_limit_post_only")),
+                    "tp_market_fallback_reason": tp_policy.get("tp_market_fallback_reason"),
+                    "reduce_only": reduce_only,
+                    "close_position": close_position,
+                    "requested_price": normalized_order_price,
+                    "requested_quantity": requested_quantity,
+                },
+                correlation_ids=normalize_correlation_ids(correlation_ids, execution_id=row.id),
+            )
+            session.flush()
         created_ids.append(row.id)
     if created_ids:
         if protection_lifecycle is not None and protection_lifecycle.state != "placed":
@@ -5805,6 +7028,7 @@ def _ensure_protected_position(
                 attempt_created_order_ids = _create_protective_orders(
                     session,
                     client,
+                    settings_row=settings_row,
                     decision_run_id=decision_run_id,
                     risk_row=risk_row,
                     symbol=symbol,
@@ -5831,6 +7055,7 @@ def _ensure_protected_position(
                     client,
                     symbol=symbol,
                     open_orders=open_orders,
+                    position=position,
                     preferred_order_ids=created_order_ids,
                 )
                 open_orders = client.get_open_orders(symbol)
@@ -6132,7 +7357,7 @@ def sync_live_state(
                     close_only_fallback=order.close_only,
                 )
                 session.add(order)
-                if _is_protective_order_type_name(order.order_type):
+                if _is_local_protective_order_row(order):
                     _backfill_finished_protective_order_trades(
                         session,
                         settings_row,
@@ -6312,17 +7537,32 @@ def sync_live_state(
                 position_mode=position_mode,
             )
         symbol_protection_state[item_symbol] = protection_state
-        if protection_state["status"] == "missing":
+        if not symbol_guard_active and _protection_state_blocks_entry(protection_state):
+            _record_protection_health_failure(
+                session,
+                settings_row,
+                symbol=item_symbol,
+                position=position,
+                protection_state=protection_state,
+                trigger_source="sync_live_state",
+            )
             _record_sync_issue(
                 session,
                 settings_row,
                 scope="protective_orders",
                 status="incomplete",
                 reason_code="PROTECTION_STATE_UNVERIFIED",
-                detail={"symbol": item_symbol, "missing_components": protection_state.get("missing_components", [])},
+                detail={
+                    "symbol": item_symbol,
+                    "protection_status": protection_state.get("status"),
+                    "missing_components": protection_state.get("missing_components", []),
+                    "health_components": _protection_state_blocking_components(protection_state),
+                    "reason_codes": _protection_state_reason_codes(protection_state),
+                    "health_issues": protection_state.get("health_issues", []),
+                },
             )
             unprotected_positions.append(item_symbol)
-            if allow_protection_recovery:
+            if protection_state["status"] == "missing" and allow_protection_recovery:
                 protection_result = _ensure_protected_position(
                     session,
                     settings_row,
@@ -6357,6 +7597,20 @@ def sync_live_state(
                         },
                         flush_state=False,
                     )
+            elif protection_state["status"] != "missing":
+                set_symbol_protection_state(
+                    session,
+                    settings_row,
+                    symbol=item_symbol,
+                    state=PROTECTION_REQUIRED_STATE,
+                    trigger_source="sync_live_state:protection_health_failed",
+                    missing_components=_protection_state_blocking_components(protection_state),
+                    auto_recovery_active=False,
+                    recovery_status="health_check_failed",
+                    last_error="Protective order health check failed: "
+                    + ", ".join(_protection_state_reason_codes(protection_state)),
+                    flush_state=False,
+                )
             else:
                 record_audit_event(
                     session,
@@ -6674,6 +7928,15 @@ def _resync_exchange_state(
     protection_state = _build_protection_state(position, open_orders)
     if verify_protection:
         if position is not None and position.quantity > 0 and protection_state["status"] != "protected":
+            _record_protection_health_failure(
+                session,
+                settings_row,
+                symbol=symbol,
+                position=position,
+                protection_state=protection_state,
+                trigger_source=f"{event_prefix}:resync",
+                correlation_ids=correlation_ids,
+            )
             _record_sync_issue(
                 session,
                 settings_row,
@@ -6682,10 +7945,27 @@ def _resync_exchange_state(
                 reason_code="PROTECTION_STATE_UNVERIFIED",
                 detail={
                     "symbol": symbol,
+                    "protection_status": protection_state.get("status"),
                     "missing_components": protection_state.get("missing_components", []),
+                    "health_components": _protection_state_blocking_components(protection_state),
+                    "reason_codes": _protection_state_reason_codes(protection_state),
+                    "health_issues": protection_state.get("health_issues", []),
                     "protective_order_count": protection_state.get("protective_order_count", 0),
                 },
             )
+            if protection_state["status"] != "missing":
+                set_symbol_protection_state(
+                    session,
+                    settings_row,
+                    symbol=symbol,
+                    state=PROTECTION_REQUIRED_STATE,
+                    trigger_source=f"{event_prefix}:protection_health_failed",
+                    missing_components=_protection_state_blocking_components(protection_state),
+                    auto_recovery_active=False,
+                    recovery_status="health_check_failed",
+                    last_error="Protective order health check failed: "
+                    + ", ".join(_protection_state_reason_codes(protection_state)),
+                )
         else:
             _record_sync_success(
                 session,
@@ -7072,6 +8352,36 @@ def _execute_live_trade_body(
             settings_row,
             pre_trade_protection=_build_protection_state(existing_position, []),
         )
+        if execution_plan.order_type == "NONE":
+            record_audit_event(
+                session,
+                event_type="live_execution_blocked",
+                entity_type="decision_run",
+                entity_id=str(decision_run_id or decision.symbol),
+                severity="warning",
+                message="Live execution skipped because execution policy requires block or pending.",
+                payload={
+                    "symbol": decision.symbol,
+                    "decision": decision.decision,
+                    "intent_type": intent_type,
+                    "reason_code": execution_plan.reason,
+                    "execution_policy": execution_plan.to_payload(),
+                    "rollout_mode": rollout_mode,
+                    "exchange_submit_allowed": exchange_submit_allowed,
+                    **holding_profile_payload,
+                },
+                correlation_ids=execution_correlation_ids,
+            )
+            session.flush()
+            return {
+                "status": "blocked",
+                "reason_codes": [execution_plan.reason],
+                "decision": decision.decision,
+                "intent_type": intent_type,
+                "execution_policy": execution_plan.to_payload(),
+                "rollout_mode": rollout_mode,
+                **holding_profile_payload,
+            }
         record_audit_event(
             session,
             event_type="live_execution_attempted",
@@ -7265,6 +8575,69 @@ def _execute_live_trade_body(
             "protection_verify_block": protection_verify_block,
         }
     pre_trade_protection = _build_protection_state(existing_position, open_orders)
+    if (
+        intent_type in PROTECTION_VERIFY_BLOCKING_INTENT_TYPES
+        and existing_position is not None
+        and _protection_state_blocks_entry(pre_trade_protection)
+    ):
+        reason_codes = ["PROTECTION_STATE_UNVERIFIED", *_protection_state_reason_codes(pre_trade_protection)]
+        _record_protection_health_failure(
+            session,
+            settings_row,
+            symbol=decision.symbol,
+            position=existing_position,
+            protection_state=pre_trade_protection,
+            trigger_source="execute_live_trade:preflight",
+            correlation_ids=execution_correlation_ids,
+        )
+        _record_sync_issue(
+            session,
+            settings_row,
+            scope="protective_orders",
+            status="incomplete",
+            reason_code="PROTECTION_STATE_UNVERIFIED",
+            detail={
+                "symbol": decision.symbol,
+                "protection_status": pre_trade_protection.get("status"),
+                "health_components": _protection_state_blocking_components(pre_trade_protection),
+                "reason_codes": _protection_state_reason_codes(pre_trade_protection),
+                "health_issues": pre_trade_protection.get("health_issues", []),
+            },
+        )
+        set_symbol_protection_state(
+            session,
+            settings_row,
+            symbol=decision.symbol,
+            state=PROTECTION_REQUIRED_STATE,
+            trigger_source="execute_live_trade:preflight_protection_health_failed",
+            missing_components=_protection_state_blocking_components(pre_trade_protection),
+            auto_recovery_active=False,
+            recovery_status="health_check_failed",
+            last_error="Protective order health check failed: "
+            + ", ".join(_protection_state_reason_codes(pre_trade_protection)),
+        )
+        record_audit_event(
+            session,
+            event_type="live_execution_blocked",
+            entity_type="decision_run",
+            entity_id=str(decision_run_id),
+            severity="critical",
+            message="Live execution skipped because protective order health check failed for the open position.",
+            payload={
+                "symbol": decision.symbol,
+                "intent_type": intent_type,
+                "reason_codes": reason_codes,
+                "protection_state": pre_trade_protection,
+            },
+            correlation_ids=execution_correlation_ids,
+        )
+        session.flush()
+        return {
+            "status": "blocked",
+            "reason_codes": reason_codes,
+            "intent_type": intent_type,
+            "protective_state": pre_trade_protection,
+        }
 
     if decision.decision in {"long", "short"}:
         target_side = "long" if decision.decision == "long" else "short"
@@ -7399,6 +8772,38 @@ def _execute_live_trade_body(
         settings_row,
         pre_trade_protection=pre_trade_protection,
     )
+    if execution_plan.order_type == "NONE":
+        record_audit_event(
+            session,
+            event_type="live_execution_blocked",
+            entity_type="decision_run",
+            entity_id=str(decision_run_id or decision.symbol),
+            severity="warning",
+            message="Live execution skipped because execution policy requires block or pending.",
+            payload={
+                "symbol": decision.symbol,
+                "decision": decision.decision,
+                "intent_type": intent_type,
+                "reason_code": execution_plan.reason,
+                "execution_policy": execution_plan.to_payload(),
+                "rollout_mode": rollout_mode,
+                "exchange_submit_allowed": exchange_submit_allowed,
+                "approved_notional_cap": approved_notional_cap,
+                "meta_gate": meta_gate_payload,
+                **holding_profile_payload,
+            },
+            correlation_ids=execution_correlation_ids,
+        )
+        session.flush()
+        return {
+            "status": "blocked",
+            "reason_codes": [execution_plan.reason],
+            "decision": decision.decision,
+            "intent_type": intent_type,
+            "execution_policy": execution_plan.to_payload(),
+            "meta_gate": meta_gate_payload,
+            **holding_profile_payload,
+        }
     execution_price = intent.requested_price
     if execution_plan.price is not None:
         if hasattr(client, "normalize_price"):
@@ -7406,6 +8811,19 @@ def _execute_live_trade_body(
         else:
             execution_price = execution_plan.price
     planned_entry_execution_type = _entry_execution_type_for_plan(execution_plan)
+    trade_performance_tags = _build_trade_performance_tags(
+        session,
+        decision_run_id=decision_run_id,
+        decision=decision,
+        market_snapshot=market_snapshot,
+        risk_result=risk_result,
+        risk_row=risk_row,
+        intent_type=intent_type,
+        requested_price=execution_price,
+        requested_quantity=normalized_quantity,
+        execution_plan=execution_plan,
+        existing_position=existing_position,
+    )
     record_audit_event(
         session,
         event_type="live_execution_attempted",
@@ -7427,6 +8845,7 @@ def _execute_live_trade_body(
                 "rollout_notional_cap_applied": rollout_notional_cap_applied,
                 "approved_notional_cap": approved_notional_cap,
                 "meta_gate": meta_gate_payload,
+                **_trade_performance_payload(trade_performance_tags),
             },
             correlation_ids=execution_correlation_ids,
         )
@@ -7450,6 +8869,7 @@ def _execute_live_trade_body(
                 "execution_policy": execution_plan.to_payload(),
                 "preflight_request": dict(preflight_request),
                 "rollout_mode": rollout_mode,
+                **_trade_performance_payload(trade_performance_tags),
                 **holding_profile_payload,
             },
             correlation_ids=execution_correlation_ids,
@@ -7466,6 +8886,7 @@ def _execute_live_trade_body(
             "approved_notional_cap": approved_notional_cap,
             "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
+            **_trade_performance_payload(trade_performance_tags),
             "preflight_request": dict(preflight_request),
             "submit_blocked": True,
             "_cache_dedupe": False,
@@ -7490,6 +8911,8 @@ def _execute_live_trade_body(
             approved_notional_cap=approved_notional_cap,
             client_order_id_seed=client_order_id_seed,
             correlation_ids=execution_correlation_ids,
+            trade_performance_tags=trade_performance_tags,
+            position_id=existing_position.id if existing_position is not None else None,
         )
     except PreTradeExchangeFilterError as exc:
         record_audit_event(
@@ -7549,6 +8972,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
         )
         payload = {
@@ -7560,6 +8984,7 @@ def _execute_live_trade_body(
             "requested_price": execution_price,
             "entry_execution_type": planned_entry_execution_type,
             "execution_policy": execution_plan.to_payload(),
+            **_trade_performance_payload(trade_performance_tags),
         }
         guard_action = _entry_action_for_decision(decision)
         if guard_action is not None:
@@ -7646,6 +9071,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
                 **({"submit_request": dict(submit_request)} if isinstance(submit_request, dict) else {}),
                 **({"submission_tracking": submission_tracking} if submission_tracking else {}),
             },
@@ -7667,6 +9093,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
         )
         record_audit_event(
@@ -7687,6 +9114,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
             correlation_ids=normalize_correlation_ids(execution_correlation_ids, execution_id=order.id),
         )
@@ -7721,6 +9149,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
         )
         create_alert(
@@ -7737,6 +9166,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
         )
         record_audit_event(
@@ -7754,6 +9184,7 @@ def _execute_live_trade_body(
                 "requested_price": execution_price,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
             correlation_ids=normalize_correlation_ids(execution_correlation_ids, execution_id=order.id),
         )
@@ -7768,6 +9199,7 @@ def _execute_live_trade_body(
                 "intent_type": intent_type,
                 "entry_execution_type": planned_entry_execution_type,
                 "execution_policy": execution_plan.to_payload(),
+                **_trade_performance_payload(trade_performance_tags),
             },
             correlation_ids=normalize_correlation_ids(execution_correlation_ids, execution_id=order.id),
         )
@@ -7886,6 +9318,9 @@ def _execute_live_trade_body(
         if position_management_payload is not None:
             session.add(position)
             session.flush()
+        position.metadata_json = _merge_trade_performance_tags(position.metadata_json, trade_performance_tags)
+        session.add(position)
+        session.flush()
 
     protection_result: dict[str, object] | None = None
     protection_lifecycle: ProtectionLifecycleSnapshot | None = None
@@ -7938,6 +9373,7 @@ def _execute_live_trade_body(
                 "execution_quality": execution_quality,
                 "entry_execution_type": entry_execution_type,
                 "signed_slippage_bps": signed_slippage_bps,
+                **_trade_performance_payload(trade_performance_tags),
                 **holding_profile_payload,
                 "position_management": {
                     "reduce_fraction": reduce_fraction,
@@ -8035,6 +9471,7 @@ def _execute_live_trade_body(
             "execution_attempts": execution_result["attempts"],
             "execution_quality": execution_quality,
             "meta_gate": meta_gate_payload,
+            **_trade_performance_payload(trade_performance_tags),
             **holding_profile_payload,
             "position_management": {
                 "reduce_fraction": reduce_fraction,
@@ -8046,6 +9483,7 @@ def _execute_live_trade_body(
     )
     order.metadata_json = {
         **(order.metadata_json or {}),
+        **_trade_performance_payload(trade_performance_tags),
         **holding_profile_payload,
         "protection_lifecycle": final_protection_lifecycle,
         "position_management": {
@@ -8075,6 +9513,7 @@ def _execute_live_trade_body(
         "fees": fee_paid,
         "signed_slippage_bps": signed_slippage_bps,
         "entry_execution_type": entry_execution_type,
+        **_trade_performance_payload(trade_performance_tags),
         "equity": pnl_snapshot.equity,
         "funding_sync": funding_sync,
         "protective_order_ids": protective_order_ids,

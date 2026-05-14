@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from trading_mvp.config import get_settings
 from trading_mvp.models import Position, Setting
 from trading_mvp.schemas import FeaturePayload
 from trading_mvp.services.holding_profile import (
@@ -33,6 +34,16 @@ MFE_ROLLBACK_SEVERE_EXTRA_PCT = 0.18
 MFE_ROLLBACK_EXIT_EXTRA_PCT = 0.3
 MFE_ROLLBACK_EXIT_MIN_R = 2.0
 MFE_ROLLBACK_EXIT_CURRENT_R_MAX = 0.2
+SCALP_EARLY_FAIL_MINUTES = 15
+SCALP_EARLY_FAIL_PROFIT_FLOOR_R = 0.1
+SHORT_TP_EXPECTED_GROSS_BPS = 50.0
+SHORT_TP_EXPECTED_HOLDING_MINUTES = 60
+SCALP_EARLY_FAIL_REASON_CODE = "scalp_early_fail"
+TIME_TO_PROFIT_MISSED_REASON_CODE = "time_to_profit_missed"
+SHORT_HOLD_REASSESSMENT_REQUIRED_REASON_CODE = "short_hold_reassessment_required"
+POSITION_MANAGEMENT_SCALP_EARLY_FAIL = "POSITION_MANAGEMENT_SCALP_EARLY_FAIL"
+POSITION_MANAGEMENT_SCALP_EARLY_FAIL_REDUCE = "POSITION_MANAGEMENT_SCALP_EARLY_FAIL_REDUCE"
+POSITION_MANAGEMENT_SHORT_HOLD_REASSESSMENT = "POSITION_MANAGEMENT_SHORT_HOLD_REASSESSMENT_REQUIRED"
 BREAKOUT_TIME_PROFILE_NAME = "breakout_fast"
 CONTINUATION_TIME_PROFILE_NAME = "continuation_balanced"
 PULLBACK_TIME_PROFILE_NAME = "pullback_flexible"
@@ -81,6 +92,51 @@ def _signed_move(side: str, entry_price: float, mark_price: float) -> float:
     if side == "long":
         return mark_price - entry_price
     return entry_price - mark_price
+
+
+def _expected_gross_bps_for_position(position: Position, take_profit: float | None) -> float | None:
+    if take_profit is None or position.entry_price <= 0:
+        return None
+    if position.side == "long" and take_profit > position.entry_price:
+        return ((take_profit - position.entry_price) / position.entry_price) * 10_000
+    if position.side == "short" and take_profit < position.entry_price:
+        return ((position.entry_price - take_profit) / position.entry_price) * 10_000
+    return None
+
+
+def _settings_float(
+    settings_row: Setting,
+    name: str,
+    fallback: float,
+    *,
+    minimum: float | None = None,
+) -> float:
+    defaults = get_settings()
+    parsed = _coerce_float(getattr(settings_row, name, None))
+    if parsed is None:
+        parsed = _coerce_float(getattr(defaults, name, None))
+    if parsed is None:
+        parsed = fallback
+    if minimum is not None:
+        parsed = max(parsed, minimum)
+    return parsed
+
+
+def _settings_int(settings_row: Setting, name: str, fallback: int, *, minimum: int = 1) -> int:
+    return int(round(_settings_float(settings_row, name, float(fallback), minimum=float(minimum))))
+
+
+def _runtime_float(name: str, fallback: float, *, minimum: float | None = None) -> float:
+    parsed = _coerce_float(getattr(get_settings(), name, None))
+    if parsed is None:
+        parsed = fallback
+    if minimum is not None:
+        parsed = max(parsed, minimum)
+    return parsed
+
+
+def _runtime_int(name: str, fallback: int, *, minimum: int = 0) -> int:
+    return int(round(_runtime_float(name, float(fallback), minimum=float(minimum))))
 
 
 def _management_metadata(position: Position) -> dict[str, Any]:
@@ -169,6 +225,61 @@ def _resolve_time_profile(
     }
 
 
+def _resolve_short_tp_intent(
+    *,
+    management: dict[str, Any],
+    position: Position,
+    holding_profile: str,
+    expected_gross_bps: float | None,
+    planned_max_holding_minutes: int | None,
+    settings_row: Setting,
+) -> dict[str, Any]:
+    explicit_profile = str(management.get("holding_profile") or "").strip().lower()
+    strategy_tag = str(
+        management.get("strategy_tag")
+        or management.get("strategy")
+        or management.get("entry_strategy")
+        or ""
+    ).strip().lower()
+    expected_holding_minutes = (
+        _coerce_float(management.get("expected_holding_minutes"))
+        or _coerce_float(management.get("expected_time_to_profit_minutes"))
+        or _coerce_float(management.get("expected_time_to_0_25r_minutes"))
+        or _coerce_float(planned_max_holding_minutes)
+    )
+    gross_threshold_bps = _settings_float(
+        settings_row,
+        "short_tp_expected_gross_bps",
+        SHORT_TP_EXPECTED_GROSS_BPS,
+        minimum=0.0,
+    )
+    holding_threshold_minutes = _settings_int(
+        settings_row,
+        "short_tp_expected_holding_minutes",
+        SHORT_TP_EXPECTED_HOLDING_MINUTES,
+        minimum=1,
+    )
+    reason_codes: list[str] = []
+    if explicit_profile == HOLDING_PROFILE_SCALP or strategy_tag == HOLDING_PROFILE_SCALP:
+        reason_codes.append("scalp_intent")
+    if expected_gross_bps is not None and expected_gross_bps < gross_threshold_bps:
+        reason_codes.append("short_tp_expected_gross_bps")
+    if expected_holding_minutes is not None and expected_holding_minutes < holding_threshold_minutes:
+        reason_codes.append("short_expected_holding_minutes")
+    applies = bool(reason_codes)
+    return {
+        "applies": applies,
+        "holding_profile": holding_profile,
+        "explicit_holding_profile": explicit_profile or None,
+        "strategy_tag": strategy_tag or None,
+        "expected_gross_bps": round(expected_gross_bps, 6) if expected_gross_bps is not None else None,
+        "expected_holding_minutes": round(expected_holding_minutes, 6) if expected_holding_minutes is not None else None,
+        "gross_threshold_bps": gross_threshold_bps,
+        "holding_threshold_minutes": holding_threshold_minutes,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+    }
+
+
 def seed_position_management_metadata(
     position: Position,
     *,
@@ -209,6 +320,7 @@ def seed_position_management_metadata(
         management,
         planned_max_holding_minutes=max_holding_minutes or int(management.get("planned_max_holding_minutes") or 0) or None,
     )
+    expected_gross_bps = _expected_gross_bps_for_position(position, baseline_take_profit)
     _set_management_stage(
         management,
         stage="partial_taken" if bool(management.get("partial_take_profit_taken")) else "initial",
@@ -223,6 +335,9 @@ def seed_position_management_metadata(
             "entry_time_profile": time_profile["profile_name"],
             "holding_profile": profile,
             "holding_profile_reason": holding_profile_reason or management.get("holding_profile_reason"),
+            "strategy_tag": management.get("strategy_tag") or profile,
+            "expected_gross_bps": expected_gross_bps,
+            "expected_holding_minutes": max_holding_minutes or time_profile["planned_max_holding_minutes"],
             "initial_stop_type": initial_stop_type or stop_management["initial_stop_type"],
             "ai_stop_management_allowed": bool(ai_stop_management_allowed),
             "hard_stop_active": bool(stop_management["hard_stop_active"]),
@@ -319,8 +434,19 @@ def store_position_management_context(position: Position, context: dict[str, Any
         "mfe_protection_action",
         "entry_time_profile",
         "effective_max_holding_minutes",
+        "expected_gross_bps",
+        "expected_holding_minutes",
+        "short_tp_intent",
+        "short_tp_intent_reason_codes",
         "early_fail_minutes",
         "early_fail_r_floor",
+        "scalp_early_fail_ready",
+        "early_fail_reason_codes",
+        "favorable_progress_r",
+        "expected_time_to_profit_minutes",
+        "time_to_profit_missed",
+        "reassessment_required",
+        "reassessment_reason_codes",
         "hold_extension_minutes",
         "time_to_fail_ready",
         "time_to_fail_action",
@@ -333,6 +459,9 @@ def store_position_management_context(position: Position, context: dict[str, Any
         "hard_stop_active",
         "stop_widening_allowed",
         "break_even_trigger_r",
+        "breakeven_lock_bps",
+        "breakeven_min_hold_seconds",
+        "breakeven_hold_satisfied",
         "partial_take_profit_trigger_r",
         "partial_take_profit_fraction",
         "trailing_stop_atr_multiplier",
@@ -405,6 +534,39 @@ def build_position_management_context(
     early_fail_r_floor = _coerce_float(time_profile["early_fail_r_floor"])
     hold_extension_minutes = int(time_profile["hold_extension_minutes"] or 0)
     time_to_fail_basis = str(time_profile["time_to_fail_basis"])
+    expected_gross_bps = _coerce_float(management.get("expected_gross_bps"))
+    if expected_gross_bps is None:
+        expected_gross_bps = _expected_gross_bps_for_position(position, initial_take_profit)
+    short_tp_intent = _resolve_short_tp_intent(
+        management=management,
+        position=position,
+        holding_profile=holding_profile,
+        expected_gross_bps=expected_gross_bps,
+        planned_max_holding_minutes=planned_max_holding_minutes,
+        settings_row=settings_row,
+    )
+    short_tp_intent_applies = bool(short_tp_intent["applies"])
+    if short_tp_intent_applies:
+        configured_scalp_minutes = _settings_int(
+            settings_row,
+            "scalp_early_fail_minutes",
+            SCALP_EARLY_FAIL_MINUTES,
+            minimum=1,
+        )
+        configured_profit_floor = _settings_float(
+            settings_row,
+            "scalp_early_fail_profit_floor_r",
+            SCALP_EARLY_FAIL_PROFIT_FLOOR_R,
+        )
+        early_fail_minutes = min(
+            early_fail_minutes if early_fail_minutes is not None else configured_scalp_minutes,
+            configured_scalp_minutes,
+        )
+        early_fail_r_floor = max(
+            early_fail_r_floor if early_fail_r_floor is not None else configured_profit_floor,
+            configured_profit_floor,
+        )
+        time_to_fail_basis = "scalp_or_short_tp_requires_fast_profit_progress"
     time_in_trade_minutes = max(
         (utcnow_naive() - position.opened_at).total_seconds() / 60.0,
         0.0,
@@ -438,6 +600,9 @@ def build_position_management_context(
     if current_r_multiple is not None:
         mfe_r = max(previous_mfe_r or 0.0, current_r_multiple, 0.0)
         mae_r = min(previous_mae_r or 0.0, current_r_multiple, 0.0)
+    favorable_progress_r = None
+    if current_r_multiple is not None:
+        favorable_progress_r = max(mfe_r if mfe_r is not None else 0.0, current_r_multiple)
     hold_extension_active = bool(
         planned_max_holding_minutes not in {None, 0}
         and hold_extension_minutes > 0
@@ -464,12 +629,22 @@ def build_position_management_context(
         or BREAK_EVEN_TRIGGER_R,
         0.0,
     )
+    breakeven_lock_bps = _runtime_float("breakeven_lock_bps", 0.0, minimum=0.0)
+    breakeven_min_hold_seconds = _runtime_int("breakeven_min_hold_seconds", 0, minimum=0)
+    breakeven_hold_satisfied = time_in_trade_minutes * 60.0 >= breakeven_min_hold_seconds
     break_even_eligible = bool(
         settings_row.break_even_enabled
         and current_r_multiple is not None
         and current_r_multiple >= break_even_trigger_r
+        and breakeven_hold_satisfied
     )
-    break_even_stop_loss = position.entry_price if break_even_eligible else None
+    break_even_stop_loss = None
+    if break_even_eligible:
+        if position.side == "long":
+            break_even_stop_loss = position.entry_price * (1.0 + breakeven_lock_bps / 10_000.0)
+        else:
+            break_even_stop_loss = position.entry_price * (1.0 - breakeven_lock_bps / 10_000.0)
+        break_even_stop_loss = _cap_stop_inside_market(position.side, position.mark_price, break_even_stop_loss)
 
     trailing_stop_loss = None
     trailing_stop_atr_multiplier = (
@@ -602,19 +777,64 @@ def build_position_management_context(
             ]
         )
 
-    time_to_fail_ready = bool(
+    expected_time_to_profit_minutes = (
+        _coerce_float(management.get("expected_time_to_profit_minutes"))
+        or _coerce_float(management.get("expected_time_to_0_25r_minutes"))
+        or _coerce_float(management.get("expected_time_to_0_5r_minutes"))
+    )
+    time_to_profit_missed = bool(
+        short_tp_intent_applies
+        and expected_time_to_profit_minutes is not None
+        and favorable_progress_r is not None
+        and early_fail_r_floor is not None
+        and time_in_trade_minutes >= expected_time_to_profit_minutes
+        and favorable_progress_r <= early_fail_r_floor
+    )
+    scalp_early_fail_ready = bool(
+        short_tp_intent_applies
+        and current_r_multiple is not None
+        and not partial_take_profit_taken
+        and early_fail_minutes is not None
+        and early_fail_r_floor is not None
+        and time_in_trade_minutes >= early_fail_minutes
+        and favorable_progress_r is not None
+        and favorable_progress_r <= early_fail_r_floor
+    )
+    generic_time_to_fail_ready = bool(
         current_r_multiple is not None
+        and not short_tp_intent_applies
         and not partial_take_profit_taken
         and early_fail_minutes is not None
         and early_fail_r_floor is not None
         and time_in_trade_minutes >= early_fail_minutes
         and current_r_multiple <= early_fail_r_floor
     )
+    time_to_fail_ready = bool(generic_time_to_fail_ready or scalp_early_fail_ready or time_to_profit_missed)
     time_to_fail_action: str | None = None
     time_to_fail_reason: str | None = None
+    early_fail_reason_codes: list[str] = []
+    reassessment_reason_codes: list[str] = []
     if time_to_fail_ready:
         applied_rule_candidates.append("POSITION_MANAGEMENT_TIME_TO_FAIL")
-        if entry_time_profile == BREAKOUT_TIME_PROFILE_NAME:
+        if scalp_early_fail_ready or time_to_profit_missed:
+            applied_rule_candidates.append(POSITION_MANAGEMENT_SCALP_EARLY_FAIL)
+            time_to_fail_reason = SCALP_EARLY_FAIL_REASON_CODE
+            time_to_fail_action = "reduce"
+            early_fail_reason_codes.extend(
+                [SCALP_EARLY_FAIL_REASON_CODE, SHORT_HOLD_REASSESSMENT_REQUIRED_REASON_CODE]
+            )
+            reassessment_reason_codes.append(SHORT_HOLD_REASSESSMENT_REQUIRED_REASON_CODE)
+            if time_to_profit_missed:
+                time_to_fail_reason = TIME_TO_PROFIT_MISSED_REASON_CODE
+                early_fail_reason_codes.append(TIME_TO_PROFIT_MISSED_REASON_CODE)
+                reassessment_reason_codes.append(TIME_TO_PROFIT_MISSED_REASON_CODE)
+            reduce_reason_codes.extend(
+                [
+                    POSITION_MANAGEMENT_SCALP_EARLY_FAIL_REDUCE,
+                    POSITION_MANAGEMENT_SHORT_HOLD_REASSESSMENT,
+                ]
+            )
+        elif entry_time_profile == BREAKOUT_TIME_PROFILE_NAME:
             applied_rule_candidates.append("POSITION_MANAGEMENT_BREAKOUT_TIME_PROFILE")
             time_to_fail_reason = "breakout_follow_through_missing"
             if current_r_multiple is not None and current_r_multiple <= 0:
@@ -727,6 +947,10 @@ def build_position_management_context(
         "initial_risk_per_unit": initial_risk_per_unit,
         "holding_profile": holding_profile,
         "holding_profile_reason": management.get("holding_profile_reason"),
+        "expected_gross_bps": round(expected_gross_bps, 4) if expected_gross_bps is not None else None,
+        "expected_holding_minutes": short_tp_intent.get("expected_holding_minutes"),
+        "short_tp_intent": short_tp_intent,
+        "short_tp_intent_reason_codes": list(short_tp_intent.get("reason_codes") or []),
         "initial_stop_type": management.get("initial_stop_type") or stop_management["initial_stop_type"],
         "ai_stop_management_allowed": bool(management.get("ai_stop_management_allowed", stop_management["ai_stop_management_allowed"])),
         "hard_stop_active": bool(management.get("hard_stop_active", stop_management["hard_stop_active"])),
@@ -740,6 +964,7 @@ def build_position_management_context(
         "current_r_multiple": round(current_r_multiple, 4) if current_r_multiple is not None else None,
         "mfe_r": round(mfe_r, 4) if mfe_r is not None else None,
         "mae_r": round(mae_r, 4) if mae_r is not None else None,
+        "favorable_progress_r": round(favorable_progress_r, 4) if favorable_progress_r is not None else None,
         "mfe_rollback_pct": round(mfe_rollback_pct, 4) if mfe_rollback_pct is not None else None,
         "mfe_rollback_threshold": (
             round(mfe_rollback_threshold, 4) if mfe_rollback_threshold is not None else None
@@ -750,6 +975,9 @@ def build_position_management_context(
         "break_even_eligible": break_even_eligible,
         "break_even_stop_loss": break_even_stop_loss,
         "break_even_trigger_r": break_even_trigger_r,
+        "breakeven_lock_bps": breakeven_lock_bps,
+        "breakeven_min_hold_seconds": breakeven_min_hold_seconds,
+        "breakeven_hold_satisfied": breakeven_hold_satisfied,
         "trailing_stop_atr_multiplier": trailing_stop_atr_multiplier,
         "trailing_stop_loss": trailing_stop_loss,
         "mfe_rollback_stop_loss": mfe_rollback_stop_loss,
@@ -770,6 +998,12 @@ def build_position_management_context(
         ),
         "early_fail_minutes": early_fail_minutes,
         "early_fail_r_floor": early_fail_r_floor,
+        "scalp_early_fail_ready": scalp_early_fail_ready,
+        "early_fail_reason_codes": list(dict.fromkeys(early_fail_reason_codes)),
+        "expected_time_to_profit_minutes": expected_time_to_profit_minutes,
+        "time_to_profit_missed": time_to_profit_missed,
+        "reassessment_required": bool(reassessment_reason_codes),
+        "reassessment_reason_codes": list(dict.fromkeys(reassessment_reason_codes)),
         "time_to_fail_basis": time_to_fail_basis,
         "time_to_fail_ready": time_to_fail_ready,
         "time_to_fail_action": time_to_fail_action,

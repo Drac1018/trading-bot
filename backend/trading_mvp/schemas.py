@@ -18,6 +18,7 @@ CapitalEfficiencyClassification = Literal["efficient", "neutral", "inefficient",
 PriorPenaltyLevel = Literal["none", "light", "medium", "strong"]
 IntentFamily = Literal["entry", "management", "protection", "exit", "unknown"]
 ManagementAction = Literal["restore_protection", "reduce_only", "exit_only", "tighten_management", "none"]
+PerformanceReportCacheStatus = Literal["fresh", "stale", "stale_revalidating"]
 RegimeStructure = Literal["trend", "range", "squeeze", "expansion", "transition"]
 RegimeDirection = Literal["bullish", "bearish", "neutral"]
 RegimeVolatility = Literal["calm", "normal", "fast", "shock"]
@@ -67,6 +68,21 @@ AITriggerReason = Literal[
     "manual_review_event",
     "periodic_backstop_due",
 ]
+ExecutionRiskProfileId = Literal[
+    "NORMAL",
+    "CAUTION",
+    "HIGH_VOLATILITY",
+    "THIN_LIQUIDITY",
+    "STRESS",
+    "DEGRADED",
+]
+AdvisorNewEntryPolicy = Literal[
+    "NORMAL_ALLOWED",
+    "PULLBACK_ONLY",
+    "STRICT_CONFIRMATION_ONLY",
+    "NO_NEW_ENTRY",
+]
+ExecutionRiskProfileAutoApplyMode = Literal["off", "shadow", "conservative_only", "manual_approval"]
 AI_CONTEXT_VERSION = "2026-04-context-v1"
 
 
@@ -111,6 +127,13 @@ class WatchEntryPlan(StrictBaseModel):
     stop_loss: float | None = None
     take_profit: float | None = None
     reason_codes: list[str] = Field(default_factory=list)
+
+
+class TradeDecisionEntryZone(StrictBaseModel):
+    side: Literal["long", "short"] | None = None
+    low: float | None = None
+    high: float | None = None
+    confirmation_type: str | None = None
 
 
 class TradeDecision(StrictBaseModel):
@@ -183,6 +206,15 @@ class TradeDecision(StrictBaseModel):
     analytics_excluded_from_entry_stats: bool = False
     prompt_family_hint: str | None = None
     ai_context_version: str = AI_CONTEXT_VERSION
+    strategy_id: str | None = None
+    regime: str | None = None
+    reason_summary: str | None = Field(default=None, max_length=500)
+    entry_intent: str | None = None
+    entry_zone: TradeDecisionEntryZone | None = None
+    invalidation_level: float | None = None
+    risk_notes: list[str] = Field(default_factory=list)
+    required_confirmations: list[str] = Field(default_factory=list)
+    hard_blocks_observed: list[str] = Field(default_factory=list)
     event_risk_acknowledgement: str | None = None
     confidence_penalty_reason: str | None = None
     scenario_note: str | None = None
@@ -214,6 +246,51 @@ class TradeDecision(StrictBaseModel):
             self.abstain_reason_codes = list(self.no_trade_reason_codes or self.primary_reason_codes)
         if not self.ai_context_version:
             self.ai_context_version = AI_CONTEXT_VERSION
+        if self.reason_summary is None:
+            self.reason_summary = self.explanation_short
+        if self.entry_intent is None:
+            if self.decision in {"long", "short"}:
+                self.entry_intent = "new_entry"
+            elif self.decision in {"reduce", "exit"}:
+                self.entry_intent = "position_management"
+            else:
+                self.entry_intent = "no_new_entry"
+        if self.entry_zone is None and self.entry_zone_min is not None and self.entry_zone_max is not None:
+            self.entry_zone = TradeDecisionEntryZone(
+                side=self.decision if self.decision in {"long", "short"} else None,
+                low=self.entry_zone_min,
+                high=self.entry_zone_max,
+                confirmation_type=self.entry_mode,
+            )
+        if self.invalidation_level is None:
+            self.invalidation_level = self.invalidation_price
+        return self
+
+
+class AIMarketSettingsRecommendation(StrictBaseModel):
+    recommendation_id: str = Field(min_length=8, max_length=128)
+    generated_at: datetime
+    valid_until: datetime
+    symbol_scope: list[str] = Field(min_length=1, max_length=20)
+    recommended_profile_id: ExecutionRiskProfileId
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason_summary: str = Field(min_length=3, max_length=500)
+    reason_codes: list[str] = Field(default_factory=list)
+    observed_risk_flags: list[str] = Field(default_factory=list)
+    suggested_new_entry_policy: AdvisorNewEntryPolicy
+    do_not_relax: bool = True
+
+    @field_validator("generated_at", "valid_until", mode="before")
+    @classmethod
+    def _coerce_timestamp(cls, value: object) -> datetime:
+        return _coerce_required_aware_datetime(value)
+
+    @model_validator(mode="after")
+    def _validate_recommendation_contract(self) -> AIMarketSettingsRecommendation:
+        if self.valid_until <= self.generated_at:
+            raise ValueError("valid_until must be after generated_at")
+        if not self.do_not_relax:
+            raise ValueError("do_not_relax must remain true")
         return self
 
 
@@ -781,6 +858,9 @@ class SignalPerformanceReportResponse(StrictBaseModel):
     window_hours: int = Field(ge=1, le=168)
     items: list[SignalPerformanceEntry] = Field(default_factory=list)
     windows: list[PerformanceWindowReport] = Field(default_factory=list)
+    cache_status: PerformanceReportCacheStatus = "fresh"
+    cache_age_seconds: float = Field(ge=0.0, default=0.0)
+    cache_rebuild_pending: bool = False
 
 
 class ReplayValidationRequest(StrictBaseModel):
@@ -1371,6 +1451,27 @@ class OperatorControlState(StrictBaseModel):
     scheduler_triggered_by: str | None = None
     scheduler_last_run_at: datetime | None = None
     scheduler_next_run_at: datetime | None = None
+    deterministic_market_profile: str | None = None
+    ai_recommended_profile: str | None = None
+    ai_recommendation_id: str | None = None
+    ai_recommendation_confidence: float | None = None
+    ai_recommendation_valid_until: datetime | None = None
+    ai_recommendation_reason_codes: list[str] = Field(default_factory=list)
+    ai_recommendation_status: str = "unknown"
+    final_active_execution_profile: str | None = None
+    shadow_final_execution_profile: str | None = None
+    profile_selection_mode: str = "shadow"
+    profile_selected_reason: str | None = None
+    was_tightened_by_ai: bool = False
+    was_relaxation_blocked: bool = False
+    relaxation_block_reason: str | None = None
+    relaxation_block_reason_codes: list[str] = Field(default_factory=list)
+    ai_recommendation_ignored_reason_codes: list[str] = Field(default_factory=list)
+    next_ai_settings_review_at: datetime | None = None
+    ai_settings_shadow_mode: bool = True
+    ai_settings_auto_apply_mode: str = "shadow"
+    profile_new_entry_blocked: bool = False
+    profile_survival_paths_allowed: bool = True
     last_market_refresh_at: datetime | None = None
     last_decision_at: datetime | None = None
     last_decision_snapshot_at: datetime | None = None
@@ -1533,6 +1634,8 @@ class PendingEntryPlanSnapshot(StrictBaseModel):
     last_watch_at: datetime | None = None
     last_watch_snapshot_id: int | None = None
     trigger_details: dict[str, Any] = Field(default_factory=dict)
+    confirmation_tracking: dict[str, Any] = Field(default_factory=dict)
+    confirmation_follow_up_snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperatorRiskSnapshot(StrictBaseModel):
@@ -1892,6 +1995,14 @@ class ExecutionIntent(StrictBaseModel):
     mode: Literal["live"]
     reduce_only: bool = Field(default=False, description="Exchange reduce-only flag for survival-path exposure reduction.")
     close_only: bool = Field(default=False, description="Exchange close-only flag for full exit or emergency-exit paths.")
+    required_order_policy: Literal[
+        "market_allowed",
+        "limit_only",
+        "limit_only_or_post_only",
+        "block_or_pending",
+    ] = "market_allowed"
+    allow_market_fallback: bool = True
+    order_policy_reason: str | None = Field(default=None, max_length=120)
 
 
 class AgentRunRecord(StrictBaseModel):
@@ -2759,6 +2870,7 @@ class AppSettingsViewResponse(StrictBaseModel):
     adaptive_signal_summary: dict[str, Any] = Field(default_factory=dict)
     position_management_summary: dict[str, Any] = Field(default_factory=dict)
     event_operator_control: EventOperatorControlPayload | None = None
+    execution_risk_profile_settings: dict[str, Any] = Field(default_factory=dict)
     ai_enabled: bool
     ai_provider: str
     ai_model: str
@@ -2810,6 +2922,32 @@ class AppSettingsAIUsageResponse(StrictBaseModel):
     manual_ai_guard_minutes: int
 
 
+class AppSettingsExecutionRiskProfilePolicy(StrictBaseModel):
+    advisor_enabled: bool = True
+    advisor_shadow_mode: bool = True
+    auto_apply_mode: ExecutionRiskProfileAutoApplyMode = "shadow"
+    normal_interval_seconds: int = Field(default=900, ge=60, le=86400)
+    elevated_interval_seconds: int = Field(default=300, ge=60, le=86400)
+    min_recheck_interval_seconds: int = Field(default=300, ge=60, le=86400)
+    recommendation_ttl_seconds: int = Field(default=900, ge=60, le=86400)
+    min_confidence_to_apply: float = Field(default=0.70, ge=0.50, le=1.0)
+    relax_requires_consecutive_confirmations: int = Field(default=2, ge=1, le=10)
+    min_profile_dwell_seconds: int = Field(default=900, ge=0, le=86400)
+
+    @field_validator(
+        "normal_interval_seconds",
+        "elevated_interval_seconds",
+        "min_recheck_interval_seconds",
+        "recommendation_ttl_seconds",
+        "min_profile_dwell_seconds",
+    )
+    @classmethod
+    def _validate_minute_granularity(cls, value: int) -> int:
+        if value % 60 != 0:
+            raise ValueError("execution risk profile policy intervals must be stored in 60-second units")
+        return value
+
+
 class AppSettingsUpdateRequest(StrictBaseModel):
     live_trading_enabled: bool
     rollout_mode: RolloutMode | None = None
@@ -2835,7 +2973,7 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     slippage_threshold_pct: float = Field(gt=0.0, le=0.1)
     adaptive_signal_enabled: bool = False
     position_management_enabled: bool = True
-    break_even_enabled: bool = True
+    break_even_enabled: bool = False
     atr_trailing_stop_enabled: bool = True
     partial_take_profit_enabled: bool = True
     partial_tp_rr: float = Field(default=1.5, ge=0.1, le=10.0)
@@ -2851,6 +2989,7 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     ai_model: str = Field(min_length=1, max_length=80)
     ai_call_interval_minutes: int = Field(ge=5, le=1440)
     decision_cycle_interval_minutes: int = Field(ge=1, le=1440)
+    execution_risk_profile_settings: AppSettingsExecutionRiskProfilePolicy | None = None
     ai_max_input_candles: int = Field(ge=16, le=200)
     ai_temperature: float = Field(ge=0.0, le=1.0)
     binance_market_data_enabled: bool

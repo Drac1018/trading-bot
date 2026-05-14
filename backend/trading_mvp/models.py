@@ -64,7 +64,7 @@ class Setting(TimestampMixin, Base):
     slippage_threshold_pct: Mapped[float] = mapped_column(Float, default=0.003)
     adaptive_signal_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     position_management_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    break_even_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    break_even_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     atr_trailing_stop_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     partial_take_profit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     partial_tp_rr: Mapped[float] = mapped_column(Float, default=1.5)
@@ -162,6 +162,7 @@ class DecisionPerformanceFact(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_decision_performance_facts_created_at", "created_at"),
         Index("ix_decision_performance_facts_decision_run_id", "decision_run_id", unique=True),
+        Index("ix_decision_performance_facts_symbol_created_at", "symbol", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -192,6 +193,10 @@ class DecisionPerformanceFact(TimestampMixin, Base):
 
 class RiskCheck(TimestampMixin, Base):
     __tablename__ = "risk_checks"
+    __table_args__ = (
+        Index("ix_risk_checks_created_at", "created_at"),
+        Index("ix_risk_checks_symbol_created_at", "symbol", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(30), index=True)
@@ -203,6 +208,37 @@ class RiskCheck(TimestampMixin, Base):
     approved_risk_pct: Mapped[float] = mapped_column(Float, default=0.0)
     approved_leverage: Mapped[float] = mapped_column(Float, default=0.0)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class StrategyCooldownState(TimestampMixin, Base):
+    __tablename__ = "strategy_cooldown_states"
+    __table_args__ = (
+        Index(
+            "ux_strategy_cooldown_identity",
+            "strategy_id",
+            "symbol",
+            "direction",
+            "regime_id",
+            "range_id",
+            unique=True,
+        ),
+        Index("ix_strategy_cooldown_until", "cooldown_until"),
+        Index("ix_strategy_cooldown_symbol_direction", "symbol", "direction"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(80), index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    direction: Mapped[str] = mapped_column(String(10), index=True)
+    regime_id: Mapped[str] = mapped_column(String(80), default="unknown")
+    range_id: Mapped[str] = mapped_column(String(180), default="unknown")
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    cooldown_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_breakout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_closed_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class PendingEntryPlan(TimestampMixin, Base):

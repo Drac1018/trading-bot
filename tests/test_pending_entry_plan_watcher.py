@@ -123,6 +123,18 @@ def _watch_snapshot(
     )
 
 
+def _watch_snapshot_zone_untouched(*, snapshot_time, latest_price: float = 69350.0) -> MarketSnapshotPayload:
+    return _snapshot(
+        timeframe="1m",
+        snapshot_time=snapshot_time,
+        latest_price=latest_price,
+        candles=[
+            (69440.0, 69480.0, 69340.0, 69410.0),
+            (69410.0, 69420.0, 69320.0, latest_price),
+        ],
+    )
+
+
 def _watch_snapshot_weak_reclaim(*, snapshot_time, latest_price: float = 69305.0) -> MarketSnapshotPayload:
     return _snapshot(
         timeframe="1m",
@@ -309,6 +321,10 @@ def test_decision_cycle_arms_pullback_entry_plan_without_immediate_order(monkeyp
     assert plan.expires_at.tzinfo is None
     assert plan.expires_at > utcnow_naive()
     assert plan.idempotency_key.startswith("pending-plan:BTCUSDT:long:")
+    assert plan.metadata_json["plan_id"] == plan.id
+    assert plan.metadata_json["strategy_id"] == "trend_pullback_engine"
+    assert plan.metadata_json["trade_performance_tags"]["regime_id"]
+    assert result["entry_plan"]["plan_id"] == plan.id
 
 
 def test_entry_plan_watcher_executes_after_zone_entry_and_confirm_without_new_ai_call(monkeypatch, db_session) -> None:
@@ -346,6 +362,104 @@ def test_entry_plan_watcher_executes_after_zone_entry_and_confirm_without_new_ai
     assert trigger_details["quality_state"] == "trigger"
     assert trigger_details["quality_score"] >= trigger_details["quality_threshold"]
     assert trigger_details["quality_components"]["reclaim_signal_strength"] >= 0.55
+    confirmation_tracking = refreshed.metadata_json["last_confirmation_tracking"]
+    assert confirmation_tracking["plan_id"] == plan.id
+    assert confirmation_tracking["confirmation_passed"] is True
+    assert confirmation_tracking["confirmation_failed_reason"] is None
+    assert confirmation_tracking["RR_before_confirmation"] is not None
+    assert confirmation_tracking["RR_after_confirmation"] is not None
+
+
+def test_entry_plan_confirmation_passed_but_final_risk_blocked_is_tracked(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+
+    execute_called = False
+
+    def fake_execute_live_trade(*args, **kwargs):
+        nonlocal execute_called
+        execute_called = True
+        return {"order_id": 501, "status": "filled"}
+
+    def fake_final_risk_block(
+        session,
+        settings_row,
+        decision,
+        market_snapshot,
+        decision_run_id=None,
+        market_snapshot_id=None,
+        execution_mode="live",
+        **kwargs,
+    ):
+        reason_codes = ["FINAL_RISK_TEST_BLOCK"]
+        risk_result = RiskCheckResult(
+            allowed=False,
+            decision=decision.decision,  # type: ignore[arg-type]
+            reason_codes=reason_codes,
+            blocked_reason_codes=reason_codes,
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            operating_mode="live",
+            effective_leverage_cap=5.0,
+            symbol_risk_tier="btc",
+            exposure_metrics={},
+        )
+        risk_row = RiskCheck(
+            symbol=decision.symbol,
+            decision_run_id=decision_run_id,
+            market_snapshot_id=market_snapshot_id,
+            allowed=False,
+            decision=decision.decision,
+            reason_codes=reason_codes,
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload=risk_result.model_dump(mode="json"),
+        )
+        session.add(risk_row)
+        session.flush()
+        return risk_result, risk_row
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fake_execute_live_trade)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", fake_final_risk_block)
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(
+            snapshot_time=utcnow_naive() + timedelta(minutes=1),
+            latest_price=69420.0,
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+    confirmation_event = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "pending_entry_plan_confirmation_evaluated")
+        .order_by(AuditEvent.id.desc())
+    )
+    funnel_event = db_session.scalar(
+        select(AuditEvent)
+        .where(
+            AuditEvent.event_type == "decision_funnel_audit",
+            AuditEvent.entity_id == str(plan.id),
+        )
+        .order_by(AuditEvent.id.desc())
+    )
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "risk_blocked"
+    assert execute_called is False
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert refreshed.metadata_json["last_confirmation_tracking"]["confirmation_passed"] is True
+    assert confirmation_event is not None
+    assert confirmation_event.payload["plan_id"] == plan.id
+    assert confirmation_event.payload["confirmation_passed"] is True
+    assert funnel_event is not None
+    assert funnel_event.payload["stage"] == "final_risk_guard"
+    assert funnel_event.payload["m1_confirmation_status"] == "passed"
+    assert funnel_event.payload["final_risk_status"] == "blocked"
+    assert funnel_event.payload["blocked_reason"] == "FINAL_RISK_TEST_BLOCK"
 
 
 def test_entry_plan_watcher_cancels_when_open_position_has_no_additional_capacity(
@@ -456,6 +570,43 @@ def test_entry_plan_watcher_marks_shadow_execution_terminal(monkeypatch, db_sess
     assert refreshed.metadata_json["execution_result"]["status"] == "shadow"
 
 
+def test_entry_plan_confirmation_tracking_records_zone_untouched(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.execute_live_trade",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("zone untouched plan must not execute")),
+    )
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot_zone_untouched(
+            snapshot_time=utcnow_naive() + timedelta(minutes=1),
+        ),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+    event = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "pending_entry_plan_confirmation_evaluated")
+        .order_by(AuditEvent.id.desc())
+    )
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "armed_waiting_confirmation"
+    assert refreshed is not None
+    assert refreshed.metadata_json["last_confirmation_tracking"]["plan_id"] == plan.id
+    assert refreshed.metadata_json["last_confirmation_tracking"]["zone_touched"] is False
+    assert refreshed.metadata_json["last_confirmation_tracking"]["confirmation_failed_reason"] == "ZONE_NOT_ENTERED"
+    assert refreshed.metadata_json["confirmation_follow_up_snapshot"]["status"] == "pending_observation"
+    assert event is not None
+    assert event.payload["plan_id"] == plan.id
+    assert event.payload["confirmation_passed"] is False
+    assert event.payload["confirmation_failed_reason"] == "ZONE_NOT_ENTERED"
+
+
 def test_entry_plan_watcher_keeps_waiting_on_weak_reclaim_quality(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
@@ -486,6 +637,32 @@ def test_entry_plan_watcher_keeps_waiting_on_weak_reclaim_quality(monkeypatch, d
     assert execute_called is False
     assert refreshed is not None
     assert refreshed.plan_status == "armed"
+    confirmation_tracking = refreshed.metadata_json["last_confirmation_tracking"]
+    assert confirmation_tracking["plan_id"] == plan.id
+    assert confirmation_tracking["zone_touched"] is True
+    assert confirmation_tracking["m1_close_reclaim"] is True
+    assert confirmation_tracking["structure_break"] is False
+    assert confirmation_tracking["confirmation_failed_reason"] == "STRUCTURE_CONFIRMATION_FAILED"
+    assert confirmation_tracking["RR_before_confirmation"] is not None
+    assert confirmation_tracking["RR_after_confirmation"] is not None
+    confirmation_event = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "pending_entry_plan_confirmation_evaluated")
+        .order_by(AuditEvent.id.desc())
+    )
+    assert confirmation_event is not None
+    assert confirmation_event.payload["confirmation_failed_reason"] == "STRUCTURE_CONFIRMATION_FAILED"
+    funnel_event = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_funnel_audit")
+        .order_by(AuditEvent.id.desc())
+    )
+    assert funnel_event is not None
+    assert funnel_event.payload["stage"] == "m1_confirmation_failed"
+    assert funnel_event.payload["entry_plan_status"] == "waiting"
+    assert funnel_event.payload["m1_confirmation_status"] == "failed"
+    assert funnel_event.payload["blocked_reason"] == "PLAN_CONFIRM_QUALITY_LOW"
+    assert funnel_event.payload["order_status"] == "not_submitted"
 
 
 def test_entry_plan_watcher_cancels_on_late_chase_and_rr_deterioration(monkeypatch, db_session) -> None:
@@ -521,6 +698,11 @@ def test_entry_plan_watcher_cancels_on_late_chase_and_rr_deterioration(monkeypat
     assert refreshed is not None
     assert refreshed.plan_status == "canceled"
     assert refreshed.canceled_reason == "PLAN_CONFIRM_QUALITY_REJECTED"
+    confirmation_tracking = refreshed.metadata_json["last_confirmation_tracking"]
+    assert confirmation_tracking["plan_id"] == plan.id
+    assert confirmation_tracking["confirmation_failed_reason"] == "RR_DETERIORATED"
+    assert confirmation_tracking["plan_cancel_reason"] == "PLAN_CONFIRM_QUALITY_REJECTED"
+    assert confirmation_tracking["follow_up_snapshot"]["status"] == "pending_observation"
 
 
 def test_entry_plan_watcher_waits_on_chase_without_rr_collapse(monkeypatch, db_session) -> None:

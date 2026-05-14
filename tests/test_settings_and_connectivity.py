@@ -8,6 +8,7 @@ import httpx
 import pytest
 import trading_mvp.main as main_module
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from trading_mvp.database import Base, get_db
@@ -229,6 +230,109 @@ def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> No
     assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
     assert serialized["event_source_api_key_configured"] is True
     assert "pre_ai_skip_simple_classification" in serialized["ai_model_routing_policy"]["no_model_call_routes"]
+    profile_settings = serialized["execution_risk_profile_settings"]
+    assert profile_settings["advisor_enabled"] is True
+    assert profile_settings["auto_apply_mode"] == "shadow"
+    assert profile_settings["blocking_severity"] == 3
+    assert [item["profile_id"] for item in profile_settings["allowed_profiles"]] == [
+        "NORMAL",
+        "CAUTION",
+        "HIGH_VOLATILITY",
+        "THIN_LIQUIDITY",
+        "STRESS",
+        "DEGRADED",
+    ]
+    assert profile_settings["operation"]["manual_cycle_endpoint"] == "/api/cycles/run"
+
+
+def test_settings_update_persists_execution_risk_profile_policy(db_session) -> None:
+    payload = build_settings_payload().model_copy(
+        update={
+            "execution_risk_profile_settings": {
+                "advisor_enabled": False,
+                "advisor_shadow_mode": False,
+                "auto_apply_mode": "conservative_only",
+                "normal_interval_seconds": 1200,
+                "elevated_interval_seconds": 60,
+                "min_recheck_interval_seconds": 120,
+                "recommendation_ttl_seconds": 180,
+                "min_confidence_to_apply": 0.85,
+                "relax_requires_consecutive_confirmations": 3,
+                "min_profile_dwell_seconds": 0,
+            }
+        }
+    )
+
+    row = update_settings(db_session, payload)
+    serialized = serialize_settings_view(row)
+    profile_settings = serialized["execution_risk_profile_settings"]
+
+    assert row.pause_reason_detail["ai_market_settings_policy"]["elevated_interval_seconds"] == 60
+    assert profile_settings["advisor_enabled"] is False
+    assert profile_settings["advisor_shadow_mode"] is False
+    assert profile_settings["auto_apply_mode"] == "conservative_only"
+    assert profile_settings["normal_interval_seconds"] == 1200
+    assert profile_settings["elevated_interval_seconds"] == 60
+    assert profile_settings["min_recheck_interval_seconds"] == 120
+    assert profile_settings["recommendation_ttl_seconds"] == 180
+    assert profile_settings["min_confidence_to_apply"] == 0.85
+    assert profile_settings["relax_requires_consecutive_confirmations"] == 3
+    assert profile_settings["min_profile_dwell_seconds"] == 0
+
+
+def test_settings_update_preserves_execution_profile_policy_when_older_payload_omits_it(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(
+            update={
+                "execution_risk_profile_settings": {
+                    "advisor_enabled": True,
+                    "advisor_shadow_mode": True,
+                    "auto_apply_mode": "manual_approval",
+                    "normal_interval_seconds": 600,
+                    "elevated_interval_seconds": 120,
+                    "min_recheck_interval_seconds": 120,
+                    "recommendation_ttl_seconds": 600,
+                    "min_confidence_to_apply": 0.75,
+                    "relax_requires_consecutive_confirmations": 4,
+                    "min_profile_dwell_seconds": 300,
+                }
+            }
+        ),
+    )
+    payload_data = build_settings_payload().model_dump()
+    payload_data.pop("execution_risk_profile_settings", None)
+
+    updated = update_settings(db_session, AppSettingsUpdateRequest(**payload_data))
+
+    assert updated.id == row.id
+    policy = serialize_settings_view(updated)["execution_risk_profile_settings"]
+    assert policy["auto_apply_mode"] == "manual_approval"
+    assert policy["elevated_interval_seconds"] == 120
+    assert policy["relax_requires_consecutive_confirmations"] == 4
+
+
+def test_settings_execution_profile_policy_rejects_sub_minute_or_low_confidence() -> None:
+    payload_data = build_settings_payload().model_dump()
+    payload_data["execution_risk_profile_settings"] = {
+        "advisor_enabled": True,
+        "advisor_shadow_mode": True,
+        "auto_apply_mode": "shadow",
+        "normal_interval_seconds": 901,
+        "elevated_interval_seconds": 300,
+        "min_recheck_interval_seconds": 300,
+        "recommendation_ttl_seconds": 900,
+        "min_confidence_to_apply": 0.70,
+        "relax_requires_consecutive_confirmations": 2,
+        "min_profile_dwell_seconds": 900,
+    }
+    with pytest.raises(ValidationError):
+        AppSettingsUpdateRequest(**payload_data)
+
+    payload_data["execution_risk_profile_settings"]["normal_interval_seconds"] = 900
+    payload_data["execution_risk_profile_settings"]["min_confidence_to_apply"] = 0.49
+    with pytest.raises(ValidationError):
+        AppSettingsUpdateRequest(**payload_data)
 
 
 def test_settings_auxiliary_serializers_expose_cadences_and_ai_usage(db_session) -> None:

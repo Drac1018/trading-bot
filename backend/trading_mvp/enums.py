@@ -4,6 +4,7 @@ from enum import StrEnum
 class AgentRole(StrEnum):
     CHIEF_REVIEW = "chief_review"
     INTEGRATION_PLANNER = "integration_planner"
+    MARKET_SETTINGS_ADVISOR = "market_settings_advisor"
     TRADING_DECISION = "trading_decision"
     UI_UX = "ui_ux"
 

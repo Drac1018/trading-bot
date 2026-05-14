@@ -70,6 +70,14 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     operator_action_ko: "AI 의견과 기준선 판단이 같은 방향인지 확인합니다.",
     check_location_ko: "AI 의견 / 신규 진입 판단",
   },
+  CONFIDENCE_BELOW_MIN_ENTRY_THRESHOLD: {
+    category: "entry_wait",
+    title_ko: "진입 신뢰도가 기준보다 낮아 대기 중입니다",
+    detail_ko: "AI가 감시용 진입 계획은 제안했지만 confidence가 최소 진입 기준보다 낮아 pending plan을 만들지 않았습니다.",
+    auto_clear_hint_ko: "다음 판단 주기에서 confidence가 기준 이상으로 올라가면 다시 리스크 검토됩니다.",
+    operator_action_ko: "AI 의견의 confidence, watch entry plan, expected cost gate 기준을 확인합니다.",
+    check_location_ko: "AI 의견 / 리스크 점검 > expected cost gate",
+  },
   NO_EDGE: {
     category: "entry_wait",
     title_ko: "거래 우위가 부족해 대기 중입니다",

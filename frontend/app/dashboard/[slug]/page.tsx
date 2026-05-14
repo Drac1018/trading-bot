@@ -1,4 +1,4 @@
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 
 import { DashboardViewLoader } from "./dashboard-view-loader";
 import type {
@@ -15,6 +15,7 @@ import type { OperatorDashboardPayload } from "../../../components/overview-dash
 import { fetchJson } from "../../../lib/api";
 import { fetchBinanceChartCandlesBySymbol } from "../../../lib/binance-chart-candles";
 import { dashboardPages } from "../../../lib/page-config";
+import { ordersDataEndpoints } from "../../../lib/orders-query";
 import { ALL_SYMBOLS, resolveSelectedSymbol } from "../../../lib/selected-symbol";
 
 function queryValue(value: string | string[] | undefined) {
@@ -22,6 +23,58 @@ function queryValue(value: string | string[] | undefined) {
     return value[0] ?? null;
   }
   return value ?? null;
+}
+
+function appendQueryParams(
+  path: string,
+  query: Record<string, string | string[] | undefined>,
+  overrides: Record<string, string>,
+  rename: Record<string, string> = {},
+) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || overrides[key]) {
+      continue;
+    }
+    const nextKey = rename[key] ?? key;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        params.append(nextKey, item);
+      }
+      continue;
+    }
+    params.set(nextKey, value);
+  }
+
+  for (const [key, value] of Object.entries(overrides)) {
+    params.set(key, value);
+  }
+
+  return `${path}?${params.toString()}`;
+}
+
+function legacyDashboardRedirect(
+  slug: string,
+  query: Record<string, string | string[] | undefined>,
+) {
+  if (slug === "decisions" || slug === "risk" || slug === "scheduler") {
+    return appendQueryParams("/dashboard/operations", query, { section: slug });
+  }
+  if (slug === "positions") {
+    return appendQueryParams("/dashboard/trading", query, { section: "positions" });
+  }
+  if (slug === "orders") {
+    return appendQueryParams(
+      "/dashboard/trading",
+      query,
+      { section: "orders" },
+      { tab: "ordersTab" },
+    );
+  }
+  if (slug === "agents") {
+    return appendQueryParams("/dashboard/audit", query, { section: "agents" });
+  }
+  return null;
 }
 
 function resolveCandleWindow(value: string | string[] | undefined): CandleWindow {
@@ -78,8 +131,14 @@ export default async function DashboardPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { slug } = await params;
-  const config = dashboardPages[slug];
   const query = await searchParams;
+  const legacyRedirectPath = legacyDashboardRedirect(slug, query);
+
+  if (legacyRedirectPath) {
+    redirect(legacyRedirectPath);
+  }
+
+  const config = dashboardPages[slug];
 
   if (!config) {
     notFound();
@@ -93,13 +152,14 @@ export default async function DashboardPage({
     slug === "market" || slug === "decisions" || slug === "scheduler" || slug === "risk"
       ? fetchJson<OperatorDashboardPayload>(operatorDashboardEndpoint(slug))
       : Promise.resolve<OperatorDashboardPayload | null>(null);
+  const ordersEndpoints = slug === "orders" ? ordersDataEndpoints(query) : null;
   const sectionsPromise =
-    slug === "settings"
+    slug === "settings" || slug === "market"
       ? Promise.resolve([])
       : Promise.all(
-          config.sections.map(async (section) => ({
+          config.sections.map(async (section, index) => ({
             ...section,
-            rows: await fetchJson<Row[] | Row>(section.endpoint),
+            rows: await fetchJson<Row[] | Row>(ordersEndpoints?.[index] ?? section.endpoint),
           })),
         );
 
@@ -138,28 +198,36 @@ export default async function DashboardPage({
     const selectedChartCandles =
       selectedSymbol === ALL_SYMBOLS ? [] : (chartCandlesBySymbol[selectedSymbol.toUpperCase()] ?? []);
     const needsChartPayloadFallback = selectedSymbol !== ALL_SYMBOLS && selectedChartCandles.length === 0;
-    const [chartFallbackSnapshots, chartFallbackFeatures] = needsChartPayloadFallback
-      ? await Promise.all([
-          fetchJson<Row[]>(
-            `/api/market/snapshots?limit=1&symbol=${encodeURIComponent(selectedSymbol)}&timeframe=${encodeURIComponent(
-              selectedTimeframe,
-            )}`,
-          ),
-          fetchJson<Row[]>(
-            `/api/market/features?limit=1&symbol=${encodeURIComponent(selectedSymbol)}&timeframe=${encodeURIComponent(
-              selectedTimeframe,
-            )}`,
-          ),
-        ])
-      : [undefined, undefined];
+    const featurePayloadTimeframe = selectedTimeframe === "15m" ? selectedTimeframe : "15m";
+    const encodedSelectedSymbol = encodeURIComponent(selectedSymbol);
+    const chartSourceRows =
+      selectedSymbol === ALL_SYMBOLS
+        ? { snapshots: undefined, features: undefined }
+        : await (async () => {
+            const compactSnapshotEndpoint = `/api/market/snapshots?limit=1&compact=true&symbol=${encodedSelectedSymbol}&timeframe=15m`;
+            const featureEndpoint = `/api/market/features?limit=1&symbol=${encodedSelectedSymbol}&timeframe=${encodeURIComponent(
+              featurePayloadTimeframe,
+            )}`;
+            const fallbackSnapshotEndpoint = `/api/market/snapshots?limit=1&symbol=${encodedSelectedSymbol}&timeframe=15m`;
+            const [compactSnapshots, features, fallbackSnapshots] = await Promise.all([
+              fetchJson<Row[]>(compactSnapshotEndpoint),
+              fetchJson<Row[]>(featureEndpoint),
+              needsChartPayloadFallback ? fetchJson<Row[]>(fallbackSnapshotEndpoint) : Promise.resolve(undefined),
+            ]);
+            return {
+              snapshots: needsChartPayloadFallback && fallbackSnapshots ? fallbackSnapshots : compactSnapshots,
+              features,
+            };
+          })();
     market = {
       selectedSymbol,
       selectedCandleWindow,
       selectedTimeframe,
       selectedChartZoomRange,
       chartCandlesBySymbol,
-      chartFallbackSnapshots,
-      chartFallbackFeatures,
+      chartMarkers: [],
+      chartFallbackSnapshots: chartSourceRows.snapshots,
+      chartFallbackFeatures: chartSourceRows.features,
     };
   }
 

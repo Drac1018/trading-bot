@@ -33,6 +33,35 @@ import {
   summarizeSettlementDisplay,
   type OrderSettlementInput,
 } from "../lib/order-settlement";
+import { ordersViewHref, type OrderLifecycleTab } from "../lib/orders-query";
+import {
+  countVisibleMarketChartMarkers,
+  dedupeMarketChartEventMarkers,
+  type MarketChartEventMarker,
+  type MarketChartEventMarkerKind,
+} from "../lib/market-chart-markers";
+import { buildExecutionRiskProfileSummary } from "../lib/execution-risk-profile-summary";
+import {
+  formatMarketRawReasonCodes,
+  formatMarketReasonCodeDebugLabels,
+  formatMarketReasonCodeLabels,
+  marketContextValueLabel,
+  marketDataSourceLabel,
+  marketDataStatusLabel,
+  marketDecisionLabel,
+  marketReasonCodeLabel,
+} from "../lib/market-dashboard-copy";
+import {
+  buildMarketBlockedReasonDistribution,
+  type MarketBlockedReasonDistributionItem,
+} from "../lib/market-period-detail-graphs";
+import {
+  resolveAvailableMarketTimeframes,
+  resolveEffectiveMarketTimeframe,
+  type MarketTimeframeAvailability,
+} from "../lib/market-timeframes";
+import { MarketRawDataPanel } from "./market-raw-data-panel";
+import { MarketPeriodDetailGraphs } from "./market-period-detail-graphs";
 
 type Row = Record<string, unknown>;
 type AiReviewReadModel = {
@@ -121,7 +150,6 @@ type TimelineStage = {
   kind: "good" | "warn" | "danger" | "neutral";
 };
 type EntryLifecycleTab = "summary" | "plan" | "execution";
-type OrderLifecycleTab = "summary" | "orders" | "executions";
 type InternalCodeBadge = {
   key: string;
   label: string;
@@ -227,18 +255,13 @@ type VolumeProfileBin = {
   volume: number;
   strength: number;
 };
-type MarketChartEventMarker = {
-  timestamp: string;
-  kind: "ai" | "risk" | "execution";
-  label: string;
-  detail: string;
-};
 type MarketChartModel = {
   symbol: string;
   window: CandleWindow;
   timeframe: MarketChartTimeframe;
   sourceTimeframe: string;
   sourceNote: string;
+  featureSourceNote: string;
   snapshotTime: string | null;
   latestPrice: number | null;
   latestVolume: number | null;
@@ -252,6 +275,7 @@ type MarketChartModel = {
   stats: MarketChartStats;
   rangeStats: MarketChartStats;
   rangeLabel: string;
+  blockedReasonDistribution: MarketBlockedReasonDistributionItem[];
   symbolState: OperatorSymbol;
   events: MarketChartEventMarker[];
 };
@@ -307,9 +331,9 @@ const reasonCodeLabelMap: Record<string, string> = {
   EMERGENCY_EXIT: "비상 청산 상태",
   MANUAL_USER_REQUEST: "수동 중지",
   PROTECTIVE_ORDER_FAILURE: "보호 주문 이상",
-  ACCOUNT_STATE_STALE: "계좌 상태 stale",
-  POSITION_STATE_STALE: "포지션 상태 stale",
-  OPEN_ORDERS_STATE_STALE: "오더 상태 stale",
+  ACCOUNT_STATE_STALE: "계좌 정보 오래됨",
+  POSITION_STATE_STALE: "포지션 정보 오래됨",
+  OPEN_ORDERS_STATE_STALE: "열린 주문 정보 오래됨",
   PROTECTION_STATE_UNVERIFIED: "보호 주문 검증 불가",
   DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 판단과 기준선 판단이 달라 즉시 주문을 보류했습니다",
   UNRESOLVED_SUBMISSION_GUARD_ACTIVE: "미해결 주문 제출 가드",
@@ -370,7 +394,7 @@ const riskReasonGroupLabels: Record<RiskReasonGroupKey, string> = {
 };
 
 const riskReasonGroupHints: Record<RiskReasonGroupKey, string> = {
-  freshness: "계좌, 포지션, 오더, 시장 데이터가 stale/incomplete/untrusted 상태인지 확인",
+  freshness: "계좌, 포지션, 주문, 시장 데이터가 오래됨/불완전/신뢰 불가 상태인지 확인",
   exposure: "단일 포지션, 방향 편중, 총 노출, 동일 tier 집중도, 상관 위험 한도",
   approval: "live approval window, live arm/disarm, 실거래 승인 상태",
   protection: "보호 주문 누락, 미검증, stop/take profit 확인 실패",
@@ -488,15 +512,15 @@ function formatDateTime(value: string | null | undefined) {
 
 function translateMarketInputFlag(value: string) {
   const labels: Record<string, string> = {
-    account: "계좌 stale",
-    positions: "포지션 stale",
-    open_orders: "오더 stale",
-    protective_orders: "보호 주문 stale",
-    market_snapshot: "시장 스냅샷 stale",
+    account: "계좌 정보 오래됨",
+    positions: "포지션 정보 오래됨",
+    open_orders: "열린 주문 정보 오래됨",
+    protective_orders: "보호 주문 정보 오래됨",
+    market_snapshot: "시장 스냅샷 오래됨",
     market_snapshot_incomplete: "시장 스냅샷 불완전",
     feature_input_missing: "지표 입력 없음",
   };
-  return labels[value] ?? value;
+  return labels[value] ?? "확인 필요";
 }
 
 function formatMarketTiming(symbol: OperatorDashboardPayload["symbols"][number]) {
@@ -507,7 +531,7 @@ function formatMarketTiming(symbol: OperatorDashboardPayload["symbols"][number])
   if (symbol.market_snapshot_time) {
     parts.push(`수집 ${formatDateTime(symbol.market_snapshot_time)}`);
   }
-  return `${parts.join(" / ") || "기록 없음"} / 시장 ${symbol.timeframe ?? "-"}`;
+  return `${parts.join(" / ") || "기록 없음"} / 봉 기준 ${symbol.timeframe ?? "-"}`;
 }
 
 function formatNumber(value: number | null | undefined, digits = 2) {
@@ -528,40 +552,6 @@ function formatRatio(value: number | null | undefined) {
     minimumFractionDigits: 0,
     maximumFractionDigits: 2,
   })}%`;
-}
-
-function marketDataSourceLabel(source: string | null | undefined) {
-  switch (source) {
-    case "redis":
-      return "Redis shared cache";
-    case "binance_ws_final_kline":
-      return "WebSocket final kline";
-    case "binance_rest":
-      return "REST fallback";
-    case "seed_fallback":
-      return "seed fallback";
-    case "snapshot":
-      return "snapshot";
-    default:
-      return source ?? "unknown";
-  }
-}
-
-function marketDataStatusLabel(status: string | null | undefined) {
-  switch (status) {
-    case "fresh":
-      return "정상";
-    case "stale":
-      return "stale";
-    case "incomplete":
-      return "incomplete";
-    case "rest_fallback":
-      return "REST fallback";
-    case "unavailable":
-      return "unavailable";
-    default:
-      return status ?? "unknown";
-  }
 }
 
 function marketFreshnessDisplay(summary: Record<string, unknown> | null) {
@@ -638,36 +628,36 @@ function marketFreshnessDisplay(summary: Record<string, unknown> | null) {
     sourceLabel: marketDataSourceLabel(activeSnapshotSource),
     sourceHint:
       [
-        source && source !== activeSnapshotSource ? `payload source ${source}` : null,
-        fallbackActive ? "REST fallback operating" : "fallback inactive",
-        fallbackReason ? `reason ${fallbackReason}` : null,
-        staleReason ? `stale ${staleReason}` : null,
+        source && source !== activeSnapshotSource ? `응답 원본 소스 ${marketDataSourceLabel(source)} (원본: ${source})` : null,
+        fallbackActive ? "REST 보조 경로 사용 중" : "보조 경로 미사용",
+        fallbackReason ? `보조 경로 사유 ${marketReasonCodeLabel(fallbackReason)} (원본: ${fallbackReason})` : null,
+        staleReason ? `오래된 이유 ${marketReasonCodeLabel(staleReason)} (원본: ${staleReason})` : null,
       ]
         .filter(Boolean)
-        .join(" / ") || "backend active_snapshot_source 기준",
+        .join(" / ") || "서버 시장 데이터 요약 기준",
     statusLabel: marketDataStatusLabel(status ?? sourceStatus),
     statusHint:
       [
-        snapshotAt ? `snapshot ${formatDateTime(snapshotAt)}` : null,
-        sourceTime ? `source ${formatDateTime(sourceTime)}` : null,
-        receivedAt ? `received ${formatDateTime(receivedAt)}` : null,
-        age !== null ? `${Math.round(age)}s old` : null,
-        staleAfter !== null ? `limit ${Math.round(staleAfter)}s` : null,
+        snapshotAt ? `스냅샷 ${formatDateTime(snapshotAt)}` : null,
+        sourceTime ? `소스 시각 ${formatDateTime(sourceTime)}` : null,
+        receivedAt ? `수신 ${formatDateTime(receivedAt)}` : null,
+        age !== null ? `${Math.round(age)}초 경과` : null,
+        staleAfter !== null ? `오래됨 기준 ${Math.round(staleAfter)}초` : null,
       ]
         .filter(Boolean)
-        .join(" / ") || "backend market_freshness_summary 기준",
+        .join(" / ") || "서버 시장 데이터 상태 요약 기준",
     streamLabel: marketDataStatusLabel(streamStatus),
     streamHint:
       [
-        configuredCacheBackend ? `configured ${configuredCacheBackend}` : null,
-        cacheHealth ? `health ${cacheHealth}` : null,
-        cacheScope ? `scope ${cacheScope}` : null,
-        redisConfigured ? `redis connected ${redisConnected === null ? "unknown" : String(redisConnected)}` : null,
-        redisRequired ? "redis required" : "redis optional",
-        streamReason ? `reason ${streamReason}` : null,
+        configuredCacheBackend ? `설정 캐시 ${marketDataSourceLabel(configuredCacheBackend)} (원본: ${configuredCacheBackend})` : null,
+        cacheHealth ? `캐시 상태 ${marketDataStatusLabel(cacheHealth)} (원본: ${cacheHealth})` : null,
+        cacheScope ? `범위 ${marketContextValueLabel(cacheScope)} (원본: ${cacheScope})` : null,
+        redisConfigured ? `Redis 연결 ${redisConnected === true ? "정상" : redisConnected === false ? "끊김" : "확인 필요"}` : null,
+        redisRequired ? "Redis 필수 사용" : "Redis 선택 사용",
+        streamReason ? `사유 ${marketReasonCodeLabel(streamReason)} (원본: ${streamReason})` : null,
       ]
         .filter(Boolean)
-        .join(" / ") || "pause_reason_detail.market_stream 기준",
+        .join(" / ") || "서버 실시간 스트림 상태 기준",
   };
 }
 
@@ -854,55 +844,78 @@ function marketFeatureForTimeframe(feature: Row | null, timeframe: MarketChartTi
   };
 }
 
-function availableMarketTimeframes(snapshots: Row[], features: Row[]) {
-  const snapshotTimeframes = new Set(snapshots.map((row) => rowString(row, "timeframe")).filter(Boolean));
-  const has15mCandles = snapshots.some((row) => rowString(row, "timeframe") === "15m" && marketSnapshotCandles(row).length > 0);
-  const featureTimeframes = new Set<string>();
-  for (const feature of features) {
-    const direct = rowString(feature, "timeframe");
-    if (direct) {
-      featureTimeframes.add(direct);
-    }
-    const payload = asRecord(feature.payload);
-    const multiTimeframe = asRecord(payload?.multi_timeframe);
-    for (const key of Object.keys(multiTimeframe ?? {})) {
-      featureTimeframes.add(key);
-    }
-  }
-  return new Map(
-    marketChartTimeframeOptions.map((option) => {
-      const directSnapshot = snapshotTimeframes.has(option.value);
-      const enabled = option.value === "15m" ? directSnapshot : has15mCandles && featureTimeframes.has(option.value);
-      const detail = directSnapshot
-        ? "OHLC 직접 수집"
-        : enabled
-          ? "15분 캔들 집계 + 다중 타임프레임 지표"
-          : "현재 데이터 없음";
-      return [option.value, { enabled, detail }] as const;
-    }),
-  );
+function availableMarketTimeframes(snapshots: Row[], features: Row[]): MarketTimeframeAvailability {
+  return resolveAvailableMarketTimeframes(snapshots, features);
 }
 
-function buildMarketChartEventMarkers(symbol: OperatorSymbol): MarketChartEventMarker[] {
+function candleSourceNote(timeframe: MarketChartTimeframe, sourceTimeframe: string, hasDirectChartCandles: boolean) {
+  if (hasDirectChartCandles) {
+    return `Binance Futures ${marketTimeframeLabel(timeframe)} 직접 캔들`;
+  }
+  if (timeframe === sourceTimeframe) {
+    return `${marketTimeframeLabel(timeframe)} 저장 스냅샷 캔들`;
+  }
+  return `${sourceTimeframe} 저장 캔들 집계`;
+}
+
+function featureSourceNote(feature: Row | null, timeframe: MarketChartTimeframe) {
+  if (!feature) {
+    return "지표 없음";
+  }
+  const direct = rowString(feature, "timeframe");
+  if (direct === timeframe) {
+    return `${marketTimeframeLabel(timeframe)} 독립 feature row`;
+  }
+  if (direct === "15m" && timeframe !== "15m") {
+    return `15분 기준 feature 내 ${marketTimeframeLabel(timeframe)} multi_timeframe 컨텍스트`;
+  }
+  return `${direct ?? "unknown"} feature row 기준`;
+}
+
+function buildMarketChartEventMarkers(
+  symbol: OperatorSymbol,
+  chartMarkers: MarketChartEventMarker[] = [],
+): MarketChartEventMarker[] {
   const markers: MarketChartEventMarker[] = [];
+  const rowMarkers = chartMarkers.filter((marker) => marker.symbol.toUpperCase() === symbol.symbol.toUpperCase());
   const aiAt = symbol.ai_decision.last_ai_invoked_at ?? symbol.ai_decision.created_at;
-  if (aiAt) {
+  if (aiAt && isMarketMarkerDecision(symbol.ai_decision.decision)) {
     markers.push({
       timestamp: aiAt,
       kind: "ai",
       label: "AI",
-      detail: `${translateDecision(symbol.ai_decision.decision)} / ${aiReviewTypeLabel(symbol)}`,
+      detail: `${marketDecisionLabel(symbol.ai_decision.decision)} / ${aiReviewTypeLabel(symbol)}`,
+      symbol: symbol.symbol,
+      action: marketDecisionLabel(symbol.ai_decision.decision),
+      price: null,
+      statusLabel: "AI 추천",
+      reasonLabel: null,
+      sourceId: symbol.ai_decision.decision_run_id ? `ai:${symbol.ai_decision.decision_run_id}` : null,
     });
   }
-  if (symbol.risk_guard.allowed === false && symbol.risk_guard.created_at) {
+  if (
+    symbol.risk_guard.allowed !== null &&
+    symbol.risk_guard.created_at &&
+    (isMarketMarkerDecision(symbol.risk_guard.decision) ||
+      symbol.risk_guard.blocked_reason_codes.some((code) => code !== "HOLD_DECISION"))
+  ) {
+    const blocked = symbol.risk_guard.allowed !== true;
     markers.push({
       timestamp: symbol.risk_guard.created_at,
-      kind: "risk",
-      label: "위험",
+      kind: blocked ? "risk_blocked" : "risk_approved",
+      label: blocked ? "차단" : "승인",
       detail:
-        symbol.risk_guard.blocked_reason_codes.length > 0
-          ? formatTranslatedCodeList(symbol.risk_guard.blocked_reason_codes)
-          : "리스크 차단",
+        blocked && symbol.risk_guard.blocked_reason_codes.length > 0
+          ? formatMarketReasonCodeDebugLabels(symbol.risk_guard.blocked_reason_codes)
+          : blocked
+            ? "리스크 차단"
+            : "리스크 승인",
+      symbol: symbol.symbol,
+      action: marketDecisionLabel(symbol.risk_guard.decision),
+      price: null,
+      statusLabel: blocked ? "리스크 차단" : "리스크 승인",
+      reasonLabel: blocked && symbol.risk_guard.blocked_reason_codes.length > 0 ? formatMarketReasonCodeDebugLabels(symbol.risk_guard.blocked_reason_codes) : null,
+      sourceId: symbol.risk_guard.risk_check_id ? `risk:${symbol.risk_guard.risk_check_id}` : null,
     });
   }
   if (symbol.execution.order_id && (symbol.execution.execution_created_at ?? symbol.execution.created_at)) {
@@ -911,9 +924,19 @@ function buildMarketChartEventMarkers(symbol: OperatorSymbol): MarketChartEventM
       kind: "execution",
       label: "주문",
       detail: symbol.execution.execution_status ?? symbol.execution.order_status ?? "주문 기록",
+      symbol: symbol.symbol,
+      action: [symbol.execution.side, symbol.execution.order_type].filter(Boolean).join(" ") || "주문",
+      price: symbol.execution.fill_price ?? symbol.execution.average_fill_price,
+      statusLabel: "실제 실행",
+      reasonLabel: symbol.execution.reason_codes.length > 0 ? formatTranslatedCodeList(symbol.execution.reason_codes) : null,
+      sourceId: symbol.execution.execution_id
+        ? `execution:${symbol.execution.execution_id}`
+        : symbol.execution.order_id
+          ? `order:${symbol.execution.order_id}`
+          : null,
     });
   }
-  return markers.filter((marker) => marker.timestamp.length > 0);
+  return dedupeMarketChartEventMarkers([...rowMarkers, ...markers.filter((marker) => marker.timestamp.length > 0)]);
 }
 
 function buildMarketChartModels(
@@ -924,6 +947,7 @@ function buildMarketChartModels(
   timeframe: MarketChartTimeframe,
   chartCandlesBySymbol: MarketChartCandlesBySymbol = {},
   chartZoomRange: MarketChartZoomRange | null = null,
+  chartMarkers: MarketChartEventMarker[] = [],
 ): MarketChartModel[] {
   return symbols
     .map((symbol): MarketChartModel | null => {
@@ -947,12 +971,14 @@ function buildMarketChartModels(
         marketFeatureForTimeframe(latestFeatureForSnapshot(features, symbol.symbol, snapshot, timeframe), timeframe) ??
         marketFeatureForTimeframe(latestFeatureForSnapshot(features, symbol.symbol, snapshot, "15m"), timeframe);
       const rangeCandles = sourceCandles.slice(-Math.min(60, sourceCandles.length));
+      const candleNote = candleSourceNote(timeframe, sourceTimeframe, hasDirectChartCandles);
       return {
         symbol: symbol.symbol,
         window: candleWindow,
         timeframe,
         sourceTimeframe,
-        sourceNote: hasDirectChartCandles ? "Binance 선물 직접 조회" : timeframe === sourceTimeframe ? "직접 수집" : `${sourceTimeframe} 캔들 집계`,
+        sourceNote: candleNote,
+        featureSourceNote: featureSourceNote(feature, timeframe),
         snapshotTime: rowString(snapshot, "snapshot_time") ?? rowString(snapshot, "created_at"),
         latestPrice: latestCandle?.close ?? rowNumber(snapshot, "latest_price"),
         latestVolume: latestCandle?.volume ?? latestVolume,
@@ -966,8 +992,14 @@ function buildMarketChartModels(
         stats: marketChartStats({ candles, latestVolume }),
         rangeStats: marketChartStats({ candles: rangeCandles, latestVolume }),
         rangeLabel: `최근 ${rangeCandles.length}개 ${sourceTimeframe}`,
+        blockedReasonDistribution: buildMarketBlockedReasonDistribution({
+          symbol: symbol.symbol,
+          candles,
+          markers: chartMarkers,
+          reasonLabeler: marketReasonCodeLabel,
+        }),
         symbolState: symbol,
-        events: buildMarketChartEventMarkers(symbol),
+        events: buildMarketChartEventMarkers(symbol, chartMarkers),
       };
     })
     .filter((item): item is MarketChartModel => item !== null);
@@ -1011,7 +1043,7 @@ function marketVisibleCandleWindowHint(model: MarketChartModel) {
   if (model.baseCandleCount > 0 && model.candles.length < model.baseCandleCount) {
     return `전체 ${model.baseCandleCount}봉 중 ${model.visibleStartIndex + 1}-${model.visibleEndIndex + 1}봉`;
   }
-  return `${model.timeframe} 표시 / ${model.sourceNote}`;
+  return `${marketTimeframeLabel(model.timeframe)} 봉 기준 / ${model.sourceNote}`;
 }
 
 function marketChartStats(model: Pick<MarketChartModel, "candles" | "latestVolume">): MarketChartStats {
@@ -1096,7 +1128,7 @@ function MarketChartStatsStrip({ model }: { model: MarketChartModel }) {
         stats.volumeVsAverage === null ? "-" : `${formatNumber(stats.volumeVsAverage, 2)}배`,
         `평균 ${formatNumber(stats.averageVolume, 2)}`,
       )}
-      {marketIndicatorCell("캔들 수", `${model.candles.length}개`, marketVisibleCandleWindowHint(model))}
+      {marketIndicatorCell("조회 캔들 수", `${model.candles.length}개`, marketVisibleCandleWindowHint(model))}
     </div>
   );
 }
@@ -1318,7 +1350,7 @@ function aiChartDecisionRows(symbol: OperatorSymbol, priceDigits: number) {
   const takeProfit = asFiniteNumber(plan?.take_profit);
   const planStatus = asNonEmptyString(plan?.plan_status);
   const entryMode = asNonEmptyString(plan?.entry_mode);
-  const rows = [`AI 판단: ${translateDecision(side)} / 신뢰도 ${formatRatio(confidence)}`];
+  const rows = [`AI 판단: ${marketDecisionLabel(side)} / 신뢰도 ${formatRatio(confidence)}`];
 
   if (planStatus) {
     rows.push(`계획: ${formatInternalCodeLabel(planStatus)}${entryMode ? ` / ${formatInternalCodeLabel(entryMode)}` : ""}`);
@@ -1402,14 +1434,35 @@ function timestampMs(value: string | null | undefined) {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-function marketEventMarkerTooltipLabel(kind: MarketChartEventMarker["kind"]) {
-  if (kind === "risk") {
-    return "리스크";
+function marketEventMarkerTooltipLabel(kind: MarketChartEventMarkerKind) {
+  if (kind === "risk_approved") {
+    return "리스크 승인";
+  }
+  if (kind === "risk_blocked") {
+    return "리스크 차단";
   }
   if (kind === "execution") {
-    return "주문";
+    return "실제 실행";
   }
-  return "AI 판단";
+  return "AI 추천";
+}
+
+function marketEventMarkerTooltipRows(marker: MarketChartEventMarker, priceDigits: number) {
+  const rows = [
+    `시각: ${formatDateTime(marker.timestamp)}`,
+    `심볼: ${marker.symbol}`,
+    `판단/액션: ${marker.action || marker.detail}`,
+    `가격: ${formatNumber(marker.price, priceDigits)}`,
+    `상태: ${marker.statusLabel || marketEventMarkerTooltipLabel(marker.kind)}`,
+  ];
+  if (marker.reasonLabel) {
+    rows.push(`${marker.kind === "risk_blocked" ? "차단 사유" : "사유"}: ${marker.reasonLabel}`);
+  }
+  return rows;
+}
+
+function clampSvgY(value: number, top: number, bottom: number) {
+  return Math.max(top, Math.min(bottom, value));
 }
 
 function MarketCandlestickSvg({
@@ -1580,7 +1633,8 @@ function MarketCandlestickSvg({
   }[latestTone];
   const markerColors = {
     ai: { fill: "#2563eb", stroke: "#bfdbfe" },
-    risk: { fill: "#e11d48", stroke: "#fecdd3" },
+    risk_approved: { fill: "#d97706", stroke: "#fde68a" },
+    risk_blocked: { fill: "#e11d48", stroke: "#fecdd3" },
     execution: { fill: "#059669", stroke: "#a7f3d0" },
   };
   const candleTimes = candles.map((item) => timestampMs(item.timestamp) ?? 0);
@@ -1608,7 +1662,7 @@ function MarketCandlestickSvg({
   const markerRowsByIndex = new Map<number, string[]>();
   visibleMarkers.forEach((marker) => {
     const rows = markerRowsByIndex.get(marker.index) ?? [];
-    rows.push(`${marketEventMarkerTooltipLabel(marker.kind)}: ${marker.detail}`);
+    rows.push(...marketEventMarkerTooltipRows(marker, priceDigits));
     markerRowsByIndex.set(marker.index, rows);
   });
   const aiRows = aiChartDecisionRows(model.symbolState, priceDigits);
@@ -1623,7 +1677,7 @@ function MarketCandlestickSvg({
     const tooltipX = center + tooltipWidth + 14 > width - right ? center - tooltipWidth - 12 : center + 12;
     const profileRows = profilePointRows(profileBinForPrice(volumeProfile, item.close), volumeProfile, priceDigits);
     const markerRows = markerRowsByIndex.get(index) ?? [];
-    const showAiRows = index === latestIndex || aiMarkerIndexes.has(index) || markerRows.some((row) => row.startsWith("AI 판단:"));
+    const showAiRows = index === latestIndex || aiMarkerIndexes.has(index);
     const tooltipExtras = {
       bollinger: bollingerSeries[index] ?? null,
       profileRows,
@@ -1800,12 +1854,35 @@ function MarketCandlestickSvg({
         {showCloseLine ? <polyline points={closeLine} fill="none" stroke="#2563eb" strokeWidth="1.8" strokeLinejoin="round" /> : null}
         {visibleMarkers.map((marker) => {
           const colors = markerColors[marker.kind];
-          const y = priceTop + 10 + marker.slot * 16;
-          const markerWidth = marker.label.length > 2 ? 30 : 22;
+          const markerPriceY =
+            marker.price !== null
+              ? clampSvgY(yForPrice(marker.price), priceTop + 8, priceTop + priceHeight - 8)
+              : null;
+          const y =
+            markerPriceY === null
+              ? priceTop + 10 + marker.slot * 16
+              : clampSvgY(markerPriceY - 12 - marker.slot * 16, priceTop + 8, priceTop + priceHeight - 8);
+          const markerWidth = marker.label.length > 2 ? 34 : 24;
           return (
-            <g key={`${marker.kind}-${marker.timestamp}-${marker.slot}`}>
-              <title>{`${marker.label}: ${marker.detail} / ${formatDateTime(marker.timestamp)}`}</title>
+            <g
+              key={`${marker.kind}-${marker.timestamp}-${marker.slot}`}
+              data-market-event-marker="true"
+              data-market-event-kind={marker.kind}
+              data-market-event-status={marker.statusLabel}
+            >
+              <title>{marketEventMarkerTooltipRows(marker, priceDigits).join("\n")}</title>
               <line x1={marker.x} x2={marker.x} y1={priceTop} y2={priceTop + priceHeight} stroke={colors.fill} strokeDasharray="2 4" strokeWidth="1" opacity="0.55" />
+              {markerPriceY !== null ? (
+                <circle
+                  cx={marker.x}
+                  cy={markerPriceY}
+                  r="4"
+                  fill={colors.fill}
+                  stroke="#ffffff"
+                  strokeWidth="1.5"
+                  data-market-event-price={marker.price}
+                />
+              ) : null}
               <rect x={marker.x - markerWidth / 2} y={y - 8} width={markerWidth} height="14" rx="5" fill={colors.fill} stroke={colors.stroke} />
               {!compact ? (
                 <text x={marker.x} y={y + 2} textAnchor="middle" className="fill-white text-[8px] font-semibold">
@@ -2054,7 +2131,7 @@ function MarketChartAiSummary({ model }: { model: MarketChartModel }) {
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">AI 판단</p>
           <h4 className="mt-1 text-sm font-semibold text-slate-950">
-            {translateDecision(planSide ?? decision)}
+            {marketDecisionLabel(planSide ?? decision)}
           </h4>
         </div>
         <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${badgeClass(riskOutcome.kind)}`}>
@@ -2085,29 +2162,43 @@ function MarketEntryFlowSummary({ model }: { model: MarketChartModel }) {
     symbol.risk_guard.blocked_reason_codes.length > 0 ? symbol.risk_guard.blocked_reason_codes : symbol.blocked_reasons;
   const effectiveDecision = symbol.risk_guard.decision ?? symbol.ai_decision.decision;
   const isEntryReady = symbol.risk_guard.allowed === true && isEntryDecision(effectiveDecision);
+  const rawRiskReasonCodes = formatMarketRawReasonCodes(riskReasons);
   const rows = [
     {
       label: "시장 조건",
-      value: String(symbol.market_context_summary.primary_regime ?? "-"),
-      detail: `추세 ${String(symbol.market_context_summary.trend_alignment ?? "-")} / 거래량 ${String(
-        symbol.market_context_summary.volume_regime ?? "-",
+      value: marketContextValueLabel(
+        typeof symbol.market_context_summary.primary_regime === "string"
+          ? symbol.market_context_summary.primary_regime
+          : null,
+      ),
+      detail: `추세 ${marketContextValueLabel(
+        typeof symbol.market_context_summary.trend_alignment === "string"
+          ? symbol.market_context_summary.trend_alignment
+          : null,
+      )} / 거래량 ${marketContextValueLabel(
+        typeof symbol.market_context_summary.volume_regime === "string"
+          ? symbol.market_context_summary.volume_regime
+          : null,
       )}`,
       kind: symbol.feature_input_delayed || symbol.stale_flags.length > 0 ? ("warn" as const) : ("neutral" as const),
+      rawCodes: null,
     },
     {
       label: "AI 판단",
-      value: `${translateDecision(symbol.ai_decision.decision)} / ${review.label}`,
+      value: `${marketDecisionLabel(symbol.ai_decision.decision)} / ${review.label}`,
       detail: `${review.detail} / ${currentCycle.label}`,
       kind: symbol.ai_decision.decision === "hold" ? ("neutral" as const) : ("good" as const),
+      rawCodes: null,
     },
     {
       label: "리스크 상태",
       value: riskOutcome.label,
       detail:
         riskReasons.length > 0
-          ? formatTranslatedCodeList(riskReasons)
+          ? formatMarketReasonCodeLabels(riskReasons)
           : riskOutcome.detail,
       kind: riskOutcome.kind,
+      rawCodes: rawRiskReasonCodes,
     },
   ];
 
@@ -2132,6 +2223,9 @@ function MarketEntryFlowSummary({ model }: { model: MarketChartModel }) {
             </div>
             <p className="mt-2 text-sm font-semibold text-slate-950">{row.value}</p>
             <p className="mt-1 text-xs leading-5 text-slate-600">{row.detail}</p>
+            {row.rawCodes ? (
+              <p className="mt-1 text-[11px] leading-5 text-slate-400">{row.rawCodes}</p>
+            ) : null}
           </div>
         ))}
       </div>
@@ -2251,14 +2345,14 @@ function MarketChartSection({
           <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">시장 차트</p>
           <h2 className="mt-2 text-xl font-semibold text-slate-950">{marketTimeframeLabel(selectedTimeframe)} 가격 흐름과 보조 지표</h2>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            최신 시장 스냅샷의 캔들과 지표를 함께 봅니다. 현재 1시간/4시간은 15분 OHLC를 집계하고, 보조 지표는 다중 타임프레임 값을 사용합니다.
+            캔들은 선택한 봉 기준으로 표시하고, 1시간/4시간 지표는 15분 기준 feature 안의 multi_timeframe 컨텍스트를 사용합니다.
           </p>
         </div>
         <div className="flex flex-col items-start gap-3 lg:items-end">
           <span className="w-fit rounded-md bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
             {models.length > 0 ? `${models.length}개 심볼` : "차트 데이터 없음"}
           </span>
-          <div className="flex rounded-md border border-slate-200 bg-slate-50 p-1" aria-label="차트 timeframe">
+          <div className="flex rounded-md border border-slate-200 bg-slate-50 p-1" aria-label="차트 봉 기준">
             {marketChartTimeframeOptions.map((option) => {
               const active = selectedTimeframe === option.value;
               const availability = timeframeAvailability.get(option.value);
@@ -2321,34 +2415,53 @@ function MarketChartSection({
         </div>
       ) : (
         <div className="mt-5 grid gap-4">
-          {models.map((model) => (
-            <article key={model.symbol} className="rounded-lg border border-slate-200 bg-slate-50 p-4 [contain-intrinsic-size:720px] [content-visibility:auto]">
-              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <h3 className="text-base font-semibold text-slate-950">{model.symbol}</h3>
-                  <p className="mt-1 text-xs text-slate-500">
-                    {model.timeframe} / {model.sourceNote} / 스냅샷 {formatDateTime(model.snapshotTime)}
-                  </p>
-                  <MarketChartStatusBadges model={model} />
+          {models.map((model) => {
+            const visibleMarkerCount = countVisibleMarketChartMarkers(model.events, model.candles);
+            const priceDigits = marketPriceDigits(model.latestPrice ?? model.candles[model.candles.length - 1]?.close);
+            return (
+              <article key={model.symbol} className="rounded-lg border border-slate-200 bg-slate-50 p-4 [contain-intrinsic-size:720px] [content-visibility:auto]">
+                <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <h3 className="text-base font-semibold text-slate-950">{model.symbol}</h3>
+                    <p className="mt-1 text-xs text-slate-500" title={`캔들: ${model.sourceNote} / 지표: ${model.featureSourceNote}`}>
+                      봉 기준 {marketTimeframeLabel(model.timeframe)} / 캔들: {model.sourceNote} / 지표: {model.featureSourceNote} / 스냅샷 {formatDateTime(model.snapshotTime)}
+                    </p>
+                    <MarketChartStatusBadges model={model} />
+                  </div>
+                  <div className="text-left sm:text-right">
+                    <p className="text-xs font-medium text-slate-500">현재가</p>
+                    <p className="mt-1 text-lg font-semibold text-slate-950">
+                      {formatNumber(model.latestPrice, priceDigits)}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">현재 봉 {formatDateTime(model.candles[model.candles.length - 1]?.timestamp)}</p>
+                  </div>
                 </div>
-                <div className="text-left sm:text-right">
-                  <p className="text-xs font-medium text-slate-500">현재가</p>
-                  <p className="mt-1 text-lg font-semibold text-slate-950">
-                    {formatNumber(model.latestPrice, marketPriceDigits(model.latestPrice))}
-                  </p>
-                  <p className="mt-1 text-xs text-slate-500">현재 봉 {formatDateTime(model.candles[model.candles.length - 1]?.timestamp)}</p>
+                <MarketChartStatsStrip model={model} />
+                <div className="mt-3 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600" data-market-marker-summary="true">
+                  {visibleMarkerCount > 0 ? (
+                    <span>AI 판단/리스크/실행 위치 {visibleMarkerCount}개 표시</span>
+                  ) : (
+                    <span data-market-marker-empty="true">표시할 AI 판단/리스크/실행 위치가 없습니다</span>
+                  )}
                 </div>
-              </div>
-              <MarketChartStatsStrip model={model} />
-              <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
-                {renderCandlestickChart?.(buildMarketCandlestickClientModel(model))}
-                <div className="space-y-4">
-                  <MarketChartAiSummary model={model} />
-                  <MarketEntryFlowSummary model={model} />
+                <MarketPeriodDetailGraphs
+                  symbol={model.symbol}
+                  timeframeLabel={marketTimeframeLabel(model.timeframe)}
+                  candleWindowLabel={marketVisibleCandleWindowLabel(model)}
+                  candles={model.candles}
+                  priceDigits={priceDigits}
+                  blockedReasonDistribution={model.blockedReasonDistribution}
+                />
+                <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
+                  {renderCandlestickChart?.(buildMarketCandlestickClientModel(model))}
+                  <div className="space-y-4">
+                    <MarketChartAiSummary model={model} />
+                    <MarketEntryFlowSummary model={model} />
+                  </div>
                 </div>
-              </div>
-            </article>
-          ))}
+              </article>
+            );
+          })}
         </div>
       )}
     </section>
@@ -2356,26 +2469,15 @@ function MarketChartSection({
 }
 
 function translateDecision(value: string | null | undefined) {
-  if (value === "long") {
-    return "롱";
-  }
-  if (value === "short") {
-    return "숏";
-  }
-  if (value === "reduce") {
-    return "축소";
-  }
-  if (value === "exit") {
-    return "청산";
-  }
-  if (value === "hold") {
-    return "신규 진입 대기";
-  }
-  return value ?? "-";
+  return marketDecisionLabel(value);
 }
 
 function isEntryDecision(value: string | null | undefined) {
-  return value === "long" || value === "short";
+  return value === "long" || value === "short" || value === "enter_long" || value === "enter_short";
+}
+
+function isMarketMarkerDecision(value: string | null | undefined) {
+  return value === "long" || value === "short" || value === "enter_long" || value === "enter_short" || value === "reduce" || value === "exit";
 }
 
 function translateAiSkipReason(value: string | null | undefined) {
@@ -3069,7 +3171,7 @@ function EntryLifecycleExecutionPanel({ symbol }: { symbol: OperatorSymbol }) {
         </div>
         {pendingPlan.planActive ? (
           <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
-            조건부 진입 대기입니다. 구간 도달 후 AI 재판단과 risk 승인을 다시 통과해야 주문 실행 단계로 넘어갑니다.
+            조건부 진입 대기입니다. 구간 도달 후 AI 재판단과 리스크 승인을 다시 통과해야 주문 실행 단계로 넘어갑니다.
           </div>
         ) : null}
       </div>
@@ -3284,9 +3386,12 @@ function pendingEntryPlanPresentation(symbol: OperatorSymbol) {
 
   const mode = formatInternalCodeLabel(plan.entry_mode);
   if (plan.plan_status === "armed") {
+    const confirmation = entryPlanConfirmationPresentation(asRecord(plan.trigger_details), formatPlanSide(plan.side));
     return {
-      label: "조건부 진입 대기",
-      detail: `AI 판단은 생성되었지만 즉시 주문이 아닙니다. ${mode} 조건 충족 후 risk/execution 재검증이 필요합니다.`,
+      label: confirmation?.label ?? "조건부 진입 대기",
+      detail:
+        confirmation?.detail ??
+        `AI 판단은 생성되었지만 즉시 주문이 아닙니다. ${mode} 조건 충족 후 리스크/실행 재검증이 필요합니다.`,
       kind: "warn" as const,
       planActive: true,
     };
@@ -3699,12 +3804,24 @@ function positionHistoryStatus(group: PositionHistoryGroup) {
   };
 }
 
-function OrderLifecycleTabLinks({ activeTab }: { activeTab: OrderLifecycleTab }) {
+function OrderLifecycleTabLinks({
+  activeTab,
+  selectedSymbol,
+  selectedPositionId,
+}: {
+  activeTab: OrderLifecycleTab;
+  selectedSymbol?: string | null;
+  selectedPositionId?: number | null;
+}) {
   return (
     <div className="flex flex-wrap gap-2">
       {orderLifecycleTabs.map((tab) => {
         const active = tab.key === activeTab;
-        const href = tab.key === "summary" ? "/dashboard/orders" : `/dashboard/orders?tab=${tab.key}`;
+        const href = ordersViewHref({
+          tab: tab.key,
+          symbol: selectedSymbol,
+          positionId: selectedPositionId,
+        });
         return (
           <Link
             key={tab.key}
@@ -3917,6 +4034,37 @@ function formatPlanDistance(currentPrice: number | null, zoneMin: number | null,
   return `대기 구간은 현재가보다 ${signed} ${direction}에 있습니다.`;
 }
 
+function entryPlanConfirmationPresentation(
+  triggerDetails: Record<string, unknown> | null,
+  sideLabel: string,
+) {
+  if (!triggerDetails || rowBoolean(triggerDetails, "confirm_met") !== false) {
+    return null;
+  }
+  const zoneEntered = rowBoolean(triggerDetails, "zone_entered");
+  const qualityScore = asFiniteNumber(triggerDetails.quality_score);
+  const qualityThreshold = asFiniteNumber(triggerDetails.quality_threshold);
+  const reason = rowString(triggerDetails, "reason");
+  const scoreText =
+    qualityScore !== null && qualityThreshold !== null
+      ? `확인 점수 ${formatNumber(qualityScore, 2)} / 기준 ${formatNumber(qualityThreshold, 2)}`
+      : "확인 점수 미충족";
+  const zoneText =
+    zoneEntered === true
+      ? "대기 구간에는 들어왔지만"
+      : zoneEntered === false
+        ? "아직 대기 구간 밖이고"
+        : "구간 도달 여부를 확인 중이고";
+  const reasonText = reason ? ` 원본 사유: ${formatInternalCodeLabel(reason)}.` : "";
+
+  return {
+    label: `${sideLabel} 대기 계획 / 확인 조건 미충족`,
+    detail: `${zoneText} ${scoreText}이라 주문 단계로 넘기지 않았습니다.${reasonText}`,
+    actionTitle: "확인 조건 대기",
+    actionDetail: "구간 도달과 확인 조건이 모두 충족되면 AI 재판단 → 리스크 승인 → 주문 실행 순서로 진행합니다.",
+  };
+}
+
 function emptyEntryPlanDetails() {
   return {
     planId: null as number | null,
@@ -3972,22 +4120,26 @@ function entryPlanDetailsFromRecord(
         ? "진입 플랜 취소됨"
         : `플랜 상태 ${formatInternalCodeLabel(status)}`;
   const canceledReason = rowString(plan, "canceled_reason");
+  const triggerDetails = asRecord(plan?.trigger_details);
+  const confirmation = status === "armed" ? entryPlanConfirmationPresentation(triggerDetails, sideLabel) : null;
   const canceledDetail = canceledReason
     ? `취소 사유: ${formatInternalCodeLabel(canceledReason)}`
     : "이전 진입 플랜이 취소되었습니다.";
   const detail =
     status === "canceled"
       ? canceledDetail
-      : "지정 구간에 도달하면 즉시 주문하지 않고 AI 재판단과 risk 승인을 다시 거칩니다.";
-  const actionTitle = status === "canceled" ? "감시 종료" : "도달 시 재판단";
+      : confirmation?.detail ?? "지정 구간에 도달하면 즉시 주문하지 않고 AI 재판단과 리스크 승인을 다시 거칩니다.";
+  const actionTitle = status === "canceled" ? "감시 종료" : confirmation?.actionTitle ?? "도달 시 재판단";
   const actionDetail =
-    status === "canceled" ? "취소된 플랜은 더 이상 감시하지 않습니다." : "구간 도달 → AI 재판단 → risk 승인 → 승인된 주문만 실행";
+    status === "canceled"
+      ? "취소된 플랜은 더 이상 감시하지 않습니다."
+      : confirmation?.actionDetail ?? "구간 도달 → AI 재판단 → 리스크 승인 → 승인된 주문만 실행";
 
   return {
     planId,
     active: status === "armed" || status === "triggered",
     status,
-    label: statusLabel,
+    label: confirmation?.label ?? statusLabel,
     detail,
     zoneText,
     distanceText: formatPlanDistance(currentPrice ?? null, zoneMin, zoneMax),
@@ -4086,7 +4238,7 @@ function aiSkipReasonCopy(value: string | null | undefined) {
     return {
       label: "AI 검토 생략 없음",
       detail: "이번 row에는 AI 호출 전 생략 사유가 없습니다.",
-      nextStep: "판단 결과와 risk 승인 여부를 확인하세요.",
+      nextStep: "판단 결과와 리스크 승인 여부를 확인하세요.",
     };
   }
   const key = normalized.toLowerCase();
@@ -4203,7 +4355,7 @@ function riskRowStatusPresentation(
     return {
       label: "AI HOLD로 즉시 주문 보류",
       detail: "엔진 기준선은 진입 후보였지만 AI 최종 판단이 HOLD라 바로 주문하지 않았습니다.",
-      nextStep: "대기 플랜이 있으면 구간 도달 후 AI 재판단과 risk 승인을 다시 거칩니다. 최신 플랜 상태를 확인하세요.",
+      nextStep: "대기 플랜이 있으면 구간 도달 후 AI 재판단과 리스크 승인을 다시 거칩니다. 최신 플랜 상태를 확인하세요.",
       kind: "warn" as const,
     };
   }
@@ -4223,6 +4375,22 @@ function riskRowStatusPresentation(
   };
 }
 
+function riskDecisionPresentation(
+  row: RiskCheckRow,
+  plan: ReturnType<typeof activeEntryPlanDetails>,
+) {
+  if (plan.status === "armed" && isEntryDecision(row.decision)) {
+    return {
+      label: `${formatPlanSide(row.decision)} 대기 계획`,
+      hint: "실제 포지션 진입 완료가 아니라 pending entry plan의 방향입니다.",
+    };
+  }
+  return {
+    label: translateDecision(row.decision),
+    hint: "리스크 대상 결정",
+  };
+}
+
 function isAiHoldBaselineDisagreement(row: RiskCheckRow) {
   const decision = row.decision?.trim().toLowerCase();
   return (
@@ -4239,9 +4407,15 @@ function riskNoTradeReason(
 ) {
   const skipReason = riskSkipReason(row);
   if (plan.active) {
+    if (plan.status === "armed" && plan.label.includes("확인 조건 미충족")) {
+      return {
+        label: "확인 조건 미충족으로 주문 대기",
+        hint: plan.detail,
+      };
+    }
     return {
       label: "플랜은 대기 중이며, 구간 도달 전에는 주문하지 않습니다.",
-      hint: "가격이 대기 구간에 도달하면 AI 재판단과 risk 승인을 다시 거칩니다.",
+      hint: "가격이 대기 구간에 도달하면 AI 재판단과 리스크 승인을 다시 거칩니다.",
     };
   }
   if (plan.status === "canceled" || plan.status === "expired") {
@@ -4743,6 +4917,7 @@ export function MarketSignalView({
   selectedTimeframe,
   selectedChartZoomRange,
   chartCandlesBySymbol = {},
+  chartMarkers = [],
   renderAutoRefresh,
   renderCandlestickChart,
 }: {
@@ -4756,6 +4931,7 @@ export function MarketSignalView({
   selectedTimeframe: MarketChartTimeframe;
   selectedChartZoomRange: MarketChartZoomRange | null;
   chartCandlesBySymbol?: MarketChartCandlesBySymbol;
+  chartMarkers?: MarketChartEventMarker[];
   renderAutoRefresh?: MarketAutoRefreshRenderer;
   renderCandlestickChart?: MarketCandlestickRenderer;
 }) {
@@ -4775,10 +4951,17 @@ export function MarketSignalView({
     selectedSymbol === "ALL"
       ? features
       : features.filter((row) => String(row.symbol ?? "").toUpperCase() === selectedSymbol);
-  const chartSourceSnapshots = chartSnapshots ?? filteredSnapshots;
-  const chartSourceFeatures = chartFeatures ?? filteredFeatures;
+  const chartSourceSnapshots = chartSnapshots && chartSnapshots.length > 0 ? chartSnapshots : filteredSnapshots;
+  const chartSourceFeatures = chartFeatures && chartFeatures.length > 0 ? chartFeatures : filteredFeatures;
   const timeframeAvailability = availableMarketTimeframes(chartSourceSnapshots, chartSourceFeatures);
-  const effectiveTimeframe = timeframeAvailability.get(selectedTimeframe)?.enabled ? selectedTimeframe : "15m";
+  const effectiveTimeframe = resolveEffectiveMarketTimeframe(selectedTimeframe, timeframeAvailability);
+  const requestedTimeframeAvailability = timeframeAvailability.get(selectedTimeframe);
+  const timeframeFallbackNotice =
+    selectedTimeframe !== effectiveTimeframe
+      ? `${marketTimeframeLabel(selectedTimeframe)} 요청은 현재 지원 metadata가 없어 ${marketTimeframeLabel(effectiveTimeframe)} 기준으로 표시합니다. ${
+          requestedTimeframeAvailability?.detail ?? "지원 정보 없음"
+        }`
+      : null;
   const marketFreshness = marketFreshnessDisplay(asRecord(operator.control.market_freshness_summary));
   const chartModels =
     selectedSymbol === "ALL"
@@ -4791,19 +4974,8 @@ export function MarketSignalView({
           effectiveTimeframe,
           chartCandlesBySymbol,
           selectedChartZoomRange,
+          chartMarkers,
         );
-  const formatMarketSnapshotRowTitle = (row: Row, index: number) => {
-    const symbol = typeof row.symbol === "string" ? row.symbol : null;
-    const timeframe = typeof row.timeframe === "string" ? row.timeframe : null;
-    if (symbol && timeframe) {
-      return `${symbol} / 시장 ${timeframe}`;
-    }
-    if (symbol) {
-      return symbol;
-    }
-    return `항목 ${index + 1}`;
-  };
-
   return (
     <div className="space-y-6">
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
@@ -4827,9 +4999,15 @@ export function MarketSignalView({
         <div className="mt-4 grid gap-3 lg:grid-cols-3">
           {metricCard("시장 데이터 소스", marketFreshness.sourceLabel, marketFreshness.sourceHint, { compact: true })}
           {metricCard("시장 데이터 상태", marketFreshness.statusLabel, marketFreshness.statusHint, { compact: true })}
-          {metricCard("public market stream", marketFreshness.streamLabel, marketFreshness.streamHint, { compact: true })}
+          {metricCard("실시간 캔들 스트림", marketFreshness.streamLabel, marketFreshness.streamHint, { compact: true })}
         </div>
       </section>
+
+      {timeframeFallbackNotice ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+          {timeframeFallbackNotice}
+        </div>
+      ) : null}
 
       {selectedSymbol === "ALL" ? (
         <MarketSymbolComparisonGrid
@@ -4915,7 +5093,7 @@ export function MarketSignalView({
                   }`}
                 >
                   {featureInputDelayed
-                    ? `시장 스냅샷은 수집됐지만 지표 입력 생성이 ${symbol.feature_input_delay_minutes ?? "-"}분째 지연되고 있습니다. 시장 ${symbol.timeframe ?? "-"} 기준 예상 대기 ${symbol.feature_input_delay_threshold_minutes ?? "-"}분을 넘겼습니다.`
+                    ? `시장 스냅샷은 수집됐지만 지표 입력 생성이 ${symbol.feature_input_delay_minutes ?? "-"}분째 지연되고 있습니다. 봉 기준 ${symbol.timeframe ?? "-"} 예상 대기 ${symbol.feature_input_delay_threshold_minutes ?? "-"}분을 넘겼습니다.`
                     : "시장 스냅샷은 수집됐지만 피처 입력은 아직 생성되지 않았습니다."}
                 </div>
               ) : null}
@@ -4924,24 +5102,7 @@ export function MarketSignalView({
         </div>
       </section>
 
-      <DataTable
-        title="시장 스냅샷"
-        description="최근 가격 입력"
-        rows={filteredSnapshots}
-        emptyStateTitle="표시할 시장 스냅샷이 없습니다."
-        emptyStateDescription="선택한 심볼 기준으로 아직 저장된 시장 스냅샷이 없습니다."
-        hiddenColumns={["candle_count", "candles", "payload"]}
-        rowTitleFormatter={formatMarketSnapshotRowTitle}
-        labelOverrides={{ timeframe: "시장 타임프레임" }}
-      />
-
-      <DataTable
-        title="특성 입력"
-        description="최근 지표 계산 결과"
-        rows={filteredFeatures}
-        emptyStateTitle="표시할 지표 입력이 없습니다."
-        emptyStateDescription="선택한 심볼 기준으로 아직 계산된 지표 스냅샷이 없습니다."
-      />
+      <MarketRawDataPanel selectedSymbol={selectedSymbol} selectedTimeframe={effectiveTimeframe} />
     </div>
   );
 }
@@ -5183,15 +5344,32 @@ export function OrdersView({
   orderRows,
   executionRows,
   activeTab,
+  selectedSymbol = null,
+  selectedPositionId = null,
 }: {
   orderRows: Row[];
   executionRows: Row[];
   activeTab: OrderLifecycleTab;
+  selectedSymbol?: string | null;
+  selectedPositionId?: number | null;
 }) {
-  const groups = buildPositionHistoryGroups(orderRows, executionRows);
+  const normalizedSelectedSymbol = selectedSymbol?.trim().toUpperCase() || null;
+  const allGroups = buildPositionHistoryGroups(orderRows, executionRows);
+  const groups = allGroups.filter((group) => {
+    const matchesPosition = selectedPositionId === null || group.positionId === selectedPositionId;
+    const matchesSymbol = normalizedSelectedSymbol === null || group.symbol.toUpperCase() === normalizedSelectedSymbol;
+    return matchesPosition && matchesSymbol;
+  });
   const activeTabMeta = orderLifecycleTabs.find((tab) => tab.key === activeTab) ?? orderLifecycleTabs[0];
   const orderCount = groups.reduce((total, group) => total + group.orders.length, 0);
   const executionCount = groups.reduce((total, group) => total + group.executions.length, 0);
+  const hasFilter = selectedPositionId !== null || normalizedSelectedSymbol !== null;
+  const filterLabel =
+    selectedPositionId !== null && normalizedSelectedSymbol
+      ? `position #${selectedPositionId} / ${normalizedSelectedSymbol}`
+      : selectedPositionId !== null
+        ? `position #${selectedPositionId}`
+        : normalizedSelectedSymbol ?? null;
 
   return (
     <div className="space-y-6">
@@ -5205,12 +5383,23 @@ export function OrdersView({
               없는 행은 주문 ID 기준으로 별도 묶음에 남깁니다.
             </p>
           </div>
-          <div className="w-fit rounded-md bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
-            묶음 {groups.length}개 / 주문 {orderCount}건 / 체결 {executionCount}건
+          <div className="flex flex-wrap gap-2">
+            {filterLabel ? (
+              <div className="w-fit rounded-md border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                필터 {filterLabel}
+              </div>
+            ) : null}
+            <div className="w-fit rounded-md bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+              묶음 {groups.length}개 / 주문 {orderCount}건 / 체결 {executionCount}건
+            </div>
           </div>
         </div>
         <div className="mt-5">
-          <OrderLifecycleTabLinks activeTab={activeTab} />
+          <OrderLifecycleTabLinks
+            activeTab={activeTab}
+            selectedSymbol={normalizedSelectedSymbol}
+            selectedPositionId={selectedPositionId}
+          />
         </div>
         <p className="mt-3 text-xs leading-5 text-slate-500">{activeTabMeta.description}</p>
       </section>
@@ -5218,14 +5407,24 @@ export function OrdersView({
       {groups.length === 0 ? (
         <section className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
           <p className="font-semibold text-slate-700">표시할 주문/체결 이력이 없습니다.</p>
-          <p className="mt-2 leading-6">저장된 live 주문과 execution row가 아직 없습니다.</p>
+          <p className="mt-2 leading-6">
+            {hasFilter && filterLabel
+              ? `${filterLabel} 조건에 맞는 live 주문과 execution row가 없습니다.`
+              : "저장된 live 주문과 execution row가 아직 없습니다."}
+          </p>
         </section>
       ) : (
         <section className="space-y-4">
           {groups.map((group) => {
             const status = positionHistoryStatus(group);
+            const selectedGroup = selectedPositionId !== null && group.positionId === selectedPositionId;
             return (
-              <article key={group.key} className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
+              <article
+                key={group.key}
+                className={`rounded-lg border p-4 sm:p-5 ${
+                  selectedGroup ? "border-blue-300 bg-blue-50" : "border-slate-200 bg-slate-50"
+                }`}
+              >
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                   <div className="min-w-0">
                     <h3 className="text-base font-semibold text-slate-950">
@@ -5242,6 +5441,18 @@ export function OrdersView({
                     <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-semibold text-slate-700">
                       주문 {group.orders.length} / 체결 {group.executions.length}
                     </span>
+                    {group.positionId !== null ? (
+                      <Link
+                        href={ordersViewHref({ tab: activeTab, positionId: group.positionId })}
+                        className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+                          selectedGroup
+                            ? "border-blue-300 bg-white text-blue-700"
+                            : "border-slate-200 bg-white text-slate-700 hover:border-blue-200 hover:bg-blue-50"
+                        }`}
+                      >
+                        {selectedGroup ? "선택된 position" : "이 position만 보기"}
+                      </Link>
+                    ) : null}
                   </div>
                 </div>
                 <p className="mt-3 text-xs leading-5 text-slate-600">{status.detail}</p>
@@ -5323,6 +5534,12 @@ export function PositionsView({ positionRows }: { positionRows: Row[] }) {
                     <span className={`rounded-md border px-3 py-1 text-xs font-semibold ${badgeClass(protectionTone)}`}>
                       {protectionLabel}
                     </span>
+                    <Link
+                      href={row.id !== null ? ordersViewHref({ positionId: row.id }) : ordersViewHref({ symbol: row.symbol })}
+                      className="rounded-md border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700 hover:border-blue-300 hover:bg-blue-100"
+                    >
+                      주문/체결 추적
+                    </Link>
                   </div>
                 </div>
 
@@ -5387,6 +5604,7 @@ export function RiskView({
   const operatorSymbolsByName = operatorSymbolMap(operator);
   const rows = riskDisplayRows(rawRows, operatorSymbolsByName);
   const collapsedRowCount = Math.max(0, rawRows.length - rows.length);
+  const executionProfile = operator ? buildExecutionRiskProfileSummary(operator.control) : null;
 
   return (
     <div className="space-y-6">
@@ -5398,6 +5616,76 @@ export function RiskView({
           왜 주문이 나가지 않았는지와 다음 판단 조건을 우선 표시합니다.
         </p>
       </section>
+
+      {executionProfile ? (
+        <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+          <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">실행 리스크 프로파일</p>
+              <h2 className="mt-2 text-xl font-semibold text-slate-950">AI 추천과 최종 active profile</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-600">
+                백엔드 operator 응답값 기준입니다. 프론트는 deterministic/AI/final profile을 자체 계산하지 않습니다.
+              </p>
+            </div>
+            <span
+              className={`w-fit rounded-md border px-3 py-1 text-xs font-semibold ${
+                operator?.control.profile_new_entry_blocked ? badgeClass("danger") : badgeClass("neutral")
+              }`}
+            >
+              {executionProfile.newEntryLabel}
+            </span>
+          </div>
+          <div className="grid gap-3 lg:grid-cols-4">
+            {metricCard("deterministic profile", executionProfile.deterministicProfile, "MarketConditionProfile 계산 결과")}
+            {metricCard(
+              "AI recommended profile",
+              executionProfile.aiRecommendedProfile,
+              `${executionProfile.recommendationStatusLabel} / ID ${executionProfile.recommendationId}`,
+            )}
+            {metricCard(
+              "final active profile",
+              executionProfile.finalActiveProfile,
+              executionProfile.shadowFinalProfile !== "-"
+                ? `shadow would select ${executionProfile.shadowFinalProfile}`
+                : executionProfile.selectedReason,
+            )}
+            {metricCard("selection mode", executionProfile.selectionMode, executionProfile.applicationLabel)}
+          </div>
+          <div className="mt-4 grid gap-3 lg:grid-cols-3">
+            {metricCard("AI 적용 여부", executionProfile.applicationLabel, executionProfile.applicationDetail, {
+              compact: true,
+            })}
+            {metricCard("신규 진입", executionProfile.newEntryLabel, executionProfile.newEntryDetail, {
+              compact: true,
+            })}
+            {metricCard(
+              "reduce/exit/emergency_exit",
+              executionProfile.survivalPathLabel,
+              executionProfile.survivalPathDetail,
+              { compact: true },
+            )}
+          </div>
+          <div className="mt-4 grid gap-3 lg:grid-cols-2">
+            {metricCard(
+              "추천 유효기간 / 다음 검토",
+              `${formatDateTime(executionProfile.validUntil)} / ${formatDateTime(executionProfile.nextReviewAt)}`,
+              `confidence ${executionProfile.confidenceLabel}`,
+              { compact: true },
+            )}
+            {metricCard(
+              "무시/완화 차단 사유",
+              [
+                ...executionProfile.ignoredReasonCodes,
+                ...executionProfile.relaxationBlockReasonCodes,
+              ].join(", ") || "-",
+              executionProfile.isProfileSelectorShadow
+                ? "shadow mode: AI 추천은 실제 차단처럼 적용되지 않습니다."
+                : "백엔드 profile selector가 내려준 사유 코드",
+              { compact: true },
+            )}
+          </div>
+        </section>
+      ) : null}
 
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
         <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -5433,11 +5721,12 @@ export function RiskView({
               const matchedSymbol = operatorSymbolsByName.get(row.symbol ?? "") ?? null;
               const plan = riskEntryPlanDetails(row, matchedSymbol);
               const status = riskRowStatusPresentation(row, plan);
+              const riskDecision = riskDecisionPresentation(row, plan);
               const noTradeReason = riskNoTradeReason(row, plan, skipReason ? skipCopy.detail : allowed.hint);
               const aiHoldBaselineDisagreement = isAiHoldBaselineDisagreement(row);
               const internalReasonTitle = aiHoldBaselineDisagreement ? "내부 검증 코드" : "차단 사유";
               const internalReasonHint = aiHoldBaselineDisagreement
-                ? "AI HOLD 상태와 함께 저장된 risk reason code입니다. 실제 주문은 risk 승인 없이는 제출되지 않습니다."
+                ? "AI 관망 상태와 함께 저장된 리스크 원본 코드입니다. 실제 주문은 리스크 승인 없이는 제출되지 않습니다."
                 : internalCodeHint(row.reason_codes);
 
               return (
@@ -5479,7 +5768,7 @@ export function RiskView({
                       noTradeReason.hint,
                       { compact: true },
                     )}
-                    {metricCard("AI 최종 판단", translateDecision(row.decision), "리스크 대상 결정")}
+                    {metricCard("AI 최종 판단", riskDecision.label, riskDecision.hint)}
                     {metricCard("허용 여부", allowed.label, allowed.hint)}
                     {metricCard(
                       "무효화 / 만료",

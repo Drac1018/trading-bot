@@ -70,6 +70,16 @@ class OpenAIProvider:
         }
 
     @staticmethod
+    def _build_system_message(role: str, instructions: str) -> str:
+        schema_contract = (
+            "Return only valid JSON that strictly matches the provided schema. "
+            "Do not wrap JSON in markdown."
+        )
+        if role in {"trading_decision", "market_settings_advisor"} and instructions:
+            return f"{instructions}\n\n{schema_contract}"
+        return schema_contract
+
+    @staticmethod
     def _build_strict_json_schema(response_model: type[BaseModel]) -> dict[str, Any]:
         schema = deepcopy(response_model.model_json_schema())
 
@@ -132,10 +142,7 @@ class OpenAIProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "Return only valid JSON that strictly matches the provided schema. "
-                        "Do not wrap JSON in markdown."
-                    ),
+                    "content": self._build_system_message(role, instructions),
                 },
                 {
                     "role": "user",

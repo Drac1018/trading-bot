@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from trading_mvp.config import get_settings
 from trading_mvp.models import Setting
 from trading_mvp.schemas import ExecutionIntent, MarketSnapshotPayload
 
@@ -15,7 +16,7 @@ MAJOR_ALT_SYMBOLS = {"ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOG
 class ExecutionPlan:
     intent_type: str
     action: str
-    order_type: Literal["MARKET", "LIMIT"]
+    order_type: Literal["MARKET", "LIMIT", "NONE"]
     price: float | None
     time_in_force: str | None
     policy_name: str
@@ -28,6 +29,9 @@ class ExecutionPlan:
     reprice_bps: float
     fallback_order_type: Literal["MARKET", "LIMIT", "NONE"]
     allow_partial_fill: bool
+    required_order_policy: Literal["market_allowed", "limit_only", "limit_only_or_post_only", "block_or_pending"]
+    allow_market_fallback: bool
+    order_policy_reason: str | None
     policy_profile: str
     symbol_risk_tier: Literal["btc", "major_alt", "alt"]
     timeframe_bucket: Literal["fast", "medium", "slow"]
@@ -53,6 +57,9 @@ class ExecutionPlan:
             "reprice_bps": self.reprice_bps,
             "fallback_order_type": self.fallback_order_type,
             "allow_partial_fill": self.allow_partial_fill,
+            "required_order_policy": self.required_order_policy,
+            "allow_market_fallback": self.allow_market_fallback,
+            "order_policy_reason": self.order_policy_reason,
             "policy_profile": self.policy_profile,
             "symbol_risk_tier": self.symbol_risk_tier,
             "timeframe_bucket": self.timeframe_bucket,
@@ -183,7 +190,7 @@ def _passive_policy_params(
 def _build_plan(
     *,
     intent: ExecutionIntent,
-    order_type: Literal["MARKET", "LIMIT"],
+    order_type: Literal["MARKET", "LIMIT", "NONE"],
     price: float | None,
     time_in_force: str | None,
     policy_name: str,
@@ -220,6 +227,9 @@ def _build_plan(
         reprice_bps=reprice_bps,
         fallback_order_type=fallback_order_type,
         allow_partial_fill=allow_partial_fill,
+        required_order_policy=intent.required_order_policy,
+        allow_market_fallback=bool(intent.allow_market_fallback),
+        order_policy_reason=intent.order_policy_reason,
         policy_profile=policy_profile,
         symbol_risk_tier=symbol_risk_tier,
         timeframe_bucket=timeframe_bucket,
@@ -251,6 +261,16 @@ def should_fallback_aggressively(
     return current_volatility_pct >= max(slippage_threshold_pct * 6.0, plan.volatility_pct * volatility_multiplier)
 
 
+def _entry_requires_limit_only(intent: ExecutionIntent) -> bool:
+    return (
+        intent.intent_type == "entry"
+        and (
+            not intent.allow_market_fallback
+            or intent.required_order_policy in {"limit_only", "limit_only_or_post_only"}
+        )
+    )
+
+
 def select_execution_plan(
     intent: ExecutionIntent,
     market_snapshot: MarketSnapshotPayload,
@@ -275,14 +295,15 @@ def select_execution_plan(
     )
 
     if intent.intent_type == "entry":
+        limit_only_required = _entry_requires_limit_only(intent)
         if stale_or_incomplete:
             return _build_plan(
                 intent=intent,
-                order_type="MARKET",
+                order_type="NONE",
                 price=None,
                 time_in_force=None,
-                policy_name="entry_marketable",
-                marketable=True,
+                policy_name="entry_block_or_pending",
+                marketable=False,
                 estimated_slippage_pct=estimated_slippage_pct,
                 volatility_pct=volatility_pct,
                 timeout_seconds=0,
@@ -297,7 +318,7 @@ def select_execution_plan(
                 volatility_regime=volatility_regime,
                 urgency=urgency,
                 fallback_after_partial_fill_ratio=0.0,
-                reason="market_data_not_reliable",
+                reason="market_data_not_reliable_entry_block_or_pending",
             )
         (
             slippage_multiplier,
@@ -312,7 +333,11 @@ def select_execution_plan(
             timeframe_bucket=timeframe_bucket,
             urgency=urgency,
         )
-        if estimated_slippage_pct <= slippage_threshold * slippage_multiplier and volatility_pct <= slippage_threshold * volatility_multiplier:
+        passive_conditions_met = (
+            estimated_slippage_pct <= slippage_threshold * slippage_multiplier
+            and volatility_pct <= slippage_threshold * volatility_multiplier
+        )
+        if passive_conditions_met:
             return _build_plan(
                 intent=intent,
                 order_type="LIMIT",
@@ -326,7 +351,7 @@ def select_execution_plan(
                 poll_interval_seconds=2,
                 max_requotes=max_requotes,
                 reprice_bps=reprice_bps,
-                fallback_order_type="MARKET",
+                fallback_order_type="NONE" if limit_only_required else "MARKET",
                 allow_partial_fill=True,
                 policy_profile=profile,
                 symbol_risk_tier=symbol_risk_tier,
@@ -334,7 +359,31 @@ def select_execution_plan(
                 volatility_regime=volatility_regime,
                 urgency=urgency,
                 fallback_after_partial_fill_ratio=partial_fill_ratio,
-                reason="passive_entry_allowed",
+                reason="passive_entry_limit_only" if limit_only_required else "passive_entry_allowed",
+            )
+        if limit_only_required:
+            return _build_plan(
+                intent=intent,
+                order_type="NONE",
+                price=None,
+                time_in_force=None,
+                policy_name="entry_block_or_pending",
+                marketable=False,
+                estimated_slippage_pct=estimated_slippage_pct,
+                volatility_pct=volatility_pct,
+                timeout_seconds=0,
+                poll_interval_seconds=0,
+                max_requotes=0,
+                reprice_bps=0.0,
+                fallback_order_type="NONE",
+                allow_partial_fill=False,
+                policy_profile=profile,
+                symbol_risk_tier=symbol_risk_tier,
+                timeframe_bucket=timeframe_bucket,
+                volatility_regime=volatility_regime,
+                urgency=urgency,
+                fallback_after_partial_fill_ratio=0.0,
+                reason="entry_limit_only_conditions_not_met",
             )
         return _build_plan(
             intent=intent,
@@ -546,14 +595,28 @@ def select_execution_plan(
 
 
 def summarize_execution_policy(settings_row: Setting) -> dict[str, object]:
+    app_settings = get_settings()
+    use_limit_tp = bool(
+        getattr(
+            settings_row,
+            "use_limit_take_profit_for_tight_tp",
+            getattr(app_settings, "use_limit_take_profit_for_tight_tp", True),
+        )
+    )
+    tight_tp_bps_threshold = float(
+        getattr(settings_row, "tight_tp_bps_threshold", getattr(app_settings, "tight_tp_bps_threshold", 40.0))
+    )
+    tp_limit_post_only = bool(
+        getattr(settings_row, "tp_limit_post_only", getattr(app_settings, "tp_limit_post_only", True))
+    )
     return {
         "slippage_threshold_pct": settings_row.slippage_threshold_pct,
         "entry": {
             "preferred_order_type": "LIMIT",
-            "fallback_order_type": "MARKET",
+            "fallback_order_type": "MARKET unless risk_guard requires limit_only or market data is unreliable",
             "timeout_seconds": 6,
             "max_requotes": 2,
-            "summary": "Entry uses passive LIMIT when market data is reliable and slippage/volatility stay within the tier and timeframe profile. MARKET is used when data is stale or urgency dominates.",
+            "summary": "Entry uses passive LIMIT when market data is reliable and slippage/volatility stay within the tier and timeframe profile. Stale/incomplete data blocks or pends entry, and risk_guard limit-only policies disable MARKET fallback.",
         },
         "scale_in": {
             "preferred_order_type": "LIMIT",
@@ -575,9 +638,12 @@ def summarize_execution_policy(settings_row: Setting) -> dict[str, object]:
             "summary": "Full exit always prioritizes certainty over maker preference.",
         },
         "protection": {
-            "preferred_order_type": "ALGO",
+            "preferred_order_type": "STOP_MARKET for SL; LIMIT/POST_ONLY TP for tight take-profit when enabled",
             "fallback_order_type": "EMERGENCY_EXIT",
-            "summary": "Exchange-resident stop/take-profit orders are required; failed protection recreates or exits.",
+            "use_limit_take_profit_for_tight_tp": use_limit_tp,
+            "tight_tp_bps_threshold": tight_tp_bps_threshold,
+            "tp_limit_post_only": tp_limit_post_only,
+            "summary": "Stop-loss keeps market-style protection. Tight take-profit can use reduce-only LIMIT/GTX to avoid automatic taker execution; failed protection recreates or exits.",
         },
         "profiles": {
             "btc_slow_calm": "Allows the most passive repricing tolerance.",

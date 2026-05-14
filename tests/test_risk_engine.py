@@ -1,22 +1,84 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
-from trading_mvp.models import Execution, Order, PnLSnapshot, Position
+from sqlalchemy import select
+from trading_mvp.enums import AgentRole
+from trading_mvp.models import (
+    AgentRun,
+    AuditEvent,
+    Execution,
+    Order,
+    PnLSnapshot,
+    Position,
+    StrategyCooldownState,
+)
 from trading_mvp.schemas import DerivativesContextPayload, TradeDecision
 from trading_mvp.services.adaptive_signal import ADAPTIVE_SETUP_DISABLE_REASON_CODE
+from trading_mvp.services.cost_model import calculate_expected_trade_cost
 from trading_mvp.services.market_data import build_market_snapshot
+from trading_mvp.services.range_mr_cooldown import (
+    RANGE_MEAN_REVERSION_STRATEGY_ID,
+    RANGE_MR_BREAKOUT_COOLDOWN_REASON_CODE,
+    RANGE_MR_CONSECUTIVE_FAILURES_REASON_CODE,
+    RANGE_MR_COOLDOWN_BLOCK_REASON_CODE,
+    record_range_mr_trade_result,
+)
 from trading_mvp.services.risk import (
+    AI_DECISION_EXPIRED_REASON_CODE,
+    AI_DECISION_PRICE_MOVE_INVALIDATED_REASON_CODE,
+    AI_DECISION_RANGE_BREAK_INVALIDATED_REASON_CODE,
+    AI_DECISION_REGIME_CHANGED_REASON_CODE,
+    AI_DECISION_VOLATILITY_SPIKE_REASON_CODE,
+    CORRELATED_EXPOSURE_LIMIT_REASON_CODE,
+    EXECUTION_RISK_PROFILE_BLOCK_REASON_CODE,
+    PROFILE_RELAXATION_CONSECUTIVE_REASON_CODE,
     evaluate_risk,
     is_survival_path_decision,
+    select_safe_execution_risk_profile,
     validate_decision_schema,
 )
 from trading_mvp.services.runtime_state import mark_sync_issue, mark_sync_success
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
+
+
+def _mock_expected_edge_gate_settings(
+    monkeypatch,
+    *,
+    enabled: bool = True,
+    shadow: bool = False,
+    max_cost_to_edge_ratio: float = 0.50,
+    min_net_expected_edge_bps: float = 15.0,
+    max_same_direction_major_exposure_pct: float = 2.0,
+) -> None:
+    settings = SimpleNamespace(
+        live_trading_env_enabled=True,
+        cost_model_maker_fee_bps=5.0,
+        cost_model_taker_fee_bps=5.0,
+        cost_model_marketable_slippage_bps=3.0,
+        cost_model_passive_slippage_bps=1.0,
+        cost_model_unknown_slippage_bps=2.0,
+        cost_model_recent_sample_limit=20,
+        cost_model_min_required_net_bps=15.0,
+        expected_edge_gate_enabled=enabled,
+        expected_edge_gate_shadow=shadow,
+        max_cost_to_edge_ratio=max_cost_to_edge_ratio,
+        min_net_expected_edge_bps=min_net_expected_edge_bps,
+        max_same_direction_major_exposure_pct=max_same_direction_major_exposure_pct,
+        min_expected_gross_bps_default=40.0,
+        max_fee_to_gross_ratio=0.30,
+        min_confidence_for_entry=0.70,
+        symbol_side_min_expected_gross_bps={
+            "BTCUSDT:long": 40.0,
+            "ETHUSDT:long": 0.0,
+        },
+    )
+    monkeypatch.setattr("trading_mvp.services.risk.get_settings", lambda: settings)
 
 
 def _mark_all_sync_scopes_fresh(settings_row) -> None:
@@ -81,6 +143,258 @@ def _entry_decision(
         explanation_short="entry trigger test",
         explanation_detailed="Deterministic entry trigger regression test.",
     )
+
+
+def _triggerable_decision(snapshot, *, decision: str = "long") -> TradeDecision:
+    price = float(snapshot.latest_price)
+    return _entry_decision(
+        decision=decision,
+        entry_zone_min=price * 0.999,
+        entry_zone_max=price * 1.001,
+        stop_loss=price * 0.99,
+        take_profit=price * 1.02,
+        invalidation_price=price * 0.985,
+        max_chase_bps=100.0,
+        entry_mode="pullback_confirm" if decision in {"long", "short"} else "none",
+    )
+
+
+def _add_ai_decision_run(
+    db_session,
+    decision: TradeDecision,
+    snapshot,
+    *,
+    generated_at=None,
+    ttl_seconds: int = 900,
+    reference_price: float | None = None,
+    regime_id: str = "range:neutral",
+    regime_label: str = "range",
+    volatility_pct: float = 0.01,
+    range_breakout_direction: str = "none",
+) -> AgentRun:
+    generated_at = generated_at or utcnow_naive()
+    valid_until = generated_at + timedelta(seconds=ttl_seconds)
+    reference_price = float(reference_price or snapshot.latest_price)
+    validity = {
+        "status": "valid",
+        "generated_at": generated_at.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "ttl_seconds": ttl_seconds,
+        "symbol": decision.symbol,
+        "timeframe": decision.timeframe,
+        "market_snapshot_id": 1001,
+        "snapshot_hash": "unit-test-snapshot",
+        "snapshot_time": snapshot.snapshot_time.isoformat(),
+        "reference_price": reference_price,
+        "regime_id": regime_id,
+        "regime_label": regime_label,
+        "volatility_pct": volatility_pct,
+        "range_breakout_direction": range_breakout_direction,
+        "price_move_invalidation_pct": 0.004,
+    }
+    row = AgentRun(
+        role=AgentRole.TRADING_DECISION.value,
+        trigger_event="unit_test",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="deterministic-mock",
+        summary="unit test decision",
+        input_payload={
+            "market_snapshot": snapshot.model_dump(mode="json"),
+            "features": {
+                "volatility_pct": volatility_pct,
+                "regime": {"primary_regime": regime_label, "trend_alignment": "neutral"},
+                "breakout": {"range_breakout_direction": range_breakout_direction},
+            },
+        },
+        output_payload=decision.model_dump(mode="json"),
+        metadata_json={
+            "generated_at": generated_at.isoformat(),
+            "ai_decision_validity": validity,
+            "trade_performance_tags": {
+                "strategy_id": "range_mean_reversion_engine",
+                "regime_id": regime_id,
+                "regime_label": regime_label,
+                "entry_confirmation_type": "pullback_confirm",
+                "risk_mode": "normal",
+            },
+        },
+        schema_valid=True,
+        started_at=generated_at,
+        completed_at=generated_at,
+        created_at=generated_at,
+        updated_at=generated_at,
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+def _closed_tp_position(
+    db_session,
+    *,
+    symbol: str = "BTCUSDT",
+    side: str = "long",
+    closed_minutes_ago: float = 10.0,
+    close_order_type: str = "take_profit_market",
+) -> Position:
+    closed_at = utcnow_naive() - timedelta(minutes=closed_minutes_ago)
+    position = Position(
+        symbol=symbol,
+        mode="live",
+        side=side,
+        status="closed",
+        quantity=0.01,
+        entry_price=65000.0,
+        mark_price=66500.0 if side == "long" else 63500.0,
+        leverage=2.0,
+        stop_loss=64000.0 if side == "long" else 66000.0,
+        take_profit=66500.0 if side == "long" else 63500.0,
+        realized_pnl=15.0,
+        unrealized_pnl=0.0,
+        opened_at=closed_at - timedelta(minutes=20),
+        closed_at=closed_at,
+        metadata_json={},
+    )
+    db_session.add(position)
+    db_session.flush()
+
+    entry_order = Order(
+        symbol=symbol,
+        position_id=position.id,
+        side="buy" if side == "long" else "sell",
+        order_type="limit",
+        mode="live",
+        status="filled",
+        requested_quantity=0.01,
+        requested_price=position.entry_price,
+        filled_quantity=0.01,
+        average_fill_price=position.entry_price,
+        reduce_only=False,
+        close_only=False,
+        metadata_json={},
+        created_at=closed_at - timedelta(minutes=20),
+    )
+    close_order = Order(
+        symbol=symbol,
+        position_id=position.id,
+        side="sell" if side == "long" else "buy",
+        order_type=close_order_type,
+        mode="live",
+        status="filled",
+        requested_quantity=0.01,
+        requested_price=position.take_profit,
+        filled_quantity=0.01,
+        average_fill_price=position.take_profit,
+        reduce_only=True,
+        close_only=True,
+        metadata_json={"protective_component": "take_profit"},
+        created_at=closed_at,
+    )
+    db_session.add_all([entry_order, close_order])
+    db_session.flush()
+
+    db_session.add(
+        Execution(
+            order_id=close_order.id,
+            position_id=position.id,
+            symbol=symbol,
+            status="filled",
+            fill_price=position.take_profit,
+            fill_quantity=0.01,
+            fee_paid=0.1,
+            slippage_pct=0.0,
+            realized_pnl=15.0,
+            payload={"exchange_order": {"type": "TAKE_PROFIT_MARKET"}},
+            created_at=closed_at,
+        )
+    )
+    db_session.flush()
+    return position
+
+
+def _range_mr_context(
+    *,
+    direction: str = "long",
+    regime_id: str = "range:range",
+    range_id: str = "BTCUSDT:15m:range:range:range:64000.00-66000.00",
+    strategy_id: str = RANGE_MEAN_REVERSION_STRATEGY_ID,
+    range_breakout_direction: str = "none",
+) -> dict[str, object]:
+    return {
+        "trade_performance_tags": {
+            "strategy_id": strategy_id,
+            "strategy_engine": strategy_id,
+            "regime_id": regime_id,
+            "regime_label": "range",
+            "range_id": range_id,
+            "range_low": 64000.0,
+            "range_high": 66000.0,
+            "range_width_pct": 3.0,
+            "entry_confirmation_type": "range_edge_confirm",
+            "risk_mode": "normal",
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": direction,
+        },
+        "current_market_state": {
+            "regime_id": regime_id,
+            "regime_label": "range",
+            "range_id": range_id,
+            "range_low": 64000.0,
+            "range_high": 66000.0,
+            "range_width_pct": 3.0,
+            "range_breakout_direction": range_breakout_direction,
+        },
+        "expected_cost_gate": {
+            "expected_gross_bps": 80.0,
+            "round_trip_fee_bps": 6.0,
+            "expected_slippage_bps": 1.0,
+            "spread_cost_bps": 0.0,
+            "entry_execution_type": "entry_passive_limit",
+        },
+    }
+
+
+def _closed_range_mr_position(
+    db_session,
+    *,
+    side: str = "long",
+    closed_minutes_ago: float = 10.0,
+    net_r_multiple: float = -0.4,
+    net_realized_pnl: float = -4.0,
+    range_id: str = "BTCUSDT:15m:range:range:range:64000.00-66000.00",
+) -> Position:
+    closed_at = utcnow_naive() - timedelta(minutes=closed_minutes_ago)
+    tags = _range_mr_context(direction=side, range_id=range_id)["trade_performance_tags"]
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side=side,
+        status="closed",
+        quantity=0.01,
+        entry_price=65000.0,
+        mark_price=64600.0 if side == "long" else 65400.0,
+        leverage=2.0,
+        stop_loss=64000.0 if side == "long" else 66000.0,
+        take_profit=66500.0 if side == "long" else 63500.0,
+        realized_pnl=net_realized_pnl,
+        unrealized_pnl=0.0,
+        opened_at=closed_at - timedelta(minutes=20),
+        closed_at=closed_at,
+        metadata_json={
+            "trade_performance_tags": tags,
+            "closed_position_pnl": {
+                "net_r_multiple": net_r_multiple,
+                "net_realized_pnl": net_realized_pnl,
+                "source": "unit_test",
+            },
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    record_range_mr_trade_result(db_session, position)
+    return position
 
 
 def test_survival_path_predicate_accepts_reduce_only_management_action() -> None:
@@ -513,7 +827,8 @@ def test_reduce_is_allowed_while_trading_is_paused(db_session) -> None:
 
 
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_expected_cost_gate_blocks_entry_when_cost_exceeds_edge(db_session, side: str) -> None:
+def test_expected_cost_gate_blocks_entry_when_cost_exceeds_edge(monkeypatch, db_session, side: str) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
     settings_row = get_or_create_settings(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
@@ -548,7 +863,152 @@ def test_expected_cost_gate_blocks_entry_when_cost_exceeds_edge(db_session, side
     assert row.payload["debug_payload"]["expected_cost_gate"]["reason_codes"] == expected_cost_gate["reason_codes"]
 
 
-def test_expected_cost_gate_blocks_entry_when_edge_is_unavailable(db_session) -> None:
+def test_expected_cost_gate_blocks_entry_when_edge_margin_is_too_thin(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.02,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_edge_bps": 20.0,
+                "expected_slippage_bps": 1.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert "EXPECTED_EDGE_MARGIN_TOO_THIN" in result.reason_codes
+    expected_cost_gate = result.debug_payload["expected_cost_gate"]
+    assert expected_cost_gate["status"] == "blocked"
+    assert expected_cost_gate["expected_cost_bps"] < expected_cost_gate["expected_edge_bps"]
+    assert expected_cost_gate["edge_cost_margin_bps"] < 15.0
+    assert expected_cost_gate["thresholds"]["minimum_edge_margin_bps"] == pytest.approx(15.0)
+
+
+def test_planned_risk_reward_gate_blocks_low_reward_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.01,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_edge_bps": 200.0,
+                "expected_slippage_bps": 1.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert "PLANNED_RISK_REWARD_TOO_LOW" in result.reason_codes
+    planned_gate = result.debug_payload["planned_risk_reward_gate"]
+    assert planned_gate["status"] == "blocked"
+    assert planned_gate["planned_risk_reward_ratio"] < 1.25
+
+
+def test_recent_symbol_performance_gate_blocks_negative_symbol_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    for index in range(4):
+        order = Order(
+            symbol="BTCUSDT",
+            side="long",
+            order_type="market",
+            mode="live",
+            status="filled",
+            requested_quantity=0.01,
+            requested_price=entry_price,
+            filled_quantity=0.01,
+            average_fill_price=entry_price,
+            reason_codes=[],
+            metadata_json={"entry_execution_type": "entry_marketable"},
+        )
+        db_session.add(order)
+        db_session.flush()
+        db_session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                fill_price=entry_price,
+                fill_quantity=0.01,
+                fee_paid=0.2,
+                slippage_pct=0.0,
+                realized_pnl=-0.1 * (index + 1),
+                payload={"signed_slippage_bps": 0.0},
+            )
+        )
+    db_session.flush()
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.03,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_edge_bps": 200.0,
+                "expected_slippage_bps": 1.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert "SYMBOL_RECENT_PERFORMANCE_NEGATIVE" in result.reason_codes
+    performance_gate = result.debug_payload["symbol_recent_performance_gate"]
+    assert performance_gate["status"] == "blocked"
+    assert performance_gate["execution_count"] == 4
+    assert performance_gate["net_pnl_after_fees"] < 0
+
+
+def test_expected_cost_gate_blocks_entry_when_edge_is_unavailable(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
     settings_row = get_or_create_settings(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
@@ -576,7 +1036,8 @@ def test_expected_cost_gate_blocks_entry_when_edge_is_unavailable(db_session) ->
     assert result.debug_payload["expected_cost_gate"]["expected_edge_source"] == "missing_target_or_entry"
 
 
-def test_expected_cost_gate_uses_recent_adverse_signed_slippage(db_session) -> None:
+def test_expected_cost_gate_uses_recent_adverse_signed_slippage(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
     settings_row = get_or_create_settings(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
@@ -635,7 +1096,8 @@ def test_expected_cost_gate_uses_recent_adverse_signed_slippage(db_session) -> N
     assert components["recent_slippage_sample_count"] == 1
 
 
-def test_expected_cost_gate_blocks_large_funding_headwind(db_session) -> None:
+def test_expected_cost_gate_blocks_large_funding_headwind(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
     settings_row = get_or_create_settings(db_session)
     settings_row.rollout_mode = "paper"
     settings_row.live_trading_enabled = False
@@ -699,7 +1161,930 @@ def test_expected_cost_gate_does_not_block_survival_paths(db_session, decision_n
     assert result.allowed is True
     assert "EXPECTED_COST_EXCEEDS_EDGE" not in result.reason_codes
     assert "EXPECTED_COST_UNAVAILABLE" not in result.reason_codes
+    assert "missing_expected_profitability_inputs" not in result.reason_codes
+    assert "expected_net_bps_too_low" not in result.reason_codes
     assert result.debug_payload["expected_cost_gate"]["applied"] is False
+
+
+def test_expected_edge_gate_shadow_records_would_block_without_blocking(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.02,
+        max_chase_bps=20.0,
+    )
+
+    result, risk_row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 20.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is True
+    assert "EXPECTED_EDGE_MIN_NET_NOT_MET" not in result.reason_codes
+    assert gate["mode"] == "shadow"
+    assert gate["would_block"] is True
+    assert "EXPECTED_EDGE_MIN_NET_NOT_MET" in gate["would_block_reason_codes"]
+    audit_event = db_session.query(AuditEvent).filter_by(event_type="risk_expected_edge_gate").one()
+    assert audit_event.entity_id == str(risk_row.id)
+    assert audit_event.payload["would_block"] is True
+    assert audit_event.payload["enforced_reason_codes"] == []
+
+
+def test_expected_edge_gate_blocking_enforces_thresholds_and_audits(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.02,
+        max_chase_bps=20.0,
+    )
+
+    result, risk_row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 20.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is False
+    assert "EXPECTED_EDGE_MIN_NET_NOT_MET" in result.reason_codes
+    assert "EXPECTED_EDGE_COST_RATIO_TOO_HIGH" in result.reason_codes
+    assert gate["mode"] == "blocking"
+    assert gate["net_expected_edge_bps"] == pytest.approx(9.0)
+    assert gate["cost_to_edge_ratio"] == pytest.approx(0.55)
+    audit_event = db_session.query(AuditEvent).filter_by(event_type="risk_expected_edge_gate").one()
+    assert audit_event.entity_id == str(risk_row.id)
+    assert audit_event.payload["would_block"] is True
+    assert "EXPECTED_EDGE_MIN_NET_NOT_MET" in audit_event.payload["enforced_reason_codes"]
+
+
+def test_expected_edge_gate_pass_records_cost_metrics(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.02,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 200.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    audit_event = db_session.query(AuditEvent).filter_by(event_type="risk_expected_edge_gate").one()
+    assert result.allowed is True
+    assert gate["would_block"] is False
+    assert gate["expected_profit_bps"] == pytest.approx(200.0)
+    assert gate["expected_loss_bps"] == pytest.approx(100.0)
+    assert gate["expected_fee_bps"] == pytest.approx(10.0)
+    assert gate["expected_total_cost_bps"] == pytest.approx(11.0)
+    assert gate["net_expected_edge_bps"] == pytest.approx(189.0)
+    assert gate["rr_after_estimated_cost"] == pytest.approx(1.89)
+    assert audit_event.payload["would_block"] is False
+
+
+def test_expected_edge_gate_blocking_does_not_apply_to_reduce_path(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["POSITION_MANAGEMENT_TEST"],
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 1.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 5.0,
+            }
+        },
+    )
+
+    assert result.allowed is True
+    assert result.debug_payload["expected_cost_gate"]["applied"] is False
+    assert db_session.query(AuditEvent).filter_by(event_type="risk_expected_edge_gate").count() == 0
+
+
+def test_expected_profitability_gate_blocks_btc_long_tight_tp_with_high_fee_ratio(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.999,
+        take_profit=entry_price * 1.003375,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 33.75,
+                "round_trip_fee_bps": 31.05,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+                "allow_market_fallback": False,
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is False
+    assert "fee_to_gross_ratio_too_high" in result.reason_codes
+    assert "expected_gross_bps_too_tight" in result.reason_codes
+    assert "btc_long_tp_too_tight" in result.reason_codes
+    assert gate["expected_gross_bps"] == pytest.approx(33.75)
+    assert gate["fee_to_gross_ratio"] == pytest.approx(0.92)
+    assert gate["expected_net_bps"] == pytest.approx(1.7)
+
+
+def test_expected_profitability_gate_does_not_blanket_block_eth_long_35bps(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.999,
+        take_profit=entry_price * 1.0035,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 35.0,
+                "round_trip_fee_bps": 6.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+                "allow_market_fallback": False,
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is True
+    assert "expected_gross_bps_too_tight" not in result.reason_codes
+    assert "btc_long_tp_too_tight" not in result.reason_codes
+    assert gate["expected_gross_bps"] == pytest.approx(35.0)
+    assert gate["expected_net_bps"] == pytest.approx(28.0)
+    assert gate["thresholds"]["effective_min_expected_gross_bps"] == pytest.approx(0.0)
+
+
+def test_expected_profitability_gate_uses_shared_cost_model_values(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.999,
+        take_profit=entry_price * 1.0035,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 35.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 3.0,
+                "spread_cost_bps": 2.0,
+                "entry_execution_type": "entry_passive_limit",
+                "allow_market_fallback": False,
+            }
+        },
+    )
+
+    shared = calculate_expected_trade_cost(
+        entry_execution_type="entry_passive_limit",
+        expected_gross_bps=35.0,
+        explicit_round_trip_fee_bps=10.0,
+        explicit_slippage_bps=3.0,
+        spread_cost_bps=2.0,
+    )
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is True
+    assert gate["round_trip_fee_bps"] == pytest.approx(shared.round_trip_fee_bps)
+    assert gate["expected_slippage_bps"] == pytest.approx(shared.expected_slippage_bps)
+    assert gate["spread_cost_bps"] == pytest.approx(shared.spread_cost_bps)
+    assert gate["expected_net_bps"] == pytest.approx(shared.expected_net_bps)
+    assert gate["fee_to_gross_ratio"] == pytest.approx(shared.fee_to_gross_ratio)
+
+
+def test_expected_profitability_gate_blocks_non_positive_net_bps(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.999,
+        take_profit=entry_price * 1.0035,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 35.0,
+                "round_trip_fee_bps": 28.0,
+                "expected_slippage_bps": 7.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+                "allow_market_fallback": False,
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert "expected_net_bps_too_low" in result.reason_codes
+    assert result.debug_payload["expected_cost_gate"]["expected_net_bps"] == pytest.approx(0.0)
+
+
+def test_expected_profitability_gate_blocks_high_fee_to_gross_ratio(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.999,
+        take_profit=entry_price * 1.0035,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 35.0,
+                "round_trip_fee_bps": 11.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+                "allow_market_fallback": False,
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert "fee_to_gross_ratio_too_high" in result.reason_codes
+    assert result.debug_payload["expected_cost_gate"]["fee_to_gross_ratio"] > 0.30
+
+
+def test_expected_profitability_gate_blocks_market_fallback_for_tight_tp(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="immediate",
+        stop_loss=entry_price * 0.999,
+        take_profit=entry_price * 1.0035,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 35.0,
+                "round_trip_fee_bps": 6.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_marketable",
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is False
+    assert "market_fallback_not_allowed_for_tight_tp" in result.reason_codes
+    assert gate["required_order_policy"] == "limit_only_or_post_only"
+    assert gate["market_fallback_allowed"] is False
+
+
+def test_same_symbol_side_tp_cooldown_blocks_fast_reentry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_tp_position(db_session, symbol="BTCUSDT", side="long", closed_minutes_ago=10)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.0046,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 46.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 16.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    gate = result.debug_payload["recent_tp_reentry_gate"]
+    assert result.allowed is False
+    assert "same_symbol_side_tp_cooldown" in result.reason_codes
+    assert "recent_tp_reentry_edge_not_enough" in result.reason_codes
+    assert gate["status"] == "blocked"
+    assert gate["required_net_bps"] == pytest.approx(25.0)
+    assert result.debug_payload["expected_cost_gate"]["required_order_policy"] == "block_or_pending"
+    assert result.debug_payload["expected_cost_gate"]["allow_market_fallback"] is False
+
+
+def test_same_symbol_side_tp_cooldown_allows_after_window(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_tp_position(db_session, symbol="BTCUSDT", side="long", closed_minutes_ago=31)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.0046,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 46.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 16.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    assert result.allowed is True
+    assert "same_symbol_side_tp_cooldown" not in result.reason_codes
+    assert result.debug_payload["recent_tp_reentry_gate"]["status"] == "clear"
+
+
+def test_same_symbol_side_tp_cooldown_allows_only_when_net_edge_exceeds_uplift(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_tp_position(db_session, symbol="BTCUSDT", side="long", closed_minutes_ago=10)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.006,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 60.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 1.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    gate = result.debug_payload["recent_tp_reentry_gate"]
+    assert result.allowed is True
+    assert gate["status"] == "limited_pass"
+    assert gate["expected_net_bps"] == pytest.approx(49.0)
+    assert result.debug_payload["expected_cost_gate"]["required_order_policy"] == "limit_only_or_post_only"
+    assert result.debug_payload["expected_cost_gate"]["allow_market_fallback"] is False
+    assert "recent_tp_reentry_requires_limit_only" in result.adjustment_reason_codes
+
+
+def test_same_symbol_side_tp_cooldown_does_not_block_opposite_side_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_tp_position(db_session, symbol="BTCUSDT", side="long", closed_minutes_ago=10)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="short",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 1.003,
+        take_profit=entry_price * 0.9954,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 46.0,
+                "round_trip_fee_bps": 10.0,
+                "expected_slippage_bps": 16.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    assert result.allowed is True
+    assert "same_symbol_side_tp_cooldown" not in result.reason_codes
+    assert result.debug_payload["recent_tp_reentry_gate"]["status"] == "clear"
+
+
+def test_same_symbol_side_tp_cooldown_does_not_block_reduce_only_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_tp_position(db_session, symbol="BTCUSDT", side="long", closed_minutes_ago=10)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["POSITION_MANAGEMENT_TEST"],
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is True
+    assert "same_symbol_side_tp_cooldown" not in result.reason_codes
+    assert result.debug_payload["recent_tp_reentry_gate"]["applied"] is False
+
+
+def test_range_mean_reversion_cooldown_blocks_after_consecutive_long_losses(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_range_mr_position(db_session, side="long", closed_minutes_ago=20, net_r_multiple=-0.5)
+    _closed_range_mr_position(db_session, side="long", closed_minutes_ago=5, net_r_multiple=-0.3)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.008,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_range_mr_context(direction="long"),
+    )
+
+    gate = result.debug_payload["range_mr_cooldown_gate"]
+    assert result.allowed is False
+    assert RANGE_MR_COOLDOWN_BLOCK_REASON_CODE in result.reason_codes
+    assert RANGE_MR_CONSECUTIVE_FAILURES_REASON_CODE in result.reason_codes
+    assert gate["status"] == "blocked"
+    assert gate["consecutive_failures"] == 2
+    assert db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "range_mean_reversion_cooldown_blocked")
+    )
+
+
+def test_range_mean_reversion_cooldown_does_not_block_short_or_trend_candidate(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_range_mr_position(db_session, side="long", closed_minutes_ago=20, net_r_multiple=-0.5)
+    _closed_range_mr_position(db_session, side="long", closed_minutes_ago=5, net_r_multiple=-0.3)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    short_decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="short",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 1.003,
+        take_profit=entry_price * 0.992,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+    trend_decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.008,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    short_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        short_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_range_mr_context(direction="short"),
+    )
+    trend_result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        trend_decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_range_mr_context(direction="long", strategy_id="trend_pullback_engine"),
+    )
+
+    assert RANGE_MR_COOLDOWN_BLOCK_REASON_CODE not in short_result.reason_codes
+    assert short_result.debug_payload["range_mr_cooldown_gate"]["status"] == "clear"
+    assert RANGE_MR_COOLDOWN_BLOCK_REASON_CODE not in trend_result.reason_codes
+    assert trend_result.debug_payload["range_mr_cooldown_gate"]["status"] == "not_applicable"
+
+
+def test_range_mean_reversion_cooldown_allows_after_elapsed_window(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    db_session.add(
+        StrategyCooldownState(
+            strategy_id=RANGE_MEAN_REVERSION_STRATEGY_ID,
+            symbol="BTCUSDT",
+            direction="long",
+            regime_id="range:range",
+            range_id="BTCUSDT:15m:range:range:range:64000.00-66000.00",
+            consecutive_failures=2,
+            cooldown_until=utcnow_naive() - timedelta(minutes=1),
+            cooldown_reason=RANGE_MR_CONSECUTIVE_FAILURES_REASON_CODE,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.008,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_range_mr_context(direction="long"),
+    )
+
+    assert result.allowed is True
+    assert RANGE_MR_COOLDOWN_BLOCK_REASON_CODE not in result.reason_codes
+    assert result.debug_payload["range_mr_cooldown_gate"]["status"] == "clear"
+    assert db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "range_mean_reversion_cooldown_released")
+    )
+
+
+def test_range_mean_reversion_breakout_enters_cooldown_and_blocks_lower_long(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.997,
+        take_profit=entry_price * 1.008,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_range_mr_context(direction="long", range_breakout_direction="down"),
+    )
+
+    assert result.allowed is False
+    assert RANGE_MR_COOLDOWN_BLOCK_REASON_CODE in result.reason_codes
+    assert RANGE_MR_BREAKOUT_COOLDOWN_REASON_CODE in result.reason_codes
+    assert result.debug_payload["range_mr_cooldown_gate"]["range_breakout_direction"] == "down"
+    assert db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "range_mean_reversion_cooldown_entered")
+    )
+
+
+def test_range_mean_reversion_cooldown_does_not_block_reduce_only_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    _closed_range_mr_position(db_session, side="long", closed_minutes_ago=20, net_r_multiple=-0.5)
+    _closed_range_mr_position(db_session, side="long", closed_minutes_ago=5, net_r_multiple=-0.3)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="reduce",
+        entry_mode="none",
+        max_chase_bps=None,
+        rationale_codes=["POSITION_MANAGEMENT_TEST"],
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context=_range_mr_context(direction="long"),
+    )
+
+    assert result.allowed is True
+    assert RANGE_MR_COOLDOWN_BLOCK_REASON_CODE not in result.reason_codes
+    assert result.debug_payload["range_mr_cooldown_gate"]["applied"] is False
+
+
+def test_expected_profitability_gate_blocks_missing_expected_gross_inputs(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="BTCUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.999,
+        take_profit=None,  # type: ignore[arg-type]
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.82})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "missing_expected_profitability_inputs" in result.reason_codes
+
+
+def test_expected_profitability_gate_blocks_low_confidence_entry(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(monkeypatch)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="long",
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        entry_mode="pullback_confirm",
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.02,
+        max_chase_bps=20.0,
+    ).model_copy(update={"confidence": 0.69})
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 200.0,
+                "round_trip_fee_bps": 6.0,
+                "expected_slippage_bps": 1.0,
+                "entry_execution_type": "entry_passive_limit",
+                "allow_market_fallback": False,
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert "confidence_below_min_entry_threshold" in result.reason_codes
 
 
 def test_macro_event_result_conflict_blocks_only_new_entries(db_session) -> None:
@@ -1038,6 +2423,158 @@ def test_risk_blocks_same_tier_concentration_limit_for_new_entry(db_session) -> 
     assert "SAME_TIER_CONCENTRATION_LIMIT_REACHED" in result.reason_codes
 
 
+def test_portfolio_gate_blocks_eth_long_when_btc_long_major_limit_exceeded(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(
+        monkeypatch,
+        enabled=False,
+        shadow=True,
+        max_same_direction_major_exposure_pct=0.75,
+    )
+    settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=1.0,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    price = float(snapshot.latest_price)
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        entry_zone_min=price * 0.999,
+        entry_zone_max=price * 1.001,
+        stop_loss=price * 0.97,
+        take_profit=price * 1.05,
+        invalidation_price=price * 0.965,
+        max_chase_bps=100.0,
+    )
+
+    result, row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert CORRELATED_EXPOSURE_LIMIT_REASON_CODE in result.reason_codes
+    gate = result.debug_payload["portfolio_exposure_gate"]
+    assert gate["combined_BTC_ETH_directional_exposure_pct"] > gate["limits"]["max_same_direction_major_exposure_pct"]
+    event = db_session.query(AuditEvent).filter_by(event_type="correlated_exposure_blocked").one()
+    assert event.entity_id == str(row.id)
+    assert event.payload["reason_code"] == CORRELATED_EXPOSURE_LIMIT_REASON_CODE
+    assert event.payload["combined_BTC_ETH_directional_exposure_pct"] == gate["combined_BTC_ETH_directional_exposure_pct"]
+
+
+def test_portfolio_gate_handles_eth_short_as_directional_bias_not_same_direction(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(
+        monkeypatch,
+        enabled=False,
+        shadow=True,
+        max_same_direction_major_exposure_pct=2.0,
+    )
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_directional_bias_pct = 0.000001
+    _seed_account_equity(db_session)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=1.0,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    price = float(snapshot.latest_price)
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        decision="short",
+        entry_zone_min=price * 0.999,
+        entry_zone_max=price * 1.001,
+        stop_loss=price * 1.03,
+        take_profit=price * 0.95,
+        invalidation_price=price * 1.035,
+        max_chase_bps=100.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is False
+    assert "DIRECTIONAL_BIAS_LIMIT_REACHED" in result.reason_codes
+    assert CORRELATED_EXPOSURE_LIMIT_REASON_CODE not in result.reason_codes
+    gate = result.debug_payload["portfolio_exposure_gate"]
+    assert gate["candidate_direction"] == "short"
+    assert gate["combined_BTC_ETH_directional_exposure_pct"] < gate["limits"]["max_same_direction_major_exposure_pct"]
+    assert db_session.query(AuditEvent).filter_by(event_type="directional_bias_blocked").one()
+    assert db_session.query(AuditEvent).filter_by(event_type="correlated_exposure_blocked").count() == 0
+
+
+def test_portfolio_gate_audits_candidate_exposure_when_no_positions(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(
+        monkeypatch,
+        enabled=False,
+        shadow=True,
+        max_same_direction_major_exposure_pct=2.0,
+    )
+    settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("ETHUSDT", "15m", upto_index=140)
+    price = float(snapshot.latest_price)
+    decision = _entry_decision(
+        symbol="ETHUSDT",
+        entry_zone_min=price * 0.999,
+        entry_zone_max=price * 1.001,
+        stop_loss=price * 0.97,
+        take_profit=price * 1.05,
+        invalidation_price=price * 0.965,
+        max_chase_bps=100.0,
+    )
+
+    result, row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is True
+    gate = result.debug_payload["portfolio_exposure_gate"]
+    assert gate["current_notional_exposure"] == 0.0
+    assert gate["candidate_notional_exposure"] > 0.0
+    assert gate["total_notional_exposure"] == pytest.approx(gate["candidate_notional_exposure"])
+    event = db_session.query(AuditEvent).filter_by(event_type="portfolio_exposure_evaluated").one()
+    assert event.entity_id == str(row.id)
+    assert event.payload["current_notional_exposure"] == 0.0
+    assert event.payload["candidate_notional_exposure"] == gate["candidate_notional_exposure"]
+
+
 def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_limit(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     _seed_account_equity(db_session)
@@ -1058,7 +2595,7 @@ def test_entry_is_auto_resized_when_raw_size_slightly_exceeds_single_position_li
         entry_zone_min=entry_price - 25.0,
         entry_zone_max=entry_price + 25.0,
         stop_loss=entry_price - 10.0,
-        take_profit=entry_price + 250.0,
+        take_profit=entry_price + 400.0,
         max_chase_bps=20.0,
     ).model_copy(
         update={
@@ -1097,7 +2634,7 @@ def test_fractional_approved_leverage_sizes_against_integer_exchange_leverage(db
         entry_zone_min=entry_price,
         entry_zone_max=entry_price,
         stop_loss=entry_price - 7.63,
-        take_profit=entry_price + 8.12,
+        take_profit=entry_price + 20.0,
         max_chase_bps=20.0,
     ).model_copy(
         update={
@@ -1535,6 +3072,65 @@ def test_reduce_and_exit_remain_allowed_under_exposure_limits(db_session) -> Non
     assert exit_result.allowed is True
     assert "GROSS_EXPOSURE_LIMIT_REACHED" not in reduce_result.reason_codes
     assert "DIRECTIONAL_BIAS_LIMIT_REACHED" not in exit_result.reason_codes
+
+
+def test_reduce_remains_allowed_under_correlated_portfolio_limit(monkeypatch, db_session) -> None:
+    _mock_expected_edge_gate_settings(
+        monkeypatch,
+        enabled=False,
+        shadow=True,
+        max_same_direction_major_exposure_pct=0.1,
+    )
+    settings_row = get_or_create_settings(db_session)
+    settings_row.max_gross_exposure_pct = 0.1
+    settings_row.max_directional_bias_pct = 0.1
+    _seed_account_equity(db_session)
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=1.0,
+            entry_price=65000.0,
+            mark_price=65000.0,
+            leverage=2.0,
+            stop_loss=63000.0,
+            take_profit=68000.0,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reduce_decision = TradeDecision(
+        decision="reduce",
+        confidence=0.7,
+        symbol="BTCUSDT",
+        timeframe="15m",
+        entry_zone_min=65000.0,
+        entry_zone_max=65100.0,
+        stop_loss=63000.0,
+        take_profit=68000.0,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST"],
+        explanation_short="reduce allowed",
+        explanation_detailed="reduce-only management must not be blocked by portfolio entry gates.",
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is True
+    assert result.debug_payload["portfolio_exposure_gate"]["applied"] is False
+    assert CORRELATED_EXPOSURE_LIMIT_REASON_CODE not in result.reason_codes
+    assert db_session.query(AuditEvent).filter_by(event_type="correlated_exposure_blocked").count() == 0
 
 
 def test_alt_entry_blocks_when_lead_context_unavailable_but_reduce_survives(db_session) -> None:
@@ -1997,6 +3593,8 @@ def test_invalid_protection_recovery_output_is_blocked(db_session) -> None:
         risk_pct=0.01,
         leverage=2.0,
         rationale_codes=["TEST"],
+        intent_family="protection",
+        management_action="restore_protection",
         explanation_short="bad protection",
         explanation_detailed="protection recovery with invalid brackets should still be blocked by risk guard.",
     )
@@ -2410,7 +4008,7 @@ def test_holding_profile_swing_downsizes_entry_when_meta_gate_passes(db_session)
         entry_zone_min=reference_price * 0.999,
         entry_zone_max=reference_price * 1.001,
         stop_loss=reference_price * 0.985,
-        take_profit=reference_price * 1.015,
+        take_profit=reference_price * 1.025,
         max_chase_bps=100.0,
     ).model_copy(
         update={
@@ -2427,7 +4025,7 @@ def test_holding_profile_swing_downsizes_entry_when_meta_gate_passes(db_session)
             entry_zone_min=reference_price * 0.999,
             entry_zone_max=reference_price * 1.001,
             stop_loss=reference_price * 0.985,
-            take_profit=reference_price * 1.015,
+            take_profit=reference_price * 1.025,
             max_chase_bps=100.0,
         ),
         snapshot,
@@ -3092,3 +4690,395 @@ def test_drawdown_soft_layer_does_not_override_daily_loss_hard_block(db_session)
     assert result.allowed is False
     assert "DAILY_LOSS_LIMIT_REACHED" in result.reason_codes
     assert result.debug_payload["drawdown_state"]["current_drawdown_state"] == "drawdown_containment"
+
+
+def test_ai_decision_ttl_expiry_blocks_new_entry_and_audits(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _triggerable_decision(snapshot)
+    decision_run = _add_ai_decision_run(
+        db_session,
+        decision,
+        snapshot,
+        generated_at=utcnow_naive() - timedelta(minutes=30),
+        ttl_seconds=60,
+    )
+
+    result, risk_row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        decision_run_id=decision_run.id,
+        market_snapshot_id=2001,
+    )
+
+    assert result.allowed is False
+    assert AI_DECISION_EXPIRED_REASON_CODE in result.reason_codes
+    assert result.debug_payload["ai_decision_validity"]["status"] == "expired"
+    event = db_session.query(AuditEvent).filter_by(event_type="ai_decision_expired").one()
+    assert event.entity_id == str(decision_run.id)
+    assert event.payload["risk_check_id"] == risk_row.id
+    assert AI_DECISION_EXPIRED_REASON_CODE in event.payload["reason_codes"]
+    db_session.refresh(decision_run)
+    assert decision_run.metadata_json["ai_decision_validity"]["status"] == "expired"
+
+
+def test_ai_decision_price_move_invalidates_new_entry_and_audits(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _triggerable_decision(snapshot)
+    decision_run = _add_ai_decision_run(
+        db_session,
+        decision,
+        snapshot,
+        reference_price=float(snapshot.latest_price) * 0.99,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        decision_run_id=decision_run.id,
+        market_snapshot_id=2002,
+    )
+
+    assert result.allowed is False
+    assert AI_DECISION_PRICE_MOVE_INVALIDATED_REASON_CODE in result.reason_codes
+    assert result.debug_payload["ai_decision_validity"]["status"] == "invalidated"
+    event = db_session.query(AuditEvent).filter_by(event_type="ai_decision_invalidated").one()
+    assert AI_DECISION_PRICE_MOVE_INVALIDATED_REASON_CODE in event.payload["reason_codes"]
+
+
+def test_ai_decision_regime_change_invalidates_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _triggerable_decision(snapshot)
+    decision_run = _add_ai_decision_run(
+        db_session,
+        decision,
+        snapshot,
+        regime_id="range:neutral",
+        regime_label="range",
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        decision_run_id=decision_run.id,
+        market_snapshot_id=2003,
+        decision_context={
+            "current_market_state": {
+                "regime_id": "bullish:aligned",
+                "regime_label": "bullish",
+                "volatility_pct": 0.01,
+                "range_breakout_direction": "none",
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert AI_DECISION_REGIME_CHANGED_REASON_CODE in result.reason_codes
+    assert result.debug_payload["ai_decision_validity"]["current_regime_id"] == "bullish:aligned"
+
+
+def test_ai_decision_range_break_and_volatility_spike_invalidates_new_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _triggerable_decision(snapshot)
+    decision_run = _add_ai_decision_run(
+        db_session,
+        decision,
+        snapshot,
+        volatility_pct=0.01,
+        range_breakout_direction="none",
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        decision_run_id=decision_run.id,
+        market_snapshot_id=2004,
+        decision_context={
+            "current_market_state": {
+                "regime_id": "range:neutral",
+                "regime_label": "range",
+                "volatility_pct": 0.025,
+                "range_breakout_direction": "up",
+            }
+        },
+    )
+
+    assert result.allowed is False
+    assert AI_DECISION_RANGE_BREAK_INVALIDATED_REASON_CODE in result.reason_codes
+    assert AI_DECISION_VOLATILITY_SPIKE_REASON_CODE in result.reason_codes
+
+
+def test_expired_ai_decision_does_not_block_reduce_path(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reduce_decision = _triggerable_decision(snapshot, decision="reduce")
+    decision_run = _add_ai_decision_run(
+        db_session,
+        reduce_decision,
+        snapshot,
+        generated_at=utcnow_naive() - timedelta(minutes=30),
+        ttl_seconds=60,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        decision_run_id=decision_run.id,
+        market_snapshot_id=2005,
+    )
+
+    assert result.allowed is True
+    assert AI_DECISION_EXPIRED_REASON_CODE not in result.reason_codes
+    assert result.debug_payload["ai_decision_validity"]["status"] == "not_applicable"
+    assert db_session.query(AuditEvent).filter_by(event_type="ai_decision_expired").count() == 0
+
+
+def _safe_profile_defaults(
+    *,
+    mode: str = "conservative_only",
+    confidence: float = 0.70,
+    dwell: int = 900,
+    confirmations: int = 2,
+):
+    from trading_mvp.services import risk as risk_service
+
+    return risk_service.get_settings().model_copy(
+        update={
+            "ai_market_settings_auto_apply_mode": mode,
+            "ai_market_settings_advisor_min_confidence_to_apply": confidence,
+            "ai_market_settings_min_profile_dwell_seconds": dwell,
+            "ai_market_settings_relax_requires_consecutive_confirmations": confirmations,
+        }
+    )
+
+
+def _store_ai_market_settings_recommendation(
+    settings_row,
+    *,
+    profile: str,
+    confidence: float = 0.80,
+    valid_for_seconds: int = 900,
+    recommendation_id: str = "rec-test-1",
+    symbol_scope: list[str] | None = None,
+    do_not_relax: bool = False,
+) -> dict[str, object]:
+    now = utcnow_naive()
+    payload: dict[str, object] = {
+        "recommendation_id": recommendation_id,
+        "generated_at": now.isoformat(),
+        "valid_until": (now + timedelta(seconds=valid_for_seconds)).isoformat(),
+        "symbol_scope": symbol_scope or ["BTCUSDT"],
+        "recommended_profile_id": profile,
+        "confidence": confidence,
+        "reason_summary": "unit test recommendation",
+        "reason_codes": ["UNIT_TEST"],
+        "observed_risk_flags": [],
+        "suggested_new_entry_policy": "STRICT_CONFIRMATION_ONLY",
+        "do_not_relax": do_not_relax,
+        "status": "valid",
+    }
+    detail = dict(settings_row.pause_reason_detail or {})
+    detail["ai_market_settings_advisor"] = {
+        "status": "valid",
+        "shadow": True,
+        "updated_at": now.isoformat(),
+        "latest": payload,
+    }
+    settings_row.pause_reason_detail = detail
+    return payload
+
+
+def _store_safe_profile_state(settings_row, *, active_profile: str, selected_seconds_ago: int = 1200) -> None:
+    detail = dict(settings_row.pause_reason_detail or {})
+    detail["safe_profile_selector"] = {
+        "active_profile": active_profile,
+        "active_profile_selected_at": (utcnow_naive() - timedelta(seconds=selected_seconds_ago)).isoformat(),
+    }
+    settings_row.pause_reason_detail = detail
+
+
+def test_safe_profile_selector_tightens_ai_profile_in_conservative_only(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_ai_market_settings_recommendation(settings_row, profile="CAUTION")
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    selection = select_safe_execution_risk_profile(
+        settings_row,
+        snapshot,
+        defaults=_safe_profile_defaults(mode="conservative_only"),
+        decision_context={"deterministic_market_condition_profile": "NORMAL"},
+        live_requested=False,
+    )
+
+    assert selection["deterministic_profile"] == "NORMAL"
+    assert selection["ai_recommended_profile"] == "CAUTION"
+    assert selection["final_active_profile"] == "CAUTION"
+    assert selection["was_tightened_by_ai"] is True
+
+
+@pytest.mark.parametrize("deterministic_profile", ["HIGH_VOLATILITY", "STRESS"])
+def test_safe_profile_selector_does_not_auto_relax_from_ai_normal(db_session, deterministic_profile: str) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_ai_market_settings_recommendation(settings_row, profile="NORMAL")
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    selection = select_safe_execution_risk_profile(
+        settings_row,
+        snapshot,
+        defaults=_safe_profile_defaults(mode="conservative_only"),
+        decision_context={"deterministic_market_condition_profile": deterministic_profile},
+        live_requested=False,
+    )
+
+    assert selection["final_active_profile"] == deterministic_profile
+    assert selection["was_tightened_by_ai"] is False
+    assert selection["was_relaxation_blocked"] is True
+
+
+def test_safe_profile_selector_stale_data_forces_degraded_and_blocks_entry(monkeypatch, db_session) -> None:
+    from trading_mvp.services import risk as risk_service
+
+    defaults = _safe_profile_defaults(mode="conservative_only")
+    monkeypatch.setattr(risk_service, "get_settings", lambda: defaults)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_ai_market_settings_recommendation(settings_row, profile="NORMAL")
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140, force_stale=True)
+    decision = _triggerable_decision(snapshot)
+
+    result, risk_row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    selector = result.debug_payload["safe_profile_selector"]
+    assert result.allowed is False
+    assert selector["final_active_profile"] == "DEGRADED"
+    assert "MARKET_STATE_STALE" in selector["hard_condition_reason_codes"]
+    assert EXECUTION_RISK_PROFILE_BLOCK_REASON_CODE in result.reason_codes
+    event = db_session.query(AuditEvent).filter_by(event_type="execution_risk_profile_selected").one()
+    assert event.entity_id == str(risk_row.id)
+    assert event.payload["final_active_profile"] == "DEGRADED"
+
+
+def test_safe_profile_selector_ignores_expired_ai_recommendation(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_ai_market_settings_recommendation(settings_row, profile="STRESS", valid_for_seconds=-60)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    selection = select_safe_execution_risk_profile(
+        settings_row,
+        snapshot,
+        defaults=_safe_profile_defaults(mode="conservative_only"),
+        decision_context={"deterministic_market_condition_profile": "NORMAL"},
+        live_requested=False,
+    )
+
+    assert selection["final_active_profile"] == "NORMAL"
+    assert "AI_MARKET_SETTINGS_RECOMMENDATION_EXPIRED" in selection["ignored_reason_codes"]
+
+
+def test_safe_profile_selector_ignores_low_confidence_ai_recommendation(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_ai_market_settings_recommendation(settings_row, profile="STRESS", confidence=0.40)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    selection = select_safe_execution_risk_profile(
+        settings_row,
+        snapshot,
+        defaults=_safe_profile_defaults(mode="conservative_only", confidence=0.70),
+        decision_context={"deterministic_market_condition_profile": "NORMAL"},
+        live_requested=False,
+    )
+
+    assert selection["final_active_profile"] == "NORMAL"
+    assert "AI_MARKET_SETTINGS_RECOMMENDATION_LOW_CONFIDENCE" in selection["ignored_reason_codes"]
+
+
+def test_safe_profile_selector_blocks_relaxation_until_consecutive_confirmations(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_safe_profile_state(settings_row, active_profile="STRESS", selected_seconds_ago=1200)
+    _store_ai_market_settings_recommendation(settings_row, profile="NORMAL")
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+
+    selection = select_safe_execution_risk_profile(
+        settings_row,
+        snapshot,
+        defaults=_safe_profile_defaults(mode="conservative_only", dwell=0, confirmations=2),
+        decision_context={"deterministic_market_condition_profile": "NORMAL"},
+        live_requested=False,
+    )
+
+    assert selection["final_active_profile"] == "STRESS"
+    assert selection["was_relaxation_blocked"] is True
+    assert PROFILE_RELAXATION_CONSECUTIVE_REASON_CODE in selection["relaxation_block_reason_codes"]
+
+
+def test_safe_profile_selector_does_not_block_reduce_only_path(monkeypatch, db_session) -> None:
+    from trading_mvp.services import risk as risk_service
+
+    defaults = _safe_profile_defaults(mode="conservative_only")
+    monkeypatch.setattr(risk_service, "get_settings", lambda: defaults)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    _seed_account_equity(db_session)
+    _mark_all_sync_scopes_fresh(settings_row)
+    _store_safe_profile_state(settings_row, active_profile="STRESS", selected_seconds_ago=0)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    reduce_decision = _triggerable_decision(snapshot, decision="reduce").model_copy(
+        update={"intent_family": "management", "management_action": "reduce_only"}
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        reduce_decision,
+        snapshot,
+        execution_mode="historical_replay",
+    )
+
+    assert result.allowed is True
+    assert result.debug_payload["safe_profile_selector"]["final_active_profile"] == "STRESS"
+    assert EXECUTION_RISK_PROFILE_BLOCK_REASON_CODE not in result.reason_codes

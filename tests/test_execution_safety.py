@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
-from trading_mvp.models import AuditEvent, Execution, Order, Position, SystemHealthEvent
+from trading_mvp.enums import AgentRole
+from trading_mvp.models import (
+    AgentRun,
+    Alert,
+    AuditEvent,
+    Execution,
+    Order,
+    Position,
+    SystemHealthEvent,
+)
 from trading_mvp.schemas import (
     FeaturePayload,
     MarketCandle,
@@ -132,6 +142,44 @@ def _live_decision(decision: str) -> TradeDecision:
         explanation_short="safety test",
         explanation_detailed="execution safety regression test path.",
     )
+
+
+def _add_trade_decision_run(
+    db_session,
+    decision: TradeDecision,
+    *,
+    strategy_engine: str = "trend_pullback_engine",
+    primary_regime: str = "bullish",
+    direction_regime: str = "aligned",
+) -> AgentRun:
+    input_payload = {
+        "ai_context": {
+            "strategy_engine": strategy_engine,
+            "regime_summary": {
+                "primary_regime": primary_regime,
+                "trend_alignment": direction_regime,
+            },
+            "composite_regime": {
+                "structure_regime": primary_regime,
+                "direction_regime": direction_regime,
+            },
+        }
+    }
+    row = AgentRun(
+        role=AgentRole.TRADING_DECISION.value,
+        trigger_event="unit_test",
+        schema_name="TradeDecision",
+        provider_name="deterministic-test",
+        summary="trade performance tag test",
+        input_payload=input_payload,
+        output_payload=decision.model_dump(mode="json"),
+        metadata_json={
+            "selection_context": {"strategy_engine": strategy_engine},
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
 
 
 def _prime_live_settings(db_session) -> None:
@@ -683,6 +731,97 @@ class UnprotectedSyncClient:
         return {"orderId": order_id, "status": "NEW"}
 
 
+class ProtectiveHealthSyncClient:
+    def __init__(self, orders: list[dict[str, object]]) -> None:
+        self.orders = orders
+
+    def get_account_info(self):
+        return {
+            "availableBalance": "100.0",
+            "totalWalletBalance": "100.0",
+            "totalUnrealizedProfit": "1.0",
+            "totalMarginBalance": "101.0",
+        }
+
+    def get_position_mode(self):
+        return {"mode": "one_way", "dual_side_position": False}
+
+    def get_open_orders(self, symbol: str):
+        return list(self.orders)
+
+    def get_position_information(self, symbol: str):
+        return [{"positionAmt": "0.01", "entryPrice": "70000", "markPrice": "70100", "leverage": "2"}]
+
+
+class ProtectiveHealthExitClient(ProtectiveHealthSyncClient):
+    def __init__(self, orders: list[dict[str, object]]) -> None:
+        super().__init__(orders)
+        self.exit_submitted = False
+
+    def get_position_information(self, symbol: str):
+        if self.exit_submitted:
+            return []
+        return super().get_position_information(symbol)
+
+    def change_initial_leverage(self, symbol: str, leverage: int):
+        return {"leverage": leverage}
+
+    def normalize_order_quantity(
+        self,
+        symbol: str,
+        quantity: float,
+        *,
+        reference_price: float | None = None,
+        enforce_min_notional: bool = True,
+    ):
+        return quantity
+
+    def normalize_price(self, symbol: str, price: float):
+        return price
+
+    def new_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        stop_price: float | None = None,
+        reduce_only: bool = False,
+        close_position: bool = False,
+        client_order_id: str | None = None,
+        response_type: str = "RESULT",
+        working_type: str = "MARK_PRICE",
+        time_in_force: str | None = None,
+    ):
+        if reduce_only:
+            self.exit_submitted = True
+            return {"orderId": "exit-1", "status": "FILLED", "executedQty": quantity or 0.01, "avgPrice": "70100"}
+        raise AssertionError("protective health exit test should only submit reduce-only orders")
+
+    def get_account_trades(self, *, symbol: str, order_id: str | None = None, limit: int = 50):
+        return [
+            {
+                "id": "trade-exit-1",
+                "price": "70100",
+                "qty": "0.01",
+                "commission": "0.1",
+                "commissionAsset": "USDT",
+                "realizedPnl": "1.0",
+            }
+        ]
+
+    def cancel_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
+        target = str(order_id or client_order_id or "")
+        self.orders = [
+            item
+            for item in self.orders
+            if str(item.get("orderId", "")) != target and str(item.get("clientOrderId", "")) != target
+        ]
+        return {"orderId": target, "status": "CANCELED"}
+
+
 class ExitWhilePausedClient:
     def __init__(self) -> None:
         self.exit_submitted = False
@@ -1071,6 +1210,7 @@ class AlgoCancelClient:
 
 class PositionManagementStopClient:
     def __init__(self) -> None:
+        self.new_order_calls: list[dict[str, object]] = []
         self.orders = [
             {
                 "orderId": "stop-old",
@@ -1123,6 +1263,19 @@ class PositionManagementStopClient:
         working_type: str = "MARK_PRICE",
         time_in_force: str | None = None,
     ):
+        self.new_order_calls.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "order_type": order_type,
+                "quantity": quantity,
+                "price": price,
+                "stop_price": stop_price,
+                "reduce_only": reduce_only,
+                "close_position": close_position,
+                "client_order_id": client_order_id,
+            }
+        )
         order_id = "stop-tightened"
         self.orders.append(
             {
@@ -1136,6 +1289,14 @@ class PositionManagementStopClient:
             }
         )
         return {"orderId": order_id, "status": "NEW"}
+
+
+class FailingPositionManagementStopClient(PositionManagementStopClient):
+    def new_order(self, **kwargs):
+        self.new_order_calls.append(dict(kwargs))
+        if kwargs.get("order_type") == "STOP_MARKET":
+            raise RuntimeError("stop move failed")
+        return super().new_order(**kwargs)
 
 
 class EntrySuccessClient:
@@ -1738,6 +1899,86 @@ class ReduceSuccessClient:
         return {"status": "CANCELED"}
 
 
+def _patch_breakeven_runtime(monkeypatch, *, shadow: bool) -> None:
+    runtime = SimpleNamespace(live_trading_env_enabled=True, breakeven_shadow=shadow)
+    monkeypatch.setattr("trading_mvp.services.execution.get_settings", lambda: runtime)
+    monkeypatch.setattr("trading_mvp.services.risk.get_settings", lambda: runtime)
+
+
+def _add_breakeven_position(
+    db_session,
+    *,
+    side: str = "long",
+    mark_price: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+) -> Position:
+    entry_price = 70000.0
+    mark = mark_price if mark_price is not None else (71000.0 if side == "long" else 69000.0)
+    stop = stop_loss if stop_loss is not None else (69000.0 if side == "long" else 71000.0)
+    target = take_profit if take_profit is not None else (72000.0 if side == "long" else 68000.0)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side=side,
+        status="open",
+        quantity=0.01,
+        entry_price=entry_price,
+        mark_price=mark,
+        leverage=2.0,
+        stop_loss=stop,
+        take_profit=target,
+        realized_pnl=0.0,
+        unrealized_pnl=10.0,
+        opened_at=utcnow_naive() - timedelta(minutes=30),
+        metadata_json={"position_management": {"initial_stop_loss": stop, "initial_risk_per_unit": 1000.0}},
+    )
+    db_session.add(position)
+    db_session.flush()
+    db_session.add(
+        Order(
+            symbol="BTCUSDT",
+            decision_run_id=None,
+            risk_check_id=None,
+            position_id=position.id,
+            side="sell" if side == "long" else "buy",
+            order_type="stop_market",
+            mode="live",
+            status="pending",
+            external_order_id="stop-old",
+            client_order_id="stop-old",
+            reduce_only=True,
+            close_only=True,
+            parent_order_id=None,
+            exchange_status="NEW",
+            requested_quantity=0.01,
+            requested_price=stop,
+            filled_quantity=0.0,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+    return position
+
+
+def _breakeven_context(*, candidate_stop: float, current_r_multiple: float = 1.0) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "status": "active",
+        "current_r_multiple": current_r_multiple,
+        "time_in_trade_minutes": 30.0,
+        "tightened_stop_loss": candidate_stop,
+        "break_even_stop_loss": candidate_stop,
+        "break_even_trigger_r": 1.0,
+        "breakeven_lock_bps": 0.0,
+        "breakeven_min_hold_seconds": 0,
+        "reduce_reason_codes": [],
+        "applied_rule_candidates": ["POSITION_MANAGEMENT_BREAK_EVEN"],
+    }
+
+
 def test_apply_position_management_tightens_stop_and_records_audit(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     settings_row = get_or_create_settings(db_session)
@@ -1866,6 +2107,230 @@ def test_apply_position_management_never_widens_stop_for_break_even(monkeypatch,
     assert result["status"] == "monitoring"
     assert refreshed is not None and refreshed.stop_loss == 69000.0
     assert stop_orders == []
+
+
+def test_breakeven_disabled_does_not_move_stop(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = False
+    _add_breakeven_position(db_session, side="long")
+    client = PositionManagementStopClient()
+    _patch_breakeven_runtime(monkeypatch, shadow=False)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: _breakeven_context(candidate_stop=70000.0),
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=51,
+        client=client,
+    )
+    db_session.flush()
+
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "blocked"
+    assert refreshed is not None and refreshed.stop_loss == 69000.0
+    assert not any(call["order_type"] == "STOP_MARKET" for call in client.new_order_calls)
+    assert any(
+        event.event_type == "breakeven_stop_move_evaluated"
+        and "BREAKEVEN_DISABLED" in event.payload["risk_guard"]["blocked_reason_codes"]
+        for event in events
+    )
+
+
+def test_breakeven_shadow_records_would_move_without_order_change(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = True
+    _add_breakeven_position(db_session, side="long")
+    client = PositionManagementStopClient()
+    _patch_breakeven_runtime(monkeypatch, shadow=True)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: _breakeven_context(candidate_stop=70000.0),
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=52,
+        client=client,
+    )
+    db_session.flush()
+
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "monitoring"
+    assert result["position_management_action"]["status"] == "shadow_would_move"
+    assert refreshed is not None and refreshed.stop_loss == 69000.0
+    assert not any(call["order_type"] == "STOP_MARKET" for call in client.new_order_calls)
+    assert any(event.event_type == "breakeven_stop_move_would_move" for event in events)
+
+
+def test_breakeven_long_moves_stop_after_risk_guard_approval(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = True
+    _add_breakeven_position(db_session, side="long")
+    client = PositionManagementStopClient()
+    _patch_breakeven_runtime(monkeypatch, shadow=False)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: _breakeven_context(candidate_stop=70000.0),
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=53,
+        client=client,
+    )
+    db_session.flush()
+
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    stop_order = db_session.scalar(select(Order).where(Order.external_order_id == "stop-tightened"))
+
+    assert result["status"] == "applied"
+    assert refreshed is not None and refreshed.stop_loss == 70000.0
+    assert stop_order is not None and stop_order.reduce_only is True and stop_order.close_only is True
+    assert client.new_order_calls[-1]["reduce_only"] is True
+    assert client.new_order_calls[-1]["close_position"] is True
+    assert any(event.event_type == "breakeven_stop_move_applied" for event in events)
+    assert any(event.event_type == "moved_stop_to_breakeven" for event in events)
+
+
+def test_breakeven_short_moves_stop_after_risk_guard_approval(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = True
+    _add_breakeven_position(db_session, side="short")
+    client = PositionManagementStopClient()
+    _patch_breakeven_runtime(monkeypatch, shadow=False)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: _breakeven_context(candidate_stop=70000.0),
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=54,
+        client=client,
+    )
+    db_session.flush()
+
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    stop_order = db_session.scalar(select(Order).where(Order.external_order_id == "stop-tightened"))
+
+    assert result["status"] == "applied"
+    assert refreshed is not None and refreshed.stop_loss == 70000.0
+    assert stop_order is not None and stop_order.side == "buy"
+    assert stop_order.reduce_only is True
+
+
+def test_breakeven_trigger_not_met_does_not_create_candidate(db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = True
+    settings_row.atr_trailing_stop_enabled = False
+    settings_row.partial_take_profit_enabled = False
+    settings_row.time_stop_enabled = False
+    _add_breakeven_position(db_session, side="long", mark_price=70500.0)
+    client = PositionManagementStopClient()
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(atr=0.0),
+        decision_run_id=55,
+        client=client,
+    )
+    db_session.flush()
+
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+
+    assert result["status"] == "monitoring"
+    assert refreshed is not None and refreshed.stop_loss == 69000.0
+    assert not any(event.event_type.startswith("breakeven_") for event in events)
+
+
+def test_breakeven_prioritizes_protective_recovery_when_stop_missing(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = True
+    _add_breakeven_position(db_session, side="long")
+    client = UnprotectedSyncClient()
+    _patch_breakeven_runtime(monkeypatch, shadow=False)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: _breakeven_context(candidate_stop=70000.0),
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=56,
+        client=client,
+    )
+    db_session.flush()
+
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "protective_recovery_required"
+    assert any(event.event_type == "protective_order_health_check_failed" for event in events)
+    assert any(event.event_type == "unprotected_position_detected" for event in events)
+    assert any(event.event_type == "breakeven_stop_move_cancelled" for event in events)
+    assert not any(event.event_type == "breakeven_stop_move_attempted" for event in events)
+
+
+def test_breakeven_stop_move_failure_records_audit_and_alert(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    settings_row.break_even_enabled = True
+    _add_breakeven_position(db_session, side="long")
+    client = FailingPositionManagementStopClient()
+    _patch_breakeven_runtime(monkeypatch, shadow=False)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: _breakeven_context(candidate_stop=70000.0),
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload(),
+        decision_run_id=57,
+        client=client,
+    )
+    db_session.flush()
+
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+    alerts = list(db_session.scalars(select(Alert).order_by(Alert.id)))
+    refreshed = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+
+    assert result["status"] == "failed"
+    assert refreshed is not None and refreshed.stop_loss == 69000.0
+    assert any(event.event_type == "breakeven_stop_move_failed" for event in events)
+    assert any(alert.title == "Break-even stop move failed" for alert in alerts)
 
 
 def test_position_management_tracks_mfe_mae_and_tightens_on_rollback(db_session) -> None:
@@ -2315,6 +2780,117 @@ def test_entry_execution_seeds_position_management_metadata(monkeypatch, db_sess
     assert client.account_info_calls >= 3
     assert client.open_orders_calls >= 3
     assert client.position_information_calls >= 3
+
+
+def test_entry_execution_persists_trade_performance_tags_on_trade_records(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    client = EntrySuccessClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    decision = _live_decision("long").model_copy(update={"entry_mode": "pullback_confirm"})
+    decision_run = _add_trade_decision_run(
+        db_session,
+        decision,
+        strategy_engine="range_mean_reversion_engine",
+        primary_regime="range",
+        direction_regime="neutral",
+    )
+    risk_result = _risk_result("long").model_copy(
+        update={"debug_payload": {"drawdown_state": {"current_drawdown_state": "recovery"}}}
+    )
+
+    result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=decision_run.id,
+        decision=decision,
+        market_snapshot=_market_snapshot(),
+        risk_result=risk_result,
+    )
+    db_session.flush()
+
+    entry_order = db_session.scalar(select(Order).where(Order.external_order_id == "entry-1"))
+    execution = db_session.scalar(select(Execution).where(Execution.external_trade_id == "trade-entry-1"))
+    position = db_session.scalar(
+        select(Position).where(Position.symbol == "BTCUSDT", Position.status == "open").order_by(Position.id.desc())
+    )
+    stop_order = db_session.scalar(select(Order).where(Order.external_order_id == "stop-1"))
+
+    assert result["status"] == "filled"
+    assert entry_order is not None
+    assert execution is not None
+    assert position is not None
+    assert stop_order is not None
+    for payload in (
+        entry_order.metadata_json,
+        execution.payload,
+        position.metadata_json,
+        stop_order.metadata_json,
+    ):
+        tags = payload["trade_performance_tags"]
+        assert tags["strategy_id"] == "range_mean_reversion_engine"
+        assert tags["regime_id"] == "range:neutral"
+        assert tags["entry_confirmation_type"] == "range_edge_confirm"
+        assert tags["risk_mode"] == "drawdown_recovery"
+    assert execution.payload["strategy_id"] == "range_mean_reversion_engine"
+    assert execution.payload["net_r_multiple"] == pytest.approx(-0.01)
+
+
+def test_exit_execution_and_closed_position_preserve_entry_trade_performance_tags(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    entry_client = EntrySuccessClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: entry_client)
+    entry_decision = _live_decision("long").model_copy(update={"entry_mode": "pullback_confirm"})
+    entry_run = _add_trade_decision_run(
+        db_session,
+        entry_decision,
+        strategy_engine="trend_pullback_engine",
+        primary_regime="bullish",
+        direction_regime="aligned",
+    )
+
+    entry_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=entry_run.id,
+        decision=entry_decision,
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    exit_client = ExitWhilePausedClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: exit_client)
+    exit_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=entry_run.id,
+        decision=_live_decision("exit"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("exit"),
+    )
+    db_session.flush()
+
+    closed_position = db_session.scalar(
+        select(Position).where(Position.symbol == "BTCUSDT", Position.status == "closed").order_by(Position.id.desc())
+    )
+    exit_order = db_session.scalar(select(Order).where(Order.external_order_id == "303"))
+    exit_execution = db_session.scalar(select(Execution).where(Execution.external_trade_id == "trade-303"))
+
+    assert entry_result["status"] == "filled"
+    assert exit_result["status"] == "filled"
+    assert closed_position is not None
+    assert exit_order is not None
+    assert exit_execution is not None
+    assert exit_order.position_id == closed_position.id
+    assert exit_execution.position_id == closed_position.id
+    assert exit_execution.payload["trade_performance_tags"]["strategy_id"] == "trend_pullback_engine"
+    assert exit_execution.payload["trade_performance_tags"]["entry_confirmation_type"] == "pullback_confirm"
+    closed_pnl = closed_position.metadata_json["closed_position_pnl"]
+    assert closed_pnl["trade_performance_tags"]["strategy_id"] == "trend_pullback_engine"
+    assert closed_pnl["gross_realized_pnl"] == pytest.approx(-0.5)
+    assert closed_pnl["fee_total"] == pytest.approx(0.15)
+    assert closed_pnl["risk_amount_usdt"] == pytest.approx(1.0)
+    assert closed_pnl["net_r_multiple"] == pytest.approx(-0.65)
 
 
 def test_swing_entry_uses_partial_reduce_take_profit_order(monkeypatch, db_session) -> None:
@@ -3523,6 +4099,135 @@ def test_post_order_resync_updates_sync_freshness_summary(monkeypatch, db_sessio
     assert serialized["sync_freshness_summary"]["open_orders"]["stale"] is False
     assert serialized["sync_freshness_summary"]["protective_orders"]["stale"] is False
     assert serialized["sync_freshness_summary"]["protective_orders"]["last_sync_at"] is not None
+
+
+def _protective_health_orders(case_name: str) -> list[dict[str, object]]:
+    stop = {
+        "orderId": "stop-1",
+        "clientOrderId": "stop-1",
+        "type": "STOP_MARKET",
+        "side": "SELL",
+        "closePosition": "true",
+        "reduceOnly": "true",
+        "stopPrice": "69000",
+        "status": "NEW",
+    }
+    tp = {
+        "orderId": "tp-1",
+        "clientOrderId": "tp-1",
+        "type": "TAKE_PROFIT_MARKET",
+        "side": "SELL",
+        "closePosition": "true",
+        "reduceOnly": "true",
+        "stopPrice": "72000",
+        "status": "NEW",
+    }
+    if case_name == "normal":
+        return [stop, tp]
+    if case_name == "sl_missing":
+        return [tp]
+    if case_name == "tp_missing":
+        return [stop]
+    if case_name == "quantity_mismatch":
+        return [
+            {**stop, "closePosition": "false", "origQty": "0.005"},
+            tp,
+        ]
+    if case_name == "reduce_only_missing":
+        return [
+            {**stop, "closePosition": "false", "reduceOnly": "false", "origQty": "0.01"},
+            tp,
+        ]
+    if case_name == "side_mismatch":
+        return [
+            {**stop, "closePosition": "false", "origQty": "0.01", "side": "BUY"},
+            tp,
+        ]
+    raise AssertionError(f"unknown protective health case: {case_name}")
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected_reason_code"),
+    [
+        ("normal", None),
+        ("sl_missing", "PROTECTIVE_STOP_LOSS_MISSING"),
+        ("tp_missing", "PROTECTIVE_TAKE_PROFIT_MISSING"),
+        ("quantity_mismatch", "PROTECTIVE_ORDER_QUANTITY_MISMATCH"),
+        ("reduce_only_missing", "PROTECTIVE_ORDER_REDUCE_ONLY_MISSING"),
+        ("side_mismatch", "PROTECTIVE_ORDER_SIDE_MISMATCH"),
+    ],
+)
+def test_sync_live_state_audits_protective_order_health_and_risk_blocks_entries(
+    monkeypatch,
+    db_session,
+    case_name: str,
+    expected_reason_code: str | None,
+) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    client = ProtectiveHealthSyncClient(_protective_health_orders(case_name))
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: _connected_user_stream_payload(),
+    )
+
+    result = sync_live_state(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        allow_protection_recovery=False,
+    )
+    db_session.flush()
+    risk_result, _risk_row = evaluate_risk(
+        db_session,
+        settings_row,
+        _live_decision("long"),
+        _market_snapshot(),
+        execution_mode="live",
+    )
+    health_events = list(
+        db_session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.event_type == "protective_order_health_check_failed")
+            .order_by(AuditEvent.id)
+        )
+    )
+
+    protection_state = result["symbol_protection_state"]["BTCUSDT"]
+    if expected_reason_code is None:
+        assert protection_state["status"] == "protected"
+        assert health_events == []
+        assert "PROTECTION_STATE_UNVERIFIED" not in risk_result.reason_codes
+        return
+
+    assert expected_reason_code in protection_state["reason_codes"]
+    assert health_events
+    assert health_events[-1].severity == "critical"
+    assert expected_reason_code in health_events[-1].payload["reason_codes"]
+    assert risk_result.allowed is False
+    assert "PROTECTION_STATE_UNVERIFIED" in risk_result.reason_codes
+
+
+def test_protective_order_health_block_does_not_block_reduce_only_execution(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    client = ProtectiveHealthExitClient(_protective_health_orders("reduce_only_missing"))
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=77,
+        decision=_live_decision("exit"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("exit"),
+    )
+    db_session.flush()
+
+    assert result["status"] == "filled"
+    assert result["intent_type"] == "reduce_only"
+    assert client.exit_submitted is True
 
 
 def test_sync_live_state_recreates_missing_protection_and_logs(monkeypatch, db_session) -> None:

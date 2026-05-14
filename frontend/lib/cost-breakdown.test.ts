@@ -24,12 +24,28 @@ test("resolveCostBreakdownSelection defaults to current Seoul month and keeps su
 });
 
 test("formatters keep null ratios and incomplete slippage from looking like zero", async () => {
-  const { formatCostBreakdownBps, formatCostBreakdownPercent } = await costBreakdownModule;
+  const { formatCostBreakdownBps, formatCostBreakdownPercent, formatCostBreakdownUsdt } = await costBreakdownModule;
 
+  assert.equal(formatCostBreakdownUsdt(12.3), "+12.30 USDT");
+  assert.equal(formatCostBreakdownUsdt(-1.2), "-1.20 USDT");
   assert.equal(formatCostBreakdownPercent(null), "N/A");
   assert.equal(formatCostBreakdownBps(null, "COMPLETE"), "N/A");
   assert.equal(formatCostBreakdownBps(0, "INCOMPLETE"), "N/A");
-  assert.equal(formatCostBreakdownBps(0.12, "COMPLETE"), "0.12 bps");
+  assert.equal(formatCostBreakdownBps(0.12, "COMPLETE"), "+0.12 bps");
+});
+
+test("metric labels hide raw internal keys and fall back safely", async () => {
+  const { costMetricDescription, costMetricLabel, slippageWeightingLabel } = await costBreakdownModule;
+
+  assert.equal(costMetricLabel("fee"), "수수료");
+  assert.equal(costMetricLabel("maker_fee"), "Maker 수수료");
+  assert.equal(costMetricLabel("funding_fee"), "펀딩비");
+  assert.equal(costMetricLabel("realized_pnl"), "실현 손익");
+  assert.equal(costMetricLabel("net_pnl"), "순손익");
+  assert.equal(costMetricLabel("unknown_metric_key"), "알 수 없는 비용 항목");
+  assert.equal(costMetricDescription("unknown_metric_key"), "아직 표시 라벨에 등록되지 않은 비용 항목입니다.");
+  assert.equal(slippageWeightingLabel("quantity"), "수량 가중");
+  assert.equal(slippageWeightingLabel("unexpected_weighting"), "알 수 없는 가중 방식");
 });
 
 test("quality badges expose missing close executions and incomplete sources", async () => {
@@ -46,7 +62,7 @@ test("quality badges expose missing close executions and incomplete sources", as
 
   assert.deepEqual(
     badges.map((badge) => badge.label),
-    ["PnL 미확정", "청산 체결 누락 2건", "체결 동기화 불완전", "Funding 오래됨", "Slippage 데이터 부족"],
+    ["실현 손익 미확정", "청산 체결 누락 2건", "체결 동기화 불완전", "펀딩 동기화 오래됨", "슬리피지 데이터 부족"],
   );
 });
 
@@ -85,10 +101,10 @@ test("warnings translate API quality codes and include high fee ratio notice", a
   });
 
   assert.deepEqual(messages, [
-    "수수료가 gross PnL의 16.2%를 차지합니다.",
-    "청산 체결 누락으로 realized PnL이 확정되지 않았습니다.",
-    "Funding 동기화가 불완전합니다.",
-    "Slippage 데이터가 부족하여 평균 체결 불리도를 확정할 수 없습니다.",
+    "수수료가 총손익의 +16.2%를 차지합니다.",
+    "청산 체결 누락으로 실현 손익이 확정되지 않았습니다.",
+    "펀딩비 동기화가 불완전합니다.",
+    "슬리피지 데이터가 부족해 평균 체결 불리도를 확정할 수 없습니다.",
   ]);
 });
 

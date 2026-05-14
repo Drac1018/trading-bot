@@ -13,6 +13,12 @@ import { IntegrationSettingsPanel } from "./settings/integration-settings-panel"
 import { MarketRiskPanel } from "./settings/market-risk-panel";
 import { EventResponseOverviewPanel } from "./settings/event-response-overview-panel";
 import {
+  ExecutionProfileSettingsPanel,
+  executionRiskProfilePolicyFromSettings,
+  type ExecutionRiskProfilePolicySettings,
+  type ExecutionRiskProfileSettings,
+} from "./settings/execution-profile-settings-panel";
+import {
   type AIModelRoutingPolicy,
   type AutoResumeAttemptResult,
   type ControlStatusSummary,
@@ -136,6 +142,7 @@ export type SettingsPayload = {
   reconciliation_summary: ReconciliationSummary;
   operator_alert?: Record<string, unknown>;
   event_operator_control?: EventOperatorControlPayload | null;
+  execution_risk_profile_settings?: ExecutionRiskProfileSettings | null;
   pause_severity: string | null;
   pause_recovery_class: string | null;
   default_symbol: string;
@@ -196,7 +203,7 @@ type FormState = Omit<
   | "trading_paused" | "guard_mode_reason_category" | "guard_mode_reason_code" | "guard_mode_reason_message" | "pause_reason_code" | "pause_origin" | "pause_reason_detail" | "pause_triggered_at" | "auto_resume_after"
   | "auto_resume_whitelisted" | "auto_resume_eligible" | "auto_resume_status" | "auto_resume_last_blockers" | "latest_blocked_reasons" | "pause_severity"
   | "pause_recovery_class" | "control_status_summary" | "event_operator_control" | "openai_api_key_configured" | "binance_api_key_configured" | "binance_api_secret_configured" | "event_source_api_key_configured"
-  | "ai_model_routing_policy"
+  | "ai_model_routing_policy" | "execution_risk_profile_settings"
   | "event_source_provider" | "event_source_api_url" | "event_source_timeout_seconds" | "event_source_default_assets" | "event_source_fred_release_ids"
   | "event_source_bls_enrichment_url" | "event_source_bls_enrichment_static_params" | "event_source_bea_enrichment_url" | "event_source_bea_enrichment_static_params"
 > & {
@@ -216,6 +223,7 @@ type FormState = Omit<
   clear_binance_api_key: boolean;
   clear_binance_api_secret: boolean;
   clear_event_source_api_key: boolean;
+  execution_risk_profile_settings: ExecutionRiskProfilePolicySettings;
 };
 
 class ApiRequestError extends Error {
@@ -331,6 +339,7 @@ function toFormState(initial: SettingsPayload): FormState {
     clear_binance_api_key: false,
     clear_binance_api_secret: false,
     clear_event_source_api_key: false,
+    execution_risk_profile_settings: executionRiskProfilePolicyFromSettings(initial.execution_risk_profile_settings),
   };
 }
 
@@ -612,6 +621,7 @@ export function SettingsControls({
     ai_model: form.ai_model,
     ai_call_interval_minutes: form.ai_call_interval_minutes,
     decision_cycle_interval_minutes: form.decision_cycle_interval_minutes,
+    execution_risk_profile_settings: form.execution_risk_profile_settings,
     ai_max_input_candles: form.ai_max_input_candles,
     ai_temperature: form.ai_temperature,
     binance_market_data_enabled: form.binance_market_data_enabled,
@@ -952,6 +962,16 @@ export function SettingsControls({
             );
           }}
         />
+
+        <ExecutionProfileSettingsPanel
+          settings={state.execution_risk_profile_settings}
+          form={form.execution_risk_profile_settings}
+          isPending={isPending}
+          feedback={feedback.control_save}
+          onPolicyChange={(next) => updateField("execution_risk_profile_settings", next)}
+          onSave={() => save("control_save")}
+        />
+
         <section className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <EventResponseOverviewPanel
             defaultSymbol={state.default_symbol}

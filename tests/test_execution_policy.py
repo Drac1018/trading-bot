@@ -18,7 +18,7 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.dashboard import get_executions
 from trading_mvp.services.execution import execute_live_trade, sync_live_state
-from trading_mvp.services.execution_policy import select_execution_plan
+from trading_mvp.services.execution_policy import select_execution_plan, summarize_execution_policy
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
@@ -31,6 +31,7 @@ def _snapshot(
     timeframe: str = "15m",
     latest_price: float = 70000.0,
     is_stale: bool = False,
+    is_complete: bool = True,
     high_delta: float = 50.0,
     low_delta: float = 40.0,
 ) -> MarketSnapshotPayload:
@@ -51,7 +52,7 @@ def _snapshot(
         latest_volume=1200.0,
         candle_count=3,
         is_stale=is_stale,
-        is_complete=True,
+        is_complete=is_complete,
         candles=[
             MarketCandle(timestamp=now, open=open_1, high=latest_price + high_delta * 0.6, low=low_1, close=close_1, volume=900.0),
             MarketCandle(timestamp=now, open=open_2, high=latest_price + high_delta * 0.8, low=low_2, close=close_2, volume=950.0),
@@ -60,7 +61,15 @@ def _snapshot(
     )
 
 
-def _intent(*, action: str, intent_type: str, symbol: str = "BTCUSDT", requested_price: float = 70000.0) -> ExecutionIntent:
+def _intent(
+    *,
+    action: str,
+    intent_type: str,
+    symbol: str = "BTCUSDT",
+    requested_price: float = 70000.0,
+    required_order_policy: str = "market_allowed",
+    allow_market_fallback: bool = True,
+) -> ExecutionIntent:
     return ExecutionIntent(
         symbol=symbol,
         action=action,  # type: ignore[arg-type]
@@ -73,10 +82,18 @@ def _intent(*, action: str, intent_type: str, symbol: str = "BTCUSDT", requested
         mode="live",
         reduce_only=intent_type == "reduce_only",
         close_only=action == "exit",
+        required_order_policy=required_order_policy,  # type: ignore[arg-type]
+        allow_market_fallback=allow_market_fallback,
     )
 
 
-def _risk_result(action: str) -> RiskCheckResult:
+def _risk_result(
+    action: str,
+    *,
+    required_order_policy: str = "market_allowed",
+    allow_market_fallback: bool = True,
+    order_policy_reason: str | None = None,
+) -> RiskCheckResult:
     return RiskCheckResult(
         allowed=True,
         decision=action,  # type: ignore[arg-type]
@@ -87,6 +104,13 @@ def _risk_result(action: str) -> RiskCheckResult:
         effective_leverage_cap=5.0,
         symbol_risk_tier="btc",
         exposure_metrics={},
+        debug_payload={
+            "expected_cost_gate": {
+                "required_order_policy": required_order_policy,
+                "allow_market_fallback": allow_market_fallback,
+                "order_policy_reason": order_policy_reason,
+            }
+        },
     )
 
 
@@ -350,6 +374,45 @@ def test_entry_policy_prefers_limit_under_passive_conditions() -> None:
     assert plan.policy_name == "entry_passive_limit"
 
 
+def test_entry_policy_disables_market_fallback_when_limit_only_required() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(
+            action="long",
+            intent_type="entry",
+            required_order_policy="limit_only_or_post_only",
+            allow_market_fallback=False,
+        ),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+
+    assert plan.order_type == "LIMIT"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.allow_market_fallback is False
+    assert plan.required_order_policy == "limit_only_or_post_only"
+    assert plan.reason == "passive_entry_limit_only"
+
+
+def test_entry_policy_disables_market_fallback_when_risk_forbids_it() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(
+            action="long",
+            intent_type="entry",
+            allow_market_fallback=False,
+        ),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+
+    assert plan.order_type == "LIMIT"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.allow_market_fallback is False
+
+
 def test_execution_policy_profiles_by_symbol_timeframe_and_volatility() -> None:
     settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
 
@@ -409,7 +472,7 @@ def test_scale_in_and_reduce_policy_split_from_exit() -> None:
     assert exit_plan.order_type == "MARKET"
 
 
-def test_entry_policy_uses_market_when_snapshot_is_stale() -> None:
+def test_entry_policy_blocks_or_pends_when_snapshot_is_stale() -> None:
     settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
     plan = select_execution_plan(
         _intent(action="long", intent_type="entry"),
@@ -418,8 +481,23 @@ def test_entry_policy_uses_market_when_snapshot_is_stale() -> None:
         pre_trade_protection={},
     )
 
-    assert plan.order_type == "MARKET"
-    assert plan.reason == "market_data_not_reliable"
+    assert plan.order_type == "NONE"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.reason == "market_data_not_reliable_entry_block_or_pending"
+
+
+def test_entry_policy_blocks_or_pends_when_snapshot_is_incomplete() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(action="long", intent_type="entry"),
+        _snapshot(is_complete=False),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={},
+    )
+
+    assert plan.order_type == "NONE"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.reason == "market_data_not_reliable_entry_block_or_pending"
 
 
 def test_execute_live_trade_uses_policy_for_entry_and_scale_in(monkeypatch, db_session) -> None:
@@ -481,7 +559,11 @@ def test_execute_live_trade_uses_reduce_and_exit_policy(monkeypatch, db_session)
         decision_run_id=12,
         decision=_decision("reduce"),
         market_snapshot=_snapshot(),
-        risk_result=_risk_result("reduce"),
+        risk_result=_risk_result(
+            "reduce",
+            required_order_policy="limit_only_or_post_only",
+            allow_market_fallback=False,
+        ),
     )
 
     assert reduce_result["intent_type"] == "reduce_only"
@@ -503,7 +585,11 @@ def test_execute_live_trade_uses_reduce_and_exit_policy(monkeypatch, db_session)
         decision_run_id=13,
         decision=_decision("exit"),
         market_snapshot=_snapshot(),
-        risk_result=_risk_result("exit"),
+        risk_result=_risk_result(
+            "exit",
+            required_order_policy="limit_only_or_post_only",
+            allow_market_fallback=False,
+        ),
     )
 
     assert exit_result["intent_type"] == "reduce_only"
@@ -537,6 +623,21 @@ def test_protection_path_stays_separate_from_primary_execution(monkeypatch, db_s
     }
 
 
+def test_execution_policy_summary_exposes_tight_tp_limit_settings(db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.use_limit_take_profit_for_tight_tp = True
+    settings_row.tight_tp_bps_threshold = 40.0
+    settings_row.tp_limit_post_only = True
+
+    summary = summarize_execution_policy(settings_row)
+
+    protection = summary["protection"]
+    assert protection["use_limit_take_profit_for_tight_tp"] is True
+    assert protection["tight_tp_bps_threshold"] == 40.0
+    assert protection["tp_limit_post_only"] is True
+    assert "LIMIT/POST_ONLY TP" in str(protection["preferred_order_type"])
+
+
 def test_entry_limit_timeout_reprices_then_falls_back_to_market(monkeypatch, db_session) -> None:
     settings_row = _prime_live_settings(db_session)
     client = LimitRepriceFallbackClient()
@@ -562,6 +663,62 @@ def test_entry_limit_timeout_reprices_then_falls_back_to_market(monkeypatch, db_
     assert "live_limit_timeout" in audit_types
     assert "live_limit_repriced" in audit_types
     assert "live_limit_aggressive_fallback" in audit_types
+
+
+def test_entry_limit_timeout_does_not_fallback_to_market_when_forbidden(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = LimitRepriceFallbackClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr("trading_mvp.services.execution._execution_policy_sleep", lambda _seconds: None)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=151,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(),
+        risk_result=_risk_result(
+            "long",
+            required_order_policy="limit_only_or_post_only",
+            allow_market_fallback=False,
+            order_policy_reason="btc_long_tp_too_tight",
+        ),
+    )
+
+    order_types = [call["order_type"] for call in client.primary_order_calls]
+
+    assert result["status"] == "canceled"
+    assert order_types
+    assert set(order_types) == {"LIMIT"}
+    assert result["execution_policy"]["fallback_order_type"] == "NONE"
+    assert result["execution_policy"]["required_order_policy"] == "limit_only_or_post_only"
+    assert result["execution_policy"]["allow_market_fallback"] is False
+    audit_types = set(db_session.scalars(select(AuditEvent.event_type)))
+    assert "live_limit_market_fallback_skipped" in audit_types
+    assert "live_limit_aggressive_fallback" not in audit_types
+
+
+def test_entry_execution_blocks_stale_snapshot_before_market_submission(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = PolicyCaptureClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=152,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(is_stale=True),
+        risk_result=_risk_result("long"),
+    )
+
+    assert result["status"] == "blocked"
+    assert result["execution_policy"]["order_type"] == "NONE"
+    assert result["execution_policy"]["fallback_order_type"] == "NONE"
+    assert client.primary_order_calls == []
+    audit_rows = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id.asc())))
+    assert audit_rows[-1].event_type == "live_execution_blocked"
+    assert audit_rows[-1].payload["reason_code"] == "market_data_not_reliable_entry_block_or_pending"
 
 
 def test_partial_fill_is_preserved_before_aggressive_fallback(monkeypatch, db_session) -> None:

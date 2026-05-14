@@ -80,25 +80,25 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "실거래 주문",
-        endpoint: "/api/orders?limit=80",
+        endpoint: "/api/orders?limit=40&compact=true",
         description: "주문 상태, 외부 주문 ID, 보호 주문 연관 관계를 표시합니다.",
       },
       {
         title: "실거래 체결",
-        endpoint: "/api/executions?limit=80",
+        endpoint: "/api/executions?limit=40&compact=true",
         description: "부분 체결을 포함한 실제 체결 기록입니다.",
       },
     ],
   },
   risk: {
-    title: "리스크 상태",
-    eyebrow: "정책 우선",
-    description: "AI 추천보다 우선하는 리스크 가드 결과와 운영 경고를 확인합니다.",
+    title: "운영 리스크 요약",
+    eyebrow: "현재 리스크",
+    description: "현재 운영 판단에 필요한 risk_guard 허용/차단 상태, 차단 사유, 경고를 요약해서 확인합니다. 호출별 원본 감사는 안전 점검 감사 화면에서 봅니다.",
     sections: [
       {
-        title: "리스크 체크",
+        title: "최근 리스크 판단",
         endpoint: "/api/risk/checks?limit=12&compact=true",
-        description: "허용 여부, 차단 사유, 승인 리스크만 먼저 확인합니다.",
+        description: "운영자가 지금 확인해야 하는 허용 여부, 차단 사유, 승인 리스크만 먼저 확인합니다.",
       },
       {
         title: "알림",
@@ -138,7 +138,7 @@ export const dashboardPages: Record<
     sections: [
       {
         title: "감사 타임라인",
-        endpoint: "/api/audit?limit=30",
+        endpoint: "/api/audit?limit=30&compact=true",
         description: "운영 감사 로그입니다.",
       },
     ],

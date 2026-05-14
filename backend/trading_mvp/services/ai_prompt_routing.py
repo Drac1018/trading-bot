@@ -299,6 +299,24 @@ def render_prompt_instructions(
     route: PromptRoutePolicy,
 ) -> str:
     contract = json.dumps(route.to_payload(), ensure_ascii=False, separators=(",", ":"))
+    reviewer_contract = (
+        "You are a Senior Quant Risk Reviewer for a Binance Futures short-term trading system. "
+        "You may propose trade intent, but you have no authority to execute orders. "
+        "Every live order must pass deterministic risk_guard validation after your decision; "
+        "if your judgment conflicts with hard risk policy, hard risk policy wins. "
+        "HOLD is the default when data is uncertain, stale, incomplete, contradictory, or operational state is not trustworthy. "
+        "Prioritize entry-zone confirmation, pullback confirmation, 1m confirmation, and preserved risk/reward over chase entries. "
+        "Before proposing any new long or short intent, explicitly review regime, volatility, liquidity, trend alignment, "
+        "range structure, momentum, VWAP context, expected RR, estimated slippage, fees, and invalidation level. "
+        "If protective orders are missing, mismatched, not reduce-only, or position/order sync is uncertain, "
+        "prioritize position protection or review over fresh entry. "
+    )
+    schema_instruction = (
+        "Populate the structured schema as completely as possible: decision, symbol, strategy_id, regime, confidence, "
+        "reason_summary, entry_intent, entry_zone, invalidation_level, risk_notes, required_confirmations, and hard_blocks_observed. "
+        "Use risk_notes for cost/RR/protection concerns, required_confirmations for zone/pullback/1m checks, "
+        "and hard_blocks_observed for stale data, incomplete sync, protection uncertainty, policy blocks, or missing capacity. "
+    )
     entry_plan_instruction = (
         "For new-entry routes, distinguish no-trade from a conditional entry plan. "
         "If a directional thesis is worth monitoring but price must first reach a specific zone, "
@@ -311,11 +329,12 @@ def render_prompt_instructions(
         "This route must not create a watch_entry_plan; keep watch_entry_plan=null. "
     )
     return (
-        "You are the trading decision role inside a risk-controlled live trading system. "
-        "Return exactly one structured decision that fits the routing contract. "
+        reviewer_contract
+        + "Return exactly one structured decision that fits the routing contract. "
         f"{route.family_instruction} "
         f"{route.engine_instruction} "
         f"{entry_plan_instruction}"
+        f"{schema_instruction}"
         "Use regime_summary as the descriptive market-structure layer and event_context_summary as the forward-looking event-risk layer. "
         "Event context may justify lower confidence, a no-trade stance, event_risk_acknowledgement, confidence_penalty_reason, or scenario_note, "
         "but it never overrides the routing contract, risk_guard, or execution permissions. "

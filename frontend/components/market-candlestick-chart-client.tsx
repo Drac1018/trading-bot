@@ -1,5 +1,6 @@
 "use client";
 
+import type { MarketChartEventMarker as ClientMarketChartEventMarker } from "../lib/market-chart-markers";
 import { MarketChartZoomShell } from "./market-chart-zoom-shell";
 
 export type ClientMarketChartTimeframe = "15m" | "1h" | "4h";
@@ -23,13 +24,6 @@ export type ClientMarketChartStats = {
   rangePositionPct: number | null;
   averageVolume: number | null;
   volumeVsAverage: number | null;
-};
-
-export type ClientMarketChartEventMarker = {
-  timestamp: string;
-  kind: "ai" | "risk" | "execution";
-  label: string;
-  detail: string;
 };
 
 export type ClientMarketCandlestickModel = {
@@ -324,13 +318,34 @@ function timestampMs(value: string | null | undefined) {
 }
 
 function marketEventMarkerTooltipLabel(kind: ClientMarketChartEventMarker["kind"]) {
-  if (kind === "risk") {
-    return "리스크";
+  if (kind === "risk_approved") {
+    return "리스크 승인";
+  }
+  if (kind === "risk_blocked") {
+    return "리스크 차단";
   }
   if (kind === "execution") {
-    return "주문";
+    return "실제 실행";
   }
-  return "AI 판단";
+  return "AI 추천";
+}
+
+function marketEventMarkerTooltipRows(marker: ClientMarketChartEventMarker, priceDigits: number) {
+  const rows = [
+    `시각: ${formatDateTime(marker.timestamp)}`,
+    `심볼: ${marker.symbol}`,
+    `판단/액션: ${marker.action || marker.detail}`,
+    `가격: ${formatNumber(marker.price, priceDigits)}`,
+    `상태: ${marker.statusLabel || marketEventMarkerTooltipLabel(marker.kind)}`,
+  ];
+  if (marker.reasonLabel) {
+    rows.push(`${marker.kind === "risk_blocked" ? "차단 사유" : "사유"}: ${marker.reasonLabel}`);
+  }
+  return rows;
+}
+
+function clampSvgY(value: number, top: number, bottom: number) {
+  return Math.max(top, Math.min(bottom, value));
 }
 
 export function MarketCandlestickChartClient({
@@ -501,7 +516,8 @@ export function MarketCandlestickChartClient({
   }[latestTone];
   const markerColors = {
     ai: { fill: "#2563eb", stroke: "#bfdbfe" },
-    risk: { fill: "#e11d48", stroke: "#fecdd3" },
+    risk_approved: { fill: "#d97706", stroke: "#fde68a" },
+    risk_blocked: { fill: "#e11d48", stroke: "#fecdd3" },
     execution: { fill: "#059669", stroke: "#a7f3d0" },
   };
   const candleTimes = candles.map((item) => timestampMs(item.timestamp) ?? 0);
@@ -529,7 +545,7 @@ export function MarketCandlestickChartClient({
   const markerRowsByIndex = new Map<number, string[]>();
   visibleMarkers.forEach((marker) => {
     const rows = markerRowsByIndex.get(marker.index) ?? [];
-    rows.push(`${marketEventMarkerTooltipLabel(marker.kind)}: ${marker.detail}`);
+    rows.push(...marketEventMarkerTooltipRows(marker, priceDigits));
     markerRowsByIndex.set(marker.index, rows);
   });
   const aiRows = model.aiTooltipRows;
@@ -544,7 +560,7 @@ export function MarketCandlestickChartClient({
     const tooltipX = center + tooltipWidth + 14 > width - right ? center - tooltipWidth - 12 : center + 12;
     const profileRows = profilePointRows(profileBinForPrice(volumeProfile, item.close), volumeProfile, priceDigits);
     const markerRows = markerRowsByIndex.get(index) ?? [];
-    const showAiRows = index === latestIndex || aiMarkerIndexes.has(index) || markerRows.some((row) => row.startsWith("AI 판단:"));
+    const showAiRows = index === latestIndex || aiMarkerIndexes.has(index);
     const tooltipExtras = {
       bollinger: bollingerSeries[index] ?? null,
       profileRows,
@@ -716,12 +732,35 @@ export function MarketCandlestickChartClient({
         {showCloseLine ? <polyline points={closeLine} fill="none" stroke="#2563eb" strokeWidth="1.8" strokeLinejoin="round" /> : null}
         {visibleMarkers.map((marker) => {
           const colors = markerColors[marker.kind];
-          const y = priceTop + 10 + marker.slot * 16;
-          const markerWidth = marker.label.length > 2 ? 30 : 22;
+          const markerPriceY =
+            marker.price !== null
+              ? clampSvgY(yForPrice(marker.price), priceTop + 8, priceTop + priceHeight - 8)
+              : null;
+          const y =
+            markerPriceY === null
+              ? priceTop + 10 + marker.slot * 16
+              : clampSvgY(markerPriceY - 12 - marker.slot * 16, priceTop + 8, priceTop + priceHeight - 8);
+          const markerWidth = marker.label.length > 2 ? 34 : 24;
           return (
-            <g key={`${marker.kind}-${marker.timestamp}-${marker.slot}`}>
-              <title>{`${marker.label}: ${marker.detail} / ${formatDateTime(marker.timestamp)}`}</title>
+            <g
+              key={`${marker.kind}-${marker.timestamp}-${marker.slot}`}
+              data-market-event-marker="true"
+              data-market-event-kind={marker.kind}
+              data-market-event-status={marker.statusLabel}
+            >
+              <title>{marketEventMarkerTooltipRows(marker, priceDigits).join("\n")}</title>
               <line x1={marker.x} x2={marker.x} y1={priceTop} y2={priceTop + priceHeight} stroke={colors.fill} strokeDasharray="2 4" strokeWidth="1" opacity="0.55" />
+              {markerPriceY !== null ? (
+                <circle
+                  cx={marker.x}
+                  cy={markerPriceY}
+                  r="4"
+                  fill={colors.fill}
+                  stroke="#ffffff"
+                  strokeWidth="1.5"
+                  data-market-event-price={marker.price}
+                />
+              ) : null}
               <rect x={marker.x - markerWidth / 2} y={y - 8} width={markerWidth} height="14" rx="5" fill={colors.fill} stroke={colors.stroke} />
               {!compact ? (
                 <text x={marker.x} y={y + 2} textAnchor="middle" className="fill-white text-[8px] font-semibold">
