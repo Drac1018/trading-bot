@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from trading_mvp.models import (
     AgentRun,
+    AuditEvent,
     MarketSnapshot,
     PendingEntryPlan,
     Position,
@@ -23,6 +24,7 @@ from trading_mvp.services.scheduler import (
     maybe_refresh_exchange_sync_freshness,
     run_due_operational_cycles,
     run_interval_decision_cycle,
+    run_market_refresh_cycle,
     run_release_enrichment_watch_cycle,
 )
 from trading_mvp.services.settings import get_or_create_settings
@@ -1117,6 +1119,43 @@ def test_release_enrichment_watch_cycle_skips_already_enriched_event(monkeypatch
     result = run_release_enrichment_watch_cycle(db_session, triggered_by="scheduler")
 
     assert result["results"] == []
+
+
+def test_market_refresh_cycle_skips_when_workflow_lease_is_held(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    settings_row.default_timeframe = "15m"
+    db_session.add(settings_row)
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler._try_workflow_advisory_lock",
+        lambda session, workflow: False,
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_market_refresh_cycle",
+        lambda self, **kwargs: pytest.fail("market refresh should not run while lease is held"),
+    )
+
+    result = run_market_refresh_cycle(db_session)
+    db_session.flush()
+
+    assert result == {
+        "workflow": "market_refresh_cycle",
+        "status": "skipped",
+        "reason": "WORKFLOW_LEASE_HELD",
+        "results": [],
+    }
+    event = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "scheduler_workflow_skipped")
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+    assert event is not None
+    assert event.entity_id == "market_refresh_cycle"
+    assert event.payload["reason"] == "WORKFLOW_LEASE_HELD"
 
 
 def test_deduped_entry_trigger_surfaces_reason_fields(monkeypatch, db_session) -> None:

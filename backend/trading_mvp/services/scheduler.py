@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_mvp.models import MarketSnapshot, PendingEntryPlan, SchedulerRun
+from trading_mvp.models import MarketSnapshot, SchedulerRun
 from trading_mvp.services.account import get_open_positions
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.runtime_state import build_sync_freshness_summary
+from trading_mvp.services.service_gate import active_pending_entry_plan_statement
 from trading_mvp.services.settings import (
     get_effective_symbol_schedule,
     get_or_create_settings,
@@ -32,6 +34,9 @@ PRE_DECISION_SYNC_MIN_FRESH_SECONDS = 60
 RELEASE_ENRICHMENT_RETRY_SECONDS = 15
 RELEASE_ENRICHMENT_WATCH_WINDOW_SECONDS = 120
 STALE_RUNNING_SCHEDULER_RUN_SECONDS = 30 * 60
+SCHEDULER_WORKFLOW_ADVISORY_LOCK_KEYS = {
+    MARKET_REFRESH_WORKFLOW: 520_241_605_160_001,
+}
 BLS_RELEASE_WATCH_EVENT_NAMES = {
     "Consumer Price Index",
     "Producer Price Index",
@@ -108,6 +113,40 @@ def _is_due(latest: SchedulerRun | None, delta: timedelta) -> bool:
     if latest.next_run_at is None:
         return computed_due_at <= utcnow_naive()
     return min(latest.next_run_at, computed_due_at) <= utcnow_naive()
+
+
+def _try_workflow_advisory_lock(session: Session, workflow: str) -> bool:
+    lock_key = SCHEDULER_WORKFLOW_ADVISORY_LOCK_KEYS.get(workflow)
+    if lock_key is None:
+        return True
+    bind = session.get_bind()
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect_name != "postgresql":
+        return True
+    return bool(
+        session.scalar(text("select pg_try_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
+    )
+
+
+def _workflow_lease_skip_payload(workflow: str) -> dict[str, object]:
+    return {
+        "workflow": workflow,
+        "status": "skipped",
+        "reason": "WORKFLOW_LEASE_HELD",
+    }
+
+
+def _record_workflow_lease_skip(session: Session, workflow: str) -> None:
+    record_audit_event(
+        session,
+        event_type="scheduler_workflow_skipped",
+        entity_type="scheduler_workflow",
+        entity_id=workflow,
+        severity="info",
+        message="Scheduler workflow skipped because another process holds the DB lease.",
+        payload=_workflow_lease_skip_payload(workflow),
+    )
+    session.flush()
 
 
 def _coerce_datetime(value: object) -> datetime | None:
@@ -352,10 +391,8 @@ def _commit_before_external_scheduler_work(session: Session) -> None:
 
 
 def _rollback_scheduler_session(session: Session) -> None:
-    try:
+    with suppress(Exception):
         session.rollback()
-    except Exception:
-        pass
 
 
 def _record_interval_decision_sync_failure(
@@ -515,6 +552,13 @@ def run_window(session: Session, window: str, triggered_by: str = "manual") -> d
             "auto_resume": auto_resume_result,
         }
     if window == "1h":
+        if not _try_workflow_advisory_lock(session, MARKET_REFRESH_WORKFLOW):
+            _record_workflow_lease_skip(session, MARKET_REFRESH_WORKFLOW)
+            return {
+                **_workflow_lease_skip_payload(MARKET_REFRESH_WORKFLOW),
+                "window": window,
+                "auto_resume": auto_resume_result,
+            }
         outcome = orchestrator.run_market_refresh_cycle(
             trigger_event=triggered_by,
             auto_resume_checked=True,
@@ -660,6 +704,9 @@ def get_due_market_refresh_symbols(session: Session) -> list[str]:
 
 
 def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") -> dict[str, object]:
+    if not _try_workflow_advisory_lock(session, MARKET_REFRESH_WORKFLOW):
+        _record_workflow_lease_skip(session, MARKET_REFRESH_WORKFLOW)
+        return {**_workflow_lease_skip_payload(MARKET_REFRESH_WORKFLOW), "results": []}
     orchestrator = TradingOrchestrator(session)
     results: list[dict[str, object]] = []
     for effective in get_effective_symbol_schedule(orchestrator.settings_row):
@@ -815,7 +862,7 @@ def get_due_entry_plan_symbols(session: Session) -> list[str]:
         {
             row.symbol.upper()
             for row in session.scalars(
-                select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed")
+                active_pending_entry_plan_statement()
             )
         }
     )
