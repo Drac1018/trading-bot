@@ -94,6 +94,7 @@ from trading_mvp.services.scheduler import (
     run_window,
 )
 from trading_mvp.services.seed import seed_demo_data
+from trading_mvp.services.service_gate import build_service_switch_gate_snapshot
 from trading_mvp.services.settings import (
     arm_live_execution,
     clear_operator_event_view,
@@ -690,6 +691,17 @@ def _run_binance_account_cache_refresh() -> None:
 @app.get("/health")
 def health() -> dict[str, object]:
     return {"status": "ok", "mode": "service_ready", "database": "ready"}
+
+
+@app.get("/api/runtime/service-gate")
+def runtime_service_gate(
+    recent_minutes: int = 30,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return build_service_switch_gate_snapshot(
+        db,
+        recent_minutes=_bounded_limit(recent_minutes, default=30, maximum=180),
+    )
 
 
 @app.post("/api/system/seed")
