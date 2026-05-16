@@ -136,18 +136,22 @@ def _env_flag(name: str, *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _background_loop_default_enabled() -> bool:
+    return engine.dialect.name != "sqlite" and _env_flag("TRADING_MVP_SERVICE_RUNTIME", default=False)
+
+
 def _background_scheduler_enabled() -> bool:
-    default = engine.dialect.name != "sqlite"
+    default = _background_loop_default_enabled()
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER", default=default)
 
 
 def _background_user_stream_enabled() -> bool:
-    default = engine.dialect.name != "sqlite"
+    default = _background_loop_default_enabled()
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM", default=default)
 
 
 def _background_market_stream_enabled() -> bool:
-    default = engine.dialect.name != "sqlite"
+    default = _background_loop_default_enabled()
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_MARKET_STREAM", default=default)
 
 
