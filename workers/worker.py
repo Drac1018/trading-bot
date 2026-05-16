@@ -11,11 +11,16 @@ def main() -> None:
     require_runtime_database_url("worker startup")
     settings = get_settings()
     if sys.platform == "win32":
+        print(
+            "TradingMvpWorker is idle on Windows; backend owns live scheduler/user/market loops.",
+            flush=True,
+        )
         while True:
             time.sleep(60)
     try:
         from rq import Connection, Queue, Worker  # type: ignore[import-not-found]
     except Exception:
+        print("RQ is unavailable; TradingMvpWorker is idling without background jobs.", flush=True)
         while True:
             time.sleep(60)
 

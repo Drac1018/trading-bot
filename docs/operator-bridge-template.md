@@ -53,7 +53,7 @@
 ## 본문 병기 예시
 
 ```md
-- `decision_cycle_interval_minutes = 1` (`재검토 확인 주기`)
+- `decision_cycle_interval_minutes <= 5` (`재검토 확인 주기`)
 - `ai_call_interval_minutes = 5` (`AI 기본 검토 간격`)
 - `Event source provider = fred` (`event_source_provider`)
 - `BLS enrichment URL = http://127.0.0.1:8091/bls/releases` (`event_source_bls_enrichment_url`)

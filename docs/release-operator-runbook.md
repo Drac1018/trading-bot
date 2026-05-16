@@ -45,12 +45,19 @@ cd C:\my-trading-bot
 powershell -ExecutionPolicy Bypass -File scripts\run_release_day.ps1 -CheckOnly
 ```
 
+decision cycle을 1분 기준으로 강하게 점검해야 하면:
+
+```powershell
+cd C:\my-trading-bot
+powershell -ExecutionPolicy Bypass -File scripts\run_release_day.ps1 -CheckOnly -MaxDecisionCycleMinutes 1
+```
+
 ## 핵심 리스크
 
 지금 남은 핵심 리스크는 2개다.
 
 1. 발표 전에 `backend`가 살아 있지 않음
-2. cadence가 1분 수준이 아님
+2. cadence가 운영 기준을 벗어남
 
 `legacy static params`는 현재 DB 기준으로 이미 `{}` 상태다.
 
@@ -139,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run_frontend.ps1
 
 - `exchange_sync_interval_seconds = 30~60` (`거래소 동기화 주기`)
 - `market_refresh_interval_minutes = 1` (`시장 갱신 주기`)
-- `decision_cycle_interval_minutes = 1` (`재검토 확인 주기`)
+- `decision_cycle_interval_minutes <= 5` (`재검토 확인 주기`)
 
 의미:
 
@@ -159,7 +166,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run_frontend.ps1
 3. settings 저장 완료
 - [http://127.0.0.1:3000/dashboard/settings?view=integration](http://127.0.0.1:3000/dashboard/settings?view=integration)
 
-4. cadence 1분 수준
+4. cadence 운영 기준
 
 ## 발표 시각
 
@@ -226,7 +233,7 @@ Invoke-WebRequest -Method POST http://127.0.0.1:8000/api/cycles/run -UseBasicPar
 ### cadence delay
 
 - 증상: 서비스는 정상이지만 반영이 늦음
-- 조치: cadence를 1분 수준으로 낮추고 다음 발표 전부터 유지
+- 조치: market 1분, decision 5분 이하로 맞추고 다음 발표 전부터 유지
 
 ## 하지 말 것
 

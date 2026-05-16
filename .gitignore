@@ -16,5 +16,8 @@ data/
 *.sqlite3
 .env
 .logs/
+logs/
 tmp/*.log
+tmp/profitability-latest.json
+tmp/pytest-*/
 frontend/tsconfig.tsbuildinfo

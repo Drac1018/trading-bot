@@ -5,6 +5,8 @@ param(
     [int]$WrapperPort = 8091,
     [int]$BackendPort = 8000,
     [int]$FrontendPort = 3000,
+    [ValidateRange(1, 1440)]
+    [int]$MaxDecisionCycleMinutes = 5,
     [int]$StartupTimeoutSeconds = 180
 )
 
@@ -291,18 +293,18 @@ if ($null -ne $settings) {
         Add-CheckResult -Level "FAIL" -Name "global market refresh" -Detail "expected 1m, actual=$($settings.market_refresh_interval_minutes)m"
     }
 
-    if (([int]$settings.decision_cycle_interval_minutes) -le 1) {
+    if (([int]$settings.decision_cycle_interval_minutes) -le $MaxDecisionCycleMinutes) {
         Add-CheckResult -Level "PASS" -Name "global decision cycle" -Detail "$($settings.decision_cycle_interval_minutes)m"
     }
     else {
-        Add-CheckResult -Level "FAIL" -Name "global decision cycle" -Detail "expected 1m, actual=$($settings.decision_cycle_interval_minutes)m"
+        Add-CheckResult -Level "FAIL" -Name "global decision cycle" -Detail "expected <=${MaxDecisionCycleMinutes}m, actual=$($settings.decision_cycle_interval_minutes)m"
     }
 }
 
 if ($null -ne $cadences) {
     $enabledItems = @($cadences.items | Where-Object { $_.enabled })
     $slowMarket = @($enabledItems | Where-Object { ([int]$_.market_refresh_interval_minutes) -gt 1 })
-    $slowDecision = @($enabledItems | Where-Object { ([int]$_.decision_cycle_interval_minutes) -gt 1 })
+    $slowDecision = @($enabledItems | Where-Object { ([int]$_.decision_cycle_interval_minutes) -gt $MaxDecisionCycleMinutes })
 
     if ($slowMarket.Count -eq 0) {
         Add-CheckResult -Level "PASS" -Name "symbol market cadence" -Detail "all enabled symbols <= 1m"
@@ -312,7 +314,7 @@ if ($null -ne $cadences) {
     }
 
     if ($slowDecision.Count -eq 0) {
-        Add-CheckResult -Level "PASS" -Name "symbol decision cadence" -Detail "all enabled symbols <= 1m"
+        Add-CheckResult -Level "PASS" -Name "symbol decision cadence" -Detail "all enabled symbols <= ${MaxDecisionCycleMinutes}m"
     }
     else {
         Add-CheckResult -Level "FAIL" -Name "symbol decision cadence" -Detail (Format-Offenders -Items $slowDecision -PropertyName "decision_cycle_interval_minutes")
@@ -328,7 +330,7 @@ if ($script:hasFailure) {
     Write-Host "현재 상태는 발표 운영 준비 완료가 아닙니다." -ForegroundColor Red
     Write-Host "우선 조치:" -ForegroundColor Red
     Write-Host "1. settings에서 provider/FRED key/BLS URL을 확인합니다."
-    Write-Host "2. cadence를 global 및 symbol 기준 모두 1분 수준으로 맞춥니다."
+    Write-Host "2. cadence를 global 및 symbol 기준 모두 운영 기준 이하로 맞춥니다. 기본 decision 기준은 ${MaxDecisionCycleMinutes}분입니다."
     Write-Host "3. 필요한 경우 settings 저장 후 다시 'scripts\\run_release_day.ps1 -CheckOnly'를 실행합니다."
     Write-Host "4. 정말 급하면 발표 직후 'POST http://127.0.0.1:$BackendPort/api/cycles/run' 1회를 사용합니다."
     exit 1

@@ -88,6 +88,10 @@ function Invoke-CheckedPython {
 
 $databaseUrl = Test-ExplicitDatabaseConfiguration
 $env:DATABASE_URL = $databaseUrl
+$env:TRADING_MVP_SERVICE_RUNTIME = "1"
+$env:TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER = "1"
+$env:TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM = "1"
+$env:TRADING_MVP_ENABLE_BACKGROUND_MARKET_STREAM = "1"
 Start-LocalPostgresqlIfConfigured -DatabaseUrl $databaseUrl
 Invoke-CheckedPython -Arguments @("-m", "trading_mvp.migrate")
 Invoke-CheckedPython -Arguments @("-m", "uvicorn", "trading_mvp.main:app", "--app-dir", "backend", "--host", "0.0.0.0", "--port", "8000")
