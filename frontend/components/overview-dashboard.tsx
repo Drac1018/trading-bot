@@ -20,7 +20,7 @@ import {
 } from "../lib/risk-reason-copy.js";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const refreshIntervalMs = 15000;
+const refreshIntervalMs = 60000;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
 
 type RolloutMode = (typeof rolloutModeOptions)[number];
@@ -1348,6 +1348,10 @@ async function fetchPayload(): Promise<OperatorDashboardPayload> {
   return (await response.json()) as OperatorDashboardPayload;
 }
 
+function shouldRefreshInBrowser() {
+  return typeof document === "undefined" || document.visibilityState === "visible";
+}
+
 function filteredBlockedReasons(symbol: OperatorSymbolSummary) {
   const source =
     symbol.risk_guard.blocked_reason_codes.length > 0
@@ -2569,6 +2573,9 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
   useEffect(() => {
     let active = true;
     const refresh = async () => {
+      if (!shouldRefreshInBrowser()) {
+        return;
+      }
       try {
         const next = await fetchPayload();
         if (!active) {
@@ -2585,9 +2592,16 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
       }
     };
     const interval = window.setInterval(() => void refresh(), refreshIntervalMs);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       active = false;
       window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 

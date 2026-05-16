@@ -120,6 +120,12 @@ function operatorDashboardEndpoint(slug: string) {
   if (slug === "market" || slug === "scheduler") {
     return `/api/dashboard/operator?view=${slug}`;
   }
+  if (slug === "decisions") {
+    return "/api/dashboard/operator?view=decision";
+  }
+  if (slug === "risk") {
+    return "/api/dashboard/operator?view=risk";
+  }
   return "/api/dashboard/operator";
 }
 

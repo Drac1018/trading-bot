@@ -4400,6 +4400,72 @@ function isAiHoldBaselineDisagreement(row: RiskCheckRow) {
   );
 }
 
+function riskReasonEvidence(row: RiskCheckRow) {
+  const payload = asRecord(row.payload);
+  const evidence = asRecord(payload?.reason_evidence) ?? asRecord(payload?.debug_payload);
+  const reasons = row.reason_codes ?? [];
+  const parts: string[] = [];
+
+  if (reasons.includes("SYMBOL_RECENT_PERFORMANCE_NEGATIVE")) {
+    const gate = asRecord(evidence?.symbol_recent_performance_gate);
+    const symbol = row.symbol ?? rowString(gate, "symbol") ?? "해당 심볼";
+    const netPnl = rowNumber(gate, "net_pnl_after_fees");
+    const grossPnl = rowNumber(gate, "gross_realized_pnl");
+    const feeTotal = rowNumber(gate, "fee_total");
+    const executionCount = rowNumber(gate, "execution_count");
+    const lookbackDays = rowNumber(gate, "lookback_days");
+    if (gate?.status === "blocked" || netPnl !== null) {
+      parts.push(
+        `${symbol} 최근 ${formatNumber(lookbackDays, 0)}일 ${formatNumber(
+          executionCount,
+          0,
+        )}건 기준 순손익 ${formatNumber(netPnl, 4)} USDT (gross ${formatNumber(grossPnl, 4)}, fee ${formatNumber(
+          feeTotal,
+          4,
+        )})`,
+      );
+    }
+  }
+
+  if (reasons.includes("CORRELATED_EXPOSURE_LIMIT_REACHED")) {
+    const gate = asRecord(evidence?.portfolio_exposure_gate);
+    const limits = asRecord(gate?.limits);
+    const combinedPct = rowNumber(gate, "combined_BTC_ETH_directional_exposure_pct");
+    const correlatedPct = rowNumber(gate, "correlated_symbol_exposure_pct");
+    const directionalPct = rowNumber(gate, "directional_bias_pct");
+    const limitPct =
+      rowNumber(limits, "max_same_direction_major_exposure_pct") ?? rowNumber(limits, "directional_bias_pct");
+    const pct = combinedPct ?? correlatedPct ?? directionalPct;
+    if (pct !== null || limitPct !== null) {
+      parts.push(
+        `BTC/ETH 동일방향 노출 ${formatNumber(pct, 2)}% / 한도 ${formatNumber(
+          limitPct,
+          2,
+        )}%로 신규 진입 전 차단`,
+      );
+    }
+  }
+
+  const entryTrigger = asRecord(evidence?.entry_trigger);
+  if (
+    reasons.some((reason) => ["ENTRY_TRIGGER_NOT_MET", "CHASE_LIMIT_EXCEEDED", "SLIPPAGE_THRESHOLD_EXCEEDED"].includes(reason)) &&
+    entryTrigger
+  ) {
+    const latestPrice = rowNumber(entryTrigger, "latest_price");
+    const zoneMin = rowNumber(entryTrigger, "entry_zone_min");
+    const zoneMax = rowNumber(entryTrigger, "entry_zone_max");
+    const observedChase = rowNumber(entryTrigger, "observed_chase_bps");
+    const maxChase = rowNumber(entryTrigger, "max_chase_bps");
+    parts.push(
+      `현재가 ${formatPriceValue(latestPrice)}, 진입 구간 ${formatPriceValue(zoneMin)}~${formatPriceValue(
+        zoneMax,
+      )}, 추격 ${formatNumber(observedChase, 2)}bps / 허용 ${formatNumber(maxChase, 2)}bps`,
+    );
+  }
+
+  return parts.join(" / ");
+}
+
 function riskNoTradeReason(
   row: RiskCheckRow,
   plan: ReturnType<typeof activeEntryPlanDetails>,
@@ -4441,6 +4507,13 @@ function riskNoTradeReason(
     return {
       label: "현재는 신규 진입 신호가 없어 대기 중입니다.",
       hint: "새 후보가 생기거나 AI가 watch plan을 제출하면 플랜 대기 상태로 바뀝니다.",
+    };
+  }
+  const evidence = riskReasonEvidence(row);
+  if (evidence) {
+    return {
+      label: formatTranslatedCodeList(row.reason_codes),
+      hint: evidence,
     };
   }
   return {
@@ -4533,8 +4606,17 @@ function translateReasonCode(value: string | null | undefined) {
     ENTRY_CLAMPED_TO_SAME_TIER_LIMIT: "동일 티어 집중도 한도에 맞게 진입 수량이 축소되었습니다.",
     ENTRY_SIZE_BELOW_MIN_NOTIONAL: "최소 실행 가능 주문 미만",
     ENTRY_TRIGGER_NOT_MET: "진입 조건이 아직 충족되지 않았습니다",
+    SYMBOL_RECENT_PERFORMANCE_NEGATIVE: "최근 해당 심볼 실현손익이 수수료 차감 후 음수입니다",
+    CORRELATED_EXPOSURE_LIMIT_REACHED: "BTC/ETH 동일방향 상관 노출 한도를 초과했습니다",
     MACRO_EVENT_RESULT_CONFLICT: "발표 결과와 진입 방향 충돌",
     CHASE_LIMIT_EXCEEDED: "가격이 이미 지나가 추격 진입을 막았습니다",
+    LOW_CONFIDENCE: "진입 확신도 부족",
+    TRANSITION_FRAGILE: "전환 레짐이 불안정",
+    TOP_TRADER_LONG_CROWDED: "상위 트레이더 롱 쏠림",
+    LOW_EDGE_HOLD_CANDIDATE: "거래 우위가 약해 관망",
+    BREADTH_WEAKNESS: "시장 폭 약화",
+    LOW_CONFIDENCE_PULLBACK: "눌림목 진입 확신도 부족",
+    DERIVATIVES_HEADWIND: "파생시장 역풍",
     INVALID_INVALIDATION_PRICE: "무효화 가격 기준 이상",
     ENGINE_TREND_PULLBACK_ENGINE: "눌림목 진입 엔진",
     ENGINE_TREND_CONTINUATION_ENGINE: "추세 지속 엔진 기준",
@@ -4596,8 +4678,14 @@ function formatInternalCodeLabel(value: string | null | undefined) {
     capacity_reached: "새 주문 슬롯 미배정",
     ranked_portfolio_focus: "포트폴리오 우선순위 선정",
     breadth_hold_bias: "시장 폭 약화로 대기",
+    breadth_weak_reduce_capacity: "시장 폭 약화로 진입 여력 축소",
     score_below_threshold: "진입 점수 부족",
+    low_confidence: "진입 확신도 부족",
+    transition_fragile: "전환 레짐이 불안정",
+    top_trader_long_crowded: "상위 트레이더 롱 쏠림",
     low_edge_hold_candidate: "우위가 약해 대기",
+    low_confidence_pullback: "눌림목 진입 확신도 부족",
+    derivatives_headwind: "파생시장 역풍",
     low_conviction_slot_excluded: "확신도 낮음으로 미선정",
     underperforming_expectancy_bucket: "최근 기대값 버킷 약화",
     expectancy_below_threshold: "기대값 기준 부족",
@@ -5723,11 +5811,12 @@ export function RiskView({
               const status = riskRowStatusPresentation(row, plan);
               const riskDecision = riskDecisionPresentation(row, plan);
               const noTradeReason = riskNoTradeReason(row, plan, skipReason ? skipCopy.detail : allowed.hint);
+              const reasonEvidence = riskReasonEvidence(row);
               const aiHoldBaselineDisagreement = isAiHoldBaselineDisagreement(row);
               const internalReasonTitle = aiHoldBaselineDisagreement ? "내부 검증 코드" : "차단 사유";
               const internalReasonHint = aiHoldBaselineDisagreement
                 ? "AI 관망 상태와 함께 저장된 리스크 원본 코드입니다. 실제 주문은 리스크 승인 없이는 제출되지 않습니다."
-                : internalCodeHint(row.reason_codes);
+                : reasonEvidence || internalCodeHint(row.reason_codes);
 
               return (
                 <article

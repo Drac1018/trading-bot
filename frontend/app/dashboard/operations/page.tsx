@@ -84,7 +84,7 @@ function tabs(searchParams: SearchParams): DashboardSectionTab[] {
 
 async function DecisionSection({ query }: { query: SearchParams }) {
   const [operator, decisionRows] = await Promise.all([
-    fetchJson<OperatorDashboardPayload>("/api/dashboard/operator"),
+    fetchJson<OperatorDashboardPayload>("/api/dashboard/operator?view=decision"),
     fetchJson<Row[]>("/api/decisions?limit=12&compact=true"),
   ]);
   const selectedSymbol = resolveSelectedSymbol(
@@ -106,7 +106,7 @@ async function DecisionSection({ query }: { query: SearchParams }) {
 
 async function RiskSection() {
   const [operator, riskRows, alertRows] = await Promise.all([
-    fetchJson<OperatorDashboardPayload>("/api/dashboard/operator"),
+    fetchJson<OperatorDashboardPayload>("/api/dashboard/operator?view=risk"),
     fetchJson<Row[]>("/api/risk/checks?limit=12&compact=true"),
     fetchJson<Row[]>("/api/alerts?limit=20"),
   ]);

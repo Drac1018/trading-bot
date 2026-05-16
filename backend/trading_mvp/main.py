@@ -47,8 +47,8 @@ from trading_mvp.services.connectivity import (
 from trading_mvp.services.dashboard import (
     get_agent_runs,
     get_alerts,
-    get_audit_event_detail,
     get_analytics_cost_breakdown,
+    get_audit_event_detail,
     get_audit_timeline,
     get_decisions,
     get_execution_quality_report,

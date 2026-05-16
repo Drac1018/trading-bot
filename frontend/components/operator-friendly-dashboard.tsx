@@ -27,7 +27,7 @@ type ActionItem = {
 };
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const refreshIntervalMs = 15000;
+const refreshIntervalMs = 60000;
 const syncCatchUpIntervalMs = 2500;
 const syncCatchUpMaxAttempts = 8;
 
@@ -833,6 +833,10 @@ async function fetchPayload(): Promise<OperatorDashboardPayload> {
   return (await response.json()) as OperatorDashboardPayload;
 }
 
+function shouldRefreshInBrowser() {
+  return typeof document === "undefined" || document.visibilityState === "visible";
+}
+
 export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashboardPayload }) {
   const [payload, setPayload] = useState(initial);
   const [lastUpdated, setLastUpdated] = useState(() =>
@@ -845,6 +849,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   useEffect(() => {
     let active = true;
     const refresh = async () => {
+      if (!shouldRefreshInBrowser()) {
+        return;
+      }
       try {
         const next = await fetchPayload();
         if (!active) {
@@ -861,9 +868,16 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
       }
     };
     const interval = window.setInterval(() => void refresh(), refreshIntervalMs);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       active = false;
       window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 
@@ -878,6 +892,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
 
     const refreshUntilCaughtUp = () => {
       timeoutId = window.setTimeout(async () => {
+        if (!shouldRefreshInBrowser()) {
+          return;
+        }
         attempts += 1;
         try {
           const next = await fetchPayload();

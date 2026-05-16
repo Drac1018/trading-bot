@@ -26,8 +26,8 @@ from trading_mvp.services.dashboard import (
     _latest_rows_by_extracted_symbol,
     _latest_rows_by_symbol,
     classify_audit_event,
-    get_audit_timeline,
     get_audit_event_detail,
+    get_audit_timeline,
     get_executions,
     get_operator_dashboard,
     get_orders,
@@ -433,7 +433,7 @@ def test_latest_rows_by_extracted_symbol_bounds_offset_fallback(db_session) -> N
 
 
 def _seed_multi_symbol_operator_rows(db_session) -> None:
-    from trading_mvp.models import AgentRun, MarketSnapshot
+    from trading_mvp.models import AgentRun, DecisionPerformanceFact, MarketSnapshot
 
     now = utcnow_naive()
     settings = get_or_create_settings(db_session)
@@ -729,6 +729,38 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
     db_session.flush()
     btc_run.created_at = now - timedelta(minutes=6)
     eth_run.created_at = now - timedelta(minutes=3)
+    db_session.add_all(
+        [
+            DecisionPerformanceFact(
+                decision_run_id=btc_run.id,
+                provider_name=btc_run.provider_name,
+                symbol="BTCUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["TREND_UP"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                telemetry_metadata={"source": "llm"},
+                telemetry_output={"decision": "long"},
+                created_at=btc_run.created_at,
+                updated_at=btc_run.updated_at,
+            ),
+            DecisionPerformanceFact(
+                decision_run_id=eth_run.id,
+                provider_name=eth_run.provider_name,
+                symbol="ETHUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["PULLBACK_ENTRY"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                telemetry_metadata={"source": "llm"},
+                telemetry_output={"decision": "long"},
+                created_at=eth_run.created_at,
+                updated_at=eth_run.updated_at,
+            ),
+        ]
+    )
 
     btc_risk = RiskCheck(
         symbol="BTCUSDT",
@@ -3156,9 +3188,13 @@ def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db
     with TestClient(app) as client:
         market_response = client.get("/api/dashboard/operator?view=market")
         scheduler_response = client.get("/api/dashboard/operator?view=scheduler")
+        decision_response = client.get("/api/dashboard/operator?view=decision")
+        risk_response = client.get("/api/dashboard/operator?view=risk")
 
     assert market_response.status_code == 200
     assert scheduler_response.status_code == 200
+    assert decision_response.status_code == 200
+    assert risk_response.status_code == 200
 
     market_payload = market_response.json()
     market_btc = next(item for item in market_payload["symbols"] if item["symbol"] == "BTCUSDT")
@@ -3187,6 +3223,34 @@ def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db
     assert scheduler_btc["execution"]["order_id"] is None
     assert scheduler_btc["protection_status"]["status"] == "unknown"
     assert scheduler_btc["audit_events"] == []
+
+    decision_payload = decision_response.json()
+    decision_btc = next(item for item in decision_payload["symbols"] if item["symbol"] == "BTCUSDT")
+
+    assert decision_payload["market_signal"]["performance_windows"] == []
+    assert decision_payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert decision_payload["execution_windows"] == []
+    assert decision_payload["audit_events"] == []
+    assert decision_btc["ai_decision"]["decision"] == "long"
+    assert decision_btc["risk_guard"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert decision_btc["execution"]["order_id"] is not None
+    assert decision_btc["open_position"]["is_open"] is True
+    assert decision_btc["event_operator_control"] is None
+    assert decision_btc["audit_events"] == []
+
+    risk_payload = risk_response.json()
+    risk_btc = next(item for item in risk_payload["symbols"] if item["symbol"] == "BTCUSDT")
+
+    assert risk_payload["market_signal"]["performance_windows"] == []
+    assert risk_payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert risk_payload["execution_windows"] == []
+    assert risk_payload["audit_events"] == []
+    assert risk_btc["ai_decision"]["decision_run_id"] is None
+    assert risk_btc["risk_guard"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert risk_btc["execution"]["order_id"] is not None
+    assert risk_btc["protection_status"]["status"] == "unknown"
+    assert risk_btc["event_operator_control"] is None
+    assert risk_btc["audit_events"] == []
 
 
 def test_scheduler_operator_projection_uses_decision_fact_for_deep_history(db_session) -> None:
@@ -3313,6 +3377,19 @@ def test_scheduler_operator_projection_uses_decision_fact_for_deep_history(db_se
     assert btc.execution.order_id is None
     assert btc.protection_status.status == "unknown"
     assert btc.audit_events == []
+
+    decision_payload = get_operator_dashboard(db_session, view="decision")
+    decision_btc = next(item for item in decision_payload.symbols if item.symbol == "BTCUSDT")
+
+    assert decision_btc.ai_decision.decision_run_id == target_run.id
+    assert decision_btc.risk_guard.blocked_reason_codes == ["POSITION_STATE_STALE"]
+    assert decision_btc.audit_events == []
+
+    full_payload = get_operator_dashboard(db_session)
+    full_btc = next(item for item in full_payload.symbols if item.symbol == "BTCUSDT")
+
+    assert full_btc.ai_decision.decision_run_id == target_run.id
+    assert full_btc.risk_guard.blocked_reason_codes == ["POSITION_STATE_STALE"]
 
 
 def test_scheduler_api_compact_omits_outcome(testclient_db_factory) -> None:
@@ -3494,6 +3571,70 @@ def test_risk_checks_api_compact_omits_debug_payload(testclient_db_factory) -> N
     assert btc["payload"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
     assert "debug_payload" not in btc["payload"]
     assert "exposure_metrics" not in btc["payload"]
+
+
+def test_risk_checks_api_compact_includes_reason_evidence(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("risk_checks_reason_evidence_compact.db")
+
+    with TestingSessionLocal() as session:
+        session.add(
+            RiskCheck(
+                symbol="BTCUSDT",
+                allowed=False,
+                decision="short",
+                reason_codes=["SYMBOL_RECENT_PERFORMANCE_NEGATIVE", "CORRELATED_EXPOSURE_LIMIT_REACHED"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={
+                    "allowed": False,
+                    "decision": "short",
+                    "blocked_reason_codes": [
+                        "SYMBOL_RECENT_PERFORMANCE_NEGATIVE",
+                        "CORRELATED_EXPOSURE_LIMIT_REACHED",
+                    ],
+                    "debug_payload": {
+                        "symbol_recent_performance_gate": {
+                            "applied": True,
+                            "status": "blocked",
+                            "symbol": "BTCUSDT",
+                            "lookback_days": 30,
+                            "execution_count": 27,
+                            "gross_realized_pnl": -2.843,
+                            "fee_total": 3.373105,
+                            "net_pnl_after_fees": -6.216105,
+                            "raw_executions": [{"id": 1}],
+                        },
+                        "portfolio_exposure_gate": {
+                            "status": "blocked",
+                            "candidate_symbol": "BTCUSDT",
+                            "candidate_direction": "short",
+                            "combined_BTC_ETH_directional_exposure_pct": 2.993049,
+                            "limits": {"max_same_direction_major_exposure_pct": 2.0},
+                            "raw_positions": [{"symbol": "ETHUSDT"}],
+                        },
+                    },
+                },
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/risk/checks?limit=1&compact=true")
+
+    assert response.status_code == 200
+    btc = response.json()[0]
+
+    assert btc["payload_mode"] == "compact"
+    assert "debug_payload" not in btc["payload"]
+    evidence = btc["payload"]["reason_evidence"]
+    symbol_gate = evidence["symbol_recent_performance_gate"]
+    portfolio_gate = evidence["portfolio_exposure_gate"]
+    assert symbol_gate["net_pnl_after_fees"] == -6.216105
+    assert symbol_gate["execution_count"] == 27
+    assert "raw_executions" not in symbol_gate
+    assert portfolio_gate["combined_BTC_ETH_directional_exposure_pct"] == 2.993049
+    assert portfolio_gate["limits"]["max_same_direction_major_exposure_pct"] == 2.0
+    assert "raw_positions" not in portfolio_gate
 
 
 def test_risk_checks_api_includes_ai_trigger_summary(testclient_db_factory) -> None:

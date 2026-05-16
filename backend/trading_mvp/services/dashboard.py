@@ -72,6 +72,7 @@ from trading_mvp.services.runtime_state import (
     derive_protection_reason_codes,
     summarize_runtime_state,
 )
+from trading_mvp.services.service_gate import active_pending_entry_plan_statement
 from trading_mvp.services.settings import (
     AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY,
     SAFE_PROFILE_SELECTOR_DETAIL_KEY,
@@ -119,7 +120,7 @@ OPERATOR_EXECUTION_PROFILE_LIMIT = 2
 OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT = 900
 RECENT_FILL_LIMIT = 4
-OPERATOR_COMPACT_VIEWS = {"market", "scheduler"}
+OPERATOR_COMPACT_VIEWS = {"market", "scheduler", "decision", "risk"}
 AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
     "GROSS_EXPOSURE_LIMIT_REACHED",
     "DIRECTIONAL_BIAS_LIMIT_REACHED",
@@ -256,6 +257,7 @@ RISK_COMPACT_PAYLOAD_KEYS = (
     "evaluated_operator_policy",
     "sync_freshness_summary",
     "exposure_headroom_snapshot",
+    "reason_evidence",
 )
 AGENT_COMPACT_INPUT_KEYS = (
     "symbol",
@@ -2291,6 +2293,91 @@ def _compact_risk_debug_payload(value: object) -> dict[str, Any]:
     return compact
 
 
+def _compact_risk_reason_evidence(value: object) -> dict[str, Any]:
+    source = _as_dict(value)
+    compact: dict[str, Any] = {}
+    symbol_performance = _compact_dict(
+        source.get("symbol_recent_performance_gate"),
+        allowed_keys=(
+            "applied",
+            "status",
+            "reason_codes",
+            "symbol",
+            "lookback_days",
+            "sample_limit",
+            "minimum_execution_count",
+            "execution_count",
+            "gross_realized_pnl",
+            "fee_total",
+            "net_pnl_after_fees",
+            "comparison",
+        ),
+    )
+    if symbol_performance:
+        compact["symbol_recent_performance_gate"] = symbol_performance
+    portfolio_gate = _compact_dict(
+        source.get("portfolio_exposure_gate"),
+        allowed_keys=(
+            "applied",
+            "status",
+            "reason_code",
+            "reason_codes",
+            "blocked_reason_codes",
+            "would_block_reason_codes",
+            "enforced_reason_codes",
+            "candidate_symbol",
+            "candidate_direction",
+            "candidate_notional_exposure",
+            "directional_bias_pct",
+            "max_single_position_exposure_pct",
+            "same_tier_concentration",
+            "same_tier_concentration_pct",
+            "correlated_symbol_exposure_pct",
+            "combined_BTC_ETH_directional_exposure_pct",
+            "limits",
+        ),
+    )
+    if portfolio_gate:
+        compact["portfolio_exposure_gate"] = portfolio_gate
+    expected_cost_gate = _compact_dict(
+        source.get("expected_cost_gate"),
+        allowed_keys=(
+            "applied",
+            "status",
+            "mode",
+            "would_block",
+            "would_block_reason_codes",
+            "enforced_reason_codes",
+            "reason_codes",
+            "expected_profit_bps",
+            "expected_total_cost_bps",
+            "net_expected_edge_bps",
+            "cost_to_edge_ratio",
+            "rr_after_estimated_cost",
+        ),
+    )
+    if expected_cost_gate:
+        compact["expected_cost_gate"] = expected_cost_gate
+    entry_trigger = _compact_dict(
+        source.get("entry_trigger"),
+        allowed_keys=(
+            "decision_side",
+            "mode",
+            "latest_price",
+            "entry_price",
+            "entry_zone_min",
+            "entry_zone_max",
+            "max_chase_bps",
+            "observed_chase_bps",
+            "trigger_met",
+            "reason_codes",
+        ),
+    )
+    if entry_trigger:
+        compact["entry_trigger"] = entry_trigger
+    return compact
+
+
 def _compact_decision_reference(reference: DecisionReferencePayload) -> DecisionReferencePayload:
     compact_market_freshness = _compact_dict(
         reference.market_freshness_summary,
@@ -2484,8 +2571,7 @@ def get_overview(session: Session) -> OverviewResponse:
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
     active_entry_plans = list(
         session.scalars(
-            select(PendingEntryPlan)
-            .where(PendingEntryPlan.plan_status == "armed")
+            active_pending_entry_plan_statement()
             .order_by(desc(PendingEntryPlan.created_at))
             .limit(20)
         )
@@ -4201,6 +4287,7 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
         "operating_state": operating_state,
         "exposure_headroom_snapshot": exposure_headroom_snapshot,
         "debug_payload": _compact_risk_debug_payload(payload.get("debug_payload", {})),
+        "reason_evidence": _compact_risk_reason_evidence(payload.get("debug_payload", {})),
     }
     normalized_payload["cycle_id"] = (
         str(payload.get("cycle_id"))
@@ -4949,8 +5036,7 @@ def _build_operator_symbol_summaries(
     active_entry_plans: dict[str, PendingEntryPlan] = {}
     if include_execution_state:
         for row in session.scalars(
-            select(PendingEntryPlan)
-            .where(PendingEntryPlan.symbol.in_(symbol_keys), PendingEntryPlan.plan_status == "armed")
+            active_pending_entry_plan_statement(symbols=symbol_keys)
             .order_by(desc(PendingEntryPlan.created_at))
         ):
             symbol = row.symbol.upper()
@@ -5190,8 +5276,8 @@ def _ai_settings_next_review_at(
         return None
     observed_risk_flags = _as_string_list(latest_recommendation.get("observed_risk_flags"))
     normal_interval = max(int(policy.get("normal_interval_seconds") or 900), 1)
-    elevated_interval = max(int(policy.get("elevated_interval_seconds") or 300), 1)
-    min_recheck = max(int(policy.get("min_recheck_interval_seconds") or 300), 1)
+    elevated_interval = max(int(policy.get("elevated_interval_seconds") or 900), 1)
+    min_recheck = max(int(policy.get("min_recheck_interval_seconds") or 900), 1)
     interval = elevated_interval if observed_risk_flags else normal_interval
     return basis + timedelta(seconds=max(interval, min_recheck))
 
@@ -5271,7 +5357,7 @@ def _operator_execution_profile_state(settings_row: Setting) -> dict[str, Any]:
 
 def get_operator_dashboard(session: Session, *, view: str | None = None) -> OperatorDashboardResponse:
     operator_view = _normalize_operator_dashboard_view(view)
-    scheduler_projection = operator_view == "scheduler"
+    fact_decision_projection = operator_view in {"decision", "scheduler"}
     overview = get_overview(session)
     settings_row = get_or_create_settings(session)
     execution_profile_state = _operator_execution_profile_state(settings_row)
@@ -5286,14 +5372,14 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
         )
     )
     latest_scheduler = (
-        None
-        if operator_view == "market"
-        else session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
+        session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
+        if operator_view in {None, "scheduler"}
+        else None
     )
-    include_decision_state = operator_view != "market"
+    include_decision_state = operator_view not in {"market", "risk"}
     include_risk_state = operator_view != "market"
-    include_execution_state = operator_view is None
-    include_protection_state = operator_view is None
+    include_execution_state = operator_view in {None, "decision", "risk"}
+    include_protection_state = operator_view in {None, "decision"}
     include_event_operator_control = operator_view is None
     include_audit_events = operator_view is None
     symbol_summaries = _build_operator_symbol_summaries(
@@ -5306,9 +5392,9 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
         include_protection_state=include_protection_state,
         include_event_operator_control=include_event_operator_control,
         include_audit_events=include_audit_events,
-        prefer_fact_decision_lookup=scheduler_projection,
+        prefer_fact_decision_lookup=True,
         extracted_symbol_fallback_limit=0
-        if scheduler_projection
+        if fact_decision_projection
         else OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
     )
     compact_performance_windows = (
@@ -5453,6 +5539,8 @@ def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False)
             payload["payload"] = dict(payload["payload"])
             payload["payload"]["reason_codes"] = risk_payload["reason_codes"]
             payload["payload"]["blocked_reason_codes"] = risk_payload["blocked_reason_codes"]
+            if risk_payload["reason_evidence"]:
+                payload["payload"]["reason_evidence"] = risk_payload["reason_evidence"]
         payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(decision_row)
         payload["ai_review_type"] = _ai_review_type_from_decision_row(decision_row)
         payload["ai_trigger_reason_codes"] = _ai_trigger_reason_codes_from_decision_row(decision_row)

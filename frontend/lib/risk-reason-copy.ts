@@ -332,6 +332,22 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     operator_action_ko: "거래소 연결 상태와 cache/source status를 확인합니다.",
     check_location_ko: "안전 점검 > 거래소 연결 / market source",
   },
+  SYMBOL_RECENT_PERFORMANCE_NEGATIVE: {
+    category: "safety_block",
+    title_ko: "최근 해당 심볼 실현손익이 수수료 차감 후 음수입니다",
+    detail_ko: "최근 실행 이력이 수수료 차감 후 손실 구간이라 같은 심볼의 신규 진입을 막았습니다.",
+    auto_clear_hint_ko: "최근 거래 성과가 순손익 기준으로 회복되면 다음 리스크 점검에서 자동 해소될 수 있습니다.",
+    operator_action_ko: "리스크 카드의 차단 사유 근거에서 lookback 기간, 실행 건수, gross/fee/net 손익을 확인하세요.",
+    check_location_ko: "운영 판단 > 리스크 > 거래 안 된 이유 / 차단 사유",
+  },
+  CORRELATED_EXPOSURE_LIMIT_REACHED: {
+    category: "safety_block",
+    title_ko: "BTC/ETH 동일방향 상관 노출 한도를 초과했습니다",
+    detail_ko: "신규 주문을 더하면 BTC/ETH 계열 동일방향 노출이 설정 한도를 넘기 때문에 주문 제출 전 차단했습니다.",
+    auto_clear_hint_ko: "기존 노출이 줄거나 반대 방향 노출이 정리되어 한도 안으로 돌아오면 자동 해소될 수 있습니다.",
+    operator_action_ko: "리스크 카드의 차단 사유 근거에서 동일방향 노출 비율과 한도 값을 확인하세요.",
+    check_location_ko: "운영 판단 > 리스크 > 거래 안 된 이유 / 차단 사유",
+  },
   SLIPPAGE_THRESHOLD_EXCEEDED: {
     category: "safety_block",
     title_ko: "주문 가격 괴리가 허용 범위를 넘었습니다",
