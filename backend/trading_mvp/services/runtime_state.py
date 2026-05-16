@@ -426,7 +426,7 @@ def get_market_stream_detail(settings_row: Setting) -> dict[str, Any]:
 
 
 def replace_market_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     runtime_detail[MARKET_STREAM_DETAIL_KEY] = build_market_stream_state(payload)
     _write_runtime_detail(settings_row, runtime_detail)
 
@@ -458,7 +458,7 @@ def set_user_stream_detail(
     listen_key_rotate_status: str | None = None,
     listen_key_rotate_error: str | None = None,
 ) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     payload = get_user_stream_detail(settings_row)
     if status is not None:
         payload["status"] = status
@@ -511,7 +511,7 @@ def set_user_stream_detail(
 
 
 def replace_user_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     runtime_detail[USER_STREAM_DETAIL_KEY] = dict(payload)
     _write_runtime_detail(settings_row, runtime_detail)
 
@@ -615,7 +615,7 @@ def set_reconciliation_detail(
     unresolved_submission_symbols: list[str] | None = None,
     unresolved_submissions: list[dict[str, Any]] | None = None,
 ) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     payload = get_reconciliation_detail(settings_row)
     if status is not None:
         payload["status"] = status
@@ -786,7 +786,7 @@ def get_binance_rest_entry_block_reason_code(
 
 
 def _write_binance_rest_detail(settings_row: Setting, payload: dict[str, Any]) -> dict[str, Any]:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     runtime_detail[BINANCE_REST_DETAIL_KEY] = payload
     _write_runtime_detail(settings_row, runtime_detail)
     return get_binance_rest_detail(settings_row)
@@ -1292,7 +1292,7 @@ def mark_sync_success(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     sync_detail = get_sync_state_detail(settings_row)
     now = synced_at or utcnow_naive()
     scope_detail = {
@@ -1329,7 +1329,7 @@ def mark_sync_issue(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     sync_detail = get_sync_state_detail(settings_row)
     now = observed_at or utcnow_naive()
     scope_detail = {
@@ -1364,7 +1364,7 @@ def mark_sync_skipped(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     sync_detail = get_sync_state_detail(settings_row)
     now = observed_at or utcnow_naive()
     scope_detail = {
