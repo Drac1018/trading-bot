@@ -173,10 +173,55 @@ def _for_update_lock_waits(session: Session) -> list[dict[str, object]]:
     rows = session.execute(
         text(
             """
-            select pid, wait_event_type, wait_event, state, left(query, 240) as query
-            from pg_stat_activity
-            where wait_event_type = 'Lock'
-              and query ilike '%FOR UPDATE%'
+            with waiting as (
+                select
+                    pid,
+                    wait_event_type,
+                    wait_event,
+                    state,
+                    left((now() - query_start)::text, 64) as query_age,
+                    left(query, 240) as query,
+                    pg_blocking_pids(pid) as blocking_pids
+                from pg_stat_activity
+                where wait_event_type = 'Lock'
+                  and query ilike '%FOR UPDATE%'
+            )
+            select
+                waiting.pid,
+                waiting.wait_event_type,
+                waiting.wait_event,
+                waiting.state,
+                waiting.query_age,
+                waiting.query,
+                waiting.blocking_pids,
+                coalesce(
+                    jsonb_agg(
+                        jsonb_build_object(
+                            'pid', blockers.pid,
+                            'application_name', blockers.application_name,
+                            'client_addr', blockers.client_addr::text,
+                            'state', blockers.state,
+                            'wait_event_type', blockers.wait_event_type,
+                            'wait_event', blockers.wait_event,
+                            'xact_age', left((now() - blockers.xact_start)::text, 64),
+                            'query_age', left((now() - blockers.query_start)::text, 64),
+                            'query', left(blockers.query, 240)
+                        )
+                    ) filter (where blockers.pid is not null),
+                    '[]'::jsonb
+                ) as blocking_sessions
+            from waiting
+            left join lateral unnest(waiting.blocking_pids) as blocker_pid(pid) on true
+            left join pg_stat_activity blockers on blockers.pid = blocker_pid.pid
+            group by
+                waiting.pid,
+                waiting.wait_event_type,
+                waiting.wait_event,
+                waiting.state,
+                waiting.query_age,
+                waiting.query,
+                waiting.blocking_pids
+            order by waiting.pid
             """
         )
     ).mappings()
