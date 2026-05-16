@@ -25,9 +25,9 @@ from trading_mvp.models import (
 from trading_mvp.schemas import (
     SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES,
     AIEventViewPayload,
-    AppSettingsExecutionRiskProfilePolicy,
     AppSettingsAIUsageResponse,
     AppSettingsCadenceResponse,
+    AppSettingsExecutionRiskProfilePolicy,
     AppSettingsResponse,
     AppSettingsUpdateRequest,
     AppSettingsViewResponse,
@@ -637,13 +637,13 @@ def _default_execution_risk_profile_policy(defaults: AppConfig | None = None) ->
         "elevated_interval_seconds": _settings_int(
             defaults,
             "ai_market_settings_advisor_elevated_interval_seconds",
-            300,
+            900,
             minimum=60,
         ),
         "min_recheck_interval_seconds": _settings_int(
             defaults,
             "ai_market_settings_advisor_min_recheck_interval_seconds",
-            300,
+            900,
             minimum=60,
         ),
         "recommendation_ttl_seconds": _settings_int(
@@ -3244,6 +3244,9 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         "recent_ai_failure_reasons": [],
         "observed_monthly_ai_calls_projection": 0,
         "observed_monthly_ai_calls_projection_breakdown": {},
+        "ai_protection_status": {},
+        "ai_usage_summary_24h": {},
+        "ai_usage_summary_7d": {},
     }
 
     rollout_mode = get_rollout_mode(settings_row)
@@ -3504,6 +3507,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         observed_monthly_ai_calls_projection_breakdown=usage_metrics[
             "observed_monthly_ai_calls_projection_breakdown"
         ],
+        ai_protection_status=usage_metrics["ai_protection_status"],
         manual_ai_guard_minutes=manual_ai_guard_minutes(settings_row),
     )
     return payload.model_dump(mode="json")
@@ -3729,6 +3733,9 @@ def serialize_settings_ai_usage(settings_row: Setting) -> dict[str, object]:
         "recent_ai_failure_reasons": [],
         "observed_monthly_ai_calls_projection": 0,
         "observed_monthly_ai_calls_projection_breakdown": {},
+        "ai_protection_status": {},
+        "ai_usage_summary_24h": {},
+        "ai_usage_summary_7d": {},
     }
     payload = AppSettingsAIUsageResponse(
         **usage_metrics,

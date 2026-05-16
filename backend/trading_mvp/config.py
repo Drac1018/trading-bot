@@ -187,8 +187,8 @@ class Settings(BaseSettings):
     ai_market_settings_advisor_enabled: bool = True
     ai_market_settings_advisor_shadow: bool = True
     ai_market_settings_advisor_normal_interval_seconds: int = 900
-    ai_market_settings_advisor_elevated_interval_seconds: int = 300
-    ai_market_settings_advisor_min_recheck_interval_seconds: int = 300
+    ai_market_settings_advisor_elevated_interval_seconds: int = 900
+    ai_market_settings_advisor_min_recheck_interval_seconds: int = 900
     ai_market_settings_advisor_recommendation_ttl_seconds: int = 900
     ai_market_settings_advisor_min_confidence_to_apply: float = 0.70
     ai_market_settings_auto_apply_mode: str = "shadow"

@@ -2804,6 +2804,7 @@ class AppSettingsResponse(StrictBaseModel):
     recent_ai_failure_reasons: list[str]
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int]
+    ai_protection_status: dict[str, Any] = Field(default_factory=dict)
     manual_ai_guard_minutes: int
 
 
@@ -2917,6 +2918,7 @@ class AppSettingsAIUsageResponse(StrictBaseModel):
     recent_ai_failure_reasons: list[str] = Field(default_factory=list)
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int] = Field(default_factory=dict)
+    ai_protection_status: dict[str, Any] = Field(default_factory=dict)
     ai_usage_summary_24h: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     ai_usage_summary_7d: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     manual_ai_guard_minutes: int
@@ -2927,8 +2929,8 @@ class AppSettingsExecutionRiskProfilePolicy(StrictBaseModel):
     advisor_shadow_mode: bool = True
     auto_apply_mode: ExecutionRiskProfileAutoApplyMode = "shadow"
     normal_interval_seconds: int = Field(default=900, ge=60, le=86400)
-    elevated_interval_seconds: int = Field(default=300, ge=60, le=86400)
-    min_recheck_interval_seconds: int = Field(default=300, ge=60, le=86400)
+    elevated_interval_seconds: int = Field(default=900, ge=60, le=86400)
+    min_recheck_interval_seconds: int = Field(default=900, ge=60, le=86400)
     recommendation_ttl_seconds: int = Field(default=900, ge=60, le=86400)
     min_confidence_to_apply: float = Field(default=0.70, ge=0.50, le=1.0)
     relax_requires_consecutive_confirmations: int = Field(default=2, ge=1, le=10)

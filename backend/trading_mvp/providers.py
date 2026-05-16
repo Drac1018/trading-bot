@@ -15,6 +15,7 @@ class ProviderResult:
     output: dict[str, Any]
     usage: dict[str, int] | None = None
     request_id: str | None = None
+    model: str | None = None
 
 
 class StructuredModelProvider(Protocol):
@@ -202,6 +203,7 @@ class OpenAIProvider:
             output=parsed,
             usage=usage,
             request_id=payload_json.get("id"),
+            model=str(payload_json.get("model") or self.model),
         )
 
     def test_connection(self) -> dict[str, Any]:

@@ -783,8 +783,7 @@ class TradingOrchestrator:
             "min_confidence_to_apply": float(policy["min_confidence_to_apply"]),
         }
 
-    def _latest_market_settings_advisor_run(self, *, symbol: str) -> AgentRun | None:
-        symbol_key = symbol.upper()
+    def _latest_market_settings_advisor_run(self, *, symbol: str | None = None) -> AgentRun | None:
         rows = list(
             self.session.scalars(
                 select(AgentRun)
@@ -793,6 +792,9 @@ class TradingOrchestrator:
                 .limit(100)
             )
         )
+        if symbol is None:
+            return rows[0] if rows else None
+        symbol_key = symbol.upper()
         for row in rows:
             metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
             output_payload = row.output_payload if isinstance(row.output_payload, dict) else {}
@@ -860,6 +862,289 @@ class TradingOrchestrator:
         return flags
 
     @staticmethod
+    def _market_settings_symbol_context_from_payload(
+        *,
+        symbol: str,
+        timeframe: str,
+        source: str,
+        feature_time: datetime,
+        feature_payload: dict[str, object],
+        market_payload: dict[str, object],
+        now: datetime,
+    ) -> dict[str, object]:
+        regime = _as_dict(feature_payload.get("regime"))
+        breakout = _as_dict(feature_payload.get("breakout"))
+        derivatives = _as_dict(feature_payload.get("derivatives"))
+        event_context = _as_dict(feature_payload.get("event_context"))
+        flags = [
+            str(item)
+            for item in feature_payload.get("data_quality_flags", [])
+            if str(item or "").strip()
+        ] if isinstance(feature_payload.get("data_quality_flags"), list) else []
+        feature_time_naive = feature_time.replace(tzinfo=None) if feature_time.tzinfo is not None else feature_time
+        data_age_seconds = max(int((now - feature_time_naive).total_seconds()), 0)
+        is_stale = bool(market_payload.get("is_stale", False)) or bool(event_context.get("is_stale", False))
+        is_complete = bool(market_payload.get("is_complete", True)) and not bool(flags)
+        spread_stress = bool(derivatives.get("spread_stress", False))
+        spread_headwind = bool(derivatives.get("spread_headwind", False))
+        volatility_pct = _safe_float(feature_payload.get("volatility_pct"))
+        volume_ratio = _safe_float(feature_payload.get("volume_ratio"), 1.0)
+        range_breakout_direction = str(breakout.get("range_breakout_direction") or "none")
+        risk_flags: list[str] = []
+        if is_stale:
+            risk_flags.append("STALE_MARKET_DATA")
+        if not is_complete:
+            risk_flags.append("INCOMPLETE_MARKET_DATA")
+        if str(regime.get("volatility_regime") or "") == "expanded" or volatility_pct >= float(
+            getattr(get_settings(), "ai_decision_volatility_spike_min_pct", 0.02) or 0.02
+        ):
+            risk_flags.append("HIGH_VOLATILITY")
+        if str(regime.get("volume_regime") or "") == "weak" or volume_ratio < 0.4:
+            risk_flags.append("THIN_LIQUIDITY")
+        if spread_stress or spread_headwind:
+            risk_flags.append("SPREAD_STRESS")
+        if range_breakout_direction in {"up", "down"}:
+            risk_flags.append("RANGE_BREAK")
+
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "source": source,
+            "feature_time": feature_time.isoformat(),
+            "data_age_seconds": data_age_seconds,
+            "latest_price": market_payload.get("latest_price"),
+            "data_quality": {
+                "is_stale": is_stale,
+                "is_complete": is_complete,
+                "candle_count": market_payload.get("candle_count"),
+                "flags": flags,
+            },
+            "regime": {
+                "primary_regime": regime.get("primary_regime"),
+                "trend_alignment": regime.get("trend_alignment"),
+                "volatility_regime": regime.get("volatility_regime"),
+                "volume_regime": regime.get("volume_regime"),
+                "momentum_weakening": bool(regime.get("momentum_weakening", False)),
+            },
+            "market_metrics": {
+                "trend_score": _safe_float(feature_payload.get("trend_score")),
+                "momentum_score": _safe_float(feature_payload.get("momentum_score")),
+                "volatility_pct": volatility_pct,
+                "atr_pct": feature_payload.get("atr_pct"),
+                "volume_ratio": volume_ratio,
+                "rsi": feature_payload.get("rsi"),
+                "range_breakout_direction": range_breakout_direction,
+            },
+            "liquidity_and_derivatives": {
+                "available": bool(derivatives.get("available", False)),
+                "spread_bps": derivatives.get("spread_bps"),
+                "spread_stress": spread_stress,
+                "spread_headwind": spread_headwind,
+                "funding_bias": derivatives.get("funding_bias"),
+                "taker_flow_alignment": derivatives.get("taker_flow_alignment"),
+                "entry_veto_reason_codes": list(derivatives.get("entry_veto_reason_codes", []))
+                if isinstance(derivatives.get("entry_veto_reason_codes"), list)
+                else [],
+                "breakout_veto_reason_codes": list(derivatives.get("breakout_veto_reason_codes", []))
+                if isinstance(derivatives.get("breakout_veto_reason_codes"), list)
+                else [],
+            },
+            "event_context": {
+                "active_risk_window": bool(event_context.get("active_risk_window", False)),
+                "next_event_name": event_context.get("next_event_name"),
+                "minutes_to_next_event": event_context.get("minutes_to_next_event"),
+                "severity": event_context.get("severity"),
+            },
+            "risk_flags": risk_flags,
+        }
+
+    def _market_settings_universe_context(
+        self,
+        *,
+        symbol_scope: list[str],
+        timeframe: str,
+        market_snapshot: MarketSnapshotPayload,
+        feature_payload: FeaturePayload,
+    ) -> dict[str, object]:
+        now = utcnow_naive()
+        symbol_order = list(dict.fromkeys(item.upper() for item in symbol_scope if item))
+        contexts: dict[str, dict[str, object]] = {
+            market_snapshot.symbol.upper(): self._market_settings_symbol_context_from_payload(
+                symbol=market_snapshot.symbol,
+                timeframe=market_snapshot.timeframe,
+                source="current_cycle",
+                feature_time=market_snapshot.snapshot_time,
+                feature_payload=feature_payload.model_dump(mode="json"),
+                market_payload={
+                    "latest_price": market_snapshot.latest_price,
+                    "candle_count": market_snapshot.candle_count,
+                    "is_stale": market_snapshot.is_stale,
+                    "is_complete": market_snapshot.is_complete,
+                },
+                now=now,
+            )
+        }
+        rows = list(
+            self.session.scalars(
+                select(FeatureSnapshot)
+                .where(FeatureSnapshot.symbol.in_(symbol_order), FeatureSnapshot.timeframe == timeframe)
+                .order_by(desc(FeatureSnapshot.feature_time))
+                .limit(max(len(symbol_order) * 4, 20))
+            )
+        )
+        market_ids = [row.market_snapshot_id for row in rows if row.market_snapshot_id is not None]
+        market_rows = {
+            row.id: row
+            for row in self.session.scalars(select(MarketSnapshot).where(MarketSnapshot.id.in_(market_ids)))
+        } if market_ids else {}
+        for row in rows:
+            symbol_key = row.symbol.upper()
+            if symbol_key in contexts:
+                continue
+            market_row = market_rows.get(row.market_snapshot_id)
+            contexts[symbol_key] = self._market_settings_symbol_context_from_payload(
+                symbol=row.symbol,
+                timeframe=row.timeframe,
+                source="stored_latest",
+                feature_time=row.feature_time,
+                feature_payload=row.payload if isinstance(row.payload, dict) else {},
+                market_payload={
+                    "latest_price": market_row.latest_price if market_row is not None else None,
+                    "candle_count": market_row.candle_count if market_row is not None else None,
+                    "is_stale": bool(market_row.is_stale) if market_row is not None else False,
+                    "is_complete": bool(market_row.is_complete) if market_row is not None else True,
+                },
+                now=now,
+            )
+            if len(contexts) >= len(symbol_order):
+                break
+
+        ordered_contexts = [contexts[symbol] for symbol in symbol_order if symbol in contexts]
+        missing_symbols = [symbol for symbol in symbol_order if symbol not in contexts]
+        breadth_items = []
+        for item in ordered_contexts:
+            regime = _as_dict(item.get("regime"))
+            metrics = _as_dict(item.get("market_metrics"))
+            breadth_items.append(
+                {
+                    "symbol": item.get("symbol"),
+                    "primary_regime": regime.get("primary_regime"),
+                    "trend_alignment": regime.get("trend_alignment"),
+                    "weak_volume": _safe_float(metrics.get("volume_ratio"), 1.0) < 0.4
+                    or str(regime.get("volume_regime") or "") == "weak",
+                    "momentum_weakening": bool(regime.get("momentum_weakening", False)),
+                }
+            )
+        breadth = summarize_universe_breadth(breadth_items)
+        risk_flag_counts: dict[str, int] = defaultdict(int)
+        stressed_symbols: list[str] = []
+        for item in ordered_contexts:
+            risk_flags = [
+                str(flag)
+                for flag in item.get("risk_flags", [])
+                if str(flag or "").strip()
+            ] if isinstance(item.get("risk_flags"), list) else []
+            if risk_flags:
+                stressed_symbols.append(str(item.get("symbol")))
+            for flag in risk_flags:
+                risk_flag_counts[flag] += 1
+        return {
+            "context_version": "market_settings_advisor_universe_v1",
+            "market_breadth": {
+                **breadth,
+                "tracked_symbols": len(symbol_order),
+                "context_symbols": len(ordered_contexts),
+                "missing_symbols": missing_symbols,
+                "stressed_symbols": stressed_symbols,
+                "risk_flag_counts": dict(sorted(risk_flag_counts.items())),
+            },
+            "symbols": ordered_contexts,
+        }
+
+    @staticmethod
+    def _market_settings_universe_risk_flags(universe_context: dict[str, object]) -> list[str]:
+        breadth = _as_dict(universe_context.get("market_breadth"))
+        counts = _as_dict(breadth.get("risk_flag_counts"))
+        flags = [str(flag) for flag, count in counts.items() if _safe_float(count) > 0]
+        if breadth.get("missing_symbols"):
+            flags.append("MARKET_CONTEXT_PARTIAL")
+        breadth_regime = str(breadth.get("breadth_regime") or "")
+        if breadth_regime in {"weak_breadth", "transition_fragile"}:
+            flags.append("MARKET_BREADTH_WEAK")
+        return list(dict.fromkeys(flag for flag in flags if flag))
+
+    @staticmethod
+    def _market_settings_advisor_fingerprint_material(
+        *,
+        symbol_scope: list[str],
+        market_state: dict[str, object],
+        universe_context: dict[str, object],
+        observed_risk_flags: list[str],
+        runtime_state: dict[str, object],
+    ) -> dict[str, object]:
+        breadth = _as_dict(universe_context.get("market_breadth"))
+        return {
+            "symbol_scope": [str(symbol).upper() for symbol in symbol_scope],
+            "operating_state": str(runtime_state.get("operating_state") or ""),
+            "observed_risk_flags": sorted(dict.fromkeys(observed_risk_flags)),
+            "market_state": {
+                "primary_regime": market_state.get("primary_regime"),
+                "trend_alignment": market_state.get("trend_alignment"),
+                "volatility_regime": market_state.get("volatility_regime"),
+                "range_breakout_direction": market_state.get("range_breakout_direction"),
+                "spread_stress": market_state.get("spread_stress"),
+            },
+            "market_breadth": {
+                "breadth_regime": breadth.get("breadth_regime"),
+                "directional_bias": breadth.get("directional_bias"),
+                "missing_symbols": sorted(str(symbol) for symbol in breadth.get("missing_symbols", []) or []),
+                "stressed_symbols": sorted(str(symbol) for symbol in breadth.get("stressed_symbols", []) or []),
+                "risk_flag_counts": _as_dict(breadth.get("risk_flag_counts")),
+            },
+        }
+
+    @staticmethod
+    def _market_settings_advisor_fingerprint(material: dict[str, object]) -> str:
+        encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _record_market_settings_provider_skip(
+        self,
+        *,
+        skip_reason: str,
+        gate: dict[str, object] | None,
+        observed_risk_flags: list[str],
+        advisor_fingerprint: str,
+        fingerprint_changed: bool,
+        symbol_scope: list[str],
+        cycle_id: str,
+        snapshot_id: int,
+        retry_after_seconds: int = 0,
+    ) -> None:
+        payload = {
+            "status": "skipped",
+            "skip_reason": skip_reason,
+            "gate": gate,
+            "observed_risk_flags": observed_risk_flags,
+            "advisor_fingerprint": advisor_fingerprint,
+            "fingerprint_changed": fingerprint_changed,
+            "symbol_scope": symbol_scope,
+            "retry_after_seconds": retry_after_seconds,
+            "risk_guard_unchanged": True,
+        }
+        record_audit_event(
+            self.session,
+            event_type="ai_market_settings_provider_skipped",
+            entity_type="settings",
+            entity_id=str(self.settings_row.id),
+            severity="warning" if gate is not None else "info",
+            message="AI market settings advisor provider call skipped before invocation.",
+            payload=payload,
+            correlation_ids=normalize_correlation_ids(cycle_id=cycle_id, snapshot_id=snapshot_id),
+        )
+        self.session.flush()
+
+    @staticmethod
     def _market_settings_advisor_status(
         *,
         recommendation: AIMarketSettingsRecommendation,
@@ -908,15 +1193,49 @@ class TradingOrchestrator:
         if not bool(defaults["enabled"]):
             return None
 
-        latest_run = self._latest_market_settings_advisor_run(symbol=symbol)
+        latest_run = self._latest_market_settings_advisor_run()
         previous_metadata = latest_run.metadata_json if latest_run is not None and isinstance(latest_run.metadata_json, dict) else {}
         previous_state = _as_dict(previous_metadata.get("market_state"))
+        symbol_scope = list(
+            dict.fromkeys(
+                effective.symbol
+                for effective in get_effective_symbol_schedule(self.settings_row)
+                if effective.enabled
+            )
+        ) or [symbol.upper()]
+        universe_context = self._market_settings_universe_context(
+            symbol_scope=symbol_scope,
+            timeframe=market_snapshot.timeframe,
+            market_snapshot=market_snapshot,
+            feature_payload=feature_payload,
+        )
         observed_risk_flags = self._market_settings_observed_risk_flags(
             market_snapshot=market_snapshot,
             feature_payload=feature_payload,
             runtime_state=runtime_state,
             previous_state=previous_state,
         )
+        observed_risk_flags = list(
+            dict.fromkeys(
+                [
+                    *observed_risk_flags,
+                    *self._market_settings_universe_risk_flags(universe_context),
+                ]
+            )
+        )
+        market_state = self._market_settings_current_state(
+            market_snapshot=market_snapshot,
+            feature_payload=feature_payload,
+        )
+        fingerprint_material = self._market_settings_advisor_fingerprint_material(
+            symbol_scope=symbol_scope,
+            market_state=market_state,
+            universe_context=universe_context,
+            observed_risk_flags=observed_risk_flags,
+            runtime_state=runtime_state,
+        )
+        advisor_fingerprint = self._market_settings_advisor_fingerprint(fingerprint_material)
+        previous_fingerprint = str(previous_metadata.get("advisor_fingerprint") or "")
         elevated = bool(observed_risk_flags)
         interval_seconds = int(
             defaults["elevated_interval_seconds"] if elevated else defaults["normal_interval_seconds"]
@@ -939,6 +1258,25 @@ class TradingOrchestrator:
                     "retry_after_seconds": interval_seconds - elapsed_seconds,
                     "observed_risk_flags": observed_risk_flags,
                 }
+            if previous_fingerprint == advisor_fingerprint:
+                self._record_market_settings_provider_skip(
+                    skip_reason="advisor_fingerprint_unchanged",
+                    gate=None,
+                    observed_risk_flags=observed_risk_flags,
+                    advisor_fingerprint=advisor_fingerprint,
+                    fingerprint_changed=False,
+                    symbol_scope=symbol_scope,
+                    cycle_id=cycle_id,
+                    snapshot_id=snapshot_id,
+                )
+                return {
+                    "status": "skipped",
+                    "skip_reason": "advisor_fingerprint_unchanged",
+                    "advisor_fingerprint": advisor_fingerprint,
+                    "fingerprint_changed": False,
+                    "observed_risk_flags": observed_risk_flags,
+                    "risk_guard_unchanged": True,
+                }
 
         gate = get_openai_call_gate(
             self.session,
@@ -946,19 +1284,33 @@ class TradingOrchestrator:
             AgentRole.MARKET_SETTINGS_ADVISOR.value,
             trigger_event,
             has_openai_key=bool(self.credentials.openai_api_key),
-            symbol=symbol,
         )
         if not gate.allowed:
+            gate_metadata = gate.as_metadata()
+            self._record_market_settings_provider_skip(
+                skip_reason=gate.reason,
+                gate=gate_metadata,
+                observed_risk_flags=observed_risk_flags,
+                advisor_fingerprint=advisor_fingerprint,
+                fingerprint_changed=previous_fingerprint != advisor_fingerprint,
+                symbol_scope=symbol_scope,
+                cycle_id=cycle_id,
+                snapshot_id=snapshot_id,
+                retry_after_seconds=gate.retry_after_seconds,
+            )
             return {
                 "status": "skipped",
                 "skip_reason": gate.reason,
-                "gate": gate.as_metadata(),
+                "gate": gate_metadata,
+                "advisor_fingerprint": advisor_fingerprint,
+                "fingerprint_changed": previous_fingerprint != advisor_fingerprint,
                 "observed_risk_flags": observed_risk_flags,
+                "risk_guard_unchanged": True,
             }
 
         settings_policy = {
             **defaults,
-            "symbol_scope": [symbol.upper()],
+            "symbol_scope": symbol_scope,
             "allowed_profiles": [
                 "NORMAL",
                 "CAUTION",
@@ -985,6 +1337,7 @@ class TradingOrchestrator:
                 if latest_run is not None and isinstance(latest_run.output_payload, dict)
                 else None
             ),
+            universe_context=universe_context,
         )
         recommendation, provider_name, metadata = self.market_settings_advisor.run(
             market_snapshot=market_snapshot,
@@ -995,6 +1348,7 @@ class TradingOrchestrator:
             previous_recommendation=input_payload.get("previous_recommendation")
             if isinstance(input_payload.get("previous_recommendation"), dict)
             else None,
+            universe_context=universe_context,
             use_ai=True,
         )
         now_aware = datetime.now(UTC)
@@ -1018,23 +1372,39 @@ class TradingOrchestrator:
             )
             output_payload = recommendation.model_dump(mode="json")
 
-        market_state = self._market_settings_current_state(
-            market_snapshot=market_snapshot,
-            feature_payload=feature_payload,
-        )
         metadata = {
             **metadata,
             "status": status,
             "ignored_reason_codes": ignored_reason_codes,
-            "symbol_scope": [symbol.upper()],
+            "symbol": symbol.upper(),
+            "representative_symbol": symbol.upper(),
+            "symbol_scope": symbol_scope,
             "observed_risk_flags": observed_risk_flags,
             "settings_policy": settings_policy,
             "market_state": market_state,
+            "market_breadth": universe_context.get("market_breadth"),
+            "advisor_fingerprint": advisor_fingerprint,
+            "advisor_fingerprint_material": fingerprint_material,
+            "fingerprint_changed": previous_fingerprint != advisor_fingerprint,
             "gate": gate.as_metadata(),
             "cycle_id": cycle_id,
             "snapshot_id": snapshot_id,
             "source": "llm_ignored" if status == "ignored" else metadata.get("source", "llm"),
         }
+        metadata.setdefault("model", self.settings_row.ai_model)
+        metadata.setdefault("ai_model", self.settings_row.ai_model)
+        usage_payload = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else None
+        if usage_payload is not None:
+            estimated_cost_usd = estimate_ai_usage_cost_usd(
+                model=str(metadata.get("ai_model") or self.settings_row.ai_model),
+                usage=usage_payload,
+            )
+            metadata["estimated_cost_usd"] = estimated_cost_usd
+            metadata["cost_estimate_status"] = (
+                "unknown_model_rate" if estimated_cost_usd is None else "estimated"
+            )
+        else:
+            metadata["cost_estimate_status"] = "missing_usage"
         advisor_run = persist_agent_run(
             self.session,
             AgentRole.MARKET_SETTINGS_ADVISOR,
@@ -1055,6 +1425,8 @@ class TradingOrchestrator:
             "would_apply": bool(status != "ignored"),
             "min_confidence_to_apply": defaults["min_confidence_to_apply"],
             "observed_risk_flags": observed_risk_flags,
+            "advisor_fingerprint": advisor_fingerprint,
+            "fingerprint_changed": previous_fingerprint != advisor_fingerprint,
         }
         if ignored_reason_codes:
             audit_payload["ignored_reason_codes"] = ignored_reason_codes

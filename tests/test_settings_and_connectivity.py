@@ -27,6 +27,8 @@ from trading_mvp.schemas import (
     BinanceConnectionTestRequest,
     OpenAIConnectionTestRequest,
 )
+from trading_mvp.services import ai_usage as ai_usage_service
+from trading_mvp.services.ai_usage import clear_ai_usage_metrics_cache, get_openai_call_gate
 from trading_mvp.services.connectivity import (
     check_binance_connection,
     check_openai_connection,
@@ -360,6 +362,215 @@ def test_settings_auxiliary_serializers_expose_cadences_and_ai_usage(db_session)
     assert cadences["items"][0]["symbol"] == "BTCUSDT"
     assert usage["recent_ai_calls_24h"] == 1
     assert usage["manual_ai_guard_minutes"] == 5
+    assert usage["ai_protection_status"]["policy"]["quota_errors"] == "global_backoff"
+
+
+def test_settings_ai_usage_estimates_advisor_cost_without_metadata_model(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    db_session.add(
+        AgentRun(
+            role="market_settings_advisor",
+            trigger_event="realtime_cycle",
+            schema_name="AIMarketSettingsRecommendation",
+            status="completed",
+            provider_name="openai",
+            summary="advisor success",
+            input_payload={},
+            output_payload={},
+            metadata_json={
+                "source": "llm",
+                "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+            },
+            schema_valid=True,
+        )
+    )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+    try:
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    assert usage["recent_ai_calls_24h"] == 1
+    advisor = usage["ai_protection_status"]["advisor"]
+    assert advisor["cost_estimate_status"] == "estimated_model_fallback"
+    assert advisor["cost_estimate_model"] == "gpt-4.1-mini"
+    assert advisor["cost_estimate_model_source"] == "settings_fallback"
+    assert advisor["estimated_cost_usd"] == pytest.approx(0.000032)
+
+
+def test_settings_ai_usage_reuses_source_revision_cache(db_session, monkeypatch) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="entry_candidate_event",
+            schema_name="TradeDecision",
+            provider_name="openai",
+            summary="decision",
+            input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+            output_payload={"decision": "hold"},
+            metadata_json={
+                "source": "llm",
+                "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+            },
+        )
+    )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+
+    calls = {"count": 0}
+    original = ai_usage_service.build_ai_telemetry_summary
+
+    def wrapped_build_ai_telemetry_summary(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ai_usage_service,
+        "build_ai_telemetry_summary",
+        wrapped_build_ai_telemetry_summary,
+    )
+    try:
+        first = serialize_settings_ai_usage(row)
+        second = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    assert first["recent_ai_calls_24h"] == 1
+    assert second["recent_ai_calls_24h"] == 1
+    assert calls["count"] == 2
+
+
+def test_openai_call_gate_applies_global_quota_backoff(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.ai_enabled = True
+    row.ai_provider = "openai"
+    row.ai_call_interval_minutes = 5
+    now = utcnow_naive()
+    db_session.add(
+        AgentRun(
+            role="market_settings_advisor",
+            trigger_event="realtime_cycle",
+            schema_name="AIMarketSettingsRecommendation",
+            status="ignored",
+            provider_name="openai",
+            summary="quota failure",
+            input_payload={},
+            output_payload={},
+            metadata_json={
+                "source": "llm_ignored",
+                "error": "429 from OpenAI chat.completions: insufficient_quota",
+            },
+            schema_valid=False,
+            created_at=now - timedelta(minutes=10),
+        )
+    )
+    db_session.flush()
+
+    gate = get_openai_call_gate(
+        db_session,
+        row,
+        "trading_decision",
+        "realtime_cycle",
+        has_openai_key=True,
+        symbol="BTCUSDT",
+    )
+
+    assert gate.allowed is False
+    assert gate.reason == "global_failure_backoff_active"
+    assert gate.failure_reason == "QUOTA"
+    assert gate.backoff_minutes == 60
+
+
+def test_openai_call_gate_keeps_plain_rate_limit_role_scoped(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.ai_enabled = True
+    row.ai_provider = "openai"
+    now = utcnow_naive()
+    db_session.add(
+        AgentRun(
+            role="market_settings_advisor",
+            trigger_event="realtime_cycle",
+            schema_name="AIMarketSettingsRecommendation",
+            status="ignored",
+            provider_name="openai",
+            summary="rate limit failure",
+            input_payload={"compact_market_context": {"representative_symbol": "BTCUSDT"}},
+            output_payload={},
+            metadata_json={
+                "source": "llm_ignored",
+                "error": "429 from OpenAI chat.completions: rate limit exceeded",
+                "symbol": "BTCUSDT",
+            },
+            schema_valid=False,
+            created_at=now - timedelta(minutes=10),
+        )
+    )
+    db_session.flush()
+
+    trading_gate = get_openai_call_gate(
+        db_session,
+        row,
+        "trading_decision",
+        "realtime_cycle",
+        has_openai_key=True,
+        symbol="BTCUSDT",
+    )
+    advisor_gate = get_openai_call_gate(
+        db_session,
+        row,
+        "market_settings_advisor",
+        "realtime_cycle",
+        has_openai_key=True,
+    )
+
+    assert trading_gate.allowed is True
+    assert advisor_gate.allowed is False
+    assert advisor_gate.reason == "failure_backoff_active"
+    assert advisor_gate.failure_reason == "RATE_LIMIT"
+
+
+def test_openai_call_gate_blocks_advisor_hourly_budget(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.ai_enabled = True
+    row.ai_provider = "openai"
+    now = utcnow_naive()
+    for offset in (5, 10, 15, 20):
+        db_session.add(
+            AgentRun(
+                role="market_settings_advisor",
+                trigger_event="realtime_cycle",
+                schema_name="AIMarketSettingsRecommendation",
+                status="completed",
+                provider_name="openai",
+                summary="advisor success",
+                input_payload={},
+                output_payload={},
+                metadata_json={
+                    "source": "llm",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                },
+                schema_valid=True,
+                created_at=now - timedelta(minutes=offset),
+            )
+        )
+    db_session.flush()
+
+    gate = get_openai_call_gate(
+        db_session,
+        row,
+        "market_settings_advisor",
+        "realtime_cycle",
+        has_openai_key=True,
+    )
+    usage = serialize_settings_ai_usage(row)
+
+    assert gate.allowed is False
+    assert gate.reason == "role_hourly_call_budget_exhausted"
+    budget = usage["ai_protection_status"]["role_budgets"]["market_settings_advisor"]
+    assert budget["status"] == "blocked"
+    assert budget["calls_1h"] == 4
 
 
 def test_serialize_settings_reports_unknown_live_snapshot_without_synthetic_equity(db_session) -> None:
@@ -627,6 +838,7 @@ def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
     assert "estimated_monthly_ai_calls_breakdown" not in serialized
     assert "BAD_REQUEST x1" in serialized["recent_ai_failure_reasons"]
     assert serialized["observed_monthly_ai_calls_projection"] == 60
+    assert serialized["ai_protection_status"]["policy"]["rate_limit_errors"] == "role_backoff"
 
 
 def test_connection_services_return_success_with_patched_clients(db_session, monkeypatch) -> None:

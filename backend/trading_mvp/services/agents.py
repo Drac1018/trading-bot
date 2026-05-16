@@ -209,6 +209,9 @@ def _provider_metadata(result: ProviderResult | None, *, source: str) -> dict[st
         metadata["usage"] = result.usage
     if result.request_id:
         metadata["request_id"] = result.request_id
+    if result.model:
+        metadata["model"] = result.model
+        metadata["ai_model"] = result.model
     return metadata
 
 
@@ -4052,7 +4055,168 @@ def build_market_settings_advisor_input_payload(
     settings_policy: dict[str, Any],
     observed_risk_flags: list[str],
     previous_recommendation: dict[str, Any] | None = None,
+    universe_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    def limited_strings(value: object, *, limit: int = 8) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item or "").strip()][:limit]
+
+    def has_value(value: object) -> bool:
+        return value is not None and value != "" and value != []
+
+    def compact_sync_summary(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        compact: dict[str, object] = {}
+        for scope, payload in value.items():
+            if not isinstance(payload, dict):
+                continue
+            compact[str(scope)] = {
+                key: payload.get(key)
+                for key in (
+                    "status",
+                    "raw_status",
+                    "age_seconds",
+                    "stale_after_seconds",
+                    "last_sync_at",
+                    "last_attempt_at",
+                    "last_error",
+                    "last_skip_reason",
+                )
+                if has_value(payload.get(key))
+            }
+        return compact
+
+    def compact_previous(value: dict[str, Any] | None) -> dict[str, object] | None:
+        if not isinstance(value, dict) or not value:
+            return None
+        keys = (
+            "recommendation_id",
+            "generated_at",
+            "valid_until",
+            "symbol_scope",
+            "recommended_profile_id",
+            "confidence",
+            "reason_summary",
+            "reason_codes",
+            "observed_risk_flags",
+            "suggested_new_entry_policy",
+            "do_not_relax",
+            "status",
+        )
+        return {key: value[key] for key in keys if key in value}
+
+    derivatives = features.derivatives
+    event_context = features.event_context
+    symbol_scope = [
+        str(item).upper()
+        for item in settings_policy.get("symbol_scope", [market_snapshot.symbol])
+        if str(item or "").strip()
+    ] or [market_snapshot.symbol.upper()]
+    current_symbol_context = {
+        "symbol": market_snapshot.symbol.upper(),
+        "timeframe": market_snapshot.timeframe,
+        "source": "current_cycle",
+        "feature_time": market_snapshot.snapshot_time.isoformat(),
+        "latest_price": market_snapshot.latest_price,
+        "data_quality": {
+            "is_stale": market_snapshot.is_stale or bool(getattr(event_context, "is_stale", False)),
+            "is_complete": market_snapshot.is_complete and not bool(features.data_quality_flags),
+            "candle_count": market_snapshot.candle_count,
+            "flags": list(features.data_quality_flags),
+        },
+        "regime": {
+            "primary_regime": features.regime.primary_regime,
+            "trend_alignment": features.regime.trend_alignment,
+            "volatility_regime": features.regime.volatility_regime,
+            "volume_regime": features.regime.volume_regime,
+            "momentum_weakening": features.regime.momentum_weakening,
+        },
+        "market_metrics": {
+            "trend_score": features.trend_score,
+            "momentum_score": features.momentum_score,
+            "volatility_pct": features.volatility_pct,
+            "atr_pct": features.atr_pct,
+            "volume_ratio": features.volume_ratio,
+            "rsi": features.rsi,
+            "range_breakout_direction": features.breakout.range_breakout_direction,
+        },
+        "liquidity_and_derivatives": {
+            "available": derivatives.available,
+            "spread_bps": derivatives.spread_bps,
+            "spread_stress": derivatives.spread_stress,
+            "spread_headwind": derivatives.spread_headwind,
+            "funding_bias": derivatives.funding_bias,
+            "taker_flow_alignment": derivatives.taker_flow_alignment,
+            "top_trader_long_crowded": derivatives.top_trader_long_crowded,
+            "top_trader_short_crowded": derivatives.top_trader_short_crowded,
+            "entry_veto_reason_codes": list(derivatives.entry_veto_reason_codes),
+            "breakout_veto_reason_codes": list(derivatives.breakout_veto_reason_codes),
+        },
+        "event_context": {
+            "active_risk_window": getattr(event_context, "active_risk_window", False),
+            "next_event_name": getattr(event_context, "next_event_name", None),
+            "minutes_to_next_event": getattr(event_context, "minutes_to_next_event", None),
+            "severity": getattr(event_context, "severity", None),
+        },
+    }
+    if isinstance(universe_context, dict):
+        market_breadth = universe_context.get("market_breadth")
+        symbol_contexts = universe_context.get("symbols")
+    else:
+        market_breadth = None
+        symbol_contexts = None
+    if not isinstance(market_breadth, dict):
+        market_breadth = {
+            "tracked_symbols": len(symbol_scope),
+            "context_symbols": 1,
+            "missing_symbols": [item for item in symbol_scope if item != market_snapshot.symbol.upper()],
+            "stressed_symbols": [market_snapshot.symbol.upper()] if observed_risk_flags else [],
+            "directional_bias": "unknown",
+            "breadth_regime": "single_symbol_fallback",
+        }
+    if not isinstance(symbol_contexts, list) or not symbol_contexts:
+        symbol_contexts = [current_symbol_context]
+    runtime_compact = {
+        "operating_state": runtime_state.get("operating_state"),
+        "protection_recovery_status": runtime_state.get("protection_recovery_status"),
+        "protection_recovery_active": bool(runtime_state.get("protection_recovery_active", False)),
+        "protection_recovery_failure_count": runtime_state.get("protection_recovery_failure_count"),
+        "missing_protection_symbols": limited_strings(runtime_state.get("missing_protection_symbols")),
+        "protection_verification_blocked_symbols": limited_strings(
+            runtime_state.get("protection_verification_blocked_symbols")
+        ),
+        "sync_freshness_summary": compact_sync_summary(runtime_state.get("sync_freshness_summary")),
+    }
+    candidate_selection = runtime_state.get("candidate_selection_summary")
+    if isinstance(candidate_selection, dict):
+        runtime_compact["candidate_selection_summary"] = {
+            key: candidate_selection.get(key)
+            for key in (
+                "status",
+                "breadth_regime",
+                "directional_bias",
+                "selected_symbols",
+                "rejected_symbols",
+                "entry_candidates",
+            )
+            if has_value(candidate_selection.get(key))
+        }
+    drawdown_state = runtime_state.get("drawdown_state_summary")
+    if isinstance(drawdown_state, dict):
+        runtime_compact["drawdown_state_summary"] = {
+            key: drawdown_state.get(key)
+            for key in (
+                "current_drawdown_state",
+                "drawdown_depth_pct",
+                "recent_net_pnl",
+                "recent_net_pnl_pct",
+                "consecutive_losses",
+            )
+            if has_value(drawdown_state.get(key))
+        }
+
     return {
         "advisor_role": "market_settings_advisor",
         "authority": {
@@ -4063,26 +4227,20 @@ def build_market_settings_advisor_input_payload(
             "allowed_new_entry_policies": list(MARKET_SETTINGS_ALLOWED_NEW_ENTRY_POLICIES),
             "mode": "shadow",
         },
-        "market_snapshot": market_snapshot.model_dump(mode="json"),
-        "features": {
-            "symbol": features.symbol,
-            "timeframe": features.timeframe,
-            "trend_score": features.trend_score,
-            "volatility_pct": features.volatility_pct,
-            "volume_ratio": features.volume_ratio,
-            "rsi": features.rsi,
-            "atr_pct": features.atr_pct,
-            "momentum_score": features.momentum_score,
-            "regime": features.regime.model_dump(mode="json"),
-            "breakout": features.breakout.model_dump(mode="json"),
-            "derivatives": features.derivatives.model_dump(mode="json"),
-            "event_context": features.event_context.model_dump(mode="json"),
-            "data_quality_flags": list(features.data_quality_flags),
+        "compact_market_context": {
+            "context_version": "market_settings_advisor_compact_v2",
+            "scope": "global_risk_profile",
+            "representative_symbol": market_snapshot.symbol.upper(),
+            "symbol_scope": symbol_scope,
+            "timeframe": market_snapshot.timeframe,
+            "snapshot_time": market_snapshot.snapshot_time.isoformat(),
+            "market_breadth": market_breadth,
+            "symbols": symbol_contexts,
+            "runtime_state": runtime_compact,
         },
-        "runtime_state": dict(runtime_state),
         "settings_policy": dict(settings_policy),
         "observed_risk_flags": list(observed_risk_flags),
-        "previous_recommendation": previous_recommendation or None,
+        "previous_recommendation": compact_previous(previous_recommendation),
     }
 
 
@@ -4165,8 +4323,9 @@ class MarketSettingsAdvisorAgent:
         runtime_state: dict[str, Any],
         settings_policy: dict[str, Any],
         observed_risk_flags: list[str],
-        previous_recommendation: dict[str, Any] | None = None,
         use_ai: bool,
+        previous_recommendation: dict[str, Any] | None = None,
+        universe_context: dict[str, Any] | None = None,
     ) -> tuple[AIMarketSettingsRecommendation | None, str, dict[str, Any]]:
         generated_at = datetime.now(UTC)
         ttl_seconds = int(settings_policy.get("recommendation_ttl_seconds") or 900)
@@ -4190,6 +4349,7 @@ class MarketSettingsAdvisorAgent:
             settings_policy=settings_policy,
             observed_risk_flags=observed_risk_flags,
             previous_recommendation=previous_recommendation,
+            universe_context=universe_context,
         )
         if not use_ai or self.provider is None:
             return baseline, "deterministic-mock", {

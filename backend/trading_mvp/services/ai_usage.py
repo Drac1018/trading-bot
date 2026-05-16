@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any, TypedDict
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
 
+from trading_mvp.config import get_settings
 from trading_mvp.models import AgentRun, AuditEvent, Execution, Order, RiskCheck, Setting
 from trading_mvp.time_utils import utcnow_naive
 
@@ -20,6 +23,18 @@ AI_COST_RATES_USD_PER_1M_TOKENS: dict[str, dict[str, float]] = {
     "gpt-4.1-mini": {"input": 0.4, "output": 1.6},
     "gpt-4.1-nano": {"input": 0.1, "output": 0.4},
 }
+AI_ROLE_HOURLY_CALL_BUDGETS = {
+    "market_settings_advisor": 4,
+}
+AI_ROLE_DAILY_TOKEN_BUDGETS = {
+    "market_settings_advisor": 250_000,
+}
+AI_ROLE_CONSECUTIVE_FAILURE_BUDGETS = {
+    "market_settings_advisor": 3,
+}
+AI_USAGE_CACHE_TTL_SECONDS = 30.0
+AI_USAGE_DETAIL_ROW_LIMIT = 1_000
+AI_USAGE_DEFAULT_COST_MODEL = "gpt-4.1-mini"
 
 
 class TokenUsage(TypedDict):
@@ -54,8 +69,19 @@ class AIUsageMetrics(TypedDict):
     recent_ai_failure_reasons: list[str]
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int]
+    ai_protection_status: dict[str, Any]
     ai_usage_summary_24h: dict[str, Any]
     ai_usage_summary_7d: dict[str, Any]
+
+
+_AI_USAGE_METRICS_CACHE: dict[
+    tuple[str, str, str],
+    tuple[float, tuple[object, ...], AIUsageMetrics],
+] = {}
+
+
+def clear_ai_usage_metrics_cache() -> None:
+    _AI_USAGE_METRICS_CACHE.clear()
 
 
 @dataclass(slots=True)
@@ -89,6 +115,8 @@ class CostEstimate:
     input_tokens: int
     output_tokens: int
     status: str
+    model: str | None = None
+    model_source: str = "unknown"
 
 
 def manual_ai_guard_minutes(settings_row: Setting) -> int:
@@ -99,6 +127,8 @@ def classify_ai_failure(error: str | None) -> str | None:
     if not error:
         return None
     message = error.lower()
+    if "insufficient_quota" in message or "quota" in message:
+        return "QUOTA"
     if "429" in message or "rate limit" in message:
         return "RATE_LIMIT"
     if "401" in message or "403" in message or "unauthorized" in message or "forbidden" in message:
@@ -116,6 +146,8 @@ def failure_backoff_minutes(settings_row: Setting, error: str | None) -> int:
     base = max(5, min(int(settings_row.ai_call_interval_minutes), 30))
     reason = classify_ai_failure(error)
     if reason in {"AUTH", "BAD_REQUEST"}:
+        return max(base, 60)
+    if reason == "QUOTA":
         return max(base, 60)
     if reason == "RATE_LIMIT":
         return max(base, 30)
@@ -165,7 +197,29 @@ def _metadata_model(row: AgentRun) -> str | None:
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    raw_input_payload = getattr(row, "input_payload", None)
+    raw_output_payload = getattr(row, "output_payload", None)
+    input_payload = raw_input_payload if isinstance(raw_input_payload, dict) else {}
+    output_payload = raw_output_payload if isinstance(raw_output_payload, dict) else {}
+    for payload in (input_payload, output_payload):
+        for key in ("ai_model", "model", "openai_model"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
+
+
+def _row_cost_model(row: AgentRun) -> tuple[str | None, str]:
+    metadata_model = _metadata_model(row)
+    if metadata_model:
+        return metadata_model, "metadata"
+    if is_ai_attempt(row):
+        try:
+            configured_model = str(getattr(get_settings(), "openai_model", "") or "").strip()
+        except Exception:
+            configured_model = ""
+        return configured_model or AI_USAGE_DEFAULT_COST_MODEL, "settings_fallback"
+    return None, "unknown"
 
 
 def _canonical_model_name(model: str | None) -> str | None:
@@ -204,26 +258,33 @@ def estimate_ai_usage_cost_usd(*, model: str | None, usage: Mapping[str, Any] | 
 
 def _estimate_row_cost(row: AgentRun) -> CostEstimate:
     usage = _metadata_usage(row)
+    model, model_source = _row_cost_model(row)
     if not _metadata_has_usage(row):
         return CostEstimate(
             estimated_cost_usd=None,
             input_tokens=usage["prompt_tokens"],
             output_tokens=usage["completion_tokens"],
             status="missing_usage",
+            model=model,
+            model_source=model_source,
         )
-    cost = estimate_ai_usage_cost_usd(model=_metadata_model(row), usage=usage)
+    cost = estimate_ai_usage_cost_usd(model=model, usage=usage)
     if cost is None:
         return CostEstimate(
             estimated_cost_usd=None,
             input_tokens=usage["prompt_tokens"],
             output_tokens=usage["completion_tokens"],
             status="unknown_model_rate",
+            model=model,
+            model_source=model_source,
         )
     return CostEstimate(
         estimated_cost_usd=cost,
         input_tokens=usage["prompt_tokens"],
         output_tokens=usage["completion_tokens"],
-        status="estimated",
+        status="estimated" if model_source == "metadata" else "estimated_model_fallback",
+        model=model,
+        model_source=model_source,
     )
 
 
@@ -253,7 +314,7 @@ def is_ai_success(row: AgentRun) -> bool:
 
 
 def is_ai_failure(row: AgentRun) -> bool:
-    return _metadata_source(row) == "llm_fallback"
+    return _metadata_source(row) == "llm_fallback" or bool(_metadata_error(row))
 
 
 def _metadata_reason_list(row: AgentRun) -> list[str]:
@@ -385,12 +446,200 @@ def count_ai_deduped_events(session: Session, since: datetime) -> int:
     )
 
 
+def _session_cache_scope(session: Session) -> str:
+    bind = session.get_bind()
+    url = getattr(bind, "url", None)
+    return str(url) if url is not None else repr(bind)
+
+
+def _agent_run_revision(session: Session, since: datetime) -> tuple[int, int]:
+    max_id, row_count = session.execute(
+        select(func.max(AgentRun.id), func.count(AgentRun.id)).where(AgentRun.created_at >= since)
+    ).one()
+    return int(max_id or 0), int(row_count or 0)
+
+
+def _deduped_event_revision(session: Session, since: datetime) -> tuple[int, int]:
+    max_id, row_count = session.execute(
+        select(func.max(AuditEvent.id), func.count(AuditEvent.id)).where(
+            AuditEvent.event_type == AI_DEDUPED_EVENT_TYPE,
+            AuditEvent.created_at >= since,
+        )
+    ).one()
+    return int(max_id or 0), int(row_count or 0)
+
+
+def _ai_usage_source_revision(
+    session: Session,
+    *,
+    cutoff_24h: datetime,
+    cutoff_7d: datetime,
+) -> tuple[object, ...]:
+    return (
+        *_agent_run_revision(session, cutoff_24h),
+        *_agent_run_revision(session, cutoff_7d),
+        *_deduped_event_revision(session, cutoff_24h),
+        *_deduped_event_revision(session, cutoff_7d),
+    )
+
+
 def _recent_role_runs(session: Session, role: str, *, limit: int = 25) -> list[AgentRun]:
     return list(
         session.scalars(
             select(AgentRun).where(AgentRun.role == role).order_by(desc(AgentRun.created_at)).limit(limit)
         )
     )
+
+
+def _recent_ai_attempt_runs(session: Session, *, limit: int = 100) -> list[AgentRun]:
+    rows = list(session.scalars(select(AgentRun).order_by(desc(AgentRun.created_at)).limit(limit)))
+    return [row for row in rows if is_ai_attempt(row)]
+
+
+def _retry_after_window_seconds(rows: Sequence[AgentRun], *, now: datetime, window: timedelta) -> int:
+    if not rows:
+        return 0
+    oldest = min(row.created_at for row in rows)
+    retry_at = oldest + window
+    return max(int((retry_at - now).total_seconds()), 1) if retry_at > now else 0
+
+
+def _role_budget_status(rows: Sequence[AgentRun], role: str, *, now: datetime) -> dict[str, Any]:
+    attempts = [row for row in rows if row.role == role and is_ai_attempt(row)]
+    hourly_limit = AI_ROLE_HOURLY_CALL_BUDGETS.get(role)
+    daily_token_limit = AI_ROLE_DAILY_TOKEN_BUDGETS.get(role)
+    consecutive_failure_limit = AI_ROLE_CONSECUTIVE_FAILURE_BUDGETS.get(role)
+
+    one_hour_rows = [row for row in attempts if row.created_at >= now - timedelta(hours=1)]
+    daily_rows = [row for row in attempts if row.created_at >= now - timedelta(hours=24)]
+    tokens_24h = sum(_metadata_usage(row)["total_tokens"] for row in daily_rows)
+    consecutive_failures = 0
+    for row in attempts:
+        if is_ai_success(row):
+            break
+        if is_ai_failure(row):
+            consecutive_failures += 1
+            continue
+        break
+
+    status = "ok"
+    reason = "within_budget"
+    retry_after_seconds = 0
+    if hourly_limit is not None and len(one_hour_rows) >= hourly_limit:
+        status = "blocked"
+        reason = "role_hourly_call_budget_exhausted"
+        retry_after_seconds = _retry_after_window_seconds(
+            one_hour_rows,
+            now=now,
+            window=timedelta(hours=1),
+        )
+    if daily_token_limit is not None and tokens_24h >= daily_token_limit:
+        status = "blocked"
+        reason = "role_daily_token_budget_exhausted"
+        retry_after_seconds = max(
+            retry_after_seconds,
+            _retry_after_window_seconds(daily_rows, now=now, window=timedelta(hours=24)),
+        )
+    if (
+        consecutive_failure_limit is not None
+        and consecutive_failures >= consecutive_failure_limit
+        and status != "blocked"
+    ):
+        status = "limited"
+        reason = "role_consecutive_failure_budget_reached"
+
+    return {
+        "role": role,
+        "status": status,
+        "reason": reason,
+        "calls_1h": len(one_hour_rows),
+        "max_calls_1h": hourly_limit,
+        "tokens_24h": int(tokens_24h),
+        "max_tokens_24h": daily_token_limit,
+        "consecutive_failures": consecutive_failures,
+        "max_consecutive_failures": consecutive_failure_limit,
+        "retry_after_seconds": retry_after_seconds,
+    }
+
+
+def _advisor_runtime_status(rows: Sequence[AgentRun], *, now: datetime) -> dict[str, Any]:
+    latest = next((row for row in rows if row.role == "market_settings_advisor"), None)
+    if latest is None:
+        return {
+            "status": "never_run",
+            "last_run_at": None,
+            "next_due_at": None,
+            "retry_after_seconds": 0,
+        }
+    metadata = _metadata_payload(latest)
+    cost_estimate = _estimate_row_cost(latest)
+    settings_policy = metadata.get("settings_policy") if isinstance(metadata.get("settings_policy"), dict) else {}
+    observed_risk_flags = [
+        str(item)
+        for item in metadata.get("observed_risk_flags", [])
+        if str(item or "").strip()
+    ] if isinstance(metadata.get("observed_risk_flags"), list) else []
+    try:
+        interval_seconds = int(
+            settings_policy.get(
+                "elevated_interval_seconds" if observed_risk_flags else "normal_interval_seconds",
+                0,
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        interval_seconds = 0
+    try:
+        min_recheck_seconds = int(settings_policy.get("min_recheck_interval_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        min_recheck_seconds = 0
+    due_seconds = max(interval_seconds, min_recheck_seconds)
+    next_due_at = latest.created_at + timedelta(seconds=due_seconds) if due_seconds > 0 else None
+    retry_after_seconds = (
+        max(int((next_due_at - now).total_seconds()), 1)
+        if next_due_at is not None and next_due_at > now
+        else 0
+    )
+    return {
+        "status": str(metadata.get("status") or latest.status or "unknown"),
+        "last_run_at": latest.created_at.isoformat(),
+        "next_due_at": next_due_at.isoformat() if next_due_at is not None else None,
+        "retry_after_seconds": retry_after_seconds,
+        "symbol_scope": metadata.get("symbol_scope") if isinstance(metadata.get("symbol_scope"), list) else [],
+        "representative_symbol": metadata.get("representative_symbol") or metadata.get("symbol"),
+        "observed_risk_flags": observed_risk_flags,
+        "source": metadata.get("source"),
+        "cost_estimate_status": metadata.get("cost_estimate_status") or cost_estimate.status,
+        "estimated_cost_usd": (
+            metadata.get("estimated_cost_usd")
+            if metadata.get("estimated_cost_usd") is not None
+            else cost_estimate.estimated_cost_usd
+        ),
+        "cost_estimate_model": metadata.get("cost_estimate_model") or cost_estimate.model,
+        "cost_estimate_model_source": metadata.get("cost_estimate_model_source") or cost_estimate.model_source,
+    }
+
+
+def build_ai_protection_status(rows: Sequence[AgentRun], *, now: datetime) -> dict[str, Any]:
+    roles = sorted(
+        {
+            *AI_ROLE_HOURLY_CALL_BUDGETS.keys(),
+            *AI_ROLE_DAILY_TOKEN_BUDGETS.keys(),
+            *AI_ROLE_CONSECUTIVE_FAILURE_BUDGETS.keys(),
+        }
+    )
+    return {
+        "policy": {
+            "quota_errors": "global_backoff",
+            "auth_errors": "global_backoff",
+            "rate_limit_errors": "role_backoff",
+        },
+        "role_budgets": {
+            role: _role_budget_status(rows, role, now=now)
+            for role in roles
+        },
+        "advisor": _advisor_runtime_status(rows, now=now),
+    }
 
 
 def _agent_run_symbol(row: AgentRun) -> str | None:
@@ -428,7 +677,33 @@ def get_openai_call_gate(
         return OpenAICallGate(allowed=False, reason="historical_replay_disabled")
 
     now = utcnow_naive()
-    recent_runs = _recent_role_runs(session, role, limit=100 if symbol else 25)
+    for row in _recent_ai_attempt_runs(session, limit=100):
+        error = _metadata_error(row)
+        reason = classify_ai_failure(error)
+        if reason not in {"AUTH", "QUOTA"}:
+            continue
+        backoff = failure_backoff_minutes(settings_row, error)
+        retry_at = row.created_at + timedelta(minutes=backoff)
+        if retry_at > now:
+            return OpenAICallGate(
+                allowed=False,
+                reason="global_failure_backoff_active",
+                retry_after_seconds=max(int((retry_at - now).total_seconds()), 1),
+                backoff_minutes=backoff,
+                last_attempt_at=row.created_at,
+                failure_reason=reason,
+            )
+        break
+
+    recent_runs = _recent_role_runs(session, role, limit=500)
+    role_budget = _role_budget_status(recent_runs, role, now=now)
+    if role_budget["status"] == "blocked":
+        return OpenAICallGate(
+            allowed=False,
+            reason=str(role_budget["reason"]),
+            retry_after_seconds=int(role_budget["retry_after_seconds"] or 0),
+        )
+    recent_runs = recent_runs[:100 if symbol else 25]
     if symbol is not None:
         symbol_upper = symbol.upper()
         recent_runs = [row for row in recent_runs if _agent_run_symbol(row) == symbol_upper]
@@ -621,21 +896,176 @@ def _summarize_attempt_rows(rows: list[AgentRun]) -> AIWindowSummary:
     }
 
 
+def _postgres_ai_attempt_summary(session: Session, since: datetime) -> AIWindowSummary | None:
+    bind = session.get_bind()
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect_name != "postgresql":
+        return None
+    try:
+        summary = session.execute(
+            text(
+                """
+                with attempts as (
+                    select
+                        role,
+                        provider_name,
+                        coalesce(metadata_json->>'source', '') as source,
+                        coalesce(metadata_json->>'error', '') as error,
+                        case
+                            when coalesce(metadata_json->'usage'->>'prompt_tokens', '') ~ '^[0-9]+$'
+                            then (metadata_json->'usage'->>'prompt_tokens')::bigint
+                            else 0
+                        end as prompt_tokens,
+                        case
+                            when coalesce(metadata_json->'usage'->>'completion_tokens', '') ~ '^[0-9]+$'
+                            then (metadata_json->'usage'->>'completion_tokens')::bigint
+                            else 0
+                        end as completion_tokens,
+                        case
+                            when coalesce(metadata_json->'usage'->>'total_tokens', '') ~ '^[0-9]+$'
+                            then (metadata_json->'usage'->>'total_tokens')::bigint
+                            else 0
+                        end as total_tokens
+                    from agent_runs
+                    where created_at >= :since
+                      and (
+                        provider_name = 'openai'
+                        or coalesce(metadata_json->>'source', '') in ('llm', 'llm_fallback')
+                      )
+                )
+                select
+                    count(*)::bigint as calls,
+                    count(*) filter (where provider_name = 'openai' and source = 'llm')::bigint as successes,
+                    count(*) filter (where source = 'llm_fallback' or error <> '')::bigint as failures,
+                    coalesce(sum(prompt_tokens), 0)::bigint as prompt_tokens,
+                    coalesce(sum(completion_tokens), 0)::bigint as completion_tokens,
+                    coalesce(sum(total_tokens), 0)::bigint as total_tokens
+                from attempts
+                """
+            ),
+            {"since": since},
+        ).mappings().one()
+        role_calls = {
+            str(row["role"]): int(row["count"] or 0)
+            for row in session.execute(
+                text(
+                    """
+                    select role, count(*)::bigint as count
+                    from agent_runs
+                    where created_at >= :since
+                      and (
+                        provider_name = 'openai'
+                        or coalesce(metadata_json->>'source', '') in ('llm', 'llm_fallback')
+                      )
+                    group by role
+                    order by role
+                    """
+                ),
+                {"since": since},
+            ).mappings()
+        }
+        role_failures = {
+            str(row["role"]): int(row["count"] or 0)
+            for row in session.execute(
+                text(
+                    """
+                    select role, count(*)::bigint as count
+                    from agent_runs
+                    where created_at >= :since
+                      and (
+                        provider_name = 'openai'
+                        or coalesce(metadata_json->>'source', '') in ('llm', 'llm_fallback')
+                      )
+                      and (
+                        coalesce(metadata_json->>'source', '') = 'llm_fallback'
+                        or coalesce(metadata_json->>'error', '') <> ''
+                      )
+                    group by role
+                    order by role
+                    """
+                ),
+                {"since": since},
+            ).mappings()
+        }
+        failure_reasons = Counter()
+        for row in session.execute(
+            text(
+                """
+                select coalesce(metadata_json->>'error', '') as error
+                from agent_runs
+                where created_at >= :since
+                  and (
+                    provider_name = 'openai'
+                    or coalesce(metadata_json->>'source', '') in ('llm', 'llm_fallback')
+                  )
+                  and (
+                    coalesce(metadata_json->>'source', '') = 'llm_fallback'
+                    or coalesce(metadata_json->>'error', '') <> ''
+                  )
+                order by created_at desc
+                limit 100
+                """
+            ),
+            {"since": since},
+        ).mappings():
+            failure_reasons[classify_ai_failure(row["error"]) or "UNKNOWN"] += 1
+    except Exception:
+        return None
+
+    return {
+        "calls": int(summary["calls"] or 0),
+        "successes": int(summary["successes"] or 0),
+        "failures": int(summary["failures"] or 0),
+        "tokens": {
+            "prompt_tokens": int(summary["prompt_tokens"] or 0),
+            "completion_tokens": int(summary["completion_tokens"] or 0),
+            "total_tokens": int(summary["total_tokens"] or 0),
+        },
+        "role_calls": role_calls,
+        "role_failures": role_failures,
+        "failure_reasons": [
+            f"{reason} x{count}" for reason, count in failure_reasons.most_common(5) if count > 0
+        ],
+    }
+
+
+def _summarize_attempt_window(session: Session, rows: list[AgentRun], since: datetime) -> AIWindowSummary:
+    return _postgres_ai_attempt_summary(session, since) or _summarize_attempt_rows(rows)
+
+
 def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
     now = utcnow_naive()
     cutoff_7d = now - timedelta(days=7)
     cutoff_24h = now - timedelta(hours=24)
+    cutoff_24h_bucket = cutoff_24h.replace(second=0, microsecond=0).isoformat()
+    cutoff_7d_bucket = cutoff_7d.replace(second=0, microsecond=0).isoformat()
+    cache_key = (
+        _session_cache_scope(session),
+        cutoff_24h_bucket,
+        cutoff_7d_bucket,
+    )
+    cached = _AI_USAGE_METRICS_CACHE.get(cache_key)
+    monotonic_now = monotonic()
+    if cached is not None and monotonic_now - cached[0] <= AI_USAGE_CACHE_TTL_SECONDS:
+        return deepcopy(cached[2])
+
+    source_revision = _ai_usage_source_revision(session, cutoff_24h=cutoff_24h, cutoff_7d=cutoff_7d)
+    if cached is not None and cached[1] == source_revision:
+        _AI_USAGE_METRICS_CACHE[cache_key] = (monotonic_now, cached[1], deepcopy(cached[2]))
+        return deepcopy(cached[2])
+
     rows_7d = list(
         session.scalars(
             select(AgentRun)
             .where(AgentRun.created_at >= cutoff_7d)
             .order_by(desc(AgentRun.created_at))
+            .limit(AI_USAGE_DETAIL_ROW_LIMIT)
         )
     )
     rows_24h = [row for row in rows_7d if row.created_at >= cutoff_24h]
 
-    summary_24h = _summarize_attempt_rows(rows_24h)
-    summary_7d = _summarize_attempt_rows(rows_7d)
+    summary_24h = _summarize_attempt_window(session, rows_24h, cutoff_24h)
+    summary_7d = _summarize_attempt_window(session, rows_7d, cutoff_7d)
     ai_usage_summary_24h = build_ai_telemetry_summary(
         session,
         rows_24h,
@@ -646,6 +1076,7 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         rows_7d,
         deduped_count=count_ai_deduped_events(session, cutoff_7d),
     )
+    ai_protection_status = build_ai_protection_status(rows_7d, now=now)
 
     if summary_24h["calls"] > 0:
         projected_total = int(summary_24h["calls"] * 30)
@@ -661,7 +1092,7 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         projected_total = 0
         projected_breakdown = {}
 
-    return {
+    metrics: AIUsageMetrics = {
         "recent_ai_calls_24h": int(summary_24h["calls"]),
         "recent_ai_calls_7d": int(summary_7d["calls"]),
         "recent_ai_successes_24h": int(summary_24h["successes"]),
@@ -677,6 +1108,10 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         "recent_ai_failure_reasons": summary_7d["failure_reasons"],
         "observed_monthly_ai_calls_projection": projected_total,
         "observed_monthly_ai_calls_projection_breakdown": projected_breakdown,
+        "ai_protection_status": ai_protection_status,
         "ai_usage_summary_24h": ai_usage_summary_24h,
         "ai_usage_summary_7d": ai_usage_summary_7d,
     }
+    _AI_USAGE_METRICS_CACHE.clear()
+    _AI_USAGE_METRICS_CACHE[cache_key] = (monotonic_now, source_revision, deepcopy(metrics))
+    return metrics

@@ -34,8 +34,13 @@ from trading_mvp.services.agents import (
     TradingDecisionAgent,
     build_trading_decision_input_payload,
 )
-from trading_mvp.services.features import compute_features, summarize_universe_breadth
+from trading_mvp.services.features import (
+    compute_features,
+    persist_feature_snapshot,
+    summarize_universe_breadth,
+)
 from trading_mvp.services.intent_semantics import infer_intent_semantics
+from trading_mvp.services.market_data import persist_market_snapshot
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
@@ -2977,6 +2982,7 @@ def test_market_settings_advisor_accepts_allowed_profile_recommendation() -> Non
                     "do_not_relax": True,
                 },
                 usage={"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+                model="gpt-4.1-mini",
             )
 
     base = _snapshot("15m", [100, 101, 102, 103, 104, 105, 106, 107])
@@ -2995,8 +3001,17 @@ def test_market_settings_advisor_accepts_allowed_profile_recommendation() -> Non
     assert recommendation.recommended_profile_id == "NORMAL"
     assert recommendation.suggested_new_entry_policy == "NORMAL_ALLOWED"
     assert metadata["schema_status"] == "valid"
+    assert metadata["ai_model"] == "gpt-4.1-mini"
     assert captured_payloads[0]["authority"]["can_change_raw_settings"] is False
     assert "NORMAL" in captured_payloads[0]["authority"]["allowed_profiles"]
+    assert "market_snapshot" not in captured_payloads[0]
+    assert "features" not in captured_payloads[0]
+    compact_context = captured_payloads[0]["compact_market_context"]
+    assert compact_context["context_version"] == "market_settings_advisor_compact_v2"
+    assert compact_context["representative_symbol"] == "BTCUSDT"
+    assert compact_context["market_breadth"]["breadth_regime"] == "single_symbol_fallback"
+    assert compact_context["symbols"][0]["data_quality"]["candle_count"] == base.candle_count
+    assert "candles" not in compact_context["symbols"][0]
 
 
 def test_market_settings_advisor_accepts_high_volatility_profile() -> None:
@@ -3144,6 +3159,262 @@ def test_market_settings_advisor_low_confidence_is_ignored_and_audited(db_sessio
     assert event.payload["recommended_profile_id"] == "CAUTION"
     assert event.payload["confidence"] == 0.42
     assert event.payload["ignored_reason_code"] == "AI_MARKET_SETTINGS_LOW_CONFIDENCE"
+
+
+def test_market_settings_advisor_uses_global_interval_across_symbols(db_session) -> None:
+    generated_at = datetime.now(UTC)
+    captured_payloads: list[dict[str, object]] = []
+
+    class ValidAdvisorProvider:
+        name = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            self.calls += 1
+            captured_payloads.append(dict(payload))
+            compact_context = payload["compact_market_context"]
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": "advisor-global-001",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": compact_context["symbol_scope"],
+                    "recommended_profile_id": "CAUTION",
+                    "confidence": 0.82,
+                    "reason_summary": "Global profile review should cover all tracked symbols.",
+                    "reason_codes": ["GLOBAL_MARKET_REVIEW"],
+                    "observed_risk_flags": [],
+                    "suggested_new_entry_policy": "STRICT_CONFIRMATION_ONLY",
+                    "do_not_relax": True,
+                },
+                usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+                model="gpt-4.1-mini",
+            )
+
+    settings_row = get_or_create_settings(db_session)
+    settings_row.default_symbol = "BTCUSDT"
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT"]
+    settings_row.ai_enabled = True
+    settings_row.ai_provider = "openai"
+    settings_row.openai_api_key_encrypted = encrypt_secret("sk-test", get_settings().app_secret_seed)
+    db_session.flush()
+
+    provider = ValidAdvisorProvider()
+    orchestrator = TradingOrchestrator(db_session)
+    orchestrator.market_settings_advisor = MarketSettingsAdvisorAgent(provider)
+    btc_snapshot = _snapshot("15m", [100, 101, 102, 103, 104, 105, 106, 107])
+    btc_features = compute_features(btc_snapshot, {})
+    eth_context_snapshot = _snapshot("15m", [200, 199, 198, 197, 196, 195, 194, 193]).model_copy(
+        update={"symbol": "ETHUSDT"}
+    )
+    eth_context_features = compute_features(eth_context_snapshot, {})
+    eth_context_features.derivatives.spread_stress = True
+    eth_context_market = persist_market_snapshot(db_session, eth_context_snapshot)
+    persist_feature_snapshot(db_session, eth_context_market.id, eth_context_snapshot, eth_context_features)
+
+    first = orchestrator._maybe_run_market_settings_advisor(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot=btc_snapshot,
+        feature_payload=btc_features,
+        runtime_state={"operating_state": "TRADABLE"},
+        cycle_id="cycle-global-btc",
+        snapshot_id=101,
+        force=True,
+    )
+
+    eth_snapshot = btc_snapshot.model_copy(update={"symbol": "ETHUSDT"})
+    eth_features = compute_features(eth_snapshot, {})
+    second = orchestrator._maybe_run_market_settings_advisor(
+        symbol="ETHUSDT",
+        trigger_event="manual",
+        market_snapshot=eth_snapshot,
+        feature_payload=eth_features,
+        runtime_state={"operating_state": "TRADABLE"},
+        cycle_id="cycle-global-eth",
+        snapshot_id=102,
+    )
+
+    assert first is not None
+    assert first["status"] == "shadow_generated"
+    assert second is not None
+    assert second["status"] == "skipped"
+    assert second["skip_reason"] == "min_recheck_interval_active"
+    assert provider.calls == 1
+
+    advisor_run = db_session.query(AgentRun).filter_by(role="market_settings_advisor").one()
+    assert advisor_run.metadata_json["symbol_scope"] == ["BTCUSDT", "ETHUSDT"]
+    assert advisor_run.metadata_json["ai_model"] == "gpt-4.1-mini"
+    assert advisor_run.metadata_json["cost_estimate_status"] == "estimated"
+    assert "market_snapshot" not in advisor_run.input_payload
+    assert "features" not in advisor_run.input_payload
+    assert advisor_run.input_payload["compact_market_context"]["symbol_scope"] == ["BTCUSDT", "ETHUSDT"]
+    compact_context = captured_payloads[0]["compact_market_context"]
+    assert compact_context["market_breadth"]["tracked_symbols"] == 2
+    assert compact_context["market_breadth"]["context_symbols"] == 2
+    assert "ETHUSDT" in compact_context["market_breadth"]["stressed_symbols"]
+    assert {item["symbol"] for item in compact_context["symbols"]} == {"BTCUSDT", "ETHUSDT"}
+
+
+def _allow_immediate_market_settings_advisor(settings_row) -> None:  # noqa: ANN001
+    detail = dict(settings_row.pause_reason_detail or {})
+    detail["ai_market_settings_policy"] = {
+        "advisor_enabled": True,
+        "advisor_shadow_mode": True,
+        "normal_interval_seconds": 60,
+        "elevated_interval_seconds": 60,
+        "min_recheck_interval_seconds": 60,
+        "recommendation_ttl_seconds": 900,
+        "min_confidence_to_apply": 0.65,
+    }
+    settings_row.pause_reason_detail = detail
+
+
+def test_market_settings_advisor_skips_when_fingerprint_is_unchanged(db_session) -> None:
+    generated_at = datetime.now(UTC)
+
+    class ValidAdvisorProvider:
+        name = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            self.calls += 1
+            compact_context = payload["compact_market_context"]
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": f"advisor-fingerprint-{self.calls}",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": compact_context["symbol_scope"],
+                    "recommended_profile_id": "CAUTION",
+                    "confidence": 0.82,
+                    "reason_summary": "Unchanged fingerprint should not call provider again.",
+                    "reason_codes": ["FINGERPRINT_TEST"],
+                    "observed_risk_flags": [],
+                    "suggested_new_entry_policy": "STRICT_CONFIRMATION_ONLY",
+                    "do_not_relax": True,
+                },
+                usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+                model="gpt-4.1-mini",
+            )
+
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_provider = "openai"
+    settings_row.openai_api_key_encrypted = encrypt_secret("sk-test", get_settings().app_secret_seed)
+    _allow_immediate_market_settings_advisor(settings_row)
+    db_session.flush()
+
+    provider = ValidAdvisorProvider()
+    orchestrator = TradingOrchestrator(db_session)
+    orchestrator.market_settings_advisor = MarketSettingsAdvisorAgent(provider)
+    snapshot = _snapshot("15m", [100, 101, 102, 103, 104, 105, 106, 107])
+    features = compute_features(snapshot, {})
+
+    first = orchestrator._maybe_run_market_settings_advisor(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot=snapshot,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        cycle_id="cycle-fingerprint-1",
+        snapshot_id=201,
+        force=True,
+    )
+    advisor_run = db_session.query(AgentRun).filter_by(role="market_settings_advisor").one()
+    advisor_run.created_at = utcnow_naive() - timedelta(seconds=120)
+    db_session.flush()
+    second = orchestrator._maybe_run_market_settings_advisor(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot=snapshot,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        cycle_id="cycle-fingerprint-2",
+        snapshot_id=202,
+    )
+
+    assert first is not None
+    assert first["status"] == "shadow_generated"
+    assert second is not None
+    assert second["status"] == "skipped"
+    assert second["skip_reason"] == "advisor_fingerprint_unchanged"
+    assert second["risk_guard_unchanged"] is True
+    assert provider.calls == 1
+    event = db_session.query(AuditEvent).filter_by(
+        event_type="ai_market_settings_provider_skipped"
+    ).one()
+    assert event.payload["skip_reason"] == "advisor_fingerprint_unchanged"
+    assert event.payload["risk_guard_unchanged"] is True
+
+
+def test_market_settings_advisor_budget_skip_is_audited_before_provider(db_session) -> None:
+    now = utcnow_naive()
+
+    class BlockingProvider:
+        name = "openai"
+
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            raise AssertionError("provider should not be called when advisor role budget is exhausted")
+
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_provider = "openai"
+    settings_row.openai_api_key_encrypted = encrypt_secret("sk-test", get_settings().app_secret_seed)
+    _allow_immediate_market_settings_advisor(settings_row)
+    for offset in (5, 10, 15, 20):
+        db_session.add(
+            AgentRun(
+                role="market_settings_advisor",
+                trigger_event="realtime_cycle",
+                schema_name="AIMarketSettingsRecommendation",
+                status="completed",
+                provider_name="openai",
+                summary="advisor success",
+                input_payload={},
+                output_payload={},
+                metadata_json={
+                    "source": "llm",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                },
+                schema_valid=True,
+                created_at=now - timedelta(minutes=offset),
+            )
+        )
+    db_session.flush()
+
+    orchestrator = TradingOrchestrator(db_session)
+    orchestrator.market_settings_advisor = MarketSettingsAdvisorAgent(BlockingProvider())
+    snapshot = _snapshot("15m", [100, 101, 102, 103, 104, 105, 106, 107])
+    features = compute_features(snapshot, {})
+
+    result = orchestrator._maybe_run_market_settings_advisor(
+        symbol="BTCUSDT",
+        trigger_event="manual",
+        market_snapshot=snapshot,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        cycle_id="cycle-budget-skip",
+        snapshot_id=203,
+        force=True,
+    )
+
+    assert result is not None
+    assert result["status"] == "skipped"
+    assert result["skip_reason"] == "role_hourly_call_budget_exhausted"
+    assert result["risk_guard_unchanged"] is True
+    event = db_session.query(AuditEvent).filter_by(
+        event_type="ai_market_settings_provider_skipped"
+    ).one()
+    assert event.payload["skip_reason"] == "role_hourly_call_budget_exhausted"
+    assert event.payload["gate"]["reason"] == "role_hourly_call_budget_exhausted"
+    assert event.payload["risk_guard_unchanged"] is True
 
 
 def test_market_settings_advisor_flags_stale_incomplete_data_as_degraded() -> None:
