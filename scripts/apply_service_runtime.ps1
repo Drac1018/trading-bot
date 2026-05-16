@@ -1,9 +1,26 @@
 [CmdletBinding()]
 param(
-    [switch]$PreflightOnly
+    [switch]$PreflightOnly,
+    [switch]$PauseOnExit
 )
 
 $ErrorActionPreference = "Stop"
+$script:RuntimeSwitchFailed = $false
+trap {
+    $script:RuntimeSwitchFailed = $true
+    Write-Host ""
+    Write-Host "Service runtime switch failed:"
+    Write-Host $_
+    try {
+        Stop-Transcript | Out-Null
+    } catch {
+    }
+    if ($PauseOnExit) {
+        Read-Host "Press Enter to close"
+    }
+    exit 1
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $repoRoot
 $runtimeSwitchLogDir = Join-Path $repoRoot ".logs\service-runtime-switch"
@@ -105,7 +122,7 @@ foreach ($serviceName in $serviceNames) {
     if ($service -and $service.Status -eq "Running") {
         Write-Host "Stopping service $serviceName"
         Stop-Service -Name $serviceName -Force
-        $service.WaitForStatus("Stopped", "00:00:30")
+        $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
 }
 
@@ -114,12 +131,12 @@ Stop-ListeningPorts -Ports @(8000, 3000) -ProtectedProcessIds $servicePids
 
 Write-Host "Starting TradingMvpBackend"
 Start-Service TradingMvpBackend
-(Get-Service TradingMvpBackend).WaitForStatus("Running", "00:00:60")
+(Get-Service TradingMvpBackend).WaitForStatus("Running", [TimeSpan]::FromSeconds(60))
 Wait-HttpOk -Uri "http://127.0.0.1:8000/health" -TimeoutSeconds 90 | Out-Null
 
 Write-Host "Starting TradingMvpFrontend"
 Start-Service TradingMvpFrontend
-(Get-Service TradingMvpFrontend).WaitForStatus("Running", "00:00:60")
+(Get-Service TradingMvpFrontend).WaitForStatus("Running", [TimeSpan]::FromSeconds(60))
 Wait-HttpOk -Uri "http://127.0.0.1:3000/" -TimeoutSeconds 90 | Out-Null
 
 $health = Invoke-RestMethod -Uri "http://127.0.0.1:8000/health" -TimeoutSec 15
@@ -142,4 +159,7 @@ try {
     Stop-Transcript | Out-Null
 } catch {
     Write-Warning "Failed to stop transcript: $($_.Exception.Message)"
+}
+if ($PauseOnExit) {
+    Read-Host "Press Enter to close"
 }
