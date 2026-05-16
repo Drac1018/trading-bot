@@ -124,6 +124,7 @@ from trading_mvp.services.runtime_state import (
     summarize_runtime_state,
     sync_scope_blocks_new_entry,
 )
+from trading_mvp.services.service_gate import active_pending_entry_plan_statement
 from trading_mvp.services.settings import (
     build_operational_status_payload,
     get_effective_symbol_schedule,
@@ -3991,7 +3992,7 @@ class TradingOrchestrator:
         *,
         symbol: str | None = None,
     ) -> list[PendingEntryPlan]:
-        query = select(PendingEntryPlan).where(PendingEntryPlan.plan_status == ACTIVE_ENTRY_PLAN_STATUS)
+        query = active_pending_entry_plan_statement()
         if symbol is not None:
             query = query.where(PendingEntryPlan.symbol == symbol.upper())
         return list(self.session.scalars(query.order_by(PendingEntryPlan.created_at.desc())))
@@ -7443,6 +7444,24 @@ class TradingOrchestrator:
                     symbol_results.append(result_item)
                     continue
                 if stale_scopes:
+                    if (
+                        pending_entry_plan_is_expired(plan.expires_at, now=generated_at)
+                        and "PLAN_WAITING_FOR_FRESH_SYNC"
+                        in (metadata.get("last_watch_blocked_reason_codes") or [])
+                    ):
+                        self._cancel_pending_entry_plan(
+                            plan,
+                            reason="PLAN_TTL_EXPIRED",
+                            cancel_status="expired",
+                            detail={
+                                "observed_at": generated_at.isoformat(),
+                                "expired_while_waiting_for_fresh_sync": True,
+                                "stale_scopes": list(stale_scopes),
+                            },
+                        )
+                        result_item["status"] = "expired"
+                        symbol_results.append(result_item)
+                        continue
                     self._defer_pending_entry_plan(
                         plan,
                         reason="PLAN_WAITING_FOR_FRESH_SYNC",
