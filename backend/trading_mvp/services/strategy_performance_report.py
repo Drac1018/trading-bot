@@ -5,14 +5,14 @@ import io
 import json
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import isfinite
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from trading_mvp.models import AuditEvent, Execution, Order, Position
+from trading_mvp.models import AuditEvent, DecisionPerformanceFact, Execution, Order, Position
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_GROUP_BY = (
@@ -25,6 +25,10 @@ DEFAULT_GROUP_BY = (
 )
 SUPPORTED_GROUP_BY = DEFAULT_GROUP_BY + ("mode",)
 NO_DATA_MESSAGE = "No closed trade records matched the filters."
+SHORT_SIDE_DRAG_DEFAULT_DAYS = 7
+SHORT_SIDE_DRAG_MAX_DAYS = 90
+SHORT_SIDE_DRAG_DEFAULT_LIMIT = 10
+SHORT_SIDE_DRAG_MAX_LIMIT = 50
 
 
 @dataclass(slots=True)
@@ -138,6 +142,51 @@ def _normalize_filter(value: str | None, *, upper: bool = False) -> str | None:
     if not text:
         return None
     return text.upper() if upper else text.lower()
+
+
+def _normalize_trade_direction(value: object, *, fallback: object = None) -> str:
+    text = _text(value).lower()
+    aliases = {
+        "buy": "long",
+        "enter_long": "long",
+        "long": "long",
+        "sell": "short",
+        "enter_short": "short",
+        "short": "short",
+    }
+    if text in aliases:
+        return aliases[text]
+    fallback_text = _text(fallback).lower()
+    return aliases.get(fallback_text, fallback_text or "unknown")
+
+
+def _strategy_id_from_rationale_codes(codes: object) -> str | None:
+    if not isinstance(codes, list):
+        return None
+    for raw_code in codes:
+        code = str(raw_code or "").strip().upper()
+        if code.startswith("ENGINE_") and code.endswith("_ENGINE"):
+            return code.removeprefix("ENGINE_").lower()
+    return None
+
+
+def _decision_fact_tags(fact: DecisionPerformanceFact | None) -> dict[str, Any]:
+    if fact is None:
+        return {}
+    strategy_id = _strategy_id_from_rationale_codes(fact.rationale_codes)
+    tags: dict[str, Any] = {
+        "symbol": fact.symbol,
+        "timeframe": fact.timeframe,
+        "decision": fact.decision,
+        "direction": fact.decision,
+        "regime_id": fact.regime,
+        "regime_label": fact.regime,
+        "trend_alignment": fact.trend_alignment,
+    }
+    if strategy_id:
+        tags["strategy_id"] = strategy_id
+        tags["strategy_engine"] = strategy_id
+    return tags
 
 
 def _metadata_tags(metadata: object) -> dict[str, Any]:
@@ -322,6 +371,17 @@ def load_strategy_trade_records(
         if order.position_id is not None:
             orders_by_position[int(order.position_id)].append(order)
     order_ids = [int(order.id) for order in orders if order.id is not None]
+    decision_run_ids = {
+        int(order.decision_run_id)
+        for order in orders
+        if order.decision_run_id is not None
+    }
+    decision_facts_by_id: dict[int, DecisionPerformanceFact] = {}
+    if decision_run_ids:
+        for fact in session.scalars(
+            select(DecisionPerformanceFact).where(DecisionPerformanceFact.decision_run_id.in_(decision_run_ids))
+        ):
+            decision_facts_by_id[int(fact.decision_run_id)] = fact
     executions = list(
         session.scalars(
             select(Execution).where(
@@ -354,9 +414,15 @@ def load_strategy_trade_records(
             continue
         position_orders = orders_by_position.get(int(position.id), [])
         position_executions = executions_by_position.get(int(position.id), [])
+        decision_fact_payloads = [
+            _decision_fact_tags(decision_facts_by_id.get(int(order.decision_run_id)))
+            for order in position_orders
+            if order.decision_run_id is not None
+        ]
         tag_payloads: list[object] = [
             position.metadata_json,
             audit_tags.get(int(position.id), {}),
+            *decision_fact_payloads,
             *[order.metadata_json for order in position_orders],
             *[execution.payload for execution in position_executions],
         ]
@@ -387,7 +453,7 @@ def load_strategy_trade_records(
         record = StrategyTradeRecord(
             position_id=int(position.id),
             symbol=_text(tags.get("symbol"), position.symbol).upper(),
-            direction=_text(tags.get("direction") or tags.get("decision"), position.side).lower(),
+            direction=_normalize_trade_direction(position.side, fallback=tags.get("direction") or tags.get("decision")),
             mode=_text(position.mode, "unknown").lower(),
             strategy_id=_text(tags.get("strategy_id") or tags.get("strategy_engine"), "unknown"),
             regime_id=_text(tags.get("regime_id"), "unknown"),
@@ -463,6 +529,119 @@ def build_strategy_performance_report(
         buckets=buckets,
         message=None if buckets else NO_DATA_MESSAGE,
     )
+
+
+def _bounded_int(value: int | None, *, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, maximum))
+
+
+def _short_drag_record_payload(record: StrategyTradeRecord) -> dict[str, object]:
+    return {
+        "position_id": record.position_id,
+        "symbol": record.symbol,
+        "strategy_id": record.strategy_id,
+        "regime_id": record.regime_id,
+        "confirmation_type": record.confirmation_type,
+        "risk_mode": record.risk_mode,
+        "mode": record.mode,
+        "closed_at": record.closed_at.isoformat() if record.closed_at is not None else None,
+        "gross_pnl_usdt": round(record.gross_pnl, 8),
+        "fee_total_usdt": round(record.fee_total, 8),
+        "net_pnl_usdt": round(record.fee_adjusted_pnl, 8),
+        "avg_slippage_bps": record.avg_slippage_bps,
+        "hold_minutes": record.hold_minutes,
+    }
+
+
+def _short_drag_summary(records: list[StrategyTradeRecord]) -> dict[str, object]:
+    wins = [record.fee_adjusted_pnl for record in records if record.fee_adjusted_pnl > 0]
+    losses = [record.fee_adjusted_pnl for record in records if record.fee_adjusted_pnl < 0]
+    slippage_values = [record.avg_slippage_bps for record in records if record.avg_slippage_bps is not None]
+    trade_count = len(records)
+    gross_pnl = sum(record.gross_pnl for record in records)
+    fee_total = sum(record.fee_total for record in records)
+    net_pnl = sum(record.fee_adjusted_pnl for record in records)
+    return {
+        "trade_count": trade_count,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": (len(wins) / trade_count) if trade_count else None,
+        "gross_pnl_usdt": round(gross_pnl, 8),
+        "fee_total_usdt": round(fee_total, 8),
+        "fee_drag_usdt": round(fee_total, 8),
+        "net_pnl_usdt": round(net_pnl, 8),
+        "avg_win_usdt": _avg(wins),
+        "avg_loss_usdt": _avg(losses),
+        "profit_factor": _profit_factor(wins, losses),
+        "max_loss_streak": _max_loss_streak(records),
+        "avg_slippage_bps": _avg(slippage_values),
+    }
+
+
+def _short_drag_group_summaries(
+    records: list[StrategyTradeRecord],
+    group_key: str,
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[StrategyTradeRecord]] = defaultdict(list)
+    for record in records:
+        grouped[str(getattr(record, group_key) or "unknown")].append(record)
+    summaries = [
+        {
+            group_key: key,
+            **_short_drag_summary(group_records),
+        }
+        for key, group_records in grouped.items()
+    ]
+    summaries.sort(key=lambda item: (float(item["net_pnl_usdt"]), str(item[group_key])))
+    return summaries
+
+
+def build_short_side_drag_report(
+    session: Session,
+    *,
+    days: int = SHORT_SIDE_DRAG_DEFAULT_DAYS,
+    limit: int = SHORT_SIDE_DRAG_DEFAULT_LIMIT,
+    mode: str | None = "live",
+) -> dict[str, object]:
+    bounded_days = _bounded_int(days, default=SHORT_SIDE_DRAG_DEFAULT_DAYS, maximum=SHORT_SIDE_DRAG_MAX_DAYS)
+    bounded_limit = _bounded_int(limit, default=SHORT_SIDE_DRAG_DEFAULT_LIMIT, maximum=SHORT_SIDE_DRAG_MAX_LIMIT)
+    generated_at = utcnow_naive()
+    since = generated_at - timedelta(days=bounded_days)
+    records = load_strategy_trade_records(
+        session,
+        StrategyPerformanceFilters(
+            direction="short",
+            mode=_normalize_filter(mode),
+            since=since,
+            until=generated_at,
+        ),
+    )
+    loss_records = sorted(
+        [record for record in records if record.fee_adjusted_pnl < 0],
+        key=lambda record: (record.fee_adjusted_pnl, record.closed_at or datetime.min),
+    )
+    return {
+        "generated_at": generated_at.isoformat(),
+        "window_days": bounded_days,
+        "since": since.isoformat(),
+        "until": generated_at.isoformat(),
+        "filters": {
+            "direction": "short",
+            "mode": _normalize_filter(mode),
+        },
+        "summary": _short_drag_summary(records),
+        "top_loss_trades": [
+            _short_drag_record_payload(record)
+            for record in loss_records[:bounded_limit]
+        ],
+        "by_symbol": _short_drag_group_summaries(records, "symbol"),
+        "by_strategy": _short_drag_group_summaries(records, "strategy_id"),
+        "by_regime": _short_drag_group_summaries(records, "regime_id"),
+    }
 
 
 def _format_number(value: object, *, digits: int = 4) -> str:

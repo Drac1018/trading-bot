@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--until", help="Closed-at upper bound as ISO datetime.")
     parser.add_argument("--limit", type=int, help="Maximum closed positions to inspect after time filters.")
     parser.add_argument(
+        "--short-drag",
+        action="store_true",
+        help="Output short-side loss decomposition for the selected window as JSON.",
+    )
+    parser.add_argument("--days", type=int, default=7, help="Lookback window in days for --short-drag.")
+    parser.add_argument(
         "--group-by",
         default="strategy_id,regime_id,confirmation_type,risk_mode,symbol,direction",
         help="Comma-separated group keys. Supported: strategy_id,regime_id,confirmation_type,risk_mode,symbol,direction,mode.",
@@ -53,11 +60,27 @@ def main(argv: list[str] | None = None) -> int:
     from trading_mvp.database import SessionLocal
     from trading_mvp.services.strategy_performance_report import (
         StrategyPerformanceFilters,
+        build_short_side_drag_report,
         build_strategy_performance_report,
         format_console_report,
         format_csv_report,
         format_json_report,
     )
+
+    if args.short_drag:
+        with SessionLocal() as session:
+            payload = build_short_side_drag_report(
+                session,
+                days=args.days,
+                limit=args.limit or 10,
+                mode=args.mode or "live",
+            )
+        output = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        if args.output:
+            Path(args.output).write_text(output, encoding="utf-8")
+        else:
+            print(output)
+        return 0
 
     filters = StrategyPerformanceFilters(
         strategy_id=args.strategy_id,

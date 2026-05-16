@@ -110,6 +110,7 @@ from trading_mvp.services.settings import (
     update_settings,
     upsert_operator_event_view,
 )
+from trading_mvp.services.strategy_performance_report import build_short_side_drag_report
 
 READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS = 20.0
 LOCAL_DEV_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
@@ -743,6 +744,21 @@ def analytics_cost_breakdown(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return payload.model_dump(mode="json")
+
+
+@app.get("/api/analytics/short-drag")
+def analytics_short_drag(
+    days: int = 7,
+    limit: int = 10,
+    mode: str | None = "live",
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return build_short_side_drag_report(
+        db,
+        days=_bounded_limit(days, default=7, maximum=90),
+        limit=_bounded_limit(limit, default=10, maximum=50),
+        mode=mode,
+    )
 
 
 @app.get("/api/market/snapshots")

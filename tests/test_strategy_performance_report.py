@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from trading_mvp.models import AuditEvent, Execution, Order, Position
+from trading_mvp.models import AuditEvent, DecisionPerformanceFact, Execution, Order, Position
 from trading_mvp.services.strategy_performance_report import (
     NO_DATA_MESSAGE,
     StrategyPerformanceFilters,
+    build_short_side_drag_report,
     build_strategy_performance_report,
     format_console_report,
     format_csv_report,
@@ -186,6 +187,159 @@ def test_strategy_performance_report_aggregates_by_trade_tags(db_session) -> Non
     assert range_bucket.avg_hold_time == pytest.approx(45.0)
     assert range_bucket.avg_slippage_bps == pytest.approx(3.0)
     assert range_bucket.fee_adjusted_pnl == pytest.approx(50.0)
+
+
+def test_short_side_drag_report_decomposes_recent_short_losses(db_session) -> None:
+    short_loss = _seed_closed_trade(
+        db_session,
+        symbol="ETHUSDT",
+        side="short",
+        strategy_id="trend_pullback_engine",
+        regime_id="bearish:bearish_aligned",
+        confirmation_type="pullback_confirm",
+        risk_mode="drawdown_recovery",
+        net_pnl=-8.0,
+        gross_pnl=-7.0,
+        fee_total=1.0,
+        net_r_multiple=-0.8,
+        hold_minutes=40,
+        slippage_bps=3.0,
+    )
+    _seed_closed_trade(
+        db_session,
+        symbol="BTCUSDT",
+        side="short",
+        strategy_id="range_mean_reversion_engine",
+        regime_id="range:range",
+        confirmation_type="range_edge_confirm",
+        risk_mode="normal",
+        net_pnl=2.0,
+        gross_pnl=2.5,
+        fee_total=0.5,
+        net_r_multiple=0.2,
+        hold_minutes=20,
+        slippage_bps=1.0,
+    )
+    _seed_closed_trade(
+        db_session,
+        symbol="SOLUSDT",
+        side="long",
+        strategy_id="trend_pullback_engine",
+        regime_id="bullish:bullish_aligned",
+        confirmation_type="pullback_confirm",
+        risk_mode="normal",
+        net_pnl=-100.0,
+        gross_pnl=-99.0,
+        fee_total=1.0,
+        net_r_multiple=-1.0,
+        hold_minutes=15,
+        slippage_bps=8.0,
+    )
+
+    report = build_short_side_drag_report(db_session, days=7, limit=5)
+
+    assert report["summary"]["trade_count"] == 2
+    assert report["summary"]["loss_count"] == 1
+    assert report["summary"]["gross_pnl_usdt"] == pytest.approx(-4.5)
+    assert report["summary"]["fee_total_usdt"] == pytest.approx(1.5)
+    assert report["summary"]["net_pnl_usdt"] == pytest.approx(-6.0)
+    assert report["summary"]["avg_slippage_bps"] == pytest.approx(2.0)
+    assert report["top_loss_trades"][0]["position_id"] == short_loss.id
+    assert report["top_loss_trades"][0]["net_pnl_usdt"] == pytest.approx(-8.0)
+    assert report["by_symbol"][0]["symbol"] == "ETHUSDT"
+    assert report["by_strategy"][0]["strategy_id"] == "trend_pullback_engine"
+
+
+def test_short_side_drag_report_uses_position_side_for_synced_sell_orders(db_session) -> None:
+    closed_at = utcnow_naive()
+    opened_at = closed_at - timedelta(minutes=8)
+    decision_run_id = 8001
+    db_session.add(
+        DecisionPerformanceFact(
+            decision_run_id=decision_run_id,
+            provider_name="openai",
+            symbol="BTCUSDT",
+            timeframe="15m",
+            decision="short",
+            rationale_codes=["ENGINE_TREND_PULLBACK_ENGINE", "REGIME_BEARISH"],
+            regime="transition",
+            trend_alignment="mixed",
+            comparison_bucket="ai_trade_observed",
+            created_at=opened_at,
+            updated_at=opened_at,
+        )
+    )
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="short",
+        status="closed",
+        quantity=0.01,
+        entry_price=100.0,
+        mark_price=100.0,
+        leverage=1.0,
+        stop_loss=105.0,
+        take_profit=95.0,
+        realized_pnl=-3.0,
+        unrealized_pnl=0.0,
+        opened_at=opened_at,
+        closed_at=closed_at,
+        metadata_json={
+            "closed_position_pnl": {
+                "gross_realized_pnl": -3.0,
+                "fee_total": 0.4,
+                "net_realized_pnl": -3.4,
+            }
+        },
+        created_at=opened_at,
+        updated_at=closed_at,
+    )
+    db_session.add(position)
+    db_session.flush()
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=decision_run_id,
+        position_id=position.id,
+        side="sell",
+        order_type="market",
+        mode="live",
+        status="filled",
+        requested_quantity=0.01,
+        requested_price=100.0,
+        filled_quantity=0.01,
+        average_fill_price=100.0,
+        metadata_json={"side": "sell"},
+        created_at=opened_at,
+        updated_at=opened_at,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        Execution(
+            order_id=order.id,
+            position_id=position.id,
+            symbol="BTCUSDT",
+            status="filled",
+            external_trade_id="synced-short-sell",
+            fill_price=100.0,
+            fill_quantity=0.01,
+            fee_paid=0.4,
+            commission_asset="USDT",
+            slippage_pct=0.0002,
+            realized_pnl=-3.0,
+            payload={"side": "sell", "signed_slippage_bps": 2.0},
+            created_at=closed_at,
+            updated_at=closed_at,
+        )
+    )
+
+    report = build_short_side_drag_report(db_session, days=7, limit=5)
+
+    assert report["summary"]["trade_count"] == 1
+    assert report["summary"]["net_pnl_usdt"] == pytest.approx(-3.4)
+    assert report["top_loss_trades"][0]["position_id"] == position.id
+    assert report["by_strategy"][0]["strategy_id"] == "trend_pullback_engine"
+    assert report["by_regime"][0]["regime_id"] == "transition"
 
 
 def test_strategy_performance_report_filters_symbol_direction_and_risk_mode(db_session) -> None:
