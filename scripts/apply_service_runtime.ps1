@@ -6,6 +6,15 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $repoRoot
+$runtimeSwitchLogDir = Join-Path $repoRoot ".logs\service-runtime-switch"
+New-Item -ItemType Directory -Path $runtimeSwitchLogDir -Force | Out-Null
+$runtimeSwitchLog = Join-Path $runtimeSwitchLogDir ("runtime-switch-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+try {
+    Start-Transcript -Path $runtimeSwitchLog -Force | Out-Null
+    Write-Host "Runtime switch log: $runtimeSwitchLog"
+} catch {
+    Write-Warning "Failed to start transcript: $($_.Exception.Message)"
+}
 
 function Test-IsAdministrator {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -28,13 +37,13 @@ function Stop-ListeningPorts {
 
     $connections = Get-NetTCPConnection -LocalPort $Ports -State Listen -ErrorAction SilentlyContinue
     foreach ($connection in $connections) {
-        $pid = [int]$connection.OwningProcess
-        if ($ProtectedProcessIds -contains $pid) {
-            Write-Host "Preserve service-owned listener PID=$pid port=$($connection.LocalPort)"
+        $owningProcessId = [int]$connection.OwningProcess
+        if ($ProtectedProcessIds -contains $owningProcessId) {
+            Write-Host "Preserve service-owned listener PID=$owningProcessId port=$($connection.LocalPort)"
             continue
         }
-        Write-Host "Stopping listener PID=$pid port=$($connection.LocalPort)"
-        Stop-Process -Id $pid -Force
+        Write-Host "Stopping listener PID=$owningProcessId port=$($connection.LocalPort)"
+        Stop-Process -Id $owningProcessId -Force
     }
 }
 
@@ -129,3 +138,8 @@ $listeners = Get-NetTCPConnection -LocalPort 8000,3000,8001,3001 -State Listen -
     ai_usage_second = $aiUsageSecond
     listeners = $listeners
 } | ConvertTo-Json -Depth 8
+try {
+    Stop-Transcript | Out-Null
+} catch {
+    Write-Warning "Failed to stop transcript: $($_.Exception.Message)"
+}
