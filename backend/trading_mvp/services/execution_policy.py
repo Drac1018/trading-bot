@@ -228,7 +228,7 @@ def _build_plan(
         fallback_order_type=fallback_order_type,
         allow_partial_fill=allow_partial_fill,
         required_order_policy=intent.required_order_policy,
-        allow_market_fallback=bool(intent.allow_market_fallback),
+        allow_market_fallback=bool(intent.allow_market_fallback and fallback_order_type == "MARKET"),
         order_policy_reason=intent.order_policy_reason,
         policy_profile=policy_profile,
         symbol_risk_tier=symbol_risk_tier,
@@ -351,7 +351,7 @@ def select_execution_plan(
                 poll_interval_seconds=2,
                 max_requotes=max_requotes,
                 reprice_bps=reprice_bps,
-                fallback_order_type="NONE" if limit_only_required else "MARKET",
+                fallback_order_type="NONE",
                 allow_partial_fill=True,
                 policy_profile=profile,
                 symbol_risk_tier=symbol_risk_tier,
@@ -359,39 +359,19 @@ def select_execution_plan(
                 volatility_regime=volatility_regime,
                 urgency=urgency,
                 fallback_after_partial_fill_ratio=partial_fill_ratio,
-                reason="passive_entry_limit_only" if limit_only_required else "passive_entry_allowed",
-            )
-        if limit_only_required:
-            return _build_plan(
-                intent=intent,
-                order_type="NONE",
-                price=None,
-                time_in_force=None,
-                policy_name="entry_block_or_pending",
-                marketable=False,
-                estimated_slippage_pct=estimated_slippage_pct,
-                volatility_pct=volatility_pct,
-                timeout_seconds=0,
-                poll_interval_seconds=0,
-                max_requotes=0,
-                reprice_bps=0.0,
-                fallback_order_type="NONE",
-                allow_partial_fill=False,
-                policy_profile=profile,
-                symbol_risk_tier=symbol_risk_tier,
-                timeframe_bucket=timeframe_bucket,
-                volatility_regime=volatility_regime,
-                urgency=urgency,
-                fallback_after_partial_fill_ratio=0.0,
-                reason="entry_limit_only_conditions_not_met",
+                reason=(
+                    "passive_entry_limit_only"
+                    if limit_only_required
+                    else "passive_entry_market_fallback_disabled"
+                ),
             )
         return _build_plan(
             intent=intent,
-            order_type="MARKET",
+            order_type="NONE",
             price=None,
             time_in_force=None,
-            policy_name="entry_marketable",
-            marketable=True,
+            policy_name="entry_block_or_pending",
+            marketable=False,
             estimated_slippage_pct=estimated_slippage_pct,
             volatility_pct=volatility_pct,
             timeout_seconds=0,
@@ -406,7 +386,11 @@ def select_execution_plan(
             volatility_regime=volatility_regime,
             urgency=urgency,
             fallback_after_partial_fill_ratio=0.0,
-            reason="slippage_or_volatility_above_threshold",
+            reason=(
+                "entry_limit_only_conditions_not_met"
+                if limit_only_required
+                else "entry_market_fallback_disabled_by_default"
+            ),
         )
 
     if intent.intent_type == "scale_in":
@@ -613,10 +597,10 @@ def summarize_execution_policy(settings_row: Setting) -> dict[str, object]:
         "slippage_threshold_pct": settings_row.slippage_threshold_pct,
         "entry": {
             "preferred_order_type": "LIMIT",
-            "fallback_order_type": "MARKET unless risk_guard requires limit_only or market data is unreliable",
+            "fallback_order_type": "NONE",
             "timeout_seconds": 6,
             "max_requotes": 2,
-            "summary": "Entry uses passive LIMIT when market data is reliable and slippage/volatility stay within the tier and timeframe profile. Stale/incomplete data blocks or pends entry, and risk_guard limit-only policies disable MARKET fallback.",
+            "summary": "Entry uses passive LIMIT when market data is reliable and slippage/volatility stay within the tier and timeframe profile. Stale/incomplete data, stressed entry conditions, and passive timeout block or pend entry instead of escalating to MARKET.",
         },
         "scale_in": {
             "preferred_order_type": "LIMIT",

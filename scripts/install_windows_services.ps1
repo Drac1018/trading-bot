@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$IncludeScheduler,
+    [switch]$IncludeWorker,
     [switch]$AllowSqliteDatabase
 )
 
@@ -198,15 +199,16 @@ $definitions = @(
         Description = "Next.js frontend for the trading MVP"
         Script = "scripts\\run_frontend_service.ps1"
         LogPath = (Join-Path $repoRoot ".logs\\services\\frontend")
-    },
-    @{
-        Id = "TradingMvpWorker"
-        Name = "Trading MVP Worker"
-        Description = "RQ worker for trading jobs"
-        Script = "scripts\\run_worker.ps1"
-        LogPath = (Join-Path $repoRoot ".logs\\services\\worker")
     }
 )
+
+$workerDefinition = @{
+    Id = "TradingMvpWorker"
+    Name = "Trading MVP Worker"
+    Description = "RQ worker for trading jobs"
+    Script = "scripts\\run_worker.ps1"
+    LogPath = (Join-Path $repoRoot ".logs\\services\\worker")
+}
 
 $schedulerDefinition = @{
     Id = "TradingMvpScheduler"
@@ -220,6 +222,12 @@ if ($IncludeScheduler) {
     $definitions += $schedulerDefinition
 } else {
     Remove-ServiceIfPresent -Definition $schedulerDefinition
+}
+
+if ($IncludeWorker) {
+    $definitions += $workerDefinition
+} else {
+    Remove-ServiceIfPresent -Definition $workerDefinition
 }
 
 Test-ServiceDatabaseConfiguration

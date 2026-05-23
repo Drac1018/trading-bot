@@ -17,9 +17,9 @@ from trading_mvp.schemas import (
     TradeDecision,
 )
 from trading_mvp.services.dashboard import get_executions
-from trading_mvp.services.execution import execute_live_trade, sync_live_state
+from trading_mvp.services.execution import apply_position_management, execute_live_trade, sync_live_state
 from trading_mvp.services.execution_policy import select_execution_plan, summarize_execution_policy
-from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE
+from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, mark_sync_success
 from trading_mvp.services.secret_store import encrypt_secret
 from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
@@ -147,6 +147,41 @@ def _prime_live_settings(db_session):
     return settings_row
 
 
+def _mark_exit_review_sync_fresh(settings_row) -> None:
+    now = utcnow_naive()
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings_row, scope=scope, synced_at=now)
+
+
+def _protected_open_orders() -> list[dict[str, object]]:
+    return [
+        {
+            "orderId": "stop-live",
+            "clientOrderId": "stop-live",
+            "type": "STOP_MARKET",
+            "side": "SELL",
+            "closePosition": "true",
+            "reduceOnly": "true",
+            "stopPrice": "69000",
+            "status": "NEW",
+        },
+        {
+            "orderId": "tp-live",
+            "clientOrderId": "tp-live",
+            "type": "TAKE_PROFIT_MARKET",
+            "side": "SELL",
+            "closePosition": "true",
+            "reduceOnly": "true",
+            "stopPrice": "72000",
+            "status": "NEW",
+        },
+    ]
+
+
+def _feature_payload_like():
+    return SimpleNamespace(timeframe="15m", volume_ratio=1.0)
+
+
 class PolicyCaptureClient:
     def __init__(self, *, initial_position_qty: float = 0.0, orders: list[dict[str, object]] | None = None) -> None:
         self.current_position_qty = initial_position_qty
@@ -242,6 +277,408 @@ class PolicyCaptureClient:
 
     def get_order(self, *, symbol: str, order_id: str | None = None, client_order_id: str | None = None):
         return {"orderId": order_id or "lookup", "status": "NEW", "executedQty": "0.0", "avgPrice": "0"}
+
+
+def test_position_exit_review_swing_partial_tp_runs_reduce_only_after_local_filter(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.position_management_enabled = True
+    settings_row.partial_tp_size_pct = 0.25
+    _mark_exit_review_sync_fresh(settings_row)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70750.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        metadata_json={
+            "position_management": {"holding_profile": "swing", "partial_take_profit_taken": False},
+            "position_exit_review": {
+                "recommendation": "partial_take_profit",
+                "confidence": 0.74,
+                "reason_codes": ["AI_PARTIAL_TP_TEST"],
+                "proposed_stop_loss": 68000.0,
+                "execution_boundary": "metadata_only_no_order_authority",
+                "advisory_only": True,
+            },
+            "position_exit_review_source": {"gate": {"allowed": True, "reason": "allowed"}},
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    client = PolicyCaptureClient(initial_position_qty=0.02, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "holding_profile": "swing",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": [],
+            "partial_take_profit_ready": True,
+            "partial_take_profit_taken": False,
+            "partial_take_profit_fraction": 0.25,
+            "applied_rule_candidates": [],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload_like(),  # type: ignore[arg-type]
+        decision_run_id=701,
+        client=client,
+    )
+    db_session.flush()
+    order = db_session.scalar(select(Order).where(Order.position_id == position.id, Order.reduce_only.is_(True)).order_by(Order.id.desc()))
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "executed"
+    assert client.primary_order_calls[0]["reduce_only"] is True
+    assert bool(client.primary_order_calls[0].get("close_position")) is False
+    assert order is not None
+    assert order.reduce_only is True
+    assert order.close_only is False
+    assert order.requested_quantity == 0.005
+    assert position.metadata_json["position_management"]["partial_take_profit_taken"] is True
+    assert any(event.event_type == "position_exit_review_stop_relaxation_ignored" for event in events)
+    assert any(event.event_type == "position_exit_review_execution_candidate" for event in events)
+
+
+def test_position_exit_review_swing_full_take_profit_runs_close_only_after_runner_invalidation(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.position_management_enabled = True
+    _mark_exit_review_sync_fresh(settings_row)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.01,
+        entry_price=70000.0,
+        mark_price=71000.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        metadata_json={
+            "position_management": {"holding_profile": "swing", "partial_take_profit_taken": True},
+            "position_exit_review": {
+                "recommendation": "full_take_profit",
+                "confidence": 0.8,
+                "reason_codes": ["AI_FULL_TP_TEST"],
+                "execution_boundary": "metadata_only_no_order_authority",
+                "advisory_only": True,
+            },
+            "position_exit_review_source": {"gate": {"allowed": True, "reason": "allowed"}},
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    client = PolicyCaptureClient(initial_position_qty=0.01, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "holding_profile": "swing",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": ["POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT"],
+            "mfe_rollback_triggered": True,
+            "partial_take_profit_taken": True,
+            "runner_after_partial_take_profit": True,
+            "applied_rule_candidates": [],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload_like(),  # type: ignore[arg-type]
+        decision_run_id=702,
+        client=client,
+    )
+    db_session.flush()
+    order = db_session.scalar(select(Order).where(Order.position_id == position.id, Order.close_only.is_(True)).order_by(Order.id.desc()))
+
+    assert result["status"] == "executed"
+    assert client.primary_order_calls[0]["reduce_only"] is True
+    assert client.primary_order_calls[0]["close_position"] is True
+    assert order is not None
+    assert order.reduce_only is True
+    assert order.close_only is True
+
+
+def test_position_exit_review_execution_blocks_on_stale_sync(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.position_management_enabled = True
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70750.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        metadata_json={
+            "position_management": {"partial_take_profit_taken": False},
+            "position_exit_review": {
+                "recommendation": "partial_take_profit",
+                "confidence": 0.74,
+                "reason_codes": ["AI_PARTIAL_TP_TEST"],
+                "execution_boundary": "metadata_only_no_order_authority",
+                "advisory_only": True,
+            },
+            "position_exit_review_source": {"gate": {"allowed": True, "reason": "allowed"}},
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    client = PolicyCaptureClient(initial_position_qty=0.02, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": [],
+            "partial_take_profit_taken": False,
+            "applied_rule_candidates": [],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload_like(),  # type: ignore[arg-type]
+        decision_run_id=703,
+        client=client,
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "monitoring"
+    assert client.primary_order_calls == []
+    assert any(
+        event.event_type == "position_exit_review_execution_blocked"
+        and "POSITION_EXIT_REVIEW_STALE_SYNC" in event.payload["reason_codes"]
+        for event in events
+    )
+
+
+def test_position_exit_review_partial_tp_blocks_when_local_filter_not_ready(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.position_management_enabled = True
+    _mark_exit_review_sync_fresh(settings_row)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70750.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        metadata_json={
+            "position_management": {"holding_profile": "swing", "partial_take_profit_taken": False},
+            "position_exit_review": {
+                "recommendation": "partial_take_profit",
+                "confidence": 0.74,
+                "reason_codes": ["AI_PARTIAL_TP_TEST"],
+                "execution_boundary": "metadata_only_no_order_authority",
+                "advisory_only": True,
+            },
+            "position_exit_review_source": {"gate": {"allowed": True, "reason": "allowed"}},
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    client = PolicyCaptureClient(initial_position_qty=0.02, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "holding_profile": "swing",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": [],
+            "partial_take_profit_ready": False,
+            "partial_take_profit_taken": False,
+            "applied_rule_candidates": [],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload_like(),  # type: ignore[arg-type]
+        decision_run_id=704,
+        client=client,
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "monitoring"
+    assert client.primary_order_calls == []
+    assert any(
+        event.event_type == "position_exit_review_execution_blocked"
+        and "POSITION_EXIT_REVIEW_PARTIAL_NOT_READY" in event.payload["reason_codes"]
+        for event in events
+    )
+
+
+def test_position_exit_review_scalp_runner_reduce_blocks_without_fast_weakness(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.position_management_enabled = True
+    _mark_exit_review_sync_fresh(settings_row)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70750.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        metadata_json={
+            "position_management": {"holding_profile": "scalp", "partial_take_profit_taken": False},
+            "position_exit_review": {
+                "recommendation": "reduce_risk_only",
+                "confidence": 0.72,
+                "reason_codes": ["AI_SCALP_RUNNER_TEST"],
+                "execution_boundary": "metadata_only_no_order_authority",
+                "advisory_only": True,
+            },
+            "position_exit_review_source": {"gate": {"allowed": True, "reason": "allowed"}},
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    client = PolicyCaptureClient(initial_position_qty=0.02, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "holding_profile": "scalp",
+            "runner_after_partial_take_profit": False,
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": [],
+            "holding_edge_decay_active": True,
+            "scalp_early_fail_ready": False,
+            "time_to_fail_ready": False,
+            "time_stop_ready": False,
+            "regime_transition_detected": False,
+            "momentum_weakening": False,
+            "countertrend_pressure": False,
+            "applied_rule_candidates": [],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload_like(),  # type: ignore[arg-type]
+        decision_run_id=705,
+        client=client,
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "monitoring"
+    assert client.primary_order_calls == []
+    assert any(
+        event.event_type == "position_exit_review_execution_blocked"
+        and "POSITION_EXIT_REVIEW_SCALP_RUNNER_BLOCKED" in event.payload["reason_codes"]
+        for event in events
+    )
+
+
+def test_position_exit_review_position_full_take_profit_blocks_without_exit_code(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    settings_row.position_management_enabled = True
+    _mark_exit_review_sync_fresh(settings_row)
+    position = Position(
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        status="open",
+        quantity=0.02,
+        entry_price=70000.0,
+        mark_price=70750.0,
+        leverage=2.0,
+        stop_loss=69000.0,
+        take_profit=72000.0,
+        metadata_json={
+            "position_management": {"holding_profile": "position", "partial_take_profit_taken": False},
+            "position_exit_review": {
+                "recommendation": "full_take_profit",
+                "confidence": 0.72,
+                "reason_codes": ["AI_POSITION_EXIT_TEST"],
+                "execution_boundary": "metadata_only_no_order_authority",
+                "advisory_only": True,
+            },
+            "position_exit_review_source": {"gate": {"allowed": True, "reason": "allowed"}},
+        },
+    )
+    db_session.add(position)
+    db_session.flush()
+    client = PolicyCaptureClient(initial_position_qty=0.02, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.build_position_management_context",
+        lambda position, *, feature_payload, settings_row: {
+            "enabled": True,
+            "status": "active",
+            "holding_profile": "position",
+            "tightened_stop_loss": None,
+            "reduce_reason_codes": [],
+            "holding_edge_decay_active": True,
+            "applied_rule_candidates": [],
+        },
+    )
+
+    result = apply_position_management(
+        db_session,
+        settings_row,
+        symbol="BTCUSDT",
+        feature_payload=_feature_payload_like(),  # type: ignore[arg-type]
+        decision_run_id=706,
+        client=client,
+    )
+    db_session.flush()
+    events = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id)))
+
+    assert result["status"] == "monitoring"
+    assert client.primary_order_calls == []
+    assert any(
+        event.event_type == "position_exit_review_execution_blocked"
+        and "POSITION_EXIT_REVIEW_POSITION_EXIT_TOO_EARLY" in event.payload["reason_codes"]
+        for event in events
+    )
 
 
 class LimitRepriceFallbackClient(PolicyCaptureClient):
@@ -372,6 +809,9 @@ def test_entry_policy_prefers_limit_under_passive_conditions() -> None:
     assert plan.order_type == "LIMIT"
     assert plan.time_in_force == "GTC"
     assert plan.policy_name == "entry_passive_limit"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.allow_market_fallback is False
+    assert plan.reason == "passive_entry_market_fallback_disabled"
 
 
 def test_entry_policy_disables_market_fallback_when_limit_only_required() -> None:
@@ -442,7 +882,9 @@ def test_execution_policy_profiles_by_symbol_timeframe_and_volatility() -> None:
     assert alt_fast_plan.order_type == "LIMIT"
     assert alt_fast_plan.policy_profile.startswith("entry_alt_fast_")
     assert alt_fast_plan.max_requotes <= btc_slow_plan.max_requotes
-    assert stressed_plan.order_type == "MARKET"
+    assert stressed_plan.order_type == "NONE"
+    assert stressed_plan.policy_name == "entry_block_or_pending"
+    assert stressed_plan.reason == "entry_market_fallback_disabled_by_default"
     assert stressed_plan.volatility_regime == "stressed"
 
 
@@ -638,7 +1080,7 @@ def test_execution_policy_summary_exposes_tight_tp_limit_settings(db_session) ->
     assert "LIMIT/POST_ONLY TP" in str(protection["preferred_order_type"])
 
 
-def test_entry_limit_timeout_reprices_then_falls_back_to_market(monkeypatch, db_session) -> None:
+def test_entry_limit_timeout_reprices_without_market_fallback(monkeypatch, db_session) -> None:
     settings_row = _prime_live_settings(db_session)
     client = LimitRepriceFallbackClient()
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
@@ -655,14 +1097,17 @@ def test_entry_limit_timeout_reprices_then_falls_back_to_market(monkeypatch, db_
 
     order_types = [call["order_type"] for call in client.primary_order_calls]
 
-    assert result["status"] == "filled"
+    assert result["status"] == "canceled"
     assert order_types[:2] == ["LIMIT", "LIMIT"]
-    assert order_types[-1] == "MARKET"
-    assert len(result["execution_attempts"]) >= 3
+    assert "MARKET" not in order_types
+    assert len(result["execution_attempts"]) >= 2
+    assert result["execution_policy"]["fallback_order_type"] == "NONE"
+    assert result["execution_policy"]["allow_market_fallback"] is False
     audit_types = set(db_session.scalars(select(AuditEvent.event_type)))
     assert "live_limit_timeout" in audit_types
     assert "live_limit_repriced" in audit_types
-    assert "live_limit_aggressive_fallback" in audit_types
+    assert "live_limit_market_fallback_skipped" in audit_types
+    assert "live_limit_aggressive_fallback" not in audit_types
 
 
 def test_entry_limit_timeout_does_not_fallback_to_market_when_forbidden(monkeypatch, db_session) -> None:
@@ -721,7 +1166,7 @@ def test_entry_execution_blocks_stale_snapshot_before_market_submission(monkeypa
     assert audit_rows[-1].payload["reason_code"] == "market_data_not_reliable_entry_block_or_pending"
 
 
-def test_partial_fill_is_preserved_before_aggressive_fallback(monkeypatch, db_session) -> None:
+def test_partial_entry_fill_is_preserved_without_aggressive_fallback(monkeypatch, db_session) -> None:
     settings_row = _prime_live_settings(db_session)
     client = LimitRepriceFallbackClient(partial_fill_qty=0.001, market_price=71250.0)
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
@@ -736,17 +1181,19 @@ def test_partial_fill_is_preserved_before_aggressive_fallback(monkeypatch, db_se
         risk_result=_risk_result("long"),
     )
 
-    assert result["status"] == "filled"
+    assert result["status"] == "partially_filled"
     assert result["fill_quantity"] >= 0.001
     assert result["execution_attempts"][0]["filled_quantity"] == 0.001
-    assert result["execution_attempts"][-1]["order_type"] == "MARKET"
-    assert result["fill_quantity"] > result["execution_attempts"][0]["filled_quantity"]
+    assert all(attempt["order_type"] == "LIMIT" for attempt in result["execution_attempts"])
+    assert result["fill_quantity"] == result["execution_attempts"][0]["filled_quantity"]
+    assert result["execution_policy"]["fallback_order_type"] == "NONE"
     audit_types = list(db_session.scalars(select(AuditEvent.event_type).order_by(AuditEvent.id.asc())))
     assert "live_limit_partial_fill" in audit_types
-    assert "live_limit_aggressive_fallback" in audit_types
+    assert "live_limit_market_fallback_skipped" in audit_types
+    assert "live_limit_aggressive_fallback" not in audit_types
 
 
-def test_large_partial_fill_finishes_remaining_quantity_with_market(monkeypatch, db_session) -> None:
+def test_large_partial_entry_fill_does_not_finish_remaining_quantity_with_market(monkeypatch, db_session) -> None:
     settings_row = _prime_live_settings(db_session)
     client = LimitRepriceFallbackClient(partial_fill_qty=0.002, market_price=70500.0)
     monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
@@ -761,12 +1208,12 @@ def test_large_partial_fill_finishes_remaining_quantity_with_market(monkeypatch,
         risk_result=_risk_result("long"),
     )
 
-    assert result["status"] == "filled"
-    assert len(result["execution_attempts"]) == 2
+    assert result["status"] == "partially_filled"
+    assert len(result["execution_attempts"]) >= 1
     assert result["execution_attempts"][0]["filled_quantity"] > 0.0
-    assert result["execution_attempts"][-1]["order_type"] == "MARKET"
-    assert result["execution_quality"]["aggressive_fallback_used"] is True
-    assert result["execution_quality"]["execution_quality_status"] == "aggressive_completion"
+    assert all(attempt["order_type"] == "LIMIT" for attempt in result["execution_attempts"])
+    assert result["execution_quality"]["aggressive_fallback_used"] is False
+    assert result["execution_quality"]["execution_quality_status"] == "incomplete_fill"
 
 
 def test_filled_order_with_empty_trade_lookup_uses_exchange_fill_for_quality(monkeypatch, db_session) -> None:

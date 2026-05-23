@@ -57,6 +57,7 @@ from trading_mvp.services.execution_policy import (
     should_fallback_aggressively,
 )
 from trading_mvp.services.holding_profile import (
+    HOLDING_PROFILE_POSITION,
     HOLDING_PROFILE_SCALP,
     HOLDING_PROFILE_SWING,
     deterministic_stop_management_payload,
@@ -128,6 +129,34 @@ ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT = "entry_passive_limit"
 ENTRY_EXECUTION_TYPE_MARKETABLE = "entry_marketable"
 ENTRY_EXECUTION_TYPE_UNKNOWN = "entry_unknown"
 PROTECTION_RETRY_ATTEMPTS = 2
+POSITION_EXIT_REVIEW_ALLOWED_RECOMMENDATIONS = {
+    "full_take_profit",
+    "partial_take_profit",
+    "tighten_trailing",
+    "move_to_breakeven",
+    "reduce_risk_only",
+}
+POSITION_EXIT_REVIEW_RECOMMENDATION_ALIASES = {
+    "take_profit_exit": "full_take_profit",
+    "take_partial_profit": "partial_take_profit",
+    "reduce_runner": "reduce_risk_only",
+}
+POSITION_EXIT_REVIEW_SYNC_SCOPES = ("account", "positions", "open_orders", "protective_orders")
+POSITION_EXIT_REVIEW_FULL_TP_REASON_CODE = "POSITION_EXIT_REVIEW_FULL_TAKE_PROFIT"
+POSITION_EXIT_REVIEW_PARTIAL_TP_REASON_CODE = "POSITION_EXIT_REVIEW_PARTIAL_TAKE_PROFIT"
+POSITION_EXIT_REVIEW_REDUCE_REASON_CODE = "POSITION_EXIT_REVIEW_REDUCE_RISK_ONLY"
+POSITION_EXIT_REVIEW_TIGHTEN_REASON_CODE = "POSITION_EXIT_REVIEW_TIGHTEN_TRAILING"
+POSITION_EXIT_REVIEW_BREAKEVEN_REASON_CODE = "POSITION_EXIT_REVIEW_MOVE_TO_BREAKEVEN"
+POSITION_EXIT_REVIEW_STALE_SYNC_REASON_CODE = "POSITION_EXIT_REVIEW_STALE_SYNC"
+POSITION_EXIT_REVIEW_PROTECTION_UNVERIFIED_REASON_CODE = "POSITION_EXIT_REVIEW_PROTECTION_UNVERIFIED"
+POSITION_EXIT_REVIEW_STOP_RELAXATION_IGNORED_REASON_CODE = "POSITION_EXIT_REVIEW_STOP_RELAXATION_IGNORED"
+POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED_REASON_CODE = "POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED"
+POSITION_EXIT_REVIEW_PARTIAL_NOT_READY_REASON_CODE = "POSITION_EXIT_REVIEW_PARTIAL_NOT_READY"
+POSITION_EXIT_REVIEW_SCALP_RUNNER_BLOCKED_REASON_CODE = "POSITION_EXIT_REVIEW_SCALP_RUNNER_BLOCKED"
+POSITION_EXIT_REVIEW_SWING_RUNNER_SIGNAL_REQUIRED_REASON_CODE = (
+    "POSITION_EXIT_REVIEW_SWING_RUNNER_SIGNAL_REQUIRED"
+)
+POSITION_EXIT_REVIEW_POSITION_EXIT_TOO_EARLY_REASON_CODE = "POSITION_EXIT_REVIEW_POSITION_EXIT_TOO_EARLY"
 PROTECTION_VERIFY_DEADLINE_SECONDS = 30
 PROTECTION_VERIFY_FETCH_ATTEMPTS = 2
 PROTECTION_VERIFY_FAILED_REASON_CODE = "PROTECTION_VERIFY_FAILED"
@@ -683,6 +712,24 @@ def _to_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _exchange_permission_sync_detail(account_info: dict[str, object]) -> dict[str, object]:
+    raw_can_trade = account_info.get("canTrade")
+    checked_at = utcnow_naive().isoformat()
+    if raw_can_trade in {None, ""}:
+        return {
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": "binance_account_info_missing_canTrade",
+            "exchange_can_trade_checked_at": checked_at,
+        }
+    return {
+        "exchange_can_trade": _to_bool(raw_can_trade),
+        "exchange_can_trade_known": True,
+        "exchange_can_trade_source": "binance_account_info",
+        "exchange_can_trade_checked_at": checked_at,
+    }
 
 
 def _coerce_datetime(value: object) -> datetime | None:
@@ -1926,6 +1973,10 @@ def _execution_order_policy_from_risk_result(
         or expected_cost_gate.get("market_fallback_violation_source")
     )
     order_policy_reason = None if order_policy_reason in {None, ""} else str(order_policy_reason)
+    if required_order_policy == "market_allowed":
+        required_order_policy = "limit_only_or_post_only"
+        allow_market_fallback = False
+        order_policy_reason = order_policy_reason or "entry_market_fallback_disabled_by_default"
     return required_order_policy, allow_market_fallback, order_policy_reason
 
 
@@ -1981,7 +2032,14 @@ def _build_position_management_trade_decision(
     if not reason_codes:
         return None
 
-    if "POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT" in reason_codes:
+    if POSITION_EXIT_REVIEW_FULL_TP_REASON_CODE in reason_codes:
+        decision_type = "exit"
+        explanation_short = "ai exit review full take profit"
+        explanation_detailed = (
+            "Position exit review requested a full take-profit candidate, then deterministic risk and execution gates "
+            "validated it as a close-only management action."
+        )
+    elif "POSITION_MANAGEMENT_MFE_ROLLBACK_EXIT" in reason_codes:
         decision_type = "exit"
         explanation_short = "mfe rollback exit"
         explanation_detailed = (
@@ -2002,6 +2060,12 @@ def _build_position_management_trade_decision(
             explanation_short = "partial take profit"
             explanation_detailed = (
                 "Partial take profit triggered after the configured R threshold and keeps the position in reduce-only mode."
+            )
+        elif POSITION_EXIT_REVIEW_REDUCE_REASON_CODE in reason_codes:
+            explanation_short = "ai exit review reduce risk"
+            explanation_detailed = (
+                "Position exit review requested a risk-reduction candidate, then deterministic risk and execution gates "
+                "validated it as a reduce-only management action."
             )
         elif "POSITION_MANAGEMENT_TIME_STOP_REDUCE" in reason_codes:
             explanation_short = "time stop reduce"
@@ -2026,6 +2090,426 @@ def _build_position_management_trade_decision(
         explanation_short=explanation_short,
         explanation_detailed=explanation_detailed,
     )
+
+
+def _position_exit_review_metadata(position: Position) -> tuple[dict[str, Any], dict[str, Any]]:
+    metadata = _as_object_dict(position.metadata_json)
+    return (
+        _as_object_dict(metadata.get("position_exit_review")),
+        _as_object_dict(metadata.get("position_exit_review_source")),
+    )
+
+
+def _normalize_position_exit_review_recommendation(value: object) -> str | None:
+    recommendation = str(value or "").strip().lower()
+    recommendation = POSITION_EXIT_REVIEW_RECOMMENDATION_ALIASES.get(recommendation, recommendation)
+    if recommendation in POSITION_EXIT_REVIEW_ALLOWED_RECOMMENDATIONS or recommendation in {"no_action", "hold_runner"}:
+        return recommendation
+    return None
+
+
+def _position_exit_review_stale_scopes(settings_row: Setting) -> tuple[list[str], dict[str, Any]]:
+    summary = build_sync_freshness_summary(settings_row)
+    stale_scopes: list[str] = []
+    for scope in POSITION_EXIT_REVIEW_SYNC_SCOPES:
+        payload = _as_object_dict(summary.get(scope))
+        status = str(payload.get("status") or "unknown").lower()
+        raw_status = str(payload.get("raw_status") or "").lower()
+        if (
+            bool(payload.get("stale"))
+            or bool(payload.get("incomplete"))
+            or status in {"unknown", "stale", "failed", "incomplete", "skipped"}
+            or raw_status in {"unknown", "failed", "incomplete", "skipped"}
+        ):
+            stale_scopes.append(scope)
+    return stale_scopes, summary
+
+
+def _position_exit_review_stop_relaxation_details(
+    position: Position,
+    review: dict[str, Any],
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    current_stop = _to_float(position.stop_loss) if position.stop_loss not in {None, ""} else None
+    for key in ("stop_loss", "proposed_stop_loss", "candidate_stop_loss", "new_stop_loss"):
+        if key not in review:
+            continue
+        try:
+            candidate = _to_float(review.get(key))
+        except (TypeError, ValueError):
+            details.append({"field": key, "value": str(review.get(key)), "reason": "invalid_stop_payload"})
+            continue
+        if candidate <= 0 or not _is_more_protective_stop(position.side, current_stop, candidate):
+            details.append({"field": key, "value": candidate, "reason": "not_more_protective"})
+    action_text = " ".join(
+        str(review.get(key) or "").lower()
+        for key in ("stop_action", "stop_loss_action", "protection_action", "rationale", "summary")
+    )
+    if any(token in action_text for token in ("widen", "relax", "loosen", "remove stop", "remove_stop")):
+        details.append({"field": "stop_action", "value": action_text[:240], "reason": "relaxation_language"})
+    return details
+
+
+def _record_position_exit_review_event(
+    session: Session,
+    *,
+    position: Position,
+    event_type: str,
+    status: str,
+    recommendation: str | None,
+    reason_codes: list[str],
+    review: dict[str, Any],
+    extra: dict[str, object] | None = None,
+) -> None:
+    record_position_management_event(
+        session,
+        event_type=event_type,
+        position_id=position.id,
+        severity="info" if status in {"candidate_applied", "no_action"} else "warning",
+        message="Position exit review execution candidate was processed.",
+        payload={
+            "symbol": position.symbol,
+            "status": status,
+            "recommendation": recommendation,
+            "reason_codes": list(dict.fromkeys(reason_codes)),
+            "review_reason_codes": _get_string_list(review, "reason_codes"),
+            "execution_boundary": review.get("execution_boundary"),
+            **(extra or {}),
+        },
+    )
+
+
+def _append_unique_reason_codes(context: dict[str, object], *reason_codes: str) -> None:
+    existing = [str(item) for item in _get_string_list(context, "reduce_reason_codes")]
+    context["reduce_reason_codes"] = list(dict.fromkeys([*existing, *reason_codes]))
+
+
+def _append_unique_applied_candidates(context: dict[str, object], *candidates: str) -> None:
+    existing = [str(item) for item in _get_string_list(context, "applied_rule_candidates")]
+    context["applied_rule_candidates"] = list(dict.fromkeys([*existing, *candidates]))
+
+
+def _position_exit_review_holding_profile(position: Position, context: dict[str, object]) -> str:
+    management = _position_management_metadata_for_execution(position)
+    profile = str(context.get("holding_profile") or management.get("holding_profile") or HOLDING_PROFILE_SCALP)
+    profile = profile.strip().lower()
+    if profile not in {HOLDING_PROFILE_SCALP, HOLDING_PROFILE_SWING, HOLDING_PROFILE_POSITION}:
+        return HOLDING_PROFILE_SCALP
+    return profile
+
+
+def _has_position_exit_review_local_reduce_evidence(
+    context: dict[str, object],
+    reduce_reason_codes: list[str],
+) -> bool:
+    if reduce_reason_codes:
+        return True
+    return any(
+        _to_bool(context.get(key))
+        for key in (
+            "mfe_rollback_triggered",
+            "time_stop_ready",
+            "time_to_fail_ready",
+            "holding_edge_decay_active",
+            "regime_transition_detected",
+            "momentum_weakening",
+            "countertrend_pressure",
+        )
+    )
+
+
+def _has_scalp_exit_weakness(context: dict[str, object], reduce_reason_codes: list[str]) -> bool:
+    if any(
+        _to_bool(context.get(key))
+        for key in (
+            "scalp_early_fail_ready",
+            "time_to_fail_ready",
+            "time_stop_ready",
+            "regime_transition_detected",
+            "momentum_weakening",
+            "countertrend_pressure",
+        )
+    ):
+        return True
+    weakness_tokens = (
+        "SCALP",
+        "TIME_TO_FAIL",
+        "TIME_STOP",
+        "BREAKOUT_TIME_FAIL",
+        "CONTINUATION_TIME_FAIL",
+        "PULLBACK_TIME_FAIL",
+        "REGIME_SHIFT",
+        "MOMENTUM",
+        "COUNTERTREND",
+        "MFE_ROLLBACK_EXIT",
+    )
+    return any(any(token in code.upper() for token in weakness_tokens) for code in reduce_reason_codes)
+
+
+def _has_swing_runner_invalidation(context: dict[str, object], reduce_reason_codes: list[str]) -> bool:
+    if reduce_reason_codes or _to_bool(context.get("mfe_rollback_triggered")):
+        return True
+    if not _to_bool(context.get("partial_take_profit_taken")):
+        return False
+    return any(
+        _to_bool(context.get(key))
+        for key in (
+            "time_stop_ready",
+            "time_to_fail_ready",
+            "holding_edge_decay_active",
+            "regime_transition_detected",
+            "momentum_weakening",
+            "countertrend_pressure",
+        )
+    )
+
+
+def _position_exit_review_local_filter_block_reasons(
+    position: Position,
+    context: dict[str, object],
+    recommendation: str,
+) -> tuple[list[str], dict[str, object]]:
+    profile = _position_exit_review_holding_profile(position, context)
+    policy = resolve_holding_profile_management_policy(profile)
+    reduce_reason_codes = [str(code) for code in _get_string_list(context, "reduce_reason_codes")]
+    partial_ready = _to_bool(context.get("partial_take_profit_ready"))
+    partial_taken = _to_bool(context.get("partial_take_profit_taken"))
+    runner_after_partial = _to_bool(
+        context.get("runner_after_partial_take_profit"),
+        bool(policy.get("runner_after_partial_take_profit")),
+    )
+    local_reduce_evidence = _has_position_exit_review_local_reduce_evidence(context, reduce_reason_codes)
+    payload = {
+        "holding_profile": profile,
+        "recommendation": recommendation,
+        "partial_take_profit_ready": partial_ready,
+        "partial_take_profit_taken": partial_taken,
+        "runner_after_partial_take_profit": runner_after_partial,
+        "local_reduce_evidence": local_reduce_evidence,
+        "reduce_reason_codes": reduce_reason_codes,
+    }
+    reason_codes: list[str] = []
+
+    if recommendation == "partial_take_profit":
+        if not partial_ready:
+            reason_codes.append(POSITION_EXIT_REVIEW_PARTIAL_NOT_READY_REASON_CODE)
+        if partial_taken:
+            reason_codes.append("POSITION_EXIT_REVIEW_PARTIAL_TP_ALREADY_TAKEN")
+        return (
+            [POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED_REASON_CODE, *reason_codes] if reason_codes else [],
+            payload,
+        )
+
+    if recommendation in {"full_take_profit", "reduce_risk_only"}:
+        if not local_reduce_evidence:
+            reason_codes.append(POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED_REASON_CODE)
+
+        if profile == HOLDING_PROFILE_SCALP and not _has_scalp_exit_weakness(context, reduce_reason_codes):
+            reason_codes.append(POSITION_EXIT_REVIEW_SCALP_RUNNER_BLOCKED_REASON_CODE)
+        elif profile == HOLDING_PROFILE_SWING and not _has_swing_runner_invalidation(context, reduce_reason_codes):
+            reason_codes.append(POSITION_EXIT_REVIEW_SWING_RUNNER_SIGNAL_REQUIRED_REASON_CODE)
+        elif profile == HOLDING_PROFILE_POSITION:
+            has_exit_code = any("EXIT" in code.upper() for code in reduce_reason_codes)
+            if recommendation == "reduce_risk_only" or not has_exit_code:
+                reason_codes.append(POSITION_EXIT_REVIEW_POSITION_EXIT_TOO_EARLY_REASON_CODE)
+
+    if reason_codes and POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED_REASON_CODE not in reason_codes:
+        reason_codes.insert(0, POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED_REASON_CODE)
+    return list(dict.fromkeys(reason_codes)), payload
+
+
+def _apply_position_exit_review_to_context(
+    session: Session,
+    settings_row: Setting,
+    position: Position,
+    context: dict[str, object],
+    protection_state: dict[str, object],
+) -> dict[str, object]:
+    review, source = _position_exit_review_metadata(position)
+    if not review:
+        return context
+
+    recommendation = _normalize_position_exit_review_recommendation(review.get("recommendation"))
+    if recommendation in {None, "no_action", "hold_runner"}:
+        context["position_exit_review_execution"] = {
+            "status": "no_action",
+            "recommendation": recommendation,
+        }
+        return context
+
+    relaxation_details = _position_exit_review_stop_relaxation_details(position, review)
+    if relaxation_details:
+        _record_position_exit_review_event(
+            session,
+            position=position,
+            event_type="position_exit_review_stop_relaxation_ignored",
+            status="stop_relaxation_ignored",
+            recommendation=recommendation,
+            reason_codes=[POSITION_EXIT_REVIEW_STOP_RELAXATION_IGNORED_REASON_CODE],
+            review=review,
+            extra={"relaxation_details": relaxation_details},
+        )
+
+    if recommendation not in POSITION_EXIT_REVIEW_ALLOWED_RECOMMENDATIONS:
+        return context
+
+    gate = _as_object_dict(source.get("gate"))
+    if gate and gate.get("allowed") is False:
+        reason = str(gate.get("reason") or "position_exit_review_gate_blocked")
+        context["position_exit_review_execution"] = {
+            "status": "blocked",
+            "recommendation": recommendation,
+            "reason_codes": [reason],
+        }
+        _record_position_exit_review_event(
+            session,
+            position=position,
+            event_type="position_exit_review_execution_blocked",
+            status="blocked",
+            recommendation=recommendation,
+            reason_codes=[reason],
+            review=review,
+            extra={"gate": gate},
+        )
+        return context
+
+    stale_scopes, sync_summary = _position_exit_review_stale_scopes(settings_row)
+    if stale_scopes:
+        context["position_exit_review_execution"] = {
+            "status": "blocked",
+            "recommendation": recommendation,
+            "reason_codes": [POSITION_EXIT_REVIEW_STALE_SYNC_REASON_CODE],
+            "stale_scopes": stale_scopes,
+        }
+        _record_position_exit_review_event(
+            session,
+            position=position,
+            event_type="position_exit_review_execution_blocked",
+            status="blocked",
+            recommendation=recommendation,
+            reason_codes=[POSITION_EXIT_REVIEW_STALE_SYNC_REASON_CODE],
+            review=review,
+            extra={"stale_scopes": stale_scopes, "sync_freshness_summary": sync_summary},
+        )
+        return context
+
+    if str(protection_state.get("status") or "").lower() != "protected":
+        reason_codes = [
+            POSITION_EXIT_REVIEW_PROTECTION_UNVERIFIED_REASON_CODE,
+            *_protection_state_reason_codes(protection_state),
+        ]
+        context["position_exit_review_execution"] = {
+            "status": "blocked",
+            "recommendation": recommendation,
+            "reason_codes": reason_codes,
+            "protection_state": protection_state,
+        }
+        _record_position_exit_review_event(
+            session,
+            position=position,
+            event_type="position_exit_review_execution_blocked",
+            status="blocked",
+            recommendation=recommendation,
+            reason_codes=reason_codes,
+            review=review,
+            extra={"protection_state": protection_state},
+        )
+        return context
+
+    context = dict(context)
+    local_filter_reason_codes, local_filter_payload = _position_exit_review_local_filter_block_reasons(
+        position,
+        context,
+        recommendation,
+    )
+    if local_filter_reason_codes:
+        context["position_exit_review_execution"] = {
+            "status": "blocked",
+            "recommendation": recommendation,
+            "reason_codes": local_filter_reason_codes,
+            "source": "position_exit_review",
+            "local_filter": local_filter_payload,
+            "reduce_only_or_close_only_required": True,
+        }
+        _record_position_exit_review_event(
+            session,
+            position=position,
+            event_type="position_exit_review_execution_blocked",
+            status="blocked",
+            recommendation=recommendation,
+            reason_codes=local_filter_reason_codes,
+            review=review,
+            extra={"local_filter": local_filter_payload},
+        )
+        return context
+
+    action_status = "candidate_applied"
+    action_reason_codes: list[str] = []
+    if recommendation == "partial_take_profit":
+        if bool(context.get("partial_take_profit_taken")):
+            action_status = "blocked"
+            action_reason_codes = ["POSITION_EXIT_REVIEW_PARTIAL_TP_ALREADY_TAKEN"]
+        else:
+            _append_unique_reason_codes(
+                context,
+                POSITION_EXIT_REVIEW_PARTIAL_TP_REASON_CODE,
+                "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT",
+                "POSITION_MANAGEMENT_LOCK_PARTIAL_PROFIT",
+            )
+            _append_unique_applied_candidates(
+                context,
+                POSITION_EXIT_REVIEW_PARTIAL_TP_REASON_CODE,
+                "POSITION_MANAGEMENT_PARTIAL_TAKE_PROFIT",
+            )
+            action_reason_codes = [POSITION_EXIT_REVIEW_PARTIAL_TP_REASON_CODE]
+    elif recommendation == "full_take_profit":
+        _append_unique_reason_codes(context, POSITION_EXIT_REVIEW_FULL_TP_REASON_CODE)
+        _append_unique_applied_candidates(context, POSITION_EXIT_REVIEW_FULL_TP_REASON_CODE)
+        action_reason_codes = [POSITION_EXIT_REVIEW_FULL_TP_REASON_CODE]
+    elif recommendation == "reduce_risk_only":
+        _append_unique_reason_codes(context, POSITION_EXIT_REVIEW_REDUCE_REASON_CODE)
+        _append_unique_applied_candidates(context, POSITION_EXIT_REVIEW_REDUCE_REASON_CODE)
+        action_reason_codes = [POSITION_EXIT_REVIEW_REDUCE_REASON_CODE]
+    elif recommendation == "move_to_breakeven":
+        candidate_stop = _to_float(context.get("break_even_stop_loss"))
+        if candidate_stop > 0 and _is_more_protective_stop(position.side, position.stop_loss, candidate_stop):
+            context["tightened_stop_loss"] = candidate_stop
+            _append_unique_applied_candidates(
+                context,
+                POSITION_EXIT_REVIEW_BREAKEVEN_REASON_CODE,
+                "POSITION_MANAGEMENT_BREAK_EVEN",
+            )
+            action_reason_codes = [POSITION_EXIT_REVIEW_BREAKEVEN_REASON_CODE]
+        else:
+            action_status = "blocked"
+            action_reason_codes = ["POSITION_EXIT_REVIEW_BREAKEVEN_NOT_MORE_PROTECTIVE"]
+    elif recommendation == "tighten_trailing":
+        candidate_stop = _to_float(context.get("tightened_stop_loss"))
+        if candidate_stop > 0 and _is_more_protective_stop(position.side, position.stop_loss, candidate_stop):
+            _append_unique_applied_candidates(context, POSITION_EXIT_REVIEW_TIGHTEN_REASON_CODE)
+            action_reason_codes = [POSITION_EXIT_REVIEW_TIGHTEN_REASON_CODE]
+        else:
+            action_status = "blocked"
+            action_reason_codes = ["POSITION_EXIT_REVIEW_TIGHTEN_NOT_MORE_PROTECTIVE"]
+
+    context["position_exit_review_execution"] = {
+        "status": action_status,
+        "recommendation": recommendation,
+        "reason_codes": action_reason_codes,
+        "source": "position_exit_review",
+        "reduce_only_or_close_only_required": True,
+    }
+    _record_position_exit_review_event(
+        session,
+        position=position,
+        event_type="position_exit_review_execution_candidate",
+        status=action_status,
+        recommendation=recommendation,
+        reason_codes=action_reason_codes,
+        review=review,
+        extra={"context": context["position_exit_review_execution"]},
+    )
+    return context
 
 
 def _is_protective_order(order_payload: dict[str, object]) -> bool:
@@ -3238,6 +3722,16 @@ def apply_position_management(
     client = client or _build_client(settings_row)
     open_orders = client.get_open_orders(symbol)
     protection_state = _build_protection_state(position, open_orders)
+    context = _apply_position_exit_review_to_context(
+        session,
+        settings_row,
+        position,
+        context,
+        protection_state,
+    )
+    store_position_management_context(position, context)
+    session.add(position)
+    session.flush()
     tightened_stop_loss = _to_float(context.get("tightened_stop_loss"))
     break_even_stop = _to_float(context.get("break_even_stop_loss"))
     break_even_stop_candidate = _is_break_even_stop_tighten_candidate(context, tightened_stop_loss)
@@ -7713,6 +8207,7 @@ def sync_live_state(
             "wallet_balance": pnl_snapshot.wallet_balance,
             "available_balance": pnl_snapshot.available_balance,
             "funding_sync": funding_sync,
+            **_exchange_permission_sync_detail(account_info),
         },
         flush_state=False,
     )
@@ -7999,6 +8494,7 @@ def _resync_exchange_state(
                 "wallet_balance": pnl_snapshot.wallet_balance,
                 "available_balance": pnl_snapshot.available_balance,
                 "funding_sync": funding_sync,
+                **_exchange_permission_sync_detail(account_info),
             },
         )
     except Exception as exc:
@@ -8478,6 +8974,19 @@ def _execute_live_trade_body(
         correlation_ids=execution_correlation_ids,
     )
     session.refresh(latest_pnl)
+    _record_sync_success(
+        session,
+        settings_row,
+        scope="account",
+        detail={
+            "symbol": decision.symbol,
+            "equity": latest_pnl.equity,
+            "wallet_balance": latest_pnl.wallet_balance,
+            "available_balance": latest_pnl.available_balance,
+            "funding_sync": funding_sync,
+            **_exchange_permission_sync_detail(account_info),
+        },
+    )
     live_balances = _live_account_balances(account_info)
 
     try:

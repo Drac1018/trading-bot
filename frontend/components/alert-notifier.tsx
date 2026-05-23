@@ -6,6 +6,8 @@ import { isEntryWaitReasonCodeInContext } from "../lib/risk-reason-copy.js";
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const pollMs = 15000;
+const idlePollMs = 60000;
+const hiddenPollMs = 60000;
 const logicalCooldownMs = 15 * 60 * 1000;
 const seenStorageKey = "trading-mvp.seen-alert-ids";
 const logicalSeenStorageKey = "trading-mvp.seen-alert-logical";
@@ -167,11 +169,14 @@ export function AlertNotifier() {
     }
 
     let active = true;
+    let timeout: number | undefined;
+    let scheduleNext: (delayMs: number) => void;
 
     const refresh = async () => {
       try {
         const response = await fetch(`${apiBaseUrl}/api/alerts?limit=10`, { cache: "no-store" });
         if (!response.ok) {
+          scheduleNext(document.hidden ? hiddenPollMs : idlePollMs);
           return;
         }
         const rows = (await response.json()) as AlertRow[];
@@ -180,8 +185,13 @@ export function AlertNotifier() {
         }
         const visibleRows = rows.filter(isOperatorAttentionAlert);
         setLatestAlerts(visibleRows);
+        const hasOperatorAttention = visibleRows.some((row) =>
+          ["warning", "error", "critical"].includes(row.severity),
+        );
+        const nextDelayMs = document.hidden ? hiddenPollMs : hasOperatorAttention ? pollMs : idlePollMs;
 
         if (!("Notification" in window) || window.Notification.permission !== "granted") {
+          scheduleNext(nextDelayMs);
           return;
         }
 
@@ -217,19 +227,44 @@ export function AlertNotifier() {
         logicalSeenRef.current = nextLogicalSeen;
         writeSeenIds(nextSeenIds);
         writeLogicalSeen(nextLogicalSeen);
+        scheduleNext(nextDelayMs);
       } catch {
+        scheduleNext(document.hidden ? hiddenPollMs : idlePollMs);
         return;
       }
     };
 
+    scheduleNext = (delayMs: number) => {
+      if (!active) {
+        return;
+      }
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+      }
+      timeout = window.setTimeout(() => {
+        void refresh();
+      }, delayMs);
+    };
+
     void refresh();
-    const interval = window.setInterval(() => {
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        return;
+      }
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+      }
       void refresh();
-    }, pollMs);
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
       active = false;
-      window.clearInterval(interval);
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+      }
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [notificationsDisabled]);
 

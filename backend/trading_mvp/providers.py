@@ -76,7 +76,7 @@ class OpenAIProvider:
             "Return only valid JSON that strictly matches the provided schema. "
             "Do not wrap JSON in markdown."
         )
-        if role in {"trading_decision", "market_settings_advisor"} and instructions:
+        if role in {"trading_decision", "market_settings_advisor", "position_exit_review"} and instructions:
             return f"{instructions}\n\n{schema_contract}"
         return schema_contract
 

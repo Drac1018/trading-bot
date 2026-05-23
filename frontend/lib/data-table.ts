@@ -18,6 +18,7 @@ const preferredColumnOrder = [
   "mode",
   "provider_name",
   "confidence",
+  "decision_quality",
   "latest_price",
   "approved_leverage",
   "approved_risk_pct",

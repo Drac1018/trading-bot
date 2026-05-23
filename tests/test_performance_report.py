@@ -12,14 +12,20 @@ from trading_mvp.models import (
     AccountLedgerEntry,
     AgentRun,
     AuditEvent,
+    DecisionPerformanceFact,
     Execution,
+    MarketSnapshot,
     Order,
+    PendingEntryPlan,
     PnLSnapshot,
     Position,
     RiskCheck,
 )
 from trading_mvp.services import performance_reporting
-from trading_mvp.services.performance_reporting import build_signal_performance_report
+from trading_mvp.services.performance_reporting import (
+    build_opportunity_attribution_report,
+    build_signal_performance_report,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 
@@ -1279,6 +1285,215 @@ def test_ai_baseline_comparison_separates_observed_and_unobserved_results(db_ses
     assert comparison.ai_filter_observed_value_net_pnl_after_fees is None
 
 
+def test_decision_performance_fact_refreshes_ai_usefulness_after_risk_and_fill(db_session) -> None:
+    run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="ai usefulness",
+        input_payload=_feature_input(
+            primary_regime="bullish",
+            trend_alignment="bullish_aligned",
+            volatility_regime="normal",
+            weak_volume=False,
+            momentum_weakening=False,
+        ),
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "long",
+            "rationale_codes": ["TREND_UP"],
+            "entry_zone_min": 69950.0,
+            "entry_zone_max": 70050.0,
+            "stop_loss": 69400.0,
+            "take_profit": 70800.0,
+            "max_holding_minutes": 60,
+            "psychology_scene_review": {
+                "market_psychology": "Pullback buyers are waiting for confirmation.",
+                "psychology_bias": "bullish",
+                "scene_scenario": "Trend pullback needs a clean reclaim.",
+                "scene_type": "trend_pullback",
+                "entry_choreography": "Wait for the zone and require confirmation.",
+                "preferred_entry_timing": "watch_zone",
+                "confirmation_cues": ["zone_touch"],
+                "invalidation_cues": ["support_lost"],
+                "reason_codes": ["SCENE_TREND_PULLBACK"],
+                "summary": "Telemetry-only scene review.",
+                "execution_boundary": "metadata_only_no_order_authority",
+            },
+        },
+        metadata_json={
+            "source": "llm",
+            "model": "gpt-4.1-mini",
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 250, "total_tokens": 1250},
+            "decision_agreement": _decision_agreement(baseline="long", final="long", ai_used=True),
+        },
+        schema_valid=True,
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    fact = performance_reporting.persist_decision_performance_fact(db_session, run)
+    assert fact is not None
+    assert fact.ai_usefulness_status == "pending_risk"
+    assert fact.ai_actionable is True
+    assert fact.ai_total_tokens == 1250
+    assert fact.ai_known_cost_usd is not None
+
+    risk = RiskCheck(
+        symbol="BTCUSDT",
+        decision_run_id=run.id,
+        allowed=True,
+        decision="long",
+        reason_codes=[],
+        approved_risk_pct=0.01,
+        approved_leverage=2.0,
+        payload={
+            "debug_payload": {
+                "expected_cost_gate": {
+                    "status": "pass",
+                    "expected_edge_bps": 80.0,
+                    "expected_total_cost_bps": 12.5,
+                    "net_expected_edge_bps": 67.5,
+                }
+            }
+        },
+    )
+    db_session.add(risk)
+    db_session.flush()
+    order = Order(
+        symbol="BTCUSDT",
+        decision_run_id=run.id,
+        risk_check_id=risk.id,
+        side="long",
+        order_type="limit",
+        mode="live",
+        status="filled",
+        external_order_id="ai-usefulness-order",
+        requested_quantity=0.1,
+        requested_price=70000.0,
+        filled_quantity=0.1,
+        average_fill_price=70000.0,
+        reason_codes=[],
+        metadata_json={},
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        Execution(
+            order_id=order.id,
+            symbol="BTCUSDT",
+            status="filled",
+            external_trade_id="ai-usefulness-fill",
+            fill_price=70000.0,
+            fill_quantity=0.1,
+            fee_paid=0.5,
+            commission_asset="USDT",
+            slippage_pct=0.0,
+            realized_pnl=5.0,
+            payload={},
+        )
+    )
+    db_session.flush()
+    db_session.add(
+        PendingEntryPlan(
+            symbol="BTCUSDT",
+            side="long",
+            plan_status="triggered",
+            source_decision_run_id=run.id,
+            regime="bullish",
+            posture="pullback_watch",
+            rationale_codes=["AI_WATCH_ENTRY_PLAN"],
+            source_timeframe="15m",
+            entry_mode="pullback_confirm",
+            entry_zone_min=69950.0,
+            entry_zone_max=70050.0,
+            invalidation_price=69400.0,
+            max_chase_bps=12.0,
+            idea_ttl_minutes=18,
+            stop_loss=69400.0,
+            take_profit=70800.0,
+            risk_pct_cap=0.01,
+            leverage_cap=1.0,
+            expires_at=utcnow_naive() + timedelta(minutes=18),
+            triggered_at=utcnow_naive(),
+            idempotency_key="scene-telemetry-triggered",
+            metadata_json={
+                "execution_result": {
+                    "status": "filled",
+                    "order_id": order.id,
+                    "risk_check_id": risk.id,
+                }
+            },
+        )
+    )
+    db_session.add(
+        PendingEntryPlan(
+            symbol="BTCUSDT",
+            side="long",
+            plan_status="canceled",
+            source_decision_run_id=run.id,
+            regime="bullish",
+            posture="pullback_watch",
+            rationale_codes=["AI_WATCH_ENTRY_PLAN"],
+            source_timeframe="15m",
+            entry_mode="pullback_confirm",
+            entry_zone_min=69800.0,
+            entry_zone_max=69900.0,
+            invalidation_price=69400.0,
+            max_chase_bps=12.0,
+            idea_ttl_minutes=18,
+            stop_loss=69400.0,
+            take_profit=70800.0,
+            risk_pct_cap=0.01,
+            leverage_cap=1.0,
+            expires_at=utcnow_naive() + timedelta(minutes=18),
+            canceled_at=utcnow_naive(),
+            canceled_reason="PLAN_INVALIDATED",
+            idempotency_key="scene-telemetry-invalidated",
+            metadata_json={
+                "last_transition_reason": "PLAN_INVALIDATED",
+                "last_confirmation_tracking": {
+                    "zone_touched": True,
+                    "quality_score": 0.31,
+                    "quality_threshold": 0.62,
+                    "blocked_reason_codes": ["PLAN_CONFIRM_QUALITY_LOW"],
+                    "confirmation_failed_reason": "STRUCTURE_CONFIRMATION_FAILED",
+                },
+            },
+        )
+    )
+    db_session.flush()
+
+    refreshed = performance_reporting.refresh_decision_performance_fact_usefulness(db_session, run.id)
+    assert refreshed is not None
+    saved = db_session.scalar(
+        select(DecisionPerformanceFact).where(DecisionPerformanceFact.decision_run_id == run.id)
+    )
+    assert saved is not None
+    assert saved.ai_usefulness_status == "filled"
+    assert saved.ai_led_to_order is True
+    assert saved.ai_led_to_fill is True
+    assert saved.expected_edge_bps == pytest.approx(80.0)
+    assert saved.expected_total_cost_bps == pytest.approx(12.5)
+    assert saved.net_expected_edge_bps == pytest.approx(67.5)
+    assert saved.pnl_data_confidence == "exchange_trade_linked"
+    assert saved.telemetry_metadata["decision_quality"]["execution_count"] == 1
+    assert saved.telemetry_metadata["scene_review"]["scene_type"] == "trend_pullback"
+    assert saved.telemetry_metadata["scene_review"]["preferred_entry_timing"] == "watch_zone"
+    scene_outcome = saved.telemetry_metadata["scene_plan_outcome"]
+    assert scene_outcome["triggered_count"] == 1
+    assert scene_outcome["canceled_count"] == 1
+    assert scene_outcome["plan_confirm_quality_low_count"] == 1
+    assert scene_outcome["plan_invalidated_count"] == 1
+    assert scene_outcome["order_observed"] is True
+    assert scene_outcome["fill_observed"] is True
+    assert scene_outcome["outcome_bucket"] == "triggered_with_fill"
+    assert saved.telemetry_metadata["decision_quality"]["scene_plan_outcome"]["fill_count"] == 1
+
+
 def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypatch) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'performance_api.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
@@ -1322,3 +1537,147 @@ def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypa
         assert "feature_flags" in payload["windows"][0]
     finally:
         app.dependency_overrides.clear()
+
+
+def _opportunity_snapshot(
+    *,
+    symbol: str,
+    snapshot_time,
+    latest_price: float,
+) -> MarketSnapshot:
+    return MarketSnapshot(
+        symbol=symbol,
+        timeframe="15m",
+        snapshot_time=snapshot_time,
+        latest_price=latest_price,
+        latest_volume=100.0,
+        candle_count=1,
+        is_stale=False,
+        is_complete=True,
+        payload={"derivatives_context": {"funding_rate": 0.0}},
+    )
+
+
+def test_opportunity_attribution_reports_reason_quality_and_ai_flow(db_session) -> None:
+    now = utcnow_naive().replace(second=0, microsecond=0)
+    snapshots = [
+        _opportunity_snapshot(symbol="BTCUSDT", snapshot_time=now, latest_price=100.0),
+        _opportunity_snapshot(symbol="BTCUSDT", snapshot_time=now + timedelta(minutes=15), latest_price=101.0),
+        _opportunity_snapshot(symbol="BTCUSDT", snapshot_time=now + timedelta(minutes=30), latest_price=102.0),
+        _opportunity_snapshot(symbol="BTCUSDT", snapshot_time=now + timedelta(minutes=60), latest_price=103.0),
+    ]
+    db_session.add_all(snapshots)
+    db_session.flush()
+
+    decision = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="deterministic-mock",
+        summary="deterministic hold with long baseline",
+        input_payload={},
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "rationale_codes": ["HOLD_DECISION"],
+        },
+        metadata_json={
+            "source": "deterministic",
+            "decision_agreement": {"baseline_decision": "long"},
+            "last_ai_skip_reason": "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE",
+        },
+        schema_valid=True,
+    )
+    db_session.add(decision)
+    db_session.flush()
+    decision.created_at = now
+
+    risk = RiskCheck(
+        symbol="BTCUSDT",
+        decision_run_id=decision.id,
+        market_snapshot_id=snapshots[0].id,
+        allowed=False,
+        decision="hold",
+        reason_codes=["HOLD_DECISION"],
+        approved_risk_pct=0.0,
+        approved_leverage=0.0,
+        payload={"reason_codes": ["HOLD_DECISION"]},
+    )
+    db_session.add(risk)
+    db_session.flush()
+
+    plan = PendingEntryPlan(
+        symbol="BTCUSDT",
+        side="long",
+        plan_status="armed",
+        source_decision_run_id=decision.id,
+        regime="bullish",
+        posture="pullback",
+        rationale_codes=["TEST_PLAN"],
+        source_timeframe="15m",
+        entry_mode="pullback_confirm",
+        entry_zone_min=99.0,
+        entry_zone_max=101.0,
+        invalidation_price=98.0,
+        max_chase_bps=20.0,
+        idea_ttl_minutes=60,
+        stop_loss=98.0,
+        take_profit=104.0,
+        risk_pct_cap=0.01,
+        leverage_cap=2.0,
+        expires_at=now + timedelta(hours=1),
+        idempotency_key="test-opportunity-plan",
+        metadata_json={
+            "source_risk_check_id": risk.id,
+            "last_confirmation_tracking": {
+                "market_snapshot_id": snapshots[0].id,
+                "market_snapshot_time": now.isoformat(),
+                "latest_price": 100.0,
+                "blocked_reason_codes": ["PLAN_CONFIRM_QUALITY_LOW"],
+                "zone_touched": True,
+                "quality_score": 0.55,
+                "quality_threshold": 0.62,
+                "quality_reason": "QUALITY_BELOW_THRESHOLD",
+            },
+        },
+    )
+    db_session.add(plan)
+    db_session.flush()
+    plan.created_at = now
+
+    db_session.add(
+        AuditEvent(
+            event_type="decision_ai_skipped",
+            entity_type="decision_run",
+            entity_id=str(decision.id),
+            severity="info",
+            message="AI skipped in test",
+            payload={
+                "symbol": "BTCUSDT",
+                "reason": "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE",
+                "snapshot_id": snapshots[0].id,
+            },
+        )
+    )
+    db_session.flush()
+
+    report = build_opportunity_attribution_report(
+        db_session,
+        lookback_hours=3,
+        limit=20,
+        notional_usdt=100.0,
+    )
+
+    assert report["overall"]["evaluated_candidates"] == 3
+    assert report["reason_code_summary"]["HOLD_DECISION"]["profitable_candidates"] == 1
+    assert report["reason_code_summary"]["PLAN_CONFIRM_QUALITY_LOW"]["profitable_candidates"] == 1
+    assert report["reason_code_summary"]["SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"][
+        "profitable_candidates"
+    ] == 1
+    assert report["pending_quality_summary"]["0.50_0.62"]["profitable_candidates"] == 1
+    assert report["ai_flow_summary"]["ai_skipped"]["profitable_candidates"] == 3
+    assert report["reason_code_summary"]["HOLD_DECISION"]["horizons"]["60m"][
+        "avg_net_after_fees_usdt"
+    ] > 0

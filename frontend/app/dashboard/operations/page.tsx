@@ -5,6 +5,7 @@ import {
   SchedulerView,
 } from "../../../components/dashboard-views";
 import { PageShell } from "../../../components/page-shell";
+import type { AIUsagePayload } from "../../../components/ai-usage-panel";
 import type { OperatorDashboardPayload } from "../../../components/overview-dashboard";
 import { fetchJson } from "../../../lib/api";
 import { resolveSelectedSymbol } from "../../../lib/selected-symbol";
@@ -105,13 +106,14 @@ async function DecisionSection({ query }: { query: SearchParams }) {
 }
 
 async function RiskSection() {
-  const [operator, riskRows, alertRows] = await Promise.all([
+  const [operator, riskRows, alertRows, aiUsage] = await Promise.all([
     fetchJson<OperatorDashboardPayload>("/api/dashboard/operator?view=risk"),
     fetchJson<Row[]>("/api/risk/checks?limit=12&compact=true"),
     fetchJson<Row[]>("/api/alerts?limit=20"),
+    fetchJson<AIUsagePayload>("/api/settings/ai-usage"),
   ]);
 
-  return <RiskView operator={operator} riskRows={riskRows} alertRows={alertRows} />;
+  return <RiskView operator={operator} riskRows={riskRows} alertRows={alertRows} aiUsage={aiUsage} summaryMode />;
 }
 
 async function SchedulerSection() {

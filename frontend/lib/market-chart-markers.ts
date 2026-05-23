@@ -29,6 +29,11 @@ type MarkerCandle = {
 
 const commonReasonLabels: Record<string, string> = {
   HOLD_DECISION: "AI가 신규 진입 신호가 없다고 판단했습니다",
+  ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "trading_decision 일일 AI 토큰 예산이 소진되어 deterministic 판단을 사용했습니다",
+  SOFT_SIGNAL_AI_REVIEW: "약한 후보라 AI 검토 대상으로 분류됐습니다",
+  DERIVATIVES_ALIGNMENT_HEADWIND: "파생시장 정합성이 진입 방향을 뒷받침하지 않습니다",
+  BREAKOUT_OI_SPREAD_FILTER: "돌파처럼 보여도 OI와 스프레드 조건이 부족합니다",
+  BREAKOUT_OI_NOT_EXPANDING: "돌파 확인에 필요한 OI 증가가 없습니다",
   ENTRY_TRIGGER_NOT_MET: "진입 조건이 아직 충족되지 않았습니다",
   SLIPPAGE_THRESHOLD_EXCEEDED: "허용 가격 차이를 넘어 신규 진입을 막았습니다",
   CHASE_LIMIT_EXCEEDED: "가격이 이미 지나가 추격 진입을 막았습니다",

@@ -10,7 +10,15 @@ from sqlalchemy.orm import Session
 
 from trading_mvp.config import get_settings
 from trading_mvp.enums import AgentRole
-from trading_mvp.models import AgentRun, Execution, Order, Position, RiskCheck, Setting
+from trading_mvp.models import (
+    AgentRun,
+    DecisionPerformanceFact,
+    Execution,
+    Order,
+    Position,
+    RiskCheck,
+    Setting,
+)
 from trading_mvp.schemas import (
     EventOperatorControlPayload,
     MarketSnapshotPayload,
@@ -73,8 +81,8 @@ from trading_mvp.services.runtime_state import (
 from trading_mvp.services.settings import (
     SAFE_PROFILE_SELECTOR_DETAIL_KEY,
     build_event_operator_control_payload,
-    get_exposure_limits,
     get_execution_risk_profile_policy,
+    get_exposure_limits,
     get_limited_live_max_notional,
     get_rollout_mode,
     get_runtime_credentials,
@@ -228,6 +236,7 @@ MISSING_EXPECTED_PROFITABILITY_INPUTS_REASON_CODE = "missing_expected_profitabil
 CONFIDENCE_BELOW_MIN_ENTRY_THRESHOLD_REASON_CODE = "confidence_below_min_entry_threshold"
 PLANNED_RISK_REWARD_TOO_LOW_REASON_CODE = "PLANNED_RISK_REWARD_TOO_LOW"
 SYMBOL_RECENT_PERFORMANCE_NEGATIVE_REASON_CODE = "SYMBOL_RECENT_PERFORMANCE_NEGATIVE"
+DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE_REASON_CODE = "DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE"
 EXPECTED_COST_ENTRY_MARKETABLE = ENTRY_EXECUTION_TYPE_MARKETABLE
 EXPECTED_COST_ENTRY_PASSIVE_LIMIT = ENTRY_EXECUTION_TYPE_PASSIVE_LIMIT
 EXPECTED_COST_ENTRY_UNKNOWN = ENTRY_EXECUTION_TYPE_UNKNOWN
@@ -253,6 +262,9 @@ MIN_PLANNED_RISK_REWARD_RATIO = 1.25
 SYMBOL_RECENT_PERFORMANCE_LOOKBACK_DAYS = 30
 SYMBOL_RECENT_PERFORMANCE_SAMPLE_LIMIT = 80
 SYMBOL_RECENT_PERFORMANCE_MIN_EXECUTIONS = 4
+DECISION_BUCKET_RECENT_PERFORMANCE_LOOKBACK_DAYS = 30
+DECISION_BUCKET_RECENT_PERFORMANCE_SAMPLE_LIMIT = 80
+DECISION_BUCKET_RECENT_PERFORMANCE_MIN_FILLS = 4
 DEFAULT_MAX_SAME_DIRECTION_MAJOR_EXPOSURE_PCT = 2.0
 CORRELATED_EXPOSURE_LIMIT_REASON_CODE = "CORRELATED_EXPOSURE_LIMIT_REACHED"
 PORTFOLIO_SLOT_SOFT_CAP_REASON_CODE = "PORTFOLIO_SLOT_SOFT_CAP"
@@ -572,12 +584,7 @@ def _evaluate_ai_decision_validity(
         1.5,
         minimum=1.0,
     )
-    volatility_floor = _settings_float(
-        defaults,
-        "ai_decision_volatility_spike_min_pct",
-        0.02,
-        minimum=0.0,
-    )
+    volatility_floor = _volatility_spike_min_pct(defaults)
     if reference_volatility is not None and current_volatility is not None:
         spike_threshold = max(reference_volatility * volatility_multiplier, volatility_floor)
         if current_volatility >= spike_threshold and current_volatility > reference_volatility:
@@ -685,6 +692,18 @@ def _optional_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _volatility_spike_min_pct(defaults: object) -> float:
+    raw_threshold = _settings_float(
+        defaults,
+        "ai_decision_volatility_spike_min_pct",
+        0.02,
+        minimum=0.0,
+    )
+    if 0.0 < raw_threshold <= 0.1:
+        return raw_threshold * 100.0
+    return raw_threshold
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -898,7 +917,7 @@ def _deterministic_market_condition_profile(
     context = _as_dict(decision_context)
     current_market_state = _as_dict(context.get("current_market_state"))
     volatility_pct = _optional_float(current_market_state.get("volatility_pct"))
-    volatility_min_pct = float(getattr(defaults, "ai_decision_volatility_spike_min_pct", 0.02) or 0.02)
+    volatility_min_pct = _volatility_spike_min_pct(defaults)
     range_breakout_direction = str(current_market_state.get("range_breakout_direction") or "none").strip().lower()
     spread_bps = _optional_float(getattr(market_snapshot.derivatives_context, "spread_bps", None))
     spread_stress_score = _optional_float(getattr(market_snapshot.derivatives_context, "spread_stress_score", None))
@@ -2494,9 +2513,9 @@ def _expected_cost_gate_evaluation(
     market_fallback_policy_allowed, market_fallback_policy_source = _market_fallback_policy(decision_context)
     tight_tp_requires_limit_only = expected_edge_bps is not None and 0.0 < expected_edge_bps < tight_tp_bps
     market_data_reliable = not market_snapshot.is_stale and market_snapshot.is_complete
-    required_order_policy = "market_allowed"
-    allow_market_fallback = True
-    order_policy_reason = "market_allowed"
+    required_order_policy = "limit_only_or_post_only"
+    allow_market_fallback = False
+    order_policy_reason = "entry_market_fallback_disabled_by_default"
     if not market_data_reliable:
         required_order_policy = "block_or_pending"
         allow_market_fallback = False
@@ -2591,19 +2610,41 @@ def _expected_cost_gate_evaluation(
     cost_payload = cost_estimate.to_payload()
     would_block_reason_codes = list(dict.fromkeys(reason_codes))
     would_block = bool(would_block_reason_codes)
-    enforced_reason_codes = would_block_reason_codes if blocking_active else []
+    live_submit_hard_reason_codes = [
+        code
+        for code in would_block_reason_codes
+        if code in {EXPECTED_COST_EXCEEDS_EDGE_REASON_CODE, EXPECTED_NET_BPS_TOO_LOW_REASON_CODE}
+    ]
+    live_submit_hard_block = bool(
+        live_submit_hard_reason_codes
+        and rollout_mode_allows_exchange_submit(settings_row)
+    )
+    enforced_reason_codes = (
+        would_block_reason_codes
+        if blocking_active
+        else live_submit_hard_reason_codes
+        if live_submit_hard_block
+        else []
+    )
     status = "pass"
-    if would_block and blocking_active:
+    if would_block and (blocking_active or live_submit_hard_block):
         status = "blocked"
     elif would_block:
         status = "would_block"
     debug_payload = {
         "applied": True,
         "status": status,
-        "mode": "blocking" if blocking_active else "shadow",
+        "mode": (
+            "blocking"
+            if blocking_active
+            else "live_submit_hard_block"
+            if live_submit_hard_block
+            else "shadow"
+        ),
         "gate_enabled": gate_enabled,
         "gate_shadow": gate_shadow,
         "blocking_active": blocking_active,
+        "live_submit_hard_block": live_submit_hard_block,
         "would_block": would_block,
         "would_block_reason_codes": would_block_reason_codes,
         "enforced_reason_codes": enforced_reason_codes,
@@ -2776,6 +2817,101 @@ def _recent_symbol_performance_gate(
         "net_pnl_after_fees": _round_float(net_pnl_after_fees),
         "skipped_fee_assets": sorted(skipped_fee_assets),
         "comparison": "block_when_recent_symbol_net_pnl_after_fees_lt_zero",
+    }
+
+
+def _decision_bucket_regime(decision_context: dict[str, Any] | None) -> str:
+    context = _as_dict(decision_context)
+    trade_tags = _as_dict(context.get("trade_performance_tags"))
+    current_market_state = _as_dict(context.get("current_market_state"))
+    selection_context = _as_dict(context.get("selection_context"))
+    selection_regime = _as_dict(selection_context.get("regime"))
+    for value in (
+        trade_tags.get("regime_label"),
+        current_market_state.get("primary_regime"),
+        selection_regime.get("primary_regime"),
+        trade_tags.get("regime_id"),
+    ):
+        regime = str(value or "").strip()
+        if regime:
+            return regime.split(":", 1)[0] or "unknown"
+    return "unknown"
+
+
+def _recent_decision_bucket_performance_gate(
+    session: Session,
+    *,
+    symbol: str,
+    direction: str,
+    decision_context: dict[str, Any] | None,
+) -> tuple[list[str], dict[str, Any]]:
+    regime = _decision_bucket_regime(decision_context)
+    since = utcnow_naive() - timedelta(days=DECISION_BUCKET_RECENT_PERFORMANCE_LOOKBACK_DAYS)
+    query = (
+        select(Execution, Order, DecisionPerformanceFact)
+        .join(Order, Execution.order_id == Order.id)
+        .join(
+            DecisionPerformanceFact,
+            Order.decision_run_id == DecisionPerformanceFact.decision_run_id,
+        )
+        .where(
+            Order.mode == "live",
+            Execution.symbol == symbol,
+            DecisionPerformanceFact.symbol == symbol,
+            DecisionPerformanceFact.decision == direction,
+            Execution.created_at >= since,
+        )
+        .order_by(Execution.created_at.desc())
+        .limit(DECISION_BUCKET_RECENT_PERFORMANCE_SAMPLE_LIMIT)
+    )
+    if regime != "unknown":
+        query = query.where(DecisionPerformanceFact.regime == regime)
+    rows = list(session.execute(query))
+    gross_realized_pnl = sum(_coerce_float(execution.realized_pnl) for execution, _, _ in rows)
+    fee_total = 0.0
+    skipped_fee_assets: set[str] = set()
+    decision_run_ids: set[int] = set()
+    for execution, order, fact in rows:
+        if fact.decision_run_id is not None:
+            decision_run_ids.add(int(fact.decision_run_id))
+        elif order.decision_run_id is not None:
+            decision_run_ids.add(int(order.decision_run_id))
+        asset = str(execution.commission_asset or "USDT").upper()
+        if asset != "USDT":
+            skipped_fee_assets.add(asset)
+            continue
+        fee_total += abs(_coerce_float(execution.fee_paid))
+    net_pnl_after_fees = gross_realized_pnl - fee_total
+    fill_count = len(rows)
+    decision_count = len(decision_run_ids)
+    expectancy = net_pnl_after_fees / max(decision_count, 1)
+    reason_codes: list[str] = []
+    if fill_count < DECISION_BUCKET_RECENT_PERFORMANCE_MIN_FILLS:
+        status = "insufficient_sample"
+    elif net_pnl_after_fees < 0.0 and expectancy <= 0.0:
+        status = "blocked"
+        reason_codes.append(DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE_REASON_CODE)
+    else:
+        status = "pass"
+    return reason_codes, {
+        "applied": True,
+        "status": status,
+        "reason_codes": reason_codes,
+        "bucket_key": f"{symbol}:{direction}:{regime}",
+        "symbol": symbol,
+        "direction": direction,
+        "regime": regime,
+        "lookback_days": DECISION_BUCKET_RECENT_PERFORMANCE_LOOKBACK_DAYS,
+        "sample_limit": DECISION_BUCKET_RECENT_PERFORMANCE_SAMPLE_LIMIT,
+        "minimum_fill_count": DECISION_BUCKET_RECENT_PERFORMANCE_MIN_FILLS,
+        "fill_count": fill_count,
+        "decision_count": decision_count,
+        "gross_realized_pnl": _round_float(gross_realized_pnl),
+        "fee_total": _round_float(fee_total),
+        "net_pnl_after_fees": _round_float(net_pnl_after_fees),
+        "expectancy_after_fees": _round_float(expectancy),
+        "skipped_fee_assets": sorted(skipped_fee_assets),
+        "comparison": "block_when_recent_decision_bucket_expectancy_after_fees_lte_zero",
     }
 
 
@@ -3605,6 +3741,10 @@ def evaluate_risk(
     portfolio_exposure_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     planned_risk_reward_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     symbol_recent_performance_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
+    decision_bucket_recent_performance_gate: dict[str, Any] = {
+        "applied": False,
+        "status": "not_entry_decision",
+    }
     recent_tp_reentry_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     range_mr_cooldown_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     safe_profile_selection: dict[str, Any] = {"status": "not_evaluated"}
@@ -3915,6 +4055,15 @@ def evaluate_risk(
             symbol=decision.symbol,
         )
         blocked_reason_codes.extend(symbol_performance_reason_codes)
+        bucket_performance_reason_codes, decision_bucket_recent_performance_gate = (
+            _recent_decision_bucket_performance_gate(
+                session,
+                symbol=decision.symbol,
+                direction=decision.decision,
+                decision_context=decision_context,
+            )
+        )
+        blocked_reason_codes.extend(bucket_performance_reason_codes)
     if decision.decision == "hold":
         blocked_reason_codes.append("HOLD_DECISION")
         operating_mode = "hold" if operating_mode != "paused" else operating_mode
@@ -4388,6 +4537,7 @@ def evaluate_risk(
         "recent_tp_reentry_gate": recent_tp_reentry_gate,
         "range_mr_cooldown_gate": range_mr_cooldown_gate,
         "symbol_recent_performance_gate": symbol_recent_performance_gate,
+        "decision_bucket_recent_performance_gate": decision_bucket_recent_performance_gate,
         "decision_agreement": {
             **decision_agreement,
             "agreement_adjusted_notional": _round_float(

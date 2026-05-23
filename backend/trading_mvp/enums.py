@@ -5,6 +5,7 @@ class AgentRole(StrEnum):
     CHIEF_REVIEW = "chief_review"
     INTEGRATION_PLANNER = "integration_planner"
     MARKET_SETTINGS_ADVISOR = "market_settings_advisor"
+    POSITION_EXIT_REVIEW = "position_exit_review"
     TRADING_DECISION = "trading_decision"
     UI_UX = "ui_ux"
 

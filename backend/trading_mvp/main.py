@@ -63,6 +63,7 @@ from trading_mvp.services.dashboard import (
     get_profitability_dashboard,
     get_risk_checks,
     get_scheduler_runs,
+    warm_profitability_dashboard_cache,
 )
 from trading_mvp.services.execution import (
     poll_live_user_stream,
@@ -81,7 +82,10 @@ from trading_mvp.services.market_data_cache import (
 )
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
-from trading_mvp.services.performance_reporting import build_signal_performance_report
+from trading_mvp.services.performance_reporting import (
+    build_opportunity_attribution_report,
+    build_signal_performance_report,
+)
 from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.runtime_state import replace_market_stream_detail
 from trading_mvp.services.safety_checks import get_safety_check_detail, get_safety_check_summaries
@@ -128,6 +132,12 @@ def _bounded_limit(value: int, *, default: int = 50, maximum: int = MAX_LIST_LIM
     except (TypeError, ValueError):
         return default
     return max(1, min(normalized, maximum))
+
+
+def _history_response_compact(compact: bool | None, *, include_payload: bool) -> bool:
+    if include_payload:
+        return False
+    return True if compact is None else compact
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -363,7 +373,11 @@ def _run_background_scheduler_tick() -> int:
                 severity="error",
                 component="scheduler",
                 message="Background scheduler loop failed.",
-                payload={"error": str(exc)},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "session_rolled_back_before_logging": True,
+                },
             )
         return interval_seconds
 
@@ -390,7 +404,11 @@ def _run_background_exchange_sync_tick() -> int:
                 severity="error",
                 component="exchange_sync",
                 message="Background exchange sync loop failed.",
-                payload={"error": str(exc)},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "session_rolled_back_before_logging": True,
+                },
             )
         return interval_seconds
 
@@ -533,6 +551,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         tasks.append(asyncio.create_task(_background_user_stream_loop()))
     if _background_market_stream_enabled():
         tasks.append(asyncio.create_task(_background_market_stream_loop()))
+    if engine.dialect.name != "sqlite":
+        warm_profitability_dashboard_cache(
+            sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+        )
     try:
         yield
     finally:
@@ -577,14 +599,24 @@ def _run_exchange_sync_read_refresh(triggered_by: str) -> None:
                 entity_id="exchange_sync_cycle",
                 severity="warning",
                 message="Read-triggered exchange sync refresh failed.",
-                payload={"error": str(exc), "triggered_by": triggered_by},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "triggered_by": triggered_by,
+                    "session_recovered_before_logging": True,
+                },
             )
             record_health_event(
                 session,
                 component="exchange_sync",
                 status="error",
                 message="Read-triggered exchange sync refresh failed.",
-                payload={"error": str(exc), "triggered_by": triggered_by},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "triggered_by": triggered_by,
+                    "session_recovered_before_logging": True,
+                },
             )
             session.commit()
     finally:
@@ -729,7 +761,7 @@ def dashboard_operator(view: str | None = None, db: Session = Depends(get_db)) -
 
 @app.get("/api/dashboard/profitability")
 def dashboard_profitability(db: Session = Depends(get_db)) -> dict[str, object]:
-    return get_profitability_dashboard(db).model_dump(mode="json")
+    return get_profitability_dashboard(db, use_cache=True, allow_stale=True).model_dump(mode="json")
 
 
 @app.get("/api/analytics/cost-breakdown")
@@ -758,6 +790,21 @@ def analytics_short_drag(
         days=_bounded_limit(days, default=7, maximum=90),
         limit=_bounded_limit(limit, default=10, maximum=50),
         mode=mode,
+    )
+
+
+@app.get("/api/analytics/opportunity-attribution")
+def analytics_opportunity_attribution(
+    lookback_hours: int = 24,
+    limit: int = 120,
+    notional_usdt: float = 100.0,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return build_opportunity_attribution_report(
+        db,
+        lookback_hours=lookback_hours,
+        limit=_bounded_limit(limit, default=120, maximum=500),
+        notional_usdt=notional_usdt,
     )
 
 
@@ -793,8 +840,17 @@ def market_chart_markers(
 
 
 @app.get("/api/decisions")
-def decisions(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_decisions(db, limit=_bounded_limit(limit), compact=compact)
+def decisions(
+    limit: int = 50,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_decisions(
+        db,
+        limit=_bounded_limit(limit),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/positions")
@@ -854,8 +910,17 @@ def execution_quality_report(db: Session = Depends(get_db)) -> dict[str, object]
 
 
 @app.get("/api/risk/checks")
-def risk_checks(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_risk_checks(db, limit=_bounded_limit(limit), compact=compact)
+def risk_checks(
+    limit: int = 50,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_risk_checks(
+        db,
+        limit=_bounded_limit(limit),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/risk/checks/summary")
@@ -872,13 +937,31 @@ def risk_check_detail(risk_check_id: int, db: Session = Depends(get_db)) -> dict
 
 
 @app.get("/api/agents")
-def agents(limit: int = 100, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_agent_runs(db, limit=_bounded_limit(limit, default=100), compact=compact)
+def agents(
+    limit: int = 100,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_agent_runs(
+        db,
+        limit=_bounded_limit(limit, default=100),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/scheduler")
-def scheduler(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_scheduler_runs(db, limit=_bounded_limit(limit), compact=compact)
+def scheduler(
+    limit: int = 50,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_scheduler_runs(
+        db,
+        limit=_bounded_limit(limit),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/audit")

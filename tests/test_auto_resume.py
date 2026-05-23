@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from trading_mvp.main import app
 from trading_mvp.models import AuditEvent, PnLSnapshot, Position, SchedulerRun
 from trading_mvp.schemas import AppSettingsUpdateRequest
@@ -345,6 +346,67 @@ def test_scheduler_path_attempts_auto_resume_before_interval_cycle(db_session, m
     assert result["auto_resume"]["status"] == "resumed"
     assert scheduler_run is not None
     assert scheduler_run.status == "success"
+
+
+def test_interval_cycle_persists_failed_scheduler_run_after_operational_error(db_session, monkeypatch) -> None:
+    update_settings(db_session, _build_live_settings_payload())
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.attempt_auto_resume",
+        lambda session, settings_row, trigger_source="system": {
+            "status": "resumed",
+            "resumed": True,
+            "allowed": True,
+            "blockers": [],
+            "trigger_source": trigger_source,
+        },
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness",
+        lambda session, triggered_by="scheduler": {
+            "workflow": "exchange_sync_cycle",
+            "status": "success",
+            "triggered_by": triggered_by,
+        },
+    )
+
+    def fake_plan(self, *, symbols, triggered_at):
+        del triggered_at
+        return {
+            "candidate_selection": {"breadth_regime": "mixed"},
+            "plans": [
+                {
+                    "symbol": symbols[0],
+                    "trigger": {
+                        "trigger_reason": "entry_candidate_event",
+                        "trigger_fingerprint": "db-failure-trigger",
+                        "fingerprint_changed_fields": [],
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "build_interval_decision_plan", fake_plan)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_decision_cycle",
+        lambda self, **kwargs: (_ for _ in ()).throw(
+            OperationalError(
+                "insert into agent_runs",
+                {},
+                Exception("server closed the connection unexpectedly"),
+            )
+        ),
+    )
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
+
+    assert result["results"]
+    assert scheduler_run is not None
+    assert scheduler_run.status == "failed"
+    assert scheduler_run.outcome["error_category"] == "db_operational_error"
+    assert scheduler_run.outcome["db_connection_lost"] is True
+    assert scheduler_run.outcome["scheduler_failure_persisted"] is True
 
 
 def test_manual_cycle_api_attempts_auto_resume_before_running(testclient_db_factory, monkeypatch) -> None:

@@ -17,9 +17,11 @@ from trading_mvp.models import (
     AgentRun,
     FeatureSnapshot,
     MarketSnapshot,
+    PendingEntryPlan,
     PnLSnapshot,
     Position,
     RiskCheck,
+    SchedulerRun,
     SystemHealthEvent,
 )
 from trading_mvp.schemas import (
@@ -101,6 +103,7 @@ def build_settings_payload() -> AppSettingsUpdateRequest:
         ai_model="gpt-4.1-mini",
         ai_call_interval_minutes=30,
         decision_cycle_interval_minutes=15,
+        ai_trading_decision_daily_token_budget=1_000_000,
         ai_max_input_candles=32,
         ai_temperature=0.1,
         binance_market_data_enabled=True,
@@ -142,6 +145,7 @@ def test_settings_update_encrypts_and_masks_secrets(db_session) -> None:
     assert serialized["event_source_timeout_seconds"] == 12.0
     assert serialized["event_source_default_assets"] == ["BTCUSDT", "ETHUSDT"]
     assert serialized["event_source_fred_release_ids"] == [10, 101]
+    assert serialized["ai_trading_decision_daily_token_budget"] == 1_000_000
     assert serialized["event_source_bls_enrichment_url"] == "https://bls.settings/releases"
     assert serialized["event_source_bls_enrichment_static_params"] == {"series_id": "CUUR0000SA0"}
     assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
@@ -216,6 +220,22 @@ def test_settings_update_preserves_event_source_fields_when_older_payload_omits_
     assert updated.event_source_api_key_encrypted == row.event_source_api_key_encrypted
 
 
+def test_settings_update_preserves_ai_token_budget_when_older_payload_omits_it(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(
+            update={"ai_trading_decision_daily_token_budget": 1_500_000}
+        ),
+    )
+    payload_data = build_settings_payload().model_dump()
+    payload_data.pop("ai_trading_decision_daily_token_budget", None)
+
+    updated = update_settings(db_session, AppSettingsUpdateRequest(**payload_data))
+
+    assert updated.id == row.id
+    assert updated.ai_trading_decision_daily_token_budget == 1_500_000
+
+
 def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
 
@@ -231,6 +251,7 @@ def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> No
     assert serialized["event_source_bls_enrichment_url"] == "https://bls.settings/releases"
     assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
     assert serialized["event_source_api_key_configured"] is True
+    assert serialized["ai_trading_decision_daily_token_budget"] == 1_000_000
     assert "pre_ai_skip_simple_classification" in serialized["ai_model_routing_policy"]["no_model_call_routes"]
     profile_settings = serialized["execution_risk_profile_settings"]
     assert profile_settings["advisor_enabled"] is True
@@ -360,6 +381,8 @@ def test_settings_auxiliary_serializers_expose_cadences_and_ai_usage(db_session)
     usage = serialize_settings_ai_usage(row)
 
     assert cadences["items"][0]["symbol"] == "BTCUSDT"
+    assert usage["ai_usage_today_timezone"] == "Asia/Seoul"
+    assert usage["recent_ai_calls_today_kst"] == 1
     assert usage["recent_ai_calls_24h"] == 1
     assert usage["manual_ai_guard_minutes"] == 5
     assert usage["ai_protection_status"]["policy"]["quota_errors"] == "global_backoff"
@@ -392,6 +415,7 @@ def test_settings_ai_usage_estimates_advisor_cost_without_metadata_model(db_sess
         clear_ai_usage_metrics_cache()
 
     assert usage["recent_ai_calls_24h"] == 1
+    assert usage["recent_ai_calls_today_kst"] == 1
     advisor = usage["ai_protection_status"]["advisor"]
     assert advisor["cost_estimate_status"] == "estimated_model_fallback"
     assert advisor["cost_estimate_model"] == "gpt-4.1-mini"
@@ -439,7 +463,9 @@ def test_settings_ai_usage_reuses_source_revision_cache(db_session, monkeypatch)
 
     assert first["recent_ai_calls_24h"] == 1
     assert second["recent_ai_calls_24h"] == 1
-    assert calls["count"] == 2
+    assert first["recent_ai_calls_today_kst"] == 1
+    assert second["recent_ai_calls_today_kst"] == 1
+    assert calls["count"] == 4
 
 
 def test_openai_call_gate_applies_global_quota_backoff(db_session) -> None:
@@ -571,6 +597,320 @@ def test_openai_call_gate_blocks_advisor_hourly_budget(db_session) -> None:
     budget = usage["ai_protection_status"]["role_budgets"]["market_settings_advisor"]
     assert budget["status"] == "blocked"
     assert budget["calls_1h"] == 4
+
+
+def test_openai_call_gate_blocks_trading_decision_daily_token_budget(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.ai_enabled = True
+    row.ai_provider = "openai"
+    now = utcnow_naive()
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="large trading decision usage",
+            input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+            output_payload={"decision": "hold"},
+            metadata_json={
+                "source": "llm",
+                "symbol": "BTCUSDT",
+                "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1, "total_tokens": 1_000_001},
+            },
+            schema_valid=True,
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.flush()
+
+    clear_ai_usage_metrics_cache()
+    try:
+        gate = get_openai_call_gate(
+            db_session,
+            row,
+            "trading_decision",
+            "realtime_cycle",
+            has_openai_key=True,
+            symbol="BTCUSDT",
+        )
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    assert gate.allowed is False
+    assert gate.reason == "role_daily_token_budget_exhausted"
+    budget = usage["ai_protection_status"]["role_budgets"]["trading_decision"]
+    assert budget["status"] == "blocked"
+    assert budget["tokens_24h"] == 1_000_001
+    assert budget["max_tokens_24h"] == 1_000_000
+
+
+def test_openai_call_gate_uses_configurable_trading_decision_daily_token_budget(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(
+            update={"ai_trading_decision_daily_token_budget": 1_500_000}
+        ),
+    )
+    row.ai_enabled = True
+    row.ai_provider = "openai"
+    row.ai_call_interval_minutes = 1
+    now = utcnow_naive()
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="large trading decision usage within configured budget",
+            input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+            output_payload={"decision": "hold"},
+            metadata_json={
+                "source": "llm",
+                "symbol": "BTCUSDT",
+                "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1, "total_tokens": 1_000_001},
+            },
+            schema_valid=True,
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+    try:
+        gate = get_openai_call_gate(
+            db_session,
+            row,
+            "trading_decision",
+            "realtime_cycle",
+            has_openai_key=True,
+            symbol="BTCUSDT",
+        )
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    assert gate.allowed is True
+    assert gate.reason == "allowed"
+    budget = usage["ai_protection_status"]["role_budgets"]["trading_decision"]
+    assert budget["status"] == "ok"
+    assert budget["tokens_24h"] == 1_000_001
+    assert budget["max_tokens_24h"] == 1_500_000
+
+
+def test_settings_ai_usage_reports_scheduler_soft_signal_suppression_and_roi(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="15m",
+            workflow="interval_decision_cycle",
+            status="success",
+            triggered_by="scheduler",
+            created_at=now - timedelta(minutes=2),
+            outcome={
+                "symbol": "BTCUSDT",
+                "status": "skipped",
+                "ai_review_status": "skipped",
+                "last_ai_skip_reason": "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE",
+            },
+        )
+    )
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="openai success",
+            input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+            output_payload={"decision": "hold"},
+            metadata_json={
+                "source": "llm",
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            },
+            schema_valid=True,
+            created_at=now - timedelta(minutes=3),
+        )
+    )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+    try:
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    summary = usage["ai_usage_summary_24h"]
+    summary_today_kst = usage["ai_usage_summary_today_kst"]
+    assert usage["ai_usage_today_timezone"] == "Asia/Seoul"
+    assert usage["recent_ai_calls_today_kst"] == 1
+    assert summary_today_kst["ai_calls_provider_invoked"] == 1
+    assert summary_today_kst["ai_calls_scheduler_skipped"] == 1
+    assert summary_today_kst["ai_calls_suppressed_soft_signal"] == 1
+    assert summary_today_kst["known_estimated_cost_usd"] == pytest.approx(0.000072)
+    assert summary["ai_calls_provider_invoked"] == 1
+    assert summary["ai_calls_scheduler_skipped"] == 1
+    assert summary["ai_calls_suppressed_soft_signal"] == 1
+    assert summary["scheduler_skip_reasons"]["SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"] == 1
+    assert summary["known_estimated_cost_usd"] == pytest.approx(0.000072)
+    assert summary["roi"]["known_ai_cost_usd"] == pytest.approx(0.000072)
+    assert summary["roi"]["net_after_known_ai_cost_usd"] == pytest.approx(-0.000072)
+
+
+def test_settings_ai_usage_reports_multiday_role_efficiency_and_reason_buckets(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    now = utcnow_naive()
+    trading_run = AgentRun(
+        role="trading_decision",
+        trigger_event="entry_candidate_event",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="hold decision",
+        input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+        output_payload={"decision": "hold", "rationale_codes": ["HOLD_DECISION"]},
+        metadata_json={
+            "source": "llm",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        },
+        schema_valid=True,
+        created_at=now - timedelta(days=2),
+    )
+    db_session.add(trading_run)
+    db_session.flush()
+    db_session.add_all(
+        [
+            RiskCheck(
+                symbol="BTCUSDT",
+                decision_run_id=trading_run.id,
+                allowed=False,
+                decision="hold",
+                reason_codes=["HOLD_DECISION"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={},
+            ),
+            PendingEntryPlan(
+                symbol="BTCUSDT",
+                side="long",
+                plan_status="canceled",
+                source_decision_run_id=trading_run.id,
+                rationale_codes=["HOLD_DECISION"],
+                entry_zone_min=90_000.0,
+                entry_zone_max=91_000.0,
+                risk_pct_cap=0.0,
+                leverage_cap=0.0,
+                expires_at=now + timedelta(minutes=30),
+                canceled_at=now - timedelta(days=1),
+                canceled_reason="PLAN_CANCELED_QUALITY_LOW",
+                idempotency_key="test-ai-usage-plan",
+            ),
+        ]
+    )
+    for offset in (3, 4, 5):
+        db_session.add(
+            AgentRun(
+                role="market_settings_advisor",
+                trigger_event="realtime_cycle",
+                schema_name="AIMarketSettingsRecommendation",
+                status="completed",
+                provider_name="openai",
+                summary="advisor stable recommendation",
+                input_payload={},
+                output_payload={
+                    "recommended_profile_id": "CAUTION",
+                    "valid_until": (now + timedelta(minutes=15)).isoformat(),
+                },
+                metadata_json={
+                    "source": "llm",
+                    "status": "shadow_generated",
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90},
+                },
+                schema_valid=True,
+                created_at=now - timedelta(days=offset),
+            )
+        )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+    try:
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    summary_7d = usage["ai_usage_summary_7d"]
+    downstream = summary_7d["downstream"]
+    role_efficiency = summary_7d["role_efficiency"]
+    advisor = role_efficiency["market_settings_advisor"]["advisor"]
+
+    assert usage["recent_ai_calls_30d"] == 4
+    assert usage["recent_ai_role_calls_30d"]["market_settings_advisor"] == 3
+    assert summary_7d["ai_calls_provider_invoked"] == 4
+    assert summary_7d["actionability"]["provider_calls"] == 1
+    assert summary_7d["reason_buckets"]["hold"]["HOLD_DECISION"] == 1
+    assert downstream["risk_reason_counts"]["HOLD_DECISION"] == 1
+    assert downstream["pending_plan_status_counts"]["canceled"] == 1
+    assert role_efficiency["trading_decision"]["actionability"]["provider_to_order_rate"] == 0.0
+    assert role_efficiency["trading_decision"]["roi"]["cost_per_risk_allowed_usd"] is None
+    assert role_efficiency["market_settings_advisor"]["known_ai_cost_usd"] > 0
+    assert advisor["profile_counts"]["CAUTION"] == 3
+    assert advisor["reuse_signal"] == "stable_profile_reuse_candidate"
+    assert usage["ai_cost_efficiency_summary"]["primary_window"] == "7d"
+    assert usage["ai_cost_efficiency_summary"]["waste_assessment"]["status"] == "needs_review"
+
+
+def test_settings_ai_usage_counts_scheduler_scalar_skip_reason(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="15m",
+            workflow="interval_decision_cycle",
+            status="success",
+            triggered_by="scheduler",
+            created_at=now - timedelta(minutes=2),
+            ai_skip_reason="LOW_SCORE",
+            outcome={"symbol": "BTCUSDT", "status": "skipped"},
+        )
+    )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+    try:
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    summary = usage["ai_usage_summary_24h"]
+    assert summary["ai_calls_scheduler_skipped"] == 1
+    assert summary["scheduler_skip_reasons"]["LOW_SCORE"] == 1
+
+
+def test_settings_ai_usage_reports_soft_signal_hold_backoff_skip_reason(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="15m",
+            workflow="interval_decision_cycle",
+            status="success",
+            triggered_by="scheduler",
+            created_at=now - timedelta(minutes=2),
+            ai_skip_reason="SOFT_SIGNAL_REVIEW_HOLD_BACKOFF_ACTIVE",
+            outcome={"symbol": "BTCUSDT", "status": "skipped"},
+        )
+    )
+    db_session.flush()
+    clear_ai_usage_metrics_cache()
+    try:
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+
+    summary = usage["ai_usage_summary_24h"]
+    assert summary["ai_calls_scheduler_skipped"] == 1
+    assert summary["scheduler_skip_reasons"]["SOFT_SIGNAL_REVIEW_HOLD_BACKOFF_ACTIVE"] == 1
 
 
 def test_serialize_settings_reports_unknown_live_snapshot_without_synthetic_equity(db_session) -> None:
@@ -837,8 +1177,11 @@ def test_serialize_settings_reports_recent_ai_usage_metrics(db_session) -> None:
     assert serialized["recent_ai_role_calls_7d"]["chief_review"] == 1
     assert "estimated_monthly_ai_calls_breakdown" not in serialized
     assert "BAD_REQUEST x1" in serialized["recent_ai_failure_reasons"]
-    assert serialized["observed_monthly_ai_calls_projection"] == 60
+    assert serialized["observed_monthly_ai_calls_projection"] == 3
     assert serialized["ai_protection_status"]["policy"]["rate_limit_errors"] == "role_backoff"
+    assert serialized["ai_usage_today_timezone"] == "Asia/Seoul"
+    assert "recent_ai_calls_today_kst" in serialized
+    assert "ai_usage_summary_today_kst" in serialized
 
 
 def test_connection_services_return_success_with_patched_clients(db_session, monkeypatch) -> None:
@@ -1369,6 +1712,8 @@ def test_settings_api_splits_heavy_payloads(testclient_db_factory) -> None:
     assert "symbol_effective_cadences" not in view_response.json()
     assert "recent_ai_calls_24h" not in view_response.json()
     assert cadence_response.json()["items"][0]["symbol"] == "BTCUSDT"
+    assert usage_response.json()["ai_usage_today_timezone"] == "Asia/Seoul"
+    assert usage_response.json()["recent_ai_calls_today_kst"] == 1
     assert usage_response.json()["recent_ai_calls_24h"] == 1
 
 

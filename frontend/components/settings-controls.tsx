@@ -171,6 +171,7 @@ export type SettingsPayload = {
   ai_model_routing_policy?: AIModelRoutingPolicy;
   ai_call_interval_minutes: number;
   decision_cycle_interval_minutes: number;
+  ai_trading_decision_daily_token_budget: number;
   ai_max_input_candles: number;
   ai_temperature: number;
   binance_market_data_enabled: boolean;
@@ -318,6 +319,7 @@ function toFormState(initial: SettingsPayload): FormState {
     ai_model: initial.ai_model,
     ai_call_interval_minutes: initial.ai_call_interval_minutes,
     decision_cycle_interval_minutes: initial.decision_cycle_interval_minutes,
+    ai_trading_decision_daily_token_budget: initial.ai_trading_decision_daily_token_budget ?? 1_000_000,
     ai_max_input_candles: initial.ai_max_input_candles,
     ai_temperature: initial.ai_temperature,
     binance_market_data_enabled: initial.binance_market_data_enabled,
@@ -377,6 +379,23 @@ function MetricCard({ label, value, tone = "default" }: { label: string; value: 
   if (tone === "dark") return <div className="rounded-md bg-slate-950 px-4 py-4 text-white"><p className="text-xs uppercase tracking-[0.2em] text-white/60">{label}</p><p className="mt-2 text-xl font-semibold">{value}</p></div>;
   if (tone === "warm") return <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-4"><p className="text-xs uppercase tracking-[0.2em] text-blue-900">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
   return <div className="rounded-md border border-slate-200 bg-white px-4 py-4"><p className="text-xs uppercase tracking-[0.2em] text-slate-500">{label}</p><p className="mt-2 text-xl font-semibold text-slate-900">{value}</p></div>;
+}
+
+function formatMetricNumber(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "미집계";
+  }
+  return value.toLocaleString("ko-KR");
+}
+
+function formatMetricUsd(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "미집계";
+  }
+  return `$${value.toLocaleString("ko-KR", {
+    minimumFractionDigits: value === 0 ? 2 : 4,
+    maximumFractionDigits: 6,
+  })}`;
 }
 
 function dedupeReasons(values: string[]) {
@@ -518,6 +537,15 @@ export function SettingsControls({
     typeof state.operator_alert?.message === "string" ? state.operator_alert.message : null;
   const showOneWayRequiredBanner =
     liveArmBlocked && (operatorAlertMessage === "one-way required for current local position model" || liveArmDisableReason === "one-way required for current local position model");
+  const tradingDecisionBudget = aiUsage?.ai_protection_status?.role_budgets?.trading_decision;
+  const tradingDecisionBudgetBlocked = tradingDecisionBudget?.status === "blocked";
+  const tradingDecisionTokenValue =
+    tradingDecisionBudget?.tokens_24h !== undefined && tradingDecisionBudget.max_tokens_24h !== undefined
+      ? `${formatMetricNumber(tradingDecisionBudget.tokens_24h)} / ${formatMetricNumber(
+          tradingDecisionBudget.max_tokens_24h,
+        )}`
+      : "불러오는 중";
+  const aiSummaryTodayKst = aiUsage?.ai_usage_summary_today_kst;
 
   const requestJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const response = await fetch(`${apiBaseUrl}${path}`, init);
@@ -531,12 +559,12 @@ export function SettingsControls({
   };
 
   const refreshAuxiliaryData = async () => {
-    const [cadencePayload, usagePayload] = await Promise.all([
+    const [cadenceResult, usageResult] = await Promise.allSettled([
       requestJson<SettingsCadencePayload>("/api/settings/cadences"),
       requestJson<AIUsagePayload>("/api/settings/ai-usage"),
     ]);
-    setSymbolCadences(cadencePayload.items);
-    setAiUsage(usagePayload);
+    setSymbolCadences(cadenceResult.status === "fulfilled" ? cadenceResult.value.items : []);
+    setAiUsage(usageResult.status === "fulfilled" ? usageResult.value : null);
   };
 
   useEffect(() => {
@@ -621,6 +649,7 @@ export function SettingsControls({
     ai_model: form.ai_model,
     ai_call_interval_minutes: form.ai_call_interval_minutes,
     decision_cycle_interval_minutes: form.decision_cycle_interval_minutes,
+    ai_trading_decision_daily_token_budget: form.ai_trading_decision_daily_token_budget,
     execution_risk_profile_settings: form.execution_risk_profile_settings,
     ai_max_input_candles: form.ai_max_input_candles,
     ai_temperature: form.ai_temperature,
@@ -865,8 +894,32 @@ export function SettingsControls({
         <MetricCard label="기본 심볼 / 타임프레임" value={`${form.default_symbol} / ${form.default_timeframe}`} />
         <MetricCard label="AI 동작 방식" value="이벤트 기반 + 주기 백스톱" tone="warm" />
         <MetricCard
-          label="최근 24시간 AI 호출"
-          value={aiUsage ? `${aiUsage.recent_ai_calls_24h.toLocaleString("ko-KR")}회` : "불러오는 중"}
+          label="KST 오늘 AI 호출"
+          value={aiUsage ? `${formatMetricNumber(aiUsage.recent_ai_calls_today_kst)}회` : "불러오는 중"}
+        />
+        <MetricCard
+          label="trading_decision 토큰"
+          value={tradingDecisionTokenValue}
+          tone={tradingDecisionBudgetBlocked ? "warm" : "default"}
+        />
+        <MetricCard
+          label="trading_decision 상태"
+          value={
+            tradingDecisionBudget
+              ? tradingDecisionBudgetBlocked
+                ? `차단: ${tradingDecisionBudget.reason ?? "예산 초과"}`
+                : "사용 가능"
+              : "불러오는 중"
+          }
+          tone={tradingDecisionBudgetBlocked ? "warm" : "default"}
+        />
+        <MetricCard
+          label="KST 오늘 AI 비용"
+          value={formatMetricUsd(aiSummaryTodayKst?.known_estimated_cost_usd)}
+        />
+        <MetricCard
+          label="약한 관망 억제"
+          value={`${formatMetricNumber(aiSummaryTodayKst?.ai_calls_suppressed_soft_signal ?? 0)}회`}
         />
       </div>
 
@@ -883,6 +936,28 @@ export function SettingsControls({
       ) : null}
 
       <div className={activeView === "control" ? "space-y-5" : "hidden"} aria-hidden={activeView !== "control"}>
+        <nav
+          aria-label="운영 설정 빠른 이동"
+          className="sticky top-20 z-10 -mx-1 flex gap-2 overflow-x-auto rounded-md border border-slate-200 bg-white/95 p-2 shadow-sm backdrop-blur"
+        >
+          {[
+            ["실거래", "#settings-live-control"],
+            ["시장/리스크", "#settings-market-risk"],
+            ["실행 프로파일", "#settings-execution-profile"],
+            ["이벤트", "#settings-events"],
+            ["운영 주기", "#settings-cadence"],
+          ].map(([label, href]) => (
+            <a
+              key={href}
+              href={href}
+              className="inline-flex min-h-10 shrink-0 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-semibold text-slate-700 transition hover:border-blue-200 hover:bg-blue-50"
+            >
+              {label}
+            </a>
+          ))}
+        </nav>
+
+        <div id="settings-live-control" className="scroll-mt-32">
         <LiveControlPanel
           state={state}
           summary={controlSummary}
@@ -946,7 +1021,9 @@ export function SettingsControls({
             updateField(field as keyof FormState, value as FormState[keyof FormState]);
           }}
         />
+        </div>
 
+        <div id="settings-market-risk" className="scroll-mt-32">
         <MarketRiskPanel
           form={form}
           mergedSymbols={mergedSymbols}
@@ -962,7 +1039,9 @@ export function SettingsControls({
             );
           }}
         />
+        </div>
 
+        <div id="settings-execution-profile" className="scroll-mt-32">
         <ExecutionProfileSettingsPanel
           settings={state.execution_risk_profile_settings}
           form={form.execution_risk_profile_settings}
@@ -971,8 +1050,9 @@ export function SettingsControls({
           onPolicyChange={(next) => updateField("execution_risk_profile_settings", next)}
           onSave={() => save("control_save")}
         />
+        </div>
 
-        <section className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <section id="settings-events" className="scroll-mt-32 grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <EventResponseOverviewPanel
             defaultSymbol={state.default_symbol}
             eventContext={eventContext}
@@ -1018,6 +1098,7 @@ export function SettingsControls({
           />
         </div>
       </section>
+      <div id="settings-cadence" className="scroll-mt-32">
       <CadenceSettingsPanel
         form={form}
         mergedSymbols={mergedSymbols}
@@ -1032,6 +1113,7 @@ export function SettingsControls({
         onSymbolOverrideChange={updateSymbolOverride}
         onSave={() => save("control_save")}
       />
+      </div>
       </div>
 
       <div className={activeView === "integration" ? "space-y-5" : "hidden"} aria-hidden={activeView !== "integration"}>

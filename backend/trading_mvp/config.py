@@ -177,11 +177,12 @@ class Settings(BaseSettings):
     app_secret_seed: str = "change-me-local-dev-secret"
     ai_provider: str = "openai"
     ai_call_interval_minutes: int = 10
-    decision_cycle_interval_minutes: int = 5
+    decision_cycle_interval_minutes: int = 15
     ai_decision_ttl_seconds: int = 900
     ai_decision_price_move_invalidation_pct: float = 0.004
     ai_decision_volatility_spike_multiplier: float = 1.5
     ai_decision_volatility_spike_min_pct: float = 0.02
+    ai_trading_decision_daily_token_budget: int = Field(default=1_000_000, ge=10_000, le=50_000_000)
     ai_max_input_candles: int = 32
     ai_temperature: float = 0.1
     ai_market_settings_advisor_enabled: bool = True

@@ -309,6 +309,42 @@ def test_summarize_universe_breadth_detects_trend_expansion_without_decision_map
     assert breadth["hold_bias_multiplier"] < 1.0
 
 
+def test_summarize_universe_breadth_uses_structural_candidates_with_decision_map() -> None:
+    breadth = summarize_universe_breadth(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "primary_regime": "bullish",
+                "trend_alignment": "bullish_aligned",
+                "weak_volume": False,
+                "momentum_weakening": False,
+            },
+            {
+                "symbol": "ETHUSDT",
+                "primary_regime": "bullish",
+                "trend_alignment": "bullish_aligned",
+                "weak_volume": False,
+                "momentum_weakening": False,
+            },
+            {
+                "symbol": "SOLUSDT",
+                "primary_regime": "bullish",
+                "trend_alignment": "bullish_aligned",
+                "weak_volume": False,
+                "momentum_weakening": False,
+            },
+        ],
+        decisions={"BTCUSDT": "hold", "ETHUSDT": "hold", "SOLUSDT": "hold"},
+    )
+
+    assert breadth["breadth_regime"] == "trend_expansion"
+    assert breadth["entry_candidates"] == 0
+    assert breadth["decision_entry_candidates"] == 0
+    assert breadth["structural_entry_candidates"] == 3
+    assert breadth["entry_candidate_pressure_count"] == 3
+    assert breadth["entry_candidate_pressure_basis"] == "structural"
+
+
 def _seed_setup_bucket_history(
     db_session,
     *,
@@ -2744,6 +2780,10 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
                     "rationale_codes": ["TREND_UP", "ALIGNED_PULLBACK"],
                     "explanation_short": "ai context propagation test",
                     "explanation_detailed": "The provider returns the legacy minimum shape while the agent backfills the new optional metadata from ai context.",
+                    "bounded_output_applied": True,
+                    "fail_closed_applied": True,
+                    "provider_status": "model_claimed_fail_closed",
+                    "fallback_reason_codes": ["MODEL_CLAIMED_FAIL_CLOSED"],
                 },
                 usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
             )
@@ -2923,6 +2963,8 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert captured_payloads[0]["ai_response_contract"]["decision_authority"] == "intent_only_no_order_execution"
     assert captured_payloads[0]["ai_response_contract"]["final_execution_gate"] == "deterministic_risk_guard"
     assert "protective_order_state" in captured_payloads[0]["ai_response_contract"]["review_required"]
+    assert "watch_entry_plan" in captured_payloads[0]["ai_response_contract"]["preferred_schema_fields"]
+    assert "fail_closed_applied" in captured_payloads[0]["ai_response_contract"]["model_must_not_populate"]
     assert decision.prompt_family_hint == "entry_candidate_event:trend_pullback_engine"
     assert decision.strategy_id == "trend_pullback_engine"
     assert decision.regime == "trend:bullish:fast"
@@ -2942,6 +2984,9 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert decision.expected_mae_r is not None
     assert decision.invalidation_reason_codes == ["INVALIDATION_PRICE_BREACH"]
     assert decision.provider_status == "ok"
+    assert decision.bounded_output_applied is False
+    assert decision.fail_closed_applied is False
+    assert "MODEL_CLAIMED_FAIL_CLOSED" not in decision.fallback_reason_codes
     assert metadata["ai_context"]["assigned_slot"] == "slot_2"
     assert metadata["ai_context_version"] == decision.ai_context_version
     assert metadata["prompt_family"] == "entry_pullback_review"
@@ -2955,6 +3000,12 @@ def test_trading_agent_propagates_ai_context_and_backfills_optional_schema_field
     assert metadata["session_time_penalty_applied"] is False
     assert metadata["allowed_actions"] == ["hold", "long", "short"]
     assert metadata["bounded_output_applied"] is False
+    assert metadata["model_owned_fields_stripped"] == [
+        "bounded_output_applied",
+        "fail_closed_applied",
+        "fallback_reason_codes",
+        "provider_status",
+    ]
 
 
 def test_market_settings_advisor_accepts_allowed_profile_recommendation() -> None:
@@ -3645,6 +3696,83 @@ def _cost_guard_fixture(*, symbol: str = "BTCUSDT", atr: float = 0.2) -> tuple[M
     features.regime.momentum_state = "stable"
     features.regime.weak_volume = False
     return base, features
+
+
+def _take_profit_policy_decision(
+    *,
+    side: str = "long",
+    profile: str = "scalp",
+    take_profit: float = 103.0,
+) -> TradeDecision:
+    return TradeDecision(
+        decision=side,  # type: ignore[arg-type]
+        confidence=0.8,
+        symbol="ETHUSDT",
+        timeframe="15m",
+        entry_zone_min=99.95,
+        entry_zone_max=100.05,
+        entry_mode="pullback_confirm",
+        holding_profile=profile,  # type: ignore[arg-type]
+        stop_loss=99.2 if side == "long" else 100.8,
+        take_profit=take_profit,
+        max_holding_minutes=120,
+        risk_pct=0.01,
+        leverage=2.0,
+        rationale_codes=["TEST_ENTRY"],
+        explanation_short="test entry",
+        explanation_detailed="test entry",
+    )
+
+
+def test_take_profit_profile_range_caps_scalp_entry_tp() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT")
+    decision = _take_profit_policy_decision(profile="scalp", take_profit=103.0)
+
+    updated = _agent()._apply_take_profit_profile_range(  # type: ignore[attr-defined]
+        decision,
+        market_snapshot=base,
+        features=features,
+    )
+
+    assert updated.take_profit == pytest.approx(101.2)
+    assert "TAKE_PROFIT_PROFILE_RANGE_ADJUSTED" in updated.rationale_codes
+
+
+def test_take_profit_profile_range_widens_position_entry_tp_when_signal_is_clean() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT")
+    decision = _take_profit_policy_decision(profile="position", take_profit=101.0)
+
+    updated = _agent()._apply_take_profit_profile_range(  # type: ignore[attr-defined]
+        decision,
+        market_snapshot=base,
+        features=features,
+    )
+
+    assert updated.take_profit == pytest.approx(102.0)
+    assert "TAKE_PROFIT_PROFILE_RANGE_ADJUSTED" in updated.rationale_codes
+
+
+def test_take_profit_profile_range_caps_wide_tp_when_breadth_is_weak() -> None:
+    base, features = _cost_guard_fixture(symbol="ETHUSDT")
+    decision = _take_profit_policy_decision(profile="position", take_profit=103.0)
+
+    updated = _agent()._apply_take_profit_profile_range(  # type: ignore[attr-defined]
+        decision,
+        market_snapshot=base,
+        features=features,
+        risk_context={
+            "selection_context": {
+                "universe_breadth": {
+                    "breadth_regime": "weak_breadth",
+                    "hold_bias_multiplier": 1.2,
+                }
+            }
+        },
+    )
+
+    assert updated.take_profit == pytest.approx(101.2)
+    assert "TAKE_PROFIT_PROFILE_RANGE_ADJUSTED" in updated.rationale_codes
+    assert "TAKE_PROFIT_WEAK_SIGNAL_CAP" in updated.rationale_codes
 
 
 def test_adaptive_brackets_widen_btc_long_tight_range_tp_for_cost() -> None:

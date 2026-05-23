@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from trading_mvp.config import get_settings as get_app_settings
 from trading_mvp.models import (
     AgentRun,
     AuditEvent,
@@ -33,16 +34,17 @@ from trading_mvp.schemas import (
     TradeDecisionCandidate,
     TradeDecisionCandidateScore,
 )
-from trading_mvp.services.agents import TradingDecisionAgent
+from trading_mvp.services.agents import MarketSettingsAdvisorAgent, TradingDecisionAgent
 from trading_mvp.services.binance import BinanceAPIError
 from trading_mvp.services.execution import execute_live_trade, sync_live_state
 from trading_mvp.services.features import compute_features
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.orchestrator import TradingOrchestrator
-from trading_mvp.services.runtime_state import mark_sync_success
+from trading_mvp.services.runtime_state import mark_sync_success, summarize_runtime_state
 from trading_mvp.services.scheduler import (
     is_interval_decision_due,
     maybe_refresh_exchange_sync_freshness,
+    run_due_entry_plan_watcher_cycle,
     run_due_windows,
     run_exchange_sync_cycle,
     run_interval_decision_cycle,
@@ -203,6 +205,63 @@ class _CountingDecisionProvider:
                 "explanation_short": f"provider {self.decision}",
                 "explanation_detailed": "Provider was intentionally called for the pre-AI gate control case.",
             },
+        )
+
+
+class _RoutingAdvisorDecisionProvider:
+    name = "openai"
+
+    def __init__(self, decision: str = "hold", advisor_profile: str = "CAUTION") -> None:
+        self.decision = decision
+        self.advisor_profile = advisor_profile
+        self.trading_calls = 0
+        self.advisor_calls = 0
+        self.trading_payloads: list[dict[str, object]] = []
+
+    def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+        del response_model, instructions
+        if role == "market_settings_advisor":
+            self.advisor_calls += 1
+            generated_at = datetime.now(UTC)
+            return ProviderResult(
+                provider="openai",
+                output={
+                    "recommendation_id": "advisor-before-trading-ai-001",
+                    "generated_at": generated_at.isoformat(),
+                    "valid_until": (generated_at + timedelta(minutes=15)).isoformat(),
+                    "symbol_scope": ["BTCUSDT"],
+                    "recommended_profile_id": self.advisor_profile,
+                    "confidence": 0.86,
+                    "reason_summary": "Refresh execution risk profile before trading AI.",
+                    "reason_codes": ["PRE_TRADE_PROFILE_REFRESH"],
+                    "observed_risk_flags": ["HIGH_VOLATILITY"],
+                    "suggested_new_entry_policy": "STRICT_CONFIRMATION_ONLY",
+                    "do_not_relax": True,
+                },
+                usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+                model="gpt-4.1-mini",
+            )
+        self.trading_calls += 1
+        self.trading_payloads.append(dict(payload))
+        return ProviderResult(
+            provider="openai",
+            output={
+                "decision": self.decision,
+                "confidence": 0.62,
+                "symbol": payload["market_snapshot"]["symbol"],
+                "timeframe": payload["market_snapshot"]["timeframe"],
+                "entry_mode": "none",
+                "max_holding_minutes": 120,
+                "risk_pct": 0.01,
+                "leverage": 1.0,
+                "rationale_codes": ["TEST_PROVIDER_CALLED"],
+                "no_trade_reason_codes": ["TEST_PROVIDER_CALLED"] if self.decision == "hold" else [],
+                "scenario_note": "Trading AI received advisor context.",
+                "explanation_short": f"provider {self.decision}",
+                "explanation_detailed": "Provider was called after the profile advisor refresh.",
+            },
+            usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            model="gpt-4.1-mini",
         )
 
 
@@ -707,6 +766,130 @@ def _interval_review_plan(
     }
 
 
+def _interval_budget_review_plan(
+    symbols: list[str],
+    *,
+    breadth_regime: str = "mixed",
+    protection_symbol: str | None = None,
+    transition_watch_symbol: str | None = None,
+) -> dict[str, object]:
+    now = utcnow_naive()
+    plans: list[dict[str, object]] = []
+    rankings: list[dict[str, object]] = []
+    for index, symbol in enumerate(symbols):
+        candidate_weight = round(0.9 - (index * 0.1), 6)
+        score_total = round(0.8 - (index * 0.05), 6)
+        trigger_reason = (
+            "protection_review_event"
+            if protection_symbol is not None and symbol == protection_symbol
+            else "entry_candidate_event"
+        )
+        reason_codes = ["TEST_SELECTION"]
+        ai_call_policy = None
+        if transition_watch_symbol is not None and symbol == transition_watch_symbol:
+            reason_codes.append("SOFT_SIGNAL_TRANSITION_WATCH")
+            ai_call_policy = {
+                "soft_signal_review_mode": "transition_watch",
+                "ai_call_allowed": True,
+            }
+        selection_context = {
+            "assigned_slot": f"slot_{index + 1}",
+            "candidate_weight": candidate_weight,
+            "slot_conviction_score": round(0.75 - (index * 0.04), 6),
+            "meta_gate_probability": round(0.7 - (index * 0.03), 6),
+            "score": {"total_score": score_total},
+            "selected": True,
+        }
+        if ai_call_policy is not None:
+            selection_context["ai_call_policy"] = ai_call_policy
+        rankings.append(
+            {
+                "symbol": symbol,
+                "selected": True,
+                "candidate_weight": candidate_weight,
+                "score": {"total_score": score_total},
+            }
+        )
+        plans.append(
+            {
+                "symbol": symbol,
+                "timeframe": "15m",
+                "cadence": {
+                    "mode": "watch",
+                    "effective_cadence": {
+                        "decision_cycle_interval_minutes": 15,
+                        "ai_call_interval_minutes": 15,
+                    },
+                },
+                "selection_context": selection_context,
+                "trigger": {
+                    "trigger_reason": trigger_reason,
+                    "symbol": symbol,
+                    "timeframe": "15m",
+                    "strategy_engine": "trend_pullback_engine",
+                    "holding_profile": "scalp",
+                    "assigned_slot": f"slot_{index + 1}",
+                    "candidate_weight": candidate_weight,
+                    "reason_codes": reason_codes,
+                    "trigger_fingerprint": f"fingerprint-{symbol}",
+                    "fingerprint_basis": {"position_state_bucket": "flat"},
+                    "fingerprint_changed_fields": [],
+                    "last_decision_at": None,
+                    "last_material_review_at": now.isoformat(),
+                    "forced_review_reason": None,
+                    "applied_review_cadence_minutes": 15,
+                    "review_cadence_source": "holding_profile_cadence_hint",
+                    "holding_profile_cadence_hint": {
+                        "holding_profile": "scalp",
+                        "decision_interval_minutes": 15,
+                    },
+                    "cadence_fallback_reason": None,
+                    "max_review_age_minutes": 45,
+                    "cadence_profile_summary": {
+                        "mode": "watch",
+                        "active_holding_profile": "scalp",
+                    },
+                    "triggered_at": now.isoformat(),
+                },
+                "trigger_deduped": False,
+                "last_decision_at": None,
+                "last_ai_invoked_at": None,
+                "last_material_review_at": now.isoformat(),
+                "next_ai_review_due_at": (now + timedelta(minutes=15)).isoformat(),
+                "applied_review_cadence_minutes": 15,
+                "review_cadence_source": "holding_profile_cadence_hint",
+                "holding_profile_cadence_hint": {
+                    "holding_profile": "scalp",
+                    "decision_interval_minutes": 15,
+                },
+                "cadence_fallback_reason": None,
+                "max_review_age_minutes": 45,
+                "cadence_profile_summary": {
+                    "mode": "watch",
+                    "active_holding_profile": "scalp",
+                },
+                "fingerprint_changed_fields": [],
+                "dedupe_reason": None,
+                "forced_review_reason": None,
+                "last_ai_skip_reason": None,
+                "ai_call_policy": ai_call_policy,
+            }
+        )
+    return {
+        "generated_at": now.isoformat(),
+        "candidate_selection": {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": breadth_regime,
+            "breadth_summary": {"breadth_regime": breadth_regime},
+            "capacity_reason": f"{breadth_regime}_test_capacity",
+            "selected_symbols": list(symbols),
+            "skipped_symbols": [],
+            "rankings": rankings,
+        },
+        "plans": plans,
+    }
+
+
 def _seed_setup_cluster_history(
     db_session,
     *,
@@ -873,7 +1056,11 @@ def test_ai_disabled_collects_market_data_only(monkeypatch, db_session) -> None:
         assert latest_pnl.daily_pnl == 0.0
         assert latest_pnl.cumulative_pnl == 0.0
         assert latest_pnl.consecutive_losses == 0
-    assert db_session.scalar(select(AuditEvent).limit(1)) is None
+    audit_event = db_session.scalar(select(AuditEvent).limit(1))
+    assert audit_event is not None
+    assert audit_event.event_type == "decision_funnel_audit"
+    assert audit_event.payload["stage"] == "ai_disabled"
+    assert audit_event.payload["status"] == "market_data_only"
 
 
 def test_ai_disabled_hourly_window_creates_only_market_snapshots(monkeypatch, db_session) -> None:
@@ -1040,7 +1227,7 @@ def test_pipeline_creates_risk_and_execution_records(monkeypatch, db_session) ->
     assert result["entry_plan"] is not None
     assert result["entry_plan"]["plan_status"] == "armed"
     assert result["decision_reference"]["market_snapshot_id"] == result["market_snapshot_id"]
-    assert result["decision_reference"]["market_snapshot_source"] == "refreshed"
+    assert result["decision_reference"]["market_snapshot_source"] == "seed_fallback"
     assert result["decision_reference"]["market_snapshot_stale"] is False
     assert result["decision_reference"]["freshness_blocking"] is False
     assert result["decision_reference"]["account_sync_at"] is None
@@ -3266,6 +3453,28 @@ def test_scheduler_exchange_sync_cycle_records_workflow(monkeypatch, db_session)
     assert scheduler_run.status == "success"
 
 
+def test_scheduler_exchange_sync_cycle_tags_auth_permission_failure(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    db_session.flush()
+
+    def fail_sync_live_state(session, settings_row, *, symbol=None):  # noqa: ANN001, ARG001
+        raise RuntimeError("Binance error -2015: Invalid API-key, IP, or permissions for action.")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.sync_live_state", fail_sync_live_state)
+
+    result = run_exchange_sync_cycle(db_session, triggered_by="scheduler")
+    scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
+
+    assert result["workflow"] == "exchange_sync_cycle"
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert scheduler_run is not None
+    assert scheduler_run.status == "failed"
+    assert scheduler_run.outcome["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+
+
 def test_maybe_refresh_exchange_sync_freshness_runs_when_sync_is_stale(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
@@ -3798,7 +4007,193 @@ def test_entry_event_invokes_ai_once(monkeypatch, db_session) -> None:
     assert result["results"][0]["outcome"]["trigger"]["trigger_reason"] == "entry_candidate_event"
 
 
-def test_interval_plan_soft_score_reject_still_creates_ai_review_trigger(monkeypatch, db_session) -> None:
+def test_interval_decision_cycle_caps_new_entry_ai_dispatch_per_cycle(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler._try_pre_decision_exchange_sync",
+        lambda *args, **kwargs: ({"status": "fresh"}, None),
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _interval_budget_review_plan(settings_row.tracked_symbols, breadth_regime="mixed"),
+    )
+
+    invoked_symbols: list[str] = []
+
+    def fake_run_decision_cycle(self, symbol=None, **kwargs):
+        invoked_symbols.append(str(symbol))
+        return {
+            "symbol": symbol,
+            "status": "completed",
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": utcnow_naive().isoformat(),
+            "next_ai_review_due_at": utcnow_naive().isoformat(),
+            "trigger_deduped": False,
+            "trigger_fingerprint": f"fingerprint-{symbol}",
+            "last_ai_skip_reason": None,
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcomes_by_symbol = {
+        item["outcome"]["symbol"]: item["outcome"]
+        for item in result["results"]
+    }
+
+    assert invoked_symbols == ["BTCUSDT", "ETHUSDT"]
+    assert result["ai_cycle_dispatch_budget"]["applied"] is True
+    assert result["ai_cycle_dispatch_budget"]["budget"] == 2
+    assert result["ai_cycle_dispatch_budget"]["allowed_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert result["ai_cycle_dispatch_budget"]["skipped_symbols"] == ["SOLUSDT", "XRPUSDT", "BNBUSDT"]
+    for symbol in ["SOLUSDT", "XRPUSDT", "BNBUSDT"]:
+        outcome = outcomes_by_symbol[symbol]
+        assert outcome["ai_review_status"] == "skipped"
+        assert outcome["last_ai_skip_reason"] == "AI_CYCLE_BUDGET_EXHAUSTED"
+        assert outcome["ai_call_policy"]["skip_category"] == "cycle_dispatch_budget"
+        assert outcome["ai_call_policy"]["cycle_dispatch_budget"]["budgeted_trigger_count"] == 5
+
+
+def test_interval_decision_cycle_budget_preserves_protection_review(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+    db_session.add(settings_row)
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler._try_pre_decision_exchange_sync",
+        lambda *args, **kwargs: ({"status": "fresh"}, None),
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "build_interval_decision_plan",
+        lambda self, **kwargs: _interval_budget_review_plan(
+            settings_row.tracked_symbols,
+            breadth_regime="mixed",
+            protection_symbol="XRPUSDT",
+        ),
+    )
+
+    invoked_symbols: list[str] = []
+    invoked_triggers: dict[str, str] = {}
+
+    def fake_run_decision_cycle(self, symbol=None, **kwargs):
+        review_trigger = dict(kwargs.get("review_trigger") or {})
+        invoked_symbols.append(str(symbol))
+        invoked_triggers[str(symbol)] = str(review_trigger.get("trigger_reason") or "")
+        return {
+            "symbol": symbol,
+            "status": "completed",
+            "last_ai_trigger_reason": review_trigger.get("trigger_reason"),
+            "last_ai_invoked_at": utcnow_naive().isoformat(),
+            "next_ai_review_due_at": utcnow_naive().isoformat(),
+            "trigger_deduped": False,
+            "trigger_fingerprint": f"fingerprint-{symbol}",
+            "last_ai_skip_reason": None,
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "run_decision_cycle", fake_run_decision_cycle)
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    outcomes_by_symbol = {
+        item["outcome"]["symbol"]: item["outcome"]
+        for item in result["results"]
+    }
+
+    assert invoked_symbols == ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+    assert invoked_triggers["XRPUSDT"] == "protection_review_event"
+    assert result["ai_cycle_dispatch_budget"]["allowed_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert result["ai_cycle_dispatch_budget"]["exempt_symbols"] == ["XRPUSDT"]
+    assert outcomes_by_symbol["SOLUSDT"]["last_ai_skip_reason"] == "AI_CYCLE_BUDGET_EXHAUSTED"
+
+
+def _transition_watch_rejected_ranking(
+    *,
+    score_total: float = 0.38,
+    primary_regime: str = "trend",
+    trend_alignment: str = "bullish_aligned",
+    volume_regime: str = "normal",
+    weak_volume: bool = False,
+) -> dict[str, object]:
+    rejected_ranking = _ranking_candidate_payload(symbol="BTCUSDT", decision="long")
+    candidate = dict(rejected_ranking["candidate"])
+    candidate.update(
+        {
+            "rationale_codes": [
+                f"REGIME_{primary_regime.upper()}",
+                f"TREND_{trend_alignment.upper()}",
+                "LEAD_MARKETS_NEUTRAL",
+                "DERIVATIVES_NEUTRAL",
+            ],
+            "lead_lag_summary": {
+                "leader_bias": "bullish",
+                "strong_reference_confirmation": False,
+                "weak_reference_confirmation": False,
+                "bullish_breakout_confirmed": False,
+                "bearish_breakout_confirmed": False,
+                "bullish_breakout_ahead": False,
+                "bearish_breakout_ahead": False,
+            },
+            "derivatives_summary": {
+                "taker_flow_alignment": "neutral",
+                "funding_bias": "neutral",
+                "crowding_bias": "neutral",
+                "spread_headwind": False,
+                "spread_stress": False,
+                "veto_reason_codes": [],
+            },
+        }
+    )
+    rejected_ranking.update(
+        {
+            "selected": False,
+            "selected_reason": None,
+            "selection_reason": "score_below_threshold",
+            "rejected_reason": "score_below_threshold",
+            "entry_score_threshold": 0.40,
+            "regime_summary": {
+                "primary_regime": primary_regime,
+                "trend_alignment": trend_alignment,
+                "volume_regime": volume_regime,
+                "weak_volume": weak_volume,
+                "momentum_weakening": False,
+            },
+            "candidate": candidate,
+            "score": {
+                "total_score": score_total,
+                "lead_lag_alignment": 0.64,
+                "derivatives_alignment": 0.62,
+            },
+        }
+    )
+    return rejected_ranking
+
+
+def _transition_watch_selection_context(ranking: dict[str, object]) -> dict[str, object]:
+    return {
+        "breadth_regime": "mixed",
+        "capacity_reason": "mixed_breadth_moderate_capacity",
+        "strategy_engine": ranking.get("strategy_engine"),
+        "holding_profile": ranking.get("holding_profile"),
+        "entry_mode": ranking.get("entry_mode"),
+        "scenario": dict(ranking.get("candidate") or {}).get("scenario"),
+        "slot_conviction_score": ranking.get("slot_conviction_score"),
+        "meta_gate_probability": ranking.get("meta_gate_probability"),
+        "entry_score_threshold": ranking.get("entry_score_threshold"),
+        "regime_summary": dict(ranking.get("regime_summary") or {}),
+        "candidate": dict(ranking.get("candidate") or {}),
+        "score": dict(ranking.get("score") or {}),
+    }
+
+
+def test_interval_plan_soft_score_reject_suppresses_weak_ai_review_trigger(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     settings_row.tracked_symbols = ["BTCUSDT"]
@@ -3813,6 +4208,8 @@ def test_interval_plan_soft_score_reject_still_creates_ai_review_trigger(monkeyp
             "selected_reason": None,
             "selection_reason": "score_below_threshold",
             "rejected_reason": "score_below_threshold",
+            "entry_score_threshold": 0.40,
+            "score": {"total_score": 0.30},
         }
     )
     monkeypatch.setattr(
@@ -3834,12 +4231,190 @@ def test_interval_plan_soft_score_reject_still_creates_ai_review_trigger(monkeyp
     plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
     symbol_plan = plan["plans"][0]
 
-    assert symbol_plan["trigger"]["trigger_reason"] == "entry_candidate_event"
-    assert "SOFT_SIGNAL_AI_REVIEW" in symbol_plan["trigger"]["reason_codes"]
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert symbol_plan["ai_call_policy"]["reason"] == "soft_signal_review_suppressed_weak_candidate"
+    assert symbol_plan["ai_call_policy"]["hard_skip_ai"] is False
+    assert symbol_plan["ai_call_policy"]["skip_category"] == "cost_saved_weak_candidate"
+    assert symbol_plan["ai_call_policy"]["allow_ai_but_later_risk_check"] == ["SOFT_SIGNAL_AI_REVIEW"]
+    assert symbol_plan["ai_call_policy"]["threshold_gap"] == pytest.approx(0.10)
+    assert symbol_plan["selection_context"]["ai_call_policy"]["reason"] == (
+        "soft_signal_review_suppressed_weak_candidate"
+    )
+
+
+def test_interval_plan_near_threshold_soft_reject_allows_transition_watch(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    rejected_ranking = _ranking_candidate_payload(symbol="BTCUSDT", decision="long")
+    rejected_ranking.update(
+        {
+            "selected": False,
+            "selected_reason": None,
+            "selection_reason": "score_below_threshold",
+            "rejected_reason": "score_below_threshold",
+            "entry_score_threshold": 0.40,
+            "score": {"total_score": 0.38},
+        }
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [rejected_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is not None
     assert symbol_plan["last_ai_skip_reason"] is None
+    assert symbol_plan["trigger"]["forced_review_reason"] == "soft_signal_transition_watch_due"
+    assert "SOFT_SIGNAL_TRANSITION_WATCH" in symbol_plan["trigger"]["reason_codes"]
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_ALLOWED"
+    assert symbol_plan["ai_call_policy"]["soft_signal_review_mode"] == "transition_watch"
+    assert symbol_plan["ai_call_policy"]["transition_watch_ai_invoked"] is True
+    assert symbol_plan["ai_call_policy"]["threshold_gap"] == pytest.approx(0.02)
 
 
-def test_interval_plan_soft_score_reject_uses_cost_cooldown_after_recent_ai(monkeypatch, db_session) -> None:
+def test_interval_plan_low_edge_hold_candidate_suppresses_transition_watch(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    rejected_ranking = _transition_watch_rejected_ranking(score_total=0.41)
+    candidate = dict(rejected_ranking["candidate"])
+    candidate.update(
+        {
+            "decision": "hold",
+            "entry_zone_min": None,
+            "entry_zone_max": None,
+            "stop_loss": None,
+            "take_profit": None,
+        }
+    )
+    rejected_ranking.update(
+        {
+            "selection_reason": "low_edge_hold_candidate",
+            "rejected_reason": "low_edge_hold_candidate",
+            "candidate": candidate,
+            "slot_conviction_score": 0.54,
+            "meta_gate_probability": 0.50,
+            "agreement_alignment_score": 0.52,
+            "agreement_level_hint": "disagreement_risk",
+        }
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [rejected_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert symbol_plan["ai_call_policy"]["skip_category"] == "cost_saved_low_edge_hold_candidate"
+    assert symbol_plan["ai_call_policy"]["soft_signal_review_mode"] == "cost_saved_low_edge_hold_candidate"
+    assert symbol_plan["ai_call_policy"]["low_edge_hold_suppression"]["active"] is True
+    assert symbol_plan["ai_call_policy"]["low_edge_hold_suppression"]["weak_quality"] is True
+
+
+def test_interval_plan_low_edge_hold_candidate_keeps_actionable_quality_exception(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    rejected_ranking = _transition_watch_rejected_ranking(score_total=0.41)
+    candidate = dict(rejected_ranking["candidate"])
+    candidate.update(
+        {
+            "decision": "hold",
+            "entry_zone_min": None,
+            "entry_zone_max": None,
+            "stop_loss": None,
+            "take_profit": None,
+        }
+    )
+    rejected_ranking.update(
+        {
+            "selection_reason": "low_edge_hold_candidate",
+            "rejected_reason": "low_edge_hold_candidate",
+            "candidate": candidate,
+            "slot_conviction_score": 0.63,
+            "meta_gate_probability": 0.60,
+            "agreement_alignment_score": 0.52,
+            "agreement_level_hint": "disagreement_risk",
+        }
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [rejected_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is not None
+    assert symbol_plan["last_ai_skip_reason"] is None
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_ALLOWED"
+    assert symbol_plan["ai_call_policy"]["soft_signal_review_mode"] == "transition_watch"
+
+
+def test_interval_plan_soft_score_reject_suppression_takes_precedence_after_recent_ai(
+    monkeypatch,
+    db_session,
+) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     settings_row.ai_call_interval_minutes = 5
@@ -3902,11 +4477,558 @@ def test_interval_plan_soft_score_reject_uses_cost_cooldown_after_recent_ai(monk
     symbol_plan = plan["plans"][0]
 
     assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert symbol_plan["ai_call_policy"]["reason"] == "soft_signal_review_suppressed_weak_candidate"
+    assert symbol_plan["ai_call_policy"]["hard_skip_ai"] is False
+    assert "cooldown_minutes" not in symbol_plan["ai_call_policy"]
+
+
+def test_interval_plan_near_threshold_soft_reject_cooldown_after_recent_ai(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_call_interval_minutes = 5
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    now = utcnow_naive()
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="prior transition watch",
+            input_payload={
+                "market_snapshot": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": (now - timedelta(minutes=5)).isoformat(),
+                }
+            },
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+            metadata_json={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "source": "llm",
+                "soft_signal_review_mode": "transition_watch",
+            },
+            schema_valid=True,
+            started_at=now - timedelta(minutes=5),
+            completed_at=now - timedelta(minutes=5),
+            created_at=now - timedelta(minutes=5),
+            updated_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.flush()
+
+    rejected_ranking = _ranking_candidate_payload(symbol="BTCUSDT", decision="long")
+    rejected_ranking.update(
+        {
+            "selected": False,
+            "selected_reason": None,
+            "selection_reason": "score_below_threshold",
+            "rejected_reason": "score_below_threshold",
+            "entry_score_threshold": 0.40,
+            "score": {"total_score": 0.38},
+        }
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [rejected_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is None
     assert symbol_plan["last_ai_skip_reason"] == "SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE"
     assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
     assert symbol_plan["ai_call_policy"]["reason"] == "soft_signal_review_cooldown_active"
-    assert symbol_plan["ai_call_policy"]["hard_skip_ai"] is False
-    assert symbol_plan["ai_call_policy"]["cooldown_minutes"] == 15
+    assert symbol_plan["ai_call_policy"]["skip_category"] == "transition_watch_cooldown"
+    assert symbol_plan["ai_call_policy"]["cooldown_minutes"] == 60
+
+
+def test_interval_plan_near_threshold_soft_reject_uses_hold_backoff_after_repeated_holds(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_call_interval_minutes = 5
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    now = utcnow_naive()
+    for index, minutes_ago in enumerate((10, 80, 150), start=1):
+        decision_row = AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary=f"prior transition watch hold {index}",
+            input_payload={
+                "market_snapshot": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": (now - timedelta(minutes=minutes_ago)).isoformat(),
+                }
+            },
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+            metadata_json={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "source": "llm",
+                "soft_signal_review_mode": "transition_watch",
+                "allow_ai_but_later_risk_check": [
+                    "SOFT_SIGNAL_AI_REVIEW",
+                    "SOFT_SIGNAL_TRANSITION_WATCH",
+                ],
+            },
+            schema_valid=True,
+            started_at=now - timedelta(minutes=minutes_ago),
+            completed_at=now - timedelta(minutes=minutes_ago),
+            created_at=now - timedelta(minutes=minutes_ago),
+            updated_at=now - timedelta(minutes=minutes_ago),
+        )
+        db_session.add(decision_row)
+        db_session.flush()
+        db_session.add(
+            RiskCheck(
+                symbol="BTCUSDT",
+                decision_run_id=decision_row.id,
+                market_snapshot_id=None,
+                allowed=False,
+                decision="hold",
+                reason_codes=["HOLD_DECISION"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={
+                    "allowed": False,
+                    "decision": "hold",
+                    "reason_codes": ["HOLD_DECISION"],
+                    "blocked_reason_codes": ["HOLD_DECISION"],
+                },
+            )
+        )
+    db_session.flush()
+
+    rejected_ranking = _transition_watch_rejected_ranking(score_total=0.39)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [rejected_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "SOFT_SIGNAL_REVIEW_HOLD_BACKOFF_ACTIVE"
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert symbol_plan["ai_call_policy"]["reason"] == "soft_signal_review_hold_backoff_active"
+    assert symbol_plan["ai_call_policy"]["skip_category"] == "transition_watch_hold_backoff"
+    assert symbol_plan["ai_call_policy"]["adaptive_hold_backoff"]["sample_count"] == 3
+
+
+def test_interval_plan_material_change_overrides_soft_signal_hold_backoff(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_call_interval_minutes = 5
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    now = utcnow_naive()
+    previous_ranking = _transition_watch_rejected_ranking(score_total=0.39)
+    previous_selection_context = _transition_watch_selection_context(previous_ranking)
+    previous_snapshot = TradingOrchestrator._soft_signal_review_snapshot(previous_selection_context)
+    for index, minutes_ago in enumerate((70, 140, 210), start=1):
+        decision_row = AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary=f"prior transition watch hold {index}",
+            input_payload={
+                "market_snapshot": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": (now - timedelta(minutes=minutes_ago)).isoformat(),
+                }
+            },
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+            metadata_json={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "source": "llm",
+                "soft_signal_review_mode": "transition_watch",
+                "selection_context": previous_selection_context,
+                "soft_signal_review_snapshot": previous_snapshot,
+                "allow_ai_but_later_risk_check": [
+                    "SOFT_SIGNAL_AI_REVIEW",
+                    "SOFT_SIGNAL_TRANSITION_WATCH",
+                ],
+            },
+            schema_valid=True,
+            started_at=now - timedelta(minutes=minutes_ago),
+            completed_at=now - timedelta(minutes=minutes_ago),
+            created_at=now - timedelta(minutes=minutes_ago),
+            updated_at=now - timedelta(minutes=minutes_ago),
+        )
+        db_session.add(decision_row)
+        db_session.flush()
+        db_session.add(
+            RiskCheck(
+                symbol="BTCUSDT",
+                decision_run_id=decision_row.id,
+                market_snapshot_id=None,
+                allowed=False,
+                decision="hold",
+                reason_codes=["HOLD_DECISION"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={
+                    "allowed": False,
+                    "decision": "hold",
+                    "reason_codes": ["HOLD_DECISION"],
+                    "blocked_reason_codes": ["HOLD_DECISION"],
+                },
+            )
+        )
+    db_session.flush()
+
+    current_ranking = _transition_watch_rejected_ranking(
+        score_total=0.39,
+        primary_regime="range",
+        trend_alignment="range",
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [current_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is not None
+    assert symbol_plan["last_ai_skip_reason"] is None
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_ALLOWED"
+    assert symbol_plan["ai_call_policy"]["adaptive_hold_backoff_override"]["active"] is True
+    assert symbol_plan["ai_call_policy"]["adaptive_hold_backoff_override"]["reason"] == "material_actionable_change"
+    assert symbol_plan["ai_call_policy"]["adaptive_hold_backoff_override"]["adaptive_hold_backoff"]["sample_count"] == 3
+
+
+def test_interval_plan_selected_neutral_entry_uses_hold_backoff_after_repeated_holds(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_call_interval_minutes = 5
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    now = utcnow_naive()
+    neutral_reason_codes = [
+        "ENGINE_TREND_PULLBACK_ENGINE",
+        "REGIME_TRANSITION",
+        "TREND_MIXED",
+        "EXPECTANCY_NEUTRAL",
+        "DERIVATIVES_NEUTRAL",
+        "LEAD_MARKETS_NEUTRAL",
+        "PROVIDER_OPENAI",
+        "HOLDING_PROFILE_SCALP_DEFAULT",
+    ]
+    for index, minutes_ago in enumerate((10, 80, 150), start=1):
+        decision_row = AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary=f"prior neutral entry hold {index}",
+            input_payload={
+                "market_snapshot": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": (now - timedelta(minutes=minutes_ago)).isoformat(),
+                }
+            },
+            output_payload={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "decision": "hold",
+                "rationale_codes": neutral_reason_codes,
+            },
+            metadata_json={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "source": "llm",
+            },
+            schema_valid=True,
+            started_at=now - timedelta(minutes=minutes_ago),
+            completed_at=now - timedelta(minutes=minutes_ago),
+            created_at=now - timedelta(minutes=minutes_ago),
+            updated_at=now - timedelta(minutes=minutes_ago),
+        )
+        db_session.add(decision_row)
+        db_session.flush()
+        db_session.add(
+            RiskCheck(
+                symbol="BTCUSDT",
+                decision_run_id=decision_row.id,
+                market_snapshot_id=None,
+                allowed=False,
+                decision="hold",
+                reason_codes=["HOLD_DECISION"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={
+                    "allowed": False,
+                    "decision": "hold",
+                    "reason_codes": ["HOLD_DECISION"],
+                    "blocked_reason_codes": ["HOLD_DECISION"],
+                },
+            )
+        )
+    db_session.flush()
+
+    ranking = _ranking_candidate_payload(symbol="BTCUSDT", decision="long")
+    candidate = dict(ranking["candidate"])
+    candidate["rationale_codes"] = [
+        "ENGINE_TREND_PULLBACK_ENGINE",
+        "REGIME_TRANSITION",
+        "TREND_MIXED",
+        "EXPECTANCY_NEUTRAL",
+        "DERIVATIVES_NEUTRAL",
+        "LEAD_MARKETS_NEUTRAL",
+    ]
+    ranking["candidate"] = candidate
+    ranking["score"] = {"total_score": 0.62, "lead_lag_alignment": 0.60, "derivatives_alignment": 0.60}
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": ["BTCUSDT"],
+            "skipped_symbols": [],
+            "rankings": [ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF"
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert symbol_plan["ai_call_policy"]["reason"] == "neutral_entry_review_hold_backoff_active"
+    assert symbol_plan["ai_call_policy"]["skip_category"] == "neutral_entry_hold_backoff"
+    assert symbol_plan["ai_call_policy"]["neutral_entry_hold_backoff"]["sample_count"] == 3
+
+
+def test_interval_plan_transition_watch_skips_without_material_change(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_call_interval_minutes = 5
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    now = utcnow_naive()
+    rejected_ranking = _transition_watch_rejected_ranking(score_total=0.38)
+    previous_selection_context = _transition_watch_selection_context(rejected_ranking)
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="prior transition watch",
+            input_payload={
+                "market_snapshot": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": (now - timedelta(minutes=65)).isoformat(),
+                }
+            },
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+            metadata_json={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "source": "llm",
+                "soft_signal_review_mode": "transition_watch",
+                "selection_context": previous_selection_context,
+                "soft_signal_review_snapshot": TradingOrchestrator._soft_signal_review_snapshot(
+                    previous_selection_context
+                ),
+            },
+            schema_valid=True,
+            started_at=now - timedelta(minutes=65),
+            completed_at=now - timedelta(minutes=65),
+            created_at=now - timedelta(minutes=65),
+            updated_at=now - timedelta(minutes=65),
+        )
+    )
+    db_session.flush()
+
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [rejected_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is None
+    assert symbol_plan["last_ai_skip_reason"] == "SOFT_SIGNAL_REVIEW_NO_MATERIAL_CHANGE"
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert symbol_plan["ai_call_policy"]["reason"] == "soft_signal_review_no_material_change"
+    assert symbol_plan["ai_call_policy"]["skip_category"] == "transition_watch_no_material_change"
+    material_change = symbol_plan["ai_call_policy"]["soft_signal_review_material_change"]
+    assert material_change["material_changed"] is False
+    assert material_change["changed_fields"] == []
+
+
+def test_interval_plan_transition_watch_allows_material_change_after_cooldown(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.ai_call_interval_minutes = 5
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    _mark_pipeline_sync_fresh(settings_row)
+    db_session.add(settings_row)
+    now = utcnow_naive()
+    previous_ranking = _transition_watch_rejected_ranking(score_total=0.38)
+    previous_selection_context = _transition_watch_selection_context(previous_ranking)
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="openai",
+            summary="prior transition watch",
+            input_payload={
+                "market_snapshot": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "snapshot_time": (now - timedelta(minutes=65)).isoformat(),
+                }
+            },
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+            metadata_json={
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "source": "llm",
+                "soft_signal_review_mode": "transition_watch",
+                "selection_context": previous_selection_context,
+                "soft_signal_review_snapshot": TradingOrchestrator._soft_signal_review_snapshot(
+                    previous_selection_context
+                ),
+            },
+            schema_valid=True,
+            started_at=now - timedelta(minutes=65),
+            completed_at=now - timedelta(minutes=65),
+            created_at=now - timedelta(minutes=65),
+            updated_at=now - timedelta(minutes=65),
+        )
+    )
+    db_session.flush()
+
+    current_ranking = _transition_watch_rejected_ranking(
+        score_total=0.38,
+        primary_regime="range",
+        trend_alignment="range",
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": [],
+            "skipped_symbols": ["BTCUSDT"],
+            "rankings": [current_ranking],
+        },
+    )
+
+    plan = TradingOrchestrator(db_session).build_interval_decision_plan(symbols=["BTCUSDT"])
+    symbol_plan = plan["plans"][0]
+
+    assert symbol_plan["trigger"] is not None
+    assert symbol_plan["last_ai_skip_reason"] is None
+    assert symbol_plan["ai_call_policy"]["ai_call_event"] == "AI_CALL_ALLOWED"
+    material_change = symbol_plan["ai_call_policy"]["soft_signal_review_material_change"]
+    assert material_change["material_changed"] is True
+    assert "primary_regime" in material_change["changed_fields"]
+    assert "trend_alignment" in material_change["changed_fields"]
 
 
 def test_interval_plan_account_untrusted_suppresses_new_entry_trigger(monkeypatch, db_session) -> None:
@@ -3996,13 +5118,15 @@ def _run_pre_ai_gate_decision(
     *,
     trigger_reason: str,
     feature_payload: FeaturePayload,
-    provider: _CountingDecisionProvider,
+    provider,
+    advisor_provider=None,
     open_position: Position | None = None,
     selection_context: dict[str, object] | None = None,
     snapshot: MarketSnapshotPayload | None = None,
     sync_fresh: bool = True,
     settings_mutator=None,
     auto_resume_checked: bool = False,
+    seed_advisor_run: bool = False,
 ):
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
@@ -4023,6 +5147,20 @@ def _run_pre_ai_gate_decision(
 
     orchestrator = TradingOrchestrator(db_session)
     orchestrator.trading_agent = TradingDecisionAgent(provider)
+    if advisor_provider is not None:
+        orchestrator.market_settings_advisor = MarketSettingsAdvisorAgent(advisor_provider)
+    if seed_advisor_run:
+        seeded_result = orchestrator._maybe_run_market_settings_advisor(
+            symbol="BTCUSDT",
+            trigger_event="realtime_cycle",
+            market_snapshot=snapshot,
+            feature_payload=feature_payload,
+            runtime_state=summarize_runtime_state(settings_row),
+            cycle_id="seed-advisor-before-trading-ai",
+            snapshot_id=0,
+            force=True,
+        )
+        assert seeded_result is not None
     result = orchestrator.run_decision_cycle(
         symbol="BTCUSDT",
         trigger_event="manual" if trigger_reason == "manual_review_event" else "realtime_cycle",
@@ -4039,6 +5177,80 @@ def _run_pre_ai_gate_decision(
     decision_row = db_session.get(AgentRun, result["decision_run_id"])
     assert decision_row is not None
     return result, decision_row
+
+
+def test_trading_ai_refreshes_profile_advisor_before_provider_call(monkeypatch, db_session) -> None:
+    provider = _RoutingAdvisorDecisionProvider(decision="hold", advisor_profile="CAUTION")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        advisor_provider=provider,
+    )
+    trading_payload = provider.trading_payloads[0]
+    risk_context = trading_payload["risk_context"]
+    ai_context = trading_payload["ai_context"]
+    advisor_context = risk_context["execution_risk_profile_advisor"]
+
+    assert provider.advisor_calls == 1
+    assert provider.trading_calls == 1
+    assert result["market_settings_advisor"]["status"] == "shadow_generated"
+    assert advisor_context["recommendation"]["recommended_profile_id"] == "CAUTION"
+    assert advisor_context["recommendation"]["suggested_new_entry_policy"] == "STRICT_CONFIRMATION_ONLY"
+    assert ai_context["execution_constraints_summary"]["execution_risk_profile_advisor"] == advisor_context
+    assert decision_row.metadata_json["market_settings_advisor_pre_trade_refresh"] is True
+    assert decision_row.metadata_json["market_settings_advisor_context"] == advisor_context
+
+
+def test_trading_ai_reuses_fresh_profile_advisor_before_provider_call(monkeypatch, db_session) -> None:
+    provider = _RoutingAdvisorDecisionProvider(decision="hold", advisor_profile="CAUTION")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        advisor_provider=provider,
+        seed_advisor_run=True,
+    )
+    trading_payload = provider.trading_payloads[0]
+    advisor_context = trading_payload["risk_context"]["execution_risk_profile_advisor"]
+
+    assert provider.advisor_calls == 1
+    assert provider.trading_calls == 1
+    assert result["market_settings_advisor"]["status"] == "reused"
+    assert result["market_settings_advisor"]["skip_reason"] == "advisor_recommendation_reused"
+    assert advisor_context["status"] == "reused"
+    assert advisor_context["recommendation"]["recommended_profile_id"] == "CAUTION"
+    assert advisor_context["reuse_ttl_seconds"] == 900
+    assert decision_row.metadata_json["market_settings_advisor_pre_trade_refresh"] is False
+    assert decision_row.metadata_json["market_settings_advisor_pre_trade_status"] == "reused"
+    assert decision_row.metadata_json["market_settings_advisor_context"] == advisor_context
+
+
+def test_profile_advisor_not_called_when_trading_ai_is_pre_ai_skipped(monkeypatch, db_session) -> None:
+    provider = _RoutingAdvisorDecisionProvider(decision="hold", advisor_profile="CAUTION")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        advisor_provider=provider,
+        sync_fresh=False,
+    )
+
+    assert provider.advisor_calls == 0
+    assert provider.trading_calls == 0
+    assert result["market_settings_advisor"] is None
+    assert result["last_ai_skip_reason"] == "account_untrusted"
+    assert decision_row.metadata_json["market_settings_advisor_pre_trade_refresh"] is False
+    assert decision_row.metadata_json["market_settings_advisor_context"] is None
 
 
 def test_entry_candidate_weak_volume_allows_ai_and_records_soft_context(monkeypatch, db_session) -> None:
@@ -4099,6 +5311,19 @@ def test_entry_candidate_hold_watch_entry_plan_arms_pending_plan(monkeypatch, db
                 "take_profit": 71000.0,
                 "reason_codes": ["WATCH_SUPPORT_RECLAIM"],
             }
+            result.output["psychology_scene_review"] = {
+                "market_psychology": "Pullback buyers are waiting while chase risk remains elevated.",
+                "psychology_bias": "bullish",
+                "scene_scenario": "Trend pullback needs a zone touch before a new entry.",
+                "scene_type": "trend_pullback",
+                "entry_choreography": "Arm the zone, then require watcher confirmation before execution.",
+                "preferred_entry_timing": "watch_zone",
+                "confirmation_cues": ["zone_touch", "volume_reclaim"],
+                "invalidation_cues": ["support_lost"],
+                "reason_codes": ["SCENE_TREND_PULLBACK"],
+                "summary": "Scene metadata must follow the pending plan without executing.",
+                "execution_boundary": "metadata_only_no_order_authority",
+            }
             return result
 
     def fail_execute(*args, **kwargs):
@@ -4138,11 +5363,200 @@ def test_entry_candidate_hold_watch_entry_plan_arms_pending_plan(monkeypatch, db
     assert pending_plan.plan_status == "armed"
     assert "AI_WATCH_ENTRY_PLAN" in pending_plan.rationale_codes
     assert pending_plan.source_decision_run_id == decision_row.id
+    assert pending_plan.metadata_json["psychology_scene_review"]["scene_type"] == "trend_pullback"
+    assert pending_plan.metadata_json["psychology_scene_review"]["execution_boundary"] == "metadata_only_no_order_authority"
     assert watch_risk is not None
     assert watch_risk.allowed is False
     assert "ENTRY_TRIGGER_NOT_MET" in watch_risk.reason_codes
     assert risk_blocked is not None
     assert risk_blocked.payload["intent"] == "watch_entry_plan"
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_abstained_hold_watch_entry_plan_still_arms_pending_plan(monkeypatch, db_session) -> None:
+    class WatchPlanProvider(_CountingDecisionProvider):
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            result = super().generate(role, payload, response_model=response_model, instructions=instructions)
+            result.output["should_abstain"] = True
+            result.output["abstain_reason_codes"] = ["LOW_CONVICTION_DIRECT_ENTRY"]
+            result.output["watch_entry_plan"] = {
+                "side": "long",
+                "entry_zone_min": 69800.0,
+                "entry_zone_max": 69950.0,
+                "entry_mode": "pullback_confirm",
+                "invalidation_price": 69400.0,
+                "max_chase_bps": 12.0,
+                "idea_ttl_minutes": 18,
+                "stop_loss": 69400.0,
+                "take_profit": 71000.0,
+                "reason_codes": ["WATCH_SUPPORT_RECLAIM"],
+            }
+            return result
+
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("abstained watch entry plan must wait for watcher recheck before execution")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", _entry_plan_fake_evaluate_risk)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+
+    provider = WatchPlanProvider(decision="hold")
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+    )
+    pending_plan = db_session.scalar(select(PendingEntryPlan).limit(1))
+    watch_risk = db_session.scalar(
+        select(RiskCheck)
+        .where(RiskCheck.decision_run_id == decision_row.id, RiskCheck.decision == "long")
+        .limit(1)
+    )
+
+    assert result["decision"]["decision"] == "hold"
+    assert result["decision"]["should_abstain"] is True
+    assert result["status"] == "entry_plan_armed"
+    assert pending_plan is not None
+    assert pending_plan.plan_status == "armed"
+    assert "AI_WATCH_ENTRY_PLAN" in pending_plan.rationale_codes
+    assert "LOW_CONVICTION_DIRECT_ENTRY" in pending_plan.metadata_json["source_no_trade_reason_codes"]
+    assert watch_risk is not None
+    assert watch_risk.allowed is False
+    assert "ENTRY_TRIGGER_NOT_MET" in watch_risk.reason_codes
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_due_entry_plan_watcher_cleans_stale_triggered_history_without_armed_plan(db_session) -> None:
+    stale_plan = PendingEntryPlan(
+        symbol="BTCUSDT",
+        side="long",
+        plan_status="triggered",
+        source_decision_run_id=9301,
+        source_timeframe="15m",
+        entry_mode="pullback_confirm",
+        entry_zone_min=69900.0,
+        entry_zone_max=70000.0,
+        invalidation_price=69500.0,
+        max_chase_bps=12.0,
+        idea_ttl_minutes=15,
+        stop_loss=69500.0,
+        take_profit=70800.0,
+        risk_pct_cap=0.01,
+        leverage_cap=1.0,
+        expires_at=utcnow_naive() - timedelta(hours=2),
+        triggered_at=utcnow_naive() - timedelta(hours=3),
+        idempotency_key="stale-triggered-cleanup-test",
+        metadata_json={"execution_result": {"status": "partially_filled"}},
+    )
+    db_session.add(stale_plan)
+    db_session.flush()
+
+    result = run_due_entry_plan_watcher_cycle(db_session)
+
+    assert result is not None
+    assert result["stale_plan_cleanup"]["normalized_count"] == 1
+    assert stale_plan.plan_status == "expired"
+    assert stale_plan.canceled_reason == "PLAN_TRIGGERED_STALE_HISTORY_CLEANED_BY_WATCHER"
+
+
+def test_transition_watch_direct_entry_is_bounded_to_pending_plan(monkeypatch, db_session) -> None:
+    class DirectEntryProvider(_CountingDecisionProvider):
+        def generate(self, role, payload, *, response_model, instructions):  # noqa: ANN001
+            result = super().generate(role, payload, response_model=response_model, instructions=instructions)
+            result.output.update(
+                {
+                    "decision": "long",
+                    "entry_zone_min": 69800.0,
+                    "entry_zone_max": 69950.0,
+                    "entry_mode": "pullback_confirm",
+                    "invalidation_price": 69400.0,
+                    "max_chase_bps": 12.0,
+                    "idea_ttl_minutes": 18,
+                    "stop_loss": 69400.0,
+                    "take_profit": 71000.0,
+                    "rationale_codes": ["TRANSITION_WATCH_DIRECT_LONG"],
+                    "no_trade_reason_codes": [],
+                }
+            )
+            return result
+
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("transition-watch AI must not submit a direct order")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", _entry_plan_fake_evaluate_risk)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+
+    provider = DirectEntryProvider(decision="long")
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        selection_context={
+            "assigned_slot": None,
+            "candidate_weight": 0.0,
+            "selected": False,
+            "selection_reason": "score_below_threshold",
+            "rejected_reason": "score_below_threshold",
+            "entry_score_threshold": 0.40,
+            "score": {"total_score": 0.38},
+            "ai_call_policy": {"soft_signal_review_mode": "transition_watch"},
+        },
+    )
+    pending_plan = db_session.scalar(select(PendingEntryPlan).limit(1))
+
+    assert provider.calls == 1
+    assert result["decision"]["decision"] == "hold"
+    assert result["status"] == "entry_plan_armed"
+    assert result["entry_plan"]["side"] == "long"
+    assert pending_plan is not None
+    assert pending_plan.plan_status == "armed"
+    assert "SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH" in pending_plan.rationale_codes
+    assert decision_row.metadata_json["transition_watch_ai_invoked"] is True
+    assert decision_row.metadata_json["watch_only_bounded"] is True
+    assert decision_row.metadata_json["soft_signal_bounded_action"] == "watch_entry_plan"
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_transition_watch_invalid_direct_entry_is_bounded_to_hold(monkeypatch, db_session) -> None:
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("invalid transition-watch direct entry must not submit an order")
+
+    monkeypatch.setattr("trading_mvp.services.orchestrator.evaluate_risk", _entry_plan_fake_evaluate_risk)
+    monkeypatch.setattr("trading_mvp.services.orchestrator.execute_live_trade", fail_execute)
+
+    provider = _CountingDecisionProvider(decision="long")
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        selection_context={
+            "assigned_slot": None,
+            "candidate_weight": 0.0,
+            "selected": False,
+            "selection_reason": "score_below_threshold",
+            "rejected_reason": "score_below_threshold",
+            "entry_score_threshold": 0.40,
+            "score": {"total_score": 0.38},
+            "ai_call_policy": {"soft_signal_review_mode": "transition_watch"},
+        },
+    )
+
+    assert provider.calls == 1
+    assert result["decision"]["decision"] == "hold"
+    assert result["entry_plan"] is None
+    assert "SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD" in result["decision"]["no_trade_reason_codes"]
+    assert decision_row.metadata_json["transition_watch_ai_invoked"] is True
+    assert decision_row.metadata_json["watch_only_bounded"] is True
+    assert decision_row.metadata_json["soft_signal_bounded_action"] == "hold"
+    assert db_session.scalar(select(PendingEntryPlan).limit(1)) is None
     assert db_session.scalar(select(Order).limit(1)) is None
     assert db_session.scalar(select(Execution).limit(1)) is None
 
@@ -4341,6 +5755,74 @@ def test_entry_candidate_account_untrusted_hard_skips_ai(monkeypatch, db_session
         reason_code.endswith("_sync_stale") or reason_code.endswith("_sync_incomplete")
         for reason_code in audit.payload["hard_skip_reason_codes"]
     )
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_entry_candidate_daily_loss_limit_hard_skips_ai(monkeypatch, db_session) -> None:
+    db_session.add(
+        PnLSnapshot(
+            snapshot_date=utcnow_naive().date(),
+            equity=100_000.0,
+            cash_balance=100_000.0,
+            wallet_balance=100_000.0,
+            available_balance=100_000.0,
+            gross_realized_pnl=-6_000.0,
+            fee_total=0.0,
+            funding_total=0.0,
+            net_pnl=-6_000.0,
+            realized_pnl=-6_000.0,
+            unrealized_pnl=0.0,
+            daily_pnl=-6_000.0,
+            cumulative_pnl=-6_000.0,
+            consecutive_losses=1,
+        )
+    )
+    db_session.flush()
+    provider = _CountingDecisionProvider(decision="long")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+    )
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == "DAILY_LOSS_LIMIT_REACHED"
+    assert decision_row.metadata_json["ai_call_policy"]["hard_skip_ai"] is True
+    assert "DAILY_LOSS_LIMIT_REACHED" in decision_row.metadata_json["ai_call_policy"]["hard_skip_reason_codes"]
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_entry_candidate_live_approval_required_hard_skips_ai(monkeypatch, db_session) -> None:
+    defaults = get_app_settings().model_copy(update={"live_trading_env_enabled": True})
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.get_settings",
+        lambda: defaults,
+    )
+    provider = _CountingDecisionProvider(decision="long")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        settings_mutator=lambda settings_row: (
+            setattr(settings_row, "live_trading_enabled", True),
+            setattr(settings_row, "rollout_mode", "limited_live"),
+            setattr(settings_row, "manual_live_approval", True),
+            setattr(settings_row, "live_execution_armed", False),
+        ),
+    )
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == "LIVE_APPROVAL_REQUIRED"
+    assert decision_row.metadata_json["ai_call_policy"]["hard_skip_ai"] is True
+    assert "LIVE_APPROVAL_REQUIRED" in decision_row.metadata_json["ai_call_policy"]["hard_skip_reason_codes"]
     assert db_session.scalar(select(Order).limit(1)) is None
     assert db_session.scalar(select(Execution).limit(1)) is None
 
@@ -5540,6 +7022,7 @@ def test_scheduler_market_refresh_cycle_runs_without_ai_or_new_entry(monkeypatch
 def test_scheduler_position_management_cycle_does_not_create_new_entry(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
+    settings_row.ai_provider = "mock"
     settings_row.position_management_enabled = True
     settings_row.tracked_symbols = ["BTCUSDT"]
     _mark_pipeline_sync_fresh(settings_row)
@@ -5603,7 +7086,14 @@ def test_scheduler_position_management_cycle_does_not_create_new_entry(monkeypat
 
     assert result["workflow"] == "position_management_cycle"
     assert result["results"][0]["status"] == "success"
-    assert db_session.scalar(select(AgentRun).limit(1)) is None
+    position_exit_review_run = db_session.scalar(select(AgentRun).limit(1))
+    assert position_exit_review_run is not None
+    assert position_exit_review_run.role == "position_exit_review"
+    assert position_exit_review_run.output_payload["execution_boundary"] == "metadata_only_no_order_authority"
+    position_row = db_session.scalar(select(Position).where(Position.symbol == "BTCUSDT"))
+    assert position_row is not None
+    assert position_row.metadata_json["position_exit_review"]["execution_boundary"] == "metadata_only_no_order_authority"
+    assert position_row.metadata_json["position_exit_review_source"]["execution_boundary"] == "metadata_only_no_order_authority"
     assert db_session.scalar(select(RiskCheck).limit(1)) is None
 
 

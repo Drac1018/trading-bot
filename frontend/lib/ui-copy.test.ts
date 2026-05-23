@@ -127,6 +127,10 @@ test("ui-copy separates AI review reason from market signal summary", async () =
   assert.equal(formatDisplayValue("entry_candidate_review"), "신규 진입 후보 검토");
   assert.equal(formatDisplayValue("ENTRY_CANDIDATE_SELECTED"), "신규 진입 후보 선정");
   assert.equal(formatDisplayValue("ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"), "거래량 부족으로 AI 검토 생략");
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF"),
+    "반복 중립 후보라 AI 검토 생략",
+  );
   assert.equal(formatDisplayValue("MACRO_EVENT_IMMINENT"), "주요 경제 이벤트 임박으로 신규 진입 보수화");
   assert.equal(formatDisplayValue("MACRO_EVENT_RISK_WINDOW_ACTIVE"), "거시 이벤트 리스크 구간");
 });

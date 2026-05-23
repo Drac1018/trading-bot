@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Check the Trading MVP service switch gate.")
     parser.add_argument("--recent-minutes", type=int, default=30)
     parser.add_argument("--check-dev-ports", default="8001,3001")
+    parser.add_argument("--normalize-stale-history", action="store_true")
     parser.add_argument("--pretty", action="store_true")
     return parser
 
@@ -36,7 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     from trading_mvp.database import SessionLocal
-    from trading_mvp.services.service_gate import build_service_switch_gate_snapshot
+    from trading_mvp.services.service_gate import (
+        build_service_switch_gate_snapshot,
+        normalize_stale_pending_entry_plan_history,
+    )
 
     ports = [
         int(item.strip())
@@ -44,10 +48,18 @@ def main(argv: list[str] | None = None) -> int:
         if item.strip()
     ]
     with SessionLocal() as session:
+        normalization = (
+            normalize_stale_pending_entry_plan_history(session)
+            if args.normalize_stale_history
+            else {"normalized_count": 0, "normalized_plans": []}
+        )
+        if args.normalize_stale_history:
+            session.commit()
         payload = build_service_switch_gate_snapshot(
             session,
             recent_minutes=args.recent_minutes,
         )
+    payload["stale_history_normalization"] = normalization
     listeners = _listener_summary(ports)
     dev_listener_blockers = [item for item in listeners if item["reachable"]]
     payload["dev_port_listeners"] = listeners

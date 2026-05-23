@@ -6,15 +6,19 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import desc, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_mvp.models import MarketSnapshot, SchedulerRun
+from trading_mvp.models import MarketSnapshot, PendingEntryPlan, SchedulerRun
 from trading_mvp.services.account import get_open_positions
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
 from trading_mvp.services.runtime_state import build_sync_freshness_summary
-from trading_mvp.services.service_gate import active_pending_entry_plan_statement
+from trading_mvp.services.service_gate import (
+    active_pending_entry_plan_statement,
+    normalize_stale_pending_entry_plan_history,
+)
 from trading_mvp.services.settings import (
     get_effective_symbol_schedule,
     get_or_create_settings,
@@ -34,6 +38,24 @@ PRE_DECISION_SYNC_MIN_FRESH_SECONDS = 60
 RELEASE_ENRICHMENT_RETRY_SECONDS = 15
 RELEASE_ENRICHMENT_WATCH_WINDOW_SECONDS = 120
 STALE_RUNNING_SCHEDULER_RUN_SECONDS = 30 * 60
+INTERVAL_DECISION_AI_CYCLE_BUDGET_EXHAUSTED_REASON = "AI_CYCLE_BUDGET_EXHAUSTED"
+INTERVAL_DECISION_AI_CYCLE_BUDGET_SKIP_CATEGORY = "cycle_dispatch_budget"
+INTERVAL_DECISION_AI_CYCLE_BUDGET_BY_BREADTH = {
+    "weak_breadth": 1,
+    "transition_fragile": 1,
+    "mixed": 2,
+    "trend_expansion": 3,
+}
+INTERVAL_DECISION_AI_CYCLE_DEFAULT_BUDGET = 2
+INTERVAL_DECISION_AI_BUDGETED_TRIGGER_REASONS = {
+    "entry_candidate_event",
+    "breakout_exception_event",
+}
+INTERVAL_DECISION_AI_BUDGET_EXEMPT_TRIGGER_REASONS = {
+    "manual_review_event",
+    "protection_review_event",
+}
+EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE = "EXCHANGE_AUTH_PERMISSION_REJECTED"
 SCHEDULER_WORKFLOW_ADVISORY_LOCK_KEYS = {
     MARKET_REFRESH_WORKFLOW: 520_241_605_160_001,
 }
@@ -156,6 +178,28 @@ def _coerce_datetime(value: object) -> datetime | None:
     parsed = parse_utc_datetime(value)
     if parsed is not None:
         return parsed.replace(tzinfo=None)
+    return None
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    if value in {None, ""}:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _exchange_sync_failure_reason_code_from_message(message: object) -> str | None:
+    normalized = str(message or "").lower()
+    if not normalized:
+        return None
+    if "exchange_auth_permission_rejected" in normalized:
+        return EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+    if "binance error -2015" in normalized or "invalid api-key" in normalized:
+        return EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
     return None
 
 
@@ -436,6 +480,101 @@ def _record_interval_decision_sync_failure(
     _rollback_scheduler_session(session)
 
 
+def _has_triggered_pending_entry_plan_cleanup_due(session: Session) -> bool:
+    return bool(
+        session.scalar(
+            select(PendingEntryPlan.id)
+            .where(PendingEntryPlan.plan_status == "triggered")
+            .where(PendingEntryPlan.expires_at <= utcnow_naive())
+            .limit(1)
+        )
+    )
+
+
+def _scheduler_error_payload(
+    error: Exception,
+    *,
+    stage: str,
+    symbol: str | None,
+    trigger: dict[str, object] | None = None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    error_message = str(error)
+    normalized_error = error_message.lower()
+    db_connection_lost = (
+        isinstance(error, OperationalError)
+        or "server closed the connection unexpectedly" in normalized_error
+        or "invalid transaction is rolled back" in normalized_error
+        or "pendingrollbackerror" in normalized_error
+    )
+    payload: dict[str, object] = {
+        "symbol": symbol,
+        "stage": stage,
+        "error": error_message,
+        "error_class": error.__class__.__name__,
+        "error_category": "db_operational_error" if db_connection_lost else "workflow_exception",
+        "db_connection_lost": db_connection_lost,
+        "session_recovered_before_logging": True,
+    }
+    reason_code = _exchange_sync_failure_reason_code_from_message(error_message)
+    if reason_code is not None:
+        payload["reason_code"] = reason_code
+    if trigger is not None:
+        payload["trigger"] = trigger
+    if db_connection_lost:
+        payload["recovery_hint"] = "Verify PostgreSQL runtime health and recent scheduler connection churn before retrying."
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _persist_scheduler_failure_result(
+    session: Session,
+    *,
+    workflow: str,
+    schedule_window: str,
+    triggered_by: str,
+    symbol: str | None,
+    next_run_at: datetime | None,
+    message: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    base_payload = dict(payload)
+    for attempt in range(2):
+        _rollback_scheduler_session(session)
+        try:
+            row = _start_scheduler_run(
+                session,
+                workflow=workflow,
+                schedule_window=schedule_window,
+                triggered_by=triggered_by,
+                symbol=symbol,
+                next_run_at=next_run_at,
+            )
+            return _finish_scheduler_run(
+                session,
+                row=row,
+                success=False,
+                message=message,
+                payload={
+                    **base_payload,
+                    "scheduler_failure_persisted": True,
+                    "scheduler_failure_persist_attempt": attempt + 1,
+                },
+            )
+        except Exception as persist_exc:
+            base_payload["scheduler_failure_persisted"] = False
+            base_payload["scheduler_failure_persist_error"] = str(persist_exc)
+            base_payload["scheduler_failure_persist_error_class"] = persist_exc.__class__.__name__
+            continue
+    _rollback_scheduler_session(session)
+    return {
+        "workflow": workflow,
+        "status": "failed",
+        **base_payload,
+    }
+
+
 def _try_pre_decision_exchange_sync(
     session: Session,
     *,
@@ -455,6 +594,165 @@ def _try_pre_decision_exchange_sync(
         return None, str(exc)
 
 
+def _scheduler_ai_skip_reason_from_payload(payload: dict[str, object]) -> str | None:
+    reason = str(payload.get("last_ai_skip_reason") or "").strip()
+    if not reason:
+        policy = payload.get("ai_call_policy")
+        if isinstance(policy, dict):
+            reason = str(policy.get("reason") or "").strip()
+    return reason or None
+
+
+def _interval_decision_ai_cycle_budget(candidate_selection: dict[str, object]) -> int:
+    breadth_regime = str(candidate_selection.get("breadth_regime") or "").strip().lower()
+    return int(
+        INTERVAL_DECISION_AI_CYCLE_BUDGET_BY_BREADTH.get(
+            breadth_regime,
+            INTERVAL_DECISION_AI_CYCLE_DEFAULT_BUDGET,
+        )
+    )
+
+
+def _interval_plan_trigger_reason(plan: dict[str, object]) -> str:
+    trigger = plan.get("trigger")
+    if not isinstance(trigger, dict):
+        return ""
+    return str(trigger.get("trigger_reason") or "").strip()
+
+
+def _interval_plan_reason_codes(plan: dict[str, object]) -> set[str]:
+    trigger = plan.get("trigger")
+    if not isinstance(trigger, dict):
+        return set()
+    return {str(item) for item in (trigger.get("reason_codes") or []) if item}
+
+
+def _interval_plan_budget_priority(plan: dict[str, object], original_index: int) -> tuple[int, float, float, float, float, int]:
+    trigger_reason = _interval_plan_trigger_reason(plan)
+    reason_codes = _interval_plan_reason_codes(plan)
+    selection_context = plan.get("selection_context")
+    selection = dict(selection_context) if isinstance(selection_context, dict) else {}
+    score = selection.get("score")
+    score_payload = dict(score) if isinstance(score, dict) else {}
+    ai_policy = plan.get("ai_call_policy")
+    ai_policy_payload = dict(ai_policy) if isinstance(ai_policy, dict) else {}
+    soft_mode = str(ai_policy_payload.get("soft_signal_review_mode") or "").strip()
+    transition_watch = "SOFT_SIGNAL_TRANSITION_WATCH" in reason_codes or soft_mode == "transition_watch"
+    trigger_rank = 0 if trigger_reason == "breakout_exception_event" else 1
+    if transition_watch:
+        trigger_rank = 2
+    return (
+        trigger_rank,
+        -_safe_float(selection.get("candidate_weight"), default=0.0),
+        -_safe_float(selection.get("slot_conviction_score"), default=0.0),
+        -_safe_float(selection.get("meta_gate_probability"), default=0.0),
+        -_safe_float(score_payload.get("total_score"), default=0.0),
+        original_index,
+    )
+
+
+def _apply_interval_ai_cycle_dispatch_budget(decision_plan: dict[str, object]) -> dict[str, object]:
+    plans = decision_plan.get("plans")
+    if not isinstance(plans, list):
+        return {"applied": False, "budget": 0, "allowed_symbols": [], "skipped_symbols": []}
+    candidate_selection = (
+        dict(decision_plan.get("candidate_selection"))
+        if isinstance(decision_plan.get("candidate_selection"), dict)
+        else {}
+    )
+    budget = _interval_decision_ai_cycle_budget(candidate_selection)
+    candidates: list[tuple[tuple[int, float, float, float, float, int], dict[str, object]]] = []
+    exempt_symbols: list[str] = []
+    for index, raw_plan in enumerate(plans):
+        if not isinstance(raw_plan, dict):
+            continue
+        trigger_reason = _interval_plan_trigger_reason(raw_plan)
+        if not trigger_reason:
+            continue
+        symbol = str(raw_plan.get("symbol") or "").upper()
+        if trigger_reason in INTERVAL_DECISION_AI_BUDGET_EXEMPT_TRIGGER_REASONS:
+            if symbol:
+                exempt_symbols.append(symbol)
+            continue
+        if trigger_reason not in INTERVAL_DECISION_AI_BUDGETED_TRIGGER_REASONS:
+            continue
+        candidates.append((_interval_plan_budget_priority(raw_plan, index), raw_plan))
+    if len(candidates) <= budget:
+        return {
+            "applied": False,
+            "budget": budget,
+            "allowed_symbols": [str(plan.get("symbol") or "").upper() for _priority, plan in candidates],
+            "skipped_symbols": [],
+            "exempt_symbols": exempt_symbols,
+        }
+    ordered = sorted(candidates, key=lambda item: item[0])
+    allowed_plans = {id(plan) for _priority, plan in ordered[:budget]}
+    allowed_symbols = [
+        str(plan.get("symbol") or "").upper()
+        for _priority, plan in ordered[:budget]
+        if str(plan.get("symbol") or "").upper()
+    ]
+    skipped_symbols = [
+        str(plan.get("symbol") or "").upper()
+        for _priority, plan in ordered[budget:]
+        if str(plan.get("symbol") or "").upper()
+    ]
+    for _priority, plan in ordered:
+        symbol = str(plan.get("symbol") or "").upper()
+        if id(plan) in allowed_plans:
+            continue
+        existing_policy = (
+            dict(plan.get("ai_call_policy"))
+            if isinstance(plan.get("ai_call_policy"), dict)
+            else {}
+        )
+        budget_payload = {
+            "budget": budget,
+            "budgeted_trigger_count": len(candidates),
+            "allowed_symbols": list(allowed_symbols),
+            "skipped_symbols": list(skipped_symbols),
+            "exempt_symbols": list(exempt_symbols),
+            "breadth_regime": str(candidate_selection.get("breadth_regime") or "") or None,
+            "capacity_reason": str(candidate_selection.get("capacity_reason") or "") or None,
+        }
+        plan_ai_call_policy = {
+            **existing_policy,
+            "ai_call_event": "AI_CALL_SKIPPED",
+            "ai_call_allowed": False,
+            "skip_ai": True,
+            "reason": INTERVAL_DECISION_AI_CYCLE_BUDGET_EXHAUSTED_REASON,
+            "scope": "new_entry",
+            "hard_skip_ai": False,
+            "skip_category": INTERVAL_DECISION_AI_CYCLE_BUDGET_SKIP_CATEGORY,
+            "hard_skip_reason_codes": [],
+            "cycle_dispatch_budget": budget_payload,
+        }
+        selection_context = plan.get("selection_context")
+        if isinstance(selection_context, dict):
+            plan["selection_context"] = {
+                **selection_context,
+                "ai_call_policy": plan_ai_call_policy,
+            }
+        plan["ai_call_policy"] = plan_ai_call_policy
+        plan["trigger"] = None
+        plan["trigger_deduped"] = False
+        plan["dedupe_reason"] = None
+        plan["forced_review_reason"] = None
+        plan["fingerprint_changed_fields"] = []
+        plan["last_ai_skip_reason"] = INTERVAL_DECISION_AI_CYCLE_BUDGET_EXHAUSTED_REASON
+        plan["cycle_dispatch_budget"] = budget_payload
+    return {
+        "applied": True,
+        "budget": budget,
+        "budgeted_trigger_count": len(candidates),
+        "allowed_symbols": allowed_symbols,
+        "skipped_symbols": skipped_symbols,
+        "exempt_symbols": exempt_symbols,
+        "breadth_regime": str(candidate_selection.get("breadth_regime") or "") or None,
+        "capacity_reason": str(candidate_selection.get("capacity_reason") or "") or None,
+    }
+
+
 def _finish_scheduler_run(
     session: Session,
     *,
@@ -465,6 +763,7 @@ def _finish_scheduler_run(
 ) -> dict[str, object]:
     row.status = "success" if success else "failed"
     row.outcome = payload
+    row.ai_skip_reason = _scheduler_ai_skip_reason_from_payload(payload)
     session.add(row)
     event_type = "scheduler_run" if success else "scheduler_run_failed"
     severity = "info" if success else "error"
@@ -612,25 +911,31 @@ def run_exchange_sync_cycle(session: Session, triggered_by: str = "scheduler") -
     interval_seconds = int(settings_row.exchange_sync_interval_seconds)
     schedule_window = _symbol_schedule_window(interval_seconds=interval_seconds)
     next_run_at = utcnow_naive() + timedelta(seconds=interval_seconds)
+    symbol = settings_row.default_symbol
     try:
         orchestrator = TradingOrchestrator(session)
         outcome = orchestrator.run_exchange_sync_cycle(trigger_event=triggered_by)
     except Exception as exc:
-        row = _start_scheduler_run(
+        return _persist_scheduler_failure_result(
             session,
             workflow=EXCHANGE_SYNC_WORKFLOW,
             schedule_window=schedule_window,
             triggered_by=triggered_by,
+            symbol=symbol,
             next_run_at=next_run_at,
-        )
-        return _finish_scheduler_run(
-            session,
-            row=row,
-            success=False,
             message="Exchange sync cycle failed.",
-            payload={"error": str(exc)},
+            payload=_scheduler_error_payload(
+                exc,
+                stage="exchange_sync",
+                symbol=symbol,
+                extra={"triggered_by": triggered_by},
+            ),
         )
     success = str(outcome.get("status")) != "error"
+    if not success and "reason_code" not in outcome:
+        reason_code = _exchange_sync_failure_reason_code_from_message(outcome.get("error"))
+        if reason_code is not None:
+            outcome = {**outcome, "reason_code": reason_code}
     row = _start_scheduler_run(
         session,
         workflow=EXCHANGE_SYNC_WORKFLOW,
@@ -887,6 +1192,10 @@ def get_due_entry_plan_symbols(session: Session) -> list[str]:
 
 def run_entry_plan_watcher_cycle(session: Session, triggered_by: str = "scheduler") -> dict[str, object]:
     orchestrator = TradingOrchestrator(session)
+    cleanup_result = normalize_stale_pending_entry_plan_history(
+        session,
+        reason="PLAN_TRIGGERED_STALE_HISTORY_CLEANED_BY_WATCHER",
+    )
     results: list[dict[str, object]] = []
     for symbol in get_due_entry_plan_symbols(session):
         effective = orchestrator._effective_symbol_settings(symbol)
@@ -934,7 +1243,11 @@ def run_entry_plan_watcher_cycle(session: Session, triggered_by: str = "schedule
                     payload={"symbol": symbol, "error": str(exc)},
                 )
             )
-    return {"workflow": ENTRY_PLAN_WATCHER_WORKFLOW, "results": results}
+    return {
+        "workflow": ENTRY_PLAN_WATCHER_WORKFLOW,
+        "results": results,
+        "stale_plan_cleanup": cleanup_result,
+    }
 
 
 def is_interval_decision_due(session: Session, symbol: str | None = None) -> bool:
@@ -1059,34 +1372,33 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             symbols=plan_symbols,
             triggered_at=utcnow_naive(),
         )
+        ai_cycle_dispatch_budget = _apply_interval_ai_cycle_dispatch_budget(decision_plan)
     except Exception as exc:
         _rollback_scheduler_session(session)
         decision_plan_error = str(exc)
+        decision_plan_error_payload = _scheduler_error_payload(
+            exc,
+            stage="decision_plan_build",
+            symbol=None,
+            extra={
+                "auto_resume": auto_resume_result,
+                "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
+            },
+        )
         for effective, _cadence_profile, cadence_minutes, _schedule_details in due_effective:
-            row = _start_scheduler_run(
-                session,
-                workflow=INTERVAL_DECISION_WORKFLOW,
-                schedule_window=_symbol_schedule_window(
-                    interval_minutes=cadence_minutes
-                ),
-                triggered_by=triggered_by,
-                symbol=effective.symbol,
-                next_run_at=utcnow_naive(),
-            )
             results.append(
-                _finish_scheduler_run(
+                _persist_scheduler_failure_result(
                     session,
-                    row=row,
-                    success=False,
+                    workflow=INTERVAL_DECISION_WORKFLOW,
+                    schedule_window=_symbol_schedule_window(
+                        interval_minutes=cadence_minutes
+                    ),
+                    triggered_by=triggered_by,
+                    symbol=effective.symbol,
+                    next_run_at=utcnow_naive(),
                     message="Interval decision cycle failed while building decision plan.",
-                    payload={
-                        "symbol": effective.symbol,
-                        "stage": "decision_plan_build",
-                        "error": decision_plan_error,
-                        "auto_resume": auto_resume_result,
-                        "pre_decision_exchange_sync": pre_decision_exchange_sync,
-                        "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
-                    },
+                    payload=decision_plan_error_payload,
                 )
             )
         return {
@@ -1096,7 +1408,9 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
             "pre_decision_exchange_sync": pre_decision_exchange_sync,
             "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
             "decision_plan_error": decision_plan_error,
+            "decision_plan_error_payload": decision_plan_error_payload,
             "candidate_selection": {},
+            "ai_cycle_dispatch_budget": {},
         }
     plan_lookup = {
         str(item.get("symbol") or "").upper(): dict(item)
@@ -1203,6 +1517,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "status": "skipped",
                             "ai_review_status": "skipped" if policy_reason else "no_event",
                             "trigger": None,
+                            "ai_call_policy": plan_ai_call_policy or None,
                             "last_ai_trigger_reason": None,
                             "last_ai_invoked_at": last_ai_invoked_at,
                             "next_ai_review_due_at": next_ai_review_due_at,
@@ -1220,6 +1535,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "max_review_age_minutes": max_review_age_minutes,
                             "cadence_profile_summary": cadence_profile_summary,
                             "cadence": cadence_profile,
+                            "ai_cycle_dispatch_budget": plan.get("cycle_dispatch_budget"),
                             "auto_resume": auto_resume_result,
                             "pre_decision_exchange_sync": pre_decision_exchange_sync,
                             "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
@@ -1276,6 +1592,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                             "max_review_age_minutes": max_review_age_minutes,
                             "cadence_profile_summary": cadence_profile_summary,
                             "cadence": cadence_profile,
+                            "ai_cycle_dispatch_budget": plan.get("cycle_dispatch_budget"),
                             "auto_resume": auto_resume_result,
                             "pre_decision_exchange_sync": pre_decision_exchange_sync,
                             "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
@@ -1338,6 +1655,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                         "symbol": effective.symbol,
                         "trigger": trigger_payload,
                         "cadence": cadence_profile,
+                        "ai_cycle_dispatch_budget": plan.get("cycle_dispatch_budget"),
                         "auto_resume": auto_resume_result,
                         "pre_decision_exchange_sync": decision_pre_decision_exchange_sync
                         or pre_decision_exchange_sync,
@@ -1346,22 +1664,29 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
                 )
             )
         except Exception as exc:
-            _rollback_scheduler_session(session)
-            row.next_run_at = utcnow_naive()
+            failure_payload = _scheduler_error_payload(
+                exc,
+                stage="decision_cycle",
+                symbol=effective.symbol,
+                trigger=trigger_payload,
+                extra={
+                    "pre_decision_exchange_sync": pre_decision_exchange_sync,
+                    "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
+                    "rolled_back_scheduler_run_id": row.id,
+                },
+            )
             results.append(
-                _finish_scheduler_run(
+                _persist_scheduler_failure_result(
                     session,
-                    row=row,
-                    success=False,
+                    workflow=INTERVAL_DECISION_WORKFLOW,
+                    schedule_window=_symbol_schedule_window(
+                        interval_minutes=cadence_minutes
+                    ),
+                    triggered_by=triggered_by,
+                    symbol=effective.symbol,
+                    next_run_at=utcnow_naive(),
                     message="Interval decision cycle failed.",
-                    payload={
-                        "symbol": effective.symbol,
-                        "stage": "decision_cycle",
-                        "error": str(exc),
-                        "trigger": trigger_payload,
-                        "pre_decision_exchange_sync": pre_decision_exchange_sync,
-                        "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
-                    },
+                    payload=failure_payload,
                 )
             )
     return {
@@ -1371,6 +1696,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         "pre_decision_exchange_sync": pre_decision_exchange_sync,
         "pre_decision_exchange_sync_error": pre_decision_exchange_sync_error,
         "candidate_selection": decision_plan.get("candidate_selection", {}),
+        "ai_cycle_dispatch_budget": ai_cycle_dispatch_budget,
     }
 
 
@@ -1387,7 +1713,7 @@ def run_due_interval_decision_cycle(session: Session) -> dict[str, object] | Non
 
 
 def run_due_entry_plan_watcher_cycle(session: Session) -> dict[str, object] | None:
-    if not get_due_entry_plan_symbols(session):
+    if not get_due_entry_plan_symbols(session) and not _has_triggered_pending_entry_plan_cleanup_due(session):
         return None
     return run_entry_plan_watcher_cycle(session, triggered_by="scheduler")
 

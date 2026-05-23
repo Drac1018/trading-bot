@@ -95,6 +95,7 @@ SYNC_STATE_DETAIL_KEY = "exchange_sync"
 EXECUTION_GUARD_DETAIL_KEY = "execution_guard"
 USER_STREAM_DETAIL_KEY = "user_stream"
 MARKET_STREAM_DETAIL_KEY = MARKET_STREAM_RUNTIME_DETAIL_KEY
+MARKET_STREAM_PERSIST_TRANSIENT_KEYS = {"freshness_seconds"}
 RECONCILIATION_DETAIL_KEY = "reconciliation"
 CANDIDATE_SELECTION_DETAIL_KEY = "candidate_selection"
 DRAWDOWN_STATE_DETAIL_KEY = "drawdown_state"
@@ -425,9 +426,20 @@ def get_market_stream_detail(settings_row: Setting) -> dict[str, Any]:
     return build_market_stream_state(_as_dict(detail.get(MARKET_STREAM_DETAIL_KEY)))
 
 
+def _market_stream_persisted_state(payload: dict[str, Any]) -> dict[str, Any]:
+    state = build_market_stream_state(payload)
+    for key in MARKET_STREAM_PERSIST_TRANSIENT_KEYS:
+        state.pop(key, None)
+    return state
+
+
 def replace_market_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
     runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
-    runtime_detail[MARKET_STREAM_DETAIL_KEY] = build_market_stream_state(payload)
+    next_state = _market_stream_persisted_state(payload)
+    current_state = _market_stream_persisted_state(_as_dict(runtime_detail.get(MARKET_STREAM_DETAIL_KEY)))
+    if current_state == next_state:
+        return
+    runtime_detail[MARKET_STREAM_DETAIL_KEY] = next_state
     _write_runtime_detail(settings_row, runtime_detail)
 
 

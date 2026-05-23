@@ -126,3 +126,25 @@ test("market chart markers do not treat AI hold rows as trade positions", async 
 
   assert.deepEqual(markers, []);
 });
+
+test("market chart risk markers translate decision hold rationale codes", async () => {
+  const { buildMarketChartEventMarkersFromRows, emptyMarketChartMarkerRows } = await marketChartMarkersModule;
+  const markers = buildMarketChartEventMarkersFromRows("BNBUSDT", {
+    ...emptyMarketChartMarkerRows(),
+    riskChecks: [
+      {
+        id: 4027,
+        symbol: "BNBUSDT",
+        allowed: false,
+        decision: "short",
+        created_at: "2026-05-18T15:08:44",
+        blocked_reason_codes: ["DERIVATIVES_ALIGNMENT_HEADWIND", "BREAKOUT_OI_SPREAD_FILTER"],
+      },
+    ],
+  });
+
+  assert.equal(markers.length, 1);
+  assert.match(markers[0]?.reasonLabel ?? "", /파생시장 정합성/);
+  assert.match(markers[0]?.reasonLabel ?? "", /돌파처럼 보여도 OI와 스프레드 조건/);
+  assert.doesNotMatch(markers[0]?.reasonLabel ?? "", /알 수 없는 차단 사유/);
+});

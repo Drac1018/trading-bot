@@ -334,6 +334,53 @@ function BucketRow({
   );
 }
 
+function BucketCard({
+  bucket,
+  payload,
+}: {
+  bucket: AnalyticsCostBreakdownBucket;
+  payload: AnalyticsCostBreakdownResponse;
+}) {
+  const slippageStatus = payload.data_quality.slippage_data_status;
+
+  return (
+    <article className="rounded-md border border-slate-200 bg-slate-50 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-950">{bucket.label}</h3>
+          <p className="mt-1 text-xs text-slate-500">{costBreakdownBucketStatus(bucket, payload.data_quality)}</p>
+        </div>
+        <span className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs font-semibold text-slate-600">
+          {periodLabel(payload.period)}
+        </span>
+      </div>
+      <dl className="mt-4 grid gap-3 text-sm">
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">순손익</dt>
+          <dd className="font-semibold text-slate-950">{formatCostBreakdownUsdt(bucket.net_pnl_usdt)}</dd>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">총손익</dt>
+          <dd className="font-semibold text-slate-950">{formatCostBreakdownUsdt(bucket.gross_pnl_usdt)}</dd>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">수수료 / 총 비용</dt>
+          <dd className="font-semibold text-slate-950">
+            {formatCostBreakdownUsdt(bucket.fee_usdt)} / {formatCostBreakdownUsdt(bucket.total_cost_usdt)}
+          </dd>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">슬리피지</dt>
+          <dd className="font-semibold text-slate-950">
+            {formatCostBreakdownBps(bucket.signed_slippage_bps, slippageStatus)} /{" "}
+            {formatCostBreakdownBps(bucket.adverse_slippage_bps, slippageStatus)}
+          </dd>
+        </div>
+      </dl>
+    </article>
+  );
+}
+
 function BreakdownTable({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
   const bucketDescription =
     payload.period === "year" ? "연간 조회는 월별 구간으로 비용을 보여줍니다." : "월간 조회는 일자별 구간으로 비용을 보여줍니다.";
@@ -352,7 +399,13 @@ function BreakdownTable({ payload }: { payload: AnalyticsCostBreakdownResponse }
       </div>
 
       {payload.buckets.length > 0 ? (
-        <div className="mt-5 overflow-x-auto rounded-md border border-slate-200">
+        <>
+        <div className="mt-5 grid gap-3 md:hidden">
+          {payload.buckets.map((bucket) => (
+            <BucketCard key={bucket.label} bucket={bucket} payload={payload} />
+          ))}
+        </div>
+        <div className="mt-5 hidden overflow-x-auto rounded-md border border-slate-200 md:block">
           <table className="min-w-[1180px] text-left text-sm">
             <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">
               <tr>
@@ -376,6 +429,7 @@ function BreakdownTable({ payload }: { payload: AnalyticsCostBreakdownResponse }
             </tbody>
           </table>
         </div>
+        </>
       ) : (
         <p className="mt-5 rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
           이 기간 응답에는 상세 구간 데이터가 없습니다. 상단 요약 기준으로만 확인하세요.

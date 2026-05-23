@@ -10,6 +10,7 @@ from trading_mvp.enums import AgentRole
 from trading_mvp.models import (
     AgentRun,
     AuditEvent,
+    DecisionPerformanceFact,
     Execution,
     Order,
     PnLSnapshot,
@@ -1007,6 +1008,91 @@ def test_recent_symbol_performance_gate_blocks_negative_symbol_entry(db_session)
     assert performance_gate["net_pnl_after_fees"] < 0
 
 
+def test_recent_decision_bucket_performance_gate_blocks_negative_bucket_entry(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "paper"
+    settings_row.live_trading_enabled = False
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    for index in range(4):
+        decision_run_id = 10_000 + index
+        db_session.add(
+            DecisionPerformanceFact(
+                decision_run_id=decision_run_id,
+                provider_name="openai",
+                symbol="BTCUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["TEST_BUCKET"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                telemetry_metadata={},
+                telemetry_output={"decision": "long"},
+            )
+        )
+        order = Order(
+            symbol="BTCUSDT",
+            decision_run_id=decision_run_id,
+            side="long",
+            order_type="market",
+            mode="live",
+            status="filled",
+            requested_quantity=0.01,
+            requested_price=entry_price,
+            filled_quantity=0.01,
+            average_fill_price=entry_price,
+            reason_codes=[],
+            metadata_json={"entry_execution_type": "entry_marketable"},
+        )
+        db_session.add(order)
+        db_session.flush()
+        db_session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                fill_price=entry_price,
+                fill_quantity=0.01,
+                fee_paid=0.2,
+                slippage_pct=0.0,
+                realized_pnl=-0.1 * (index + 1),
+                payload={"signed_slippage_bps": 0.0},
+            )
+        )
+    db_session.flush()
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.03,
+        max_chase_bps=20.0,
+    )
+
+    result, _ = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "current_market_state": {"primary_regime": "bullish"},
+            "expected_cost_gate": {
+                "expected_edge_bps": 200.0,
+                "expected_slippage_bps": 1.0,
+                "entry_execution_type": "entry_passive_limit",
+            },
+        },
+    )
+
+    assert result.allowed is False
+    assert "DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE" in result.reason_codes
+    performance_gate = result.debug_payload["decision_bucket_recent_performance_gate"]
+    assert performance_gate["status"] == "blocked"
+    assert performance_gate["bucket_key"] == "BTCUSDT:long:bullish"
+    assert performance_gate["fill_count"] == 4
+    assert performance_gate["expectancy_after_fees"] < 0
+
+
 def test_expected_cost_gate_blocks_entry_when_edge_is_unavailable(monkeypatch, db_session) -> None:
     _mock_expected_edge_gate_settings(monkeypatch)
     settings_row = get_or_create_settings(db_session)
@@ -1208,6 +1294,56 @@ def test_expected_edge_gate_shadow_records_would_block_without_blocking(db_sessi
     assert audit_event.entity_id == str(risk_row.id)
     assert audit_event.payload["would_block"] is True
     assert audit_event.payload["enforced_reason_codes"] == []
+
+
+def test_expected_edge_gate_blocks_negative_net_edge_for_submit_modes(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "limited_live"
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    _mark_all_sync_scopes_fresh(settings_row)
+    _seed_account_equity(db_session)
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    entry_price = snapshot.latest_price
+    decision = _entry_decision(
+        entry_zone_min=entry_price,
+        entry_zone_max=entry_price,
+        stop_loss=entry_price * 0.99,
+        take_profit=entry_price * 1.002,
+        max_chase_bps=20.0,
+    )
+
+    result, risk_row = evaluate_risk(
+        db_session,
+        settings_row,
+        decision,
+        snapshot,
+        execution_mode="historical_replay",
+        decision_context={
+            "expected_cost_gate": {
+                "expected_gross_bps": 20.0,
+                "round_trip_fee_bps": 18.0,
+                "expected_slippage_bps": 5.0,
+                "spread_cost_bps": 0.0,
+                "entry_execution_type": "entry_passive_limit",
+            }
+        },
+    )
+
+    gate = result.debug_payload["expected_cost_gate"]
+    assert result.allowed is False
+    assert "EXPECTED_COST_EXCEEDS_EDGE" in result.reason_codes
+    assert gate["mode"] == "live_submit_hard_block"
+    assert gate["blocking_active"] is False
+    assert gate["live_submit_hard_block"] is True
+    assert gate["enforced_reason_codes"] == ["EXPECTED_COST_EXCEEDS_EDGE", "expected_net_bps_too_low"]
+    audit_event = db_session.query(AuditEvent).filter_by(event_type="risk_expected_edge_gate").one()
+    assert audit_event.entity_id == str(risk_row.id)
+    assert audit_event.payload["enforced_reason_codes"] == [
+        "EXPECTED_COST_EXCEEDS_EDGE",
+        "expected_net_bps_too_low",
+    ]
 
 
 def test_expected_edge_gate_blocking_enforces_thresholds_and_audits(monkeypatch, db_session) -> None:
@@ -4807,7 +4943,7 @@ def test_ai_decision_range_break_and_volatility_spike_invalidates_new_entry(db_s
         db_session,
         decision,
         snapshot,
-        volatility_pct=0.01,
+        volatility_pct=1.0,
         range_breakout_direction="none",
     )
 
@@ -4822,7 +4958,7 @@ def test_ai_decision_range_break_and_volatility_spike_invalidates_new_entry(db_s
             "current_market_state": {
                 "regime_id": "range:neutral",
                 "regime_label": "range",
-                "volatility_pct": 0.025,
+                "volatility_pct": 2.5,
                 "range_breakout_direction": "up",
             }
         },

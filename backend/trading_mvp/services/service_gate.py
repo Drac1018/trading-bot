@@ -6,6 +6,7 @@ from sqlalchemy import Select, func, select, text
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import (
+    AuditEvent,
     Order,
     PendingEntryPlan,
     Position,
@@ -111,6 +112,119 @@ def _pending_plan_payload(row: PendingEntryPlan) -> dict[str, object]:
         "canceled_reason": row.canceled_reason,
         "blocked_reason_codes": tracking_payload.get("blocked_reason_codes") or [],
         "confirmation_failed_reason": tracking_payload.get("confirmation_failed_reason"),
+    }
+
+
+def _stale_triggered_plan_cleanup_guard(session: Session, plan: PendingEntryPlan) -> dict[str, object]:
+    symbol = str(plan.symbol or "").upper()
+    source_decision_run_id = int(plan.source_decision_run_id) if plan.source_decision_run_id is not None else None
+    open_position_exists = bool(
+        session.scalar(
+            select(Position.id)
+            .where(
+                Position.mode == "live",
+                Position.status == "open",
+                Position.quantity > 0,
+                Position.symbol == symbol,
+            )
+            .limit(1)
+        )
+    )
+    active_order_exists = bool(
+        session.scalar(
+            select(Order.id)
+            .where(
+                Order.mode == "live",
+                Order.symbol == symbol,
+                func.lower(Order.status).in_(ACTIVE_LIVE_ORDER_STATUSES),
+            )
+            .limit(1)
+        )
+    )
+    linked_order_exists = False
+    if source_decision_run_id is not None:
+        linked_order_exists = bool(
+            session.scalar(
+                select(Order.id)
+                .where(
+                    Order.mode == "live",
+                    Order.decision_run_id == source_decision_run_id,
+                )
+                .limit(1)
+            )
+        )
+    cleanup_safe = not open_position_exists and not active_order_exists and not linked_order_exists
+    return {
+        "cleanup_safe": cleanup_safe,
+        "open_position_exists": open_position_exists,
+        "active_order_exists": active_order_exists,
+        "linked_order_exists": linked_order_exists,
+        "source_decision_run_id": source_decision_run_id,
+    }
+
+
+def normalize_stale_pending_entry_plan_history(
+    session: Session,
+    *,
+    now: datetime | None = None,
+    reason: str = "PLAN_TRIGGERED_STALE_HISTORY_NORMALIZED",
+) -> dict[str, object]:
+    generated_at = now or utcnow_naive()
+    candidates = list(
+        session.scalars(
+            select(PendingEntryPlan)
+            .where(PendingEntryPlan.plan_status == TRIGGERED_PENDING_ENTRY_PLAN_STATUS)
+            .order_by(PendingEntryPlan.expires_at.asc(), PendingEntryPlan.id.asc())
+        )
+    )
+    normalized: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    for plan in candidates:
+        gate_state = pending_entry_plan_gate_state(plan, now=generated_at)
+        if gate_state != "triggered_stale_history":
+            continue
+        before_payload = _pending_plan_payload(plan)
+        cleanup_guard = _stale_triggered_plan_cleanup_guard(session, plan)
+        if not cleanup_guard["cleanup_safe"]:
+            skipped.append({**before_payload, "cleanup_guard": cleanup_guard})
+            continue
+        metadata = plan.metadata_json if isinstance(plan.metadata_json, dict) else {}
+        metadata = {
+            **metadata,
+            "normalized_from_gate_state": gate_state,
+            "normalized_reason": reason,
+            "normalized_at": generated_at.isoformat(),
+            "cleanup_guard": cleanup_guard,
+        }
+        plan.plan_status = "expired"
+        plan.canceled_at = generated_at
+        plan.canceled_reason = reason
+        plan.metadata_json = metadata
+        session.add(plan)
+        session.add(
+            AuditEvent(
+                event_type="pending_entry_plan_expired",
+                entity_type="pending_entry_plan",
+                entity_id=str(plan.id),
+                severity="info",
+                message="Stale triggered pending entry plan normalized to expired history.",
+                payload={
+                    "reason": reason,
+                    "previous_gate_state": gate_state,
+                    "previous_plan": before_payload,
+                    "cleanup_guard": cleanup_guard,
+                    "plan_status": "expired",
+                    "normalized_at": generated_at.isoformat(),
+                },
+            )
+        )
+        normalized.append({**before_payload, "normalized_to_status": "expired", "normalized_reason": reason})
+    session.flush()
+    return {
+        "normalized_count": len(normalized),
+        "normalized_plans": normalized,
+        "skipped_count": len(skipped),
+        "skipped_plans": skipped,
     }
 
 

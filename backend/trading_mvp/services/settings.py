@@ -250,10 +250,12 @@ def build_ai_model_routing_policy(settings_row: Setting) -> dict[str, Any]:
                 "model_candidates": [],
                 "reason_codes": [
                     "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+                    "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF",
                     "STALE_MARKET_DATA",
                     "LOW_SCORE",
                     "SPREAD_STRESS",
                     "EXPOSURE_LIMIT",
+                    "AI_CYCLE_BUDGET_EXHAUSTED",
                     "MACRO_EVENT_IMMINENT",
                     "MACRO_EVENT_RISK_WINDOW_ACTIVE",
                 ],
@@ -335,6 +337,9 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_AUTH_PERMISSION_REJECTED",
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
 }
+EXCHANGE_SYNC_WORKFLOW = "exchange_sync_cycle"
+EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS = 24
+EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE = "EXCHANGE_AUTH_PERMISSION_REJECTED"
 SYNC_SCOPE_GUARD_REASON_CODES = {
     "account": "ACCOUNT_STATE_STALE",
     "positions": "POSITION_STATE_STALE",
@@ -1649,6 +1654,7 @@ def get_or_create_settings(session: Session) -> Setting:
         ai_model=defaults.openai_model,
         ai_call_interval_minutes=defaults.ai_call_interval_minutes,
         decision_cycle_interval_minutes=defaults.decision_cycle_interval_minutes,
+        ai_trading_decision_daily_token_budget=defaults.ai_trading_decision_daily_token_budget,
         ai_max_input_candles=defaults.ai_max_input_candles,
         ai_temperature=defaults.ai_temperature,
         openai_api_key_encrypted=encrypt_secret(defaults.openai_api_key, defaults.app_secret_seed),
@@ -2176,6 +2182,171 @@ def _latest_scheduler_timestamps_by_symbol(
     return resolved
 
 
+def _exchange_sync_failure_reason_code_from_text(value: object) -> str | None:
+    normalized = str(value or "").lower()
+    if not normalized:
+        return None
+    if "exchange_auth_permission_rejected" in normalized:
+        return EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+    if "binance error -2015" in normalized or "invalid api-key" in normalized:
+        return EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+    return None
+
+
+def _exchange_sync_outcome_reason_codes(outcome: dict[str, object]) -> list[str]:
+    codes: list[str] = []
+
+    def add(value: object) -> None:
+        code = str(value or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+
+    for key in ("reason_code", "last_failure_reason", "error_code"):
+        add(outcome.get(key))
+    for key in ("error", "message", "last_failure_message"):
+        add(_exchange_sync_failure_reason_code_from_text(outcome.get(key)))
+
+    sync_summary = outcome.get("sync_freshness_summary")
+    if isinstance(sync_summary, dict):
+        for scope_payload in sync_summary.values():
+            if not isinstance(scope_payload, dict):
+                continue
+            add(scope_payload.get("last_failure_reason"))
+            add(_exchange_sync_failure_reason_code_from_text(scope_payload.get("last_failure_reason")))
+            add(_exchange_sync_failure_reason_code_from_text(scope_payload.get("last_failure_message")))
+    return codes
+
+
+def _exchange_sync_scope_states(sync_freshness_summary: dict[str, object]) -> dict[str, dict[str, object]]:
+    states: dict[str, dict[str, object]] = {}
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        scope_payload = sync_freshness_summary.get(scope)
+        if not isinstance(scope_payload, dict):
+            continue
+        states[scope] = {
+            "status": scope_payload.get("status"),
+            "raw_status": scope_payload.get("raw_status"),
+            "stale": bool(scope_payload.get("stale")),
+            "incomplete": bool(scope_payload.get("incomplete")),
+            "last_sync_at": scope_payload.get("last_sync_at"),
+            "last_attempt_at": scope_payload.get("last_attempt_at"),
+            "last_failure_at": scope_payload.get("last_failure_at"),
+            "last_failure_reason": scope_payload.get("last_failure_reason"),
+        }
+    return states
+
+
+def _build_exchange_sync_diagnostics(
+    session: Session | None,
+    sync_freshness_summary: dict[str, object],
+) -> dict[str, object]:
+    active_reason_codes = _derive_sync_blocking_reasons(sync_freshness_summary)
+    active_permission_block = EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE in active_reason_codes
+    base: dict[str, object] = {
+        "workflow": EXCHANGE_SYNC_WORKFLOW,
+        "lookback_hours": EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS,
+        "status": "unknown",
+        "current_block_state": "unknown",
+        "currently_blocking_new_entries": bool(active_reason_codes),
+        "currently_permission_blocked": active_permission_block,
+        "active_reason_codes": active_reason_codes,
+        "scope_states": _exchange_sync_scope_states(sync_freshness_summary),
+        "failure_count_24h": 0,
+        "permission_failure_count_24h": 0,
+        "success_count_24h": 0,
+        "latest_status": None,
+        "latest_run_at": None,
+        "latest_success_at": None,
+        "latest_failure_at": None,
+        "latest_failure_reason_code": None,
+        "latest_failure_summary": None,
+        "recovered_after_latest_failure": False,
+        "recovery_basis": None,
+    }
+    if session is None:
+        return base
+
+    now = utcnow_naive()
+    cutoff = now - timedelta(hours=EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS)
+    rows = list(
+        session.scalars(
+            select(SchedulerRun)
+            .where(SchedulerRun.workflow == EXCHANGE_SYNC_WORKFLOW)
+            .where(SchedulerRun.created_at >= cutoff)
+            .order_by(desc(SchedulerRun.created_at))
+            .limit(500)
+        )
+    )
+    latest_run = rows[0] if rows else session.scalar(
+        select(SchedulerRun)
+        .where(SchedulerRun.workflow == EXCHANGE_SYNC_WORKFLOW)
+        .order_by(desc(SchedulerRun.created_at))
+        .limit(1)
+    )
+    success_rows = [row for row in rows if str(row.status).lower() in {"success", "completed"}]
+    failure_rows = [row for row in rows if str(row.status).lower() in {"failed", "error"}]
+    permission_failure_rows = [
+        row
+        for row in failure_rows
+        if EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+        in _exchange_sync_outcome_reason_codes(row.outcome if isinstance(row.outcome, dict) else {})
+    ]
+    latest_success = success_rows[0] if success_rows else None
+    latest_failure = failure_rows[0] if failure_rows else None
+    latest_failure_codes = (
+        _exchange_sync_outcome_reason_codes(latest_failure.outcome if isinstance(latest_failure.outcome, dict) else {})
+        if latest_failure is not None
+        else []
+    )
+    latest_failure_reason_code = latest_failure_codes[0] if latest_failure_codes else None
+    recovered_after_latest_failure = (
+        latest_success is not None
+        and latest_failure is not None
+        and latest_success.created_at > latest_failure.created_at
+        and not bool(active_reason_codes)
+    )
+    if bool(active_reason_codes):
+        status = "blocked"
+        current_block_state = "currently_blocked"
+    elif recovered_after_latest_failure:
+        status = "recovered"
+        current_block_state = "recovered"
+    elif latest_run is not None and str(latest_run.status).lower() in {"failed", "error"}:
+        status = "blocked"
+        current_block_state = "currently_blocked"
+    elif latest_success is not None:
+        status = "healthy"
+        current_block_state = "not_blocked"
+    else:
+        status = "unknown"
+        current_block_state = "unknown"
+
+    return {
+        **base,
+        "status": status,
+        "current_block_state": current_block_state,
+        "failure_count_24h": len(failure_rows),
+        "permission_failure_count_24h": len(permission_failure_rows),
+        "success_count_24h": len(success_rows),
+        "latest_status": latest_run.status if latest_run is not None else None,
+        "latest_run_at": latest_run.created_at if latest_run is not None else None,
+        "latest_success_at": latest_success.created_at if latest_success is not None else None,
+        "latest_failure_at": latest_failure.created_at if latest_failure is not None else None,
+        "latest_failure_reason_code": latest_failure_reason_code,
+        "latest_failure_summary": (
+            "Binance API auth, IP, or permission was rejected."
+            if latest_failure_reason_code == EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+            else None
+        ),
+        "recovered_after_latest_failure": recovered_after_latest_failure,
+        "recovery_basis": (
+            "latest_success_after_latest_failure_and_no_active_sync_block"
+            if recovered_after_latest_failure
+            else ("active_sync_reason_codes" if active_reason_codes else None)
+        ),
+    }
+
+
 def _latest_decision_activity_by_symbol(
     session: Session | None,
     *,
@@ -2386,6 +2557,26 @@ def _coerce_optional_bool(value: object) -> bool | None:
         if normalized in {"false", "0", "no", "n"}:
             return False
     return None
+
+
+def _exchange_can_trade_metadata(account_sync_detail: dict[str, object]) -> dict[str, object]:
+    exchange_can_trade = _coerce_optional_bool(account_sync_detail.get("exchange_can_trade"))
+    exchange_can_trade_known = bool(account_sync_detail.get("exchange_can_trade_known")) and exchange_can_trade is not None
+    if not exchange_can_trade_known:
+        return {
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": "unknown",
+            "exchange_can_trade_checked_at": None,
+        }
+    return {
+        "exchange_can_trade": exchange_can_trade,
+        "exchange_can_trade_known": True,
+        "exchange_can_trade_source": str(account_sync_detail.get("exchange_can_trade_source") or "account_sync"),
+        "exchange_can_trade_checked_at": _coerce_datetime(
+            account_sync_detail.get("exchange_can_trade_checked_at") or account_sync_detail.get("last_sync_at")
+        ),
+    }
 
 
 def get_live_approval_status(settings_row: Setting) -> tuple[bool, str, dict[str, object]]:
@@ -2890,10 +3081,11 @@ def _build_control_status_summary(
     risk_allowed: bool | None,
     reconciliation_summary: dict[str, object],
     drawdown_state_summary: dict[str, object],
+    exchange_sync_diagnostics: dict[str, object] | None = None,
 ) -> ControlStatusSummary:
     approval_window_open, approval_state, approval_detail = get_live_approval_status(settings_row)
     account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
-    exchange_can_trade = _coerce_optional_bool(account_sync_detail.get("exchange_can_trade"))
+    exchange_permission = _exchange_can_trade_metadata(account_sync_detail)
     rollout_mode = get_rollout_mode(settings_row)
     resolved_risk_allowed = risk_allowed
     if resolved_risk_allowed is None and current_cycle_blocked_reasons:
@@ -2904,7 +3096,10 @@ def _build_control_status_summary(
         + ([one_way_reason_code] if one_way_reason_code else [])
     )
     return ControlStatusSummary(
-        exchange_can_trade=exchange_can_trade,
+        exchange_can_trade=cast(bool | None, exchange_permission["exchange_can_trade"]),
+        exchange_can_trade_known=bool(exchange_permission["exchange_can_trade_known"]),
+        exchange_can_trade_source=str(exchange_permission["exchange_can_trade_source"]),
+        exchange_can_trade_checked_at=cast(datetime | None, exchange_permission["exchange_can_trade_checked_at"]),
         exchange_connectivity_state=exchange_connectivity_state,
         rollout_mode=rollout_mode,
         exchange_submit_allowed=rollout_mode_allows_exchange_submit(settings_row),
@@ -2926,6 +3121,7 @@ def _build_control_status_summary(
         blocked_reason_codes=_prioritize_blocked_reasons(blocked_reason_codes),
         degraded_reason_codes=_prioritize_blocked_reasons(degraded_reason_codes),
         protection_reason_codes=_prioritize_blocked_reasons(protection_reason_codes),
+        exchange_sync_diagnostics=dict(exchange_sync_diagnostics or {}),
         approval_control_blocked_reasons=approval_control_blocked_reasons,
         live_arm_disabled=bool(one_way_reason_message),
         live_arm_disable_reason_code=one_way_reason_code,
@@ -2981,6 +3177,7 @@ def build_operational_status_payload(
             current_detail=get_drawdown_state_detail(settings_row),
         )
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
+    exchange_sync_diagnostics = _build_exchange_sync_diagnostics(current_session, sync_summary)
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     if current_cycle_blocked_reasons:
         current_cycle_blocked_reasons = _filter_resolved_latest_blocked_reasons(
@@ -3123,7 +3320,8 @@ def build_operational_status_payload(
         missing_protection_symbols=missing_protection_symbols,
         missing_protection_items=missing_protection_items,
     )
-    exchange_can_trade = _coerce_optional_bool(get_sync_state_detail(settings_row).get("account", {}).get("exchange_can_trade"))
+    exchange_permission = _exchange_can_trade_metadata(get_sync_state_detail(settings_row).get("account", {}))
+    exchange_can_trade = cast(bool | None, exchange_permission["exchange_can_trade"])
     exchange_connectivity_state = resolve_exchange_connectivity_state(
         exchange_can_trade,
         reason_codes=reason_code_basis,
@@ -3141,6 +3339,7 @@ def build_operational_status_payload(
         risk_allowed=risk_allowed,
         reconciliation_summary=reconciliation_summary,
         drawdown_state_summary=drawdown_state_summary,
+        exchange_sync_diagnostics=exchange_sync_diagnostics,
     )
     operator_alert: dict[str, object] = {}
     if one_way_reason_message:
@@ -3187,6 +3386,7 @@ def build_operational_status_payload(
         latest_blocked_reasons=recent_blocked_reasons,
         account_sync_summary=account_summary,
         sync_freshness_summary=sync_summary,
+        exchange_sync_diagnostics=exchange_sync_diagnostics,
         market_freshness_summary=market_summary,
         protection_recovery_status=str(runtime["protection_recovery_status"]),
         protection_recovery_active=bool(runtime["protection_recovery_active"]),
@@ -3229,24 +3429,44 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     credentials = get_runtime_credentials(settings_row, defaults=defaults)
     current_session = object_session(settings_row)
     usage_metrics: AIUsageMetrics = build_ai_usage_metrics(current_session) if current_session is not None else {
+        "recent_ai_calls_today_kst": 0,
         "recent_ai_calls_24h": 0,
         "recent_ai_calls_7d": 0,
+        "recent_ai_calls_30d": 0,
+        "recent_ai_successes_today_kst": 0,
         "recent_ai_successes_24h": 0,
         "recent_ai_successes_7d": 0,
+        "recent_ai_successes_30d": 0,
+        "recent_ai_failures_today_kst": 0,
         "recent_ai_failures_24h": 0,
         "recent_ai_failures_7d": 0,
+        "recent_ai_failures_30d": 0,
+        "recent_ai_tokens_today_kst": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_24h": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_7d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_tokens_30d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_role_calls_today_kst": {},
         "recent_ai_role_calls_24h": {},
         "recent_ai_role_calls_7d": {},
+        "recent_ai_role_calls_30d": {},
+        "recent_ai_role_failures_today_kst": {},
         "recent_ai_role_failures_24h": {},
         "recent_ai_role_failures_7d": {},
+        "recent_ai_role_failures_30d": {},
         "recent_ai_failure_reasons": [],
         "observed_monthly_ai_calls_projection": 0,
         "observed_monthly_ai_calls_projection_breakdown": {},
+        "observed_monthly_ai_cost_projection_usd": None,
+        "observed_monthly_ai_net_projection_usd": None,
         "ai_protection_status": {},
+        "ai_cost_efficiency_summary": {},
+        "ai_usage_today_timezone": "Asia/Seoul",
+        "ai_usage_today_start_at": None,
+        "ai_usage_today_end_at": None,
+        "ai_usage_summary_today_kst": {},
         "ai_usage_summary_24h": {},
         "ai_usage_summary_7d": {},
+        "ai_usage_summary_30d": {},
     }
 
     rollout_mode = get_rollout_mode(settings_row)
@@ -3449,6 +3669,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         ai_model_routing_policy=build_ai_model_routing_policy(settings_row),
         ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
         decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
+        ai_trading_decision_daily_token_budget=settings_row.ai_trading_decision_daily_token_budget,
         ai_max_input_candles=settings_row.ai_max_input_candles,
         ai_temperature=settings_row.ai_temperature,
         binance_market_data_enabled=settings_row.binance_market_data_enabled,
@@ -3482,12 +3703,23 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         binance_api_key_configured=bool(credentials.binance_api_key),
         binance_api_secret_configured=bool(credentials.binance_api_secret),
         event_source_api_key_configured=bool(credentials.event_source_api_key),
+        recent_ai_calls_today_kst=usage_metrics["recent_ai_calls_today_kst"],
         recent_ai_calls_24h=usage_metrics["recent_ai_calls_24h"],
         recent_ai_calls_7d=usage_metrics["recent_ai_calls_7d"],
+        recent_ai_calls_30d=usage_metrics["recent_ai_calls_30d"],
+        recent_ai_successes_today_kst=usage_metrics["recent_ai_successes_today_kst"],
         recent_ai_successes_24h=usage_metrics["recent_ai_successes_24h"],
         recent_ai_successes_7d=usage_metrics["recent_ai_successes_7d"],
+        recent_ai_successes_30d=usage_metrics["recent_ai_successes_30d"],
+        recent_ai_failures_today_kst=usage_metrics["recent_ai_failures_today_kst"],
         recent_ai_failures_24h=usage_metrics["recent_ai_failures_24h"],
         recent_ai_failures_7d=usage_metrics["recent_ai_failures_7d"],
+        recent_ai_failures_30d=usage_metrics["recent_ai_failures_30d"],
+        recent_ai_tokens_today_kst={
+            "prompt_tokens": usage_metrics["recent_ai_tokens_today_kst"]["prompt_tokens"],
+            "completion_tokens": usage_metrics["recent_ai_tokens_today_kst"]["completion_tokens"],
+            "total_tokens": usage_metrics["recent_ai_tokens_today_kst"]["total_tokens"],
+        },
         recent_ai_tokens_24h={
             "prompt_tokens": usage_metrics["recent_ai_tokens_24h"]["prompt_tokens"],
             "completion_tokens": usage_metrics["recent_ai_tokens_24h"]["completion_tokens"],
@@ -3498,16 +3730,39 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
             "completion_tokens": usage_metrics["recent_ai_tokens_7d"]["completion_tokens"],
             "total_tokens": usage_metrics["recent_ai_tokens_7d"]["total_tokens"],
         },
+        recent_ai_tokens_30d={
+            "prompt_tokens": usage_metrics["recent_ai_tokens_30d"]["prompt_tokens"],
+            "completion_tokens": usage_metrics["recent_ai_tokens_30d"]["completion_tokens"],
+            "total_tokens": usage_metrics["recent_ai_tokens_30d"]["total_tokens"],
+        },
+        recent_ai_role_calls_today_kst=usage_metrics["recent_ai_role_calls_today_kst"],
         recent_ai_role_calls_24h=usage_metrics["recent_ai_role_calls_24h"],
         recent_ai_role_calls_7d=usage_metrics["recent_ai_role_calls_7d"],
+        recent_ai_role_calls_30d=usage_metrics["recent_ai_role_calls_30d"],
+        recent_ai_role_failures_today_kst=usage_metrics["recent_ai_role_failures_today_kst"],
         recent_ai_role_failures_24h=usage_metrics["recent_ai_role_failures_24h"],
         recent_ai_role_failures_7d=usage_metrics["recent_ai_role_failures_7d"],
+        recent_ai_role_failures_30d=usage_metrics["recent_ai_role_failures_30d"],
         recent_ai_failure_reasons=usage_metrics["recent_ai_failure_reasons"],
         observed_monthly_ai_calls_projection=usage_metrics["observed_monthly_ai_calls_projection"],
         observed_monthly_ai_calls_projection_breakdown=usage_metrics[
             "observed_monthly_ai_calls_projection_breakdown"
         ],
+        observed_monthly_ai_cost_projection_usd=usage_metrics[
+            "observed_monthly_ai_cost_projection_usd"
+        ],
+        observed_monthly_ai_net_projection_usd=usage_metrics[
+            "observed_monthly_ai_net_projection_usd"
+        ],
         ai_protection_status=usage_metrics["ai_protection_status"],
+        ai_cost_efficiency_summary=usage_metrics["ai_cost_efficiency_summary"],
+        ai_usage_today_timezone=usage_metrics["ai_usage_today_timezone"],
+        ai_usage_today_start_at=usage_metrics["ai_usage_today_start_at"],
+        ai_usage_today_end_at=usage_metrics["ai_usage_today_end_at"],
+        ai_usage_summary_today_kst=usage_metrics["ai_usage_summary_today_kst"],
+        ai_usage_summary_24h=usage_metrics["ai_usage_summary_24h"],
+        ai_usage_summary_7d=usage_metrics["ai_usage_summary_7d"],
+        ai_usage_summary_30d=usage_metrics["ai_usage_summary_30d"],
         manual_ai_guard_minutes=manual_ai_guard_minutes(settings_row),
     )
     return payload.model_dump(mode="json")
@@ -3671,6 +3926,7 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         ai_model_routing_policy=build_ai_model_routing_policy(settings_row),
         ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
         decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
+        ai_trading_decision_daily_token_budget=settings_row.ai_trading_decision_daily_token_budget,
         ai_max_input_candles=settings_row.ai_max_input_candles,
         ai_temperature=settings_row.ai_temperature,
         binance_market_data_enabled=settings_row.binance_market_data_enabled,
@@ -3718,24 +3974,44 @@ def serialize_settings_cadences(settings_row: Setting) -> dict[str, object]:
 def serialize_settings_ai_usage(settings_row: Setting) -> dict[str, object]:
     current_session = object_session(settings_row)
     usage_metrics: AIUsageMetrics = build_ai_usage_metrics(current_session) if current_session is not None else {
+        "recent_ai_calls_today_kst": 0,
         "recent_ai_calls_24h": 0,
         "recent_ai_calls_7d": 0,
+        "recent_ai_calls_30d": 0,
+        "recent_ai_successes_today_kst": 0,
         "recent_ai_successes_24h": 0,
         "recent_ai_successes_7d": 0,
+        "recent_ai_successes_30d": 0,
+        "recent_ai_failures_today_kst": 0,
         "recent_ai_failures_24h": 0,
         "recent_ai_failures_7d": 0,
+        "recent_ai_failures_30d": 0,
+        "recent_ai_tokens_today_kst": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_24h": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_7d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_tokens_30d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_role_calls_today_kst": {},
         "recent_ai_role_calls_24h": {},
         "recent_ai_role_calls_7d": {},
+        "recent_ai_role_calls_30d": {},
+        "recent_ai_role_failures_today_kst": {},
         "recent_ai_role_failures_24h": {},
         "recent_ai_role_failures_7d": {},
+        "recent_ai_role_failures_30d": {},
         "recent_ai_failure_reasons": [],
         "observed_monthly_ai_calls_projection": 0,
         "observed_monthly_ai_calls_projection_breakdown": {},
+        "observed_monthly_ai_cost_projection_usd": None,
+        "observed_monthly_ai_net_projection_usd": None,
         "ai_protection_status": {},
+        "ai_cost_efficiency_summary": {},
+        "ai_usage_today_timezone": "Asia/Seoul",
+        "ai_usage_today_start_at": None,
+        "ai_usage_today_end_at": None,
+        "ai_usage_summary_today_kst": {},
         "ai_usage_summary_24h": {},
         "ai_usage_summary_7d": {},
+        "ai_usage_summary_30d": {},
     }
     payload = AppSettingsAIUsageResponse(
         **usage_metrics,
@@ -3918,6 +4194,8 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.ai_model = payload.ai_model
     row.ai_call_interval_minutes = payload.ai_call_interval_minutes
     row.decision_cycle_interval_minutes = payload.decision_cycle_interval_minutes
+    if "ai_trading_decision_daily_token_budget" in fields_set:
+        row.ai_trading_decision_daily_token_budget = payload.ai_trading_decision_daily_token_budget
     if "execution_risk_profile_settings" in fields_set:
         _write_execution_risk_profile_policy(
             row,

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Lock, Thread
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, cast, desc, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from trading_mvp.config import get_settings
 from trading_mvp.models import (
@@ -72,9 +75,13 @@ from trading_mvp.services.runtime_state import (
     derive_protection_reason_codes,
     summarize_runtime_state,
 )
-from trading_mvp.services.service_gate import active_pending_entry_plan_statement
+from trading_mvp.services.service_gate import (
+    active_pending_entry_plan_statement,
+    build_service_switch_gate_snapshot,
+)
 from trading_mvp.services.settings import (
     AI_MARKET_SETTINGS_ADVISOR_DETAIL_KEY,
+    RISK_STATUS_ONLY_REASON_CODES,
     SAFE_PROFILE_SELECTOR_DETAIL_KEY,
     build_event_operator_control_payload,
     build_operational_status_payload,
@@ -121,12 +128,29 @@ OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT = 900
 RECENT_FILL_LIMIT = 4
 OPERATOR_COMPACT_VIEWS = {"market", "scheduler", "decision", "risk"}
+PROFITABILITY_DASHBOARD_CACHE_TTL_SECONDS = 120.0
+PROFITABILITY_DASHBOARD_STALE_SECONDS = 900.0
+PROFITABILITY_DASHBOARD_REFRESH_DEBOUNCE_SECONDS = 30.0
 AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
     "GROSS_EXPOSURE_LIMIT_REACHED",
     "DIRECTIONAL_BIAS_LIMIT_REACHED",
     "LARGEST_POSITION_LIMIT_REACHED",
     "SAME_TIER_CONCENTRATION_LIMIT_REACHED",
 }
+OPERATOR_CANDIDATE_HOLD_REASON_LIMIT = 5
+
+
+@dataclass
+class _ProfitabilityDashboardCacheEntry:
+    payload: DashboardProfitabilityResponse
+    stored_at: float
+    refresh_started_at: float | None = None
+
+
+_profitability_dashboard_cache: dict[tuple[object, ...], _ProfitabilityDashboardCacheEntry] = {}
+_profitability_dashboard_refresh_started_at: dict[tuple[object, ...], float] = {}
+_profitability_dashboard_cache_lock = Lock()
+
 AI_REVIEW_TYPE_BY_TRIGGER_REASON = {
     "entry_candidate_event": "entry_candidate_review",
     "breakout_exception_event": "breakout_exception_review",
@@ -197,6 +221,7 @@ DECISION_COMPACT_OUTPUT_KEYS = (
     "abstain_reason_codes",
     "fallback_reason_codes",
     "provider_status",
+    "psychology_scene_review",
     "explanation_short",
 )
 DECISION_COMPACT_TRIGGER_KEYS = (
@@ -228,6 +253,7 @@ DECISION_COMPACT_METADATA_KEYS = (
     "last_ai_skip_reason",
     "trigger_deduped",
     "trigger_fingerprint",
+    "psychology_scene_review",
 )
 RISK_COMPACT_PAYLOAD_KEYS = (
     "allowed",
@@ -281,6 +307,7 @@ AGENT_COMPACT_OUTPUT_KEYS = (
     "abstain_reason_codes",
     "rationale_codes",
     "provider_status",
+    "psychology_scene_review",
     "explanation_short",
     "items",
 )
@@ -295,6 +322,35 @@ AGENT_COMPACT_METADATA_KEYS = (
     "trigger_deduped",
     "trigger_fingerprint",
     "active_position_prompt_route_context",
+    "psychology_scene_review",
+)
+PSYCHOLOGY_SCENE_REVIEW_KEYS = (
+    "market_psychology",
+    "psychology_bias",
+    "scene_scenario",
+    "scene_type",
+    "entry_choreography",
+    "preferred_entry_timing",
+    "confirmation_cues",
+    "invalidation_cues",
+    "reason_codes",
+    "summary",
+    "execution_boundary",
+)
+POSITION_EXIT_REVIEW_KEYS = (
+    "recommendation",
+    "confidence",
+    "profit_take_bias",
+    "runner_state",
+    "exit_urgency",
+    "rationale",
+    "summary",
+    "reason_codes",
+    "profit_protection_cues",
+    "runner_invalidation_cues",
+    "data_quality_notes",
+    "advisory_only",
+    "execution_boundary",
 )
 ADAPTIVE_SIGNAL_SUMMARY_KEYS = (
     "status",
@@ -573,11 +629,39 @@ def _as_string_list(value: object) -> list[str]:
     return [str(item) for item in value if item not in {None, ""}]
 
 
+def _as_non_empty_string(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingEntryPlanSnapshot:
     if row is None:
         return PendingEntryPlanSnapshot()
     metadata = dict(row.metadata_json) if isinstance(row.metadata_json, dict) else {}
     trigger_details = metadata.get("trigger_details")
+    confirmation_tracking = _as_dict(metadata.get("last_confirmation_tracking"))
+    confirmation_follow_up_snapshot = _as_dict(metadata.get("confirmation_follow_up_snapshot"))
+    if not confirmation_follow_up_snapshot:
+        confirmation_follow_up_snapshot = _as_dict(confirmation_tracking.get("follow_up_snapshot"))
+    confirmation_failed_reason = _as_non_empty_string(confirmation_tracking.get("confirmation_failed_reason"))
+    plan_cancel_reason = _as_non_empty_string(confirmation_tracking.get("plan_cancel_reason"))
+    watcher_reason_codes = list(
+        dict.fromkeys(
+            [
+                *_as_string_list(metadata.get("last_watch_blocked_reason_codes")),
+                *_as_string_list(confirmation_tracking.get("blocked_reason_codes")),
+                *(
+                    [confirmation_failed_reason]
+                    if confirmation_failed_reason
+                    else []
+                ),
+                *([plan_cancel_reason] if plan_cancel_reason else []),
+                *([row.canceled_reason] if row.canceled_reason else []),
+            ]
+        )
+    )
     expiry_context = pending_entry_expiry_context(row.expires_at)
     return PendingEntryPlanSnapshot(
         plan_id=row.id,
@@ -612,10 +696,20 @@ def _build_pending_entry_plan_snapshot(row: PendingEntryPlan | None) -> PendingE
         triggered_at=row.triggered_at,
         canceled_at=row.canceled_at,
         canceled_reason=row.canceled_reason,
+        watcher_reason_codes=watcher_reason_codes,
+        confirmation_failed_reason=confirmation_failed_reason,
+        plan_cancel_reason=plan_cancel_reason,
+        confirmation_quality_state=_as_non_empty_string(confirmation_tracking.get("quality_state")),
+        confirmation_quality_reason=_as_non_empty_string(confirmation_tracking.get("quality_reason")),
+        confirmation_quality_score=_as_optional_float(confirmation_tracking.get("quality_score")),
+        confirmation_quality_threshold=_as_optional_float(confirmation_tracking.get("quality_threshold")),
         idempotency_key=row.idempotency_key,
         last_watch_at=_as_datetime(metadata.get("last_watch_at")),
         last_watch_snapshot_id=_as_int(metadata.get("last_watch_snapshot_id"), default=0) or None,
+        psychology_scene_review=_psychology_scene_review_payload(metadata.get("psychology_scene_review")),
         trigger_details=dict(trigger_details) if isinstance(trigger_details, dict) else {},
+        confirmation_tracking=confirmation_tracking,
+        confirmation_follow_up_snapshot=confirmation_follow_up_snapshot,
     )
 
 
@@ -1473,6 +1567,22 @@ def _as_dict(value: object) -> dict[str, Any]:
     return {str(key): item for key, item in value.items()}
 
 
+def _psychology_scene_review_payload(value: object) -> dict[str, Any] | None:
+    payload = _as_dict(value)
+    if not payload:
+        return None
+    compact = {key: payload[key] for key in PSYCHOLOGY_SCENE_REVIEW_KEYS if key in payload}
+    return compact or None
+
+
+def _position_exit_review_payload(value: object) -> dict[str, Any] | None:
+    payload = _as_dict(value)
+    if not payload:
+        return None
+    compact = {key: payload[key] for key in POSITION_EXIT_REVIEW_KEYS if key in payload}
+    return compact or None
+
+
 def _as_optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None
@@ -2315,6 +2425,30 @@ def _compact_risk_reason_evidence(value: object) -> dict[str, Any]:
     )
     if symbol_performance:
         compact["symbol_recent_performance_gate"] = symbol_performance
+    decision_bucket_performance = _compact_dict(
+        source.get("decision_bucket_recent_performance_gate"),
+        allowed_keys=(
+            "applied",
+            "status",
+            "reason_codes",
+            "bucket_key",
+            "symbol",
+            "direction",
+            "regime",
+            "lookback_days",
+            "sample_limit",
+            "minimum_fill_count",
+            "fill_count",
+            "decision_count",
+            "gross_realized_pnl",
+            "fee_total",
+            "net_pnl_after_fees",
+            "expectancy_after_fees",
+            "comparison",
+        ),
+    )
+    if decision_bucket_performance:
+        compact["decision_bucket_recent_performance_gate"] = decision_bucket_performance
     portfolio_gate = _compact_dict(
         source.get("portfolio_exposure_gate"),
         allowed_keys=(
@@ -2560,21 +2694,39 @@ def classify_audit_event(
     return AUDIT_CATEGORY_HEALTH_SYSTEM
 
 
-def get_overview(session: Session) -> OverviewResponse:
+def get_overview(
+    session: Session,
+    *,
+    include_latest_decision_snapshot: bool = True,
+    include_active_entry_plans: bool = True,
+) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
     settings_payload = serialize_settings_runtime_summary(settings_row)
     runtime_state = summarize_runtime_state(settings_row)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
-    latest_decision = session.scalar(
-        select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1)
+    latest_decision = (
+        session.scalar(
+            select(AgentRun).where(AgentRun.role == "trading_decision").order_by(desc(AgentRun.created_at)).limit(1)
+        )
+        if include_latest_decision_snapshot
+        else None
+    )
+    latest_decision_at = (
+        latest_decision.created_at
+        if latest_decision is not None
+        else session.scalar(select(func.max(AgentRun.created_at)).where(AgentRun.role == "trading_decision"))
     )
     latest_risk = session.scalar(select(RiskCheck).order_by(desc(RiskCheck.created_at)).limit(1))
-    active_entry_plans = list(
-        session.scalars(
-            active_pending_entry_plan_statement()
-            .order_by(desc(PendingEntryPlan.created_at))
-            .limit(20)
+    active_entry_plans = (
+        list(
+            session.scalars(
+                active_pending_entry_plan_statement()
+                .order_by(desc(PendingEntryPlan.created_at))
+                .limit(20)
+            )
         )
+        if include_active_entry_plans
+        else []
     )
     latest_pnl = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at)).limit(1))
     open_positions = list(session.scalars(select(Position).where(Position.status == "open", Position.mode == "live")))
@@ -2614,15 +2766,23 @@ def get_overview(session: Session) -> OverviewResponse:
     adaptive_protection_summary = _as_dict(settings_payload.get("adaptive_protection_summary", {}))
     adaptive_signal_summary = _compact_adaptive_signal_summary(settings_payload.get("adaptive_signal_summary", {}))
     position_management_summary = _as_dict(settings_payload.get("position_management_summary", {}))
-    current_market_refresh_at = _latest_market_refresh_at_for_decision(
-        session,
-        latest_decision,
-        fallback_summary=operational_status.market_freshness_summary,
+    current_market_refresh_at = (
+        _latest_market_refresh_at_for_decision(
+            session,
+            latest_decision,
+            fallback_summary=operational_status.market_freshness_summary,
+        )
+        if include_latest_decision_snapshot
+        else _as_datetime(operational_status.market_freshness_summary.get("snapshot_at"))
     )
-    last_decision_reference = _annotate_decision_reference(
-        _build_decision_reference(latest_decision),
-        current_market_refresh_at=current_market_refresh_at,
-        current_sync_freshness_summary=operational_status.sync_freshness_summary,
+    last_decision_reference = (
+        _annotate_decision_reference(
+            _build_decision_reference(latest_decision),
+            current_market_refresh_at=current_market_refresh_at,
+            current_sync_freshness_summary=operational_status.sync_freshness_summary,
+        )
+        if include_latest_decision_snapshot
+        else DecisionReferencePayload()
     )
     return OverviewResponse(
         mode=str(settings_payload["mode"]),
@@ -2642,7 +2802,7 @@ def get_overview(session: Session) -> OverviewResponse:
         ],
         operational_status=operational_status,
         last_market_refresh_at=current_market_refresh_at,
-        last_decision_at=latest_decision.created_at if latest_decision is not None else None,
+        last_decision_at=latest_decision_at,
         last_decision_snapshot_at=last_decision_reference.market_snapshot_at,
         last_decision_reference=last_decision_reference,
         open_positions=len(open_positions),
@@ -2673,6 +2833,7 @@ def get_overview(session: Session) -> OverviewResponse:
         pnl_summary=pnl_summary,
         account_sync_summary=operational_status.account_sync_summary,
         sync_freshness_summary=operational_status.sync_freshness_summary,
+        exchange_sync_diagnostics=operational_status.exchange_sync_diagnostics,
         market_freshness_summary=operational_status.market_freshness_summary,
         exposure_summary=exposure_summary,
         execution_policy_summary=execution_policy_summary,
@@ -3166,6 +3327,135 @@ def get_market_chart_markers(
     return deduped
 
 
+def _latest_risk_rows_by_decision_id(
+    session: Session,
+    decision_ids: Sequence[int],
+) -> dict[int, RiskCheck]:
+    if not decision_ids:
+        return {}
+    latest: dict[int, RiskCheck] = {}
+    rows = list(
+        session.scalars(
+            select(RiskCheck)
+            .where(RiskCheck.decision_run_id.in_(decision_ids))
+            .order_by(desc(RiskCheck.created_at), desc(RiskCheck.id))
+        )
+    )
+    for row in rows:
+        if row.decision_run_id is None:
+            continue
+        latest.setdefault(int(row.decision_run_id), row)
+    return latest
+
+
+def _decision_quality_payload(
+    fact: DecisionPerformanceFact | None,
+    risk_row: RiskCheck | None,
+) -> dict[str, object]:
+    fact_metadata = _as_dict(fact.telemetry_metadata) if fact is not None else {}
+    risk_payload = _as_dict(risk_row.payload if risk_row is not None else {})
+    risk_debug = _as_dict(risk_payload.get("debug_payload"))
+    expected_cost_gate = _as_dict(risk_debug.get("expected_cost_gate"))
+    risk_reason_codes = _as_string_list(risk_row.reason_codes if risk_row is not None else [])
+    return {
+        "ai_actionable": bool(fact.ai_actionable) if fact is not None else False,
+        "ai_blocked_by_risk": bool(fact.ai_blocked_by_risk) if fact is not None else False,
+        "ai_led_to_order": bool(fact.ai_led_to_order) if fact is not None else False,
+        "ai_led_to_fill": bool(fact.ai_led_to_fill) if fact is not None else False,
+        "ai_usefulness_status": fact.ai_usefulness_status if fact is not None else "unknown",
+        "ai_known_cost_usd": fact.ai_known_cost_usd if fact is not None else None,
+        "ai_total_tokens": fact.ai_total_tokens if fact is not None else None,
+        "expected_edge_bps": (
+            fact.expected_edge_bps
+            if fact is not None and fact.expected_edge_bps is not None
+            else expected_cost_gate.get("expected_edge_bps") or expected_cost_gate.get("expected_profit_bps")
+        ),
+        "expected_total_cost_bps": (
+            fact.expected_total_cost_bps
+            if fact is not None and fact.expected_total_cost_bps is not None
+            else expected_cost_gate.get("expected_total_cost_bps")
+        ),
+        "net_expected_edge_bps": (
+            fact.net_expected_edge_bps
+            if fact is not None and fact.net_expected_edge_bps is not None
+            else expected_cost_gate.get("net_expected_edge_bps")
+        ),
+        "pnl_data_confidence": fact.pnl_data_confidence if fact is not None else "unknown",
+        "risk_checked": risk_row is not None,
+        "risk_allowed": bool(risk_row.allowed) if risk_row is not None else None,
+        "risk_reason_codes": risk_reason_codes,
+        "expected_cost_gate_status": expected_cost_gate.get("status"),
+        "scene_review": _as_dict(fact_metadata.get("scene_review")),
+        "scene_plan_outcome": _as_dict(fact_metadata.get("scene_plan_outcome")),
+        "expected_cost_gate": _compact_dict(
+            expected_cost_gate,
+            allowed_keys=(
+                "status",
+                "expected_profit_bps",
+                "expected_edge_bps",
+                "expected_total_cost_bps",
+                "net_expected_edge_bps",
+                "cost_to_edge_ratio",
+                "rr_after_estimated_cost",
+                "required_order_policy",
+                "allow_market_fallback",
+            ),
+        ),
+    }
+
+
+def _decision_quality_payloads(
+    session: Session,
+    decision_ids: Sequence[int],
+) -> dict[int, dict[str, object]]:
+    if not decision_ids:
+        return {}
+    facts = list(
+        session.scalars(
+            select(DecisionPerformanceFact).where(
+                DecisionPerformanceFact.decision_run_id.in_(decision_ids)
+            )
+        )
+    )
+    facts_by_decision_id = {int(fact.decision_run_id): fact for fact in facts}
+    risk_by_decision_id = _latest_risk_rows_by_decision_id(session, decision_ids)
+    return {
+        decision_id: _decision_quality_payload(
+            facts_by_decision_id.get(decision_id),
+            risk_by_decision_id.get(decision_id),
+        )
+        for decision_id in decision_ids
+    }
+
+
+def _psychology_scene_performance_payload(fact: DecisionPerformanceFact | None) -> dict[str, object]:
+    if fact is None:
+        return {}
+    metadata = _as_dict(fact.telemetry_metadata)
+    scene_review = _as_dict(metadata.get("scene_review"))
+    scene_plan_outcome = _as_dict(metadata.get("scene_plan_outcome"))
+    if not scene_review and not scene_plan_outcome:
+        return {}
+    return {
+        "scene_type": scene_review.get("scene_type"),
+        "psychology_bias": scene_review.get("psychology_bias"),
+        "preferred_entry_timing": scene_review.get("preferred_entry_timing"),
+        "outcome_bucket": scene_plan_outcome.get("outcome_bucket"),
+        "pending_plan_count": scene_plan_outcome.get("pending_plan_count", 0),
+        "latest_plan_status": scene_plan_outcome.get("latest_plan_status"),
+        "latest_canceled_reason": scene_plan_outcome.get("latest_canceled_reason"),
+        "plan_triggered": bool(scene_plan_outcome.get("plan_triggered", False)),
+        "plan_canceled": bool(scene_plan_outcome.get("plan_canceled", False)),
+        "plan_confirm_quality_low_count": scene_plan_outcome.get("plan_confirm_quality_low_count", 0),
+        "plan_invalidated_count": scene_plan_outcome.get("plan_invalidated_count", 0),
+        "order_observed": bool(scene_plan_outcome.get("order_observed", False)),
+        "fill_observed": bool(scene_plan_outcome.get("fill_observed", False)),
+        "order_count": scene_plan_outcome.get("order_count", 0),
+        "fill_count": scene_plan_outcome.get("fill_count", 0),
+        "reason_codes": _as_string_list(scene_plan_outcome.get("reason_codes")),
+    }
+
+
 def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -> list[dict[str, object]]:
     rows = list(
         session.scalars(
@@ -3174,6 +3464,10 @@ def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -
             .order_by(desc(AgentRun.created_at))
             .limit(limit)
         )
+    )
+    decision_quality_by_id = _decision_quality_payloads(
+        session,
+        [int(row.id) for row in rows if row.id is not None],
     )
     payloads: list[dict[str, object]] = []
     for row in rows:
@@ -3186,6 +3480,7 @@ def get_decisions(session: Session, limit: int = 50, *, compact: bool = False) -
         payload["ai_skip_reason"] = payload["last_ai_skip_reason"]
         payload["ai_trigger_summary"] = _ai_trigger_summary_from_decision_row(row)
         payload["market_signal_summary"] = _market_signal_summary_from_decision_row(row)
+        payload["decision_quality"] = decision_quality_by_id.get(int(row.id), {}) if row.id is not None else {}
         payloads.append(payload)
     return payloads
 
@@ -3801,7 +4096,174 @@ def _top_execution_profiles(window_payload: dict[str, object], *, limit: int = 5
     )[:limit]
 
 
-def get_profitability_dashboard(
+def _profitability_dashboard_db_identity(session: Session) -> str:
+    bind = session.get_bind()
+    if bind is None:
+        return "unknown"
+    url = getattr(bind, "url", None)
+    if url is None:
+        return repr(bind)
+    try:
+        return str(url.render_as_string(hide_password=True))
+    except Exception:
+        return str(url)
+
+
+def _profitability_dashboard_cache_key(
+    session: Session,
+    *,
+    performance_window_specs: Sequence[tuple[str, int]] | None,
+    cost_window_specs: Sequence[tuple[str, int | None]] | None,
+) -> tuple[object, ...]:
+    return (
+        _profitability_dashboard_db_identity(session),
+        tuple(performance_window_specs or ()),
+        tuple(cost_window_specs or PROFITABILITY_COST_WINDOW_SPECS),
+    )
+
+
+def _copy_profitability_dashboard_payload(
+    payload: DashboardProfitabilityResponse,
+) -> DashboardProfitabilityResponse:
+    return payload.model_copy(deep=True)
+
+
+def _store_profitability_dashboard_cache(
+    cache_key: tuple[object, ...],
+    payload: DashboardProfitabilityResponse,
+) -> None:
+    with _profitability_dashboard_cache_lock:
+        _profitability_dashboard_cache[cache_key] = _ProfitabilityDashboardCacheEntry(
+            payload=_copy_profitability_dashboard_payload(payload),
+            stored_at=monotonic(),
+        )
+
+
+def _finish_profitability_dashboard_refresh(cache_key: tuple[object, ...]) -> None:
+    with _profitability_dashboard_cache_lock:
+        _profitability_dashboard_refresh_started_at.pop(cache_key, None)
+        cached = _profitability_dashboard_cache.get(cache_key)
+        if cached is not None:
+            cached.refresh_started_at = None
+
+
+def _build_profitability_dashboard_pending_payload(
+    session: Session,
+    *,
+    overview: OverviewResponse | None = None,
+) -> DashboardProfitabilityResponse:
+    thin_overview = overview or get_overview(
+        session,
+        include_latest_decision_snapshot=False,
+        include_active_entry_plans=False,
+    )
+    return DashboardProfitabilityResponse(
+        generated_at=utcnow_naive(),
+        operating_state=thin_overview.operating_state,
+        guard_mode_reason_code=thin_overview.guard_mode_reason_code,
+        guard_mode_reason_message=thin_overview.guard_mode_reason_message,
+        adaptive_signal_summary=thin_overview.adaptive_signal_summary,
+        latest_decision=thin_overview.latest_decision,
+        latest_risk=thin_overview.latest_risk,
+        windows=[],
+        entry_quality={},
+        cost_breakdowns=[],
+        execution_windows=[],
+        hold_blocked_summary=DashboardHoldBlockedSummary(
+            latest_blocked_reasons=thin_overview.latest_blocked_reasons,
+            auto_resume_blockers=thin_overview.auto_resume_last_blockers,
+            guard_mode_reason_code=thin_overview.guard_mode_reason_code,
+            guard_mode_reason_message=thin_overview.guard_mode_reason_message,
+        ),
+        limited_live_readiness=LimitedLiveReadinessReport(),
+    )
+
+
+def _rebuild_profitability_dashboard_cache(
+    *,
+    bind: Any,
+    cache_key: tuple[object, ...],
+    performance_window_specs: tuple[tuple[str, int], ...] | None,
+    cost_window_specs: tuple[tuple[str, int | None], ...] | None,
+) -> None:
+    try:
+        refresh_session_factory = sessionmaker(
+            bind=bind,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
+        with refresh_session_factory() as refresh_session:
+            payload = _build_profitability_dashboard_uncached(
+                refresh_session,
+                performance_window_specs=performance_window_specs,
+                cost_window_specs=cost_window_specs,
+            )
+            _store_profitability_dashboard_cache(cache_key, payload)
+    finally:
+        _finish_profitability_dashboard_refresh(cache_key)
+
+
+def _start_profitability_dashboard_background_refresh(
+    session: Session,
+    *,
+    performance_window_specs: Sequence[tuple[str, int]] | None,
+    cost_window_specs: Sequence[tuple[str, int | None]] | None,
+) -> bool:
+    cache_key = _profitability_dashboard_cache_key(
+        session,
+        performance_window_specs=performance_window_specs,
+        cost_window_specs=cost_window_specs,
+    )
+    now_monotonic = monotonic()
+    with _profitability_dashboard_cache_lock:
+        cached = _profitability_dashboard_cache.get(cache_key)
+        refresh_started_at = (
+            cached.refresh_started_at
+            if cached is not None
+            else _profitability_dashboard_refresh_started_at.get(cache_key)
+        )
+        if refresh_started_at is not None and (
+            now_monotonic - refresh_started_at < PROFITABILITY_DASHBOARD_REFRESH_DEBOUNCE_SECONDS
+        ):
+            return False
+        if cached is None:
+            _profitability_dashboard_refresh_started_at[cache_key] = now_monotonic
+        else:
+            cached.refresh_started_at = now_monotonic
+
+    bind = session.get_bind()
+    if bind is None:
+        _finish_profitability_dashboard_refresh(cache_key)
+        return False
+
+    Thread(
+        target=_rebuild_profitability_dashboard_cache,
+        kwargs={
+            "bind": bind,
+            "cache_key": cache_key,
+            "performance_window_specs": tuple(performance_window_specs) if performance_window_specs is not None else None,
+            "cost_window_specs": tuple(cost_window_specs) if cost_window_specs is not None else None,
+        },
+        daemon=True,
+        name="profitability-dashboard-refresh",
+    ).start()
+    return True
+
+
+def warm_profitability_dashboard_cache(session_factory: Callable[[], Session]) -> bool:
+    try:
+        with session_factory() as session:
+            return _start_profitability_dashboard_background_refresh(
+                session,
+                performance_window_specs=None,
+                cost_window_specs=None,
+            )
+    except Exception:
+        return False
+
+
+def _build_profitability_dashboard_uncached(
     session: Session,
     *,
     overview: OverviewResponse | None = None,
@@ -3943,6 +4405,69 @@ def get_profitability_dashboard(
     )
 
 
+def get_profitability_dashboard(
+    session: Session,
+    *,
+    overview: OverviewResponse | None = None,
+    performance_window_specs: Sequence[tuple[str, int]] | None = None,
+    cost_window_specs: Sequence[tuple[str, int | None]] | None = None,
+    use_cache: bool = False,
+    allow_stale: bool = True,
+) -> DashboardProfitabilityResponse:
+    if not use_cache:
+        return _build_profitability_dashboard_uncached(
+            session,
+            overview=overview,
+            performance_window_specs=performance_window_specs,
+            cost_window_specs=cost_window_specs,
+        )
+
+    cache_key = _profitability_dashboard_cache_key(
+        session,
+        performance_window_specs=performance_window_specs,
+        cost_window_specs=cost_window_specs,
+    )
+    now_monotonic = monotonic()
+    stale_payload: DashboardProfitabilityResponse | None = None
+    with _profitability_dashboard_cache_lock:
+        cached = _profitability_dashboard_cache.get(cache_key)
+        cache_age_seconds = (
+            now_monotonic - cached.stored_at
+            if cached is not None and cached.stored_at > 0
+            else None
+        )
+        if cached is not None and cache_age_seconds is not None:
+            if cache_age_seconds <= PROFITABILITY_DASHBOARD_CACHE_TTL_SECONDS:
+                return _copy_profitability_dashboard_payload(cached.payload)
+            if allow_stale and cache_age_seconds <= PROFITABILITY_DASHBOARD_STALE_SECONDS:
+                stale_payload = _copy_profitability_dashboard_payload(cached.payload)
+
+    if stale_payload is not None:
+        _start_profitability_dashboard_background_refresh(
+            session,
+            performance_window_specs=performance_window_specs,
+            cost_window_specs=cost_window_specs,
+        )
+        return stale_payload
+
+    if allow_stale and cached is None:
+        _start_profitability_dashboard_background_refresh(
+            session,
+            performance_window_specs=performance_window_specs,
+            cost_window_specs=cost_window_specs,
+        )
+        return _build_profitability_dashboard_pending_payload(session, overview=overview)
+
+    payload = _build_profitability_dashboard_uncached(
+        session,
+        overview=overview,
+        performance_window_specs=performance_window_specs,
+        cost_window_specs=cost_window_specs,
+    )
+    _store_profitability_dashboard_cache(cache_key, payload)
+    return payload
+
+
 def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     if row is None:
         return OperatorDecisionSnapshot()
@@ -3997,6 +4522,10 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
     ai_review = _ai_review_snapshot_from_decision_row(row)
     market_signal_context = _market_signal_context_from_decision_row(row)
     macro_event_summary = _decision_macro_event_context_summary(row)
+    psychology_scene_review = (
+        _psychology_scene_review_payload(payload.get("psychology_scene_review"))
+        or _psychology_scene_review_payload(metadata.get("psychology_scene_review"))
+    )
     return OperatorDecisionSnapshot(
         decision_run_id=row.id,
         created_at=row.created_at,
@@ -4086,6 +4615,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         )
         or None,
         scenario_note=str(payload.get("scenario_note") or metadata.get("scenario_note") or "") or None,
+        psychology_scene_review=psychology_scene_review,
         decision_reference=decision_reference,
         raw_output={},
     )
@@ -4141,6 +4671,7 @@ def _overlay_interval_review_state(
     if not interval_state:
         return snapshot
     decision_created_at = decision_row.created_at if decision_row is not None else None
+    interval_is_current = decision_created_at is None or interval_row.created_at >= decision_created_at
     update: dict[str, Any] = {}
     ai_review_update: dict[str, Any] = {}
     if interval_state.get("last_ai_skip_reason") is not None:
@@ -4151,9 +4682,7 @@ def _overlay_interval_review_state(
         update["trigger_deduped"] = True
         ai_review_update["trigger_deduped"] = True
         ai_review_update["dedupe_reason"] = interval_state.get("dedupe_reason") or "TRIGGER_DEDUPED"
-    if interval_state.get("last_ai_trigger_reason") is not None and (
-        decision_created_at is None or interval_row.created_at >= decision_created_at
-    ):
+    if interval_state.get("last_ai_trigger_reason") is not None and interval_is_current:
         update["last_ai_trigger_reason"] = interval_state["last_ai_trigger_reason"]
         update["ai_review_type"] = interval_state["ai_review_type"]
         ai_review_update["trigger_reason"] = interval_state["last_ai_trigger_reason"]
@@ -4161,20 +4690,27 @@ def _overlay_interval_review_state(
     if interval_state.get("ai_trigger_reason_codes"):
         update["ai_trigger_reason_codes"] = interval_state["ai_trigger_reason_codes"]
         ai_review_update["trigger_reason_codes"] = interval_state["ai_trigger_reason_codes"]
-    if interval_state.get("trigger_fingerprint") is not None and (
-        decision_created_at is None or interval_row.created_at >= decision_created_at
-    ):
+    if interval_state.get("trigger_fingerprint") is not None and interval_is_current:
         update["trigger_fingerprint"] = interval_state["trigger_fingerprint"]
         ai_review_update["trigger_fingerprint"] = interval_state["trigger_fingerprint"]
     if interval_state.get("last_ai_invoked_at") is not None:
         update["last_ai_invoked_at"] = interval_state["last_ai_invoked_at"]
         ai_review_update["invoked_at"] = interval_state["last_ai_invoked_at"]
     if interval_state.get("provider_skipped") is not None:
-        ai_review_update["provider_skipped"] = bool(interval_state["provider_skipped"])
+        provider_skipped = bool(interval_state["provider_skipped"])
+        provider_invoked = snapshot.ai_review.provider_invoked
+        trigger_deduped = bool(ai_review_update.get("trigger_deduped", snapshot.ai_review.trigger_deduped))
+        if provider_skipped and interval_is_current and not trigger_deduped:
+            provider_invoked = False
+            ai_review_update["provider_invoked"] = False
+            ai_review_update["invoked_at"] = None
+            ai_review_update["provider_name"] = None
+            ai_review_update["provider_source"] = None
+        ai_review_update["provider_skipped"] = provider_skipped
         ai_review_update["provider_status"] = _provider_status_from_review(
-            provider_invoked=snapshot.ai_review.provider_invoked,
-            provider_skipped=bool(interval_state["provider_skipped"]),
-            deduped=bool(ai_review_update.get("trigger_deduped", snapshot.ai_review.trigger_deduped)),
+            provider_invoked=provider_invoked,
+            provider_skipped=provider_skipped,
+            deduped=trigger_deduped,
         )
     if ai_review_update:
         update["ai_review"] = snapshot.ai_review.model_copy(update=ai_review_update)
@@ -4221,7 +4757,59 @@ def _risk_adjustment_reason_codes_from_row(row: RiskCheck | None) -> list[str]:
     return []
 
 
-def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
+def _decision_hold_reason_codes_from_row(row: AgentRun | None) -> list[str]:
+    if row is None or not isinstance(row.output_payload, dict):
+        return []
+    payload = _as_dict(row.output_payload)
+    reason_codes = _as_string_list(payload.get("rationale_codes"))
+    return [
+        code
+        for code in list(dict.fromkeys(reason_codes))
+        if code and code != "HOLD_DECISION"
+    ]
+
+
+def _risk_block_scope_details(
+    blocked_reason_codes: Sequence[str],
+    *,
+    decision: str | None,
+    decision_row: AgentRun | None = None,
+) -> tuple[str, list[str], list[str]]:
+    unique_blocked = list(dict.fromkeys(code for code in blocked_reason_codes if code))
+    candidate_hold_reason_codes = _decision_hold_reason_codes_from_row(decision_row)
+    if not candidate_hold_reason_codes:
+        candidate_hold_reason_codes = [
+            code
+            for code in unique_blocked
+            if code in RISK_STATUS_ONLY_REASON_CODES and code != "HOLD_DECISION"
+        ]
+    global_block_reason_codes = [
+        code
+        for code in unique_blocked
+        if code not in RISK_STATUS_ONLY_REASON_CODES
+    ]
+    if not global_block_reason_codes and decision == "hold" and unique_blocked:
+        block_scope = "candidate_hold"
+    elif global_block_reason_codes and candidate_hold_reason_codes:
+        block_scope = "mixed"
+    elif global_block_reason_codes:
+        block_scope = "global_block"
+    elif candidate_hold_reason_codes:
+        block_scope = "candidate_hold"
+    else:
+        block_scope = "none"
+    return (
+        block_scope,
+        candidate_hold_reason_codes[:OPERATOR_CANDIDATE_HOLD_REASON_LIMIT],
+        global_block_reason_codes,
+    )
+
+
+def _dashboard_risk_payload_from_row(
+    row: RiskCheck | None,
+    *,
+    decision_row: AgentRun | None = None,
+) -> dict[str, Any]:
     if row is None:
         return {}
     payload = dict(row.payload) if isinstance(row.payload, dict) else {}
@@ -4256,9 +4844,15 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
         for key, value in _as_dict(payload.get("exposure_headroom_snapshot")).items()
         if value is not None
     }
+    decision = str(payload.get("decision") or row.decision or "") or None
+    block_scope, candidate_hold_reason_codes, global_block_reason_codes = _risk_block_scope_details(
+        blocked_reason_codes,
+        decision=decision,
+        decision_row=decision_row,
+    )
     normalized_payload: dict[str, Any] = {
         "allowed": payload.get("allowed", row.allowed),
-        "decision": payload.get("decision", row.decision),
+        "decision": decision,
         "reason_codes": blocked_reason_codes,
         "blocked_reason_codes": blocked_reason_codes,
         "adjustment_reason_codes": adjustment_reason_codes,
@@ -4266,6 +4860,9 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
         "degraded_reason": degraded_reason,
         "degraded_reason_codes": degraded_reason_codes,
         "protection_reason_codes": protection_reason_codes,
+        "block_scope": block_scope,
+        "candidate_hold_reason_codes": candidate_hold_reason_codes,
+        "global_block_reason_codes": global_block_reason_codes,
         "approval_required_reason": str(payload.get("approval_required_reason") or "") or None,
         "survival_path": str(payload.get("survival_path") or "") or None,
         "policy_source": str(payload.get("policy_source") or "none") or "none",
@@ -4298,15 +4895,21 @@ def _dashboard_risk_payload_from_row(row: RiskCheck | None) -> dict[str, Any]:
     return normalized_payload
 
 
-def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
+def _build_risk_snapshot(
+    row: RiskCheck | None,
+    *,
+    decision_row: AgentRun | None = None,
+) -> OperatorRiskSnapshot:
     if row is None:
         return OperatorRiskSnapshot()
-    payload = _dashboard_risk_payload_from_row(row)
+    payload = _dashboard_risk_payload_from_row(row, decision_row=decision_row)
     reason_codes = _as_string_list(payload.get("reason_codes", []))
     blocked_reason_codes = _as_string_list(payload.get("blocked_reason_codes", []))
     adjustment_reason_codes = _as_string_list(payload.get("adjustment_reason_codes", []))
     degraded_reason_codes = _as_string_list(payload.get("degraded_reason_codes", []))
     protection_reason_codes = _as_string_list(payload.get("protection_reason_codes", []))
+    candidate_hold_reason_codes = _as_string_list(payload.get("candidate_hold_reason_codes", []))
+    global_block_reason_codes = _as_string_list(payload.get("global_block_reason_codes", []))
     debug_payload = _as_dict(payload.get("debug_payload", {}))
     slot_allocation = _as_dict(debug_payload.get("slot_allocation"))
     holding_profile = _as_dict(debug_payload.get("holding_profile"))
@@ -4326,6 +4929,9 @@ def _build_risk_snapshot(row: RiskCheck | None) -> OperatorRiskSnapshot:
         adjustment_reason_codes=adjustment_reason_codes,
         degraded_reason_codes=degraded_reason_codes,
         protection_reason_codes=protection_reason_codes,
+        block_scope=str(payload.get("block_scope") or "none"),
+        candidate_hold_reason_codes=candidate_hold_reason_codes,
+        global_block_reason_codes=global_block_reason_codes,
         blocked_reason=str(payload.get("blocked_reason") or "") or None,
         degraded_reason=str(payload.get("degraded_reason") or "") or None,
         approval_required_reason=str(payload.get("approval_required_reason") or "") or None,
@@ -4575,6 +5181,7 @@ def _build_position_snapshot(position: Position | None) -> OperatorPositionSumma
             if "stop_widening_allowed" in management
             else None
         ),
+        position_exit_review=_position_exit_review_payload(metadata.get("position_exit_review")),
     )
 
 
@@ -5023,6 +5630,18 @@ def _build_operator_symbol_summaries(
             prefer_fact_lookup=prefer_fact_decision_lookup,
             fallback_scan_limit=extracted_symbol_fallback_limit,
         )
+    decision_facts_by_id: dict[int, DecisionPerformanceFact] = {}
+    if include_decision_state and latest_decisions:
+        decision_ids = [int(row.id) for row in latest_decisions.values() if row.id is not None]
+        if decision_ids:
+            decision_facts_by_id = {
+                int(fact.decision_run_id): fact
+                for fact in session.scalars(
+                    select(DecisionPerformanceFact).where(
+                        DecisionPerformanceFact.decision_run_id.in_(decision_ids)
+                    )
+                )
+            }
 
     latest_risks: dict[str, RiskCheck] = {}
     if include_risk_state:
@@ -5190,22 +5809,30 @@ def _build_operator_symbol_summaries(
             execution_row.created_at if execution_row is not None else None,
             position_row.created_at if position_row is not None else None,
         )
-        decision_snapshot = _build_decision_snapshot(decision_row)
-        decision_snapshot = _overlay_interval_review_state(
-            decision_snapshot,
-            decision_row=decision_row,
-            interval_row=interval_review_row,
-        )
-        decision_snapshot = decision_snapshot.model_copy(
-            update={
-                "decision_reference": _annotate_decision_reference(
-                    decision_snapshot.decision_reference,
-                    current_market_refresh_at=market_row.snapshot_time if market_row is not None else None,
-                    current_sync_freshness_summary=overview.sync_freshness_summary,
-                )
-            }
-        )
-        risk_snapshot = _build_risk_snapshot(risk_row)
+        if include_decision_state:
+            decision_snapshot = _build_decision_snapshot(decision_row)
+            decision_snapshot = _overlay_interval_review_state(
+                decision_snapshot,
+                decision_row=decision_row,
+                interval_row=interval_review_row,
+            )
+            decision_snapshot = decision_snapshot.model_copy(
+                update={
+                    "decision_reference": _annotate_decision_reference(
+                        decision_snapshot.decision_reference,
+                        current_market_refresh_at=market_row.snapshot_time if market_row is not None else None,
+                        current_sync_freshness_summary=overview.sync_freshness_summary,
+                    ),
+                    "psychology_scene_performance": _psychology_scene_performance_payload(
+                        decision_facts_by_id.get(int(decision_row.id))
+                        if decision_row is not None and decision_row.id is not None
+                        else None
+                    ),
+                }
+            )
+        else:
+            decision_snapshot = OperatorDecisionSnapshot()
+        risk_snapshot = _build_risk_snapshot(risk_row, decision_row=decision_row)
         summaries.append(
             OperatorSymbolSummary(
                 symbol=symbol_key,
@@ -5358,7 +5985,12 @@ def _operator_execution_profile_state(settings_row: Setting) -> dict[str, Any]:
 def get_operator_dashboard(session: Session, *, view: str | None = None) -> OperatorDashboardResponse:
     operator_view = _normalize_operator_dashboard_view(view)
     fact_decision_projection = operator_view in {"decision", "scheduler"}
-    overview = get_overview(session)
+    compact_operator_view = operator_view is not None
+    overview = get_overview(
+        session,
+        include_latest_decision_snapshot=not compact_operator_view,
+        include_active_entry_plans=not compact_operator_view,
+    )
     settings_row = get_or_create_settings(session)
     execution_profile_state = _operator_execution_profile_state(settings_row)
     profitability = (
@@ -5416,6 +6048,7 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
     limited_live_readiness = (
         LimitedLiveReadinessReport() if profitability is None else profitability.limited_live_readiness
     )
+    service_gate_snapshot = build_service_switch_gate_snapshot(session)
     audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT) if include_audit_events else []
     return OperatorDashboardResponse(
         generated_at=utcnow_naive(),
@@ -5456,6 +6089,7 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
             latest_blocked_reasons=overview.operational_status.latest_blocked_reasons,
             market_freshness_summary=overview.operational_status.market_freshness_summary,
             sync_freshness_summary=overview.operational_status.sync_freshness_summary,
+            exchange_sync_diagnostics=overview.operational_status.exchange_sync_diagnostics,
             protection_recovery_status=overview.operational_status.protection_recovery_status,
             protected_positions=overview.protected_positions,
             unprotected_positions=overview.unprotected_positions,
@@ -5468,6 +6102,18 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
             user_stream_summary=overview.user_stream_summary,
             reconciliation_summary=overview.reconciliation_summary,
             candidate_selection_summary=overview.candidate_selection_summary,
+            service_gate_blockers=_as_string_list(service_gate_snapshot.get("blockers")),
+            stale_pending_entry_plan_count=int(
+                _as_dict(service_gate_snapshot.get("counts")).get("triggered_stale_history_entry_plans") or 0
+            ),
+            stale_pending_entry_plans=[
+                dict(item)
+                for item in (service_gate_snapshot.get("triggered_stale_history_entry_plans") or [])
+                if isinstance(item, dict)
+            ],
+            triggered_terminal_history_entry_plan_count=int(
+                _as_dict(service_gate_snapshot.get("counts")).get("triggered_terminal_history_entry_plans") or 0
+            ),
             operator_alert=overview.operator_alert,
             limited_live_readiness=limited_live_readiness,
             scheduler_status=latest_scheduler.status if latest_scheduler is not None else None,
@@ -5531,14 +6177,20 @@ def get_risk_checks(session: Session, limit: int = 50, *, compact: bool = False)
     for risk_row, decision_row in rows:
         payload = _serialize_model_row(risk_row)
         macro_event_summary = _decision_macro_event_context_summary(decision_row)
-        risk_snapshot = _build_risk_snapshot(risk_row)
-        risk_payload = _dashboard_risk_payload_from_row(risk_row)
+        risk_snapshot = _build_risk_snapshot(risk_row, decision_row=decision_row)
+        risk_payload = _dashboard_risk_payload_from_row(risk_row, decision_row=decision_row)
         payload["reason_codes"] = risk_payload["reason_codes"]
         payload["blocked_reason_codes"] = risk_payload["blocked_reason_codes"]
+        payload["block_scope"] = risk_payload["block_scope"]
+        payload["candidate_hold_reason_codes"] = risk_payload["candidate_hold_reason_codes"]
+        payload["global_block_reason_codes"] = risk_payload["global_block_reason_codes"]
         if isinstance(payload.get("payload"), dict):
             payload["payload"] = dict(payload["payload"])
             payload["payload"]["reason_codes"] = risk_payload["reason_codes"]
             payload["payload"]["blocked_reason_codes"] = risk_payload["blocked_reason_codes"]
+            payload["payload"]["block_scope"] = risk_payload["block_scope"]
+            payload["payload"]["candidate_hold_reason_codes"] = risk_payload["candidate_hold_reason_codes"]
+            payload["payload"]["global_block_reason_codes"] = risk_payload["global_block_reason_codes"]
             if risk_payload["reason_evidence"]:
                 payload["payload"]["reason_evidence"] = risk_payload["reason_evidence"]
         payload["ai_trigger_reason"] = _ai_trigger_reason_from_decision_row(decision_row)
@@ -5580,6 +6232,7 @@ def get_scheduler_runs(session: Session, limit: int = 50, *, compact: bool = Fal
                 SchedulerRun.status,
                 SchedulerRun.triggered_by,
                 SchedulerRun.next_run_at,
+                SchedulerRun.ai_skip_reason,
                 SchedulerRun.created_at,
                 SchedulerRun.updated_at,
             )

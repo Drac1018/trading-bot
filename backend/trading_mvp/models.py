@@ -80,6 +80,7 @@ class Setting(TimestampMixin, Base):
     ai_model: Mapped[str] = mapped_column(String(80), default="gpt-4.1-mini")
     ai_call_interval_minutes: Mapped[int] = mapped_column(Integer, default=30)
     decision_cycle_interval_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    ai_trading_decision_daily_token_budget: Mapped[int] = mapped_column(Integer, default=1_000_000)
     ai_max_input_candles: Mapped[int] = mapped_column(Integer, default=32)
     ai_temperature: Mapped[float] = mapped_column(Float, default=0.1)
     openai_api_key_encrypted: Mapped[str] = mapped_column(Text, default="")
@@ -187,6 +188,17 @@ class DecisionPerformanceFact(TimestampMixin, Base):
     comparison_bucket: Mapped[str] = mapped_column(String(60), default="ai_hold_no_trade")
     decision_agreement_level: Mapped[str] = mapped_column(String(80), default="")
     decision_agreement_source: Mapped[str] = mapped_column(String(80), default="")
+    ai_actionable: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_blocked_by_risk: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_led_to_order: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_led_to_fill: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_usefulness_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    ai_known_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_edge_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_total_cost_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_expected_edge_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl_data_confidence: Mapped[str] = mapped_column(String(40), default="unknown")
     telemetry_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     telemetry_output: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
@@ -431,6 +443,7 @@ class SchedulerRun(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(20), default="running")
     triggered_by: Mapped[str] = mapped_column(String(40), default="system")
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    ai_skip_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
     outcome: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 

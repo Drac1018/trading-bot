@@ -19,7 +19,9 @@ from trading_mvp.models import (
     CompetitorNote,
     DecisionPerformanceFact,
     Execution,
+    MarketSnapshot,
     Order,
+    PendingEntryPlan,
     PnLSnapshot,
     Position,
     RiskCheck,
@@ -40,7 +42,16 @@ from trading_mvp.schemas import (
     StructuredCompetitorNote,
     StructuredCompetitorNotesResponse,
 )
-from trading_mvp.services.ai_usage import build_ai_telemetry_summary, count_ai_deduped_events
+from trading_mvp.services.ai_usage import (
+    build_ai_telemetry_summary,
+    count_ai_deduped_events,
+    estimate_ai_usage_cost_usd,
+    is_ai_attempt,
+)
+from trading_mvp.services.cost_model import (
+    build_recent_execution_cost_estimate,
+    calculate_expected_trade_cost,
+)
 from trading_mvp.time_utils import utcnow_naive
 
 DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
@@ -51,6 +62,10 @@ DEFAULT_SIGNAL_PERFORMANCE_WINDOW_SPECS: tuple[tuple[str, int], ...] = (
 SIGNAL_PERFORMANCE_REPORT_CACHE_TTL_SECONDS = 120.0
 SIGNAL_PERFORMANCE_PNL_SOURCE_BUCKET_SECONDS = 60
 SIGNAL_PERFORMANCE_REPORT_REFRESH_DEBOUNCE_SECONDS = 30.0
+OPPORTUNITY_ATTRIBUTION_HORIZONS_MINUTES = (15, 30, 60)
+OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT = 100.0
+OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME = "15m"
+OPPORTUNITY_ATTRIBUTION_FUNDING_INTERVAL_MINUTES = 8 * 60
 
 
 @dataclass(slots=True)
@@ -373,6 +388,43 @@ def _safe_bool(value: object, default: bool = False) -> bool:
 
 def _as_dict(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
+
+
+def _optional_float(value: object) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if value in {None, ""}:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
+
+
+def _unique_nonempty_strings(values: Sequence[object]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        result.append(text)
+        seen.add(text)
+    return result
+
+
+def _opportunity_reason_code_key(value: object) -> str:
+    text = str(value or "UNSPECIFIED").strip()
+    return text.upper() if text else "UNSPECIFIED"
 
 
 def _normalize_entry_execution_type(value: object) -> str | None:
@@ -1087,6 +1139,35 @@ def _compact_telemetry_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _compact_scene_review_payload(
+    *,
+    metadata: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    review = _as_dict(payload.get("psychology_scene_review")) or _as_dict(
+        metadata.get("psychology_scene_review")
+    )
+    if not review:
+        return {}
+    compact: dict[str, Any] = {"has_review": True}
+    for key in (
+        "scene_type",
+        "psychology_bias",
+        "preferred_entry_timing",
+        "execution_boundary",
+        "summary",
+    ):
+        value = review.get(key)
+        if value not in {None, ""}:
+            compact[key] = value
+    reason_codes = _unique_nonempty_strings(
+        list(review.get("reason_codes") or []) if isinstance(review.get("reason_codes"), list) else []
+    )
+    if reason_codes:
+        compact["reason_codes"] = reason_codes
+    return compact
+
+
 def _compact_telemetry_output(payload: Mapping[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {"decision": payload.get("decision")}
     for key in ("should_abstain", "fail_closed_applied", "data_quality_flags"):
@@ -1094,6 +1175,333 @@ def _compact_telemetry_output(payload: Mapping[str, Any]) -> dict[str, Any]:
         if value is not None:
             compact[key] = value
     return compact
+
+
+def _metadata_model_name(row: AgentRun, metadata: Mapping[str, Any]) -> str | None:
+    for key in ("ai_model", "model", "openai_model"):
+        model = str(metadata.get(key) or "").strip()
+        if model:
+            return model
+    provider = str(row.provider_name or "").strip()
+    return provider or None
+
+
+def _ai_total_tokens(metadata: Mapping[str, Any]) -> int | None:
+    usage = _as_dict(metadata.get("usage"))
+    total_tokens = _safe_int(usage.get("total_tokens"))
+    if total_tokens is not None:
+        return total_tokens
+    prompt_tokens = _safe_int(usage.get("prompt_tokens"), default=0) or 0
+    completion_tokens = _safe_int(usage.get("completion_tokens"), default=0) or 0
+    total = prompt_tokens + completion_tokens
+    return total if total > 0 else None
+
+
+def _ai_known_cost_usd(row: AgentRun, metadata: Mapping[str, Any]) -> float | None:
+    usage = _as_dict(metadata.get("usage"))
+    if not usage:
+        return None
+    return estimate_ai_usage_cost_usd(model=_metadata_model_name(row, metadata), usage=usage)
+
+
+def _latest_expected_cost_gate(risk_checks: Sequence[RiskCheck]) -> dict[str, object]:
+    for risk_row in risk_checks:
+        payload = _as_dict(risk_row.payload)
+        debug_payload = _as_dict(payload.get("debug_payload"))
+        gate = _as_dict(debug_payload.get("expected_cost_gate"))
+        if gate:
+            return gate
+    return {}
+
+
+def _pnl_data_confidence(orders: Sequence[Order], executions: Sequence[Execution]) -> str:
+    if not orders and not executions:
+        return "not_realized"
+    if orders and not executions:
+        return "order_without_fill"
+    if any(str(row.external_trade_id or "").strip() for row in executions):
+        return "exchange_trade_linked"
+    if any(_as_dict(row.payload).get("exchange_trade_id") or _as_dict(row.payload).get("binance_trade_id") for row in executions):
+        return "exchange_trade_linked"
+    return "local_execution_row"
+
+
+def _ai_usefulness_status(
+    *,
+    ai_used: bool,
+    ai_actionable: bool,
+    risk_checks: Sequence[RiskCheck],
+    risk_allowed: bool,
+    ai_blocked_by_risk: bool,
+    ai_led_to_order: bool,
+    ai_led_to_fill: bool,
+) -> str:
+    if not ai_used:
+        return "no_ai_provider"
+    if not ai_actionable:
+        return "not_actionable_hold"
+    if ai_led_to_fill:
+        return "filled"
+    if ai_led_to_order:
+        return "ordered"
+    if risk_allowed:
+        return "risk_allowed_no_order"
+    if ai_blocked_by_risk:
+        return "risk_blocked"
+    if risk_checks:
+        return "risk_checked_pending"
+    return "pending_risk"
+
+
+def _execution_result_status(value: object) -> str:
+    result = _as_dict(value)
+    return str(
+        result.get("status")
+        or result.get("order_status")
+        or result.get("exchange_status")
+        or ""
+    ).lower()
+
+
+def _scene_plan_outcome_bucket(summary: Mapping[str, Any]) -> str:
+    if bool(summary.get("fill_observed")):
+        return "triggered_with_fill"
+    if bool(summary.get("order_observed")):
+        return "triggered_order_no_fill"
+    if int(summary.get("triggered_count") or 0) > 0:
+        return "triggered_no_order_observed"
+    if int(summary.get("plan_invalidated_count") or 0) > 0:
+        return "canceled_invalidated"
+    if int(summary.get("plan_confirm_quality_low_count") or 0) > 0:
+        return "waiting_confirm_quality_low"
+    if int(summary.get("canceled_count") or 0) > 0:
+        return "canceled"
+    if int(summary.get("expired_count") or 0) > 0:
+        return "expired"
+    if int(summary.get("armed_count") or 0) > 0:
+        return "armed_waiting"
+    return "no_pending_plan"
+
+
+def _scene_review_pending_plan_outcome(session: Session, decision_run_id: int) -> dict[str, Any]:
+    plans = list(
+        session.scalars(
+            select(PendingEntryPlan)
+            .where(PendingEntryPlan.source_decision_run_id == int(decision_run_id))
+            .order_by(desc(PendingEntryPlan.created_at), desc(PendingEntryPlan.id))
+        )
+    )
+    direct_orders = list(
+        session.scalars(
+            select(Order)
+            .where(Order.decision_run_id == int(decision_run_id))
+            .order_by(desc(Order.created_at), desc(Order.id))
+        )
+    )
+    reason_codes: list[object] = []
+    order_ids: list[int] = [int(order.id) for order in direct_orders if order.id is not None]
+    risk_check_ids: list[int] = [
+        int(order.risk_check_id)
+        for order in direct_orders
+        if order.risk_check_id is not None
+    ]
+    plan_confirm_quality_low_count = 0
+    plan_invalidated_count = 0
+    execution_fill_statuses = {"filled", "partially_filled"}
+    execution_result_fill_count = 0
+    latest_plan = plans[0] if plans else None
+    for plan in plans:
+        plan_reason_start = len(reason_codes)
+        metadata = _as_dict(plan.metadata_json)
+        tracking = _as_dict(metadata.get("last_confirmation_tracking"))
+        transition_detail = _as_dict(metadata.get("last_transition_detail"))
+        execution_result = _as_dict(metadata.get("execution_result"))
+        reason_codes.extend(_pending_plan_reason_codes(plan))
+        reason_codes.extend(
+            list(metadata.get("last_watch_blocked_reason_codes") or [])
+            if isinstance(metadata.get("last_watch_blocked_reason_codes"), list)
+            else []
+        )
+        reason_codes.extend(
+            list(tracking.get("blocked_reason_codes") or [])
+            if isinstance(tracking.get("blocked_reason_codes"), list)
+            else []
+        )
+        reason_codes.extend(
+            [
+                tracking.get("confirmation_failed_reason"),
+                tracking.get("plan_cancel_reason"),
+                metadata.get("last_transition_reason"),
+                transition_detail.get("reason"),
+            ]
+        )
+        plan_order_id = _safe_int(execution_result.get("order_id"))
+        if plan_order_id is not None:
+            order_ids.append(plan_order_id)
+        plan_risk_id = _safe_int(execution_result.get("risk_check_id")) or _safe_int(metadata.get("last_risk_check_id"))
+        if plan_risk_id is not None:
+            risk_check_ids.append(plan_risk_id)
+        if _execution_result_status(execution_result) in execution_fill_statuses:
+            execution_result_fill_count += 1
+        plan_reason_set = {str(code) for code in reason_codes[plan_reason_start:] if str(code or "").strip()}
+        if "PLAN_CONFIRM_QUALITY_LOW" in plan_reason_set:
+            plan_confirm_quality_low_count += 1
+        if "PLAN_INVALIDATED" in plan_reason_set:
+            plan_invalidated_count += 1
+
+    normalized_order_ids = list(dict.fromkeys(order_ids))
+    orders_by_plan_id = (
+        list(
+            session.scalars(
+                select(Order)
+                .where(Order.id.in_(normalized_order_ids))
+                .order_by(desc(Order.created_at), desc(Order.id))
+            )
+        )
+        if normalized_order_ids
+        else []
+    )
+    order_ids_for_execution = [int(order.id) for order in orders_by_plan_id if order.id is not None]
+    executions = (
+        list(
+            session.scalars(
+                select(Execution)
+                .where(Execution.order_id.in_(order_ids_for_execution))
+                .order_by(desc(Execution.created_at), desc(Execution.id))
+            )
+        )
+        if order_ids_for_execution
+        else []
+    )
+    fill_count = len(executions) if executions else execution_result_fill_count
+    unique_reason_codes = _unique_nonempty_strings(reason_codes)
+    summary: dict[str, Any] = {
+        "pending_plan_count": len(plans),
+        "plan_ids": [int(plan.id) for plan in plans[:8] if plan.id is not None],
+        "latest_plan_id": int(latest_plan.id) if latest_plan is not None and latest_plan.id is not None else None,
+        "latest_plan_status": str(latest_plan.plan_status) if latest_plan is not None else None,
+        "latest_canceled_reason": str(latest_plan.canceled_reason or "") or None if latest_plan is not None else None,
+        "armed_count": sum(1 for plan in plans if str(plan.plan_status) == "armed"),
+        "triggered_count": sum(1 for plan in plans if str(plan.plan_status) == "triggered"),
+        "canceled_count": sum(1 for plan in plans if str(plan.plan_status) == "canceled"),
+        "expired_count": sum(1 for plan in plans if str(plan.plan_status) == "expired"),
+        "plan_triggered": any(str(plan.plan_status) == "triggered" for plan in plans),
+        "plan_canceled": any(str(plan.plan_status) == "canceled" for plan in plans),
+        "plan_confirm_quality_low_count": plan_confirm_quality_low_count,
+        "plan_invalidated_count": plan_invalidated_count,
+        "order_count": max(len(orders_by_plan_id), len(normalized_order_ids)),
+        "fill_count": fill_count,
+        "order_observed": bool(normalized_order_ids or orders_by_plan_id),
+        "fill_observed": fill_count > 0,
+        "order_ids": normalized_order_ids[:8],
+        "risk_check_ids": list(dict.fromkeys(risk_check_ids))[:8],
+        "reason_codes": unique_reason_codes[:16],
+    }
+    summary["outcome_bucket"] = _scene_plan_outcome_bucket(summary)
+    return summary
+
+
+def _decision_usefulness_fields(session: Session, row: AgentRun, fact: DecisionPerformanceFact) -> dict[str, Any]:
+    payload = row.output_payload if isinstance(row.output_payload, dict) else {}
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    decision = str(payload.get("decision") or fact.decision or "unknown").lower()
+    has_watch_entry_plan = bool(_as_dict(payload.get("watch_entry_plan")))
+    ai_actionable = bool(fact.ai_used and (decision in {"long", "short", "reduce", "exit"} or has_watch_entry_plan))
+    risk_checks = list(
+        session.scalars(
+            select(RiskCheck)
+            .where(RiskCheck.decision_run_id == int(row.id))
+            .order_by(desc(RiskCheck.created_at), desc(RiskCheck.id))
+        )
+    )
+    risk_allowed = any(bool(risk_row.allowed) for risk_row in risk_checks)
+    ai_blocked_by_risk = bool(risk_checks and not risk_allowed and ai_actionable)
+    orders = list(
+        session.scalars(
+            select(Order)
+            .where(Order.decision_run_id == int(row.id))
+            .order_by(desc(Order.created_at), desc(Order.id))
+        )
+    )
+    order_ids = [int(order.id) for order in orders if order.id is not None]
+    executions = (
+        list(
+            session.scalars(
+                select(Execution)
+                .where(Execution.order_id.in_(order_ids))
+                .order_by(desc(Execution.created_at), desc(Execution.id))
+            )
+        )
+        if order_ids
+        else []
+    )
+    ai_led_to_order = bool(orders)
+    ai_led_to_fill = any(
+        str(execution.status or "").lower() == "filled" or _safe_float(execution.fill_quantity) > 0.0
+        for execution in executions
+    )
+    expected_cost_gate = _latest_expected_cost_gate(risk_checks)
+    scene_review = _compact_scene_review_payload(metadata=metadata, payload=payload)
+    scene_plan_outcome = _scene_review_pending_plan_outcome(session, int(row.id))
+    fields = {
+        "ai_actionable": ai_actionable,
+        "ai_blocked_by_risk": ai_blocked_by_risk,
+        "ai_led_to_order": ai_led_to_order,
+        "ai_led_to_fill": ai_led_to_fill,
+        "ai_usefulness_status": _ai_usefulness_status(
+            ai_used=bool(fact.ai_used),
+            ai_actionable=ai_actionable,
+            risk_checks=risk_checks,
+            risk_allowed=risk_allowed,
+            ai_blocked_by_risk=ai_blocked_by_risk,
+            ai_led_to_order=ai_led_to_order,
+            ai_led_to_fill=ai_led_to_fill,
+        ),
+        "ai_known_cost_usd": _ai_known_cost_usd(row, metadata),
+        "ai_total_tokens": _ai_total_tokens(metadata),
+        "expected_edge_bps": _safe_float(
+            expected_cost_gate.get("expected_edge_bps", expected_cost_gate.get("expected_profit_bps")),
+            default=0.0,
+        )
+        or None,
+        "expected_total_cost_bps": _safe_float(expected_cost_gate.get("expected_total_cost_bps"), default=0.0)
+        or None,
+        "net_expected_edge_bps": _safe_float(expected_cost_gate.get("net_expected_edge_bps"), default=0.0)
+        or None,
+        "pnl_data_confidence": _pnl_data_confidence(orders, executions),
+    }
+    fields["decision_quality"] = {
+        **fields,
+        "risk_checked": bool(risk_checks),
+        "risk_allowed": risk_allowed,
+        "risk_reason_codes": list(risk_checks[0].reason_codes or []) if risk_checks else [],
+        "order_count": len(orders),
+        "execution_count": len(executions),
+    }
+    if scene_review:
+        fields["decision_quality"]["scene_review"] = scene_review
+        fields["decision_quality"]["scene_plan_outcome"] = scene_plan_outcome
+    return fields
+
+
+def _apply_decision_usefulness_fields(
+    session: Session,
+    row: AgentRun,
+    fact: DecisionPerformanceFact,
+) -> None:
+    fields = _decision_usefulness_fields(session, row, fact)
+    decision_quality = fields.pop("decision_quality")
+    for key, value in fields.items():
+        setattr(fact, key, value)
+    telemetry_metadata = dict(fact.telemetry_metadata or {})
+    telemetry_metadata["decision_quality"] = decision_quality
+    if "scene_review" in decision_quality:
+        telemetry_metadata["scene_review"] = decision_quality["scene_review"]
+        telemetry_metadata["scene_plan_outcome"] = decision_quality["scene_plan_outcome"]
+    else:
+        telemetry_metadata.pop("scene_review", None)
+        telemetry_metadata.pop("scene_plan_outcome", None)
+    fact.telemetry_metadata = telemetry_metadata
 
 
 def _decision_performance_fact_values(row: AgentRun) -> dict[str, Any]:
@@ -1163,6 +1571,28 @@ def persist_decision_performance_fact(session: Session, row: AgentRun) -> Decisi
     else:
         for key, value in values.items():
             setattr(fact, key, value)
+    _apply_decision_usefulness_fields(session, row, fact)
+    session.flush()
+    return fact
+
+
+def refresh_decision_performance_fact_usefulness(
+    session: Session,
+    decision_run_id: int | None,
+) -> DecisionPerformanceFact | None:
+    if decision_run_id is None:
+        return None
+    row = session.get(AgentRun, int(decision_run_id))
+    if row is None or row.role != "trading_decision":
+        return None
+    fact = session.scalar(
+        select(DecisionPerformanceFact).where(
+            DecisionPerformanceFact.decision_run_id == int(row.id)
+        )
+    )
+    if fact is None:
+        return persist_decision_performance_fact(session, row)
+    _apply_decision_usefulness_fields(session, row, fact)
     session.flush()
     return fact
 
@@ -2464,6 +2894,846 @@ def _signal_performance_source_key(session: Session) -> tuple[object, ...]:
         ),
         latest_safety_audit,
     )
+
+
+def _opportunity_timeframe_minutes(timeframe: str | None) -> int:
+    raw = str(timeframe or "").strip().lower()
+    if raw.endswith("m") and raw[:-1].isdigit():
+        return max(int(raw[:-1]), 1)
+    if raw.endswith("h") and raw[:-1].isdigit():
+        return max(int(raw[:-1]) * 60, 60)
+    if raw.endswith("d") and raw[:-1].isdigit():
+        return max(int(raw[:-1]) * 24 * 60, 24 * 60)
+    return 15
+
+
+def _zone_midpoint(*values: object) -> float | None:
+    parsed = [_optional_float(value) for value in values]
+    numbers = [value for value in parsed if value is not None and value > 0]
+    if len(numbers) >= 2:
+        return sum(numbers[:2]) / 2.0
+    return numbers[0] if numbers else None
+
+
+def _decision_output(row: AgentRun | None) -> dict[str, object]:
+    return _as_dict(row.output_payload) if row is not None else {}
+
+
+def _decision_metadata(row: AgentRun | None) -> dict[str, object]:
+    return _as_dict(row.metadata_json) if row is not None else {}
+
+
+def _decision_input(row: AgentRun | None) -> dict[str, object]:
+    return _as_dict(row.input_payload) if row is not None else {}
+
+
+def _decision_side_from_row(row: AgentRun | None) -> str | None:
+    output = _decision_output(row)
+    metadata = _decision_metadata(row)
+    input_payload = _decision_input(row)
+    candidates: list[object] = [
+        output.get("decision"),
+        _as_dict(metadata.get("deterministic_baseline")).get("decision"),
+        _as_dict(metadata.get("decision_agreement")).get("baseline_decision"),
+        _as_dict(metadata.get("selection_context")).get("expected_side"),
+        _as_dict(_as_dict(metadata.get("selection_context")).get("candidate")).get("decision"),
+        _as_dict(_as_dict(input_payload.get("selection_context")).get("candidate")).get("decision"),
+    ]
+    for value in candidates:
+        side = str(value or "").strip().lower()
+        if side in ENTRY_DECISIONS:
+            return side
+    return None
+
+
+def _decision_skip_reason(row: AgentRun | None) -> str | None:
+    metadata = _decision_metadata(row)
+    for key in ("last_ai_skip_reason", "ai_skipped_reason", "pre_ai_skip_reason"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    policy = _as_dict(metadata.get("ai_call_policy"))
+    value = str(policy.get("reason") or "").strip()
+    return value or None
+
+
+def _decision_timeframe(row: AgentRun | None) -> str | None:
+    output = _decision_output(row)
+    metadata = _decision_metadata(row)
+    input_payload = _decision_input(row)
+    for value in (
+        output.get("timeframe"),
+        metadata.get("timeframe"),
+        _as_dict(metadata.get("selection_context")).get("timeframe"),
+        input_payload.get("timeframe"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _decision_reference_price(row: AgentRun | None) -> float | None:
+    output = _decision_output(row)
+    metadata = _decision_metadata(row)
+    baseline = _as_dict(metadata.get("deterministic_baseline"))
+    selection_candidate = _as_dict(_as_dict(metadata.get("selection_context")).get("candidate"))
+    return (
+        _zone_midpoint(output.get("entry_zone_min"), output.get("entry_zone_max"))
+        or _zone_midpoint(baseline.get("entry_zone_min"), baseline.get("entry_zone_max"))
+        or _zone_midpoint(selection_candidate.get("entry_zone_min"), selection_candidate.get("entry_zone_max"))
+    )
+
+
+def _decision_entry_execution_type(row: AgentRun | None) -> str:
+    output = _decision_output(row)
+    metadata = _decision_metadata(row)
+    selection = _as_dict(metadata.get("selection_context"))
+    for value in (
+        output.get("entry_execution_type"),
+        output.get("entry_mode"),
+        selection.get("entry_execution_type"),
+        selection.get("entry_mode"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ENTRY_EXECUTION_TYPE_UNKNOWN
+
+
+def _market_snapshot_by_id(session: Session, snapshot_id: int | None) -> MarketSnapshot | None:
+    if snapshot_id is None:
+        return None
+    return session.get(MarketSnapshot, int(snapshot_id))
+
+
+def _funding_rate_from_snapshot(snapshot: MarketSnapshot | None) -> float | None:
+    if snapshot is None:
+        return None
+    payload = _as_dict(snapshot.payload)
+    candidates = [
+        payload,
+        _as_dict(payload.get("derivatives_context")),
+        _as_dict(payload.get("derivatives")),
+        _as_dict(_as_dict(payload.get("features")).get("derivatives")),
+    ]
+    for item in candidates:
+        parsed = _optional_float(item.get("funding_rate"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _funding_contribution_usdt(
+    *,
+    side: str,
+    funding_rate: float | None,
+    horizon_minutes: int,
+    notional_usdt: float,
+) -> tuple[float, str]:
+    if funding_rate is None:
+        return 0.0, "unavailable"
+    interval_fraction = max(float(horizon_minutes), 0.0) / OPPORTUNITY_ATTRIBUTION_FUNDING_INTERVAL_MINUTES
+    if side == "short":
+        return round(notional_usdt * funding_rate * interval_fraction, 8), "market_snapshot_funding_rate"
+    return round(-notional_usdt * funding_rate * interval_fraction, 8), "market_snapshot_funding_rate"
+
+
+def _future_market_snapshot(
+    session: Session,
+    *,
+    symbol: str,
+    timeframe: str,
+    target_at: datetime,
+) -> MarketSnapshot | None:
+    max_lag_minutes = max(_opportunity_timeframe_minutes(timeframe), 15)
+    return session.scalar(
+        select(MarketSnapshot)
+        .where(
+            MarketSnapshot.symbol == symbol,
+            MarketSnapshot.timeframe == timeframe,
+            MarketSnapshot.snapshot_time >= target_at,
+            MarketSnapshot.snapshot_time <= target_at + timedelta(minutes=max_lag_minutes),
+        )
+        .order_by(MarketSnapshot.snapshot_time.asc(), MarketSnapshot.id.asc())
+        .limit(1)
+    )
+
+
+def _candidate_cost_payload(
+    session: Session,
+    *,
+    symbol: str,
+    side: str,
+    entry_execution_type: str,
+    cache: dict[tuple[str, str], object],
+) -> dict[str, object]:
+    cache_key = (symbol, side)
+    recent_estimate = cache.get(cache_key)
+    if recent_estimate is None:
+        recent_estimate = build_recent_execution_cost_estimate(session, symbol=symbol, side=side)
+        cache[cache_key] = recent_estimate
+    estimate = calculate_expected_trade_cost(
+        entry_execution_type=entry_execution_type,
+        expected_gross_bps=None,
+        recent_estimate=recent_estimate,  # type: ignore[arg-type]
+    )
+    return estimate.to_payload()
+
+
+def _opportunity_horizon_payload(
+    session: Session,
+    *,
+    symbol: str,
+    timeframe: str,
+    side: str | None,
+    reference_time: datetime | None,
+    reference_price: float | None,
+    reference_snapshot: MarketSnapshot | None,
+    horizon_minutes: int,
+    cost_payload: Mapping[str, object] | None,
+    notional_usdt: float,
+) -> dict[str, object]:
+    if side not in ENTRY_DECISIONS:
+        return {"status": "missing_side", "horizon_minutes": horizon_minutes}
+    if reference_time is None or reference_price is None or reference_price <= 0:
+        return {"status": "missing_reference_price", "horizon_minutes": horizon_minutes}
+    target_at = reference_time + timedelta(minutes=horizon_minutes)
+    future_snapshot = _future_market_snapshot(session, symbol=symbol, timeframe=timeframe, target_at=target_at)
+    if future_snapshot is None:
+        return {
+            "status": "missing_future_price",
+            "horizon_minutes": horizon_minutes,
+            "target_at": target_at.isoformat(),
+        }
+
+    future_price = float(future_snapshot.latest_price)
+    gross_move_pct = (
+        (future_price - reference_price) / reference_price
+        if side == "long"
+        else (reference_price - future_price) / reference_price
+    )
+    gross_move_usdt = notional_usdt * gross_move_pct
+    fee_bps = _safe_float(_as_dict(cost_payload).get("round_trip_fee_bps"), default=0.0)
+    slippage_bps = _safe_float(_as_dict(cost_payload).get("expected_slippage_bps"), default=0.0)
+    spread_bps = _safe_float(_as_dict(cost_payload).get("spread_cost_bps"), default=0.0)
+    estimated_fee_usdt = notional_usdt * fee_bps / 10_000.0
+    estimated_slippage_usdt = notional_usdt * slippage_bps / 10_000.0
+    estimated_spread_usdt = notional_usdt * spread_bps / 10_000.0
+    funding_usdt, funding_source = _funding_contribution_usdt(
+        side=side,
+        funding_rate=_funding_rate_from_snapshot(reference_snapshot),
+        horizon_minutes=horizon_minutes,
+        notional_usdt=notional_usdt,
+    )
+    net_after_fees_usdt = (
+        gross_move_usdt
+        - estimated_fee_usdt
+        - estimated_slippage_usdt
+        - estimated_spread_usdt
+        + funding_usdt
+    )
+    return {
+        "status": "evaluated",
+        "horizon_minutes": horizon_minutes,
+        "target_at": target_at.isoformat(),
+        "future_snapshot_id": future_snapshot.id,
+        "future_snapshot_time": future_snapshot.snapshot_time.isoformat(),
+        "reference_price": round(reference_price, 8),
+        "future_price": round(future_price, 8),
+        "gross_move_pct": round(gross_move_pct, 8),
+        "gross_move_bps": round(gross_move_pct * 10_000.0, 6),
+        "gross_move_usdt": round(gross_move_usdt, 8),
+        "estimated_fee_usdt": round(estimated_fee_usdt, 8),
+        "estimated_slippage_usdt": round(estimated_slippage_usdt, 8),
+        "estimated_spread_usdt": round(estimated_spread_usdt, 8),
+        "estimated_funding_usdt": funding_usdt,
+        "funding_source": funding_source,
+        "net_after_fees_usdt": round(net_after_fees_usdt, 8),
+    }
+
+
+def _candidate_best_net(candidate: Mapping[str, object]) -> float | None:
+    horizons = _as_dict(candidate.get("horizons"))
+    values = [
+        _optional_float(_as_dict(payload).get("net_after_fees_usdt"))
+        for payload in horizons.values()
+        if _as_dict(payload).get("status") == "evaluated"
+    ]
+    evaluated = [value for value in values if value is not None]
+    return max(evaluated) if evaluated else None
+
+
+def _attach_candidate_horizons(
+    session: Session,
+    candidate: dict[str, object],
+    *,
+    cost_cache: dict[tuple[str, str], object],
+    notional_usdt: float,
+) -> dict[str, object]:
+    symbol = str(candidate.get("symbol") or "").upper()
+    side = str(candidate.get("side") or "").lower() or None
+    timeframe = str(candidate.get("timeframe") or OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME)
+    reference_time = _optional_datetime(candidate.get("reference_time"))
+    reference_price = _optional_float(candidate.get("reference_price"))
+    reference_snapshot = _market_snapshot_by_id(session, _safe_int(candidate.get("reference_snapshot_id")))
+    cost_payload = (
+        _candidate_cost_payload(
+            session,
+            symbol=symbol,
+            side=side,
+            entry_execution_type=str(candidate.get("entry_execution_type") or ENTRY_EXECUTION_TYPE_UNKNOWN),
+            cache=cost_cache,
+        )
+        if side in ENTRY_DECISIONS
+        else {}
+    )
+    horizons = {
+        f"{horizon}m": _opportunity_horizon_payload(
+            session,
+            symbol=symbol,
+            timeframe=timeframe,
+            side=side,
+            reference_time=reference_time,
+            reference_price=reference_price,
+            reference_snapshot=reference_snapshot,
+            horizon_minutes=horizon,
+            cost_payload=cost_payload,
+            notional_usdt=notional_usdt,
+        )
+        for horizon in OPPORTUNITY_ATTRIBUTION_HORIZONS_MINUTES
+    }
+    candidate["cost_model"] = cost_payload
+    candidate["horizons"] = horizons
+    best_net = _candidate_best_net(candidate)
+    candidate["best_net_after_fees_usdt"] = round(best_net, 8) if best_net is not None else None
+    candidate["would_have_been_profitable"] = bool(best_net is not None and best_net > 0.0)
+    candidate["evaluation_status"] = "evaluated" if best_net is not None else "unevaluable"
+    return candidate
+
+
+def _ai_flow_tags(
+    *,
+    source: str,
+    decision_row: AgentRun | None,
+    risk_row: RiskCheck | None = None,
+    reason_codes: Sequence[str] = (),
+) -> list[str]:
+    tags: list[str] = []
+    if decision_row is not None and is_ai_attempt(decision_row):
+        tags.append("provider_invoked")
+    if source == "decision_ai_skipped" or _decision_skip_reason(decision_row):
+        tags.append("ai_skipped")
+    output_decision = str(_decision_output(decision_row).get("decision") or "").lower()
+    if output_decision == "hold" and not (decision_row is not None and is_ai_attempt(decision_row)):
+        tags.append("deterministic_hold")
+    if risk_row is not None and not bool(risk_row.allowed):
+        tags.append("risk_blocked")
+    if "HOLD_DECISION" in set(reason_codes) and "deterministic_hold" not in tags:
+        tags.append("deterministic_hold")
+    return tags or ["unclassified"]
+
+
+def _risk_opportunity_candidates(
+    session: Session,
+    *,
+    since: datetime,
+    limit: int,
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(RiskCheck)
+            .where(RiskCheck.created_at >= since)
+            .order_by(desc(RiskCheck.created_at), desc(RiskCheck.id))
+            .limit(limit)
+        )
+    )
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        decision_row = session.get(AgentRun, int(row.decision_run_id)) if row.decision_run_id is not None else None
+        snapshot = _market_snapshot_by_id(session, row.market_snapshot_id)
+        reason_codes = _risk_reason_codes(row)
+        if not reason_codes:
+            reason_codes = ["RISK_ALLOWED" if bool(row.allowed) else "RISK_BLOCKED_UNSPECIFIED"]
+        side = str(row.decision or "").lower()
+        if side not in ENTRY_DECISIONS:
+            side = _decision_side_from_row(decision_row) or ""
+        reference_price = (
+            float(snapshot.latest_price)
+            if snapshot is not None and snapshot.latest_price > 0
+            else _decision_reference_price(decision_row)
+        )
+        reference_time = snapshot.snapshot_time if snapshot is not None else row.created_at
+        candidates.append(
+            {
+                "_sort_at": row.created_at,
+                "source": "risk_check",
+                "source_id": row.id,
+                "created_at": row.created_at.isoformat(),
+                "symbol": row.symbol,
+                "timeframe": snapshot.timeframe if snapshot is not None else (_decision_timeframe(decision_row) or OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME),
+                "side": side or None,
+                "decision_run_id": row.decision_run_id,
+                "risk_check_id": row.id,
+                "risk_allowed": bool(row.allowed),
+                "reason_codes": reason_codes,
+                "reference_snapshot_id": row.market_snapshot_id,
+                "reference_time": reference_time.isoformat() if reference_time is not None else None,
+                "reference_price": reference_price,
+                "entry_execution_type": _decision_entry_execution_type(decision_row),
+                "ai_flow_tags": _ai_flow_tags(
+                    source="risk_check",
+                    decision_row=decision_row,
+                    risk_row=row,
+                    reason_codes=reason_codes,
+                ),
+            }
+        )
+    return candidates
+
+
+def _pending_quality_bucket(score: float | None) -> str:
+    if score is None:
+        return "missing"
+    if score < 0.40:
+        return "under_0.40"
+    if score < 0.50:
+        return "0.40_0.50"
+    if score < 0.62:
+        return "0.50_0.62"
+    return "0.62_plus"
+
+
+def _pending_plan_reason_codes(plan: PendingEntryPlan) -> list[str]:
+    metadata = _as_dict(plan.metadata_json)
+    tracking = _as_dict(metadata.get("last_confirmation_tracking"))
+    reason_codes = _unique_nonempty_strings(
+        [
+            *list(tracking.get("blocked_reason_codes") or [] if isinstance(tracking.get("blocked_reason_codes"), list) else []),
+            tracking.get("confirmation_failed_reason"),
+            tracking.get("quality_reason"),
+            plan.canceled_reason,
+            metadata.get("last_ai_recheck_skip_reason"),
+        ]
+    )
+    quality_score = _optional_float(tracking.get("quality_score"))
+    quality_threshold = _optional_float(tracking.get("quality_threshold"))
+    if (
+        quality_score is not None
+        and quality_threshold is not None
+        and quality_score < quality_threshold
+        and bool(tracking.get("zone_touched"))
+        and "PLAN_CONFIRM_QUALITY_LOW" not in reason_codes
+    ):
+        reason_codes.append("PLAN_CONFIRM_QUALITY_LOW")
+    if not reason_codes:
+        reason_codes.append(f"PENDING_ENTRY_PLAN_{str(plan.plan_status or 'unknown').upper()}")
+    return reason_codes
+
+
+def _pending_opportunity_candidates(
+    session: Session,
+    *,
+    since: datetime,
+    limit: int,
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(PendingEntryPlan)
+            .where(PendingEntryPlan.created_at >= since)
+            .order_by(desc(PendingEntryPlan.updated_at), desc(PendingEntryPlan.id))
+            .limit(limit)
+        )
+    )
+    candidates: list[dict[str, object]] = []
+    for plan in rows:
+        metadata = _as_dict(plan.metadata_json)
+        tracking = _as_dict(metadata.get("last_confirmation_tracking"))
+        decision_row = (
+            session.get(AgentRun, int(plan.source_decision_run_id))
+            if plan.source_decision_run_id is not None
+            else None
+        )
+        snapshot_id = (
+            _safe_int(tracking.get("market_snapshot_id"))
+            or _safe_int(tracking.get("reference_snapshot_id"))
+            or _safe_int(metadata.get("last_watch_snapshot_id"))
+        )
+        snapshot = _market_snapshot_by_id(session, snapshot_id)
+        reference_time = (
+            _optional_datetime(tracking.get("market_snapshot_time"))
+            or _optional_datetime(tracking.get("reference_time"))
+            or (snapshot.snapshot_time if snapshot is not None else None)
+            or plan.triggered_at
+            or plan.canceled_at
+            or plan.created_at
+        )
+        reference_price = (
+            _optional_float(tracking.get("latest_price"))
+            or _optional_float(tracking.get("reference_price"))
+            or (float(snapshot.latest_price) if snapshot is not None and snapshot.latest_price > 0 else None)
+            or _zone_midpoint(plan.entry_zone_min, plan.entry_zone_max)
+        )
+        quality_score = _optional_float(tracking.get("quality_score"))
+        reason_codes = _pending_plan_reason_codes(plan)
+        linked_risk = None
+        source_risk_check_id = _safe_int(metadata.get("source_risk_check_id"))
+        if source_risk_check_id is not None:
+            linked_risk = session.get(RiskCheck, source_risk_check_id)
+        candidates.append(
+            {
+                "_sort_at": plan.updated_at or plan.created_at,
+                "source": "pending_entry_plan",
+                "source_id": plan.id,
+                "created_at": plan.created_at.isoformat(),
+                "updated_at": plan.updated_at.isoformat() if plan.updated_at is not None else None,
+                "symbol": plan.symbol,
+                "timeframe": plan.source_timeframe or (snapshot.timeframe if snapshot is not None else OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME),
+                "side": plan.side if plan.side in ENTRY_DECISIONS else None,
+                "decision_run_id": plan.source_decision_run_id,
+                "risk_check_id": source_risk_check_id,
+                "pending_entry_plan_id": plan.id,
+                "plan_status": plan.plan_status,
+                "quality_score": quality_score,
+                "quality_threshold": _optional_float(tracking.get("quality_threshold")),
+                "quality_bucket": _pending_quality_bucket(quality_score),
+                "reason_codes": reason_codes,
+                "reference_snapshot_id": snapshot_id,
+                "reference_time": reference_time.isoformat() if reference_time is not None else None,
+                "reference_price": reference_price,
+                "entry_execution_type": plan.entry_mode or ENTRY_EXECUTION_TYPE_UNKNOWN,
+                "ai_flow_tags": _ai_flow_tags(
+                    source="pending_entry_plan",
+                    decision_row=decision_row,
+                    risk_row=linked_risk,
+                    reason_codes=reason_codes,
+                ),
+            }
+        )
+    return candidates
+
+
+def _audit_skip_opportunity_candidates(
+    session: Session,
+    *,
+    since: datetime,
+    limit: int,
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.event_type == "decision_ai_skipped", AuditEvent.created_at >= since)
+            .order_by(desc(AuditEvent.created_at), desc(AuditEvent.id))
+            .limit(limit)
+        )
+    )
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        payload = _as_dict(row.payload)
+        entity_type = str(row.entity_type or "")
+        entity_id = str(row.entity_id or "")
+        plan: PendingEntryPlan | None = None
+        decision_row: AgentRun | None = None
+        if entity_type == "pending_entry_plan":
+            plan_id = _safe_int(payload.get("plan_id")) or _safe_int(entity_id)
+            plan = session.get(PendingEntryPlan, plan_id) if plan_id is not None else None
+            if plan is not None and plan.source_decision_run_id is not None:
+                decision_row = session.get(AgentRun, int(plan.source_decision_run_id))
+        elif entity_type == "decision_run":
+            decision_id = _safe_int(entity_id)
+            decision_row = session.get(AgentRun, decision_id) if decision_id is not None else None
+        decision_id = (
+            int(decision_row.id)
+            if decision_row is not None and decision_row.id is not None
+            else _safe_int(payload.get("source_decision_run_id"))
+        )
+        snapshot_id = _safe_int(payload.get("snapshot_id"))
+        snapshot = _market_snapshot_by_id(session, snapshot_id)
+        side = plan.side if plan is not None and plan.side in ENTRY_DECISIONS else _decision_side_from_row(decision_row)
+        reason_codes = _unique_nonempty_strings(
+            [
+                *list(payload.get("hard_skip_reason_codes") or [] if isinstance(payload.get("hard_skip_reason_codes"), list) else []),
+                payload.get("reason"),
+                payload.get("ai_skipped_reason"),
+                payload.get("pre_ai_skip_reason"),
+            ]
+        ) or ["AI_CALL_SKIPPED"]
+        reference_price = (
+            (float(snapshot.latest_price) if snapshot is not None and snapshot.latest_price > 0 else None)
+            or ( _zone_midpoint(plan.entry_zone_min, plan.entry_zone_max) if plan is not None else None)
+            or _decision_reference_price(decision_row)
+        )
+        reference_time = snapshot.snapshot_time if snapshot is not None else row.created_at
+        candidates.append(
+            {
+                "_sort_at": row.created_at,
+                "source": "decision_ai_skipped",
+                "source_id": row.id,
+                "created_at": row.created_at.isoformat(),
+                "symbol": str(payload.get("symbol") or (plan.symbol if plan is not None else "") or _decision_output(decision_row).get("symbol") or "").upper(),
+                "timeframe": (
+                    (snapshot.timeframe if snapshot is not None else None)
+                    or (plan.source_timeframe if plan is not None else None)
+                    or _decision_timeframe(decision_row)
+                    or OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME
+                ),
+                "side": side,
+                "decision_run_id": decision_id,
+                "pending_entry_plan_id": plan.id if plan is not None else None,
+                "reason_codes": reason_codes,
+                "reference_snapshot_id": snapshot_id,
+                "reference_time": reference_time.isoformat() if reference_time is not None else None,
+                "reference_price": reference_price,
+                "entry_execution_type": (
+                    plan.entry_mode if plan is not None else _decision_entry_execution_type(decision_row)
+                ),
+                "ai_flow_tags": _ai_flow_tags(
+                    source="decision_ai_skipped",
+                    decision_row=decision_row,
+                    reason_codes=reason_codes,
+                ),
+            }
+        )
+    return candidates
+
+
+def _new_opportunity_summary() -> dict[str, object]:
+    return {
+        "candidates": 0,
+        "evaluated_candidates": 0,
+        "profitable_candidates": 0,
+        "loss_avoided_candidates": 0,
+        "source_counts": {},
+        "ai_flow_counts": {},
+        "_best_net_values": [],
+        "horizons": {
+            f"{horizon}m": {
+                "evaluated": 0,
+                "profitable": 0,
+                "_gross_move_pct_values": [],
+                "_net_after_fees_values": [],
+                "_fee_values": [],
+                "_slippage_values": [],
+                "_funding_values": [],
+            }
+            for horizon in OPPORTUNITY_ATTRIBUTION_HORIZONS_MINUTES
+        },
+    }
+
+
+def _add_opportunity_candidate(summary: dict[str, object], candidate: Mapping[str, object]) -> None:
+    summary["candidates"] = int(summary["candidates"]) + 1
+    source_counts = _as_dict(summary.get("source_counts"))
+    source = str(candidate.get("source") or "unknown")
+    source_counts[source] = int(source_counts.get(source, 0) or 0) + 1
+    summary["source_counts"] = source_counts
+    flow_counts = _as_dict(summary.get("ai_flow_counts"))
+    for tag in list(candidate.get("ai_flow_tags") or []):
+        tag_text = str(tag or "unclassified")
+        flow_counts[tag_text] = int(flow_counts.get(tag_text, 0) or 0) + 1
+    summary["ai_flow_counts"] = flow_counts
+
+    best_net = _optional_float(candidate.get("best_net_after_fees_usdt"))
+    if best_net is not None:
+        summary["evaluated_candidates"] = int(summary["evaluated_candidates"]) + 1
+        cast_values = list(summary.get("_best_net_values") or [])
+        cast_values.append(best_net)
+        summary["_best_net_values"] = cast_values
+        if best_net > 0:
+            summary["profitable_candidates"] = int(summary["profitable_candidates"]) + 1
+        else:
+            summary["loss_avoided_candidates"] = int(summary["loss_avoided_candidates"]) + 1
+
+    horizon_summaries = _as_dict(summary.get("horizons"))
+    for key, payload in _as_dict(candidate.get("horizons")).items():
+        horizon_summary = _as_dict(horizon_summaries.get(key))
+        horizon_payload = _as_dict(payload)
+        if horizon_payload.get("status") != "evaluated":
+            continue
+        horizon_summary["evaluated"] = int(horizon_summary.get("evaluated", 0) or 0) + 1
+        net = _safe_float(horizon_payload.get("net_after_fees_usdt"), default=0.0)
+        if net > 0:
+            horizon_summary["profitable"] = int(horizon_summary.get("profitable", 0) or 0) + 1
+        for source_key, target_key in (
+            ("gross_move_pct", "_gross_move_pct_values"),
+            ("net_after_fees_usdt", "_net_after_fees_values"),
+            ("estimated_fee_usdt", "_fee_values"),
+            ("estimated_slippage_usdt", "_slippage_values"),
+            ("estimated_funding_usdt", "_funding_values"),
+        ):
+            values = list(horizon_summary.get(target_key) or [])
+            values.append(_safe_float(horizon_payload.get(source_key), default=0.0))
+            horizon_summary[target_key] = values
+        horizon_summaries[key] = horizon_summary
+    summary["horizons"] = horizon_summaries
+
+
+def _finish_opportunity_summary(summary: dict[str, object]) -> dict[str, object]:
+    best_values = [float(value) for value in list(summary.pop("_best_net_values", []) or [])]
+    evaluated = int(summary.get("evaluated_candidates", 0) or 0)
+    summary["profitable_rate"] = round(int(summary.get("profitable_candidates", 0) or 0) / evaluated, 6) if evaluated else 0.0
+    summary["avg_best_net_after_fees_usdt"] = round(sum(best_values) / len(best_values), 8) if best_values else 0.0
+    summary["best_net_after_fees_usdt"] = round(max(best_values), 8) if best_values else 0.0
+    summary["worst_net_after_fees_usdt"] = round(min(best_values), 8) if best_values else 0.0
+    horizon_summaries = _as_dict(summary.get("horizons"))
+    for key, horizon_summary_raw in list(horizon_summaries.items()):
+        horizon_summary = _as_dict(horizon_summary_raw)
+        evaluated_horizon = int(horizon_summary.get("evaluated", 0) or 0)
+        for internal_key, output_key in (
+            ("_gross_move_pct_values", "avg_gross_move_pct"),
+            ("_net_after_fees_values", "avg_net_after_fees_usdt"),
+            ("_fee_values", "avg_estimated_fee_usdt"),
+            ("_slippage_values", "avg_estimated_slippage_usdt"),
+            ("_funding_values", "avg_estimated_funding_usdt"),
+        ):
+            values = [float(value) for value in list(horizon_summary.pop(internal_key, []) or [])]
+            horizon_summary[output_key] = round(sum(values) / len(values), 8) if values else 0.0
+        horizon_summary["profitable_rate"] = (
+            round(int(horizon_summary.get("profitable", 0) or 0) / evaluated_horizon, 6)
+            if evaluated_horizon
+            else 0.0
+        )
+        horizon_summaries[key] = horizon_summary
+    summary["horizons"] = horizon_summaries
+    return summary
+
+
+def _summaries_by_key(candidates: Sequence[Mapping[str, object]], key_getter) -> dict[str, dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for candidate in candidates:
+        keys = key_getter(candidate)
+        for key in keys:
+            key_text = str(key or "").strip()
+            if not key_text:
+                continue
+            grouped.setdefault(key_text, _new_opportunity_summary())
+            _add_opportunity_candidate(grouped[key_text], candidate)
+    return {key: _finish_opportunity_summary(value) for key, value in sorted(grouped.items())}
+
+
+def _threshold_review_from_quality_summary(quality_summary: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
+    mid = quality_summary.get("0.50_0.62", {})
+    high = quality_summary.get("0.62_plus", {})
+    mid_evaluated = int(mid.get("evaluated_candidates", 0) or 0)
+    high_evaluated = int(high.get("evaluated_candidates", 0) or 0)
+    mid_avg = _safe_float(mid.get("avg_best_net_after_fees_usdt"), default=0.0)
+    high_avg = _safe_float(high.get("avg_best_net_after_fees_usdt"), default=0.0)
+    if mid_evaluated < 3:
+        return {
+            "status": "insufficient_mid_bucket_sample",
+            "recommendation": "threshold_no_change",
+            "basis": "0.50~0.62 pending quality bucket has fewer than 3 evaluated samples.",
+        }
+    if mid_avg > 0 and (high_evaluated == 0 or mid_avg >= high_avg):
+        return {
+            "status": "review_threshold_possible_too_high",
+            "recommendation": "report_only_no_auto_change",
+            "basis": "0.50~0.62 bucket shows positive net-after-fees versus the current high-quality bucket.",
+        }
+    return {
+        "status": "threshold_supported_or_neutral",
+        "recommendation": "threshold_no_change",
+        "basis": "Mid-quality pending entries do not show stronger net-after-fees than 0.62+ entries in this sample.",
+    }
+
+
+def build_opportunity_attribution_report(
+    session: Session,
+    *,
+    lookback_hours: int = 24,
+    limit: int = 120,
+    notional_usdt: float = OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT,
+) -> dict[str, object]:
+    now = utcnow_naive()
+    bounded_lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    bounded_limit = max(1, min(int(limit), 500))
+    safe_notional = max(float(notional_usdt), 1.0)
+    since = now - timedelta(hours=bounded_lookback_hours)
+    candidates = [
+        *_risk_opportunity_candidates(session, since=since, limit=bounded_limit),
+        *_pending_opportunity_candidates(session, since=since, limit=bounded_limit),
+        *_audit_skip_opportunity_candidates(session, since=since, limit=bounded_limit),
+    ]
+    cost_cache: dict[tuple[str, str], object] = {}
+    evaluated_candidates = [
+        _attach_candidate_horizons(
+            session,
+            candidate,
+            cost_cache=cost_cache,
+            notional_usdt=safe_notional,
+        )
+        for candidate in candidates
+        if str(candidate.get("symbol") or "").strip()
+    ]
+    evaluated_candidates.sort(key=lambda item: item.get("_sort_at") or now, reverse=True)
+    for candidate in evaluated_candidates:
+        candidate.pop("_sort_at", None)
+
+    overall = _new_opportunity_summary()
+    for candidate in evaluated_candidates:
+        _add_opportunity_candidate(overall, candidate)
+    overall = _finish_opportunity_summary(overall)
+    reason_code_summary = _summaries_by_key(
+        evaluated_candidates,
+        lambda item: [
+            _opportunity_reason_code_key(reason)
+            for reason in list(item.get("reason_codes") or ["UNSPECIFIED"])
+        ],
+    )
+    quality_summary = _summaries_by_key(
+        [item for item in evaluated_candidates if item.get("source") == "pending_entry_plan"],
+        lambda item: [item.get("quality_bucket") or "missing"],
+    )
+    ai_flow_summary = _summaries_by_key(
+        evaluated_candidates,
+        lambda item: list(item.get("ai_flow_tags") or ["unclassified"]),
+    )
+    missed_opportunity_reason_codes = [
+        {"reason_code": key, **value}
+        for key, value in sorted(
+            reason_code_summary.items(),
+            key=lambda item: (
+                _safe_float(item[1].get("best_net_after_fees_usdt"), default=0.0),
+                int(item[1].get("profitable_candidates", 0) or 0),
+            ),
+            reverse=True,
+        )
+        if int(value.get("profitable_candidates", 0) or 0) > 0
+    ][:8]
+    loss_prevention_reason_codes = [
+        {"reason_code": key, **value}
+        for key, value in sorted(
+            reason_code_summary.items(),
+            key=lambda item: (
+                int(item[1].get("loss_avoided_candidates", 0) or 0),
+                -_safe_float(item[1].get("worst_net_after_fees_usdt"), default=0.0),
+            ),
+            reverse=True,
+        )
+        if int(value.get("loss_avoided_candidates", 0) or 0) > 0
+    ][:8]
+    return {
+        "generated_at": now.isoformat(),
+        "lookback_hours": bounded_lookback_hours,
+        "since": since.isoformat(),
+        "candidate_source_limit": bounded_limit,
+        "virtual_notional_usdt": round(safe_notional, 8),
+        "horizons_minutes": list(OPPORTUNITY_ATTRIBUTION_HORIZONS_MINUTES),
+        "basis": (
+            "Read-only opportunity attribution over risk_checks, pending_entry_plans, and "
+            "decision_ai_skipped audit events. Net estimate uses current cost_model fee/slippage "
+            "settings plus recent execution samples when available; funding is included only when "
+            "the reference market snapshot carries a funding_rate."
+        ),
+        "overall": overall,
+        "reason_code_summary": reason_code_summary,
+        "missed_opportunity_reason_codes": missed_opportunity_reason_codes,
+        "loss_prevention_reason_codes": loss_prevention_reason_codes,
+        "pending_quality_summary": quality_summary,
+        "pending_quality_threshold_review": _threshold_review_from_quality_summary(quality_summary),
+        "ai_flow_summary": ai_flow_summary,
+        "candidates": evaluated_candidates,
+    }
 
 
 def build_signal_performance_report(

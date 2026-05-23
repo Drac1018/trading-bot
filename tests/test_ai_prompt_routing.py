@@ -4,9 +4,11 @@ from trading_mvp.schemas import (
     AIDecisionContextPacket,
     CompositeRegimePacket,
     DataQualityPacket,
+    PositionExitReview,
     PreviousThesisDeltaPacket,
     TradeDecision,
 )
+from trading_mvp.services.agents import render_position_exit_review_instructions
 from trading_mvp.services.ai_prompt_routing import (
     bound_trade_decision,
     render_prompt_instructions,
@@ -157,13 +159,64 @@ def test_trading_decision_prompt_defines_senior_quant_risk_reviewer_contract() -
         "regime",
         "reason_summary",
         "entry_intent",
+        "watch_entry_plan",
         "entry_zone",
         "invalidation_level",
         "risk_notes",
         "required_confirmations",
         "hard_blocks_observed",
+        "psychology_scene_review",
+        "market_psychology",
+        "scene_scenario",
+        "entry_choreography",
+        "metadata_only_no_order_authority",
+        "fail_closed_applied",
+        "deterministic post-processing owns those fields",
     ):
         assert field_name in instructions
+
+
+def test_trade_decision_accepts_optional_psychology_scene_review_metadata() -> None:
+    decision = _decision(action="hold")
+    assert decision.psychology_scene_review is None
+
+    payload = decision.model_dump(mode="json")
+    payload["psychology_scene_review"] = {
+        "market_psychology": "Late longs are crowding into a pullback.",
+        "psychology_bias": "crowded_long",
+        "scene_scenario": "Trend pullback is forming but chase risk is elevated.",
+        "scene_type": "trend_pullback",
+        "entry_choreography": "Wait for the zone, then require a clean 1m reclaim.",
+        "preferred_entry_timing": "wait_1m_confirm",
+        "confirmation_cues": ["zone_touch", "1m_reclaim"],
+        "invalidation_cues": ["support_lost"],
+        "reason_codes": ["SCENE_TREND_PULLBACK"],
+        "summary": "Metadata-only scene read for the operator.",
+        "execution_boundary": "metadata_only_no_order_authority",
+    }
+
+    parsed = TradeDecision.model_validate(payload)
+
+    assert parsed.psychology_scene_review is not None
+    assert parsed.psychology_scene_review.scene_type == "trend_pullback"
+    assert parsed.psychology_scene_review.execution_boundary == "metadata_only_no_order_authority"
+
+
+def test_position_exit_review_schema_and_prompt_are_metadata_only() -> None:
+    review = PositionExitReview()
+    instructions = render_position_exit_review_instructions()
+
+    assert review.recommendation == "no_action"
+    assert review.advisory_only is True
+    assert review.execution_boundary == "metadata_only_no_order_authority"
+    assert "cannot submit, cancel, reduce, close, or modify any order" in instructions
+    assert "Never change stop loss" in instructions
+    assert "Do not mix this review with fresh-entry analysis" in instructions
+    assert "for scalp" in instructions
+    assert "For swing" in instructions
+    assert "For position" in instructions
+    assert "partial_take_profit_ready is true" in instructions
+    assert "metadata_only_no_order_authority" in instructions
 
 
 def test_invalid_output_bounding_on_protection_review_event() -> None:

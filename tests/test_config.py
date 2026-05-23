@@ -18,6 +18,14 @@ def test_settings_default_database_url_is_postgresql(monkeypatch, tmp_path) -> N
     assert settings.database_url == "postgresql+psycopg://trading:trading@127.0.0.1:5432/trading_mvp"
 
 
+def test_settings_default_decision_cycle_is_cost_conservative(monkeypatch) -> None:
+    monkeypatch.delenv("DECISION_CYCLE_INTERVAL_MINUTES", raising=False)
+
+    settings = config_module.Settings(_env_file=None)
+
+    assert settings.decision_cycle_interval_minutes == 15
+
+
 def test_settings_relative_sqlite_override_is_project_root_relative(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./runtime/state.db")

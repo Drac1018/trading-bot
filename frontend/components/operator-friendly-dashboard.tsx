@@ -3,7 +3,12 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
-import type { EntryQualityBreakdown, OperatorDashboardPayload, ProfitabilityCostBreakdown } from "./overview-dashboard";
+import type {
+  EntryQualityBreakdown,
+  ExchangeSyncDiagnostics,
+  OperatorDashboardPayload,
+  ProfitabilityCostBreakdown,
+} from "./overview-dashboard";
 import { formatAuditEntityType, formatAuditRowTitle } from "../lib/audit-log";
 import {
   describeReasonCode,
@@ -178,6 +183,13 @@ function isCurrentRiskBlocked(control: OperatorDashboardPayload["control"]) {
   return control.control_status_summary?.risk_allowed === false;
 }
 
+function isGlobalEntryBlocked(control: OperatorDashboardPayload["control"]) {
+  const summary = control.control_status_summary;
+  const globalReasons = summary?.global_block_reason_codes ?? [];
+  const blockScope = summary?.block_scope ?? "unknown";
+  return globalReasons.length > 0 || (blockScope !== "none" && blockScope !== "candidate");
+}
+
 function isPassiveRiskOnly(control: OperatorDashboardPayload["control"]) {
   const blockers = currentRiskBlockers(control);
   return blockers.length === 0 || blockers.every((code) => isEntryWaitReasonCodeInContext(code, blockers));
@@ -223,6 +235,17 @@ function protectionLabel(control: OperatorDashboardPayload["control"]) {
   return { label: "확인 중", tone: "warn" as const };
 }
 
+function protectionHeading(control: OperatorDashboardPayload["control"]) {
+  const protection = protectionLabel(control);
+  if (protection.tone === "safe") {
+    return "보호 장치 정상";
+  }
+  if (protection.tone === "neutral") {
+    return "보호 대상 없음";
+  }
+  return "보호 장치 확인 중";
+}
+
 function mainState(operator: OperatorDashboardPayload) {
   const control = operator.control;
   const blockers = importantBlockers(control);
@@ -237,6 +260,16 @@ function mainState(operator: OperatorDashboardPayload) {
         translateReasonCode(control.pause_reason_code) ||
         (manualPause ? "운영자가 자동 거래를 일시정지했습니다." : "시스템 보호 조건으로 신규 진입을 보류했습니다."),
       tone: "danger" as const,
+    };
+  }
+
+  if (control.can_enter_new_position && !isGlobalEntryBlocked(control)) {
+    return {
+      title: "진입 안전 기준 정상",
+      detail: isCurrentRiskBlocked(control)
+        ? "최근 후보는 리스크 기준에서 보류됐지만, 전역 신규 진입 게이트는 열려 있습니다."
+        : "계좌, 동기화, 보호주문 기준은 새 주문을 보낼 준비 상태입니다. 실제 신규 진입은 이번 AI/리스크 판단을 따릅니다.",
+      tone: "safe" as const,
     };
   }
 
@@ -300,9 +333,61 @@ function syncSummary(control: OperatorDashboardPayload["control"]) {
   return { label: "정상", tone: "safe" as const };
 }
 
+function exchangeSyncDiagnostics(control: OperatorDashboardPayload["control"]): ExchangeSyncDiagnostics {
+  return control.control_status_summary?.exchange_sync_diagnostics ?? control.exchange_sync_diagnostics ?? {};
+}
+
+function diagnosticCount(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function exchangeSyncPresentation(control: OperatorDashboardPayload["control"]) {
+  const diagnostics = exchangeSyncDiagnostics(control);
+  const status = diagnostics.status ?? "unknown";
+  const blockState = diagnostics.current_block_state ?? "unknown";
+  const failureCount = diagnosticCount(diagnostics.failure_count_24h);
+  const permissionFailureCount = diagnosticCount(diagnostics.permission_failure_count_24h);
+  const latestFailureAt = formatDateTime(diagnostics.latest_failure_at);
+  const latestSuccessAt = formatDateTime(diagnostics.latest_success_at);
+  const reason =
+    diagnostics.latest_failure_reason_code === "EXCHANGE_AUTH_PERMISSION_REJECTED"
+      ? "권한 거부"
+      : diagnostics.latest_failure_reason_code ?? "실패";
+
+  if (diagnostics.currently_blocking_new_entries || status === "blocked" || blockState === "currently_blocked") {
+    return {
+      label: "현재 차단",
+      detail: `최근 실패 ${latestFailureAt} / ${reason} / 24시간 실패 ${failureCount}건, 권한 ${permissionFailureCount}건`,
+      tone: "danger" as const,
+    };
+  }
+  if (status === "recovered" || diagnostics.recovered_after_latest_failure) {
+    return {
+      label: "복구됨",
+      detail: `최근 실패 이후 ${latestSuccessAt} 성공 / 권한 실패 이력 ${permissionFailureCount}건`,
+      tone: "safe" as const,
+    };
+  }
+  if (status === "healthy") {
+    return {
+      label: "정상",
+      detail: `최근 성공 ${latestSuccessAt} / 24시간 실패 ${failureCount}건`,
+      tone: "safe" as const,
+    };
+  }
+  return {
+    label: "확인 중",
+    detail: "exchange_sync_cycle 실행 이력 또는 sync freshness 근거가 부족합니다.",
+    tone: "neutral" as const,
+  };
+}
+
 function entryPermissionStatus(control: OperatorDashboardPayload["control"]) {
   if (control.trading_paused) {
     return { label: "보류", tone: "neutral" as const };
+  }
+  if (control.can_enter_new_position && !isGlobalEntryBlocked(control)) {
+    return { label: "준비됨", tone: "safe" as const };
   }
   if (isCurrentRiskBlocked(control)) {
     return isPassiveRiskOnly(control)
@@ -338,6 +423,23 @@ function syncActionDetail(scope: string, status: string) {
 function buildActionItems(operator: OperatorDashboardPayload): ActionItem[] {
   const control = operator.control;
   const items: ActionItem[] = [];
+
+  if (control.stale_pending_entry_plan_count > 0) {
+    const staleSymbols = unique(
+      control.stale_pending_entry_plans
+        .map((row) => (typeof row.symbol === "string" ? row.symbol : ""))
+        .filter((value) => value.length > 0),
+    );
+    const stalePreview = staleSymbols.length > 0 ? ` (${staleSymbols.join(", ")})` : "";
+    items.push({
+      id: "stale-triggered-pending-plans",
+      title: "만료된 triggered 진입 계획 정리 필요",
+      detail: `DB에 만료된 triggered pending_entry_plans가 ${control.stale_pending_entry_plan_count}건 남아 있습니다${stalePreview}. 현재 오픈 포지션/오픈 주문과 분리된 stale history일 수 있어 watcher cleanup 결과를 확인해야 합니다.`,
+      symbol: "전체",
+      priority: "높음",
+      tone: "warn",
+    });
+  }
 
   if (control.unprotected_positions > 0) {
     items.push({
@@ -512,11 +614,11 @@ function exposureCards(operator: OperatorDashboardPayload) {
 }
 
 const profitabilityWarningCopy: Record<string, string> = {
-  fee_exceeds_gross_pnl: "수수료가 gross PnL보다 큽니다.",
-  cost_exceeds_gross_pnl: "수수료와 funding 비용이 gross PnL보다 큽니다.",
-  positive_gross_negative_net: "gross PnL은 양수지만 비용 반영 후 net PnL은 음수입니다.",
+  fee_exceeds_gross_pnl: "수수료가 총손익보다 큽니다.",
+  cost_exceeds_gross_pnl: "수수료와 펀딩비가 총손익보다 큽니다.",
+  positive_gross_negative_net: "총손익은 양수지만 비용 반영 후 순손익은 음수입니다.",
   adverse_slippage_positive: "평균 체결 슬리피지가 거래자에게 불리하게 누적되고 있습니다.",
-  high_marketable_ratio_low_net_pnl: "marketable 진입 비중이 높고 net PnL이 낮습니다.",
+  high_marketable_ratio_low_net_pnl: "즉시체결형 진입 비중이 높고 순손익이 낮습니다.",
 };
 
 function costWindowLabel(value: string | null | undefined) {
@@ -532,9 +634,9 @@ function costWindowLabel(value: string | null | undefined) {
 
 function entryQualityLabel(value: string) {
   const labels: Record<string, string> = {
-    entry_passive_limit: "Passive limit",
-    entry_marketable: "Marketable",
-    entry_unknown: "Unknown",
+    entry_passive_limit: "지정가 대기형",
+    entry_marketable: "즉시체결형",
+    entry_unknown: "분류 없음",
   };
   return labels[value] ?? value;
 }
@@ -695,7 +797,7 @@ function ProfitabilityCostPanel({
       }
     >
       <p className="mt-4 text-sm leading-6 text-slate-600">
-        거래 확대 판단용 화면이 아니라 gross PnL이 수수료, funding, 불리한 체결에 먹히는지 확인하는 화면입니다.
+        거래 확대 판단용 화면이 아니라 총손익이 수수료, 펀딩비, 불리한 체결에 줄어드는지 확인하는 화면입니다.
       </p>
 
       {cost ? (
@@ -703,13 +805,13 @@ function ProfitabilityCostPanel({
           <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {[
               ["기간", costWindowLabel(cost.window_label), cost.status === "no_data" ? "집계 데이터 없음" : "비용 확인 기준"],
-              ["Net PnL", formatMoney(cost.net_pnl, 2), `funding 포함 ${formatMoney(cost.net_pnl_including_funding, 2)}`],
-              ["Gross PnL", formatMoney(cost.gross_pnl, 2), `실현 손익 ${formatMoney(cost.realized_pnl, 2)}`],
-              ["Fee", formatMoney(cost.fee, 2), `gross 대비 ${formatPct(cost.fee_to_gross_pnl_ratio)}`],
-              ["Funding", formatMoney(cost.funding, 2), "양수는 수취, 음수는 비용"],
-              ["총 비용", formatMoney(cost.total_cost, 2), `gross 대비 ${formatPct(cost.cost_to_gross_pnl_ratio)}`],
-              ["Signed slippage", formatBps(cost.signed_slippage_bps_avg), "양수는 불리한 평균 체결"],
-              ["Adverse slippage", formatBps(cost.adverse_slippage_bps_avg), "불리한 방향만 누적한 평균"],
+              ["순손익", formatMoney(cost.net_pnl, 2), `펀딩비 포함 ${formatMoney(cost.net_pnl_including_funding, 2)}`],
+              ["총손익", formatMoney(cost.gross_pnl, 2), `실현 손익 ${formatMoney(cost.realized_pnl, 2)}`],
+              ["수수료", formatMoney(cost.fee, 2), `총손익 대비 ${formatPct(cost.fee_to_gross_pnl_ratio)}`],
+              ["펀딩비", formatMoney(cost.funding, 2), "양수는 수취, 음수는 비용"],
+              ["총 비용", formatMoney(cost.total_cost, 2), `총손익 대비 ${formatPct(cost.cost_to_gross_pnl_ratio)}`],
+              ["평균 슬리피지", formatBps(cost.signed_slippage_bps_avg), "양수는 불리한 평균 체결"],
+              ["불리한 슬리피지", formatBps(cost.adverse_slippage_bps_avg), "불리한 방향만 누적한 평균"],
             ].map(([label, value, hint]) => (
               <div key={label} className="rounded-md border border-slate-100 bg-slate-50 p-4">
                 <p className="text-sm text-slate-500">{label}</p>
@@ -724,14 +826,14 @@ function ProfitabilityCostPanel({
               <p className="text-sm font-semibold text-slate-950">진입 방식 비중</p>
               <div className="mt-3 grid gap-3 sm:grid-cols-2">
                 <div>
-                  <p className="text-xs text-slate-500">Marketable entry</p>
+                  <p className="text-xs text-slate-500">즉시체결형 진입</p>
                   <p className="mt-1 text-base font-semibold text-slate-950">
                     {formatPct(cost.marketable_entry_ratio)}
                   </p>
                   <p className="text-xs text-slate-500">{cost.marketable_entry_count}건</p>
                 </div>
                 <div>
-                  <p className="text-xs text-slate-500">Passive limit entry</p>
+                  <p className="text-xs text-slate-500">지정가 대기형 진입</p>
                   <p className="mt-1 text-base font-semibold text-slate-950">
                     {formatPct(cost.passive_entry_ratio)}
                   </p>
@@ -739,7 +841,7 @@ function ProfitabilityCostPanel({
                 </div>
               </div>
               <p className="mt-3 text-xs leading-5 text-slate-500">
-                marketable 비중이 높으면 빠른 체결 대신 수수료와 슬리피지 부담이 커질 수 있습니다.
+                즉시체결형 비중이 높으면 빠른 체결 대신 수수료와 슬리피지 부담이 커질 수 있습니다.
               </p>
             </div>
 
@@ -752,7 +854,7 @@ function ProfitabilityCostPanel({
                   ))}
                 </ul>
               ) : (
-                <p className="mt-3 text-sm leading-6">현재 기간에서는 비용이 gross PnL을 넘는 경고가 없습니다.</p>
+                <p className="mt-3 text-sm leading-6">현재 기간에서는 비용이 총손익을 넘는 경고가 없습니다.</p>
               )}
             </div>
           </div>
@@ -763,9 +865,9 @@ function ProfitabilityCostPanel({
                 <span>진입 방식</span>
                 <span>거래</span>
                 <span>승률</span>
-                <span>Net</span>
-                <span>Expectancy</span>
-                <span>Slippage</span>
+                <span>순손익</span>
+                <span>기대값</span>
+                <span>슬리피지</span>
               </div>
               {visibleEntryQuality.map((item) => (
                 <div
@@ -780,7 +882,7 @@ function ProfitabilityCostPanel({
                   </span>
                   <span className="text-slate-700">{formatMoney(item.expectancy, 2)}</span>
                   <span className="text-slate-700">
-                    {formatBps(item.avg_signed_slippage_bps)} / adverse {formatBps(item.avg_adverse_slippage_bps)}
+                    {formatBps(item.avg_signed_slippage_bps)} / 불리 {formatBps(item.avg_adverse_slippage_bps)}
                   </span>
                 </div>
               ))}
@@ -791,8 +893,8 @@ function ProfitabilityCostPanel({
             <div className="mt-5 rounded-md border border-slate-100 bg-white">
               <div className="grid gap-2 border-b border-slate-100 px-4 py-3 text-xs font-semibold text-slate-500 sm:grid-cols-5">
                 <span>기간</span>
-                <span>Net</span>
-                <span>Gross</span>
+                <span>순손익</span>
+                <span>총손익</span>
                 <span>총 비용</span>
                 <span>진입 방식</span>
               </div>
@@ -808,7 +910,7 @@ function ProfitabilityCostPanel({
                   <span className="text-slate-700">{formatMoney(item.gross_pnl, 2)}</span>
                   <span className="text-slate-700">{formatMoney(item.total_cost, 2)}</span>
                   <span className="text-slate-700">
-                    M {formatPct(item.marketable_entry_ratio)} / P {formatPct(item.passive_entry_ratio)}
+                    즉시 {formatPct(item.marketable_entry_ratio)} / 대기 {formatPct(item.passive_entry_ratio)}
                   </span>
                 </div>
               ))}
@@ -932,7 +1034,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   const operator = payload;
   const state = mainState(operator);
   const protection = protectionLabel(operator.control);
+  const protectionTitle = protectionHeading(operator.control);
   const sync = syncSummary(operator.control);
+  const exchangeSync = exchangeSyncPresentation(operator.control);
   const entryPermission = entryPermissionStatus(operator.control);
   const actions = useMemo(() => buildActionItems(operator), [operator]);
   const remainingActions = actions.filter((item) => !checkedIds.includes(item.id));
@@ -976,7 +1080,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                 </div>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-3">
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="border-t border-slate-100 pt-4 sm:border-l sm:border-t-0 sm:pl-5 sm:pt-0">
                   <div className="flex items-center gap-3 text-slate-500">
                     <Icon name="clock" />
@@ -1002,18 +1106,28 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                     {sync.label}
                   </p>
                 </div>
+                <div className="border-t border-slate-100 pt-4 sm:border-l sm:border-t-0 sm:pl-5 sm:pt-0">
+                  <div className="flex items-center gap-3 text-slate-500">
+                    <Icon name="swap" />
+                    <span className="text-sm">거래소 동기화</span>
+                  </div>
+                  <p className={`mt-2 text-base font-semibold ${exchangeSync.tone === "safe" ? "text-emerald-700" : exchangeSync.tone === "danger" ? "text-rose-700" : "text-slate-700"}`}>
+                    {exchangeSync.label}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">{exchangeSync.detail}</p>
+                </div>
               </div>
             </div>
           </section>
 
-          <div className="grid gap-6 xl:grid-cols-[320px_minmax(330px,1fr)_360px]">
+          <div className="grid gap-6 xl:grid-cols-[minmax(280px,0.85fr)_minmax(0,1fr)] 2xl:grid-cols-[300px_minmax(0,1fr)_320px]">
             <Panel title="안전 상태" className="xl:min-h-[510px]">
               <div className="mt-6 flex flex-col items-center text-center">
                 <div className={`flex h-36 w-36 items-center justify-center rounded-full ${toneClass(protection.tone)}`}>
                   <Icon name="shield" className="h-20 w-20" />
                 </div>
                 <p className={`mt-5 text-2xl font-semibold ${protection.tone === "safe" ? "text-emerald-700" : "text-amber-800"}`}>
-                  {protection.tone === "safe" ? "보호 장치 정상" : "보호 장치 확인 중"}
+                  {protectionTitle}
                 </p>
                 <p className="mt-2 text-sm text-slate-500">
                   {openPositionCount > 0 ? `${openPositionCount}개 포지션 기준` : "열린 포지션 없음"}
@@ -1033,7 +1147,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                   },
                   {
                     label: "실행 프로파일",
-                    value: executionProfile.finalActiveProfile,
+                    value: executionProfile.finalActiveProfileLabel,
                     tone: operator.control.profile_new_entry_blocked ? "danger" as const : "info" as const,
                   },
                   { label: "보호주문 상태", value: protection.label, tone: protection.tone },
@@ -1119,9 +1233,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
               <Panel title="AI 실행 리스크 프로파일">
                 <div className="mt-5 grid gap-3 sm:grid-cols-3">
                   {[
-                    ["deterministic", executionProfile.deterministicProfile, "deterministic profile"],
+                    ["기본 규칙", executionProfile.deterministicProfile, "규칙 기반 상태"],
                     ["AI 추천", executionProfile.aiRecommendedProfile, executionProfile.recommendationStatusLabel],
-                    ["최종 active", executionProfile.finalActiveProfile, executionProfile.selectedReason],
+                    ["최종 적용", executionProfile.finalActiveProfile, executionProfile.profileBlockLabel],
                   ].map(([label, value, detail]) => (
                     <div key={label} className="rounded-md border border-slate-100 bg-slate-50 p-4">
                       <p className="text-sm text-slate-500">{label}</p>
@@ -1141,17 +1255,18 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                     <p className="mt-2 text-base font-semibold text-slate-950">
                       {executionProfile.newEntryLabel} / 생존 경로 {executionProfile.survivalPathLabel}
                     </p>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">{executionProfile.profileBlockDetail}</p>
                     <p className="mt-1 text-xs leading-5 text-slate-500">{executionProfile.survivalPathDetail}</p>
                   </div>
                 </div>
                 <div className="mt-4 rounded-md border border-slate-100 bg-slate-50 px-4 py-3">
                   <p className="text-sm leading-6 text-slate-600">
-                    profile selector {executionProfile.selectionMode} / 추천 ID {executionProfile.recommendationId} /
-                    confidence {executionProfile.confidenceLabel} / 다음 검토 {formatDateTime(executionProfile.nextReviewAt)}
+                    적용 방식 {executionProfile.selectionMode} / 추천 ID {executionProfile.recommendationId} /
+                    신뢰도 {executionProfile.confidenceLabel} / 다음 검토 {formatDateTime(executionProfile.nextReviewAt)}
                   </p>
                   {executionProfile.isProfileSelectorShadow ? (
                     <p className="mt-2 text-sm leading-6 text-blue-800">
-                      shadow mode에서는 AI 추천이 실제 active profile 변경이나 신규 진입 차단처럼 표시되지 않습니다.
+                      관찰 모드에서는 AI 추천을 기록만 하고 실제 프로파일이나 신규 진입 차단으로 적용하지 않습니다.
                     </p>
                   ) : null}
                   {executionProfile.ignoredReasonCodes.length > 0 ? (
@@ -1169,7 +1284,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
               />
             </div>
 
-            <Panel title="최근 감사 로그" className="xl:min-h-[510px]">
+            <Panel title="최근 감사 로그" className="xl:col-span-2 xl:min-h-[360px] 2xl:col-span-1 2xl:min-h-[510px]">
               <ol className="mt-6 space-y-5">
                 {audits.length === 0 ? (
                   <li className="rounded-lg border border-dashed border-slate-200 p-5 text-sm text-slate-500">

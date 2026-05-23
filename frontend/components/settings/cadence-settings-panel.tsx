@@ -21,6 +21,7 @@ type CadenceForm = {
   position_management_interval_seconds: number;
   decision_cycle_interval_minutes: number;
   ai_call_interval_minutes: number;
+  ai_trading_decision_daily_token_budget: number;
   adaptive_signal_enabled: boolean;
   position_management_enabled: boolean;
   break_even_enabled: boolean;
@@ -388,6 +389,22 @@ export function CadenceSettingsPanel({
                 min={5}
                 value={form.ai_call_interval_minutes}
                 onChange={(event) => onFieldChange("ai_call_interval_minutes", Number(event.target.value))}
+              />
+            </Field>
+            <Field
+              label="trading_decision 24h 토큰 예산"
+              hint="이 값에 도달하면 제공자 호출만 일시 차단하고 리스크/실행 안전 로직은 바꾸지 않습니다."
+            >
+              <input
+                className={inputClass}
+                type="number"
+                min={10000}
+                max={50000000}
+                step={10000}
+                value={form.ai_trading_decision_daily_token_budget}
+                onChange={(event) =>
+                  onFieldChange("ai_trading_decision_daily_token_budget", Number(event.target.value))
+                }
               />
             </Field>
           </div>

@@ -994,6 +994,7 @@ def summarize_universe_breadth(
     weak_volume_count = 0
     transition_count = 0
     entry_candidates = 0
+    structural_entry_candidates = 0
 
     for item in items:
         if item is None:
@@ -1030,6 +1031,8 @@ def summarize_universe_breadth(
             and primary_regime not in {"range", "transition"}
             and not momentum_weakening
         )
+        if inferred_entry_candidate:
+            structural_entry_candidates += 1
         if decisions is not None:
             if str(decisions.get(symbol, "") or "") in {"long", "short"}:
                 entry_candidates += 1
@@ -1051,8 +1054,9 @@ def summarize_universe_breadth(
     bullish_alignment_ratio = bullish_aligned_count / denominator
     bearish_alignment_ratio = bearish_aligned_count / denominator
     dominant_alignment_ratio = dominant_alignment_count / denominator
+    entry_candidate_pressure_count = structural_entry_candidates if decisions is not None else entry_candidates
 
-    if weak_volume_ratio >= 0.5 or entry_candidates <= 1:
+    if weak_volume_ratio >= 0.5 or entry_candidate_pressure_count <= 1:
         breadth_regime = "weak_breadth"
         entry_score_multiplier = 0.82
         hold_bias_multiplier = 1.18
@@ -1081,6 +1085,10 @@ def summarize_universe_breadth(
         "directional_bias": directional_bias,
         "tracked_symbols": total,
         "entry_candidates": entry_candidates,
+        "structural_entry_candidates": structural_entry_candidates,
+        "decision_entry_candidates": entry_candidates if decisions is not None else None,
+        "entry_candidate_pressure_count": entry_candidate_pressure_count,
+        "entry_candidate_pressure_basis": "structural" if decisions is not None else "inferred",
         "bullish_aligned_count": bullish_aligned_count,
         "bearish_aligned_count": bearish_aligned_count,
         "weak_volume_count": weak_volume_count,

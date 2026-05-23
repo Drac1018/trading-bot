@@ -38,9 +38,11 @@ test("valid conservative AI recommendation is shown as applied tighten", async (
   const summary = buildExecutionRiskProfileSummary(baseControl);
 
   assert.equal(summary.applicationStatus, "applied_tighten");
-  assert.equal(summary.deterministicProfile, "NORMAL");
-  assert.equal(summary.aiRecommendedProfile, "CAUTION");
-  assert.equal(summary.finalActiveProfile, "CAUTION");
+  assert.equal(summary.deterministicProfile, "정상");
+  assert.equal(summary.aiRecommendedProfile, "주의");
+  assert.equal(summary.finalActiveProfile, "주의");
+  assert.equal(summary.finalActiveProfileLabel, "주의 / 차단 미적용");
+  assert.equal(summary.profileBlockLabel, "차단 미적용");
   assert.equal(summary.newEntryLabel, "신규 진입 가능");
   assert.equal(summary.survivalPathLabel, "허용");
 });
@@ -60,8 +62,8 @@ test("expired and low confidence recommendations are shown as ignored", async ()
 
   assert.equal(summary.applicationStatus, "ignored");
   assert.deepEqual(summary.ignoredReasonCodes, [
-    "AI_MARKET_SETTINGS_RECOMMENDATION_EXPIRED",
-    "AI_MARKET_SETTINGS_RECOMMENDATION_LOW_CONFIDENCE",
+    "추천 유효 시간 만료",
+    "추천 신뢰도 부족",
   ]);
 });
 
@@ -80,8 +82,8 @@ test("AI relaxation is shown as blocked when deterministic profile is stricter",
   });
 
   assert.equal(summary.applicationStatus, "relaxation_blocked");
-  assert.deepEqual(summary.relaxationBlockReasonCodes, ["PROFILE_RELAXATION_CONSECUTIVE_CONFIRMATIONS"]);
-  assert.equal(summary.finalActiveProfile, "HIGH_VOLATILITY");
+  assert.deepEqual(summary.relaxationBlockReasonCodes, ["완화 확인 횟수 부족"]);
+  assert.equal(summary.finalActiveProfile, "변동성 확대");
 });
 
 test("shadow mode does not look like an active block", async () => {
@@ -98,8 +100,10 @@ test("shadow mode does not look like an active block", async () => {
   });
 
   assert.equal(summary.applicationStatus, "shadow");
-  assert.equal(summary.shadowFinalProfile, "STRESS");
-  assert.equal(summary.finalActiveProfile, "NORMAL");
+  assert.equal(summary.shadowFinalProfile, "위험 확대");
+  assert.equal(summary.finalActiveProfile, "정상");
+  assert.equal(summary.finalActiveProfileLabel, "정상 / 관찰만");
+  assert.equal(summary.profileBlockLabel, "관찰만");
   assert.equal(summary.newEntryLabel, "신규 진입 가능");
 });
 
@@ -115,5 +119,7 @@ test("backend profile block is displayed separately from survival paths", async 
   });
 
   assert.equal(summary.newEntryLabel, "신규 진입 차단");
+  assert.equal(summary.finalActiveProfileLabel, "보호 확인 필요 / 신규 진입 차단 적용");
+  assert.equal(summary.profileBlockLabel, "신규 진입 차단 적용");
   assert.equal(summary.survivalPathLabel, "허용");
 });

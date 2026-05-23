@@ -8,7 +8,10 @@ from trading_mvp.config import get_settings
 from trading_mvp.models import AuditEvent, PnLSnapshot
 from trading_mvp.providers import ProviderResult
 from trading_mvp.schemas import AIMarketSettingsRecommendation, TradeDecision
-from trading_mvp.services.agents import MarketSettingsAdvisorAgent
+from trading_mvp.services.agents import (
+    MarketSettingsAdvisorAgent,
+    build_market_settings_advisor_input_payload,
+)
 from trading_mvp.services.features import compute_features
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.orchestrator import TradingOrchestrator
@@ -288,6 +291,200 @@ def test_orchestrator_stale_incomplete_flags_drive_degraded_advisor_profile() ->
     assert "INCOMPLETE_MARKET_DATA" in flags
     assert recommendation.recommended_profile_id == "DEGRADED"
     assert recommendation.suggested_new_entry_policy == "NO_NEW_ENTRY"
+
+
+def test_orchestrator_soft_signal_flags_do_not_drive_incomplete_market_data() -> None:
+    snapshot = _snapshot()
+    features = compute_features(snapshot, {}).model_copy(
+        update={
+            "data_quality_flags": ["WEAK_VOLUME", "MOMENTUM_WEAKENING"],
+            "volatility_pct": 1.5,
+        }
+    )
+    features.regime.volatility_regime = "normal"
+
+    flags = TradingOrchestrator._market_settings_observed_risk_flags(
+        market_snapshot=snapshot,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        previous_state=None,
+    )
+
+    assert "INCOMPLETE_MARKET_DATA" not in flags
+    assert "HIGH_VOLATILITY" not in flags
+
+
+def test_market_settings_symbol_context_keeps_soft_signal_flags_complete() -> None:
+    snapshot = _snapshot()
+    features = compute_features(snapshot, {}).model_copy(
+        update={
+            "data_quality_flags": [
+                "WEAK_VOLUME",
+                "MOMENTUM_WEAKENING",
+                "LEAD_LAG_CONTEXT_UNAVAILABLE",
+                "DERIVATIVES_CONTEXT_UNAVAILABLE",
+                "PULLBACK_CONTEXT_PARTIAL",
+            ],
+            "volatility_pct": 1.5,
+        }
+    )
+    features.regime.volatility_regime = "normal"
+
+    context = TradingOrchestrator._market_settings_symbol_context_from_payload(
+        symbol=snapshot.symbol,
+        timeframe=snapshot.timeframe,
+        source="unit_test",
+        feature_time=snapshot.snapshot_time,
+        feature_payload=features.model_dump(mode="json"),
+        market_payload=snapshot.model_dump(mode="json"),
+        now=utcnow_naive(),
+    )
+
+    assert context["data_quality"]["is_complete"] is True
+    assert "INCOMPLETE_MARKET_DATA" not in context["risk_flags"]
+    assert "HIGH_VOLATILITY" not in context["risk_flags"]
+
+
+def test_market_settings_advisor_payload_keeps_context_flags_complete() -> None:
+    snapshot = _snapshot()
+    features = compute_features(snapshot, {}).model_copy(
+        update={
+            "data_quality_flags": [
+                "WEAK_VOLUME",
+                "MOMENTUM_WEAKENING",
+                "LEAD_LAG_CONTEXT_UNAVAILABLE",
+                "DERIVATIVES_CONTEXT_UNAVAILABLE",
+                "PULLBACK_CONTEXT_PARTIAL",
+            ],
+            "volatility_pct": 1.5,
+        }
+    )
+
+    payload = build_market_settings_advisor_input_payload(
+        market_snapshot=snapshot,
+        features=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        settings_policy={"symbol_scope": ["BTCUSDT"]},
+        observed_risk_flags=[],
+    )
+    symbol_context = payload["compact_market_context"]["symbols"][0]
+
+    assert symbol_context["data_quality"]["is_complete"] is True
+
+
+def test_market_settings_volatility_threshold_treats_ratio_default_as_percent(monkeypatch) -> None:
+    defaults = get_settings().model_copy(update={"ai_decision_volatility_spike_min_pct": 0.02})
+    monkeypatch.setattr("trading_mvp.services.orchestrator.get_settings", lambda: defaults)
+    snapshot = _snapshot()
+    features = compute_features(snapshot, {}).model_copy(
+        update={"data_quality_flags": [], "volatility_pct": 1.5}
+    )
+    features.regime.volatility_regime = "normal"
+
+    normal_flags = TradingOrchestrator._market_settings_observed_risk_flags(
+        market_snapshot=snapshot,
+        feature_payload=features,
+        runtime_state={"operating_state": "TRADABLE"},
+        previous_state=None,
+    )
+    elevated_flags = TradingOrchestrator._market_settings_observed_risk_flags(
+        market_snapshot=snapshot,
+        feature_payload=features.model_copy(update={"volatility_pct": 2.5}),
+        runtime_state={"operating_state": "TRADABLE"},
+        previous_state=None,
+    )
+
+    assert "HIGH_VOLATILITY" not in normal_flags
+    assert "HIGH_VOLATILITY" in elevated_flags
+
+
+def test_shadow_market_settings_advisor_is_not_injected_as_trading_constraint() -> None:
+    risk_context = {
+        "execution_constraints_summary": {
+            "risk_guard_final_authority": True,
+        }
+    }
+    advisor_result = {
+        "status": "shadow_generated",
+        "provider": "openai",
+        "shadow": True,
+        "risk_guard_unchanged": True,
+        "observed_risk_flags": ["MARKET_BREADTH_WEAK"],
+        "recommendation": {
+            "recommended_profile_id": "DEGRADED",
+            "confidence": 0.88,
+            "suggested_new_entry_policy": "NO_NEW_ENTRY",
+            "do_not_relax": True,
+            "reason_codes": ["MARKET_BREADTH_WEAK"],
+        },
+    }
+
+    updated, advisor_context = TradingOrchestrator._risk_context_with_market_settings_advisor(
+        risk_context,
+        advisor_result,
+    )
+
+    assert updated == risk_context
+    assert advisor_context["shadow"] is True
+    assert "suggested_new_entry_policy" not in advisor_context["recommendation"]
+    assert "market_settings_advisor" not in updated
+    assert "execution_risk_profile_advisor" not in updated["execution_constraints_summary"]
+
+
+def test_skipped_market_settings_advisor_is_not_injected_as_trading_constraint() -> None:
+    risk_context = {
+        "execution_constraints_summary": {
+            "risk_guard_final_authority": True,
+        }
+    }
+    advisor_result = {
+        "status": "skipped",
+        "skip_reason": "min_recheck_interval_active",
+        "risk_guard_unchanged": True,
+        "observed_risk_flags": ["MARKET_BREADTH_WEAK"],
+    }
+
+    updated, advisor_context = TradingOrchestrator._risk_context_with_market_settings_advisor(
+        risk_context,
+        advisor_result,
+    )
+
+    assert updated == risk_context
+    assert advisor_context["status"] == "skipped"
+    assert "market_settings_advisor" not in updated
+    assert "execution_risk_profile_advisor" not in updated["execution_constraints_summary"]
+
+
+def test_non_shadow_market_settings_advisor_is_injected_as_trading_constraint() -> None:
+    risk_context = {
+        "execution_constraints_summary": {
+            "risk_guard_final_authority": True,
+        }
+    }
+    advisor_result = {
+        "status": "generated",
+        "provider": "openai",
+        "shadow": False,
+        "risk_guard_unchanged": True,
+        "observed_risk_flags": ["HIGH_VOLATILITY"],
+        "recommendation": {
+            "recommended_profile_id": "HIGH_VOLATILITY",
+            "confidence": 0.88,
+            "suggested_new_entry_policy": "STRICT_CONFIRMATION_ONLY",
+            "do_not_relax": True,
+            "reason_codes": ["HIGH_VOLATILITY"],
+        },
+    }
+
+    updated, advisor_context = TradingOrchestrator._risk_context_with_market_settings_advisor(
+        risk_context,
+        advisor_result,
+    )
+
+    assert advisor_context["shadow"] is False
+    assert advisor_context["recommendation"]["suggested_new_entry_policy"] == "STRICT_CONFIRMATION_ONLY"
+    assert updated["market_settings_advisor"] == advisor_context
+    assert updated["execution_constraints_summary"]["execution_risk_profile_advisor"] == advisor_context
 
 
 def test_safe_profile_selector_tightens_normal_to_ai_caution(db_session) -> None:

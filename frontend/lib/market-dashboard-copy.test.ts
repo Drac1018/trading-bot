@@ -41,8 +41,28 @@ test("market block reason labels cover representative and unknown reason codes",
     marketReasonCodeLabel("market_stream_cache_unavailable"),
     "실시간 시장 데이터 캐시를 사용할 수 없어 REST 보조 경로를 사용 중입니다",
   );
+  assert.equal(
+    marketReasonCodeLabel("market_stream_older_than_rest"),
+    "실시간 스트림보다 REST 최신 캔들이 더 최신이라 REST 보조 경로를 사용 중입니다",
+  );
+  assert.equal(
+    marketReasonCodeLabel("MARKET_STREAM_CONNECTION_DROPPED"),
+    "실시간 시장 데이터 스트림 연결이 끊겼습니다",
+  );
   assert.equal(marketReasonCodeLabel("incomplete_market_data"), "시장 데이터가 불완전하여 신규 진입을 막았습니다");
   assert.equal(marketReasonCodeLabel("exposure_limit_exceeded"), "노출 한도를 초과해 신규 진입을 막았습니다");
+  assert.equal(
+    marketReasonCodeLabel("DERIVATIVES_ALIGNMENT_HEADWIND"),
+    "파생시장 정합성이 진입 방향을 뒷받침하지 않습니다",
+  );
+  assert.equal(
+    marketReasonCodeLabel("BREAKOUT_OI_SPREAD_FILTER"),
+    "돌파처럼 보여도 OI와 스프레드 조건이 부족합니다",
+  );
+  assert.equal(
+    marketReasonCodeLabel("ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED"),
+    "trading_decision 일일 AI 토큰 예산이 소진되어 deterministic 판단을 사용했습니다",
+  );
   assert.equal(marketReasonCodeLabel("unknown_reason_code"), "알 수 없는 차단 사유");
   assert.equal(formatMarketReasonCodeLabels(["unknown_reason_code"]), "알 수 없는 차단 사유");
   assert.equal(

@@ -22,6 +22,30 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     operator_action_ko: "운영 상태가 정상이라면 별도 조치 없이 다음 판단 주기를 기다립니다.",
     check_location_ko: "AI 의견 / 이번 판단 주기 상태",
   },
+  DERIVATIVES_ALIGNMENT_HEADWIND: {
+    category: "entry_wait",
+    title_ko: "파생시장 정합성이 진입 방향을 뒷받침하지 않습니다",
+    detail_ko: "가격 움직임은 있어도 funding, basis, taker flow, 포지션 쏠림 같은 파생시장 근거가 진입 방향과 충분히 맞지 않습니다.",
+    auto_clear_hint_ko: "파생시장 정합성이 개선되면 다음 판단 주기에서 다시 진입 후보로 평가됩니다.",
+    operator_action_ko: "AI 의견의 derivatives summary와 시장 신호 요약에서 funding, basis, taker flow, crowding 상태를 확인하세요.",
+    check_location_ko: "AI 의견 / 파생시장 요약",
+  },
+  BREAKOUT_OI_SPREAD_FILTER: {
+    category: "entry_wait",
+    title_ko: "돌파처럼 보여도 OI와 스프레드 조건이 부족합니다",
+    detail_ko: "가격은 돌파 형태를 보였지만 OI 확장 또는 스프레드 품질이 충분하지 않아 추격 진입을 보류했습니다.",
+    auto_clear_hint_ko: "OI 확장과 체결 품질 조건이 좋아지면 다음 판단 주기에서 다시 평가됩니다.",
+    operator_action_ko: "AI 의견의 돌파 근거, OI 확장 여부, 스프레드 부담 여부를 확인하세요.",
+    check_location_ko: "AI 의견 / 시장 신호 / 파생시장 요약",
+  },
+  BREAKOUT_OI_NOT_EXPANDING: {
+    category: "entry_wait",
+    title_ko: "돌파 확인에 필요한 OI 증가가 없습니다",
+    detail_ko: "가격 돌파가 신규 포지션 유입으로 확인되지 않아 돌파 추종 진입을 보류했습니다.",
+    auto_clear_hint_ko: "돌파 방향으로 OI가 확장되면 다음 판단 주기에서 다시 평가됩니다.",
+    operator_action_ko: "AI 의견의 OI 확장 여부와 돌파 방향 신뢰도를 확인하세요.",
+    check_location_ko: "AI 의견 / 파생시장 요약",
+  },
   ENTRY_TRIGGER_NOT_MET: {
     category: "entry_wait",
     title_ko: "진입 조건이 아직 충족되지 않았습니다",
@@ -41,9 +65,9 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
   PLAN_MAX_CHASE_EXCEEDED: {
     category: "entry_wait",
     title_ko: "대기 중인 진입 계획이 추격 한도를 넘었습니다",
-    detail_ko: "pending plan은 유지되지만, 현재 가격에서는 주문으로 전환하지 않습니다.",
+    detail_ko: "대기 계획은 유지되지만, 현재 가격에서는 주문으로 전환하지 않습니다.",
     auto_clear_hint_ko: "가격이 다시 허용 범위로 돌아오면 watcher가 다음 주기에서 다시 평가합니다.",
-    operator_action_ko: "pending plan의 현재가, 진입 구간, 최대 추격폭을 확인합니다.",
+    operator_action_ko: "대기 계획의 현재가, 진입 구간, 최대 추격폭을 확인합니다.",
     check_location_ko: "진입 대기 계획 > 감시 상태 / 추격 폭",
   },
   PLAN_LATE_CHASE_WAITING_REENTRY: {
@@ -65,7 +89,7 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
   DETERMINISTIC_BASELINE_DISAGREEMENT: {
     category: "entry_wait",
     title_ko: "AI 판단과 기준선 판단이 달라 즉시 주문을 보류했습니다",
-    detail_ko: "AI는 진입을 제안했지만, 결정론적 기준선과 일치하지 않아 안전상 즉시 주문하지 않았습니다.",
+    detail_ko: "AI는 진입을 제안했지만, 규칙 기반 기준선과 일치하지 않아 안전상 즉시 주문하지 않았습니다.",
     auto_clear_hint_ko: "다음 판단 주기에서 판단이 일치하면 해소될 수 있습니다.",
     operator_action_ko: "AI 의견과 기준선 판단이 같은 방향인지 확인합니다.",
     check_location_ko: "AI 의견 / 신규 진입 판단",
@@ -73,10 +97,10 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
   CONFIDENCE_BELOW_MIN_ENTRY_THRESHOLD: {
     category: "entry_wait",
     title_ko: "진입 신뢰도가 기준보다 낮아 대기 중입니다",
-    detail_ko: "AI가 감시용 진입 계획은 제안했지만 confidence가 최소 진입 기준보다 낮아 pending plan을 만들지 않았습니다.",
-    auto_clear_hint_ko: "다음 판단 주기에서 confidence가 기준 이상으로 올라가면 다시 리스크 검토됩니다.",
-    operator_action_ko: "AI 의견의 confidence, watch entry plan, expected cost gate 기준을 확인합니다.",
-    check_location_ko: "AI 의견 / 리스크 점검 > expected cost gate",
+    detail_ko: "AI가 감시용 진입 계획은 제안했지만 신뢰도가 최소 진입 기준보다 낮아 대기 진입 계획을 만들지 않았습니다.",
+    auto_clear_hint_ko: "다음 판단 주기에서 신뢰도가 기준 이상으로 올라가면 다시 리스크 검토됩니다.",
+    operator_action_ko: "AI 의견의 신뢰도, 감시용 진입 계획, 예상 비용 점검 기준을 확인합니다.",
+    check_location_ko: "AI 의견 / 리스크 점검 > 예상 비용 점검",
   },
   NO_EDGE: {
     category: "entry_wait",
@@ -113,6 +137,14 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
 };
 
 const operationalReasonDefinitions: Record<string, ReasonCodeDefinition> = {
+  ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: {
+    category: "operational_control",
+    title_ko: "trading_decision 일일 AI 토큰 예산을 모두 사용했습니다",
+    detail_ko: "OpenAI 호출 예산이 소진되어 이번 주기는 규칙 기반 판단으로 처리됐습니다. 주문 실행 차단 사유가 아니라 AI 호출 생략 사유입니다.",
+    auto_clear_hint_ko: "역할별 24시간 토큰 사용량이 예산 아래로 내려가면 자동으로 다시 OpenAI 호출이 가능합니다.",
+    operator_action_ko: "운영 진단의 AI 비용/억제 상태에서 trading_decision 역할 예산과 재시도 가능 시간을 확인하세요.",
+    check_location_ko: "운영 진단 > 리스크 > AI 비용/억제 상태",
+  },
   MANUAL_USER_REQUEST: {
     category: "operational_control",
     title_ko: "운영자가 수동으로 거래를 일시정지했습니다",
@@ -337,8 +369,16 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     title_ko: "최근 해당 심볼 실현손익이 수수료 차감 후 음수입니다",
     detail_ko: "최근 실행 이력이 수수료 차감 후 손실 구간이라 같은 심볼의 신규 진입을 막았습니다.",
     auto_clear_hint_ko: "최근 거래 성과가 순손익 기준으로 회복되면 다음 리스크 점검에서 자동 해소될 수 있습니다.",
-    operator_action_ko: "리스크 카드의 차단 사유 근거에서 lookback 기간, 실행 건수, gross/fee/net 손익을 확인하세요.",
+    operator_action_ko: "리스크 카드의 차단 사유 근거에서 조회 기간, 실행 건수, 총손익/수수료/순손익을 확인하세요.",
     check_location_ko: "운영 판단 > 리스크 > 거래 안 된 이유 / 차단 사유",
+  },
+  DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE: {
+    category: "safety_block",
+    title_ko: "최근 같은 판단 버킷의 순손익이 음수입니다",
+    detail_ko: "심볼, 방향, 레짐이 같은 최근 체결 버킷의 수수료 차감 후 기대값이 음수라 신규 진입을 차단합니다.",
+    auto_clear_hint_ko: "같은 버킷의 최근 성과가 충분한 표본에서 회복되면 다음 리스크 평가에서 자동 해소됩니다.",
+    operator_action_ko: "리스크 카드의 판단 버킷 성과 근거에서 버킷, 표본 수, 순손익, 기대값을 확인하세요.",
+    check_location_ko: "운영 진단 > 리스크 > 거래 안 된 이유 / 차단 사유",
   },
   CORRELATED_EXPOSURE_LIMIT_REACHED: {
     category: "safety_block",
@@ -353,8 +393,123 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     title_ko: "주문 가격 괴리가 허용 범위를 넘었습니다",
     detail_ko: "주문 제출 직전 기준 가격과 현재 시장가 차이가 커서 주문을 보내지 않았습니다.",
     auto_clear_hint_ko: "가격 괴리가 허용 범위로 줄어들면 다음 판단 주기에서 다시 검토됩니다.",
-    operator_action_ko: "기준 가격, 현재가, slippage threshold를 확인합니다.",
-    check_location_ko: "안전 점검 > 주문 가격 괴리 / slippage threshold",
+    operator_action_ko: "기준 가격, 현재가, 허용 가격 괴리 기준을 확인합니다.",
+    check_location_ko: "안전 점검 > 주문 가격 괴리 / 허용 가격 괴리",
+  },
+};
+
+const positionExitReviewReasonDefinitions: Record<string, ReasonCodeDefinition> = {
+  POSITION_EXIT_REVIEW_LOCAL_FILTER_BLOCKED: {
+    category: "safety_block",
+    title_ko: "AI 익절 제안이 로컬 보유전략 필터에서 차단됐습니다",
+    detail_ko: "AI가 익절/축소 후보를 냈지만 현재 포지션의 초단기/스윙/장기 보유전략 조건과 맞지 않아 실행 후보로 쓰지 않았습니다.",
+    auto_clear_hint_ko: "포지션의 R 배수, 최대 유리 이동폭 되돌림, 시간 조건, 레짐 약화 같은 규칙 기반 근거가 생기면 다음 관리 주기에서 다시 평가됩니다.",
+    operator_action_ko: "AI 익절 판단의 recommendation과 position_management의 holding_profile, reduce_reason_codes, partial_take_profit_ready 값을 함께 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단 / position_management payload",
+  },
+  POSITION_EXIT_REVIEW_PARTIAL_NOT_READY: {
+    category: "safety_block",
+    title_ko: "부분익절 조건이 아직 충족되지 않았습니다",
+    detail_ko: "AI가 부분익절을 제안했지만 규칙 기반 부분익절 준비 상태가 false라서 실제 축소 전용 부분익절 후보로 쓰지 않았습니다.",
+    auto_clear_hint_ko: "설정된 partial TP R 기준과 포지션 수익 조건이 충족되면 다음 관리 주기에서 자동으로 다시 평가됩니다.",
+    operator_action_ko: "position_management.partial_take_profit_ready, current_r_multiple, partial_take_profit_trigger_r, partial_take_profit_taken 값을 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_PARTIAL_TP_ALREADY_TAKEN: {
+    category: "safety_block",
+    title_ko: "이미 부분익절이 처리된 포지션입니다",
+    detail_ko: "AI가 부분익절을 제안했지만 이 포지션은 이미 partial take-profit 처리 이력이 있어 중복 축소 후보로 쓰지 않았습니다.",
+    auto_clear_hint_ko: "남은 수량은 잔여 수량 관리 또는 보호주문/트레일링 조건으로 계속 관리됩니다.",
+    operator_action_ko: "포지션 관리 상태에서 부분익절 처리 여부와 남은 포지션 수량을 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_SCALP_RUNNER_BLOCKED: {
+    category: "safety_block",
+    title_ko: "단타 포지션: 잔여 수량 축소 근거가 부족합니다",
+    detail_ko: "단타 보유전략에서는 긴 잔여 수량 관리보다 빠른 실패/약화 근거가 필요합니다. 해당 근거가 없어 AI의 축소 또는 전량 익절 제안을 막았습니다.",
+    auto_clear_hint_ko: "초단기 실패 준비, 시간 조건, 모멘텀 약화, 레짐 전환 같은 근거가 생기면 다시 평가됩니다.",
+    operator_action_ko: "보유전략이 단타인지, 부분익절 이후 잔여 수량 관리 상태인지, 빠른 실패/약화 사유가 있는지 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단 / 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_SWING_RUNNER_SIGNAL_REQUIRED: {
+    category: "safety_block",
+    title_ko: "스윙 포지션: 잔여 수량 훼손 근거가 아직 부족합니다",
+    detail_ko: "스윙 보유전략에서는 부분익절 이후 잔여 수량 훼손, 최대 유리 이동폭 되돌림, 축소 사유 코드 같은 근거가 있어야 AI 축소/청산 후보를 허용합니다.",
+    auto_clear_hint_ko: "부분익절 이후 잔여 수량이 약해지거나 되돌림/축소 사유 코드가 생기면 다음 관리 주기에서 다시 검토됩니다.",
+    operator_action_ko: "부분익절 처리 여부, 최대 유리 이동폭 되돌림, 축소 사유, 부분익절 이후 잔여 수량 상태를 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단 / 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_POSITION_EXIT_TOO_EARLY: {
+    category: "safety_block",
+    title_ko: "장기 보유 포지션: 전량 익절 근거가 아직 이릅니다",
+    detail_ko: "장기 보유전략에서는 더 긴 보유와 보호적 손절 조정을 우선합니다. 로컬 청산 계열 사유 코드가 없어 AI 청산/축소 제안을 막았습니다.",
+    auto_clear_hint_ko: "로컬 청산 사유 코드가 생기거나 보호적 추적 손절/본전 이동 조건이 충족되면 다음 관리 주기에서 다시 평가됩니다.",
+    operator_action_ko: "holding_profile=position, reduce_reason_codes의 EXIT 계열 코드, tightened_stop_loss 후보를 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단 / 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_STALE_SYNC: {
+    category: "safety_block",
+    title_ko: "동기화 상태가 오래되어 AI 익절 실행 후보를 차단했습니다",
+    detail_ko: "계정, 포지션, 미체결 주문, 보호주문 동기화 중 하나라도 신뢰하기 어려워 AI 익절 판단을 실행 후보로 사용하지 않았습니다.",
+    auto_clear_hint_ko: "동기화가 정상 상태로 회복되면 다음 포지션 관리 주기에서 다시 평가됩니다.",
+    operator_action_ko: "sync freshness summary에서 account, positions, open_orders, protective_orders 상태를 확인하세요.",
+    check_location_ko: "운영 진단 > 거래소 동기화 / 포지션 관리 audit",
+  },
+  POSITION_EXIT_REVIEW_PROTECTION_UNVERIFIED: {
+    category: "safety_block",
+    title_ko: "보호주문 검증 전이라 AI 익절 실행 후보를 차단했습니다",
+    detail_ko: "포지션의 보호주문 상태가 protected로 확인되지 않아 AI 익절/축소 판단을 실행 후보로 사용하지 않았습니다.",
+    auto_clear_hint_ko: "보호주문 검증이 완료되면 다음 관리 주기에서 다시 평가됩니다.",
+    operator_action_ko: "손절/익절 보호주문이 거래소에 축소 전용 또는 청산 전용으로 살아 있는지 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > 보호주문 상태",
+  },
+  POSITION_EXIT_REVIEW_STOP_RELAXATION_IGNORED: {
+    category: "safety_block",
+    title_ko: "AI의 손절 완화 제안은 무시됐습니다",
+    detail_ko: "AI 출력에 손절을 넓히거나 약화시키는 내용이 감지되어 적용하지 않고 감사 기록만 남겼습니다. 손절 권한은 규칙 기반 고정 손절에 남아 있습니다.",
+    auto_clear_hint_ko: "AI가 더 보호적인 손절 조임을 제안하거나 규칙 기반 손절 조건이 충족되면 별도 보호 경로에서 평가됩니다.",
+    operator_action_ko: "감사 상세의 손절 완화 내용과 현재 보호 손절 상태를 확인하세요.",
+    check_location_ko: "감사 로그 > position_exit_review_stop_relaxation_ignored",
+  },
+  POSITION_EXIT_REVIEW_BREAKEVEN_NOT_MORE_PROTECTIVE: {
+    category: "safety_block",
+    title_ko: "본전 이동 후보가 현재 손절보다 보호적이지 않습니다",
+    detail_ko: "AI가 본전 이동을 제안했지만 규칙 기반 손절 후보가 현재 손절보다 더 보호적이지 않아 적용하지 않았습니다.",
+    auto_clear_hint_ko: "현재가와 손절 후보가 더 보호적인 구조가 되면 다음 관리 주기에서 다시 평가됩니다.",
+    operator_action_ko: "break_even_stop_loss, current_stop_loss, mark_price를 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_TIGHTEN_NOT_MORE_PROTECTIVE: {
+    category: "safety_block",
+    title_ko: "트레일링 조임 후보가 현재 손절보다 보호적이지 않습니다",
+    detail_ko: "AI가 추적 손절 조임을 제안했지만 규칙 기반 손절 후보가 현재 손절보다 더 보호적이지 않아 적용하지 않았습니다.",
+    auto_clear_hint_ko: "ATR 추적 손절 또는 최대 유리 이동폭 되돌림 손절 후보가 현재 손절보다 보호적으로 계산되면 다시 평가됩니다.",
+    operator_action_ko: "tightened_stop_loss, current_stop_loss, atr_trailing_stop_enabled, mfe_rollback 상태를 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > 포지션 관리 상태",
+  },
+  POSITION_EXIT_REVIEW_FULL_TAKE_PROFIT: {
+    category: "safety_block",
+    title_ko: "AI 전량 익절 후보",
+    detail_ko: "AI가 전량 익절을 제안했고 로컬 필터와 리스크/실행 게이트를 통과할 때만 청산 전용 후보로 사용됩니다.",
+    auto_clear_hint_ko: "후보 상태는 다음 포지션 관리 주기에서 새 데이터로 다시 평가됩니다.",
+    operator_action_ko: "position_exit_review_execution과 risk_result, execution_result를 함께 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단",
+  },
+  POSITION_EXIT_REVIEW_PARTIAL_TAKE_PROFIT: {
+    category: "safety_block",
+    title_ko: "AI 부분익절 후보",
+    detail_ko: "AI가 부분익절을 제안했고 규칙 기반 부분익절 준비 상태가 true일 때만 축소 전용 후보로 사용됩니다.",
+    auto_clear_hint_ko: "partial TP 조건은 다음 포지션 관리 주기에서 새 R 배수 기준으로 다시 평가됩니다.",
+    operator_action_ko: "partial_take_profit_ready, partial_take_profit_fraction, current_r_multiple을 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단",
+  },
+  POSITION_EXIT_REVIEW_REDUCE_RISK_ONLY: {
+    category: "safety_block",
+    title_ko: "AI 리스크 축소 후보",
+    detail_ko: "AI가 포지션 축소를 제안했고 로컬 보유전략 필터와 리스크 게이트를 통과할 때만 축소 전용 후보로 사용됩니다.",
+    auto_clear_hint_ko: "잔여 수량 훼손 또는 시간/레짐 약화 근거가 바뀌면 다음 관리 주기에서 다시 평가됩니다.",
+    operator_action_ko: "holding_profile, reduce_reason_codes, mfe_rollback_triggered, time_to_fail_ready를 확인하세요.",
+    check_location_ko: "대시보드 > 포지션 > AI 익절 판단",
   },
 };
 
@@ -398,6 +553,34 @@ const reasonDefinitions: Record<string, ReasonCodeDefinition> = {
   ...entryWaitReasonDefinitions,
   ...operationalReasonDefinitions,
   ...safetyReasonDefinitions,
+  ...positionExitReviewReasonDefinitions,
+};
+
+const operatorReasonOverrides: Record<string, ReasonCodeDefinition> = {
+  SYMBOL_RECENT_PERFORMANCE_NEGATIVE: {
+    category: "safety_block",
+    title_ko: "최근 BTCUSDT 실거래 성과가 수수료 차감 후 손실입니다",
+    detail_ko: "최근 BTCUSDT 체결 이력의 총손익에서 수수료를 뺀 순손익이 음수라서 같은 심볼의 신규 진입을 보류했습니다.",
+    auto_clear_hint_ko: "최근 BTCUSDT 실거래 성과가 충분한 표본에서 수수료 차감 후 순손익 기준으로 회복되면 다음 리스크 평가에서 자동 해제될 수 있습니다.",
+    operator_action_ko: "리스크 근거에서 조회 기간, 실행 건수, 총손익, 수수료, 수수료 차감 후 순손익을 확인하세요.",
+    check_location_ko: "운영 대시보드 > 리스크 > 차단 사유 근거",
+  },
+  DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE: {
+    category: "safety_block",
+    title_ko: "BTCUSDT long 전환장 버킷의 최근 기대값이 음수입니다",
+    detail_ko: "같은 심볼, 같은 방향, 같은 시장 레짐의 최근 체결 버킷에서 수수료 차감 후 순손익과 체결당 기대값이 모두 음수라서 신규 진입을 차단했습니다.",
+    auto_clear_hint_ko: "같은 버킷의 최근 성과가 충분한 표본에서 수수료 차감 후 순손익과 기대값 기준으로 회복되면 다음 리스크 평가에서 자동 해제될 수 있습니다.",
+    operator_action_ko: "판단 버킷 성과 근거에서 버킷 키, 체결 수, 판단 수, 수수료 차감 후 순손익, 수수료 차감 후 기대값을 확인하세요.",
+    check_location_ko: "운영 대시보드 > 리스크 > 버킷 성과 근거",
+  },
+  CORRELATED_EXPOSURE_LIMIT_REACHED: {
+    category: "safety_block",
+    title_ko: "BTC/ETH 같은 방향 노출 한도를 넘습니다",
+    detail_ko: "이 후보 주문을 더하면 BTC/ETH 계열의 같은 방향 노출이 허용 한도를 초과합니다. 그래서 실제 주문 제출 전에 차단했습니다.",
+    auto_clear_hint_ko: "후보 주문 크기가 줄거나 기존 BTC/ETH 같은 방향 노출이 감소해 한도 안으로 돌아오면 다음 리스크 평가에서 자동 해제될 수 있습니다.",
+    operator_action_ko: "portfolio_exposure_gate에서 candidate_notional_exposure, combined_BTC_ETH_directional_exposure_pct, limits.max_same_direction_major_exposure_pct를 확인하세요.",
+    check_location_ko: "운영 대시보드 > 리스크 > 포트폴리오 노출 근거",
+  },
 };
 
 const slippageEntryWaitContextCodes = new Set([
@@ -406,6 +589,21 @@ const slippageEntryWaitContextCodes = new Set([
   "PLAN_MAX_CHASE_EXCEEDED",
   "PLAN_LATE_CHASE_WAITING_REENTRY",
 ]);
+
+const btcLongRecentPerformanceExposureBlockCodes = [
+  "SYMBOL_RECENT_PERFORMANCE_NEGATIVE",
+  "DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE",
+  "CORRELATED_EXPOSURE_LIMIT_REACHED",
+];
+
+const btcLongRecentPerformanceExposureBlockDefinition: ReasonCodeDefinition = {
+  category: "safety_block",
+  title_ko: "BTCUSDT long 후보는 AI 승인 주문이 아니라 리스크 평가에서 차단된 관찰 후보입니다",
+  detail_ko: "AI 최종 판단은 HOLD였고, 별도로 감시 중이던 BTCUSDT long 후보가 진입 조건을 충족해 리스크 평가를 받았습니다. 최근 BTCUSDT 및 BTCUSDT long 전환장 성과가 수수료 차감 후 손실이고, 후보 주문 크기가 BTC/ETH 같은 방향 노출 한도를 넘어 실제 주문 제출 전에 차단됐습니다.",
+  auto_clear_hint_ko: "성과 버킷의 수수료 차감 후 순손익이 회복되고 후보 크기 또는 BTC/ETH 같은 방향 노출이 한도 안으로 돌아오면 다음 리스크 평가에서 자동 해제될 수 있습니다.",
+  operator_action_ko: "AgentRun 최종 decision, risk_check debug_payload의 symbol_recent_performance_gate, decision_bucket_recent_performance_gate, portfolio_exposure_gate를 함께 확인하세요.",
+  check_location_ko: "운영 대시보드 > 리스크 > 차단 사유 근거",
+};
 
 const slippageEntryWaitDefinition: ReasonCodeDefinition = {
   category: "entry_wait",
@@ -426,6 +624,11 @@ function normalizeReasonCodeList(values: string[] | null | undefined) {
 
 function hasSlippageEntryWaitContext(values: string[] | null | undefined) {
   return normalizeReasonCodeList(values).some((value) => slippageEntryWaitContextCodes.has(value));
+}
+
+function hasBtcLongRecentPerformanceExposureBlockContext(values: string[] | null | undefined) {
+  const codes = new Set(normalizeReasonCodeList(values));
+  return btcLongRecentPerformanceExposureBlockCodes.every((value) => codes.has(value));
 }
 
 function inferCategory(code: string): ReasonCodeCategory {
@@ -506,7 +709,7 @@ export function describeReasonCode(value: string | null | undefined): ReasonCode
     };
   }
 
-  const definition = reasonDefinitions[code];
+  const definition = operatorReasonOverrides[code] ?? reasonDefinitions[code];
   if (definition) {
     return {
       raw_code: raw || code,
@@ -545,6 +748,16 @@ export function describeReasonCodeInContext(
 ): ReasonCodeDisplay {
   const raw = value?.trim() ?? "";
   const code = normalizeReasonCode(value);
+  if (
+    code === "SYMBOL_RECENT_PERFORMANCE_NEGATIVE" &&
+    hasBtcLongRecentPerformanceExposureBlockContext(allReasonCodes)
+  ) {
+    return {
+      raw_code: raw || code,
+      known: true,
+      ...btcLongRecentPerformanceExposureBlockDefinition,
+    };
+  }
   if (code === "SLIPPAGE_THRESHOLD_EXCEEDED" && hasSlippageEntryWaitContext(allReasonCodes)) {
     return {
       raw_code: raw || code,

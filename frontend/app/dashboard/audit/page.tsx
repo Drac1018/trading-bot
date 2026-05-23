@@ -26,11 +26,11 @@ const sectionMeta: Record<AuditSection, Omit<DashboardSectionTab, "href">> = {
   "safety-checks": {
     value: "safety-checks",
     label: "안전 점검 감사",
-    description: "risk check 요약과 필요 시 raw JSON 상세를 lazy load로 확인합니다.",
+    description: "리스크 점검 요약과 필요 시 원본 JSON 상세를 열어서 확인합니다.",
   },
   agents: {
     value: "agents",
-    label: "고급 디버그",
+    label: "AI 실행 추적",
     description: "최근 AI 에이전트 실행 결과를 원인 추적용 보조 정보로 확인합니다.",
   },
 };
@@ -125,7 +125,7 @@ export default async function AuditPage({
   return (
     <div className="space-y-6">
       <PageShell
-        eyebrow="감사 / 디버그"
+        eyebrow="감사 / 원인 추적"
         title="감사와 원인 추적 통합"
         description="운영 로그, 안전 점검 상세, AI 실행 기록을 원인 추적 축으로 묶어 확인합니다. 거래 정책과 실행 로직은 변경하지 않습니다."
         compact

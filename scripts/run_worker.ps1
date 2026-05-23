@@ -1,6 +1,17 @@
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
+function Test-Truthy {
+    param([string]$Value)
+    return $Value -in @("1", "true", "TRUE", "True", "yes", "YES", "Yes", "on", "ON", "On")
+}
+
+$isWindowsPlatform = [System.Environment]::OSVersion.Platform -eq "Win32NT"
+if ($isWindowsPlatform -and -not (Test-Truthy -Value $env:TRADING_MVP_ALLOW_WINDOWS_WORKER)) {
+    Write-Host "TradingMvpWorker is disabled by default on Windows. Backend owns live scheduler/user/market loops. Set TRADING_MVP_ALLOW_WINDOWS_WORKER=1 only when an RQ worker is intentionally required."
+    exit 0
+}
+
 function Get-DotEnvValue {
     param(
         [string]$Path,

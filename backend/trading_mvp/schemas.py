@@ -136,6 +136,84 @@ class TradeDecisionEntryZone(StrictBaseModel):
     confirmation_type: str | None = None
 
 
+class PsychologySceneReview(StrictBaseModel):
+    market_psychology: str | None = Field(default=None, max_length=240)
+    psychology_bias: Literal[
+        "bullish",
+        "bearish",
+        "two_way",
+        "crowded_long",
+        "crowded_short",
+        "uncertain",
+    ] = "uncertain"
+    scene_scenario: str | None = Field(default=None, max_length=240)
+    scene_type: Literal[
+        "trend_pullback",
+        "breakout_attempt",
+        "range_fade",
+        "liquidity_sweep",
+        "trap_risk",
+        "late_chase",
+        "event_reaction",
+        "position_management",
+        "no_clear_scene",
+        "unknown",
+    ] = "unknown"
+    entry_choreography: str | None = Field(default=None, max_length=300)
+    preferred_entry_timing: Literal[
+        "none",
+        "watch_zone",
+        "wait_1m_confirm",
+        "avoid_chase",
+        "immediate_only_if_risk_guard_allows",
+        "manage_existing_position",
+    ] = "none"
+    confirmation_cues: list[str] = Field(default_factory=list, max_length=8)
+    invalidation_cues: list[str] = Field(default_factory=list, max_length=8)
+    reason_codes: list[str] = Field(default_factory=list, max_length=12)
+    summary: str | None = Field(default=None, max_length=360)
+    execution_boundary: Literal["metadata_only_no_order_authority"] = "metadata_only_no_order_authority"
+
+
+class PositionExitReview(StrictBaseModel):
+    recommendation: Literal[
+        "no_action",
+        "hold_runner",
+        "full_take_profit",
+        "partial_take_profit",
+        "tighten_trailing",
+        "move_to_breakeven",
+        "reduce_risk_only",
+        "take_partial_profit",
+        "reduce_runner",
+        "take_profit_exit",
+    ] = "no_action"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    profit_take_bias: Literal[
+        "stand_aside",
+        "defer_to_existing_plan",
+        "protect_unrealized",
+        "let_runner_work",
+    ] = "defer_to_existing_plan"
+    runner_state: Literal[
+        "not_applicable",
+        "healthy",
+        "extended",
+        "fragile",
+        "exhausted",
+        "unknown",
+    ] = "unknown"
+    exit_urgency: Literal["none", "watch", "soon", "now"] = "none"
+    rationale: str | None = Field(default=None, max_length=360)
+    summary: str | None = Field(default=None, max_length=360)
+    reason_codes: list[str] = Field(default_factory=list, max_length=12)
+    profit_protection_cues: list[str] = Field(default_factory=list, max_length=8)
+    runner_invalidation_cues: list[str] = Field(default_factory=list, max_length=8)
+    data_quality_notes: list[str] = Field(default_factory=list, max_length=8)
+    advisory_only: bool = True
+    execution_boundary: Literal["metadata_only_no_order_authority"] = "metadata_only_no_order_authority"
+
+
 class TradeDecision(StrictBaseModel):
     decision: Literal["hold", "long", "short", "reduce", "exit"]
     confidence: float = Field(ge=0.0, le=1.0)
@@ -218,6 +296,7 @@ class TradeDecision(StrictBaseModel):
     event_risk_acknowledgement: str | None = None
     confidence_penalty_reason: str | None = None
     scenario_note: str | None = None
+    psychology_scene_review: PsychologySceneReview | None = None
     explanation_short: str = Field(min_length=3, max_length=240)
     explanation_detailed: str = Field(min_length=10, max_length=600)
 
@@ -563,17 +642,44 @@ class AIDownstreamTelemetrySummary(StrictBaseModel):
     fee: float = 0.0
     net_realized_pnl: float = 0.0
     average_slippage_pct: float = 0.0
+    risk_reason_counts: dict[str, int] = Field(default_factory=dict)
+    pending_entry_plans: int = Field(default=0, ge=0)
+    active_pending_entry_plans: int = Field(default=0, ge=0)
+    canceled_pending_entry_plans: int = Field(default=0, ge=0)
+    expired_pending_entry_plans: int = Field(default=0, ge=0)
+    pending_plan_status_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class AIActionabilityTelemetrySummary(StrictBaseModel):
+    provider_calls: int = Field(default=0, ge=0)
+    risk_checks_after_provider: int = Field(default=0, ge=0)
+    risk_allowed_after_provider: int = Field(default=0, ge=0)
+    risk_blocked_after_provider: int = Field(default=0, ge=0)
+    orders_after_provider: int = Field(default=0, ge=0)
+    fills_after_provider: int = Field(default=0, ge=0)
+    provider_to_risk_allowed_rate: float | None = None
+    provider_to_risk_blocked_rate: float | None = None
+    provider_to_order_rate: float | None = None
+    provider_to_fill_rate: float | None = None
+    usefulness_status: str = "no_provider_calls"
+    warning_status: str | None = None
+    warning_title: str | None = None
+    warning_detail: str | None = None
+    basis: str = ""
 
 
 class AIUsageTelemetrySummary(StrictBaseModel):
     ai_calls_total: int = Field(default=0, ge=0)
     ai_calls_provider_invoked: int = Field(default=0, ge=0)
     ai_calls_skipped_preai: int = Field(default=0, ge=0)
+    ai_calls_scheduler_skipped: int = Field(default=0, ge=0)
+    ai_calls_suppressed_soft_signal: int = Field(default=0, ge=0)
     ai_calls_deduped: int = Field(default=0, ge=0)
     ai_calls_failed: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     estimated_cost_usd: float | None = None
+    known_estimated_cost_usd: float = 0.0
     cost_estimate_status: str = "no_provider_calls"
     missing_usage_rows: int = Field(default=0, ge=0)
     unknown_cost_rows: int = Field(default=0, ge=0)
@@ -582,8 +688,15 @@ class AIUsageTelemetrySummary(StrictBaseModel):
     should_abstain: int = Field(default=0, ge=0)
     fail_closed: int = Field(default=0, ge=0)
     preai_skip_reasons: dict[str, int] = Field(default_factory=dict)
+    scheduler_skip_reasons: dict[str, int] = Field(default_factory=dict)
     downstream: AIDownstreamTelemetrySummary = Field(default_factory=AIDownstreamTelemetrySummary)
     downstream_by_decision: dict[str, AIDownstreamTelemetrySummary] = Field(default_factory=dict)
+    provider_downstream: AIDownstreamTelemetrySummary = Field(default_factory=AIDownstreamTelemetrySummary)
+    role_efficiency: dict[str, Any] = Field(default_factory=dict)
+    reason_buckets: dict[str, dict[str, int]] = Field(default_factory=dict)
+    actionability: AIActionabilityTelemetrySummary = Field(default_factory=AIActionabilityTelemetrySummary)
+    roi: dict[str, Any] = Field(default_factory=dict)
+    preai_savings: dict[str, Any] = Field(default_factory=dict)
     cost_basis: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1307,6 +1420,9 @@ class DashboardProfitabilityResponse(StrictBaseModel):
 
 class ControlStatusSummary(StrictBaseModel):
     exchange_can_trade: bool | None = None
+    exchange_can_trade_known: bool = False
+    exchange_can_trade_source: str = "unknown"
+    exchange_can_trade_checked_at: datetime | None = None
     exchange_connectivity_state: str = "unknown"
     rollout_mode: RolloutMode = "paper"
     exchange_submit_allowed: bool = False
@@ -1322,7 +1438,11 @@ class ControlStatusSummary(StrictBaseModel):
     blocked_reason_codes: list[str] = Field(default_factory=list)
     degraded_reason_codes: list[str] = Field(default_factory=list)
     protection_reason_codes: list[str] = Field(default_factory=list)
+    block_scope: str = "none"
+    candidate_hold_reason_codes: list[str] = Field(default_factory=list)
+    global_block_reason_codes: list[str] = Field(default_factory=list)
     approval_control_blocked_reasons: list[str] = Field(default_factory=list)
+    exchange_sync_diagnostics: dict[str, Any] = Field(default_factory=dict)
     live_arm_disabled: bool = False
     live_arm_disable_reason_code: str | None = None
     live_arm_disable_reason: str | None = None
@@ -1364,6 +1484,7 @@ class OperationalStatusPayload(StrictBaseModel):
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    exchange_sync_diagnostics: dict[str, Any] = Field(default_factory=dict)
     market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     protection_recovery_status: str = "idle"
     protection_recovery_active: bool = False
@@ -1437,6 +1558,7 @@ class OperatorControlState(StrictBaseModel):
     latest_blocked_reasons: list[str] = Field(default_factory=list)
     market_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    exchange_sync_diagnostics: dict[str, Any] = Field(default_factory=dict)
     protection_recovery_status: str = "idle"
     protected_positions: int = 0
     unprotected_positions: int = 0
@@ -1479,6 +1601,10 @@ class OperatorControlState(StrictBaseModel):
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict, exclude=True)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    service_gate_blockers: list[str] = Field(default_factory=list)
+    stale_pending_entry_plan_count: int = 0
+    stale_pending_entry_plans: list[dict[str, Any]] = Field(default_factory=list)
+    triggered_terminal_history_entry_plan_count: int = 0
     operator_alert: dict[str, Any] = Field(default_factory=dict)
     limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
 
@@ -1590,6 +1716,8 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     event_risk_acknowledgement: str | None = None
     confidence_penalty_reason: str | None = None
     scenario_note: str | None = None
+    psychology_scene_review: PsychologySceneReview | None = None
+    psychology_scene_performance: dict[str, Any] = Field(default_factory=dict)
     decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
     raw_output: dict[str, Any] = Field(default_factory=dict)
 
@@ -1630,9 +1758,17 @@ class PendingEntryPlanSnapshot(StrictBaseModel):
     triggered_at: datetime | None = None
     canceled_at: datetime | None = None
     canceled_reason: str | None = None
+    watcher_reason_codes: list[str] = Field(default_factory=list)
+    confirmation_failed_reason: str | None = None
+    plan_cancel_reason: str | None = None
+    confirmation_quality_state: str | None = None
+    confirmation_quality_reason: str | None = None
+    confirmation_quality_score: float | None = None
+    confirmation_quality_threshold: float | None = None
     idempotency_key: str | None = None
     last_watch_at: datetime | None = None
     last_watch_snapshot_id: int | None = None
+    psychology_scene_review: PsychologySceneReview | None = None
     trigger_details: dict[str, Any] = Field(default_factory=dict)
     confirmation_tracking: dict[str, Any] = Field(default_factory=dict)
     confirmation_follow_up_snapshot: dict[str, Any] = Field(default_factory=dict)
@@ -1653,6 +1789,9 @@ class OperatorRiskSnapshot(StrictBaseModel):
     adjustment_reason_codes: list[str] = Field(default_factory=list)
     degraded_reason_codes: list[str] = Field(default_factory=list)
     protection_reason_codes: list[str] = Field(default_factory=list)
+    block_scope: str = "none"
+    candidate_hold_reason_codes: list[str] = Field(default_factory=list)
+    global_block_reason_codes: list[str] = Field(default_factory=list)
     blocked_reason: str | None = None
     degraded_reason: str | None = None
     approval_required_reason: str | None = None
@@ -1745,6 +1884,7 @@ class OperatorPositionSummary(StrictBaseModel):
     ai_stop_management_allowed: bool | None = None
     hard_stop_active: bool | None = None
     stop_widening_allowed: bool | None = None
+    position_exit_review: PositionExitReview | None = None
 
 
 class OperatorCandidateSelectionSnapshot(StrictBaseModel):
@@ -2603,6 +2743,7 @@ class OverviewResponse(StrictBaseModel):
     pnl_summary: dict[str, Any] = Field(default_factory=dict)
     account_sync_summary: dict[str, Any] = Field(default_factory=dict)
     sync_freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    exchange_sync_diagnostics: dict[str, Any] = Field(default_factory=dict)
     exposure_summary: dict[str, Any] = Field(default_factory=dict)
     execution_policy_summary: dict[str, Any] = Field(default_factory=dict)
     market_context_summary: dict[str, Any] = Field(default_factory=dict)
@@ -2770,6 +2911,7 @@ class AppSettingsResponse(StrictBaseModel):
     ai_model_routing_policy: dict[str, Any] = Field(default_factory=dict)
     ai_call_interval_minutes: int
     decision_cycle_interval_minutes: int
+    ai_trading_decision_daily_token_budget: int
     ai_max_input_candles: int
     ai_temperature: float
     binance_market_data_enabled: bool
@@ -2789,22 +2931,44 @@ class AppSettingsResponse(StrictBaseModel):
     binance_api_key_configured: bool
     binance_api_secret_configured: bool
     event_source_api_key_configured: bool
+    recent_ai_calls_today_kst: int
     recent_ai_calls_24h: int
     recent_ai_calls_7d: int
+    recent_ai_calls_30d: int
+    recent_ai_successes_today_kst: int
     recent_ai_successes_24h: int
     recent_ai_successes_7d: int
+    recent_ai_successes_30d: int
+    recent_ai_failures_today_kst: int
     recent_ai_failures_24h: int
     recent_ai_failures_7d: int
+    recent_ai_failures_30d: int
+    recent_ai_tokens_today_kst: dict[str, int]
     recent_ai_tokens_24h: dict[str, int]
     recent_ai_tokens_7d: dict[str, int]
+    recent_ai_tokens_30d: dict[str, int]
+    recent_ai_role_calls_today_kst: dict[str, int]
     recent_ai_role_calls_24h: dict[str, int]
     recent_ai_role_calls_7d: dict[str, int]
+    recent_ai_role_calls_30d: dict[str, int]
+    recent_ai_role_failures_today_kst: dict[str, int]
     recent_ai_role_failures_24h: dict[str, int]
     recent_ai_role_failures_7d: dict[str, int]
+    recent_ai_role_failures_30d: dict[str, int]
     recent_ai_failure_reasons: list[str]
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int]
+    observed_monthly_ai_cost_projection_usd: float | None = None
+    observed_monthly_ai_net_projection_usd: float | None = None
     ai_protection_status: dict[str, Any] = Field(default_factory=dict)
+    ai_cost_efficiency_summary: dict[str, Any] = Field(default_factory=dict)
+    ai_usage_today_timezone: str = "Asia/Seoul"
+    ai_usage_today_start_at: str | None = None
+    ai_usage_today_end_at: str | None = None
+    ai_usage_summary_today_kst: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
+    ai_usage_summary_24h: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
+    ai_usage_summary_7d: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
+    ai_usage_summary_30d: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     manual_ai_guard_minutes: int
 
 
@@ -2878,6 +3042,7 @@ class AppSettingsViewResponse(StrictBaseModel):
     ai_model_routing_policy: dict[str, Any] = Field(default_factory=dict)
     ai_call_interval_minutes: int
     decision_cycle_interval_minutes: int
+    ai_trading_decision_daily_token_budget: int
     ai_max_input_candles: int
     ai_temperature: float
     binance_market_data_enabled: bool
@@ -2903,24 +3068,44 @@ class AppSettingsCadenceResponse(StrictBaseModel):
 
 
 class AppSettingsAIUsageResponse(StrictBaseModel):
+    recent_ai_calls_today_kst: int
     recent_ai_calls_24h: int
     recent_ai_calls_7d: int
+    recent_ai_calls_30d: int
+    recent_ai_successes_today_kst: int
     recent_ai_successes_24h: int
     recent_ai_successes_7d: int
+    recent_ai_successes_30d: int
+    recent_ai_failures_today_kst: int
     recent_ai_failures_24h: int
     recent_ai_failures_7d: int
+    recent_ai_failures_30d: int
+    recent_ai_tokens_today_kst: dict[str, int]
     recent_ai_tokens_24h: dict[str, int]
     recent_ai_tokens_7d: dict[str, int]
+    recent_ai_tokens_30d: dict[str, int]
+    recent_ai_role_calls_today_kst: dict[str, int]
     recent_ai_role_calls_24h: dict[str, int]
     recent_ai_role_calls_7d: dict[str, int]
+    recent_ai_role_calls_30d: dict[str, int]
+    recent_ai_role_failures_today_kst: dict[str, int]
     recent_ai_role_failures_24h: dict[str, int]
     recent_ai_role_failures_7d: dict[str, int]
+    recent_ai_role_failures_30d: dict[str, int]
     recent_ai_failure_reasons: list[str] = Field(default_factory=list)
     observed_monthly_ai_calls_projection: int
     observed_monthly_ai_calls_projection_breakdown: dict[str, int] = Field(default_factory=dict)
+    observed_monthly_ai_cost_projection_usd: float | None = None
+    observed_monthly_ai_net_projection_usd: float | None = None
     ai_protection_status: dict[str, Any] = Field(default_factory=dict)
+    ai_cost_efficiency_summary: dict[str, Any] = Field(default_factory=dict)
+    ai_usage_today_timezone: str = "Asia/Seoul"
+    ai_usage_today_start_at: str | None = None
+    ai_usage_today_end_at: str | None = None
+    ai_usage_summary_today_kst: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     ai_usage_summary_24h: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     ai_usage_summary_7d: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
+    ai_usage_summary_30d: AIUsageTelemetrySummary = Field(default_factory=AIUsageTelemetrySummary)
     manual_ai_guard_minutes: int
 
 
@@ -2991,6 +3176,7 @@ class AppSettingsUpdateRequest(StrictBaseModel):
     ai_model: str = Field(min_length=1, max_length=80)
     ai_call_interval_minutes: int = Field(ge=5, le=1440)
     decision_cycle_interval_minutes: int = Field(ge=1, le=1440)
+    ai_trading_decision_daily_token_budget: int = Field(default=1_000_000, ge=10_000, le=50_000_000)
     execution_risk_profile_settings: AppSettingsExecutionRiskProfilePolicy | None = None
     ai_max_input_candles: int = Field(ge=16, le=200)
     ai_temperature: float = Field(ge=0.0, le=1.0)
@@ -3109,8 +3295,12 @@ class BinanceAccountSummary(StrictBaseModel):
     testnet_enabled: bool
     futures_enabled: bool
     tracked_symbols: list[str] = Field(default_factory=list)
-    can_trade: bool = False
-    exchange_can_trade: bool = False
+    can_trade: bool | None = None
+    exchange_can_trade: bool | None = None
+    exchange_can_trade_known: bool = False
+    exchange_can_trade_source: str = "unknown"
+    exchange_can_trade_checked_at: datetime | None = None
+    exchange_can_trade_note: str | None = None
     app_live_execution_ready: bool = False
     app_trading_paused: bool = False
     app_operating_state: str = "TRADABLE"

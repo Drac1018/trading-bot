@@ -20,7 +20,7 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.account import account_snapshot_to_dict, create_exchange_pnl_snapshot
 from trading_mvp.services.binance import BinanceClient
-from trading_mvp.services.runtime_state import write_runtime_detail_key
+from trading_mvp.services.runtime_state import get_sync_state_detail, mark_sync_success, write_runtime_detail_key
 from trading_mvp.services.settings import (
     derive_guard_mode_reason,
     get_effective_symbols,
@@ -234,6 +234,21 @@ def _to_bool(value: object) -> bool:
     return bool(value)
 
 
+def _to_optional_bool(value: object) -> bool | None:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
 def _to_datetime_ms(value: Any) -> datetime | None:
     try:
         timestamp_ms = int(float(value))
@@ -248,11 +263,55 @@ def _has_meaningful_balance(*values: float) -> bool:
     return any(abs(value) > 1e-12 for value in values)
 
 
-def _resolve_exchange_trade_permission(account_info: Mapping[str, object]) -> tuple[bool, str | None]:
+def _resolve_exchange_trade_permission(
+    account_info: Mapping[str, object],
+) -> tuple[bool | None, bool, str, str | None]:
     raw_can_trade = account_info.get("canTrade")
     if raw_can_trade is None:
-        return True, "Binance account response omitted canTrade; treated as not explicitly blocked."
-    return _to_bool(raw_can_trade), None
+        return (
+            None,
+            False,
+            "binance_account_info_missing_canTrade",
+            "Binance account response omitted canTrade; exchange trade permission is unknown.",
+        )
+    return _to_bool(raw_can_trade), True, "binance_account_info", None
+
+
+def _exchange_permission_from_sync_state(settings_row: Setting) -> dict[str, object]:
+    account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
+    exchange_can_trade = _to_optional_bool(account_sync_detail.get("exchange_can_trade"))
+    exchange_can_trade_known = bool(account_sync_detail.get("exchange_can_trade_known")) and exchange_can_trade is not None
+    if not exchange_can_trade_known:
+        return {
+            "can_trade": None,
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": "local_snapshot_unchecked",
+            "exchange_can_trade_checked_at": None,
+            "exchange_can_trade_note": "Local account snapshot does not include Binance canTrade; original exchange permission is unknown.",
+        }
+    return {
+        "can_trade": exchange_can_trade,
+        "exchange_can_trade": exchange_can_trade,
+        "exchange_can_trade_known": True,
+        "exchange_can_trade_source": str(account_sync_detail.get("exchange_can_trade_source") or "account_sync"),
+        "exchange_can_trade_checked_at": _coerce_iso_datetime(
+            account_sync_detail.get("exchange_can_trade_checked_at") or account_sync_detail.get("last_sync_at")
+        ),
+        "exchange_can_trade_note": None,
+    }
+
+
+def _exchange_permission_sync_detail_from_summary(summary: BinanceAccountSummary) -> dict[str, object]:
+    checked_at = summary.exchange_can_trade_checked_at or utcnow_naive()
+    return {
+        "exchange_can_trade": summary.exchange_can_trade,
+        "exchange_can_trade_known": bool(summary.exchange_can_trade_known) and summary.exchange_can_trade is not None,
+        "exchange_can_trade_source": summary.exchange_can_trade_source,
+        "exchange_can_trade_checked_at": checked_at.isoformat()
+        if isinstance(checked_at, datetime)
+        else str(checked_at),
+    }
 
 
 def _build_client(
@@ -293,6 +352,12 @@ def _build_base_summary(
         testnet_enabled=settings_row.binance_testnet_enabled,
         futures_enabled=settings_row.binance_futures_enabled,
         tracked_symbols=get_effective_symbols(settings_row),
+        can_trade=None,
+        exchange_can_trade=None,
+        exchange_can_trade_known=False,
+        exchange_can_trade_source="not_checked" if connected else "not_configured",
+        exchange_can_trade_checked_at=None,
+        exchange_can_trade_note="Binance canTrade was not checked for this local account snapshot.",
         app_live_execution_ready=is_live_execution_ready(settings_row),
         app_trading_paused=settings_row.trading_paused,
         app_operating_state=str(settings_payload.get("operating_state", "TRADABLE")),
@@ -328,6 +393,7 @@ def get_local_binance_account_snapshot(session: Session) -> BinanceAccountRespon
         ),
     ).model_copy(
         update={
+            **_exchange_permission_from_sync_state(settings_row),
             "total_wallet_balance": _to_float(snapshot.get("wallet_balance")),
             "available_balance": _to_float(snapshot.get("available_balance")),
             "total_unrealized_profit": _to_float(snapshot.get("unrealized_pnl")),
@@ -472,6 +538,14 @@ def store_binance_account_cache_result(
     normalized_cache = _write_account_cache_detail(settings_row, cache)
     if payload.summary.connected:
         create_exchange_pnl_snapshot(session, settings_row, _account_info_from_response(payload))
+        mark_sync_success(
+            settings_row,
+            scope="account",
+            detail={
+                "source": "binance_account_cache",
+                **_exchange_permission_sync_detail_from_summary(payload.summary),
+            },
+        )
     session.add(settings_row)
     session.flush()
     return _cache_response(session, settings_row, cache=normalized_cache)
@@ -630,7 +704,13 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
             )
         )
     open_orders.sort(key=lambda item: item.update_time or datetime.min, reverse=True)
-    exchange_can_trade, exchange_can_trade_note = _resolve_exchange_trade_permission(account_info)
+    (
+        exchange_can_trade,
+        exchange_can_trade_known,
+        exchange_can_trade_source,
+        exchange_can_trade_note,
+    ) = _resolve_exchange_trade_permission(account_info)
+    exchange_can_trade_checked_at = utcnow_naive()
 
     summary = _build_base_summary(
         session,
@@ -641,6 +721,10 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         update={
             "can_trade": exchange_can_trade,
             "exchange_can_trade": exchange_can_trade,
+            "exchange_can_trade_known": exchange_can_trade_known,
+            "exchange_can_trade_source": exchange_can_trade_source,
+            "exchange_can_trade_checked_at": exchange_can_trade_checked_at,
+            "exchange_can_trade_note": exchange_can_trade_note,
             "fee_tier": _to_int(account_info.get("feeTier")),
             "total_wallet_balance": _to_float(account_info.get("totalWalletBalance")),
             "available_balance": _to_float(account_info.get("availableBalance")),

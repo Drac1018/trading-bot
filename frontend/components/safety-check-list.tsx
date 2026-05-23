@@ -62,7 +62,7 @@ function RawJsonBlock({ title, value }: { title: string; value: string }) {
 
 function DetailContent({ state }: { state?: DetailState }) {
   if (!state || state.status === "loading") {
-    return <p className="text-sm text-slate-600">선택한 risk check 원본을 불러오는 중입니다.</p>;
+    return <p className="text-sm text-slate-600">선택한 리스크 점검 원본을 불러오는 중입니다.</p>;
   }
 
   if (state.status === "error") {
@@ -71,7 +71,7 @@ function DetailContent({ state }: { state?: DetailState }) {
 
   const riskCheck = state.data.risk_check;
   if (!riskCheck) {
-    return <p className="text-sm text-slate-600">선택한 risk check 원본이 없습니다.</p>;
+    return <p className="text-sm text-slate-600">선택한 리스크 점검 원본이 없습니다.</p>;
   }
 
   const auditEvent = state.data.audit_event ?? null;
@@ -79,13 +79,13 @@ function DetailContent({ state }: { state?: DetailState }) {
     ...riskCheck,
     audit_event_id: riskCheck.audit_event_id ?? auditEvent?.id,
   });
-  const auditRawJson = auditEvent ? JSON.stringify(auditEvent, null, 2) : "연결된 risk_check audit event 없음";
+  const auditRawJson = auditEvent ? JSON.stringify(auditEvent, null, 2) : "연결된 리스크 점검 감사 이벤트 없음";
 
   return (
     <div className="space-y-5">
       {view.reasonDisplays.length > 0 ? (
         <section>
-          <h3 className="text-sm font-semibold text-slate-950">raw reason code</h3>
+          <h3 className="text-sm font-semibold text-slate-950">원본 사유 코드</h3>
           <div className="mt-3 flex flex-wrap gap-2">
             {view.reasonDisplays.map((reason) => (
               <span
@@ -108,8 +108,8 @@ function DetailContent({ state }: { state?: DetailState }) {
         </section>
       ))}
 
-      <RawJsonBlock title="risk check raw JSON" value={view.rawJson} />
-      <RawJsonBlock title="audit event raw JSON" value={auditRawJson} />
+      <RawJsonBlock title="리스크 점검 원본 JSON" value={view.rawJson} />
+      <RawJsonBlock title="감사 이벤트 원본 JSON" value={auditRawJson} />
     </div>
   );
 }
@@ -179,7 +179,7 @@ export function SafetyCheckList({
                   <span className="text-xs font-medium text-slate-500">{view.createdAtLabel}</span>
                 </div>
                 <h2 className="mt-3 text-base font-semibold leading-6 text-slate-950">
-                  {view.requestedAction} / risk check #{view.id}
+                  {view.requestedAction} / 리스크 점검 #{view.id}
                 </h2>
               </div>
               <span
@@ -194,9 +194,9 @@ export function SafetyCheckList({
             <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
               <SummaryCell label="생성 시각" detail={view.createdAtLabel} />
               <SummaryCell label="심볼" detail={view.symbol} />
-              <SummaryCell label="action / intent" detail={`${view.requestedAction} / ${view.intentLabel}`} />
-              <SummaryCell label="allow/block" detail={view.resultLabel} />
-              <SummaryCell label="blocked reason" detail={view.blockedReasonSummary} />
+              <SummaryCell label="요청 / 의도" detail={`${view.requestedAction} / ${view.intentLabel}`} />
+              <SummaryCell label="결과" detail={view.resultLabel} />
+              <SummaryCell label="차단 사유" detail={view.blockedReasonSummary} />
             </div>
 
             <div className="mt-4 flex flex-wrap gap-2">
@@ -228,7 +228,7 @@ export function SafetyCheckList({
               }}
             >
               <summary className="cursor-pointer text-sm font-semibold text-slate-800">
-                상세 입력/결과 및 raw JSON 보기
+                상세 입력/결과와 원본 JSON 보기
               </summary>
               <div className="mt-4">
                 <DetailContent state={details[view.id]} />
