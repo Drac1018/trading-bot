@@ -141,7 +141,11 @@ class FeatureSnapshot(TimestampMixin, Base):
 
 class AgentRun(TimestampMixin, Base):
     __tablename__ = "agent_runs"
-    __table_args__ = (Index("ix_agent_runs_role_created_at", "role", "created_at"),)
+    __table_args__ = (
+        Index("ix_agent_runs_created_at", "created_at"),
+        Index("ix_agent_runs_provider_created_at", "provider_name", "created_at"),
+        Index("ix_agent_runs_role_created_at", "role", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     role: Mapped[str] = mapped_column(String(50), index=True)

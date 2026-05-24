@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -35,6 +36,7 @@ from trading_mvp.schemas import (
     TradeDecisionCandidateScore,
 )
 from trading_mvp.services.agents import MarketSettingsAdvisorAgent, TradingDecisionAgent
+from trading_mvp.services.ai_usage import OpenAICallGate
 from trading_mvp.services.binance import BinanceAPIError
 from trading_mvp.services.execution import execute_live_trade, sync_live_state
 from trading_mvp.services.features import compute_features
@@ -5697,6 +5699,39 @@ def test_entry_candidate_pause_hard_skips_ai(monkeypatch, db_session) -> None:
     assert audit.payload["hard_skip_ai"] is True
     assert db_session.scalar(select(Order).limit(1)) is None
     assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_low_actionability_cost_gate_is_hard_new_entry_ai_skip(db_session) -> None:
+    orchestrator = TradingOrchestrator(db_session)
+    policy = orchestrator._ai_call_policy(
+        review_trigger_payload=None,
+        market_snapshot=_pre_ai_gate_snapshot(),
+        effective_settings=SimpleNamespace(enabled=True),
+        runtime_state={"operating_state": "TRADABLE"},
+        ai_context=SimpleNamespace(
+            data_quality=SimpleNamespace(
+                account_state_trustworthy=True,
+                market_state_trustworthy=True,
+                missing_context_flags=[],
+                stale_context_flags=[],
+            )
+        ),
+        openai_gate=OpenAICallGate(
+            allowed=False,
+            reason="low_actionability_cost_guard_active",
+            retry_after_seconds=360 * 60,
+        ),
+        cadence_profile={},
+        open_positions=[],
+        allow_ai_but_later_risk_check=[],
+    )
+
+    assert policy["ai_call_event"] == "AI_CALL_SKIPPED"
+    assert policy["ai_call_allowed"] is False
+    assert policy["reason"] == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+    assert policy["hard_skip_ai"] is True
+    assert policy["skip_category"] == "cost_governance"
+    assert policy["hard_skip_reason_codes"] == ["LOW_ACTIONABILITY_COST_GUARD_ACTIVE"]
 
 
 def test_entry_candidate_stale_market_data_hard_skips_ai(monkeypatch, db_session) -> None:

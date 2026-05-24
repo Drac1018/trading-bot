@@ -320,6 +320,47 @@ def _survival_path_label(decision: TradeDecision, *, is_protection_recovery: boo
     return None
 
 
+def _runtime_protection_recovery_matches(settings_row: Setting, symbol: str) -> bool:
+    detail = settings_row.pause_reason_detail if isinstance(settings_row.pause_reason_detail, dict) else {}
+    recovery = detail.get("protection_recovery")
+    if not isinstance(recovery, dict):
+        return False
+    status = str(recovery.get("status") or "").strip().lower()
+    active = bool(recovery.get("auto_recovery_active", False)) or status in {
+        "active",
+        "recreating",
+        "manage_only",
+        "pending",
+        "repairing",
+    }
+    if not active:
+        return False
+    symbol_upper = str(symbol or "").upper()
+    raw_symbol_states = recovery.get("symbol_states")
+    raw_missing_items = recovery.get("missing_items")
+    symbol_states = {
+        str(key).upper(): value
+        for key, value in (raw_symbol_states.items() if isinstance(raw_symbol_states, dict) else [])
+    }
+    missing_items = {
+        str(key).upper(): value
+        for key, value in (raw_missing_items.items() if isinstance(raw_missing_items, dict) else [])
+    }
+    missing_symbols = {
+        str(item).upper()
+        for item in recovery.get("missing_symbols", [])
+        if item not in {None, ""}
+    }
+    symbol_state = symbol_states.get(symbol_upper)
+    if isinstance(symbol_state, dict):
+        state = str(symbol_state.get("state") or "").strip().upper()
+        if state in {PROTECTION_REQUIRED_STATE, DEGRADED_MANAGE_ONLY_STATE}:
+            return True
+        if symbol_state.get("missing_components"):
+            return True
+    return symbol_upper in missing_symbols or symbol_upper in missing_items
+
+
 def _has_operator_event_override(payload: EventOperatorControlPayload | None) -> bool:
     if payload is None:
         return False
@@ -3693,7 +3734,10 @@ def evaluate_risk(
         and _decision_matches_position_side(existing_position.side, decision.decision)
         and decision.stop_loss is not None
         and decision.take_profit is not None
-        and is_survival_path_intent(decision)
+        and (
+            is_survival_path_intent(decision)
+            or _runtime_protection_recovery_matches(settings_row, decision.symbol)
+        )
     )
     is_entry_decision = decision.decision in {"long", "short"} and not is_protection_recovery
     latest_pnl = get_latest_pnl_snapshot(session, settings_row)
@@ -4018,7 +4062,7 @@ def evaluate_risk(
     slippage = abs(entry - market_snapshot.latest_price) / max(market_snapshot.latest_price, 1.0)
     if slippage > settings_row.slippage_threshold_pct and is_entry_decision:
         blocked_reason_codes.append("SLIPPAGE_THRESHOLD_EXCEEDED")
-    if is_entry_decision:
+    if is_entry_decision and "ENTRY_TRIGGER_NOT_MET" not in blocked_reason_codes:
         planned_risk_reward_reason_codes, planned_risk_reward_gate = _planned_risk_reward_gate(
             decision,
             market_snapshot,

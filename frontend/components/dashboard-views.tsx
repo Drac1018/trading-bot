@@ -9,6 +9,8 @@ import type { BinanceChartCandle } from "../lib/binance-chart-candles";
 import { RiskCheckPayloadDetails } from "./risk-check-payload-details";
 import { getSelectedSymbolPolicyHint } from "../lib/selected-symbol";
 import {
+  aiSkipReasonTitle,
+  describeAiSkipReason,
   describeReasonCode,
   describeReasonCodeInContext,
   isEntryWaitReasonCode,
@@ -864,6 +866,10 @@ function RiskAIUsageSummary({ usage }: { usage: AIUsagePayload | null | undefine
   const advisorCalls = summary7d?.role_efficiency?.market_settings_advisor?.provider_calls ?? 0;
   const holdCount7d = summary7d?.decision_counts?.hold ?? 0;
   const wasteSignalCount = costEfficiency?.waste_assessment?.signals?.length ?? 0;
+  const runtimeGuard = costEfficiency?.waste_assessment?.runtime_guard;
+  const runtimeGuardActive = runtimeGuard?.status === "active";
+  const runtimeGuardMissingForWaste =
+    costEfficiency?.waste_assessment?.status === "needs_review" && !runtimeGuardActive;
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
@@ -915,6 +921,23 @@ function RiskAIUsageSummary({ usage }: { usage: AIUsagePayload | null | undefine
           { compact: true },
         )}
       </div>
+      {runtimeGuardActive ? (
+        <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          <p className="font-semibold text-red-900">신규 진입 AI 비용 게이트 활성</p>
+          <p className="mt-1 leading-6">
+            비수동 신규 진입 AI 호출은 {aiSkipReasonTitle(runtimeGuard?.reason ?? "low_actionability_cost_guard_active")} 상태로
+            차단 중입니다. 보호, 축소, 청산 경로는 이 신규 진입 차단과 분리됩니다.
+          </p>
+        </div>
+      ) : runtimeGuardMissingForWaste ? (
+        <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          <p className="font-semibold text-red-900">신규 진입 AI 비용 게이트 미확인</p>
+          <p className="mt-1 leading-6">
+            비용 낭비 신호가 있지만 런타임 payload에서 비수동 신규 진입 AI 차단 게이트가 활성 상태로 확인되지
+            않습니다. 제품화 전 백엔드 런타임 반영 여부를 먼저 증명해야 합니다.
+          </p>
+        </div>
+      ) : null}
       <div className="mt-3 grid gap-3 lg:grid-cols-4">
         {metricCard(
           "7일 risk checks",
@@ -2816,35 +2839,7 @@ function isMarketMarkerDecision(value: string | null | undefined) {
 }
 
 function translateAiSkipReason(value: string | null | undefined) {
-  if (!value) {
-    return "-";
-  }
-  const normalized = value.trim();
-  const key = normalized.toUpperCase();
-  const labels: Record<string, string> = {
-    NO_EVENT: "검토 이벤트 없음",
-    TRIGGER_DEDUPED: "동일 지문 중복",
-    AI_DISABLED: "AI 비활성화",
-    AI_FAILURE_BACKOFF: "AI 실패 백오프",
-    AI_COOLDOWN_ACTIVE: "AI 쿨다운 유지",
-    ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "trading_decision 일일 AI 토큰 예산 소진",
-    SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE: "약한 관망 후보라 AI 호출 전 억제",
-    SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE: "약한 후보 전환감시 쿨다운",
-    SOFT_SIGNAL_REVIEW_NO_MATERIAL_CHANGE: "약한 후보 변화 부족으로 AI 생략",
-    AI_CYCLE_BUDGET_EXHAUSTED: "사이클 AI 예산 초과로 신규 후보 검토 생략",
-    PROTECTION_REVIEW_DETERMINISTIC_ONLY: "보호 검토는 규칙 기반 경로만 사용",
-    ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
-    ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF: "반복 중립 후보라 AI 검토 생략",
-    MACRO_EVENT_IMMINENT: "주요 경제 이벤트 임박으로 신규 진입 보수화",
-    MACRO_EVENT_RISK_WINDOW_ACTIVE: "거시 이벤트 리스크 구간",
-    STALE_MARKET_DATA: "시장 데이터 지연으로 AI 검토 생략",
-    LOW_SCORE: "점수 부족으로 AI 검토 생략",
-    SPREAD_STRESS: "스프레드 부담으로 AI 검토 생략",
-    EXPOSURE_LIMIT: "노출 한도로 AI 검토 생략",
-    ACCOUNT_UNTRUSTED: "계정/주문 상태 신뢰 불가",
-    PROTECTIVE_ORDERS_SYNC_STALE: "보호주문 상태 확인 지연",
-  };
-  return labels[key] ?? normalized;
+  return aiSkipReasonTitle(value);
 }
 
 function translateAiReviewType(value: string | null | undefined, fallbackTriggerReason?: string | null) {
@@ -4944,61 +4939,11 @@ function riskDisplayRows(rows: RiskCheckRow[], symbolsByName?: Map<string, Opera
 }
 
 function aiSkipReasonCopy(value: string | null | undefined) {
-  const normalized = value?.trim();
-  if (!normalized) {
-    return {
-      label: "AI 검토 생략 없음",
-      detail: "이번 row에는 AI 호출 전 생략 사유가 없습니다.",
-      nextStep: "판단 결과와 리스크 승인 여부를 확인하세요.",
-    };
-  }
-  const key = normalized.toLowerCase();
-  if (key === "account_untrusted") {
-    return {
-      label: "계정/주문 상태 신뢰 불가",
-      detail: "판단 시점에 계정, 포지션, 오픈오더 또는 보호주문 상태를 신뢰할 수 없어 AI를 호출하지 않았습니다.",
-      nextStep: "동기화가 회복되면 다음 판단 주기에서 다시 후보를 검토합니다.",
-    };
-  }
-  if (key === "protective_orders_sync_stale") {
-    return {
-      label: "보호주문 상태 확인 지연",
-      detail: "보호주문 확인 시각이 오래되어 신규 진입 판단을 보류했습니다.",
-      nextStep: "보호주문 sync가 fresh로 회복된 뒤 다시 판단합니다.",
-    };
-  }
-  if (normalized.toUpperCase() === "PLAN_CANCELED_NO_ENTRY_CAPACITY") {
-    return {
-      label: "추가 진입 여유 없음",
-      detail: "이미 열린 포지션이 허용 노출을 사용 중이라 대기 플랜 감시를 중단했고 AI 재판단을 호출하지 않았습니다.",
-      nextStep: "포지션이 줄거나 잔고/한도가 회복되면 새 판단에서 다시 플랜이 생성될 수 있습니다.",
-    };
-  }
-  if (key === "stale_market_data" || key === "stale_market_data_preai") {
-    return {
-      label: "시장 데이터 지연",
-      detail: "시장 스냅샷이 오래되어 AI 판단 입력으로 쓰지 않았습니다.",
-      nextStep: "새 시장 데이터 수집 이후 다시 판단합니다.",
-    };
-  }
-  if (key === "no_event") {
-    return {
-      label: "검토 이벤트 없음",
-      detail: "이번 주기에는 AI를 호출할 신규 진입 후보나 포지션 점검 이벤트가 없었습니다.",
-      nextStep: "새 신호, 플랜 구간 도달, 포지션 보호 이벤트가 생기면 다시 검토합니다.",
-    };
-  }
-  if (key === "trigger_deduped") {
-    return {
-      label: "동일 상태 중복 호출 방지",
-      detail: "같은 심볼과 같은 판단 지문이 반복되어 AI 호출을 생략했습니다.",
-      nextStep: "가격, 신호, 포지션 상태가 달라지면 다시 검토합니다.",
-    };
-  }
+  const copy = describeAiSkipReason(value);
   return {
-    label: translateAiSkipReason(normalized),
-    detail: "AI 호출 전 정책에 의해 검토가 생략되었습니다.",
-    nextStep: "고급 정보에서 원본 reason code를 확인하세요.",
+    label: copy.title_ko,
+    detail: copy.detail_ko,
+    nextStep: copy.next_step_ko,
   };
 }
 
@@ -5381,7 +5326,12 @@ function translateReasonCode(value: string | null | undefined) {
     LONG_HOLDING_PROFILE_QUALITY_INSUFFICIENT: "롱 보유 품질 근거 부족",
     NO_EDGE: "거래 우위 부족",
   };
-  return extraReasonCodeLabelMap[value] ?? reasonCodeLabelMap[value] ?? value;
+  const translated = extraReasonCodeLabelMap[value] ?? reasonCodeLabelMap[value];
+  if (translated) {
+    return translated;
+  }
+  const aiSkipCopy = describeAiSkipReason(value);
+  return aiSkipCopy.known ? aiSkipCopy.title_ko : value;
 }
 
 function formatTranslatedCodeList(values: string[] | null | undefined) {
@@ -6015,7 +5965,7 @@ export function DecisionView({
         <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-xs leading-5 text-slate-600">
           {getSelectedSymbolPolicyHint("single")}
         </div>
-        <div className="mt-5 grid gap-4 lg:grid-cols-4">
+        <div className="mt-5 grid gap-4 lg:grid-cols-5">
           {metricCard("마지막 AI 스냅샷", formatDateTime(symbol.ai_decision.created_at), "상단 AI 카드는 과거 스냅샷일 수 있습니다.")}
           {metricCard("이번 주기 AI 상태", topReview?.label ?? "-", topReview?.detail ?? "-")}
           {metricCard(
@@ -6052,6 +6002,16 @@ export function SchedulerView({
   operator: OperatorDashboardPayload;
   schedulerRows: Row[];
 }) {
+  const schedulerFreshness = operator.control.scheduler_freshness_summary ?? {};
+  const schedulerFreshnessStatus =
+    schedulerFreshness.status === "stale"
+      ? "지연"
+      : schedulerFreshness.status === "fresh"
+        ? "정상"
+        : "미확인";
+  const schedulerFreshnessHint =
+    typeof schedulerFreshness.message === "string" ? schedulerFreshness.message : "scheduler_runs 기준 최신성";
+
   return (
     <div className="space-y-6">
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
@@ -6064,6 +6024,7 @@ export function SchedulerView({
         <div className="mt-5 grid gap-4 lg:grid-cols-4">
           {metricCard("현재 상태", translateSchedulerStatus(operator.control.scheduler_status), "최근 스케줄러 실행 상태")}
           {metricCard("실행 윈도우", operator.control.scheduler_window ?? "-", "현재 대표 실행 주기")}
+          {metricCard("최신성", schedulerFreshnessStatus, schedulerFreshnessHint)}
           {metricCard("다음 실행 예정", formatDateTime(operator.control.scheduler_next_run_at), "전역 스케줄 기준")}
           {metricCard(
             "운영 상태",

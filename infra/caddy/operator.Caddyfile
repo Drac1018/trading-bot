@@ -1,0 +1,23 @@
+{
+	storage file_system {$CADDY_STORAGE_PATH}
+}
+
+{$OPERATOR_HTTPS_HOST} {
+	encode gzip zstd
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+	}
+
+	reverse_proxy 127.0.0.1:3000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Operator-Client-IP {remote_host}
+		header_up X-Operator-Proxy-Secret {$OPERATOR_UI_TRUSTED_PROXY_SECRET}
+	}
+}

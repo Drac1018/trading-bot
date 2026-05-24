@@ -7,6 +7,9 @@ from pathlib import Path
 os.environ.setdefault("DATABASE_URL", "sqlite:///./data/pytest_bootstrap.db")
 os.environ.setdefault("TRADING_MVP_ALLOW_SQLITE", "1")
 os.environ.setdefault("LIVE_TRADING_ENV_ENABLED", "true")
+os.environ.setdefault("APP_ENV", "development")
+os.environ.setdefault("APP_SECRET_SEED", "change-me-local-dev-secret")
+os.environ.setdefault("OPERATOR_API_KEY", "")
 
 import pytest
 from sqlalchemy import create_engine
@@ -89,6 +92,19 @@ def db_session(tmp_path) -> Session:
                 session.rollback()
     finally:
         engine.dispose()
+
+
+@pytest.fixture()
+def full_live_operator_headers(monkeypatch):
+    from trading_mvp.config import get_settings
+
+    monkeypatch.setenv("APP_SECRET_SEED", "pytest-non-default-secret")
+    monkeypatch.setenv("OPERATOR_API_KEY", "pytest-operator-key")
+    get_settings.cache_clear()
+    try:
+        yield {"X-Operator-API-Key": "pytest-operator-key", "X-Operator-Intent": "operator.write"}
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.fixture()

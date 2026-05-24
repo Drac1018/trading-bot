@@ -15,6 +15,7 @@ from trading_mvp.models import (
     SystemHealthEvent,
 )
 from trading_mvp.services.runtime_state import (
+    get_market_stream_detail,
     get_reconciliation_detail,
     list_unresolved_submission_guards,
 )
@@ -47,6 +48,7 @@ TERMINAL_TRIGGERED_EXECUTION_STATUSES = frozenset(
 )
 HEALTH_BLOCKING_STATUSES = frozenset({"error", "degraded"})
 SCHEDULER_NON_BLOCKING_STATUSES = frozenset({"success", "skipped"})
+REDIS_CACHE_UNAVAILABLE_BLOCKER = "redis_cache_unavailable"
 
 
 def active_pending_entry_plan_statement(*, symbols: list[str] | tuple[str, ...] | None = None) -> Select[tuple[PendingEntryPlan]]:
@@ -280,6 +282,24 @@ def _setting_row(session: Session) -> Setting | None:
     return session.scalar(select(Setting).order_by(Setting.id.asc()).limit(1))
 
 
+def _redis_cache_unavailable(settings_row: Setting | None) -> dict[str, object]:
+    if settings_row is None:
+        return {"blocking": False}
+    state = get_market_stream_detail(settings_row)
+    redis_configured = bool(state.get("redis_configured"))
+    redis_connected = state.get("redis_connected")
+    cache_health = str(state.get("cache_health") or "").strip().lower()
+    blocking = redis_configured and (redis_connected is False or cache_health == "unavailable")
+    return {
+        "blocking": blocking,
+        "redis_configured": redis_configured,
+        "redis_connected": redis_connected,
+        "cache_health": cache_health or "unknown",
+        "cache_reject_reason": state.get("cache_reject_reason"),
+        "last_shared_cache_error": state.get("last_shared_cache_error"),
+    }
+
+
 def _for_update_lock_waits(session: Session) -> list[dict[str, object]]:
     bind = session.get_bind()
     if bind.dialect.name != "postgresql":
@@ -415,6 +435,7 @@ def build_service_switch_gate_snapshot(
         )
     )
     for_update_waits = _for_update_lock_waits(session)
+    redis_cache = _redis_cache_unavailable(settings_row)
     reconciliation_synced = str(reconciliation.get("status") or "").lower() == "synced"
     blockers: list[str] = []
     if open_positions:
@@ -433,6 +454,8 @@ def build_service_switch_gate_snapshot(
         blockers.append("recent_health_errors")
     if for_update_waits:
         blockers.append("for_update_lock_wait")
+    if redis_cache.get("blocking"):
+        blockers.append(REDIS_CACHE_UNAVAILABLE_BLOCKER)
 
     return {
         "generated_at": now.isoformat(),
@@ -461,7 +484,9 @@ def build_service_switch_gate_snapshot(
             "recent_scheduler_non_success": len(scheduler_non_success),
             "recent_health_errors": len(health_errors),
             "for_update_lock_waits": len(for_update_waits),
+            REDIS_CACHE_UNAVAILABLE_BLOCKER: 1 if redis_cache.get("blocking") else 0,
         },
+        "redis_cache": redis_cache,
         "open_positions": [_position_payload(row) for row in open_positions],
         "active_orders": [_order_payload(row) for row in active_orders],
         "active_pending_entry_plans": [_pending_plan_payload(row) for row in blocking_pending],

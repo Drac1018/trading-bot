@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta
 from hashlib import sha1
@@ -50,6 +50,10 @@ from trading_mvp.services.binance_user_stream import (
     BinanceUserStreamListener,
     build_user_stream_state,
     normalize_user_stream_event,
+)
+from trading_mvp.services.exchange_permission import (
+    fetch_account_config_for_permission,
+    resolve_exchange_trade_permission,
 )
 from trading_mvp.services.execution_policy import (
     ExecutionPlan,
@@ -714,22 +718,27 @@ def _to_bool(value: object, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
-def _exchange_permission_sync_detail(account_info: dict[str, object]) -> dict[str, object]:
-    raw_can_trade = account_info.get("canTrade")
+def _exchange_permission_sync_detail(
+    account_info: dict[str, object],
+    *,
+    account_config: Mapping[str, object] | None = None,
+    account_config_error: str | None = None,
+) -> dict[str, object]:
     checked_at = utcnow_naive().isoformat()
-    if raw_can_trade in {None, ""}:
-        return {
-            "exchange_can_trade": None,
-            "exchange_can_trade_known": False,
-            "exchange_can_trade_source": "binance_account_info_missing_canTrade",
-            "exchange_can_trade_checked_at": checked_at,
-        }
-    return {
-        "exchange_can_trade": _to_bool(raw_can_trade),
-        "exchange_can_trade_known": True,
-        "exchange_can_trade_source": "binance_account_info",
+    permission = resolve_exchange_trade_permission(
+        account_info,
+        account_config=account_config,
+        account_config_error=account_config_error,
+    )
+    detail = {
+        "exchange_can_trade": permission["exchange_can_trade"],
+        "exchange_can_trade_known": permission["exchange_can_trade_known"],
+        "exchange_can_trade_source": permission["exchange_can_trade_source"],
         "exchange_can_trade_checked_at": checked_at,
     }
+    if permission["exchange_can_trade_note"] is not None:
+        detail["exchange_can_trade_note"] = permission["exchange_can_trade_note"]
+    return detail
 
 
 def _coerce_datetime(value: object) -> datetime | None:
@@ -8166,6 +8175,7 @@ def sync_live_state(
     account_symbol = symbols[0] if symbols else settings_row.default_symbol.upper()
     try:
         account_info = client.get_account_info()
+        account_config, account_config_error = fetch_account_config_for_permission(client)
     except Exception as exc:
         reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
         _record_sync_issue(
@@ -8207,7 +8217,11 @@ def sync_live_state(
             "wallet_balance": pnl_snapshot.wallet_balance,
             "available_balance": pnl_snapshot.available_balance,
             "funding_sync": funding_sync,
-            **_exchange_permission_sync_detail(account_info),
+            **_exchange_permission_sync_detail(
+                account_info,
+                account_config=account_config,
+                account_config_error=account_config_error,
+            ),
         },
         flush_state=False,
     )
@@ -8475,6 +8489,7 @@ def _resync_exchange_state(
 
     try:
         account_info = client.get_account_info()
+        account_config, account_config_error = fetch_account_config_for_permission(client)
         pnl_snapshot, funding_sync = _create_live_account_snapshot(
             session,
             settings_row,
@@ -8494,7 +8509,11 @@ def _resync_exchange_state(
                 "wallet_balance": pnl_snapshot.wallet_balance,
                 "available_balance": pnl_snapshot.available_balance,
                 "funding_sync": funding_sync,
-                **_exchange_permission_sync_detail(account_info),
+                **_exchange_permission_sync_detail(
+                    account_info,
+                    account_config=account_config,
+                    account_config_error=account_config_error,
+                ),
             },
         )
     except Exception as exc:
@@ -8936,6 +8955,7 @@ def _execute_live_trade_body(
     client = _build_client(settings_row)
     try:
         account_info = client.get_account_info()
+        account_config, account_config_error = fetch_account_config_for_permission(client)
     except Exception as exc:
         reason_code = _classify_exchange_state_error(exc, "EXCHANGE_ACCOUNT_STATE_UNAVAILABLE")
         _pause_for_system_issue(
@@ -8984,7 +9004,11 @@ def _execute_live_trade_body(
             "wallet_balance": latest_pnl.wallet_balance,
             "available_balance": latest_pnl.available_balance,
             "funding_sync": funding_sync,
-            **_exchange_permission_sync_detail(account_info),
+            **_exchange_permission_sync_detail(
+                account_info,
+                account_config=account_config,
+                account_config_error=account_config_error,
+            ),
         },
     )
     live_balances = _live_account_balances(account_info)

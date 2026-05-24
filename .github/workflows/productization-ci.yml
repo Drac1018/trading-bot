@@ -1,0 +1,115 @@
+name: Productization CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Compile backend
+        run: python -m compileall -q backend\trading_mvp
+
+      - name: Lint backend
+        run: python -m ruff check backend tests workers
+
+      - name: Test backend
+        env:
+          APP_SECRET_SEED: ci-non-default-secret
+          TRADING_MVP_ALLOW_SQLITE: "1"
+        run: python -m pytest
+
+  frontend:
+    name: Frontend validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install backend runtime for smoke test
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@latest --activate
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check frontend
+        working-directory: frontend
+        run: pnpm run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          API_BASE_URL: http://127.0.0.1:18002
+          OPERATOR_UI_USERNAME: operator
+          OPERATOR_UI_PASSWORD: playwright-operator-password
+          OPERATOR_API_KEY: playwright-operator-password
+        run: pnpm run build
+
+      - name: Install Playwright browser
+        working-directory: frontend
+        run: pnpm exec playwright install chromium
+
+      - name: Run frontend smoke
+        working-directory: frontend
+        env:
+          APP_SECRET_SEED: playwright-ci-non-default-secret
+          TRADING_MVP_ALLOW_SQLITE: "1"
+          PLAYWRIGHT_OPERATOR_PASSWORD: playwright-operator-password
+        run: pnpm run test:smoke
+
+  productization-checks:
+    name: Productization script guard
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run productization script guard path
+        env:
+          DATABASE_URL: postgresql+psycopg://trading_app:ci-strong-password@127.0.0.1:5432/trading_mvp
+        run: >
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_productization_checks.ps1
+          -SkipBackendValidation
+          -SkipFrontendSmoke
+          -SkipSlo
+          -SkipBackupRestore
+          -SkipAiCostGate
+          -SkipReadinessGate

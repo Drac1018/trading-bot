@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Lock, Thread
 from time import monotonic
 from typing import Any, TypedDict
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import desc, func, select, text
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy import desc, func, inspect, or_, select, text
+from sqlalchemy.orm import Session, load_only, sessionmaker
 
 from trading_mvp.config import get_settings
 from trading_mvp.models import (
@@ -26,6 +27,7 @@ from trading_mvp.models import (
 from trading_mvp.time_utils import parse_utc_datetime, utcnow_naive
 
 AI_ATTEMPT_SOURCES = {"llm", "llm_fallback"}
+AI_USAGE_SOURCE_FILTER_VALUES = AI_ATTEMPT_SOURCES | {"quality_fail_closed"}
 AI_DECISION_VALUES = ("hold", "long", "short", "reduce", "exit")
 AI_DEDUPED_EVENT_TYPE = "decision_ai_deduped"
 AI_COST_RATES_USD_PER_1M_TOKENS: dict[str, dict[str, float]] = {
@@ -48,12 +50,20 @@ AI_ROLE_CONSECUTIVE_FAILURE_BUDGETS = {
     "position_exit_review": 5,
     "trading_decision": 5,
 }
-AI_USAGE_CACHE_TTL_SECONDS = 30.0
+AI_USAGE_CACHE_TTL_SECONDS = 180.0
+AI_USAGE_STALE_CACHE_TTL_SECONDS = 900.0
 AI_USAGE_DETAIL_ROW_LIMIT = 10_000
 AI_USAGE_DEFAULT_COST_MODEL = "gpt-4.1-mini"
 AI_USAGE_REPORT_TIMEZONE_NAME = "Asia/Seoul"
 AI_USAGE_REPORT_TIMEZONE = ZoneInfo(AI_USAGE_REPORT_TIMEZONE_NAME)
 SOFT_SIGNAL_REVIEW_SUPPRESSED_SKIP_REASON = "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+AI_TRADING_DECISION_WASTE_MIN_PROVIDER_CALLS_7D = 50
+AI_TRADING_DECISION_WASTE_MAX_PROVIDER_TO_ORDER_RATE = 0.01
+AI_TRADING_DECISION_WASTE_BACKOFF_MINUTES = 360
+AI_TRADING_DECISION_WASTE_GUARD_REASON = "low_actionability_cost_guard_active"
+AI_TRADING_DECISION_WASTE_GUARD_FALLBACK = (
+    "skip provider call; deterministic HOLD/fail-closed path remains active"
+)
 
 
 class TokenUsage(TypedDict):
@@ -117,10 +127,102 @@ _AI_USAGE_METRICS_CACHE: dict[
     tuple[object, ...],
     tuple[float, tuple[object, ...], AIUsageMetrics],
 ] = {}
+_AI_USAGE_METRICS_CACHE_LOCK = Lock()
+_AI_USAGE_METRICS_REFRESHING: set[tuple[object, ...]] = set()
 
 
 def clear_ai_usage_metrics_cache() -> None:
-    _AI_USAGE_METRICS_CACHE.clear()
+    with _AI_USAGE_METRICS_CACHE_LOCK:
+        _AI_USAGE_METRICS_CACHE.clear()
+        _AI_USAGE_METRICS_REFRESHING.clear()
+
+
+def _warm_ai_usage_metrics_cache(bind: Any) -> None:
+    try:
+        refresh_session_factory = sessionmaker(
+            bind=bind,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
+        with refresh_session_factory() as session:
+            build_ai_usage_metrics(session, allow_stale=False)
+    except Exception:
+        return
+
+
+def _refresh_ai_usage_metrics_cache(bind: Any, cache_key: tuple[object, ...]) -> None:
+    try:
+        _warm_ai_usage_metrics_cache(bind)
+    finally:
+        with _AI_USAGE_METRICS_CACHE_LOCK:
+            _AI_USAGE_METRICS_REFRESHING.discard(cache_key)
+
+
+def _start_ai_usage_metrics_refresh(session: Session, cache_key: tuple[object, ...]) -> None:
+    try:
+        bind = session.get_bind()
+    except Exception:
+        return
+    if bind is None:
+        return
+    with _AI_USAGE_METRICS_CACHE_LOCK:
+        if cache_key in _AI_USAGE_METRICS_REFRESHING:
+            return
+        _AI_USAGE_METRICS_REFRESHING.add(cache_key)
+    Thread(
+        target=_refresh_ai_usage_metrics_cache,
+        kwargs={"bind": bind, "cache_key": cache_key},
+        daemon=True,
+        name="ai-usage-metrics-refresh",
+    ).start()
+
+
+def _copy_cached_ai_usage_metrics(entry: tuple[float, tuple[object, ...], AIUsageMetrics]) -> AIUsageMetrics:
+    return deepcopy(entry[2])
+
+
+def _find_stale_ai_usage_metrics_cache(
+    cache_key: tuple[object, ...],
+    *,
+    monotonic_now: float,
+) -> tuple[float, tuple[object, ...], AIUsageMetrics] | None:
+    with _AI_USAGE_METRICS_CACHE_LOCK:
+        candidates = [
+            entry
+            for key, entry in _AI_USAGE_METRICS_CACHE.items()
+            if key
+            and key[0] == cache_key[0]
+            and key[-1] == cache_key[-1]
+            and monotonic_now - entry[0] <= AI_USAGE_STALE_CACHE_TTL_SECONDS
+        ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda entry: entry[0])
+
+
+def warm_ai_usage_metrics_cache(
+    session_factory: Callable[[], Session],
+    *,
+    synchronous: bool = False,
+) -> bool:
+    try:
+        with session_factory() as session:
+            bind = session.get_bind()
+        if bind is None:
+            return False
+        if synchronous:
+            _warm_ai_usage_metrics_cache(bind)
+            return True
+        Thread(
+            target=_warm_ai_usage_metrics_cache,
+            kwargs={"bind": bind},
+            daemon=True,
+            name="ai-usage-metrics-warmup",
+        ).start()
+        return True
+    except Exception:
+        return False
 
 
 @dataclass(slots=True)
@@ -132,6 +234,7 @@ class OpenAICallGate:
     manual_guard_minutes: int = 0
     last_attempt_at: datetime | None = None
     failure_reason: str | None = None
+    evidence: dict[str, Any] | None = None
 
     def as_metadata(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -145,6 +248,8 @@ class OpenAICallGate:
             payload["last_attempt_at"] = self.last_attempt_at.isoformat()
         if self.failure_reason is not None:
             payload["failure_reason"] = self.failure_reason
+        if self.evidence is not None:
+            payload["evidence"] = dict(self.evidence)
         return payload
 
 
@@ -156,6 +261,14 @@ class CostEstimate:
     status: str
     model: str | None = None
     model_source: str = "unknown"
+
+
+@dataclass(slots=True)
+class _LoadedDownstreamRows:
+    risk_rows: Sequence[RiskCheck]
+    order_rows: Sequence[Order]
+    execution_rows_by_order_id: Mapping[int, Sequence[Execution]]
+    pending_plan_rows: Sequence[PendingEntryPlan]
 
 
 def manual_ai_guard_minutes(settings_row: Setting) -> int:
@@ -230,16 +343,24 @@ def _metadata_has_usage(row: AgentRun) -> bool:
     return isinstance(metadata.get("usage"), dict)
 
 
+def _mapping_if_loaded(row: AgentRun, field_name: str) -> dict[str, Any]:
+    try:
+        if field_name in inspect(row).unloaded:
+            return {}
+    except Exception:
+        pass
+    value = getattr(row, field_name, None)
+    return value if isinstance(value, dict) else {}
+
+
 def _metadata_model(row: AgentRun) -> str | None:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     for key in ("ai_model", "model", "openai_model"):
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    raw_input_payload = getattr(row, "input_payload", None)
-    raw_output_payload = getattr(row, "output_payload", None)
-    input_payload = raw_input_payload if isinstance(raw_input_payload, dict) else {}
-    output_payload = raw_output_payload if isinstance(raw_output_payload, dict) else {}
+    input_payload = _mapping_if_loaded(row, "input_payload")
+    output_payload = _mapping_if_loaded(row, "output_payload")
     for payload in (input_payload, output_payload):
         for key in ("ai_model", "model", "openai_model"):
             value = payload.get(key)
@@ -328,7 +449,7 @@ def _estimate_row_cost(row: AgentRun) -> CostEstimate:
 
 
 def _output_payload(row: AgentRun) -> dict[str, Any]:
-    return row.output_payload if isinstance(row.output_payload, dict) else {}
+    return _mapping_if_loaded(row, "output_payload")
 
 
 def _metadata_payload(row: AgentRun) -> dict[str, Any]:
@@ -408,6 +529,18 @@ def _is_preai_skipped(row: AgentRun) -> bool:
         _skip_reason_labels(row)
         or metadata.get("provider_not_called_due_to_quality") is True
         or str(metadata.get("source") or "") == "quality_fail_closed"
+    )
+
+
+def _agent_run_ai_usage_filter():
+    metadata_source = AgentRun.metadata_json["source"].as_string()
+    return or_(
+        AgentRun.provider_name == "openai",
+        metadata_source.in_(sorted(AI_USAGE_SOURCE_FILTER_VALUES)),
+        AgentRun.metadata_json["pre_ai_skip_reason"].as_string().is_not(None),
+        AgentRun.metadata_json["ai_skipped_reason"].as_string().is_not(None),
+        AgentRun.metadata_json["last_ai_skip_reason"].as_string().is_not(None),
+        AgentRun.metadata_json["provider_not_called_due_to_quality"].as_boolean().is_(True),
     )
 
 
@@ -575,10 +708,85 @@ def _summarize_loaded_downstream(
     }
 
 
+def _load_downstream_rows(session: Session, decision_ids: Sequence[int]) -> _LoadedDownstreamRows:
+    unique_decision_ids = sorted({int(item) for item in decision_ids if item is not None})
+    if not unique_decision_ids:
+        return _LoadedDownstreamRows(
+            risk_rows=[],
+            order_rows=[],
+            execution_rows_by_order_id={},
+            pending_plan_rows=[],
+        )
+
+    risk_rows = list(
+        session.scalars(
+            select(RiskCheck)
+            .options(
+                load_only(
+                    RiskCheck.id,
+                    RiskCheck.decision_run_id,
+                    RiskCheck.allowed,
+                    RiskCheck.reason_codes,
+                )
+            )
+            .where(RiskCheck.decision_run_id.in_(unique_decision_ids))
+        )
+    )
+    order_rows = list(
+        session.scalars(
+            select(Order)
+            .options(load_only(Order.id, Order.decision_run_id))
+            .where(Order.decision_run_id.in_(unique_decision_ids))
+        )
+    )
+    pending_plan_rows = list(
+        session.scalars(
+            select(PendingEntryPlan)
+            .options(
+                load_only(
+                    PendingEntryPlan.id,
+                    PendingEntryPlan.source_decision_run_id,
+                    PendingEntryPlan.plan_status,
+                    PendingEntryPlan.canceled_at,
+                )
+            )
+            .where(PendingEntryPlan.source_decision_run_id.in_(unique_decision_ids))
+        )
+    )
+    order_ids = [int(row.id) for row in order_rows if row.id is not None]
+    execution_rows_by_order_id: dict[int, list[Execution]] = {}
+    if order_ids:
+        for row in session.scalars(
+            select(Execution)
+            .options(
+                load_only(
+                    Execution.id,
+                    Execution.order_id,
+                    Execution.slippage_pct,
+                    Execution.realized_pnl,
+                    Execution.fee_paid,
+                )
+            )
+            .where(Execution.order_id.in_(order_ids))
+        ):
+            if row.order_id is None:
+                continue
+            execution_rows_by_order_id.setdefault(int(row.order_id), []).append(row)
+
+    return _LoadedDownstreamRows(
+        risk_rows=risk_rows,
+        order_rows=order_rows,
+        execution_rows_by_order_id=execution_rows_by_order_id,
+        pending_plan_rows=pending_plan_rows,
+    )
+
+
 def _downstream_summaries(
     session: Session,
     decision_ids: Sequence[int],
     decision_ids_by_decision: Mapping[str, Sequence[int]],
+    *,
+    loaded_downstream: _LoadedDownstreamRows | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     unique_decision_ids = sorted({int(item) for item in decision_ids if item is not None})
     if not unique_decision_ids:
@@ -587,39 +795,22 @@ def _downstream_summaries(
             {decision: _empty_downstream_summary() for decision in decision_ids_by_decision},
         )
 
-    risk_rows = list(
-        session.scalars(select(RiskCheck).where(RiskCheck.decision_run_id.in_(unique_decision_ids)))
-    )
-    order_rows = list(
-        session.scalars(select(Order).where(Order.decision_run_id.in_(unique_decision_ids)))
-    )
-    pending_plan_rows = list(
-        session.scalars(
-            select(PendingEntryPlan).where(PendingEntryPlan.source_decision_run_id.in_(unique_decision_ids))
-        )
-    )
-    order_ids = [int(row.id) for row in order_rows if row.id is not None]
-    execution_rows_by_order_id: dict[int, list[Execution]] = {}
-    if order_ids:
-        for row in session.scalars(select(Execution).where(Execution.order_id.in_(order_ids))):
-            if row.order_id is None:
-                continue
-            execution_rows_by_order_id.setdefault(int(row.order_id), []).append(row)
+    downstream_rows = loaded_downstream or _load_downstream_rows(session, unique_decision_ids)
 
     downstream = _summarize_loaded_downstream(
         unique_decision_ids,
-        risk_rows=risk_rows,
-        order_rows=order_rows,
-        execution_rows_by_order_id=execution_rows_by_order_id,
-        pending_plan_rows=pending_plan_rows,
+        risk_rows=downstream_rows.risk_rows,
+        order_rows=downstream_rows.order_rows,
+        execution_rows_by_order_id=downstream_rows.execution_rows_by_order_id,
+        pending_plan_rows=downstream_rows.pending_plan_rows,
     )
     downstream_by_decision = {
         decision: _summarize_loaded_downstream(
             bucket_decision_ids,
-            risk_rows=risk_rows,
-            order_rows=order_rows,
-            execution_rows_by_order_id=execution_rows_by_order_id,
-            pending_plan_rows=pending_plan_rows,
+            risk_rows=downstream_rows.risk_rows,
+            order_rows=downstream_rows.order_rows,
+            execution_rows_by_order_id=downstream_rows.execution_rows_by_order_id,
+            pending_plan_rows=downstream_rows.pending_plan_rows,
         )
         for decision, bucket_decision_ids in decision_ids_by_decision.items()
     }
@@ -827,6 +1018,7 @@ def _role_efficiency_summary(
     rows: Sequence[AgentRun],
     *,
     provider_invoked_rows: Sequence[AgentRun],
+    loaded_downstream: _LoadedDownstreamRows | None = None,
 ) -> dict[str, Any]:
     roles = sorted({row.role for row in rows} | {row.role for row in provider_invoked_rows})
     summary: dict[str, Any] = {}
@@ -853,6 +1045,7 @@ def _role_efficiency_summary(
             }
             if role == "trading_decision"
             else {},
+            loaded_downstream=loaded_downstream,
         )
         roi = _ai_roi_summary(
             downstream,
@@ -945,6 +1138,28 @@ def _waste_signal_summary(
     roi_30d = summary_30d.get("roi") if isinstance(summary_30d.get("roi"), dict) else {}
     provider_to_order_7d = actionability_7d.get("provider_to_order_rate")
     net_after_cost_7d = _safe_float(roi_7d.get("net_after_known_ai_cost_usd"), 0.0)
+    provider_calls_7d = int(_safe_float(actionability_7d.get("provider_calls"), 0.0))
+    provider_to_order_rate_7d = (
+        _safe_float(provider_to_order_7d, 0.0) if provider_to_order_7d is not None else None
+    )
+    guard_active = (
+        provider_calls_7d >= AI_TRADING_DECISION_WASTE_MIN_PROVIDER_CALLS_7D
+        and provider_to_order_rate_7d is not None
+        and provider_to_order_rate_7d < AI_TRADING_DECISION_WASTE_MAX_PROVIDER_TO_ORDER_RATE
+        and net_after_cost_7d < 0
+    )
+    runtime_guard = {
+        "status": "active" if guard_active else "inactive",
+        "reason": AI_TRADING_DECISION_WASTE_GUARD_REASON if guard_active else None,
+        "applies_to": "non_manual_trading_decision_new_entry_ai_calls",
+        "backoff_minutes": AI_TRADING_DECISION_WASTE_BACKOFF_MINUTES,
+        "min_provider_calls": AI_TRADING_DECISION_WASTE_MIN_PROVIDER_CALLS_7D,
+        "max_provider_to_order_rate": AI_TRADING_DECISION_WASTE_MAX_PROVIDER_TO_ORDER_RATE,
+        "provider_calls_7d": provider_calls_7d,
+        "provider_to_order_rate_7d": provider_to_order_rate_7d,
+        "net_after_known_ai_cost_usd_7d": round(net_after_cost_7d, 8),
+        "fallback": AI_TRADING_DECISION_WASTE_GUARD_FALLBACK if guard_active else None,
+    }
     if provider_to_order_7d is not None and float(provider_to_order_7d) < 0.01:
         add_signal(
             "LOW_7D_PROVIDER_TO_ORDER_RATE",
@@ -988,6 +1203,7 @@ def _waste_signal_summary(
         "status": "needs_review" if any(item["severity"] == "warning" for item in signals) else "ok",
         "primary_window": "7d",
         "signals": signals,
+        "runtime_guard": runtime_guard,
         "note": "24시간 체결 없음은 단독 경고 조건으로 사용하지 않고, 7일/30일 전환율과 비용 순효과를 함께 봅니다.",
     }
 
@@ -1216,7 +1432,10 @@ def _session_cache_scope(session: Session) -> str:
 
 def _agent_run_revision(session: Session, since: datetime) -> tuple[int, int]:
     max_id, row_count = session.execute(
-        select(func.max(AgentRun.id), func.count(AgentRun.id)).where(AgentRun.created_at >= since)
+        select(func.max(AgentRun.id), func.count(AgentRun.id)).where(
+            AgentRun.created_at >= since,
+            _agent_run_ai_usage_filter(),
+        )
     ).one()
     return int(max_id or 0), int(row_count or 0)
 
@@ -1493,6 +1712,106 @@ def _agent_run_symbol(row: AgentRun) -> str | None:
     return None
 
 
+def _trading_decision_waste_guard(
+    session: Session,
+    *,
+    now: datetime,
+) -> OpenAICallGate | None:
+    since = now - timedelta(days=7)
+    rows = list(
+        session.scalars(
+            select(AgentRun)
+            .options(
+                load_only(
+                    AgentRun.id,
+                    AgentRun.role,
+                    AgentRun.status,
+                    AgentRun.provider_name,
+                    AgentRun.metadata_json,
+                    AgentRun.created_at,
+                )
+            )
+            .where(
+                AgentRun.role == "trading_decision",
+                AgentRun.created_at >= since,
+                _agent_run_ai_usage_filter(),
+            )
+            .order_by(desc(AgentRun.created_at))
+            .limit(AI_USAGE_DETAIL_ROW_LIMIT)
+        )
+    )
+    provider_rows = [row for row in rows if is_ai_attempt(row)]
+    provider_calls = len(provider_rows)
+    if provider_calls < AI_TRADING_DECISION_WASTE_MIN_PROVIDER_CALLS_7D:
+        return None
+
+    decision_ids = [int(row.id) for row in provider_rows if row.id is not None]
+    if not decision_ids:
+        return None
+    order_rows = list(
+        session.scalars(
+            select(Order)
+            .options(load_only(Order.id, Order.decision_run_id))
+            .where(Order.decision_run_id.in_(decision_ids))
+        )
+    )
+    order_ids = [int(row.id) for row in order_rows if row.id is not None]
+    execution_rows = (
+        list(
+            session.scalars(
+                select(Execution)
+                .options(
+                    load_only(
+                        Execution.id,
+                        Execution.order_id,
+                        Execution.realized_pnl,
+                        Execution.fee_paid,
+                    )
+                )
+                .where(Execution.order_id.in_(order_ids))
+            )
+        )
+        if order_ids
+        else []
+    )
+    known_cost, _input_tokens, _output_tokens, missing_usage_rows, unknown_cost_rows = _known_cost_for_rows(
+        provider_rows
+    )
+    trade_net = round(
+        sum(_safe_float(row.realized_pnl) - _safe_float(row.fee_paid) for row in execution_rows),
+        8,
+    )
+    net_after_cost = round(trade_net - known_cost, 8)
+    provider_to_order_rate = _safe_rate(float(len(order_rows)), float(provider_calls)) or 0.0
+    if (
+        provider_to_order_rate >= AI_TRADING_DECISION_WASTE_MAX_PROVIDER_TO_ORDER_RATE
+        or net_after_cost >= 0
+    ):
+        return None
+
+    return OpenAICallGate(
+        allowed=False,
+        reason=AI_TRADING_DECISION_WASTE_GUARD_REASON,
+        retry_after_seconds=AI_TRADING_DECISION_WASTE_BACKOFF_MINUTES * 60,
+        backoff_minutes=AI_TRADING_DECISION_WASTE_BACKOFF_MINUTES,
+        evidence={
+            "window": "7d",
+            "provider_calls": provider_calls,
+            "orders": len(order_rows),
+            "fills": len(execution_rows),
+            "provider_to_order_rate": provider_to_order_rate,
+            "known_ai_cost_usd": known_cost,
+            "trade_net_realized_pnl_usd": trade_net,
+            "net_after_known_ai_cost_usd": net_after_cost,
+            "missing_usage_rows": missing_usage_rows,
+            "unknown_cost_rows": unknown_cost_rows,
+            "min_provider_calls": AI_TRADING_DECISION_WASTE_MIN_PROVIDER_CALLS_7D,
+            "max_provider_to_order_rate": AI_TRADING_DECISION_WASTE_MAX_PROVIDER_TO_ORDER_RATE,
+            "fallback": AI_TRADING_DECISION_WASTE_GUARD_FALLBACK,
+        },
+    )
+
+
 def get_openai_call_gate(
     session: Session,
     settings_row: Setting,
@@ -1503,6 +1822,7 @@ def get_openai_call_gate(
     symbol: str | None = None,
     cooldown_minutes_override: int | None = None,
     manual_guard_minutes_override: int | None = None,
+    enforce_waste_guard: bool | None = None,
 ) -> OpenAICallGate:
     if not settings_row.ai_enabled:
         return OpenAICallGate(allowed=False, reason="ai_disabled")
@@ -1545,6 +1865,15 @@ def get_openai_call_gate(
             reason=str(role_budget["reason"]),
             retry_after_seconds=int(role_budget["retry_after_seconds"] or 0),
         )
+    effective_enforce_waste_guard = (
+        enforce_waste_guard
+        if enforce_waste_guard is not None
+        else role == "trading_decision" and trigger_event != "manual"
+    )
+    if effective_enforce_waste_guard and role == "trading_decision" and trigger_event != "manual":
+        waste_gate = _trading_decision_waste_guard(session, now=now)
+        if waste_gate is not None:
+            return waste_gate
     recent_runs = recent_runs[:100 if symbol else 25]
     if symbol is not None:
         symbol_upper = symbol.upper()
@@ -1611,6 +1940,7 @@ def build_ai_telemetry_summary(
     *,
     deduped_count: int = 0,
     scheduler_skip_reasons: Mapping[str, int] | None = None,
+    loaded_downstream: _LoadedDownstreamRows | None = None,
 ) -> dict[str, Any]:
     decision_rows = [row for row in rows if row.role == "trading_decision"]
     trading_provider_invoked_rows = [row for row in decision_rows if is_ai_attempt(row)]
@@ -1689,16 +2019,19 @@ def build_ai_telemetry_summary(
         session,
         sorted(telemetry_row_ids),
         decision_ids_by_decision,
+        loaded_downstream=loaded_downstream,
     )
     provider_downstream, _ = _downstream_summaries(
         session,
         sorted(int(row.id) for row in trading_provider_invoked_rows if row.id is not None),
         {},
+        loaded_downstream=loaded_downstream,
     )
     role_efficiency = _role_efficiency_summary(
         session,
         rows,
         provider_invoked_rows=provider_invoked_rows,
+        loaded_downstream=loaded_downstream,
     )
 
     return {
@@ -1950,7 +2283,40 @@ def _summarize_attempt_window(
     return _postgres_ai_attempt_summary(session, since) or _summarize_attempt_rows(rows)
 
 
-def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
+def _load_ai_usage_rows(
+    session: Session,
+    *,
+    cutoff_30d: datetime,
+    limit: int,
+    include_output_payload: bool = True,
+) -> list[AgentRun]:
+    columns = [
+        AgentRun.id,
+        AgentRun.role,
+        AgentRun.status,
+        AgentRun.provider_name,
+        AgentRun.metadata_json,
+        AgentRun.created_at,
+    ]
+    if include_output_payload:
+        columns.append(AgentRun.output_payload)
+    return list(
+        session.scalars(
+            select(AgentRun)
+            .options(
+                load_only(*columns)
+            )
+            .where(
+                AgentRun.created_at >= cutoff_30d,
+                _agent_run_ai_usage_filter(),
+            )
+            .order_by(desc(AgentRun.created_at))
+            .limit(limit)
+        )
+    )
+
+
+def build_ai_usage_metrics(session: Session, *, allow_stale: bool = True) -> AIUsageMetrics:
     now = utcnow_naive()
     cutoff_30d = now - timedelta(days=30)
     cutoff_7d = now - timedelta(days=7)
@@ -1970,10 +2336,22 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         cutoff_30d_bucket,
         trading_decision_daily_token_budget,
     )
-    cached = _AI_USAGE_METRICS_CACHE.get(cache_key)
     monotonic_now = monotonic()
+    with _AI_USAGE_METRICS_CACHE_LOCK:
+        cached = _AI_USAGE_METRICS_CACHE.get(cache_key)
     if cached is not None and monotonic_now - cached[0] <= AI_USAGE_CACHE_TTL_SECONDS:
-        return deepcopy(cached[2])
+        return _copy_cached_ai_usage_metrics(cached)
+    if allow_stale:
+        stale_cached = cached or _find_stale_ai_usage_metrics_cache(
+            cache_key,
+            monotonic_now=monotonic_now,
+        )
+        if (
+            stale_cached is not None
+            and monotonic_now - stale_cached[0] <= AI_USAGE_STALE_CACHE_TTL_SECONDS
+        ):
+            _start_ai_usage_metrics_refresh(session, cache_key)
+            return _copy_cached_ai_usage_metrics(stale_cached)
 
     source_revision = (
         *_ai_usage_source_revision(
@@ -1985,32 +2363,29 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         trading_decision_daily_token_budget,
     )
     if cached is not None and cached[1] == source_revision:
-        _AI_USAGE_METRICS_CACHE[cache_key] = (monotonic_now, cached[1], deepcopy(cached[2]))
-        return deepcopy(cached[2])
+        with _AI_USAGE_METRICS_CACHE_LOCK:
+            _AI_USAGE_METRICS_CACHE[cache_key] = (monotonic_now, cached[1], deepcopy(cached[2]))
+        return _copy_cached_ai_usage_metrics(cached)
 
-    rows_30d = list(
-        session.scalars(
-            select(AgentRun)
-            .options(
-                load_only(
-                    AgentRun.id,
-                    AgentRun.role,
-                    AgentRun.status,
-                    AgentRun.provider_name,
-                    AgentRun.output_payload,
-                    AgentRun.metadata_json,
-                    AgentRun.created_at,
-                )
-            )
-            .where(AgentRun.created_at >= cutoff_30d)
-            .order_by(desc(AgentRun.created_at))
-            .limit(AI_USAGE_DETAIL_ROW_LIMIT)
-        )
+    rows_7d = _load_ai_usage_rows(
+        session,
+        cutoff_30d=cutoff_7d,
+        limit=AI_USAGE_DETAIL_ROW_LIMIT,
+        include_output_payload=True,
     )
-    rows_7d = [row for row in rows_30d if row.created_at >= cutoff_7d]
+    rows_30d = _load_ai_usage_rows(
+        session,
+        cutoff_30d=cutoff_30d,
+        limit=AI_USAGE_DETAIL_ROW_LIMIT,
+        include_output_payload=False,
+    )
     rows_today_kst = [row for row in rows_7d if row.created_at >= cutoff_today_kst]
     rows_24h = [row for row in rows_7d if row.created_at >= cutoff_24h]
     oldest_loaded_at = rows_30d[-1].created_at if rows_30d else None
+    downstream_rows_30d = _load_downstream_rows(
+        session,
+        [int(row.id) for row in rows_30d if row.role == "trading_decision" and row.id is not None],
+    )
 
     def loaded_rows_cover(cutoff: datetime) -> bool:
         return len(rows_30d) < AI_USAGE_DETAIL_ROW_LIMIT or (
@@ -2060,24 +2435,28 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         rows_today_kst,
         deduped_count=count_ai_deduped_events(session, cutoff_today_kst),
         scheduler_skip_reasons=scheduler_skip_reasons_today_kst,
+        loaded_downstream=downstream_rows_30d,
     )
     ai_usage_summary_24h = build_ai_telemetry_summary(
         session,
         rows_24h,
         deduped_count=count_ai_deduped_events(session, cutoff_24h),
         scheduler_skip_reasons=scheduler_skip_reasons_24h,
+        loaded_downstream=downstream_rows_30d,
     )
     ai_usage_summary_7d = build_ai_telemetry_summary(
         session,
         rows_7d,
         deduped_count=count_ai_deduped_events(session, cutoff_7d),
         scheduler_skip_reasons=scheduler_skip_reasons_7d,
+        loaded_downstream=downstream_rows_30d,
     )
     ai_usage_summary_30d = build_ai_telemetry_summary(
         session,
         rows_30d,
         deduped_count=count_ai_deduped_events(session, cutoff_30d),
         scheduler_skip_reasons=scheduler_skip_reasons_30d,
+        loaded_downstream=downstream_rows_30d,
     )
     ai_protection_status = build_ai_protection_status(rows_7d, now=now, settings_row=settings_row)
 
@@ -2151,6 +2530,13 @@ def build_ai_usage_metrics(session: Session) -> AIUsageMetrics:
         "ai_usage_summary_7d": ai_usage_summary_7d,
         "ai_usage_summary_30d": ai_usage_summary_30d,
     }
-    _AI_USAGE_METRICS_CACHE.clear()
-    _AI_USAGE_METRICS_CACHE[cache_key] = (monotonic_now, source_revision, deepcopy(metrics))
+    with _AI_USAGE_METRICS_CACHE_LOCK:
+        _AI_USAGE_METRICS_CACHE[cache_key] = (monotonic_now, source_revision, deepcopy(metrics))
+        if len(_AI_USAGE_METRICS_CACHE) > 8:
+            oldest_keys = sorted(
+                _AI_USAGE_METRICS_CACHE,
+                key=lambda key: _AI_USAGE_METRICS_CACHE[key][0],
+            )[: len(_AI_USAGE_METRICS_CACHE) - 8]
+            for old_key in oldest_keys:
+                _AI_USAGE_METRICS_CACHE.pop(old_key, None)
     return metrics

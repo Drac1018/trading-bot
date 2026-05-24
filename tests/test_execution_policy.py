@@ -17,7 +17,11 @@ from trading_mvp.schemas import (
     TradeDecision,
 )
 from trading_mvp.services.dashboard import get_executions
-from trading_mvp.services.execution import apply_position_management, execute_live_trade, sync_live_state
+from trading_mvp.services.execution import (
+    apply_position_management,
+    execute_live_trade,
+    sync_live_state,
+)
 from trading_mvp.services.execution_policy import select_execution_plan, summarize_execution_policy
 from trading_mvp.services.runtime_state import PROTECTION_REQUIRED_STATE, mark_sync_success
 from trading_mvp.services.secret_store import encrypt_secret

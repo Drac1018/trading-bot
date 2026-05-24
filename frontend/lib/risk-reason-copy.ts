@@ -11,7 +11,149 @@ export type ReasonCodeDisplay = {
   known: boolean;
 };
 
+export type AiSkipReasonDisplay = {
+  raw_code: string;
+  title_ko: string;
+  detail_ko: string;
+  next_step_ko: string;
+  known: boolean;
+};
+
 type ReasonCodeDefinition = Omit<ReasonCodeDisplay, "raw_code" | "known">;
+type AiSkipReasonDefinition = Omit<AiSkipReasonDisplay, "raw_code" | "known">;
+
+const aiSkipReasonDefinitions: Record<string, AiSkipReasonDefinition> = {
+  NO_EVENT: {
+    title_ko: "검토 이벤트 없음",
+    detail_ko: "이번 주기에는 AI를 호출할 신규 진입 후보나 포지션 점검 이벤트가 없었습니다.",
+    next_step_ko: "새 신호, 플랜 구간 도달, 포지션 보호 이벤트가 생기면 다시 검토합니다.",
+  },
+  TRIGGER_DEDUPED: {
+    title_ko: "동일 상태 중복 호출 방지",
+    detail_ko: "같은 심볼과 같은 판단 지문이 반복되어 AI 호출을 생략했습니다.",
+    next_step_ko: "가격, 신호, 포지션 상태가 달라지면 다시 검토합니다.",
+  },
+  TRIGGER_FINGERPRINT_UNCHANGED: {
+    title_ko: "동일 상태 중복 호출 방지",
+    detail_ko: "직전 AI 검토와 입력 지문이 같아 중복 호출을 막았습니다.",
+    next_step_ko: "가격, 신호, 포지션 상태가 달라지면 다시 검토합니다.",
+  },
+  AI_DISABLED: {
+    title_ko: "AI 검토 비활성화",
+    detail_ko: "운영 설정에서 AI 검토가 꺼져 있어 호출하지 않았습니다.",
+    next_step_ko: "설정에서 AI 사용 상태가 의도한 값인지 확인하세요.",
+  },
+  AI_FAILURE_BACKOFF: {
+    title_ko: "AI 실패 후 재시도 대기",
+    detail_ko: "최근 AI 호출 실패 후 보호 대기 시간이 적용되어 이번 호출을 건너뛰었습니다.",
+    next_step_ko: "재시도 제한 시간이 지나거나 오류가 해소되면 다시 호출합니다.",
+  },
+  AI_COOLDOWN_ACTIVE: {
+    title_ko: "AI 재호출 대기 시간 적용",
+    detail_ko: "너무 잦은 AI 호출을 막기 위해 쿨다운이 적용되어 이번 검토를 생략했습니다.",
+    next_step_ko: "쿨다운이 끝나면 다음 판단 주기에서 다시 검토합니다.",
+  },
+  ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: {
+    title_ko: "거래 판단 AI 일일 예산 소진",
+    detail_ko: "거래 판단 역할의 24시간 AI 토큰 예산을 모두 사용해 추가 호출을 막았습니다.",
+    next_step_ko: "예산 창이 갱신되거나 운영자가 예산을 조정하면 다시 호출할 수 있습니다.",
+  },
+  SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE: {
+    title_ko: "신호가 약해 AI 검토 전 보류",
+    detail_ko: "신규 진입 후보의 신호가 약해 AI 호출 비용을 쓰기 전에 관망 처리했습니다.",
+    next_step_ko: "후보 강도나 시장 변화가 충분해지면 다시 검토합니다.",
+  },
+  SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE: {
+    title_ko: "약한 후보 재검토 대기",
+    detail_ko: "약한 후보를 너무 자주 재검토하지 않도록 대기 시간이 적용되었습니다.",
+    next_step_ko: "대기 시간이 지나거나 의미 있는 변화가 생기면 다시 검토합니다.",
+  },
+  SOFT_SIGNAL_REVIEW_NO_MATERIAL_CHANGE: {
+    title_ko: "이전 검토 이후 의미 있는 변화 없음",
+    detail_ko: "직전 약한 후보 검토 이후 가격, 신호, 리스크 상태가 충분히 달라지지 않았습니다.",
+    next_step_ko: "의미 있는 시장 변화가 생기면 다시 검토합니다.",
+  },
+  AI_CYCLE_BUDGET_EXHAUSTED: {
+    title_ko: "이번 주기 AI 검토 예산 소진",
+    detail_ko: "한 판단 주기에서 사용할 수 있는 AI 검토 횟수를 이미 사용했습니다.",
+    next_step_ko: "다음 판단 주기에서 다시 후보를 검토합니다.",
+  },
+  PROTECTION_REVIEW_DETERMINISTIC_ONLY: {
+    title_ko: "보호 점검은 규칙 기반으로 처리",
+    detail_ko: "포지션 보호, 축소, 청산 점검은 AI 호출 없이 규칙 기반 경로로 처리했습니다.",
+    next_step_ko: "보호 주문과 포지션 관리 상태를 확인하세요.",
+  },
+  ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: {
+    title_ko: "거래량 부족으로 AI 검토 생략",
+    detail_ko: "신규 진입 후보의 거래량 확인이 부족해 AI 호출 전에 보류했습니다.",
+    next_step_ko: "거래량 조건이 회복되면 다음 판단 주기에서 다시 검토합니다.",
+  },
+  ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF: {
+    title_ko: "반복 중립 후보라 AI 검토 생략",
+    detail_ko: "같은 중립 후보가 반복되어 AI 비용을 쓰기 전에 관망 처리했습니다.",
+    next_step_ko: "새 신호나 방향성이 생기면 다시 검토합니다.",
+  },
+  MACRO_EVENT_IMMINENT: {
+    title_ko: "주요 경제 이벤트 임박",
+    detail_ko: "주요 경제 이벤트가 가까워 신규 진입 AI 검토를 보수적으로 생략했습니다.",
+    next_step_ko: "이벤트 리스크 구간이 지나면 다시 검토합니다.",
+  },
+  MACRO_EVENT_RISK_WINDOW_ACTIVE: {
+    title_ko: "경제 이벤트 리스크 구간",
+    detail_ko: "경제 이벤트 전후 변동성 구간이라 신규 진입 검토를 보류했습니다.",
+    next_step_ko: "리스크 구간이 끝나면 다시 검토합니다.",
+  },
+  STALE_MARKET_DATA: {
+    title_ko: "시장 데이터 지연",
+    detail_ko: "시장 스냅샷이 오래되어 AI 판단 입력으로 쓰지 않았습니다.",
+    next_step_ko: "새 시장 데이터가 수집된 뒤 다시 판단합니다.",
+  },
+  STALE_MARKET_DATA_PREAI: {
+    title_ko: "시장 데이터 지연",
+    detail_ko: "시장 스냅샷이 오래되어 AI 판단 입력으로 쓰지 않았습니다.",
+    next_step_ko: "새 시장 데이터가 수집된 뒤 다시 판단합니다.",
+  },
+  LOW_SCORE: {
+    title_ko: "진입 점수 부족",
+    detail_ko: "신규 진입 후보 점수가 기준에 못 미쳐 AI 호출 전에 보류했습니다.",
+    next_step_ko: "점수가 기준 이상으로 올라가면 다시 검토합니다.",
+  },
+  SPREAD_STRESS: {
+    title_ko: "스프레드 부담",
+    detail_ko: "현재 스프레드가 부담스러워 AI 호출 전에 신규 진입 검토를 보류했습니다.",
+    next_step_ko: "체결 환경이 개선되면 다시 검토합니다.",
+  },
+  EXPOSURE_LIMIT: {
+    title_ko: "노출 한도 초과 우려",
+    detail_ko: "현재 포지션 또는 후보를 더하면 노출 한도에 걸릴 수 있어 AI 검토를 생략했습니다.",
+    next_step_ko: "노출이 줄거나 한도가 회복되면 다시 검토합니다.",
+  },
+  ACCOUNT_UNTRUSTED: {
+    title_ko: "계정/주문 상태 신뢰 불가",
+    detail_ko: "판단 시점에 계정, 포지션, 오픈오더 또는 보호주문 상태를 신뢰할 수 없어 AI를 호출하지 않았습니다.",
+    next_step_ko: "동기화가 회복되면 다음 판단 주기에서 다시 후보를 검토합니다.",
+  },
+  PROTECTIVE_ORDERS_SYNC_STALE: {
+    title_ko: "보호주문 상태 확인 지연",
+    detail_ko: "보호주문 확인 시각이 오래되어 신규 진입 판단을 보류했습니다.",
+    next_step_ko: "보호주문 동기화가 정상으로 돌아온 뒤 다시 판단합니다.",
+  },
+  PLAN_CANCELED_NO_ENTRY_CAPACITY: {
+    title_ko: "추가 진입 여유 없음",
+    detail_ko: "이미 열린 포지션이 허용 노출을 사용 중이라 대기 플랜 감시를 중단했고 AI 재판단을 호출하지 않았습니다.",
+    next_step_ko: "포지션이 줄거나 잔고/한도가 회복되면 새 판단에서 다시 플랜이 생성될 수 있습니다.",
+  },
+  LOW_ACTIONABILITY_COST_GUARD_ACTIVE: {
+    title_ko: "AI 비용 보호 정책으로 신규 진입 검토를 건너뜀",
+    detail_ko:
+      "최근 신규 진입 AI 호출이 주문으로 이어진 비율이 낮아, 비용 낭비를 막기 위해 AI 호출 전에 이번 검토를 생략했습니다. 기존 포지션 보호, 축소, 청산 경로는 계속 분리되어 작동합니다.",
+    next_step_ko: "재시도 제한 시간이 지나거나 주문 전환율과 순효과가 회복되면 다음 판단 주기에서 다시 검토합니다.",
+  },
+};
+
+function normalizeAiSkipReason(value: string | null | undefined) {
+  return (value ?? "").trim().toUpperCase();
+}
 
 const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
   HOLD_DECISION: {
@@ -260,6 +402,14 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     operator_action_ko: "보호 주문 상태와 미보호 포지션 수를 확인합니다.",
     check_location_ko: "안전 점검 > 보호 주문",
   },
+  FULL_LIVE_SYNC_STALE: {
+    category: "safety_block",
+    title_ko: "full_live 승인 전 거래소 동기화가 최신이 아닙니다",
+    detail_ko: "계좌, 포지션, 미체결 주문, 보호주문 동기화가 최신 상태가 아니면 실거래 승인 창을 열 수 없습니다.",
+    auto_clear_hint_ko: "거래소 동기화가 정상 완료되면 승인 차단이 자동 해소될 수 있습니다.",
+    operator_action_ko: "안전 점검의 거래소 정보 최신성에서 stale scope를 확인하고 live sync를 먼저 실행하세요.",
+    check_location_ko: "안전 점검 > 거래소 정보 최신성",
+  },
   MARKET_STATE_STALE: {
     category: "safety_block",
     title_ko: "시장 데이터가 오래되어 신규 진입을 막았습니다",
@@ -347,6 +497,14 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     auto_clear_hint_ko: "계좌 reconciliation이 synced로 돌아오면 해소될 수 있습니다.",
     operator_action_ko: "계좌 동기화와 reconciliation status를 확인합니다.",
     check_location_ko: "안전 점검 > 계좌 / reconciliation",
+  },
+  EXCHANGE_CAN_TRADE_UNKNOWN: {
+    category: "safety_block",
+    title_ko: "거래소 주문 권한 확인값이 unknown입니다",
+    detail_ko: "full_live 승인 상태지만 거래소가 실제 주문 가능 상태인지 확인되지 않아 신규 진입을 보류합니다.",
+    auto_clear_hint_ko: "계좌 동기화가 성공하고 exchange_can_trade가 확인되면 해소될 수 있습니다.",
+    operator_action_ko: "live sync와 Binance 계좌 권한, exchange_can_trade_checked_at을 확인합니다.",
+    check_location_ko: "안전 점검 > 거래소 계좌 권한",
   },
   PORTFOLIO_RISK_UNCERTAIN: {
     category: "safety_block",
@@ -533,6 +691,7 @@ const compatibilityDetailMap: Record<string, string> = {
   PLAN_CANCELED_NO_ENTRY_CAPACITY: "이미 열린 포지션 때문에 추가 진입 여유가 없어 대기 플랜 감시를 중단했습니다.",
   REPLACED_BY_NEW_APPROVED_PLAN: "더 최신 승인 플랜으로 대체되어 이전 대기 플랜 감시를 중단했습니다.",
   EXCHANGE_ACCOUNT_STATE_UNAVAILABLE: "거래소 계좌 상태를 확인할 수 없습니다.",
+  EXCHANGE_CAN_TRADE_UNKNOWN: "거래소 주문 권한 확인값이 unknown이라 신규 진입을 보류합니다.",
   EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE: "거래소 또는 네트워크 연결이 일시적으로 불안정합니다.",
   TEMPORARY_MARKET_DATA_FAILURE: "시장 데이터 확인 중 일시적인 오류가 발생했습니다.",
   TEMPORARY_SYNC_FAILURE: "거래소 상태 동기화 중 일시적인 오류가 발생했습니다.",
@@ -740,6 +899,42 @@ export function describeReasonCode(value: string | null | undefined): ReasonCode
     known: false,
     ...fallbackHint("unknown"),
   };
+}
+
+export function describeAiSkipReason(value: string | null | undefined): AiSkipReasonDisplay {
+  const raw = value?.trim() ?? "";
+  const code = normalizeAiSkipReason(value);
+  if (!code) {
+    return {
+      raw_code: "",
+      title_ko: "AI 검토 생략 없음",
+      detail_ko: "이번 row에는 AI 호출 전 생략 사유가 없습니다.",
+      next_step_ko: "판단 결과와 리스크 승인 여부를 확인하세요.",
+      known: true,
+    };
+  }
+
+  const definition = aiSkipReasonDefinitions[code];
+  if (definition) {
+    return {
+      raw_code: raw || code,
+      known: true,
+      ...definition,
+    };
+  }
+
+  return {
+    raw_code: raw || code,
+    title_ko: "AI 검토 생략 사유 확인 필요",
+    detail_ko:
+      "시스템이 AI를 호출하기 전에 이번 후보를 건너뛰도록 판단했습니다. 아직 이 사유에 대한 상세 사용자 설명은 등록되지 않았습니다.",
+    next_step_ko: "고급 정보의 원본 reason code를 확인하고 사용자용 설명 매핑을 추가하세요.",
+    known: false,
+  };
+}
+
+export function aiSkipReasonTitle(value: string | null | undefined) {
+  return describeAiSkipReason(value).title_ko;
 }
 
 export function describeReasonCodeInContext(

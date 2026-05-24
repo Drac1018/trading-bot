@@ -20,7 +20,15 @@ from trading_mvp.schemas import (
 )
 from trading_mvp.services.account import account_snapshot_to_dict, create_exchange_pnl_snapshot
 from trading_mvp.services.binance import BinanceClient
-from trading_mvp.services.runtime_state import get_sync_state_detail, mark_sync_success, write_runtime_detail_key
+from trading_mvp.services.exchange_permission import (
+    fetch_account_config_for_permission,
+    resolve_exchange_trade_permission,
+)
+from trading_mvp.services.runtime_state import (
+    get_sync_state_detail,
+    mark_sync_success,
+    write_runtime_detail_key,
+)
 from trading_mvp.services.settings import (
     derive_guard_mode_reason,
     get_effective_symbols,
@@ -265,16 +273,20 @@ def _has_meaningful_balance(*values: float) -> bool:
 
 def _resolve_exchange_trade_permission(
     account_info: Mapping[str, object],
+    account_config: Mapping[str, object] | None = None,
+    account_config_error: str | None = None,
 ) -> tuple[bool | None, bool, str, str | None]:
-    raw_can_trade = account_info.get("canTrade")
-    if raw_can_trade is None:
-        return (
-            None,
-            False,
-            "binance_account_info_missing_canTrade",
-            "Binance account response omitted canTrade; exchange trade permission is unknown.",
-        )
-    return _to_bool(raw_can_trade), True, "binance_account_info", None
+    permission = resolve_exchange_trade_permission(
+        account_info,
+        account_config=account_config,
+        account_config_error=account_config_error,
+    )
+    return (
+        permission["exchange_can_trade"],
+        bool(permission["exchange_can_trade_known"]),
+        str(permission["exchange_can_trade_source"]),
+        permission["exchange_can_trade_note"],
+    )
 
 
 def _exchange_permission_from_sync_state(settings_row: Setting) -> dict[str, object]:
@@ -593,13 +605,21 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
     max_get_attempts = _account_read_max_get_attempts()
 
     try:
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="binance-account-read") as executor:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="binance-account-read") as executor:
             account_future = executor.submit(
                 _build_client(
                     settings_row,
                     timeout_seconds=timeout_seconds,
                     max_get_attempts=max_get_attempts,
                 ).get_account_info
+            )
+            account_config_future = executor.submit(
+                fetch_account_config_for_permission,
+                _build_client(
+                    settings_row,
+                    timeout_seconds=timeout_seconds,
+                    max_get_attempts=max_get_attempts,
+                ),
             )
             positions_future = executor.submit(
                 _build_client(
@@ -616,6 +636,7 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
                 ).get_open_orders
             )
             account_info = account_future.result()
+            account_config, account_config_error = account_config_future.result()
             positions_raw = positions_future.result()
             open_orders_raw = open_orders_future.result()
     except Exception as exc:
@@ -709,7 +730,11 @@ def get_binance_account_snapshot(session: Session) -> BinanceAccountResponse:
         exchange_can_trade_known,
         exchange_can_trade_source,
         exchange_can_trade_note,
-    ) = _resolve_exchange_trade_permission(account_info)
+    ) = _resolve_exchange_trade_permission(
+        account_info,
+        account_config=account_config,
+        account_config_error=account_config_error,
+    )
     exchange_can_trade_checked_at = utcnow_naive()
 
     summary = _build_base_summary(

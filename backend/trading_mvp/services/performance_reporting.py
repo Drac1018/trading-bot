@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from threading import Lock, Thread
@@ -66,6 +66,9 @@ OPPORTUNITY_ATTRIBUTION_HORIZONS_MINUTES = (15, 30, 60)
 OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT = 100.0
 OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME = "15m"
 OPPORTUNITY_ATTRIBUTION_FUNDING_INTERVAL_MINUTES = 8 * 60
+OPPORTUNITY_ATTRIBUTION_SUMMARY_CACHE_TTL_SECONDS = 120.0
+OPPORTUNITY_ATTRIBUTION_SUMMARY_STALE_SECONDS = 900.0
+OPPORTUNITY_ATTRIBUTION_SUMMARY_REFRESH_DEBOUNCE_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -78,6 +81,18 @@ class _CachedSignalPerformanceReport:
 
 _signal_performance_report_cache: dict[tuple[object, ...], _CachedSignalPerformanceReport] = {}
 _signal_performance_report_cache_lock = Lock()
+
+
+@dataclass(slots=True)
+class _CachedOpportunityAttributionSummary:
+    stored_at: float
+    payload: dict[str, object]
+    refresh_started_at: float | None = None
+
+
+_opportunity_attribution_summary_cache: dict[tuple[object, ...], _CachedOpportunityAttributionSummary] = {}
+_opportunity_attribution_summary_refresh_started_at: dict[tuple[object, ...], float] = {}
+_opportunity_attribution_summary_cache_lock = Lock()
 
 
 @dataclass(slots=True)
@@ -2183,6 +2198,8 @@ def _build_limited_live_readiness(
     reason_codes: list[str] = []
     if len(decision_items) < READINESS_MIN_CANDIDATE_EVENTS or actual_entries < READINESS_MIN_ACTUAL_ENTRIES:
         reason_codes.append("insufficient_sample")
+    if actual_entries < READINESS_MIN_ACTUAL_ENTRIES or summary.fills < READINESS_MIN_ACTUAL_ENTRIES:
+        reason_codes.append("productization_profitability_unverified")
     if observed_entry_decisions and expectancy_after_fees < 0:
         reason_codes.append("negative_expectancy")
     if max_drawdown > READINESS_MAX_DRAWDOWN:
@@ -3292,6 +3309,82 @@ def _risk_opportunity_candidates(
     return candidates
 
 
+def _decision_fact_opportunity_candidates(
+    session: Session,
+    *,
+    since: datetime,
+    limit: int,
+) -> list[dict[str, object]]:
+    rows = list(
+        session.scalars(
+            select(DecisionPerformanceFact)
+            .where(DecisionPerformanceFact.created_at >= since)
+            .order_by(desc(DecisionPerformanceFact.created_at), desc(DecisionPerformanceFact.id))
+            .limit(limit)
+        )
+    )
+    candidates: list[dict[str, object]] = []
+    for fact in rows:
+        decision = str(fact.decision or "").strip().lower()
+        baseline_decision = str(fact.baseline_decision or "").strip().lower()
+        side = decision if decision in ENTRY_DECISIONS else baseline_decision
+        if side not in ENTRY_DECISIONS:
+            continue
+        if bool(fact.ai_led_to_fill):
+            continue
+        source_status = str(fact.ai_usefulness_status or "").strip() or "unknown"
+        blocked_or_canceled = (
+            bool(fact.ai_blocked_by_risk)
+            or source_status in {"risk_blocked", "risk_allowed_no_order", "ordered", "order_without_fill"}
+            or bool(fact.ai_actionable and not fact.ai_led_to_order)
+        )
+        if not blocked_or_canceled:
+            continue
+        reason_codes = _unique_nonempty_strings(
+            [
+                *list(fact.rationale_codes or [] if isinstance(fact.rationale_codes, list) else []),
+                source_status,
+                fact.comparison_bucket,
+            ]
+        ) or ["DECISION_FACT_BLOCKED_OR_CANCELED"]
+        if bool(fact.ai_blocked_by_risk) and "AI_BLOCKED_BY_RISK" not in reason_codes:
+            reason_codes.append("AI_BLOCKED_BY_RISK")
+        reference_price = _zone_midpoint(fact.entry_zone_min, fact.entry_zone_max)
+        candidates.append(
+            {
+                "_sort_at": fact.created_at,
+                "source": "decision_performance_fact",
+                "source_id": fact.id,
+                "created_at": fact.created_at.isoformat(),
+                "symbol": fact.symbol,
+                "timeframe": fact.timeframe or OPPORTUNITY_ATTRIBUTION_DEFAULT_TIMEFRAME,
+                "side": side,
+                "decision_run_id": fact.decision_run_id,
+                "decision_fact_id": fact.id,
+                "decision": fact.decision,
+                "baseline_decision": fact.baseline_decision,
+                "ai_usefulness_status": source_status,
+                "ai_blocked_by_risk": bool(fact.ai_blocked_by_risk),
+                "ai_led_to_order": bool(fact.ai_led_to_order),
+                "ai_led_to_fill": bool(fact.ai_led_to_fill),
+                "expected_edge_bps": fact.expected_edge_bps,
+                "expected_total_cost_bps": fact.expected_total_cost_bps,
+                "net_expected_edge_bps": fact.net_expected_edge_bps,
+                "reason_codes": reason_codes,
+                "reference_snapshot_id": None,
+                "reference_time": fact.created_at.isoformat(),
+                "reference_price": reference_price,
+                "entry_execution_type": ENTRY_EXECUTION_TYPE_UNKNOWN,
+                "ai_flow_tags": _ai_flow_tags(
+                    source="decision_performance_fact",
+                    decision_row=None,
+                    reason_codes=reason_codes,
+                ),
+            }
+        )
+    return candidates
+
+
 def _pending_quality_bucket(score: float | None) -> str:
     if score is None:
         return "missing"
@@ -3651,6 +3744,7 @@ def build_opportunity_attribution_report(
     since = now - timedelta(hours=bounded_lookback_hours)
     candidates = [
         *_risk_opportunity_candidates(session, since=since, limit=bounded_limit),
+        *_decision_fact_opportunity_candidates(session, since=since, limit=bounded_limit),
         *_pending_opportunity_candidates(session, since=since, limit=bounded_limit),
         *_audit_skip_opportunity_candidates(session, since=since, limit=bounded_limit),
     ]
@@ -3720,8 +3814,8 @@ def build_opportunity_attribution_report(
         "virtual_notional_usdt": round(safe_notional, 8),
         "horizons_minutes": list(OPPORTUNITY_ATTRIBUTION_HORIZONS_MINUTES),
         "basis": (
-            "Read-only opportunity attribution over risk_checks, pending_entry_plans, and "
-            "decision_ai_skipped audit events. Net estimate uses current cost_model fee/slippage "
+            "Read-only opportunity attribution over risk_checks, pending_entry_plans, "
+            "decision_performance_facts, and decision_ai_skipped audit events. Net estimate uses current cost_model fee/slippage "
             "settings plus recent execution samples when available; funding is included only when "
             "the reference market snapshot carries a funding_rate."
         ),
@@ -3734,6 +3828,268 @@ def build_opportunity_attribution_report(
         "ai_flow_summary": ai_flow_summary,
         "candidates": evaluated_candidates,
     }
+
+
+def _opportunity_attribution_summary_cache_key(
+    session: Session,
+    *,
+    limit: int,
+    notional_usdt: float,
+) -> tuple[object, ...]:
+    return (
+        _performance_report_db_identity(session),
+        max(1, min(int(limit), 500)),
+        round(max(float(notional_usdt), 1.0), 8),
+    )
+
+
+def _copy_opportunity_attribution_summary(payload: dict[str, object]) -> dict[str, object]:
+    return dict(payload)
+
+
+def _compact_opportunity_attribution_summary(window_label: str, report: dict[str, object]) -> dict[str, object]:
+    return {
+        "window_label": window_label,
+        "generated_at": report.get("generated_at"),
+        "lookback_hours": report.get("lookback_hours"),
+        "since": report.get("since"),
+        "virtual_notional_usdt": report.get("virtual_notional_usdt"),
+        "basis": report.get("basis"),
+        "overall": report.get("overall"),
+        "missed_opportunity_reason_codes": list(report.get("missed_opportunity_reason_codes") or [])[:12],
+        "loss_prevention_reason_codes": list(report.get("loss_prevention_reason_codes") or [])[:12],
+        "pending_quality_summary": report.get("pending_quality_summary"),
+        "pending_quality_threshold_review": report.get("pending_quality_threshold_review"),
+        "ai_flow_summary": report.get("ai_flow_summary"),
+    }
+
+
+def _build_opportunity_attribution_summary_uncached(
+    session: Session,
+    *,
+    limit: int = 120,
+    notional_usdt: float = OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT,
+) -> dict[str, object]:
+    bounded_limit = max(1, min(int(limit), 500))
+    windows = (
+        ("24h", 24),
+        ("7d", 24 * 7),
+    )
+    return {
+        "windows": [
+            _compact_opportunity_attribution_summary(
+                label,
+                build_opportunity_attribution_report(
+                    session,
+                    lookback_hours=hours,
+                    limit=bounded_limit,
+                    notional_usdt=notional_usdt,
+                ),
+            )
+            for label, hours in windows
+        ]
+    }
+
+
+def _opportunity_attribution_summary_pending_payload(
+    *,
+    limit: int,
+    notional_usdt: float,
+) -> dict[str, object]:
+    generated_at = utcnow_naive().isoformat()
+    windows: list[dict[str, object]] = []
+    for label, hours in (("24h", 24), ("7d", 24 * 7)):
+        windows.append(
+            {
+                "window_label": label,
+                "generated_at": generated_at,
+                "lookback_hours": hours,
+                "since": None,
+                "virtual_notional_usdt": notional_usdt,
+                "basis": "pending_cache_refresh",
+                "overall": {},
+                "missed_opportunity_reason_codes": [],
+                "loss_prevention_reason_codes": [],
+                "pending_quality_summary": {},
+                "pending_quality_threshold_review": {},
+                "ai_flow_summary": {},
+                "status": "pending_refresh",
+            }
+        )
+    return {
+        "status": "pending_refresh",
+        "cache_miss": True,
+        "limit": limit,
+        "notional_usdt": notional_usdt,
+        "windows": windows,
+    }
+
+
+def _store_opportunity_attribution_summary_cache(cache_key: tuple[object, ...], payload: dict[str, object]) -> None:
+    with _opportunity_attribution_summary_cache_lock:
+        _opportunity_attribution_summary_cache[cache_key] = _CachedOpportunityAttributionSummary(
+            stored_at=monotonic(),
+            payload=_copy_opportunity_attribution_summary(payload),
+        )
+        _opportunity_attribution_summary_refresh_started_at.pop(cache_key, None)
+
+
+def _finish_opportunity_attribution_summary_refresh(cache_key: tuple[object, ...]) -> None:
+    with _opportunity_attribution_summary_cache_lock:
+        cached = _opportunity_attribution_summary_cache.get(cache_key)
+        if cached is not None:
+            cached.refresh_started_at = None
+        _opportunity_attribution_summary_refresh_started_at.pop(cache_key, None)
+
+
+def _rebuild_opportunity_attribution_summary_cache(
+    *,
+    bind: Any,
+    cache_key: tuple[object, ...],
+    limit: int,
+    notional_usdt: float,
+) -> None:
+    try:
+        refresh_session_factory = sessionmaker(
+            bind=bind,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
+        with refresh_session_factory() as refresh_session:
+            payload = _build_opportunity_attribution_summary_uncached(
+                refresh_session,
+                limit=limit,
+                notional_usdt=notional_usdt,
+            )
+            _store_opportunity_attribution_summary_cache(cache_key, payload)
+    finally:
+        _finish_opportunity_attribution_summary_refresh(cache_key)
+
+
+def _start_opportunity_attribution_summary_background_refresh(
+    session: Session,
+    *,
+    limit: int,
+    notional_usdt: float,
+) -> bool:
+    cache_key = _opportunity_attribution_summary_cache_key(session, limit=limit, notional_usdt=notional_usdt)
+    now_monotonic = monotonic()
+    with _opportunity_attribution_summary_cache_lock:
+        cached = _opportunity_attribution_summary_cache.get(cache_key)
+        refresh_started_at = (
+            cached.refresh_started_at
+            if cached is not None
+            else _opportunity_attribution_summary_refresh_started_at.get(cache_key)
+        )
+        if refresh_started_at is not None and (
+            now_monotonic - refresh_started_at < OPPORTUNITY_ATTRIBUTION_SUMMARY_REFRESH_DEBOUNCE_SECONDS
+        ):
+            return False
+        if cached is None:
+            _opportunity_attribution_summary_refresh_started_at[cache_key] = now_monotonic
+        else:
+            cached.refresh_started_at = now_monotonic
+
+    bind = session.get_bind()
+    if bind is None:
+        _finish_opportunity_attribution_summary_refresh(cache_key)
+        return False
+
+    Thread(
+        target=_rebuild_opportunity_attribution_summary_cache,
+        kwargs={
+            "bind": bind,
+            "cache_key": cache_key,
+            "limit": limit,
+            "notional_usdt": notional_usdt,
+        },
+        daemon=True,
+        name="opportunity-attribution-summary-refresh",
+    ).start()
+    return True
+
+
+def warm_opportunity_attribution_summary_cache(
+    session_factory: Callable[[], Session],
+    *,
+    synchronous: bool = False,
+) -> bool:
+    try:
+        with session_factory() as session:
+            if synchronous:
+                limit = 120
+                notional_usdt = OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT
+                cache_key = _opportunity_attribution_summary_cache_key(
+                    session,
+                    limit=limit,
+                    notional_usdt=notional_usdt,
+                )
+                payload = _build_opportunity_attribution_summary_uncached(
+                    session,
+                    limit=limit,
+                    notional_usdt=notional_usdt,
+                )
+                _store_opportunity_attribution_summary_cache(cache_key, payload)
+                return True
+            return _start_opportunity_attribution_summary_background_refresh(
+                session,
+                limit=120,
+                notional_usdt=OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT,
+            )
+    except Exception:
+        return False
+
+
+def build_opportunity_attribution_summary(
+    session: Session,
+    *,
+    limit: int = 120,
+    notional_usdt: float = OPPORTUNITY_ATTRIBUTION_DEFAULT_NOTIONAL_USDT,
+    use_cache: bool = False,
+    allow_stale: bool = True,
+) -> dict[str, object]:
+    if not use_cache:
+        return _build_opportunity_attribution_summary_uncached(session, limit=limit, notional_usdt=notional_usdt)
+
+    cache_key = _opportunity_attribution_summary_cache_key(session, limit=limit, notional_usdt=notional_usdt)
+    now_monotonic = monotonic()
+    stale_payload: dict[str, object] | None = None
+    with _opportunity_attribution_summary_cache_lock:
+        cached = _opportunity_attribution_summary_cache.get(cache_key)
+        cache_age_seconds = (
+            now_monotonic - cached.stored_at
+            if cached is not None and cached.stored_at > 0
+            else None
+        )
+        if cached is not None and cache_age_seconds is not None:
+            if cache_age_seconds <= OPPORTUNITY_ATTRIBUTION_SUMMARY_CACHE_TTL_SECONDS:
+                return _copy_opportunity_attribution_summary(cached.payload)
+            if allow_stale and cache_age_seconds <= OPPORTUNITY_ATTRIBUTION_SUMMARY_STALE_SECONDS:
+                stale_payload = _copy_opportunity_attribution_summary(cached.payload)
+
+    if stale_payload is not None:
+        _start_opportunity_attribution_summary_background_refresh(
+            session,
+            limit=limit,
+            notional_usdt=notional_usdt,
+        )
+        return stale_payload
+
+    if allow_stale:
+        _start_opportunity_attribution_summary_background_refresh(
+            session,
+            limit=limit,
+            notional_usdt=notional_usdt,
+        )
+        return _opportunity_attribution_summary_pending_payload(
+            limit=max(1, min(int(limit), 500)),
+            notional_usdt=max(float(notional_usdt), 1.0),
+        )
+
+    payload = _build_opportunity_attribution_summary_uncached(session, limit=limit, notional_usdt=notional_usdt)
+    _store_opportunity_attribution_summary_cache(cache_key, payload)
+    return payload
 
 
 def build_signal_performance_report(

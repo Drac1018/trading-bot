@@ -223,9 +223,13 @@ def test_replay_validation_report_compares_variants_without_live_execution(monke
 
 
 def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) -> None:
+    from trading_mvp.config import get_settings
+
     test_engine = create_engine(f"sqlite:///{tmp_path / 'replay_validation_api.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setenv("OPERATOR_API_KEY", "pytest-operator-key")
+    get_settings.cache_clear()
     monkeypatch.setattr("trading_mvp.main.engine", test_engine)
 
     def fail_execute(*args, **kwargs):
@@ -242,6 +246,10 @@ def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) 
         with TestClient(app) as client:
             response = client.post(
                 "/api/replay/validation",
+                headers={
+                    "X-Operator-API-Key": "pytest-operator-key",
+                    "X-Operator-Intent": "replay.validation",
+                },
                 json={
                     "cycles": 20,
                     "start_index": 90,
@@ -270,6 +278,7 @@ def test_replay_validation_api_returns_comparison_report(tmp_path, monkeypatch) 
         assert payload["scenario_comparison"]
         assert payload["rationale_comparison"]
     finally:
+        get_settings.cache_clear()
         app.dependency_overrides.clear()
 
 

@@ -2,6 +2,8 @@ import { redirect } from "next/navigation";
 
 import { CostBreakdownDashboard } from "../../../components/cost-breakdown-dashboard";
 
+export const dynamic = "force-dynamic";
+
 type SearchParams = Record<string, string | string[] | undefined>;
 
 function queryValue(value: string | string[] | undefined) {

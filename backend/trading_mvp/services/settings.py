@@ -13,6 +13,7 @@ from trading_mvp.config import Settings as AppConfig
 from trading_mvp.config import get_settings
 from trading_mvp.models import (
     AgentRun,
+    DecisionPerformanceFact,
     FeatureSnapshot,
     MarketSnapshot,
     PnLSnapshot,
@@ -81,6 +82,7 @@ from trading_mvp.services.runtime_state import (
     get_drawdown_state_detail,
     get_market_stream_detail,
     get_sync_state_detail,
+    public_user_stream_detail,
     resolve_exchange_connectivity_state,
     summarize_runtime_state,
 )
@@ -340,6 +342,7 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
 EXCHANGE_SYNC_WORKFLOW = "exchange_sync_cycle"
 EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS = 24
 EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE = "EXCHANGE_AUTH_PERMISSION_REJECTED"
+FULL_LIVE_SYNC_STALE_REASON_CODE = "FULL_LIVE_SYNC_STALE"
 SYNC_SCOPE_GUARD_REASON_CODES = {
     "account": "ACCOUNT_STATE_STALE",
     "positions": "POSITION_STATE_STALE",
@@ -360,6 +363,7 @@ STALE_FIRST_REASON_PRIORITY = {
     "EXCHANGE_AUTH_PERMISSION_REJECTED": 4,
     "EXCHANGE_POSITION_SYNC_FAILED": 5,
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": 6,
+    "EXCHANGE_CAN_TRADE_UNKNOWN": 6,
     "TEMPORARY_SYNC_FAILURE": 7,
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE": 8,
     "LIVE_CREDENTIALS_MISSING": 9,
@@ -378,6 +382,7 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "TEMPORARY_SYNC_FAILURE": "계좌 상태 동기화가 일시 실패해 가드 모드입니다.",
     "EXCHANGE_POSITION_SYNC_FAILED": "거래소 포지션 동기화 실패로 가드 모드입니다.",
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": "거래소 주문 동기화 실패로 가드 모드입니다.",
+    "EXCHANGE_CAN_TRADE_UNKNOWN": "full_live 승인 상태지만 거래소 주문 권한 확인값이 unknown이라 신규 진입을 보류합니다.",
     "PROTECTION_REQUIRED": "무보호 포지션이 감지되어 보호 복구 우선 상태입니다.",
     "DEGRADED_MANAGE_ONLY": "보호 복구가 반복 실패해 관리 전용 상태로 가드 모드입니다.",
     "EMERGENCY_EXIT": "비상 청산 상태가 진행 중이라 가드 모드입니다.",
@@ -398,6 +403,7 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "POSITION_STATE_STALE": "거래소 포지션 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
+    "FULL_LIVE_SYNC_STALE": "full_live 실거래 승인 전 거래소 계좌, 포지션, 미체결 주문, 보호주문 동기화가 최신이어야 합니다.",
     "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": "listen key 재등록이 완료되지 않아 신규 진입을 차단하고 REST fallback으로 운용 중입니다.",
     "BINANCE_REST_CIRCUIT_OPEN": "Binance REST/API circuit is open, so new entries are blocked.",
     "BINANCE_REST_RECOVERING_SYNC_STALE": "Binance REST/API is recovering; account, position, open-order, and protection sync must be fresh before new entries resume.",
@@ -413,6 +419,7 @@ RISK_STATUS_ONLY_REASON_CODES = frozenset(
         "WEAK_VOLUME",
         "MOMENTUM_WEAKENING",
         "DETERMINISTIC_BASELINE_DISAGREEMENT",
+        "EXCHANGE_CAN_TRADE_UNKNOWN",
     }
 )
 
@@ -872,6 +879,19 @@ def _latest_symbol_decision(
     if session is None:
         return None
     symbol_key = symbol.upper()
+    fact_query = select(DecisionPerformanceFact.decision_run_id).where(
+        DecisionPerformanceFact.symbol == symbol_key
+    )
+    if timeframe:
+        fact_query = fact_query.where(DecisionPerformanceFact.timeframe == timeframe)
+    fact_decision_run_id = session.scalar(
+        fact_query.order_by(desc(DecisionPerformanceFact.created_at), desc(DecisionPerformanceFact.id)).limit(1)
+    )
+    if fact_decision_run_id is not None:
+        fact_decision = session.get(AgentRun, int(fact_decision_run_id))
+        if fact_decision is not None and fact_decision.role == "trading_decision":
+            return fact_decision
+
     statement = (
         select(AgentRun)
         .where(AgentRun.role == "trading_decision")
@@ -1679,19 +1699,20 @@ def get_or_create_settings(session: Session) -> Setting:
 
 def get_runtime_credentials(settings_row: Setting, defaults: AppConfig | None = None) -> RuntimeCredentials:
     app_defaults = defaults or get_settings()
-    openai_key = decrypt_secret(settings_row.openai_api_key_encrypted, app_defaults.app_secret_seed)
+    app_secret_seed = getattr(app_defaults, "app_secret_seed", "")
+    openai_key = decrypt_secret(settings_row.openai_api_key_encrypted, app_secret_seed)
     if not openai_key:
-        openai_key = app_defaults.openai_api_key
+        openai_key = getattr(app_defaults, "openai_api_key", "")
     event_source_api_key = decrypt_secret(
         settings_row.event_source_api_key_encrypted,
-        app_defaults.app_secret_seed,
+        app_secret_seed,
     )
     if not event_source_api_key:
         event_source_api_key = os.getenv("TRADING_EVENT_SOURCE_API_KEY", "").strip()
     return RuntimeCredentials(
         openai_api_key=openai_key,
-        binance_api_key=decrypt_secret(settings_row.binance_api_key_encrypted, app_defaults.app_secret_seed),
-        binance_api_secret=decrypt_secret(settings_row.binance_api_secret_encrypted, app_defaults.app_secret_seed),
+        binance_api_key=decrypt_secret(settings_row.binance_api_key_encrypted, app_secret_seed),
+        binance_api_secret=decrypt_secret(settings_row.binance_api_secret_encrypted, app_secret_seed),
         event_source_api_key=event_source_api_key,
     )
 
@@ -2561,19 +2582,24 @@ def _coerce_optional_bool(value: object) -> bool | None:
 
 def _exchange_can_trade_metadata(account_sync_detail: dict[str, object]) -> dict[str, object]:
     exchange_can_trade = _coerce_optional_bool(account_sync_detail.get("exchange_can_trade"))
-    exchange_can_trade_known = bool(account_sync_detail.get("exchange_can_trade_known")) and exchange_can_trade is not None
+    explicit_known = account_sync_detail.get("exchange_can_trade_known")
+    exchange_can_trade_known = (
+        bool(explicit_known) if explicit_known is not None else exchange_can_trade is not None
+    ) and exchange_can_trade is not None
     if not exchange_can_trade_known:
         return {
             "exchange_can_trade": None,
             "exchange_can_trade_known": False,
-            "exchange_can_trade_source": "unknown",
-            "exchange_can_trade_checked_at": None,
+            "exchange_can_trade_source": str(account_sync_detail.get("exchange_can_trade_source") or "unknown"),
+            "exchange_can_trade_checked_at": _parse_runtime_datetime(
+                account_sync_detail.get("exchange_can_trade_checked_at") or account_sync_detail.get("last_sync_at")
+            ),
         }
     return {
         "exchange_can_trade": exchange_can_trade,
         "exchange_can_trade_known": True,
         "exchange_can_trade_source": str(account_sync_detail.get("exchange_can_trade_source") or "account_sync"),
-        "exchange_can_trade_checked_at": _coerce_datetime(
+        "exchange_can_trade_checked_at": _parse_runtime_datetime(
             account_sync_detail.get("exchange_can_trade_checked_at") or account_sync_detail.get("last_sync_at")
         ),
     }
@@ -3065,6 +3091,15 @@ def _sync_blocks_new_entries(sync_freshness_summary: dict[str, object]) -> bool:
     return False
 
 
+def live_arm_blocking_reason_codes(settings_row: Setting) -> list[str]:
+    if get_rollout_mode(settings_row) != "full_live":
+        return []
+    sync_summary = build_sync_freshness_summary(settings_row)
+    if not _sync_blocks_new_entries(sync_summary):
+        return []
+    return _derive_sync_blocking_reasons(sync_summary)
+
+
 def _market_blocks_new_entries(market_freshness_summary: dict[str, object]) -> bool:
     return bool(market_freshness_summary.get("stale")) or bool(market_freshness_summary.get("incomplete"))
 
@@ -3082,6 +3117,9 @@ def _build_control_status_summary(
     reconciliation_summary: dict[str, object],
     drawdown_state_summary: dict[str, object],
     exchange_sync_diagnostics: dict[str, object] | None = None,
+    live_arm_disable_reason_code: str | None = None,
+    live_arm_disable_reason: str | None = None,
+    live_arm_blocked_reason_codes: list[str] | None = None,
 ) -> ControlStatusSummary:
     approval_window_open, approval_state, approval_detail = get_live_approval_status(settings_row)
     account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
@@ -3094,7 +3132,11 @@ def _build_control_status_summary(
     approval_control_blocked_reasons = _prioritize_blocked_reasons(
         _actionable_guard_reason_codes(list(current_cycle_blocked_reasons))
         + ([one_way_reason_code] if one_way_reason_code else [])
+        + ([live_arm_disable_reason_code] if live_arm_disable_reason_code else [])
+        + [str(item) for item in (live_arm_blocked_reason_codes or []) if item not in {None, ""}]
     )
+    resolved_live_arm_disable_reason_code = one_way_reason_code or live_arm_disable_reason_code
+    resolved_live_arm_disable_reason = one_way_reason_message or live_arm_disable_reason
     return ControlStatusSummary(
         exchange_can_trade=cast(bool | None, exchange_permission["exchange_can_trade"]),
         exchange_can_trade_known=bool(exchange_permission["exchange_can_trade_known"]),
@@ -3123,9 +3165,9 @@ def _build_control_status_summary(
         protection_reason_codes=_prioritize_blocked_reasons(protection_reason_codes),
         exchange_sync_diagnostics=dict(exchange_sync_diagnostics or {}),
         approval_control_blocked_reasons=approval_control_blocked_reasons,
-        live_arm_disabled=bool(one_way_reason_message),
-        live_arm_disable_reason_code=one_way_reason_code,
-        live_arm_disable_reason=one_way_reason_message,
+        live_arm_disabled=bool(resolved_live_arm_disable_reason),
+        live_arm_disable_reason_code=resolved_live_arm_disable_reason_code,
+        live_arm_disable_reason=resolved_live_arm_disable_reason,
         current_drawdown_state=str(drawdown_state_summary.get("current_drawdown_state") or "normal"),
         drawdown_state_entered_at=_parse_runtime_datetime(drawdown_state_summary.get("entered_at")),
         drawdown_transition_reason=str(drawdown_state_summary.get("transition_reason") or "") or None,
@@ -3177,6 +3219,18 @@ def build_operational_status_payload(
             current_detail=get_drawdown_state_detail(settings_row),
         )
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
+    rollout_mode = get_rollout_mode(settings_row)
+    full_live_arm_blockers = (
+        _derive_sync_blocking_reasons(sync_summary)
+        if rollout_mode == "full_live" and _sync_blocks_new_entries(sync_summary)
+        else []
+    )
+    full_live_arm_disable_reason_code = FULL_LIVE_SYNC_STALE_REASON_CODE if full_live_arm_blockers else None
+    full_live_arm_disable_reason = (
+        _guard_message_for_code(FULL_LIVE_SYNC_STALE_REASON_CODE)
+        if full_live_arm_disable_reason_code
+        else None
+    )
     exchange_sync_diagnostics = _build_exchange_sync_diagnostics(current_session, sync_summary)
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     if current_cycle_blocked_reasons:
@@ -3277,6 +3331,29 @@ def build_operational_status_payload(
         }
     )
     operating_state = operating_state_override or str(runtime.get("operating_state", "TRADABLE"))
+    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
+    exchange_permission = _exchange_can_trade_metadata(get_sync_state_detail(settings_row).get("account", {}))
+    exchange_can_trade = cast(bool | None, exchange_permission["exchange_can_trade"])
+    exchange_can_trade_known = bool(exchange_permission["exchange_can_trade_known"])
+    exchange_permission_unknown_blocks_entry = (
+        rollout_mode == "full_live"
+        and is_live_execution_armed(settings_row)
+        and not exchange_can_trade_known
+    )
+    exchange_permission_unknown_reasons = (
+        ["EXCHANGE_CAN_TRADE_UNKNOWN"] if exchange_permission_unknown_blocks_entry else []
+    )
+    if exchange_permission_unknown_reasons:
+        risk_allowed = False
+        current_cycle_blocked_reasons = _prioritize_blocked_reasons(
+            exchange_permission_unknown_reasons + current_cycle_blocked_reasons
+        )
+        recent_blocked_reasons = _prioritize_blocked_reasons(
+            exchange_permission_unknown_reasons + recent_blocked_reasons
+        )
+        current_blocked_reasons = _prioritize_blocked_reasons(
+            exchange_permission_unknown_reasons + current_blocked_reasons
+        )
     guard_runtime = {**runtime, "operating_state": operating_state}
     guard_mode_reason = derive_guard_mode_reason(
         settings_row,
@@ -3287,8 +3364,6 @@ def build_operational_status_payload(
         sync_freshness_summary=sync_summary,
         market_freshness_summary=market_summary,
     )
-    rollout_mode = get_rollout_mode(settings_row)
-    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
     can_enter_new_position = (
         exchange_submit_allowed
         and
@@ -3300,6 +3375,7 @@ def build_operational_status_payload(
         and not _user_stream_blocks_new_entries(user_stream_summary)
         and not _binance_rest_blocks_new_entries(binance_rest_summary)
         and not _reconciliation_blocks_new_entries(reconciliation_summary)
+        and not exchange_permission_unknown_blocks_entry
     )
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
     one_way_reason_code, one_way_reason_message = _one_way_requirement_reason_payload(reconciliation_summary)
@@ -3320,8 +3396,6 @@ def build_operational_status_payload(
         missing_protection_symbols=missing_protection_symbols,
         missing_protection_items=missing_protection_items,
     )
-    exchange_permission = _exchange_can_trade_metadata(get_sync_state_detail(settings_row).get("account", {}))
-    exchange_can_trade = cast(bool | None, exchange_permission["exchange_can_trade"])
     exchange_connectivity_state = resolve_exchange_connectivity_state(
         exchange_can_trade,
         reason_codes=reason_code_basis,
@@ -3340,6 +3414,9 @@ def build_operational_status_payload(
         reconciliation_summary=reconciliation_summary,
         drawdown_state_summary=drawdown_state_summary,
         exchange_sync_diagnostics=exchange_sync_diagnostics,
+        live_arm_disable_reason_code=full_live_arm_disable_reason_code,
+        live_arm_disable_reason=full_live_arm_disable_reason,
+        live_arm_blocked_reason_codes=full_live_arm_blockers,
     )
     operator_alert: dict[str, object] = {}
     if one_way_reason_message:
@@ -3352,6 +3429,7 @@ def build_operational_status_payload(
             "position_mode_checked_at": reconciliation_summary.get("position_mode_checked_at"),
             "guarded_symbols_count": int(reconciliation_summary.get("guarded_symbols_count") or 0),
         }
+    public_user_stream_summary = public_user_stream_detail(user_stream_summary)
     return OperationalStatusPayload(
         live_trading_enabled=settings_row.live_trading_enabled,
         rollout_mode=rollout_mode,
@@ -3398,7 +3476,7 @@ def build_operational_status_payload(
         drawdown_transition_reason=str(drawdown_state_summary.get("transition_reason") or "") or None,
         drawdown_policy_adjustments=dict(drawdown_state_summary.get("policy_adjustments") or {}),
         control_status_summary=control_status_summary,
-        user_stream_summary=user_stream_summary,
+        user_stream_summary=public_user_stream_summary,
         reconciliation_summary=reconciliation_summary,
         candidate_selection_summary=dict(runtime.get("candidate_selection_summary") or {}),
         operator_alert=operator_alert,
@@ -4020,7 +4098,12 @@ def serialize_settings_ai_usage(settings_row: Setting) -> dict[str, object]:
     return payload.model_dump(mode="json")
 
 
-def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, object]:
+def serialize_settings_runtime_summary(
+    settings_row: Setting,
+    *,
+    include_operational_status: bool = True,
+    include_event_operator_control: bool = True,
+) -> dict[str, object]:
     defaults = get_settings()
     current_session = object_session(settings_row)
 
@@ -4089,7 +4172,10 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
             raw_codes = payload.get("rationale_codes", [])
             if isinstance(raw_codes, list):
                 latest_decision_rationale_codes = [str(item) for item in raw_codes if item not in {None, ""}]
-    current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
+    current_risk_allowed: bool | None = None
+    current_cycle_blocked_reasons: list[str] = []
+    if include_operational_status:
+        current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
     adaptive_signal_summary = summarize_adaptive_signal_state(
         adaptive_signal_context,
         latest_rationale_codes=latest_decision_rationale_codes,
@@ -4105,40 +4191,51 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)
-    event_operator_control = build_event_operator_control_payload(
-        session=current_session,
-        settings_row=settings_row,
-        symbol=settings_row.default_symbol.upper(),
-        timeframe=settings_row.default_timeframe,
+    event_operator_control = (
+        build_event_operator_control_payload(
+            session=current_session,
+            settings_row=settings_row,
+            symbol=settings_row.default_symbol.upper(),
+            timeframe=settings_row.default_timeframe,
+        )
+        if include_event_operator_control
+        else None
     )
-    operational_status = build_operational_status_payload(
-        settings_row,
-        session=current_session,
-        defaults=defaults,
-        runtime_state=runtime_state,
-        blocked_reasons=current_cycle_blocked_reasons,
-        latest_blocked_reasons=current_cycle_blocked_reasons,
-        risk_allowed=current_risk_allowed,
-        account_sync_summary=account_sync_summary,
-        sync_freshness_summary=sync_freshness_summary,
-        market_freshness_summary=market_freshness_summary,
+    operational_status = (
+        build_operational_status_payload(
+            settings_row,
+            session=current_session,
+            defaults=defaults,
+            runtime_state=runtime_state,
+            blocked_reasons=current_cycle_blocked_reasons,
+            latest_blocked_reasons=current_cycle_blocked_reasons,
+            risk_allowed=current_risk_allowed,
+            account_sync_summary=account_sync_summary,
+            sync_freshness_summary=sync_freshness_summary,
+            market_freshness_summary=market_freshness_summary,
+        )
+        if include_operational_status
+        else None
     )
-    return {
+    payload: dict[str, object] = {
         "mode": mode,
         "pnl_summary": pnl_summary,
         "account_sync_summary": account_sync_summary,
         "sync_freshness_summary": sync_freshness_summary,
         "market_freshness_summary": market_freshness_summary,
-        "binance_rest_summary": operational_status.reconciliation_summary.get("rest_connectivity", {}),
         "exposure_summary": exposure_summary,
         "execution_policy_summary": execution_policy_summary,
         "market_context_summary": market_context_summary,
         "adaptive_protection_summary": adaptive_protection_summary,
         "adaptive_signal_summary": adaptive_signal_summary,
         "position_management_summary": position_management_summary,
-        "event_operator_control": event_operator_control.model_dump(mode="json"),
-        "operational_status": operational_status.model_dump(mode="json"),
     }
+    if operational_status is not None:
+        payload["binance_rest_summary"] = operational_status.reconciliation_summary.get("rest_connectivity", {})
+        payload["operational_status"] = operational_status.model_dump(mode="json")
+    if event_operator_control is not None:
+        payload["event_operator_control"] = event_operator_control.model_dump(mode="json")
+    return payload
 
 
 def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Setting:

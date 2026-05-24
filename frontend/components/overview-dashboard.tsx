@@ -19,7 +19,7 @@ import {
   lookupRiskReasonCode,
 } from "../lib/risk-reason-copy.js";
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const apiBaseUrl = "";
 const refreshIntervalMs = 60000;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
 
@@ -52,6 +52,7 @@ type PerformanceWindow = {
   };
   cost_breakdown?: ProfitabilityCostBreakdown;
   entry_quality?: Record<string, EntryQualityBreakdown>;
+  limited_live_readiness?: LimitedLiveReadiness;
   rationale_winners: PerformanceEntry[];
   rationale_losers: PerformanceEntry[];
   top_regimes: PerformanceEntry[];
@@ -99,6 +100,30 @@ export type ProfitabilityCostBreakdown = {
   basis: string;
 };
 
+export type LimitedLiveReadiness = {
+  window_label: string;
+  window_hours: number;
+  status: string;
+  reason_codes: string[];
+  read_only: boolean;
+  recent_candidate_events: number;
+  ai_calls_total: number;
+  ai_calls_provider_invoked: number;
+  ai_calls_skipped_preai: number;
+  actual_entries: number;
+  fills: number;
+  expectancy_after_fees: number;
+  net_pnl_after_fees: number;
+  max_drawdown: number;
+  consecutive_losses: number;
+  protection_failure_count: number;
+  unknown_submission_count: number;
+  stale_incomplete_data_block_count: number;
+  ai_filter_observed_value_net_pnl_after_fees: number | null;
+  thresholds: Record<string, number>;
+  basis: string;
+};
+
 type ExecutionWindow = {
   window: string;
   execution_quality_summary: Record<string, number>;
@@ -137,6 +162,10 @@ export type ExchangeSyncDiagnostics = {
 };
 
 type ControlStatusSummary = {
+  exchange_can_trade?: boolean | null;
+  exchange_can_trade_known?: boolean;
+  exchange_can_trade_source?: string;
+  exchange_can_trade_checked_at?: string | null;
   exchange_connectivity_state: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;
@@ -155,7 +184,11 @@ type ControlStatusSummary = {
   block_scope?: string;
   candidate_hold_reason_codes?: string[];
   global_block_reason_codes?: string[];
+  approval_control_blocked_reasons?: string[];
   exchange_sync_diagnostics?: ExchangeSyncDiagnostics | null;
+  live_arm_disabled?: boolean;
+  live_arm_disable_reason_code?: string | null;
+  live_arm_disable_reason?: string | null;
 };
 
 type PsychologySceneReview = {
@@ -467,13 +500,16 @@ export type OperatorDashboardPayload = {
     cumulative_pnl: number;
     account_sync_summary: Record<string, unknown>;
     exposure_summary: Record<string, unknown>;
+    limited_live_readiness: LimitedLiveReadiness;
     service_gate_blockers: string[];
     stale_pending_entry_plan_count: number;
     stale_pending_entry_plans: Array<Record<string, unknown>>;
     triggered_terminal_history_entry_plan_count: number;
     scheduler_status: string | null;
     scheduler_window: string | null;
+    scheduler_last_run_at: string | null;
     scheduler_next_run_at: string | null;
+    scheduler_freshness_summary: Record<string, unknown>;
     deterministic_market_profile: string | null;
     ai_recommended_profile: string | null;
     ai_recommendation_id: string | null;
@@ -547,6 +583,7 @@ const reasonCodeLabelMap: Record<string, string> = {
   POSITION_STATE_STALE: "포지션 정보가 늦게 들어오고 있습니다.",
   OPEN_ORDERS_STATE_STALE: "열린 주문 정보가 늦게 들어오고 있습니다.",
   PROTECTION_STATE_UNVERIFIED: "보호 주문 검증 불가",
+  FULL_LIVE_SYNC_STALE: "full_live 승인 전 거래소 동기화 필요",
 };
 
 const syncScopeLabelMap: Record<string, string> = {
@@ -1287,6 +1324,10 @@ function rolloutModeLabel(mode: RolloutMode) {
 function resolveControlStatusSummary(control: OperatorDashboardPayload["control"]): ControlStatusSummary {
   const summary = control.control_status_summary;
   return {
+    exchange_can_trade: summary?.exchange_can_trade ?? null,
+    exchange_can_trade_known: summary?.exchange_can_trade_known ?? false,
+    exchange_can_trade_source: summary?.exchange_can_trade_source ?? "unknown",
+    exchange_can_trade_checked_at: summary?.exchange_can_trade_checked_at ?? null,
     exchange_connectivity_state:
       summary?.exchange_connectivity_state ?? control.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? control.rollout_mode,
@@ -1307,8 +1348,12 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
     protection_reason_codes: dedupeReasons(
       summary?.protection_reason_codes ?? control.protection_reason_codes ?? [],
     ),
+    approval_control_blocked_reasons: dedupeReasons(summary?.approval_control_blocked_reasons ?? []),
     exchange_sync_diagnostics:
       summary?.exchange_sync_diagnostics ?? control.exchange_sync_diagnostics ?? {},
+    live_arm_disabled: summary?.live_arm_disabled ?? false,
+    live_arm_disable_reason_code: summary?.live_arm_disable_reason_code ?? null,
+    live_arm_disable_reason: summary?.live_arm_disable_reason ?? null,
   };
 }
 
@@ -1472,8 +1517,24 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
   ];
 }
 
-async function fetchPayload(): Promise<OperatorDashboardPayload> {
-  const response = await fetch(`${apiBaseUrl}/api/dashboard/operator`, { cache: "no-store" });
+function operatorDashboardRefreshPath(pathname: string | null) {
+  if (pathname?.includes("/dashboard/market")) {
+    return "/api/dashboard/operator?view=market";
+  }
+  if (pathname?.includes("/dashboard/decisions")) {
+    return "/api/dashboard/operator?view=decision";
+  }
+  if (pathname?.includes("/dashboard/scheduler")) {
+    return "/api/dashboard/operator?view=scheduler";
+  }
+  if (pathname?.includes("/dashboard/risk")) {
+    return "/api/dashboard/operator?view=risk";
+  }
+  return "/api/dashboard/operator?view=home";
+}
+
+async function fetchPayload(pathname: string | null): Promise<OperatorDashboardPayload> {
+  const response = await fetch(`${apiBaseUrl}${operatorDashboardRefreshPath(pathname)}`, { cache: "no-store" });
   if (!response.ok) {
     const body = await response.text();
     throw new Error(body || response.statusText);
@@ -1783,6 +1844,14 @@ function GlobalOperatorSummary({
               control.scheduler_window || control.scheduler_status
                 ? `${control.scheduler_window ?? "-"} / ${translateSchedulerStatus(control.scheduler_status)}`
                 : "-",
+            ],
+            [
+              "자동 점검 최신성",
+              recordString(control.scheduler_freshness_summary, "status") === "stale"
+                ? `지연: ${recordString(control.scheduler_freshness_summary, "message") || "-"}`
+                : recordString(control.scheduler_freshness_summary, "status") === "fresh"
+                  ? "최근 실행 확인"
+                  : "기록 없음",
             ],
             ["다음 자동 점검 예정", formatDateTime(control.scheduler_next_run_at)],
             [
@@ -2710,7 +2779,7 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
         return;
       }
       try {
-        const next = await fetchPayload();
+        const next = await fetchPayload(pathname);
         if (!active) {
           return;
         }
@@ -2725,6 +2794,7 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
       }
     };
     const interval = window.setInterval(() => void refresh(), refreshIntervalMs);
+    void refresh();
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         void refresh();
@@ -2736,7 +2806,7 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, []);
+  }, [pathname]);
 
   const operator = payload;
   const selectedSymbol = useMemo(

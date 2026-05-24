@@ -5,18 +5,7 @@ function Use-ProjectNodeRuntime {
         [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
     )
 
-    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
-    if ($nodeCommand) {
-        $commandRoot = Split-Path -Parent $nodeCommand.Source
-        return @{
-            Source = "PATH"
-            NodeExe = $nodeCommand.Source
-            NpmCmd = (Join-Path $commandRoot "npm.cmd")
-            CorepackCmd = (Join-Path $commandRoot "corepack.cmd")
-        }
-    }
-
-    $version = "v24.14.1"
+    $version = "v22.21.1"
     $packageName = "node-$version-win-x64"
     $toolsDir = Join-Path $RepoRoot ".tools"
     $installDir = Join-Path $toolsDir $packageName

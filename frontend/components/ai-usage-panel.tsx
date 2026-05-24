@@ -1,5 +1,7 @@
 ﻿"use client";
 
+import { aiSkipReasonTitle, describeAiSkipReason, describeReasonCode } from "../lib/risk-reason-copy.js";
+
 export type AIUsagePayload = {
   recent_ai_calls_today_kst: number;
   recent_ai_calls_24h: number;
@@ -70,6 +72,15 @@ type AICostEfficiencySummary = {
       message?: string;
       evidence?: Record<string, unknown>;
     }>;
+    runtime_guard?: {
+      status?: string;
+      reason?: string | null;
+      provider_calls_7d?: number | null;
+      provider_to_order_rate_7d?: number | null;
+      net_after_known_ai_cost_usd_7d?: number | null;
+      backoff_minutes?: number | null;
+      fallback?: string | null;
+    };
   };
   focus_metrics?: Record<
     string,
@@ -184,6 +195,26 @@ const roleLabels: Record<string, string> = {
   chief_review: "운영 검토",
 };
 
+function formatKnownReasonLabel(reason: string) {
+  const aiSkipCopy = describeAiSkipReason(reason);
+  if (aiSkipCopy.known) {
+    return aiSkipCopy.title_ko;
+  }
+  const riskCopy = describeReasonCode(reason);
+  if (riskCopy.known) {
+    return riskCopy.title_ko;
+  }
+  return reason;
+}
+
+function formatReasonBucketLabel(reason: string) {
+  const label = formatKnownReasonLabel(reason);
+  if (label !== reason) {
+    return label;
+  }
+  return "내부 조건 확인 필요";
+}
+
 function formatNumber(value: number) {
   return value.toLocaleString("ko-KR");
 }
@@ -273,10 +304,12 @@ function ReasonBucketCard({
   title,
   buckets,
   emptyText,
+  labelReason = formatReasonBucketLabel,
 }: {
   title: string;
   buckets: Record<string, number> | undefined;
   emptyText: string;
+  labelReason?: (reason: string) => string;
 }) {
   const items = topEntries(buckets);
   return (
@@ -291,7 +324,7 @@ function ReasonBucketCard({
               key={reason}
               className="rounded-md border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
             >
-              {reason} {formatNumber(count)}
+              {labelReason(reason)} {formatNumber(count)}
             </span>
           ))}
         </div>
@@ -429,6 +462,10 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
   const actionability7d = summary7d?.actionability ?? {};
   const actionability30d = summary30d?.actionability ?? {};
   const efficiency = usage.ai_cost_efficiency_summary;
+  const runtimeGuard = efficiency?.waste_assessment?.runtime_guard;
+  const runtimeGuardActive = runtimeGuard?.status === "active";
+  const runtimeGuardMissingForWaste =
+    efficiency?.waste_assessment?.status === "needs_review" && !runtimeGuardActive;
   const roleEfficiency7d = summary7d?.role_efficiency;
   const reasonBuckets7d = summary7d?.reason_buckets ?? {};
 
@@ -445,7 +482,34 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
         </div>
       </div>
 
-      {efficiency?.waste_assessment?.status === "needs_review" || actionability7d.warning_status ? (
+      {runtimeGuardActive ? (
+        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-4">
+          <p className="text-sm font-semibold text-red-900">신규 진입 AI 비용 게이트 활성</p>
+          <p className="mt-2 text-sm leading-6 text-red-800">
+            비수동 신규 진입 AI 호출은 {aiSkipReasonTitle(runtimeGuard?.reason ?? "low_actionability_cost_guard_active")} 상태로
+            차단 중입니다. 기존 포지션 보호, 축소, 청산 경로는 이 게이트의 신규 진입 차단과 분리됩니다.
+          </p>
+          <p className="mt-2 text-xs leading-5 text-red-700">
+            7일 provider {formatNumber(runtimeGuard?.provider_calls_7d ?? actionability7d.provider_calls ?? 0)}회 /
+            주문 전환 {formatPercent(runtimeGuard?.provider_to_order_rate_7d)} / AI 비용 반영 순효과{" "}
+            {formatUsd(runtimeGuard?.net_after_known_ai_cost_usd_7d)} / 재시도 제한{" "}
+            {formatNumber(runtimeGuard?.backoff_minutes ?? 0)}분
+          </p>
+        </div>
+      ) : runtimeGuardMissingForWaste ? (
+        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-4">
+          <p className="text-sm font-semibold text-red-900">신규 진입 AI 비용 게이트 미확인</p>
+          <p className="mt-2 text-sm leading-6 text-red-800">
+            비용 낭비 신호가 있지만 런타임 payload에서 비수동 신규 진입 AI 차단 게이트가 활성 상태로 확인되지
+            않았습니다. 이 상태는 제품화 차단이며, 신규 진입 AI 호출을 안전하게 막는지 런타임으로 증명해야 합니다.
+          </p>
+          <p className="mt-2 text-xs leading-5 text-red-700">
+            provider 호출 {formatNumber(actionability7d.provider_calls ?? 0)}회 / 주문 전환{" "}
+            {formatPercent(actionability7d.provider_to_order_rate)} / AI 비용 반영 순효과{" "}
+            {formatUsd(roi7d.net_after_known_ai_cost_usd)}
+          </p>
+        </div>
+      ) : actionability7d.warning_status ? (
         <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-4">
           <p className="text-sm font-semibold text-amber-900">
             {actionability7d.warning_title ?? "AI 비용 효율 확인 필요"}
@@ -609,7 +673,7 @@ export function AIUsagePanel({ usage }: { usage: AIUsagePayload | null }) {
                   key={reason}
                   className="rounded-md border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-slate-700"
                 >
-                  {reason}
+                  {formatKnownReasonLabel(reason)}
                 </span>
               ))}
             </div>

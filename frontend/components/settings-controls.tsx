@@ -56,9 +56,10 @@ import {
 } from "../lib/page-config";
 import { filterNonEntryWaitReasonCodesInContext } from "../lib/risk-reason-copy.js";
 import { buildSettingsEventPreviewSummary } from "../lib/settings-event-preview.js";
+import { handleOperatorApiAuthFailure, withOperatorWriteProtection } from "../lib/api";
 import { formatDisplayValue } from "../lib/ui-copy";
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const apiBaseUrl = "";
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
 type FeedbackKey =
   | "control_save"
@@ -428,6 +429,10 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     ? "one-way required for current local position model"
     : null;
   return {
+    exchange_can_trade: summary?.exchange_can_trade ?? null,
+    exchange_can_trade_known: summary?.exchange_can_trade_known ?? false,
+    exchange_can_trade_source: summary?.exchange_can_trade_source ?? "unknown",
+    exchange_can_trade_checked_at: summary?.exchange_can_trade_checked_at ?? null,
     exchange_connectivity_state: summary?.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? state.rollout_mode,
     exchange_submit_allowed: summary?.exchange_submit_allowed ?? state.exchange_submit_allowed,
@@ -548,10 +553,15 @@ export function SettingsControls({
   const aiSummaryTodayKst = aiUsage?.ai_usage_summary_today_kst;
 
   const requestJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-    const response = await fetch(`${apiBaseUrl}${path}`, init);
+    const method = String(init?.method ?? "GET").toUpperCase();
+    const writeInit = method === "GET" || method === "HEAD" ? init : await withOperatorWriteProtection(path, init);
+    const response = await fetch(`${apiBaseUrl}${path}`, writeInit);
     const contentType = response.headers.get("content-type") ?? "";
     const body = contentType.includes("application/json") ? await response.json() : await response.text();
     if (!response.ok) {
+      if (handleOperatorApiAuthFailure(response)) {
+        throw new ApiRequestError("운영자 세션이 만료되어 로그인 화면으로 이동합니다.", body);
+      }
       const message = typeof body === "string" ? body : JSON.stringify(body);
       throw new ApiRequestError(message || "요청 처리에 실패했습니다.", body);
     }

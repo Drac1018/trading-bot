@@ -125,6 +125,10 @@ def _is_invalid_listen_key_error(exc: Exception) -> bool:
     return "listenkey does not exist" in str(exc).lower()
 
 
+def _listen_key_presence_payload(listen_key: str | None) -> dict[str, bool]:
+    return {"listen_key_present": bool(str(listen_key or "").strip())}
+
+
 def normalize_user_stream_event(
     payload: Mapping[str, Any],
     *,
@@ -265,7 +269,10 @@ class BinanceUserStreamListener:
                         "severity": "warning",
                         "reason_code": "USER_STREAM_INVALID_LISTEN_KEY_CLOSE_FAILED",
                         "message": "Failed to close invalid Binance futures listen key.",
-                        "payload": {"error": str(close_exc), "listen_key": previous_listen_key},
+                        "payload": {
+                            "error": str(close_exc),
+                            **_listen_key_presence_payload(previous_listen_key),
+                        },
                     }
                 )
 
@@ -394,7 +401,7 @@ class BinanceUserStreamListener:
                     "message": "Failed to create or keep alive the Binance futures listen key.",
                     "payload": {
                         "error": str(exc),
-                        "listen_key": listen_key,
+                        **_listen_key_presence_payload(listen_key),
                         "reconnect_count": reconnect_count,
                         "next_retry_at": current["next_retry_at"],
                     },
@@ -434,7 +441,10 @@ class BinanceUserStreamListener:
                         "severity": "warning",
                         "reason_code": "USER_STREAM_EXPIRED_LISTEN_KEY_CLOSE_FAILED",
                         "message": "Failed to close expired Binance futures listen key.",
-                        "payload": {"error": str(exc), "listen_key": previous_listen_key},
+                        "payload": {
+                            "error": str(exc),
+                            **_listen_key_presence_payload(previous_listen_key),
+                        },
                     }
                 )
 
@@ -512,7 +522,10 @@ class BinanceUserStreamListener:
                     "severity": "warning",
                     "reason_code": "USER_STREAM_CLOSE_FAILED",
                     "message": "Failed to close the Binance futures listen key.",
-                    "payload": {"error": str(exc), "listen_key": listen_key},
+                    "payload": {
+                        "error": str(exc),
+                        **_listen_key_presence_payload(listen_key),
+                    },
                 }
             )
         return current, issues
@@ -592,7 +605,7 @@ class BinanceUserStreamListener:
                     "message": "Binance futures user stream connection dropped.",
                     "payload": {
                         "error": str(exc),
-                        "listen_key": listen_key,
+                        **_listen_key_presence_payload(listen_key),
                         "reconnect_count": reconnect_count,
                         "next_retry_at": current["next_retry_at"],
                     },

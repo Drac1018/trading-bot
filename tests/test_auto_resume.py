@@ -409,7 +409,11 @@ def test_interval_cycle_persists_failed_scheduler_run_after_operational_error(db
     assert scheduler_run.outcome["scheduler_failure_persisted"] is True
 
 
-def test_manual_cycle_api_attempts_auto_resume_before_running(testclient_db_factory, monkeypatch) -> None:
+def test_manual_cycle_api_attempts_auto_resume_before_running(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("auto_resume_cycle.db")
 
     call_state = {"count": 0}
@@ -435,7 +439,10 @@ def test_manual_cycle_api_attempts_auto_resume_before_running(testclient_db_fact
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/cycles/run")
+        response = client.post(
+            "/api/cycles/run",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "cycle.run"},
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["auto_resume"]["status"] == "resumed"
@@ -530,7 +537,11 @@ def test_auto_resume_reports_symbol_detail_for_market_data_failure(db_session, m
     )
 
 
-def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, monkeypatch) -> None:
+def test_live_sync_runs_auto_resume_precheck_before_sync(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("live_sync_precheck.db")
 
     call_order: list[str] = []
@@ -600,7 +611,10 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, 
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/live/sync")
+        response = client.post(
+            "/api/live/sync",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "live.sync"},
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["auto_resume_precheck"]["trigger_source"] == "api_live_sync_precheck"
@@ -611,7 +625,11 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, 
         assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
 
 
-def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypatch) -> None:
+def test_live_sync_verify_only_skips_auto_resume(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("live_sync_verify_only.db")
 
     call_order: list[str] = []
@@ -654,7 +672,10 @@ def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypa
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/live/sync?allow_protection_recovery=false")
+        response = client.post(
+            "/api/live/sync?allow_protection_recovery=false",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "live.sync"},
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["allow_protection_recovery"] is False
@@ -664,7 +685,11 @@ def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypa
         assert call_order == ["sync:False"]
 
 
-def test_live_sync_failure_still_returns_precheck_result(testclient_db_factory, monkeypatch) -> None:
+def test_live_sync_failure_still_returns_precheck_result(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("live_sync_failure.db")
 
     def fake_attempt(db, settings_row, trigger_source="system"):
@@ -708,7 +733,10 @@ def test_live_sync_failure_still_returns_precheck_result(testclient_db_factory, 
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/live/sync")
+        response = client.post(
+            "/api/live/sync",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "live.sync"},
+        )
         assert response.status_code == 400
         detail = response.json()["detail"]
         assert detail["auto_resume_precheck"]["symbol_blockers"]["BTCUSDT"] == ["MISSING_PROTECTIVE_ORDERS"]

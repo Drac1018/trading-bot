@@ -9,6 +9,8 @@ __pycache__/
 htmlcov/
 .next/
 node_modules/
+.pnpm-store/
+.services/TradingMvpHttpsProxy.exe
 dist/
 build/
 data/

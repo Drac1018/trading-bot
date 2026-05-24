@@ -199,7 +199,7 @@ if (-not $CheckOnly) {
         $frontendPid = Get-ListeningProcessId -Port $FrontendPort
         if ($null -eq $frontendPid) {
             Start-ServiceWindow -Name "frontend" `
-                -ScriptPath (Join-Path $repoRoot "scripts\\run_frontend.ps1")
+                -ScriptPath (Join-Path $repoRoot "scripts\\run_frontend_service.ps1")
         }
         else {
             Write-Host "frontend 이미 실행 중 (PID $frontendPid)" -ForegroundColor DarkYellow

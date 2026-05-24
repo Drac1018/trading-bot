@@ -222,6 +222,7 @@ ACTIVE_POSITION_ENTRY_SUPPRESSION_REASON_CODES = frozenset(
 ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS = {
     "CHASE_LIMIT_EXCEEDED",
     "ENTRY_TRIGGER_NOT_MET",
+    "EXCHANGE_CAN_TRADE_UNKNOWN",
     "SLIPPAGE_THRESHOLD_EXCEEDED",
 }
 ENTRY_PLAN_WATCH_STORAGE_BLOCKERS = {
@@ -1239,6 +1240,8 @@ class TradingOrchestrator:
     @staticmethod
     def _market_settings_advisor_trading_context(
         advisor_result: dict[str, object] | None,
+        *,
+        include_shadow_policy: bool = False,
     ) -> dict[str, object]:
         if not isinstance(advisor_result, dict) or not advisor_result:
             return {}
@@ -1275,7 +1278,7 @@ class TradingOrchestrator:
                 "reason_codes": list(recommendation.get("reason_codes") or []),
                 "valid_until": recommendation.get("valid_until"),
             }
-            if not shadow:
+            if include_shadow_policy or not shadow:
                 context["recommendation"]["suggested_new_entry_policy"] = recommendation.get(
                     "suggested_new_entry_policy"
                 )
@@ -1309,6 +1312,23 @@ class TradingOrchestrator:
             "execution_risk_profile_advisor": advisor_context,
             "execution_constraints_summary": execution_constraints,
         }, advisor_context
+
+    @staticmethod
+    def _risk_context_with_advisor_prompt_context(
+        risk_context: dict[str, object],
+        advisor_context: dict[str, object],
+    ) -> dict[str, object]:
+        status = str(advisor_context.get("status") or "").strip().lower()
+        if status in {"skipped", "ignored"} or not _as_dict(advisor_context.get("recommendation")):
+            return risk_context
+        execution_constraints = dict(risk_context.get("execution_constraints_summary") or {})
+        execution_constraints["execution_risk_profile_advisor"] = advisor_context
+        return {
+            **risk_context,
+            "market_settings_advisor": advisor_context,
+            "execution_risk_profile_advisor": advisor_context,
+            "execution_constraints_summary": execution_constraints,
+        }
 
     @staticmethod
     def _advisor_datetime_as_utc(value: object) -> datetime | None:
@@ -4691,22 +4711,38 @@ class TradingOrchestrator:
         cls,
         operational_status,
     ) -> tuple[bool, list[str]]:
-        reason_codes = cls._unique_reason_codes(
+        raw_reason_codes = cls._unique_reason_codes(
             [
                 *list(getattr(operational_status, "blocked_reasons", []) or []),
                 *list(getattr(operational_status, "blocked_reason_codes", []) or []),
             ]
         )
+        reason_codes = list(raw_reason_codes)
         reason_codes = [
             code
             for code in reason_codes
             if code not in ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
         ]
         guard_reason_code = str(getattr(operational_status, "guard_mode_reason_code", "") or "").strip()
-        if guard_reason_code and guard_reason_code not in ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES:
+        if (
+            guard_reason_code
+            and guard_reason_code not in ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES
+            and guard_reason_code not in ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
+        ):
             reason_codes = cls._unique_reason_codes([*reason_codes, guard_reason_code])
         if bool(getattr(operational_status, "can_enter_new_position", False)):
             return False, reason_codes
+
+        exchange_unknown_only = (
+            "EXCHANGE_CAN_TRADE_UNKNOWN" in raw_reason_codes
+            and not reason_codes
+            and bool(getattr(operational_status, "live_execution_ready", False))
+            and not bool(getattr(operational_status, "trading_paused", False))
+            and str(getattr(operational_status, "operating_state", "") or "") == "TRADABLE"
+            and bool(getattr(operational_status, "exchange_submit_allowed", False))
+        )
+        if exchange_unknown_only:
+            return False, []
 
         rollout_mode = str(getattr(operational_status, "rollout_mode", "") or "")
         simulation_without_submit = (
@@ -5353,6 +5389,7 @@ class TradingOrchestrator:
             symbol=plan.symbol,
             cooldown_minutes_override=0,
             manual_guard_minutes_override=0,
+            enforce_waste_guard=True,
         )
         gate_payload = openai_gate.as_metadata()
         if not openai_gate.allowed:
@@ -10684,7 +10721,11 @@ class TradingOrchestrator:
             skip_category = "cadence_policy"
         elif not bool(getattr(openai_gate, "allowed", False)):
             reason = str(getattr(openai_gate, "reason", "") or "openai_gate_blocked").upper()
-            skip_category = "budget_cooldown_dedup"
+            if reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE" and scope == "new_entry":
+                hard_skip_ai = True
+                skip_category = "cost_governance"
+            else:
+                skip_category = "budget_cooldown_dedup"
 
         if reason is not None:
             hard_skip_reason_codes.append(reason)
@@ -11716,6 +11757,7 @@ class TradingOrchestrator:
                 2,
                 min(int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]), 5),
             ),
+            enforce_waste_guard=not bool(open_positions),
         )
         recent_tp_direction = (
             self._recent_tp_direction_from_selection_context(effective_selection_context)
@@ -11787,6 +11829,12 @@ class TradingOrchestrator:
                     market_settings_advisor_result,
                 )
             )
+            ai_market_settings_advisor_context = market_settings_advisor_context
+            if bool(market_settings_advisor_context.get("shadow", False)):
+                ai_market_settings_advisor_context = self._market_settings_advisor_trading_context(
+                    market_settings_advisor_result,
+                    include_shadow_policy=True,
+                )
             ai_risk_context = self._risk_context_with_recent_tp_close_summary(
                 risk_context,
                 symbol=symbol,
@@ -11794,6 +11842,12 @@ class TradingOrchestrator:
                 generated_at=utcnow_naive(),
                 lookback_minutes=recent_tp_lookback_minutes,
             )
+            if ai_market_settings_advisor_context:
+                ai_risk_context = self._risk_context_with_advisor_prompt_context(
+                    ai_risk_context,
+                    ai_market_settings_advisor_context,
+                )
+                market_settings_advisor_context = ai_market_settings_advisor_context
             ai_context = build_ai_decision_context(
                 market_snapshot=market_snapshot,
                 features=feature_payload,

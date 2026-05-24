@@ -87,6 +87,7 @@ DEGRADED_REASON_CODES = {
     "BINANCE_REST_MUTATING_ORDER_FAILED",
     "BINANCE_REST_AUTH_PERMISSION_REJECTED",
     "EXCHANGE_AUTH_PERMISSION_REJECTED",
+    "EXCHANGE_CAN_TRADE_UNKNOWN",
     "DAILY_LOSS_LIMIT_REACHED",
     "MAX_CONSECUTIVE_LOSSES_REACHED",
 }
@@ -144,6 +145,7 @@ EXCHANGE_CONNECTIVITY_DEGRADED_REASON_CODES = {
     BINANCE_REST_MUTATING_FAILURE_REASON_CODE,
     BINANCE_REST_AUTH_PERMISSION_REASON_CODE,
     "EXCHANGE_AUTH_PERMISSION_REJECTED",
+    "EXCHANGE_CAN_TRADE_UNKNOWN",
 }
 
 
@@ -419,6 +421,13 @@ def get_user_stream_detail(settings_row: Setting) -> dict[str, Any]:
         "listen_key_rotate_status": str(payload.get("listen_key_rotate_status") or "idle"),
         "listen_key_rotate_error": str(payload.get("listen_key_rotate_error") or "") or None,
     }
+
+
+def public_user_stream_detail(user_stream_summary: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = dict(user_stream_summary or {})
+    listen_key = str(payload.pop("listen_key", "") or "").strip()
+    payload["listen_key_present"] = bool(listen_key)
+    return payload
 
 
 def get_market_stream_detail(settings_row: Setting) -> dict[str, Any]:

@@ -7,10 +7,15 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
+from trading_mvp.services.secret_store import secret_seed_is_insecure
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_DIR = (_PROJECT_ROOT / "data").resolve()
 _DEFAULT_DATABASE_PATH = (_DEFAULT_DATA_DIR / "trading_mvp.db").resolve()
 _DEFAULT_POSTGRES_DATABASE_URL = "postgresql+psycopg://trading:trading@127.0.0.1:5432/trading_mvp"
+DEFAULT_APP_SECRET_SEED = "change-me-local-dev-secret"
+PRODUCTION_APP_ENVS = {"prod", "production"}
+_PRODUCTION_APP_ENVS = {"prod", "production"}
 
 
 def _resolve_project_path(path: str | Path) -> Path:
@@ -82,6 +87,61 @@ def require_runtime_database_url(context: str) -> str:
     return database_url
 
 
+def runtime_security_enforced(settings: "Settings", *, rollout_mode: str | None = None) -> bool:
+    return settings.app_env.strip().lower() in PRODUCTION_APP_ENVS or str(rollout_mode or "").strip().lower() == "full_live"
+
+
+def runtime_security_errors(settings: "Settings", *, rollout_mode: str | None = None) -> list[str]:
+    if not runtime_security_enforced(settings, rollout_mode=rollout_mode):
+        return []
+
+    errors: list[str] = []
+    if secret_seed_is_insecure(settings.app_secret_seed):
+        errors.append("APP_SECRET_SEED must be changed before production/full_live runtime.")
+    if not any(
+        key.strip()
+        for key in (
+            settings.operator_api_key,
+            settings.operator_viewer_api_key,
+            settings.operator_trader_api_key,
+            settings.operator_admin_api_key,
+        )
+    ):
+        errors.append(
+            "OPERATOR_API_KEY or role-specific operator API keys are required before production/full_live runtime."
+        )
+    return errors
+
+
+def require_runtime_security_settings(settings: "Settings", *, rollout_mode: str | None = None) -> None:
+    errors = runtime_security_errors(settings, rollout_mode=rollout_mode)
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
+def split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def app_env_is_production(value: str | None) -> bool:
+    return str(value or "").strip().lower() in _PRODUCTION_APP_ENVS
+
+
+def runtime_requires_private_secret(settings: "Settings", *, rollout_mode: object | None = None) -> bool:
+    return runtime_security_enforced(settings, rollout_mode=str(rollout_mode or ""))
+
+
+def validate_runtime_secret_seed(settings: "Settings", *, rollout_mode: object | None = None) -> None:
+    if runtime_requires_private_secret(settings, rollout_mode=rollout_mode) and secret_seed_is_insecure(
+        settings.app_secret_seed
+    ):
+        raise RuntimeError(
+            "APP_SECRET_SEED must be changed from the local development default before production/full_live runtime."
+        )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / ".env"),
@@ -90,7 +150,7 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8000
     frontend_port: int = 3000
     database_url: str = _DEFAULT_POSTGRES_DATABASE_URL
@@ -174,7 +234,15 @@ class Settings(BaseSettings):
     ai_enabled: bool = False
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
-    app_secret_seed: str = "change-me-local-dev-secret"
+    app_secret_seed: str = DEFAULT_APP_SECRET_SEED
+    operator_api_key: str = ""
+    operator_viewer_api_key: str = ""
+    operator_trader_api_key: str = ""
+    operator_admin_api_key: str = ""
+    operator_api_rate_limit_per_minute: int = Field(default=600, ge=1, le=10000)
+    operator_api_write_rate_limit_per_minute: int = Field(default=120, ge=1, le=10000)
+    cors_allowed_origins: str = ""
+    cors_allow_local_dev_origins: bool = True
     ai_provider: str = "openai"
     ai_call_interval_minutes: int = 10
     decision_cycle_interval_minutes: int = 15

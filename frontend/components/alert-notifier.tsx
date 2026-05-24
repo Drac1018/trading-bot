@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { isEntryWaitReasonCodeInContext } from "../lib/risk-reason-copy.js";
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const apiBaseUrl = "";
 const pollMs = 15000;
 const idlePollMs = 60000;
 const hiddenPollMs = 60000;

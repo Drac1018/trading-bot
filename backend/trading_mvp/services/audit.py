@@ -1,11 +1,46 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from trading_mvp.models import Alert, AuditEvent, SystemHealthEvent
 
+SENSITIVE_REDACTED_VALUE = "[REDACTED]"
+SENSITIVE_KEY_EXACT_MATCHES = frozenset(
+    {
+        "apikey",
+        "apisecret",
+        "api_key",
+        "api_secret",
+        "authorization",
+        "accesstoken",
+        "auth_token",
+        "bearer_token",
+        "clientsecret",
+        "idtoken",
+        "listenkey",
+        "listen_key",
+        "password",
+        "refresh_token",
+        "refreshtoken",
+        "secret",
+        "sessiontoken",
+        "session_token",
+        "token",
+    }
+)
+SENSITIVE_KEY_SUFFIXES = (
+    "_api_key",
+    "_api_secret",
+    "_auth_token",
+    "_password",
+    "_refresh_token",
+    "_secret",
+    "_session_token",
+    "_token",
+)
 CORRELATION_ID_FIELDS = (
     "cycle_id",
     "snapshot_id",
@@ -361,7 +396,7 @@ def compact_audit_payload(
     event_type: str | None = None,
     event_category: str | None = None,
 ) -> dict[str, Any]:
-    source = dict(payload or {})
+    source = redact_sensitive_payload(dict(payload or {}))
     if not source:
         return {}
 
@@ -549,6 +584,40 @@ def compact_audit_payload(
     return {}
 
 
+def _normalized_payload_key(key: object) -> str:
+    raw = str(key or "").strip().replace("-", "_").replace(" ", "_")
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", raw).lower()
+
+
+def payload_key_is_sensitive(key: object) -> bool:
+    normalized = _normalized_payload_key(key)
+    compact = normalized.replace("_", "")
+    return (
+        normalized in SENSITIVE_KEY_EXACT_MATCHES
+        or compact in SENSITIVE_KEY_EXACT_MATCHES
+        or normalized.endswith(SENSITIVE_KEY_SUFFIXES)
+    )
+
+
+def redact_sensitive_payload(value: Any, *, _depth: int = 0) -> Any:
+    if _depth > 24:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: (
+                SENSITIVE_REDACTED_VALUE
+                if payload_key_is_sensitive(key)
+                else redact_sensitive_payload(nested, _depth=_depth + 1)
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_payload(item, _depth=_depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return [redact_sensitive_payload(item, _depth=_depth + 1) for item in value]
+    return value
+
+
 def normalize_correlation_ids(
     correlation_ids: dict[str, Any] | None = None,
     *,
@@ -586,7 +655,7 @@ def merge_correlation_payload(
     normalized = normalize_correlation_ids(correlation_ids)
     if normalized:
         merged_payload.update(normalized)
-    return merged_payload
+    return redact_sensitive_payload(merged_payload)
 
 
 def record_audit_event(

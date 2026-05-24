@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   EntryQualityBreakdown,
   ExchangeSyncDiagnostics,
+  LimitedLiveReadiness,
   OperatorDashboardPayload,
   ProfitabilityCostBreakdown,
 } from "./overview-dashboard";
@@ -18,6 +19,7 @@ import {
 } from "../lib/risk-reason-copy.js";
 import { buildExecutionRiskProfileSummary } from "../lib/execution-risk-profile-summary";
 import { normalizeSyncScopeStatus } from "../lib/sync-freshness";
+import { handleOperatorApiAuthFailure, postJson, withOperatorWriteProtection } from "../lib/api";
 
 type Tone = "safe" | "warn" | "danger" | "neutral" | "info";
 type AuditEvent = OperatorDashboardPayload["audit_events"][number];
@@ -29,9 +31,11 @@ type ActionItem = {
   symbol: string;
   priority: "높음" | "보통";
   tone: Tone;
+  action?: "live-sync";
+  buttonLabel?: string;
 };
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const apiBaseUrl = "";
 const refreshIntervalMs = 60000;
 const syncCatchUpIntervalMs = 2500;
 const syncCatchUpMaxAttempts = 8;
@@ -41,6 +45,7 @@ const tradingSyncBlockers = new Set([
   "POSITION_STATE_STALE",
   "OPEN_ORDERS_STATE_STALE",
   "PROTECTION_STATE_UNVERIFIED",
+  "FULL_LIVE_SYNC_STALE",
 ]);
 
 const recoverableSyncStatuses = new Set(["stale", "skipped", "unknown"]);
@@ -153,7 +158,8 @@ function currentControlBlockers(control: OperatorDashboardPayload["control"]) {
   const explicitBlockers = control.control_status_summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? [];
   const degraded = control.control_status_summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? [];
   const protection = control.control_status_summary?.protection_reason_codes ?? control.protection_reason_codes ?? [];
-  return unique([...explicitBlockers, ...currentCycle, ...degraded, ...protection]);
+  const approvalControl = control.control_status_summary?.approval_control_blocked_reasons ?? [];
+  return unique([...explicitBlockers, ...currentCycle, ...degraded, ...protection, ...approvalControl]);
 }
 
 function hasActiveSyncProblem(control: OperatorDashboardPayload["control"]) {
@@ -190,6 +196,15 @@ function isGlobalEntryBlocked(control: OperatorDashboardPayload["control"]) {
   return globalReasons.length > 0 || (blockScope !== "none" && blockScope !== "candidate");
 }
 
+function exchangePermissionUnknown(control: OperatorDashboardPayload["control"]) {
+  const summary = control.control_status_summary;
+  return (
+    control.rollout_mode === "full_live" &&
+    control.approval_armed &&
+    summary?.exchange_can_trade_known === false
+  );
+}
+
 function isPassiveRiskOnly(control: OperatorDashboardPayload["control"]) {
   const blockers = currentRiskBlockers(control);
   return blockers.length === 0 || blockers.every((code) => isEntryWaitReasonCodeInContext(code, blockers));
@@ -212,6 +227,40 @@ function hasRecoverableSyncDelay(control: OperatorDashboardPayload["control"]) {
 
 function needsSyncCatchUp(control: OperatorDashboardPayload["control"]) {
   return hasTradingSyncBlocker(control) || hasRecoverableSyncDelay(control);
+}
+
+function needsExecutionProfileCatchUp(control: OperatorDashboardPayload["control"]) {
+  return Boolean(control.profile_new_entry_blocked);
+}
+
+function schedulerSummary(control: OperatorDashboardPayload["control"]) {
+  const freshness = control.scheduler_freshness_summary ?? {};
+  if (freshness.stale === true || freshness.status === "stale") {
+    return {
+      label: "지연",
+      detail: typeof freshness.message === "string" ? freshness.message : "최근 스케줄러 실행이 예정 시각보다 늦습니다.",
+      tone: "danger" as const,
+    };
+  }
+  if (control.scheduler_status === "failed") {
+    return {
+      label: "확인 필요",
+      detail: "최근 스케줄러 실행이 실패했습니다.",
+      tone: "danger" as const,
+    };
+  }
+  if (freshness.status === "fresh") {
+    return {
+      label: "정상",
+      detail: `최근 실행 ${formatDateTime(control.scheduler_last_run_at)}`,
+      tone: "safe" as const,
+    };
+  }
+  return {
+    label: "미확인",
+    detail: "스케줄러 실행 기록을 아직 확인하지 못했습니다.",
+    tone: "warn" as const,
+  };
 }
 
 function syncBlockerDetail(code: string) {
@@ -251,6 +300,14 @@ function mainState(operator: OperatorDashboardPayload) {
   const blockers = importantBlockers(control);
   const riskBlockers = currentRiskBlockers(control);
   const passiveRiskOnly = isPassiveRiskOnly(control);
+
+  if (exchangePermissionUnknown(control)) {
+    return {
+      title: "거래소 권한 확인 중",
+      detail: "full live 승인 상태지만 거래소 주문 가능 여부가 확인되지 않아 신규 진입을 보류합니다.",
+      tone: "warn" as const,
+    };
+  }
 
   if (control.trading_paused) {
     const manualPause = control.pause_origin === "manual";
@@ -383,6 +440,9 @@ function exchangeSyncPresentation(control: OperatorDashboardPayload["control"]) 
 }
 
 function entryPermissionStatus(control: OperatorDashboardPayload["control"]) {
+  if (exchangePermissionUnknown(control)) {
+    return { label: "권한 확인 중", tone: "warn" as const };
+  }
   if (control.trading_paused) {
     return { label: "보류", tone: "neutral" as const };
   }
@@ -453,15 +513,22 @@ function buildActionItems(operator: OperatorDashboardPayload): ActionItem[] {
   }
 
   for (const code of importantBlockers(control).slice(0, 3)) {
+    const canRefreshSync = code === "EXCHANGE_CAN_TRADE_UNKNOWN" || tradingSyncBlockers.has(code);
     items.push({
       id: `blocker-${code}`,
-      title: tradingSyncBlockers.has(code) ? "진입 안전 기준 갱신 중" : "신규 진입 차단 사유",
+      title: code === "EXCHANGE_CAN_TRADE_UNKNOWN"
+        ? "거래소 권한 확인 필요"
+        : tradingSyncBlockers.has(code)
+          ? "진입 안전 기준 갱신 중"
+          : "신규 진입 차단 사유",
       detail: syncBlockerDetail(code),
       symbol: "전체",
       priority: ["PROTECTION_REQUIRED", ...tradingSyncBlockers].includes(code)
         ? "높음"
         : "보통",
       tone: "warn",
+      action: canRefreshSync ? "live-sync" : undefined,
+      buttonLabel: canRefreshSync ? "동기화" : undefined,
     });
   }
 
@@ -478,6 +545,8 @@ function buildActionItems(operator: OperatorDashboardPayload): ActionItem[] {
       symbol: "전체",
       priority: normalized === "failed" || normalized === "incomplete" ? "높음" : "보통",
       tone: normalized === "failed" || normalized === "incomplete" ? "danger" : "warn",
+      action: "live-sync",
+      buttonLabel: "동기화",
     });
   }
 
@@ -668,6 +737,39 @@ function profitabilityTone(cost: ProfitabilityCostBreakdown | null): Tone {
   return cost.warning_codes.length > 0 ? "warn" : "safe";
 }
 
+function readinessTone(readiness: LimitedLiveReadiness | null | undefined): Tone {
+  if (!readiness) {
+    return "neutral";
+  }
+  if (readiness.status === "blocked" || readiness.status === "not_ready") {
+    return "danger";
+  }
+  if (readiness.status === "limited_live_candidate" || readiness.status === "scale_up_candidate") {
+    return "safe";
+  }
+  return "warn";
+}
+
+function readinessLabel(readiness: LimitedLiveReadiness | null | undefined) {
+  if (!readiness) {
+    return "준비도 미확인";
+  }
+  if (
+    readiness.status === "not_ready" &&
+    readiness.reason_codes.includes("productization_profitability_unverified")
+  ) {
+    return "제품화 수익성 검증 부족";
+  }
+  const labels: Record<string, string> = {
+    not_ready: "제품화 준비 미달",
+    watch: "제품화 관찰 필요",
+    limited_live_candidate: "제한 실주문 후보",
+    scale_up_candidate: "확대 후보",
+    blocked: "제품화 차단",
+  };
+  return labels[readiness.status] ?? readiness.status;
+}
+
 function formatBps(value: number | null | undefined) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "-";
@@ -682,6 +784,16 @@ function toneClass(tone: Tone) {
     danger: "border-rose-200 bg-rose-50 text-rose-800",
     neutral: "border-slate-200 bg-slate-50 text-slate-700",
     info: "border-blue-200 bg-blue-50 text-blue-800",
+  }[tone];
+}
+
+function feedbackTextClass(tone: Tone) {
+  return {
+    safe: "text-emerald-700",
+    warn: "text-amber-700",
+    danger: "text-rose-700",
+    neutral: "text-slate-600",
+    info: "text-blue-700",
   }[tone];
 }
 
@@ -766,12 +878,17 @@ function ProfitabilityCostPanel({
   cost,
   breakdowns,
   entryQuality,
+  limitedLiveReadiness,
 }: {
   cost: ProfitabilityCostBreakdown | null;
   breakdowns: ProfitabilityCostBreakdown[];
   entryQuality: EntryQualityBreakdown[];
+  limitedLiveReadiness: LimitedLiveReadiness | null | undefined;
 }) {
   const tone = profitabilityTone(cost);
+  const readiness = limitedLiveReadiness;
+  const readinessStatusTone = readinessTone(readiness);
+  const lacksRealizedProfitabilityEvidence = readiness ? readiness.actual_entries === 0 || readiness.fills === 0 : false;
   const warningLabels = cost?.warning_codes.map((code) => profitabilityWarningCopy[code] ?? code) ?? [];
   const statusLabel = !cost || cost.status === "no_data"
     ? "데이터 없음"
@@ -799,6 +916,28 @@ function ProfitabilityCostPanel({
       <p className="mt-4 text-sm leading-6 text-slate-600">
         거래 확대 판단용 화면이 아니라 총손익이 수수료, 펀딩비, 불리한 체결에 줄어드는지 확인하는 화면입니다.
       </p>
+
+      {readiness ? (
+        <div className={`mt-4 rounded-md border p-4 text-sm ${toneClass(readinessStatusTone)}`}>
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+            <p className="font-semibold">{readinessLabel(readiness)}</p>
+            <p>
+              Net after fees {formatMoney(readiness.net_pnl_after_fees, 2)} / 기대값{" "}
+              {formatMoney(readiness.expectancy_after_fees, 2)}
+            </p>
+          </div>
+          <p className="mt-2 leading-6">
+            실제 진입 {formatNumber(readiness.actual_entries)}건, 체결 {formatNumber(readiness.fills)}건, 섀도우 후보{" "}
+            {formatNumber(readiness.recent_candidate_events)}건
+            {readiness.reason_codes.length > 0 ? ` / ${readiness.reason_codes.join(", ")}` : ""}
+          </p>
+          {lacksRealizedProfitabilityEvidence ? (
+            <p className="mt-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 font-semibold text-amber-900">
+              판매 가능한 실현 수익성 증거 없음: 실제 주문/체결 0건 구간은 simulated opportunity와 분리해 판단해야 합니다.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {cost ? (
         <>
@@ -927,8 +1066,11 @@ function ProfitabilityCostPanel({
 }
 
 async function fetchPayload(): Promise<OperatorDashboardPayload> {
-  const response = await fetch(`${apiBaseUrl}/api/dashboard/operator`, { cache: "no-store" });
+  const response = await fetch(`${apiBaseUrl}/api/dashboard/operator?view=home`, { cache: "no-store" });
   if (!response.ok) {
+    if (handleOperatorApiAuthFailure(response)) {
+      throw new Error("운영자 세션이 만료되어 로그인 화면으로 이동합니다.");
+    }
     const body = await response.text();
     throw new Error(body || response.statusText);
   }
@@ -946,7 +1088,13 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   );
   const [refreshError, setRefreshError] = useState("");
   const [checkedIds, setCheckedIds] = useState<string[]>([]);
-  const syncCatchUpNeeded = needsSyncCatchUp(payload.control);
+  const [pendingActionId, setPendingActionId] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<{
+    id: string;
+    tone: Tone;
+    message: string;
+  } | null>(null);
+  const fastCatchUpNeeded = needsSyncCatchUp(payload.control) || needsExecutionProfileCatchUp(payload.control);
 
   useEffect(() => {
     let active = true;
@@ -970,6 +1118,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
       }
     };
     const interval = window.setInterval(() => void refresh(), refreshIntervalMs);
+    void refresh();
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         void refresh();
@@ -984,7 +1133,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   }, []);
 
   useEffect(() => {
-    if (!syncCatchUpNeeded) {
+    if (!fastCatchUpNeeded) {
       return;
     }
 
@@ -1006,7 +1155,10 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
           setPayload(next);
           setLastUpdated(new Date());
           setRefreshError("");
-          if (attempts < syncCatchUpMaxAttempts && needsSyncCatchUp(next.control)) {
+          if (
+            attempts < syncCatchUpMaxAttempts &&
+            (needsSyncCatchUp(next.control) || needsExecutionProfileCatchUp(next.control))
+          ) {
             refreshUntilCaughtUp();
           }
         } catch (error) {
@@ -1029,13 +1181,14 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
         window.clearTimeout(timeoutId);
       }
     };
-  }, [syncCatchUpNeeded]);
+  }, [fastCatchUpNeeded]);
 
   const operator = payload;
   const state = mainState(operator);
   const protection = protectionLabel(operator.control);
   const protectionTitle = protectionHeading(operator.control);
   const sync = syncSummary(operator.control);
+  const scheduler = schedulerSummary(operator.control);
   const exchangeSync = exchangeSyncPresentation(operator.control);
   const entryPermission = entryPermissionStatus(operator.control);
   const actions = useMemo(() => buildActionItems(operator), [operator]);
@@ -1045,7 +1198,8 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
   const profitabilityBreakdowns = operator.market_signal.profitability_cost_breakdowns ?? [];
   const profitabilityCost = primaryProfitabilityCost(operator);
   const entryQuality = primaryEntryQuality(operator);
-  const openPositionCount = operator.symbols.filter((symbol) => symbol.open_position.is_open).length;
+  const openPositionCount =
+    operator.control.open_positions ?? operator.symbols.filter((symbol) => symbol.open_position.is_open).length;
   const executionProfile = buildExecutionRiskProfileSummary(operator.control);
 
   const toggleChecked = (id: string) => {
@@ -1054,8 +1208,75 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
     );
   };
 
+  const refreshPayload = async () => {
+    const next = await fetchPayload();
+    setPayload(next);
+    setLastUpdated(new Date());
+    setRefreshError("");
+    return next;
+  };
+
+  const runLiveSyncAction = async (id: string) => {
+    setPendingActionId(id);
+    setActionFeedback({ id, tone: "warn", message: "거래소 권한과 동기화 상태를 확인 중입니다." });
+    try {
+      await postJson<Record<string, unknown>>(
+        `/api/live/sync?symbol=${encodeURIComponent(payload.control.default_symbol)}&allow_protection_recovery=false`,
+      );
+      const next = await refreshPayload();
+      const stillOpen = buildActionItems(next).some((item) => item.id === id);
+      setActionFeedback({
+        id,
+        tone: stillOpen ? "warn" : "safe",
+        message: stillOpen
+          ? "동기화는 실행됐지만 이 안전 기준은 아직 해소되지 않았습니다."
+          : "거래소 권한과 동기화 상태를 다시 확인했습니다.",
+      });
+    } catch (error) {
+      setActionFeedback({
+        id,
+        tone: "danger",
+        message: error instanceof Error ? error.message : "거래소 동기화에 실패했습니다.",
+      });
+    } finally {
+      setPendingActionId(null);
+    }
+  };
+
+  const handleActionClick = (item: ActionItem) => {
+    if (item.action === "live-sync") {
+      void runLiveSyncAction(item.id);
+      return;
+    }
+    toggleChecked(item.id);
+  };
+
+  const handleLogout = async () => {
+    const response = await fetch(
+      "/api/operator/logout",
+      await withOperatorWriteProtection("/api/operator/logout", { method: "POST", cache: "no-store" }),
+    );
+    if (!response.ok) {
+      if (handleOperatorApiAuthFailure(response)) {
+        return;
+      }
+      setRefreshError(`로그아웃 요청에 실패했습니다: ${response.status}`);
+      return;
+    }
+    window.location.assign("/login");
+  };
+
   return (
     <div className="space-y-6">
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={() => void handleLogout()}
+              className="rounded border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-slate-400 hover:text-slate-950"
+            >
+              로그아웃
+            </button>
+          </div>
           <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
             <div className="grid gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)] xl:items-center">
               <div className="flex min-w-0 items-center gap-5">
@@ -1093,7 +1314,9 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                     <Icon name="pulse" />
                     <span className="text-sm">자동 실행</span>
                   </div>
-                  <p className={`mt-2 text-base font-semibold ${operator.control.scheduler_status === "failed" ? "text-rose-700" : "text-emerald-700"}`}>
+                  <p className={`mt-2 text-base font-semibold ${scheduler.tone === "danger" ? "text-rose-700" : scheduler.tone === "warn" ? "text-amber-800" : "text-emerald-700"}`}>{scheduler.label}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">{scheduler.detail}</p>
+                  <p className="hidden">
                     {operator.control.scheduler_status === "failed" ? "확인 필요" : "정상"}
                   </p>
                 </div>
@@ -1185,6 +1408,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                   ) : (
                     actions.map((item) => {
                       const checked = checkedIds.includes(item.id);
+                      const pending = pendingActionId === item.id;
                       return (
                         <div key={item.id} className="grid gap-4 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
                           <div className="min-w-0">
@@ -1194,18 +1418,26 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                             </div>
                             <p className="mt-3 text-base font-semibold leading-6 text-slate-950">{item.title}</p>
                             <p className="mt-1 text-sm leading-6 text-slate-600">{item.detail}</p>
+                            {actionFeedback?.id === item.id ? (
+                              <p className={`mt-2 text-sm font-medium ${feedbackTextClass(actionFeedback.tone)}`}>
+                                {actionFeedback.message}
+                              </p>
+                            ) : null}
                           </div>
                           <button
                             type="button"
                             data-testid={`action-${item.id}`}
-                            onClick={() => toggleChecked(item.id)}
+                            onClick={() => handleActionClick(item)}
+                            disabled={pending}
                             className={`h-11 rounded-md border px-5 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
-                              checked
+                              pending
+                                ? "cursor-wait border-blue-200 bg-blue-50 text-blue-800"
+                                : checked
                                 ? "border-emerald-200 bg-emerald-50 text-emerald-800"
                                 : "border-slate-300 bg-white text-slate-900 hover:bg-slate-50"
                             }`}
                           >
-                            {checked ? "확인됨" : "확인하기"}
+                            {pending ? "확인 중" : checked ? "확인됨" : item.buttonLabel ?? "확인하기"}
                           </button>
                         </div>
                       );
@@ -1281,6 +1513,7 @@ export function OperatorFriendlyDashboard({ initial }: { initial: OperatorDashbo
                 cost={profitabilityCost}
                 breakdowns={profitabilityBreakdowns}
                 entryQuality={entryQuality}
+                limitedLiveReadiness={payload.control.limited_live_readiness}
               />
             </div>
 

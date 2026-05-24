@@ -1539,6 +1539,17 @@ def test_performance_endpoint_returns_extended_report_payload(tmp_path, monkeypa
         app.dependency_overrides.clear()
 
 
+def test_opportunity_attribution_summary_endpoint_returns_24h_and_7d(testclient_db_factory) -> None:
+    testclient_db_factory("opportunity_attribution_summary.db")
+
+    with TestClient(app) as client:
+        response = client.get("/api/analytics/opportunity-attribution/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [window["window_label"] for window in payload["windows"]] == ["24h", "7d"]
+
+
 def _opportunity_snapshot(
     *,
     symbol: str,
@@ -1681,3 +1692,92 @@ def test_opportunity_attribution_reports_reason_quality_and_ai_flow(db_session) 
     assert report["reason_code_summary"]["HOLD_DECISION"]["horizons"]["60m"][
         "avg_net_after_fees_usdt"
     ] > 0
+
+
+def test_opportunity_attribution_uses_decision_performance_facts_for_blocked_net_positive_candidates(
+    db_session,
+) -> None:
+    now = utcnow_naive().replace(second=0, microsecond=0)
+    db_session.add_all(
+        [
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=15),
+                latest_price=101.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=30),
+                latest_price=102.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=60),
+                latest_price=104.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            DecisionPerformanceFact(
+                decision_run_id=9101,
+                provider_name="openai",
+                symbol="BTCUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["EXPECTED_COST_EXCEEDS_EDGE"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                entry_zone_min=99.0,
+                entry_zone_max=101.0,
+                stop_loss=98.0,
+                take_profit=104.0,
+                baseline_decision="long",
+                ai_used=True,
+                comparison_bucket="ai_rejected_baseline_entry",
+                ai_actionable=True,
+                ai_blocked_by_risk=True,
+                ai_led_to_order=False,
+                ai_led_to_fill=False,
+                ai_usefulness_status="risk_blocked",
+                expected_edge_bps=40.0,
+                expected_total_cost_bps=12.0,
+                net_expected_edge_bps=28.0,
+                pnl_data_confidence="not_realized",
+                telemetry_metadata={},
+                telemetry_output={"decision": "long"},
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    report = build_opportunity_attribution_report(
+        db_session,
+        lookback_hours=3,
+        limit=20,
+        notional_usdt=100.0,
+    )
+
+    assert report["overall"]["source_counts"]["decision_performance_fact"] == 1
+    assert report["overall"]["evaluated_candidates"] == 1
+    assert report["overall"]["profitable_candidates"] == 1
+    assert report["reason_code_summary"]["EXPECTED_COST_EXCEEDS_EDGE"]["profitable_candidates"] == 1
+    fact_candidate = report["candidates"][0]
+    assert fact_candidate["source"] == "decision_performance_fact"
+    assert fact_candidate["would_have_been_profitable"] is True
+    assert fact_candidate["best_net_after_fees_usdt"] > 0

@@ -10,15 +10,23 @@ from sqlalchemy import desc, select
 from trading_mvp.main import app
 from trading_mvp.models import (
     AccountLedgerEntry,
+    Alert,
     AuditEvent,
+    DecisionPerformanceFact,
     Execution,
     FeatureSnapshot,
     MarketSnapshot,
     Order,
     PendingEntryPlan,
+    PnLSnapshot,
     Position,
     RiskCheck,
     SchedulerRun,
+)
+from trading_mvp.services.audit import (
+    SENSITIVE_REDACTED_VALUE,
+    record_audit_event,
+    redact_sensitive_payload,
 )
 from trading_mvp.services.dashboard import (
     OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
@@ -26,6 +34,7 @@ from trading_mvp.services.dashboard import (
     _latest_rows_by_extracted_symbol,
     _latest_rows_by_symbol,
     classify_audit_event,
+    get_alerts,
     get_audit_event_detail,
     get_audit_timeline,
     get_decisions,
@@ -1497,6 +1506,135 @@ def test_audit_compact_list_filters_and_detail_lazy_payload(db_session) -> None:
     assert detail["event_category"] == "risk"
 
 
+def test_get_alerts_can_filter_acknowledged_rows(db_session) -> None:
+    db_session.add_all(
+        [
+            Alert(
+                category="execution",
+                severity="error",
+                title="Open orders sync failed",
+                message="old permission error",
+                acknowledged=True,
+                payload={"reason_code": "EXCHANGE_AUTH_PERMISSION_REJECTED"},
+            ),
+            Alert(
+                category="risk",
+                severity="warning",
+                title="Risk gate active",
+                message="current unresolved alert",
+                acknowledged=False,
+                payload={"reason_code": "HOLD_DECISION"},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    rows = get_alerts(db_session, acknowledged=False)
+
+    assert [row["title"] for row in rows] == ["Risk gate active"]
+
+
+def test_audit_payload_redaction_masks_recursive_sensitive_keys() -> None:
+    payload = {
+        "user_stream_summary": {
+            "listen_key": "listen-key-raw",
+            "listenKey": "listen-key-camel",
+            "listen_key_present": True,
+            "listen_key_created_at": "2026-05-24T00:00:00",
+        },
+        "openai_api_key": "sk-raw",
+        "binance_api_secret": "binance-secret-raw",
+        "nested": [
+            {"refresh_token": "refresh-raw"},
+            {"token": "token-raw"},
+            {"password": "password-raw"},
+        ],
+        "usage": {"ai_total_tokens": 1234},
+    }
+
+    redacted = redact_sensitive_payload(payload)
+
+    assert redacted["user_stream_summary"]["listen_key"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["user_stream_summary"]["listenKey"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["user_stream_summary"]["listen_key_present"] is True
+    assert redacted["user_stream_summary"]["listen_key_created_at"] == "2026-05-24T00:00:00"
+    assert redacted["openai_api_key"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["binance_api_secret"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["nested"][0]["refresh_token"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["nested"][1]["token"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["nested"][2]["password"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["usage"]["ai_total_tokens"] == 1234
+
+
+def test_record_audit_event_redacts_sensitive_payload_before_storage(db_session) -> None:
+    event = record_audit_event(
+        db_session,
+        event_type="scheduler_live_poll_sync",
+        entity_type="scheduler_run",
+        entity_id="live",
+        message="Live poll synchronized.",
+        payload={
+            "user_stream_summary": {
+                "listen_key": "listen-key-raw",
+                "status": "connected",
+            },
+            "api_key": "api-key-raw",
+            "safe": "visible",
+        },
+    )
+    db_session.flush()
+
+    stored = db_session.get(AuditEvent, event.id)
+
+    assert stored is not None
+    assert stored.payload["user_stream_summary"]["listen_key"] == SENSITIVE_REDACTED_VALUE
+    assert stored.payload["user_stream_summary"]["status"] == "connected"
+    assert stored.payload["api_key"] == SENSITIVE_REDACTED_VALUE
+    assert stored.payload["safe"] == "visible"
+
+
+def test_audit_api_redacts_legacy_sensitive_payload_rows(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("audit_redaction.db")
+
+    with TestingSessionLocal() as session:
+        legacy = AuditEvent(
+            event_type="scheduler_live_poll_sync",
+            entity_type="scheduler_run",
+            entity_id="live",
+            severity="info",
+            message="Live poll synchronized.",
+            payload={
+                "user_stream_summary": {
+                    "listen_key": "legacy-listen-key",
+                    "status": "connected",
+                },
+                "api_key": "legacy-api-key",
+                "secret": "legacy-secret",
+                "nested": {"token": "legacy-token", "safe": "visible"},
+            },
+        )
+        session.add(legacy)
+        session.commit()
+        event_id = legacy.id
+
+    with TestClient(app) as client:
+        list_response = client.get("/api/audit", params={"event_type": "scheduler_live_poll_sync", "limit": 1})
+        detail_response = client.get(f"/api/audit/{event_id}")
+
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    list_payload = list_response.json()[0]["payload"]
+    detail_payload = detail_response.json()["payload"]
+
+    for payload in (list_payload, detail_payload):
+        assert payload["user_stream_summary"]["listen_key"] == SENSITIVE_REDACTED_VALUE
+        assert payload["user_stream_summary"]["status"] == "connected"
+        assert payload["api_key"] == SENSITIVE_REDACTED_VALUE
+        assert payload["secret"] == SENSITIVE_REDACTED_VALUE
+        assert payload["nested"]["token"] == SENSITIVE_REDACTED_VALUE
+        assert payload["nested"]["safe"] == "visible"
+
+
 def test_audit_timeline_projects_active_position_suppression_without_fingerprint(db_session) -> None:
     from trading_mvp.models import AgentRun
 
@@ -1764,6 +1902,31 @@ def test_operator_dashboard_exposes_sync_freshness_summary(db_session) -> None:
     assert payload.control.sync_freshness_summary["account"]["stale"] is False
     assert payload.control.sync_freshness_summary["protective_orders"]["stale"] is True
     assert payload.control.can_enter_new_position is False
+
+
+def test_operator_dashboard_exposes_scheduler_freshness_summary(db_session) -> None:
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="60s",
+            workflow="exchange_sync_cycle",
+            status="success",
+            triggered_by="scheduler",
+            created_at=now - timedelta(minutes=20),
+            next_run_at=now - timedelta(minutes=19),
+            outcome={"status": "ok"},
+        )
+    )
+    db_session.flush()
+
+    payload = get_operator_dashboard(db_session, view="scheduler")
+    summary = payload.control.scheduler_freshness_summary
+
+    assert summary["status"] == "stale"
+    assert summary["stale"] is True
+    assert summary["reason_code"] == "SCHEDULER_NEXT_RUN_MISSED"
+    assert summary["source"] == "scheduler_runs"
+    assert payload.control.scheduler_last_run_at is not None
 
 
 def test_operator_dashboard_exchange_sync_diagnostics_recovered_after_permission_failure(db_session) -> None:
@@ -2039,6 +2202,126 @@ def test_profitability_dashboard_cost_breakdown_flags_cost_leakage(db_session) -
         "adverse_slippage_positive",
         "high_marketable_ratio_low_net_pnl",
     }.issubset(set(cost.warning_codes))
+
+
+def test_profitability_dashboard_reports_latest_pnl_snapshot_and_fact_gate_diagnostic(db_session) -> None:
+    now = utcnow_naive().replace(second=0, microsecond=0)
+    db_session.add_all(
+        [
+            PnLSnapshot(
+                snapshot_date=(now - timedelta(days=1)).date(),
+                equity=100000.0,
+                cash_balance=100000.0,
+                gross_realized_pnl=1.0,
+                fee_total=0.1,
+                funding_total=0.0,
+                net_pnl=0.9,
+                realized_pnl=1.0,
+                daily_pnl=0.9,
+                cumulative_pnl=0.9,
+                created_at=now - timedelta(days=1),
+            ),
+            PnLSnapshot(
+                snapshot_date=now.date(),
+                equity=100008.0,
+                cash_balance=100008.0,
+                gross_realized_pnl=12.0,
+                fee_total=3.0,
+                funding_total=-1.0,
+                net_pnl=8.0,
+                realized_pnl=12.0,
+                daily_pnl=8.0,
+                cumulative_pnl=8.0,
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.add_all(
+        [
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=15),
+                latest_price=101.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=30),
+                latest_price=102.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=60),
+                latest_price=104.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            DecisionPerformanceFact(
+                decision_run_id=9001,
+                provider_name="openai",
+                symbol="BTCUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["EXPECTED_EDGE_MARGIN_TOO_THIN"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                entry_zone_min=99.0,
+                entry_zone_max=101.0,
+                stop_loss=98.0,
+                take_profit=104.0,
+                baseline_decision="long",
+                ai_used=True,
+                comparison_bucket="ai_rejected_baseline_entry",
+                ai_actionable=True,
+                ai_blocked_by_risk=True,
+                ai_led_to_order=False,
+                ai_led_to_fill=False,
+                ai_usefulness_status="risk_blocked",
+                expected_edge_bps=40.0,
+                expected_total_cost_bps=12.0,
+                net_expected_edge_bps=28.0,
+                pnl_data_confidence="not_realized",
+                telemetry_metadata={},
+                telemetry_output={"decision": "long"},
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    payload = get_profitability_dashboard(db_session)
+
+    snapshot = payload.latest_pnl_snapshot_breakdown
+    assert snapshot.status == "ok"
+    assert snapshot.gross_pnl == pytest.approx(12.0, abs=1e-9)
+    assert snapshot.fee == pytest.approx(3.0, abs=1e-9)
+    assert snapshot.funding == pytest.approx(-1.0, abs=1e-9)
+    assert snapshot.net_pnl_excluding_funding == pytest.approx(9.0, abs=1e-9)
+    assert snapshot.net_pnl_including_funding == pytest.approx(8.0, abs=1e-9)
+
+    diagnostic = payload.candidate_gate_diagnostic
+    assert diagnostic.recommendation == "diagnose_candidate_quality_and_cost_before_entry_relaxation"
+    assert diagnostic.diagnostic_order[0] == "net_after_fees"
+    assert diagnostic.source_counts["decision_performance_fact"] == 1
+    assert diagnostic.evaluated_candidates == 1
+    assert diagnostic.net_positive_blocked_or_canceled_candidates == 1
+    missed_reason_codes = {item["reason_code"] for item in diagnostic.missed_opportunity_reason_codes}
+    assert "EXPECTED_EDGE_MARGIN_TOO_THIN" in missed_reason_codes
 
 
 def test_profitability_dashboard_cache_returns_snapshot_when_enabled(db_session) -> None:
@@ -3583,6 +3866,28 @@ def test_operator_dashboard_compact_view_skips_overview_decision_snapshot(db_ses
     assert payload.control.last_decision_at == now
     assert payload.symbols[0].symbol == "BTCUSDT"
     assert payload.symbols[0].ai_decision.decision_run_id is None
+
+
+def test_get_overview_uses_thin_runtime_summary(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+
+    calls: list[dict[str, object]] = []
+    original = dashboard_module.serialize_settings_runtime_summary
+
+    def wrapped_runtime_summary(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_module, "serialize_settings_runtime_summary", wrapped_runtime_summary)
+
+    dashboard_module.get_overview(db_session)
+
+    assert calls == [
+        {
+            "include_operational_status": False,
+            "include_event_operator_control": False,
+        }
+    ]
 
 
 def test_scheduler_operator_projection_uses_decision_fact_for_deep_history(db_session) -> None:

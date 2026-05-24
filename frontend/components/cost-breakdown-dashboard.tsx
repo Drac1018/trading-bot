@@ -184,11 +184,18 @@ function SummaryGrid({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
             {periodRangeLabel(payload)} / {payload.timezone}
           </p>
         </div>
-        {!payload.data_quality.realized_pnl_confirmed ? (
-          <span className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${badgeClass("danger")}`}>
-            실현 손익 미확정
-          </span>
-        ) : null}
+        <div className="flex flex-wrap gap-2">
+          {!payload.data_quality.realized_pnl_confirmed ? (
+            <span className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${badgeClass("danger")}`}>
+              실현 손익 미확정
+            </span>
+          ) : null}
+          {slippageStatus !== "COMPLETE" ? (
+            <span className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${badgeClass("warn")}`}>
+              슬리피지 미확정: {statusLabel(slippageStatus)}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">

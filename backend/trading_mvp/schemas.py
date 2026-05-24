@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -1329,6 +1329,50 @@ class DashboardProfitabilityCostBreakdown(StrictBaseModel):
     basis: str = "decision_performance_summary_plus_execution_ledger"
 
 
+class DashboardPnlSnapshotBreakdown(StrictBaseModel):
+    status: str = "no_data"
+    snapshot_date: date | None = None
+    snapshot_created_at: datetime | None = None
+    gross_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    fee: float = 0.0
+    funding: float = 0.0
+    net_pnl: float = 0.0
+    net_pnl_excluding_funding: float = 0.0
+    net_pnl_including_funding: float = 0.0
+    basis: str = "latest_pnl_snapshots"
+
+
+class DashboardCandidateGateDiagnostic(StrictBaseModel):
+    status: str = "no_data"
+    basis: str = (
+        "risk_checks_pending_entry_plans_decision_ai_skipped_audit_events_and_decision_performance_facts"
+    )
+    recommendation: str = "diagnose_candidate_quality_and_cost_before_entry_relaxation"
+    diagnostic_order: list[str] = Field(
+        default_factory=lambda: [
+            "net_after_fees",
+            "candidate_quality_bucket",
+            "fee_slippage_funding_cost",
+            "reason_code_gate",
+            "threshold_review_no_auto_relaxation",
+        ]
+    )
+    evaluated_candidates: int = Field(default=0, ge=0)
+    net_positive_blocked_or_canceled_candidates: int = Field(default=0, ge=0)
+    loss_avoided_candidates: int = Field(default=0, ge=0)
+    net_positive_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_best_net_after_fees_usdt: float = 0.0
+    best_net_after_fees_usdt: float = 0.0
+    worst_net_after_fees_usdt: float = 0.0
+    source_counts: dict[str, int] = Field(default_factory=dict)
+    missed_opportunity_reason_codes: list[dict[str, Any]] = Field(default_factory=list)
+    loss_prevention_reason_codes: list[dict[str, Any]] = Field(default_factory=list)
+    pending_quality_summary: dict[str, Any] = Field(default_factory=dict)
+    pending_quality_threshold_review: dict[str, Any] = Field(default_factory=dict)
+    ai_flow_summary: dict[str, Any] = Field(default_factory=dict)
+
+
 class AnalyticsCostBreakdownSummary(StrictBaseModel):
     net_pnl_usdt: float = 0.0
     gross_pnl_usdt: float = 0.0
@@ -1412,7 +1456,11 @@ class DashboardProfitabilityResponse(StrictBaseModel):
     latest_risk: dict[str, Any] | None = None
     windows: list[DashboardProfitabilityWindow] = Field(default_factory=list)
     entry_quality: dict[str, EntryQualityPerformanceEntry] = Field(default_factory=dict)
+    latest_pnl_snapshot_breakdown: DashboardPnlSnapshotBreakdown = Field(default_factory=DashboardPnlSnapshotBreakdown)
     cost_breakdowns: list[DashboardProfitabilityCostBreakdown] = Field(default_factory=list)
+    candidate_gate_diagnostic: DashboardCandidateGateDiagnostic = Field(
+        default_factory=DashboardCandidateGateDiagnostic
+    )
     execution_windows: list[DashboardExecutionWindowSummary] = Field(default_factory=list)
     hold_blocked_summary: DashboardHoldBlockedSummary
     limited_live_readiness: LimitedLiveReadinessReport = Field(default_factory=LimitedLiveReadinessReport)
@@ -1573,6 +1621,7 @@ class OperatorControlState(StrictBaseModel):
     scheduler_triggered_by: str | None = None
     scheduler_last_run_at: datetime | None = None
     scheduler_next_run_at: datetime | None = None
+    scheduler_freshness_summary: dict[str, Any] = Field(default_factory=dict)
     deterministic_market_profile: str | None = None
     ai_recommended_profile: str | None = None
     ai_recommendation_id: str | None = None

@@ -18,6 +18,8 @@ import { dashboardPages } from "../../../lib/page-config";
 import { ordersDataEndpoints } from "../../../lib/orders-query";
 import { ALL_SYMBOLS, resolveSelectedSymbol } from "../../../lib/selected-symbol";
 
+export const dynamic = "force-dynamic";
+
 function queryValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
     return value[0] ?? null;

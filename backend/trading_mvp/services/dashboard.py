@@ -36,9 +36,11 @@ from trading_mvp.schemas import (
     AnalyticsCostBreakdownResponse,
     AnalyticsCostBreakdownSummary,
     AuditTimelineEntry,
+    DashboardCandidateGateDiagnostic,
     DashboardExecutionProfileSummary,
     DashboardExecutionWindowSummary,
     DashboardHoldBlockedSummary,
+    DashboardPnlSnapshotBreakdown,
     DashboardProfitabilityCostBreakdown,
     DashboardProfitabilityResponse,
     DashboardProfitabilityWindow,
@@ -64,10 +66,13 @@ from trading_mvp.schemas import (
     PerformanceAggregateEntry,
     PerformanceWindowSummary,
 )
-from trading_mvp.services.audit import compact_audit_payload
+from trading_mvp.services.audit import compact_audit_payload, redact_sensitive_payload
 from trading_mvp.services.intent_semantics import infer_intent_semantics
 from trading_mvp.services.pending_entry_time import pending_entry_expiry_context
-from trading_mvp.services.performance_reporting import build_signal_performance_report
+from trading_mvp.services.performance_reporting import (
+    build_opportunity_attribution_report,
+    build_signal_performance_report,
+)
 from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
@@ -127,16 +132,95 @@ OPERATOR_EXECUTION_PROFILE_LIMIT = 2
 OPERATOR_RECENT_ROW_SCAN_LIMIT = 100
 OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT = 900
 RECENT_FILL_LIMIT = 4
-OPERATOR_COMPACT_VIEWS = {"market", "scheduler", "decision", "risk"}
+OPERATOR_COMPACT_VIEWS = {"home", "market", "scheduler", "decision", "risk"}
 PROFITABILITY_DASHBOARD_CACHE_TTL_SECONDS = 120.0
 PROFITABILITY_DASHBOARD_STALE_SECONDS = 900.0
 PROFITABILITY_DASHBOARD_REFRESH_DEBOUNCE_SECONDS = 30.0
+SCHEDULER_FRESHNESS_MIN_STALE_SECONDS = 300
+SCHEDULER_FRESHNESS_GRACE_MULTIPLIER = 3.0
 AUTO_RESIZABLE_EXPOSURE_LIMIT_REASON_CODES = {
     "GROSS_EXPOSURE_LIMIT_REACHED",
     "DIRECTIONAL_BIAS_LIMIT_REACHED",
     "LARGEST_POSITION_LIMIT_REACHED",
     "SAME_TIER_CONCENTRATION_LIMIT_REACHED",
 }
+
+
+def _scheduler_window_seconds(value: object) -> int | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    if raw.endswith("ms"):
+        return None
+    suffix = raw[-1]
+    number_part = raw[:-1] if suffix in {"s", "m", "h", "d"} else raw
+    try:
+        amount = float(number_part)
+    except ValueError:
+        return None
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    seconds = amount * multipliers.get(suffix, 1)
+    return int(seconds) if seconds > 0 else None
+
+
+def _scheduler_freshness_summary(
+    latest_scheduler: SchedulerRun | None,
+    *,
+    now: datetime,
+) -> dict[str, object]:
+    if latest_scheduler is None:
+        return {
+            "status": "unknown",
+            "stale": True,
+            "reason_code": "NO_SCHEDULER_RUN",
+            "message": "스케줄러 실행 기록이 없어 자동 운영 상태를 확인할 수 없습니다.",
+            "last_run_at": None,
+            "next_run_at": None,
+            "age_seconds": None,
+            "overdue_seconds": None,
+            "expected_interval_seconds": None,
+            "source": "scheduler_runs",
+        }
+
+    interval_seconds = _scheduler_window_seconds(latest_scheduler.schedule_window)
+    stale_after_seconds = max(
+        SCHEDULER_FRESHNESS_MIN_STALE_SECONDS,
+        int((interval_seconds or 60) * SCHEDULER_FRESHNESS_GRACE_MULTIPLIER),
+    )
+    age_seconds = max(0, int((now - latest_scheduler.created_at).total_seconds()))
+    overdue_seconds = (
+        max(0, int((now - latest_scheduler.next_run_at).total_seconds()))
+        if latest_scheduler.next_run_at is not None
+        else None
+    )
+    stale_by_age = age_seconds > stale_after_seconds
+    stale_by_next_run = overdue_seconds is not None and overdue_seconds > stale_after_seconds
+    stale = stale_by_age or stale_by_next_run
+    reason_code = None
+    if stale_by_next_run:
+        reason_code = "SCHEDULER_NEXT_RUN_MISSED"
+    elif stale_by_age:
+        reason_code = "SCHEDULER_LAST_RUN_STALE"
+
+    return {
+        "status": "stale" if stale else "fresh",
+        "stale": stale,
+        "reason_code": reason_code,
+        "message": (
+            "다음 예정 시각이 지났지만 새 스케줄러 실행이 없습니다."
+            if stale_by_next_run
+            else "최근 스케줄러 실행 기록이 오래되었습니다."
+            if stale_by_age
+            else "최근 스케줄러 실행 기록이 유효합니다."
+        ),
+        "last_run_at": latest_scheduler.created_at,
+        "next_run_at": latest_scheduler.next_run_at,
+        "age_seconds": age_seconds,
+        "overdue_seconds": overdue_seconds,
+        "expected_interval_seconds": interval_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "source": "scheduler_runs",
+    }
 OPERATOR_CANDIDATE_HOLD_REASON_LIMIT = 5
 
 
@@ -984,6 +1068,55 @@ def _build_profitability_cost_breakdown(
         total_cost=total_cost,
         warning_codes=warning_codes,
         basis=basis,
+    )
+
+
+def _latest_pnl_snapshot_breakdown(session: Session) -> DashboardPnlSnapshotBreakdown:
+    row = session.scalar(select(PnLSnapshot).order_by(desc(PnLSnapshot.created_at), desc(PnLSnapshot.id)).limit(1))
+    if row is None:
+        return DashboardPnlSnapshotBreakdown()
+    gross_pnl = _as_float(row.gross_realized_pnl, default=_as_float(row.realized_pnl, default=0.0))
+    fee = _as_float(row.fee_total, default=0.0)
+    funding = _as_float(row.funding_total, default=0.0)
+    net_excluding_funding = gross_pnl - fee
+    net_including_funding = _as_float(row.net_pnl, default=net_excluding_funding + funding)
+    return DashboardPnlSnapshotBreakdown(
+        status="ok",
+        snapshot_date=row.snapshot_date,
+        snapshot_created_at=row.created_at,
+        gross_pnl=gross_pnl,
+        realized_pnl=_as_float(row.realized_pnl, default=gross_pnl),
+        fee=fee,
+        funding=funding,
+        net_pnl=net_including_funding,
+        net_pnl_excluding_funding=net_excluding_funding,
+        net_pnl_including_funding=net_including_funding,
+    )
+
+
+def _candidate_gate_diagnostic(session: Session, *, lookback_hours: int = 24) -> DashboardCandidateGateDiagnostic:
+    report = build_opportunity_attribution_report(session, lookback_hours=lookback_hours, limit=120)
+    overall = _as_dict(report.get("overall"))
+    evaluated = int(overall.get("evaluated_candidates", 0) or 0)
+    source_counts = {
+        str(key): int(value or 0)
+        for key, value in _as_dict(overall.get("source_counts")).items()
+    }
+    return DashboardCandidateGateDiagnostic(
+        status="ok" if evaluated > 0 else "no_data",
+        evaluated_candidates=evaluated,
+        net_positive_blocked_or_canceled_candidates=int(overall.get("profitable_candidates", 0) or 0),
+        loss_avoided_candidates=int(overall.get("loss_avoided_candidates", 0) or 0),
+        net_positive_rate=_as_float(overall.get("profitable_rate"), default=0.0),
+        avg_best_net_after_fees_usdt=_as_float(overall.get("avg_best_net_after_fees_usdt"), default=0.0),
+        best_net_after_fees_usdt=_as_float(overall.get("best_net_after_fees_usdt"), default=0.0),
+        worst_net_after_fees_usdt=_as_float(overall.get("worst_net_after_fees_usdt"), default=0.0),
+        source_counts=source_counts,
+        missed_opportunity_reason_codes=list(report.get("missed_opportunity_reason_codes") or []),
+        loss_prevention_reason_codes=list(report.get("loss_prevention_reason_codes") or []),
+        pending_quality_summary=_as_dict(report.get("pending_quality_summary")),
+        pending_quality_threshold_review=_as_dict(report.get("pending_quality_threshold_review")),
+        ai_flow_summary=_as_dict(report.get("ai_flow_summary")),
     )
 
 
@@ -2701,7 +2834,11 @@ def get_overview(
     include_active_entry_plans: bool = True,
 ) -> OverviewResponse:
     settings_row = get_or_create_settings(session)
-    settings_payload = serialize_settings_runtime_summary(settings_row)
+    settings_payload = serialize_settings_runtime_summary(
+        settings_row,
+        include_operational_status=False,
+        include_event_operator_control=False,
+    )
     runtime_state = summarize_runtime_state(settings_row)
     latest_market = session.scalar(select(MarketSnapshot).order_by(desc(MarketSnapshot.snapshot_time)).limit(1))
     latest_decision = (
@@ -4125,7 +4262,7 @@ def _profitability_dashboard_cache_key(
 def _copy_profitability_dashboard_payload(
     payload: DashboardProfitabilityResponse,
 ) -> DashboardProfitabilityResponse:
-    return payload.model_copy(deep=True)
+    return payload.model_copy(deep=False)
 
 
 def _store_profitability_dashboard_cache(
@@ -4251,9 +4388,26 @@ def _start_profitability_dashboard_background_refresh(
     return True
 
 
-def warm_profitability_dashboard_cache(session_factory: Callable[[], Session]) -> bool:
+def warm_profitability_dashboard_cache(
+    session_factory: Callable[[], Session],
+    *,
+    synchronous: bool = False,
+) -> bool:
     try:
         with session_factory() as session:
+            if synchronous:
+                cache_key = _profitability_dashboard_cache_key(
+                    session,
+                    performance_window_specs=None,
+                    cost_window_specs=None,
+                )
+                payload = _build_profitability_dashboard_uncached(
+                    session,
+                    performance_window_specs=None,
+                    cost_window_specs=None,
+                )
+                _store_profitability_dashboard_cache(cache_key, payload)
+                return True
             return _start_profitability_dashboard_background_refresh(
                 session,
                 performance_window_specs=None,
@@ -4398,7 +4552,9 @@ def _build_profitability_dashboard_uncached(
         latest_risk=overview.latest_risk,
         windows=windows,
         entry_quality=primary_window.entry_quality if primary_window is not None else {},
+        latest_pnl_snapshot_breakdown=_latest_pnl_snapshot_breakdown(session),
         cost_breakdowns=cost_breakdowns,
+        candidate_gate_diagnostic=_candidate_gate_diagnostic(session),
         execution_windows=execution_windows,
         hold_blocked_summary=hold_blocked_summary,
         limited_live_readiness=limited_live_readiness,
@@ -4449,14 +4605,6 @@ def get_profitability_dashboard(
             cost_window_specs=cost_window_specs,
         )
         return stale_payload
-
-    if allow_stale and cached is None:
-        _start_profitability_dashboard_background_refresh(
-            session,
-            performance_window_specs=performance_window_specs,
-            cost_window_specs=cost_window_specs,
-        )
-        return _build_profitability_dashboard_pending_payload(session, overview=overview)
 
     payload = _build_profitability_dashboard_uncached(
         session,
@@ -5568,6 +5716,8 @@ def _compact_execution_window(window: DashboardExecutionWindowSummary) -> Dashbo
 
 def _normalize_operator_dashboard_view(view: str | None) -> str | None:
     normalized = (view or "").strip().lower()
+    if normalized == "operator":
+        return "home"
     return normalized if normalized in OPERATOR_COMPACT_VIEWS else None
 
 
@@ -6003,32 +6153,36 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
             cost_window_specs=OPERATOR_PROFITABILITY_COST_WINDOW_SPECS,
         )
     )
-    latest_scheduler = (
-        session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
-        if operator_view in {None, "scheduler"}
-        else None
+    latest_scheduler = session.scalar(select(SchedulerRun).order_by(desc(SchedulerRun.created_at)).limit(1))
+    generated_at = utcnow_naive()
+    scheduler_freshness_summary = _scheduler_freshness_summary(
+        latest_scheduler,
+        now=generated_at,
     )
-    include_decision_state = operator_view not in {"market", "risk"}
+    include_decision_state = operator_view not in {"home", "market", "risk"}
     include_risk_state = operator_view != "market"
     include_execution_state = operator_view in {None, "decision", "risk"}
     include_protection_state = operator_view in {None, "decision"}
     include_event_operator_control = operator_view is None
     include_audit_events = operator_view is None
-    symbol_summaries = _build_operator_symbol_summaries(
-        session,
-        tracked_symbols=overview.tracked_symbols,
-        overview=overview,
-        include_decision_state=include_decision_state,
-        include_risk_state=include_risk_state,
-        include_execution_state=include_execution_state,
-        include_protection_state=include_protection_state,
-        include_event_operator_control=include_event_operator_control,
-        include_audit_events=include_audit_events,
-        prefer_fact_decision_lookup=True,
-        extracted_symbol_fallback_limit=0
-        if fact_decision_projection
-        else OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
-    )
+    if operator_view == "home":
+        symbol_summaries = []
+    else:
+        symbol_summaries = _build_operator_symbol_summaries(
+            session,
+            tracked_symbols=overview.tracked_symbols,
+            overview=overview,
+            include_decision_state=include_decision_state,
+            include_risk_state=include_risk_state,
+            include_execution_state=include_execution_state,
+            include_protection_state=include_protection_state,
+            include_event_operator_control=include_event_operator_control,
+            include_audit_events=include_audit_events,
+            prefer_fact_decision_lookup=True,
+            extracted_symbol_fallback_limit=0
+            if fact_decision_projection
+            else OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
+        )
     compact_performance_windows = (
         []
         if profitability is None
@@ -6051,9 +6205,9 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
     service_gate_snapshot = build_service_switch_gate_snapshot(session)
     audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT) if include_audit_events else []
     return OperatorDashboardResponse(
-        generated_at=utcnow_naive(),
+        generated_at=generated_at,
         control=OperatorControlState(
-            generated_at=utcnow_naive(),
+            generated_at=generated_at,
             operational_status=overview.operational_status,
             control_status_summary=overview.operational_status.control_status_summary,
             can_enter_new_position=overview.operational_status.can_enter_new_position,
@@ -6121,6 +6275,7 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
             scheduler_triggered_by=latest_scheduler.triggered_by if latest_scheduler is not None else None,
             scheduler_last_run_at=latest_scheduler.created_at if latest_scheduler is not None else None,
             scheduler_next_run_at=latest_scheduler.next_run_at if latest_scheduler is not None else None,
+            scheduler_freshness_summary=scheduler_freshness_summary,
             **execution_profile_state,
             last_market_refresh_at=overview.last_market_refresh_at,
             last_decision_at=overview.last_decision_at,
@@ -6338,7 +6493,8 @@ def _project_audit_rows(
     for row in payloads:
         if not isinstance(row, dict):
             continue
-        payload = _as_dict(row.get("payload"))
+        payload = redact_sensitive_payload(_as_dict(row.get("payload")))
+        row["payload"] = payload
         payload_has_suppression_source = _has_active_position_suppression_source(payload)
         decision_run_id = _decision_run_id_from_audit_row(row)
         fallback_context = suppression_context_by_decision_id.get(decision_run_id)
@@ -6432,5 +6588,14 @@ def get_audit_event_detail(session: Session, audit_event_id: int) -> dict[str, o
     return rows[0] if rows else None
 
 
-def get_alerts(session: Session, limit: int = 50) -> list[dict[str, object]]:
-    return _serialize_model_list(list(session.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(limit))))
+def get_alerts(
+    session: Session,
+    limit: int = 50,
+    *,
+    acknowledged: bool | None = None,
+) -> list[dict[str, object]]:
+    stmt = select(Alert)
+    if acknowledged is not None:
+        stmt = stmt.where(Alert.acknowledged.is_(acknowledged))
+    stmt = stmt.order_by(desc(Alert.created_at)).limit(limit)
+    return _serialize_model_list(list(session.scalars(stmt)))

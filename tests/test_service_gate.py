@@ -4,8 +4,12 @@ from datetime import timedelta
 
 from sqlalchemy import select
 from trading_mvp.models import AuditEvent, Order, PendingEntryPlan, Position
-from trading_mvp.services.runtime_state import set_reconciliation_detail
+from trading_mvp.services.runtime_state import (
+    replace_market_stream_detail,
+    set_reconciliation_detail,
+)
 from trading_mvp.services.service_gate import (
+    REDIS_CACHE_UNAVAILABLE_BLOCKER,
     build_service_switch_gate_snapshot,
     normalize_stale_pending_entry_plan_history,
 )
@@ -118,6 +122,30 @@ def test_service_gate_treats_expired_triggered_non_terminal_plan_as_stale_histor
     assert snapshot["counts"]["active_pending_entry_plans"] == 0
     assert snapshot["counts"]["triggered_stale_history_entry_plans"] == 1
     assert snapshot["triggered_stale_history_entry_plans"][0]["gate_state"] == "triggered_stale_history"
+
+
+def test_service_gate_blocks_when_configured_redis_is_unavailable(db_session) -> None:
+    settings = _synced_gate_settings(db_session)
+    replace_market_stream_detail(
+        settings,
+        {
+            "redis_configured": True,
+            "redis_connected": False,
+            "cache_health": "unavailable",
+            "cache_reject_reason": "redis_unavailable",
+            "last_shared_cache_error": "connection refused",
+        },
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["gate_clear"] is False
+    assert REDIS_CACHE_UNAVAILABLE_BLOCKER in snapshot["blockers"]
+    assert snapshot["counts"][REDIS_CACHE_UNAVAILABLE_BLOCKER] == 1
+    assert snapshot["redis_cache"]["blocking"] is True
+    assert snapshot["redis_cache"]["redis_configured"] is True
+    assert snapshot["redis_cache"]["redis_connected"] is False
 
 
 def test_normalize_stale_pending_entry_plan_history_expires_only_stale_triggered(db_session) -> None:

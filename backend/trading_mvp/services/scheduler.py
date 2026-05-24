@@ -1059,21 +1059,21 @@ def run_market_refresh_cycle(session: Session, triggered_by: str = "scheduler") 
                 )
             )
         except Exception as exc:
-            row = _start_scheduler_run(
-                session,
-                workflow=MARKET_REFRESH_WORKFLOW,
-                schedule_window=schedule_window,
-                triggered_by=triggered_by,
+            failure_payload = _scheduler_error_payload(
+                exc,
+                stage="market_refresh",
                 symbol=effective.symbol,
-                next_run_at=next_run_at,
             )
             results.append(
-                _finish_scheduler_run(
+                _persist_scheduler_failure_result(
                     session,
-                    row=row,
-                    success=False,
+                    workflow=MARKET_REFRESH_WORKFLOW,
+                    schedule_window=schedule_window,
+                    triggered_by=triggered_by,
+                    symbol=effective.symbol,
+                    next_run_at=next_run_at,
                     message="Market refresh cycle failed.",
-                    payload={"symbol": effective.symbol, "error": str(exc)},
+                    payload=failure_payload,
                 )
             )
     return {"workflow": MARKET_REFRESH_WORKFLOW, "results": results}

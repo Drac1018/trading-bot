@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from trading_mvp import config as config_module
 from trading_mvp.database import Base, get_db
 from trading_mvp.main import app
 from trading_mvp.models import (
@@ -42,10 +43,13 @@ from trading_mvp.services.runtime_state import (
     set_drawdown_state_detail,
 )
 from trading_mvp.services.settings import (
+    arm_live_execution,
+    build_operational_status_payload,
     get_or_create_settings,
     serialize_settings,
     serialize_settings_ai_usage,
     serialize_settings_cadences,
+    serialize_settings_runtime_summary,
     serialize_settings_view,
     set_trading_pause,
     should_call_openai,
@@ -268,6 +272,26 @@ def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> No
     assert profile_settings["operation"]["manual_cycle_endpoint"] == "/api/cycles/run"
 
 
+def test_settings_runtime_summary_can_skip_duplicate_operational_payloads(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+
+    default_payload = serialize_settings_runtime_summary(row)
+    thin_payload = serialize_settings_runtime_summary(
+        row,
+        include_operational_status=False,
+        include_event_operator_control=False,
+    )
+
+    assert "operational_status" in default_payload
+    assert "event_operator_control" in default_payload
+    assert "binance_rest_summary" in default_payload
+    assert "operational_status" not in thin_payload
+    assert "event_operator_control" not in thin_payload
+    assert "binance_rest_summary" not in thin_payload
+    assert thin_payload["account_sync_summary"]
+    assert thin_payload["sync_freshness_summary"]
+
+
 def test_settings_update_persists_execution_risk_profile_policy(db_session) -> None:
     payload = build_settings_payload().model_copy(
         update={
@@ -468,6 +492,62 @@ def test_settings_ai_usage_reuses_source_revision_cache(db_session, monkeypatch)
     assert calls["count"] == 4
 
 
+def test_ai_usage_detail_loader_skips_unrelated_agent_runs(db_session) -> None:
+    now = utcnow_naive()
+    openai_run = AgentRun(
+        role="trading_decision",
+        trigger_event="entry_candidate_event",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="openai decision",
+        input_payload={},
+        output_payload={"decision": "hold"},
+        metadata_json={
+            "source": "llm",
+            "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
+        },
+        created_at=now,
+    )
+    pre_ai_skip = AgentRun(
+        role="trading_decision",
+        trigger_event="entry_candidate_event",
+        schema_name="TradeDecision",
+        status="skipped",
+        provider_name="deterministic",
+        summary="quality gate skip",
+        input_payload={},
+        output_payload={},
+        metadata_json={"pre_ai_skip_reason": "LOW_SCORE"},
+        created_at=now - timedelta(minutes=1),
+    )
+    unrelated_run = AgentRun(
+        role="trading_decision",
+        trigger_event="entry_candidate_event",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="deterministic",
+        summary="large deterministic payload",
+        input_payload={},
+        output_payload={"large_blob": "x" * 200_000},
+        metadata_json={"source": "deterministic"},
+        created_at=now,
+    )
+    db_session.add_all([openai_run, pre_ai_skip, unrelated_run])
+    db_session.flush()
+
+    rows = ai_usage_service._load_ai_usage_rows(
+        db_session,
+        cutoff_30d=now - timedelta(days=30),
+        limit=50,
+    )
+    row_ids = {row.id for row in rows}
+
+    assert openai_run.id in row_ids
+    assert pre_ai_skip.id in row_ids
+    assert unrelated_run.id not in row_ids
+
+
 def test_openai_call_gate_applies_global_quota_backoff(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
     row.ai_enabled = True
@@ -645,6 +725,91 @@ def test_openai_call_gate_blocks_trading_decision_daily_token_budget(db_session)
     assert budget["status"] == "blocked"
     assert budget["tokens_24h"] == 1_000_001
     assert budget["max_tokens_24h"] == 1_000_000
+
+
+def test_openai_call_gate_blocks_low_actionability_entry_ai_cost(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    row.ai_enabled = True
+    row.ai_provider = "openai"
+    now = utcnow_naive()
+    for offset in range(60):
+        db_session.add(
+            AgentRun(
+                role="trading_decision",
+                trigger_event="realtime_cycle",
+                schema_name="TradeDecision",
+                status="completed",
+                provider_name="openai",
+                summary="hold",
+                input_payload={"market_snapshot": {"symbol": "BTCUSDT"}},
+                output_payload={"decision": "hold"},
+                metadata_json={
+                    "source": "llm",
+                    "symbol": "BTCUSDT",
+                    "usage": {
+                        "prompt_tokens": 1_000,
+                        "completion_tokens": 100,
+                        "total_tokens": 1_100,
+                    },
+                },
+                schema_valid=True,
+                created_at=now - timedelta(days=1, minutes=offset),
+            )
+        )
+    db_session.flush()
+
+    gate = get_openai_call_gate(
+        db_session,
+        row,
+        "trading_decision",
+        "realtime_cycle",
+        has_openai_key=True,
+        symbol="BTCUSDT",
+    )
+    explicit_gate = get_openai_call_gate(
+        db_session,
+        row,
+        "trading_decision",
+        "realtime_cycle",
+        has_openai_key=True,
+        symbol="BTCUSDT",
+        enforce_waste_guard=True,
+    )
+    manual_gate = get_openai_call_gate(
+        db_session,
+        row,
+        "trading_decision",
+        "manual",
+        has_openai_key=True,
+        symbol="BTCUSDT",
+        enforce_waste_guard=True,
+    )
+
+    assert gate.allowed is False
+    assert gate.reason == "low_actionability_cost_guard_active"
+    assert explicit_gate.allowed is False
+    assert explicit_gate.reason == gate.reason
+    assert gate.retry_after_seconds == 360 * 60
+    assert gate.evidence is not None
+    assert gate.evidence["provider_calls"] == 60
+    assert gate.evidence["orders"] == 0
+    assert gate.evidence["provider_to_order_rate"] == 0.0
+    assert gate.evidence["net_after_known_ai_cost_usd"] < 0
+    assert gate.as_metadata()["evidence"]["fallback"] == (
+        "skip provider call; deterministic HOLD/fail-closed path remains active"
+    )
+    assert manual_gate.allowed is True
+    clear_ai_usage_metrics_cache()
+    try:
+        usage = serialize_settings_ai_usage(row)
+    finally:
+        clear_ai_usage_metrics_cache()
+    runtime_guard = usage["ai_cost_efficiency_summary"]["waste_assessment"]["runtime_guard"]
+    assert runtime_guard["status"] == "active"
+    assert runtime_guard["reason"] == "low_actionability_cost_guard_active"
+    assert runtime_guard["provider_calls_7d"] == 60
+    assert runtime_guard["provider_to_order_rate_7d"] == 0.0
+    assert runtime_guard["net_after_known_ai_cost_usd_7d"] < 0
 
 
 def test_openai_call_gate_uses_configurable_trading_decision_daily_token_budget(db_session) -> None:
@@ -1679,7 +1844,7 @@ def test_serialize_settings_reports_emergency_exit_guard_reason(db_session) -> N
     assert serialized["guard_mode_reason_message"] == "비상 청산 상태가 진행 중이라 가드 모드입니다."
 
 
-def test_settings_api_splits_heavy_payloads(testclient_db_factory) -> None:
+def test_settings_api_splits_heavy_payloads(testclient_db_factory, full_live_operator_headers) -> None:
     TestingSessionLocal = testclient_db_factory("settings_view_split.db")
 
     with TestingSessionLocal() as session:
@@ -1702,9 +1867,9 @@ def test_settings_api_splits_heavy_payloads(testclient_db_factory) -> None:
         session.commit()
 
     with TestClient(app) as client:
-        view_response = client.get("/api/settings")
-        cadence_response = client.get("/api/settings/cadences")
-        usage_response = client.get("/api/settings/ai-usage")
+        view_response = client.get("/api/settings", headers=full_live_operator_headers)
+        cadence_response = client.get("/api/settings/cadences", headers=full_live_operator_headers)
+        usage_response = client.get("/api/settings/ai-usage", headers=full_live_operator_headers)
 
     assert view_response.status_code == 200
     assert cadence_response.status_code == 200
@@ -1731,9 +1896,17 @@ def test_settings_endpoint_allows_loopback_origin_without_port(testclient_db_fac
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1"
+    allowed_methods = response.headers["access-control-allow-methods"]
+    assert "*" not in allowed_methods
+    assert "PUT" in allowed_methods
+    assert "DELETE" not in allowed_methods
 
 
-def test_settings_view_does_not_trigger_exchange_sync_read_refresh(testclient_db_factory, monkeypatch) -> None:
+def test_settings_view_does_not_trigger_exchange_sync_read_refresh(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     TestingSessionLocal = testclient_db_factory("settings_view_no_read_refresh.db")
 
     with TestingSessionLocal() as session:
@@ -1749,14 +1922,166 @@ def test_settings_view_does_not_trigger_exchange_sync_read_refresh(testclient_db
     monkeypatch.setattr("trading_mvp.main._refresh_exchange_sync_for_read", record_trigger)
 
     with TestClient(app) as client:
-        response = client.get("/api/settings")
+        response = client.get("/api/settings", headers=full_live_operator_headers)
 
     assert response.status_code == 200
     assert refresh_triggers == []
 
 
+def test_full_live_write_api_requires_operator_key(testclient_db_factory, monkeypatch) -> None:
+    from trading_mvp.config import get_settings
 
-def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_full_live_auth.db")
+    monkeypatch.setenv("APP_SECRET_SEED", "pytest-non-default-secret")
+    monkeypatch.setenv("OPERATOR_API_KEY", "")
+    get_settings.cache_clear()
+
+    try:
+        with TestingSessionLocal() as session:
+            update_settings(session, build_settings_payload())
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.post("/api/live/sync")
+
+        assert response.status_code == 503
+        assert "OPERATOR_API_KEY" in response.json()["detail"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_full_live_write_api_rejects_generic_operator_intent(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'operator_full_live_intent.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setenv("APP_SECRET_SEED", "pytest-non-default-secret")
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    config_module.get_settings.cache_clear()
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestingSessionLocal() as session:
+            update_settings(session, build_settings_payload())
+            session.commit()
+
+        with TestClient(app) as client:
+            generic_response = client.post(
+                "/api/settings/pause",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "operator.write",
+                },
+            )
+            exact_response = client.post(
+                "/api/settings/pause",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "settings.pause",
+                },
+            )
+            generic_manual_window_response = client.post(
+                "/api/settings/manual-no-trade-windows",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "operator.write",
+                },
+                json={
+                    "scope": {"scope_type": "symbols", "symbols": ["BTCUSDT"]},
+                    "start_at": "2030-01-01T00:00:00Z",
+                    "end_at": "2030-01-01T01:00:00Z",
+                    "reason": "pytest full_live intent check",
+                    "auto_resume": False,
+                    "require_manual_rearm": False,
+                    "created_by": "pytest",
+                },
+            )
+            exact_manual_window_response = client.post(
+                "/api/settings/manual-no-trade-windows",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "settings.manual_no_trade_window",
+                },
+                json={
+                    "scope": {"scope_type": "symbols", "symbols": ["BTCUSDT"]},
+                    "start_at": "2030-01-01T00:00:00Z",
+                    "end_at": "2030-01-01T01:00:00Z",
+                    "reason": "pytest full_live intent check",
+                    "auto_resume": False,
+                    "require_manual_rearm": False,
+                    "created_by": "pytest",
+                },
+            )
+
+        assert generic_response.status_code == 403
+        assert exact_response.status_code == 200
+        assert generic_manual_window_response.status_code == 403
+        assert exact_manual_window_response.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+        config_module.get_settings.cache_clear()
+
+
+def test_full_live_live_arm_blocks_stale_exchange_sync(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'live_arm_stale_sync.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setenv("APP_SECRET_SEED", "pytest-non-default-secret")
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    config_module.get_settings.cache_clear()
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestingSessionLocal() as session:
+            row = update_settings(session, build_settings_payload())
+            stale_at = utcnow_naive() - timedelta(hours=2)
+            mark_sync_success(row, scope="account", synced_at=stale_at, stale_after_seconds=60)
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/settings/live/arm",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "settings.live_arm",
+                },
+            )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["reason_code"] == "FULL_LIVE_SYNC_STALE"
+        assert "ACCOUNT_STATE_STALE" in detail["blocked_reason_codes"]
+    finally:
+        app.dependency_overrides.clear()
+        config_module.get_settings.cache_clear()
+
+
+def test_full_live_armed_blocks_when_exchange_can_trade_unknown(db_session) -> None:
+    settings_row = update_settings(db_session, build_settings_payload())
+    arm_live_execution(db_session, 15)
+    db_session.flush()
+
+    status = build_operational_status_payload(settings_row)
+
+    assert status.can_enter_new_position is False
+    assert status.exchange_connectivity_state == "degraded"
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in status.blocked_reason_codes
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in status.control_status_summary.degraded_reason_codes
+
+
+
+def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch, full_live_operator_headers) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'settings_api.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(bind=test_engine)
@@ -1770,11 +2095,11 @@ def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> No
 
     try:
         with TestClient(app) as client:
-            pause_response = client.post("/api/settings/pause")
+            pause_response = client.post("/api/settings/pause", headers=full_live_operator_headers)
             assert pause_response.status_code == 200
             assert pause_response.json()["trading_paused"] is True
 
-            resume_response = client.post("/api/settings/resume")
+            resume_response = client.post("/api/settings/resume", headers=full_live_operator_headers)
             assert resume_response.status_code == 200
             assert resume_response.json()["trading_paused"] is False
 
@@ -1794,7 +2119,211 @@ def test_pause_resume_endpoints_record_audit_events(tmp_path, monkeypatch) -> No
         app.dependency_overrides.clear()
 
 
-def test_resume_attempt_endpoint_keeps_non_eligible_system_pause(tmp_path, monkeypatch) -> None:
+def test_operator_api_key_dependency_blocks_write_without_header(tmp_path, monkeypatch) -> None:
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'operator_auth.db'}", future=True)
+    TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    config_module.get_settings.cache_clear()
+    monkeypatch.setattr("trading_mvp.main.engine", test_engine)
+
+    def override_get_db():
+        with TestingSessionLocal() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as client:
+            missing_response = client.post("/api/settings/pause")
+            assert missing_response.status_code == 401
+
+            missing_intent_response = client.post(
+                "/api/settings/pause",
+                headers={"X-Operator-API-Key": "operator-test-key"},
+            )
+            assert missing_intent_response.status_code == 403
+
+            wrong_intent_response = client.post(
+                "/api/settings/pause",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "settings.resume",
+                },
+            )
+            assert wrong_intent_response.status_code == 403
+
+            ok_response = client.post(
+                "/api/settings/pause",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "settings.pause",
+                },
+            )
+            assert ok_response.status_code == 200
+            assert ok_response.json()["trading_paused"] is True
+
+        with TestingSessionLocal() as session:
+            gate_events = session.execute(
+                text(
+                    """
+                select event_type, json_extract(payload, '$.reason_code') as reason_code
+                from audit_events
+                where entity_type = 'operator_write_gate'
+                order by id asc
+                """
+                )
+            ).all()
+            assert ("operator_write_denied", "operator_auth_failed") in gate_events
+            assert ("operator_write_denied", "operator_intent_mismatch") in gate_events
+            assert ("operator_write_authorized", None) in gate_events
+    finally:
+        app.dependency_overrides.clear()
+        config_module.get_settings.cache_clear()
+
+
+def test_operator_api_key_dependency_blocks_read_without_header(
+    testclient_db_factory,
+    monkeypatch,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_read_auth.db")
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    config_module.get_settings.cache_clear()
+
+    try:
+        with TestingSessionLocal() as session:
+            get_or_create_settings(session)
+            session.commit()
+
+        with TestClient(app) as client:
+            missing_response = client.get("/api/settings")
+            ok_response = client.get(
+                "/api/settings",
+                headers={"X-Operator-API-Key": "operator-test-key"},
+            )
+
+        assert missing_response.status_code == 401
+        assert ok_response.status_code == 200
+    finally:
+        config_module.get_settings.cache_clear()
+
+
+def test_operator_viewer_key_can_read_but_cannot_write(
+    testclient_db_factory,
+    monkeypatch,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_role_auth.db")
+    monkeypatch.setenv("OPERATOR_VIEWER_API_KEY", "viewer-test-key")
+    monkeypatch.setenv("OPERATOR_TRADER_API_KEY", "trader-test-key")
+    monkeypatch.setenv("OPERATOR_ADMIN_API_KEY", "admin-test-key")
+    config_module.get_settings.cache_clear()
+
+    try:
+        with TestingSessionLocal() as session:
+            get_or_create_settings(session)
+            session.commit()
+
+        with TestClient(app) as client:
+            read_response = client.get(
+                "/api/settings",
+                headers={"X-Operator-API-Key": "viewer-test-key"},
+            )
+            viewer_write_response = client.post(
+                "/api/settings/pause",
+                headers={
+                    "X-Operator-API-Key": "viewer-test-key",
+                    "X-Operator-Intent": "settings.pause",
+                },
+            )
+            trader_write_response = client.post(
+                "/api/settings/pause",
+                headers={
+                    "X-Operator-API-Key": "trader-test-key",
+                    "X-Operator-Intent": "settings.pause",
+                },
+            )
+            trader_admin_response = client.put(
+                "/api/settings",
+                headers={
+                    "X-Operator-API-Key": "trader-test-key",
+                    "X-Operator-Intent": "settings.update",
+                },
+                json=build_settings_payload().model_dump(mode="json"),
+            )
+
+        assert read_response.status_code == 200
+        assert viewer_write_response.status_code == 403
+        assert trader_write_response.status_code == 200
+        assert trader_admin_response.status_code == 403
+    finally:
+        config_module.get_settings.cache_clear()
+
+
+def test_operator_api_rate_limit_returns_429(testclient_db_factory, monkeypatch) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_rate_limit.db")
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    monkeypatch.setenv("OPERATOR_API_RATE_LIMIT_PER_MINUTE", "1")
+    config_module.get_settings.cache_clear()
+    main_module._operator_rate_limit_buckets.clear()
+
+    try:
+        with TestingSessionLocal() as session:
+            get_or_create_settings(session)
+            session.commit()
+
+        with TestClient(app) as client:
+            first_response = client.get(
+                "/api/settings",
+                headers={"X-Operator-API-Key": "operator-test-key"},
+            )
+            second_response = client.get(
+                "/api/settings",
+                headers={"X-Operator-API-Key": "operator-test-key"},
+            )
+
+        assert first_response.status_code == 200
+        assert second_response.status_code == 429
+        assert second_response.headers["Retry-After"] == "60"
+    finally:
+        main_module._operator_rate_limit_buckets.clear()
+        config_module.get_settings.cache_clear()
+
+
+def test_operator_api_rate_limit_buckets_invalid_keys_by_client(testclient_db_factory, monkeypatch) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_invalid_key_rate_limit.db")
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    monkeypatch.setenv("OPERATOR_API_RATE_LIMIT_PER_MINUTE", "1")
+    config_module.get_settings.cache_clear()
+    main_module._operator_rate_limit_buckets.clear()
+
+    try:
+        with TestingSessionLocal() as session:
+            get_or_create_settings(session)
+            session.commit()
+
+        with TestClient(app) as client:
+            first_response = client.get(
+                "/api/settings",
+                headers={"X-Operator-API-Key": "wrong-key-1"},
+            )
+            second_response = client.get(
+                "/api/settings",
+                headers={"X-Operator-API-Key": "wrong-key-2"},
+            )
+
+        assert first_response.status_code == 401
+        assert second_response.status_code == 429
+        assert second_response.headers["Retry-After"] == "60"
+    finally:
+        main_module._operator_rate_limit_buckets.clear()
+        config_module.get_settings.cache_clear()
+
+
+def test_resume_attempt_endpoint_keeps_non_eligible_system_pause(
+    tmp_path,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'settings_resume_attempt.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(bind=test_engine)
@@ -1819,7 +2348,10 @@ def test_resume_attempt_endpoint_keeps_non_eligible_system_pause(tmp_path, monke
             session.commit()
 
         with TestClient(app) as client:
-            response = client.post("/api/settings/resume/attempt")
+            response = client.post(
+                "/api/settings/resume/attempt",
+                headers={**full_live_operator_headers, "X-Operator-Intent": "settings.resume_attempt"},
+            )
 
         assert response.status_code == 200
         payload = response.json()
@@ -1971,6 +2503,8 @@ def test_review_api_rejects_out_of_scope_windows(tmp_path, monkeypatch) -> None:
     test_engine = create_engine(f"sqlite:///{tmp_path / 'review_api.db'}", future=True)
     TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setenv("OPERATOR_API_KEY", "operator-test-key")
+    config_module.get_settings.cache_clear()
     monkeypatch.setattr("trading_mvp.main.engine", test_engine)
 
     def override_get_db():
@@ -1981,8 +2515,15 @@ def test_review_api_rejects_out_of_scope_windows(tmp_path, monkeypatch) -> None:
 
     try:
         with TestClient(app) as client:
-            response = client.post("/api/reviews/24h")
+            response = client.post(
+                "/api/reviews/24h",
+                headers={
+                    "X-Operator-API-Key": "operator-test-key",
+                    "X-Operator-Intent": "review.run",
+                },
+            )
             assert response.status_code == 400
             assert "Only 1h review window is enabled" in response.json()["detail"]
     finally:
+        config_module.get_settings.cache_clear()
         app.dependency_overrides.clear()

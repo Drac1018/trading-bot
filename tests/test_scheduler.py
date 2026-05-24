@@ -1158,6 +1158,45 @@ def test_market_refresh_cycle_skips_when_workflow_lease_is_held(monkeypatch, db_
     assert event.payload["reason"] == "WORKFLOW_LEASE_HELD"
 
 
+def test_market_refresh_cycle_recovers_session_before_persisting_failure(monkeypatch, db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    settings_row.default_timeframe = "15m"
+    db_session.add(settings_row)
+    db_session.flush()
+
+    def fail_with_poisoned_transaction(self, **kwargs):  # noqa: ANN001, ARG001
+        self.session.add(
+            SchedulerRun(
+                schedule_window=None,
+                workflow="poisoned_market_refresh",
+                status="running",
+                triggered_by="test",
+                outcome={},
+            )
+        )
+        self.session.flush()
+
+    monkeypatch.setattr(TradingOrchestrator, "run_market_refresh_cycle", fail_with_poisoned_transaction)
+
+    result = run_market_refresh_cycle(db_session, triggered_by="scheduler")
+    scheduler_run = db_session.scalar(
+        select(SchedulerRun)
+        .where(SchedulerRun.workflow == "market_refresh_cycle")
+        .order_by(SchedulerRun.id.desc())
+        .limit(1)
+    )
+
+    assert result["results"]
+    assert result["results"][0]["status"] == "failed"
+    assert result["results"][0]["outcome"]["stage"] == "market_refresh"
+    assert result["results"][0]["outcome"]["scheduler_failure_persisted"] is True
+    assert scheduler_run is not None
+    assert scheduler_run.status == "failed"
+    assert scheduler_run.outcome["symbol"] == "BTCUSDT"
+    assert scheduler_run.outcome["scheduler_failure_persisted"] is True
+
+
 def test_deduped_entry_trigger_surfaces_reason_fields(monkeypatch, db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True

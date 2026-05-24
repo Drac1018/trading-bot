@@ -3921,6 +3921,58 @@ def test_sync_live_state_reconciles_enabled_symbols_only_and_records_one_way_map
     assert position.metadata_json["exchange_position_mode"] == "one_way"
 
 
+def test_sync_live_state_missing_cantrade_keeps_unknown_entry_blocker(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    client = StreamPrimarySyncClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: _connected_user_stream_payload(),
+    )
+
+    sync_live_state(db_session, settings_row, symbol="BTCUSDT", allow_protection_recovery=False)
+    db_session.flush()
+
+    summary = serialize_settings(settings_row)["operational_status"]["control_status_summary"]
+
+    assert summary["exchange_can_trade"] is None
+    assert summary["exchange_can_trade_known"] is False
+    assert summary["exchange_can_trade_source"] == "binance_account_info_missing_canTrade"
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in summary["blocked_reasons_current_cycle"]
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in summary["degraded_reason_codes"]
+
+
+def test_sync_live_state_uses_account_config_cantrade_when_account_info_omits(
+    monkeypatch,
+    db_session,
+) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+
+    class AccountConfigSyncClient(StreamPrimarySyncClient):
+        def get_account_config(self):
+            return {"canTrade": True}
+
+    client = AccountConfigSyncClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: _connected_user_stream_payload(),
+    )
+
+    sync_live_state(db_session, settings_row, symbol="BTCUSDT", allow_protection_recovery=False)
+    db_session.flush()
+
+    summary = serialize_settings(settings_row)["operational_status"]["control_status_summary"]
+
+    assert summary["exchange_can_trade"] is True
+    assert summary["exchange_can_trade_known"] is True
+    assert summary["exchange_can_trade_source"] == "binance_account_config"
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" not in summary["blocked_reasons_current_cycle"]
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" not in summary["degraded_reason_codes"]
+
+
 def test_sync_live_state_prefetches_bulk_exchange_state_for_multi_symbol_sync(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     settings_row = get_or_create_settings(db_session)

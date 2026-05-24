@@ -92,6 +92,10 @@ export type SymbolEffectiveCadence = {
 };
 
 export type ControlStatusSummary = {
+  exchange_can_trade?: boolean | null;
+  exchange_can_trade_known?: boolean;
+  exchange_can_trade_source?: string;
+  exchange_can_trade_checked_at?: string | null;
   exchange_connectivity_state?: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;
