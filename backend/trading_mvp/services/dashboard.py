@@ -1240,7 +1240,7 @@ def _analytics_slippage_metrics(
     execution_rows: Sequence[tuple[Execution, Order]],
 ) -> tuple[float | None, float | None, str, int]:
     if not execution_rows:
-        return None, None, "UNKNOWN", 0
+        return None, None, "NO_SAMPLE", 0
 
     signed_weighted_sum = 0.0
     adverse_weighted_sum = 0.0
@@ -1580,7 +1580,7 @@ def get_analytics_cost_breakdown(
         warnings.append(f"missing_close_execution_count:{data_quality.missing_close_execution_count}")
     if data_quality.funding_sync_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
         warnings.append(f"funding_sync_status:{data_quality.funding_sync_status}")
-    if data_quality.slippage_data_status in {"INCOMPLETE", "UNKNOWN"}:
+    if data_quality.slippage_data_status in {"INCOMPLETE", "NO_SAMPLE", "UNKNOWN"}:
         warnings.append(f"slippage_data_status:{data_quality.slippage_data_status}")
 
     bucket_bounds = _analytics_bucket_bounds(
@@ -6132,6 +6132,16 @@ def _operator_execution_profile_state(settings_row: Setting) -> dict[str, Any]:
     }
 
 
+def _operator_limited_live_readiness(session: Session) -> LimitedLiveReadinessReport:
+    report = build_signal_performance_report(
+        session,
+        window_specs=OPERATOR_PERFORMANCE_WINDOW_SPECS,
+        limit=OPERATOR_PERFORMANCE_ENTRY_LIMIT,
+    )
+    first_window = report.windows[0] if report.windows else None
+    return first_window.limited_live_readiness if first_window is not None else LimitedLiveReadinessReport()
+
+
 def get_operator_dashboard(session: Session, *, view: str | None = None) -> OperatorDashboardResponse:
     operator_view = _normalize_operator_dashboard_view(view)
     fact_decision_projection = operator_view in {"decision", "scheduler"}
@@ -6200,7 +6210,7 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
         ]
     )
     limited_live_readiness = (
-        LimitedLiveReadinessReport() if profitability is None else profitability.limited_live_readiness
+        _operator_limited_live_readiness(session) if profitability is None else profitability.limited_live_readiness
     )
     service_gate_snapshot = build_service_switch_gate_snapshot(session)
     audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT) if include_audit_events else []

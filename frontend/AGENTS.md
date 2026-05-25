@@ -19,6 +19,7 @@
 
 변경 범위에 맞춰 아래를 우선 실행:
 
-* `C:\my-trading-bot\.tools\node-v24.14.1-win-x64\corepack.cmd pnpm -C C:\my-trading-bot\frontend lint`
-* `C:\my-trading-bot\.tools\node-v24.14.1-win-x64\corepack.cmd pnpm -C C:\my-trading-bot\frontend build`
+* `& 'C:\Program Files\nodejs\corepack.cmd' pnpm -C C:\my-trading-bot\frontend lint`
+* `& 'C:\Program Files\nodejs\corepack.cmd' pnpm -C C:\my-trading-bot\frontend build`
+* `C:\Program Files\nodejs\corepack.cmd`가 없으면 `Test-Path 'C:\my-trading-bot\.tools\node-v22.21.1-win-x64\corepack.cmd'`를 확인한 뒤 해당 로컬 Corepack을 fallback으로 사용한다. 현재 `.tools\node-v24.14.1-win-x64\corepack.cmd`는 없다.
 * 인증/프록시/라우팅 변경 시 `pnpm -C frontend test:smoke` 또는 현재 Playwright smoke 경로 확인

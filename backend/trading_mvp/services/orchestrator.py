@@ -71,6 +71,10 @@ from trading_mvp.services.drawdown_state import (
     build_drawdown_state_snapshot,
 )
 from trading_mvp.services.event_context import EventContextProvider, resolve_event_context_provider
+from trading_mvp.services.exchange_permission import (
+    EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE,
+    exchange_trade_permission_entry_blocker,
+)
 from trading_mvp.services.execution import (
     apply_position_management,
     execute_live_trade,
@@ -123,6 +127,7 @@ from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
     get_drawdown_state_detail,
+    get_sync_state_detail,
     get_unresolved_submission_guard,
     mark_sync_skipped,
     set_candidate_selection_detail,
@@ -138,6 +143,7 @@ from trading_mvp.services.settings import (
     get_effective_symbols,
     get_execution_risk_profile_policy,
     get_or_create_settings,
+    get_rollout_mode,
     get_runtime_credentials,
     is_live_execution_armed,
     rollout_mode_allows_exchange_submit,
@@ -4488,6 +4494,12 @@ class TradingOrchestrator:
         if decision_side not in {"long", "short"}:
             return False
         blockers = set(getattr(risk_result, "blocked_reason_codes", []) or getattr(risk_result, "reason_codes", []))
+        if (
+            EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE in blockers
+            and get_rollout_mode(self.settings_row) == "full_live"
+            and rollout_mode_allows_exchange_submit(self.settings_row)
+        ):
+            return False
         storage_blockers = ENTRY_PLAN_WATCH_STORAGE_BLOCKERS if watch_entry_plan else ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
         return len(blockers - storage_blockers) == 0
 
@@ -4730,21 +4742,30 @@ class TradingOrchestrator:
             and guard_reason_code not in ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
         ):
             reason_codes = cls._unique_reason_codes([*reason_codes, guard_reason_code])
+        rollout_mode = str(getattr(operational_status, "rollout_mode", "") or "")
+        if (
+            EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE in raw_reason_codes
+            and rollout_mode == "full_live"
+            and bool(getattr(operational_status, "exchange_submit_allowed", False))
+        ):
+            reason_codes = cls._unique_reason_codes(
+                [*reason_codes, EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE]
+            )
         if bool(getattr(operational_status, "can_enter_new_position", False)):
             return False, reason_codes
 
         exchange_unknown_only = (
-            "EXCHANGE_CAN_TRADE_UNKNOWN" in raw_reason_codes
+            EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE in raw_reason_codes
             and not reason_codes
+            and rollout_mode in ENTRY_PLAN_SIMULATION_ROLLOUT_MODES
             and bool(getattr(operational_status, "live_execution_ready", False))
             and not bool(getattr(operational_status, "trading_paused", False))
             and str(getattr(operational_status, "operating_state", "") or "") == "TRADABLE"
-            and bool(getattr(operational_status, "exchange_submit_allowed", False))
+            and not bool(getattr(operational_status, "exchange_submit_allowed", False))
         )
         if exchange_unknown_only:
             return False, []
 
-        rollout_mode = str(getattr(operational_status, "rollout_mode", "") or "")
         simulation_without_submit = (
             rollout_mode in ENTRY_PLAN_SIMULATION_ROLLOUT_MODES
             and not bool(getattr(operational_status, "exchange_submit_allowed", False))
@@ -5254,6 +5275,9 @@ class TradingOrchestrator:
         generated_at: datetime,
         retry_after_seconds: int = 0,
         gate_payload: dict[str, object] | None = None,
+        hard_skip_ai: bool = False,
+        skip_category: str | None = None,
+        hard_skip_reason_codes: list[str] | None = None,
         correlation_ids: dict[str, object] | None = None,
     ) -> dict[str, object]:
         metadata = self._pending_entry_plan_metadata(plan)
@@ -5269,7 +5293,13 @@ class TradingOrchestrator:
             "symbol": plan.symbol,
             "scope": "entry_plan_recheck",
             "reason": reason,
-            "hard_skip_ai": False,
+            "hard_skip_ai": hard_skip_ai,
+            "skip_category": skip_category,
+            "hard_skip_reason_codes": list(
+                hard_skip_reason_codes
+                if hard_skip_reason_codes is not None
+                else [reason] if hard_skip_ai else []
+            ),
             "plan_id": plan.id,
             "source_decision_run_id": plan.source_decision_run_id,
             "retry_after_seconds": retry_after_seconds,
@@ -7928,6 +7958,9 @@ class TradingOrchestrator:
             entry_control_blocked, entry_control_blocked_reasons = self._entry_plan_control_block(
                 operational_status
             )
+            entry_exchange_permission_pre_ai_block = self._risk_adding_exchange_permission_pre_ai_block(
+                intent_type="entry"
+            )
             entry_capacity_risk_budget: dict[str, object] | None = None
             symbol_results: list[dict[str, object]] = []
             for plan in active_plans:
@@ -8079,17 +8112,49 @@ class TradingOrchestrator:
                     result_item["status"] = "expired"
                     symbol_results.append(result_item)
                     continue
-                if entry_control_blocked:
+                if entry_control_blocked or entry_exchange_permission_pre_ai_block is not None:
+                    blocked_reasons = list(entry_control_blocked_reasons)
+                    exchange_permission_payload: dict[str, object] | None = None
+                    if entry_exchange_permission_pre_ai_block is not None:
+                        reason_code = str(entry_exchange_permission_pre_ai_block["reason_code"])
+                        blocked_reasons = self._unique_reason_codes([*blocked_reasons, reason_code])
+                        exchange_permission_payload = dict(entry_exchange_permission_pre_ai_block)
+                        ai_recheck = self._record_entry_plan_ai_recheck_skip(
+                            plan=plan,
+                            reason=reason_code,
+                            generated_at=generated_at,
+                            gate_payload={"exchange_permission": exchange_permission_payload},
+                            hard_skip_ai=True,
+                            skip_category="hard_skip_ai",
+                            hard_skip_reason_codes=[reason_code],
+                            correlation_ids=normalize_correlation_ids(
+                                cycle_id=f"entry-plan-watch:{plan.id}:{market_row.id}",
+                                snapshot_id=market_row.id,
+                                decision_id=plan.source_decision_run_id,
+                            ),
+                        )
+                        result_item["ai_recheck"] = {
+                            "status": ai_recheck.get("status"),
+                            "skip_reason": ai_recheck.get("skip_reason"),
+                            "retry_after_seconds": ai_recheck.get("retry_after_seconds"),
+                            "decision_run_id": None,
+                            "decision": None,
+                            "ai_call_policy": ai_recheck.get("ai_call_policy"),
+                            "trigger": None,
+                        }
                     self._defer_pending_entry_plan(
                         plan,
                         reason="PLAN_WAITING_FOR_ENTRY_CONTROL",
                         generated_at=generated_at,
                         market_row_id=market_row.id,
-                        detail={"blocked_reasons": list(entry_control_blocked_reasons)},
+                        detail={
+                            "blocked_reasons": blocked_reasons,
+                            "exchange_permission": exchange_permission_payload,
+                        },
                     )
                     result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
                     result_item["status"] = "control_blocked"
-                    result_item["blocked_reasons"] = list(entry_control_blocked_reasons)
+                    result_item["blocked_reasons"] = blocked_reasons
                     symbol_results.append(result_item)
                     continue
                 if self._plan_invalidation_broken(plan, market_snapshot):
@@ -9199,6 +9264,11 @@ class TradingOrchestrator:
             "allowed_add_on_side": None,
             "entry_proposal_suppression_active": False,
             "entry_proposal_suppressed_reason_code": None,
+            "risk_adding_add_on_candidate": False,
+            "risk_adding_add_on_side": None,
+            "risk_adding_add_on_pre_ai_blocked": False,
+            "risk_adding_add_on_pre_ai_block_reason": None,
+            "risk_adding_add_on_pre_ai_reason_codes": [],
         }
         if recovery_active:
             return route_context, None
@@ -9294,6 +9364,8 @@ class TradingOrchestrator:
             allowed_add_on_side = "long"
         elif bool(short_add_on_context.get("candidate")) and bool(short_add_on_context.get("allowed")):
             allowed_add_on_side = "short"
+        route_context["risk_adding_add_on_candidate"] = bool(allowed_add_on_side)
+        route_context["risk_adding_add_on_side"] = allowed_add_on_side
         route_context["allow_same_side_add_on"] = bool(allowed_add_on_side)
         route_context["allowed_add_on_side"] = allowed_add_on_side
         sync_freshness_summary = _as_dict(decision_reference.get("sync_freshness_summary"))
@@ -9327,17 +9399,50 @@ class TradingOrchestrator:
         return route_context, fingerprint_basis
 
     @staticmethod
+    def _mark_risk_adding_add_on_pre_ai_blocked(
+        route_context: dict[str, object] | None,
+        reason_code: str | None,
+    ) -> bool:
+        if not route_context or not reason_code:
+            return False
+        if not bool(
+            route_context.get("risk_adding_add_on_candidate")
+            or route_context.get("allow_same_side_add_on")
+        ):
+            return False
+        route_context["allow_same_side_add_on"] = False
+        route_context["allowed_add_on_side"] = None
+        route_context["risk_adding_add_on_pre_ai_blocked"] = True
+        route_context["risk_adding_add_on_pre_ai_block_reason"] = reason_code
+        route_context["risk_adding_add_on_pre_ai_reason_codes"] = [reason_code]
+        return True
+
+    @staticmethod
     def _active_position_suppression_audit_payload(route_context: dict[str, object] | None) -> dict[str, object]:
         context = _as_dict(route_context)
         if not context:
             return {}
         allowed_add_on_side = str(context.get("allowed_add_on_side") or "").lower()
+        risk_adding_add_on_side = str(context.get("risk_adding_add_on_side") or "").lower()
         return {
             "suppression_active": bool(context.get("entry_proposal_suppression_active")),
             "suppression_reason_code": str(context.get("entry_proposal_suppressed_reason_code") or "") or None,
             "allow_same_side_add_on": bool(context.get("allow_same_side_add_on")),
             "allowed_add_on_side": (
                 allowed_add_on_side if allowed_add_on_side in {"long", "short"} else None
+            ),
+            "risk_adding_add_on_candidate": bool(context.get("risk_adding_add_on_candidate")),
+            "risk_adding_add_on_side": (
+                risk_adding_add_on_side if risk_adding_add_on_side in {"long", "short"} else None
+            ),
+            "risk_adding_add_on_pre_ai_blocked": bool(
+                context.get("risk_adding_add_on_pre_ai_blocked")
+            ),
+            "risk_adding_add_on_pre_ai_block_reason": (
+                str(context.get("risk_adding_add_on_pre_ai_block_reason") or "") or None
+            ),
+            "risk_adding_add_on_pre_ai_reason_codes": list(
+                context.get("risk_adding_add_on_pre_ai_reason_codes") or []
             ),
         }
 
@@ -10600,19 +10705,34 @@ class TradingOrchestrator:
                 reason_codes.append(f"{scope}_sync_incomplete")
         return reason_codes
 
+    def _risk_adding_exchange_permission_pre_ai_block(
+        self,
+        *,
+        intent_type: str,
+    ) -> dict[str, object] | None:
+        return exchange_trade_permission_entry_blocker(
+            get_sync_state_detail(self.settings_row).get("account", {}),
+            rollout_mode=get_rollout_mode(self.settings_row),
+            live_execution_armed=is_live_execution_armed(self.settings_row),
+            intent_type=intent_type,
+        )
+
     @staticmethod
     def _ai_review_scope(
         *,
         review_trigger_payload: AIReviewTriggerPayload | None,
         open_positions: list[Position],
+        risk_adding_add_on: bool = False,
     ) -> str:
         if review_trigger_payload is not None and review_trigger_payload.trigger_reason == "protection_review_event":
             return "protective_recovery"
+        if risk_adding_add_on:
+            return "risk_adding_add_on"
         if open_positions:
             return "position_management"
         return "new_entry"
 
-    def _new_entry_pre_ai_hard_block_reason(self) -> str | None:
+    def _new_entry_pre_ai_hard_block_reason(self, *, intent_type: str = "entry") -> str | None:
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
         daily_equity = max(_safe_float(getattr(latest_pnl, "equity", None), default=0.0), 1.0)
         daily_loss_cap = min(
@@ -10639,6 +10759,40 @@ class TradingOrchestrator:
                 return "LIVE_APPROVAL_POLICY_DISABLED"
             if not is_live_execution_armed(self.settings_row):
                 return "LIVE_APPROVAL_REQUIRED"
+        exchange_permission_entry_block = self._risk_adding_exchange_permission_pre_ai_block(
+            intent_type=intent_type
+        )
+        if exchange_permission_entry_block is not None:
+            return str(exchange_permission_entry_block["reason_code"])
+        return None
+
+    def _risk_adding_add_on_pre_ai_hard_block_reason(
+        self,
+        *,
+        active_position_prompt_route_context: dict[str, object] | None,
+        effective_settings: object,
+        runtime_state: dict[str, object],
+        openai_gate: object,
+    ) -> str | None:
+        route_context = _as_dict(active_position_prompt_route_context)
+        if not bool(
+            route_context.get("risk_adding_add_on_candidate")
+            or route_context.get("allow_same_side_add_on")
+        ):
+            return None
+        if not bool(getattr(effective_settings, "enabled", True)):
+            return "symbol_disabled"
+        operating_state = str(runtime_state.get("operating_state") or "")
+        if operating_state in ENTRY_BLOCKING_OPERATING_STATES:
+            return f"new_entry_blocked_{operating_state.lower()}"
+        if pre_ai_hard_block_reason := self._new_entry_pre_ai_hard_block_reason(intent_type="scale_in"):
+            return pre_ai_hard_block_reason
+        openai_gate_reason = str(getattr(openai_gate, "reason", "") or "").upper()
+        if (
+            not bool(getattr(openai_gate, "allowed", False))
+            and openai_gate_reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+        ):
+            return openai_gate_reason
         return None
 
     def _ai_call_policy(
@@ -10653,11 +10807,25 @@ class TradingOrchestrator:
         cadence_profile: dict[str, object],
         open_positions: list[Position],
         allow_ai_but_later_risk_check: list[str],
+        active_position_prompt_route_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        route_context = _as_dict(active_position_prompt_route_context)
+        risk_adding_add_on = bool(
+            route_context.get("risk_adding_add_on_candidate")
+            or route_context.get("allow_same_side_add_on")
+        )
+        risk_adding_add_on_pre_ai_block_reason = (
+            str(route_context.get("risk_adding_add_on_pre_ai_block_reason") or "") or None
+        )
+        risk_adding_add_on_pre_ai_reason_codes = list(
+            route_context.get("risk_adding_add_on_pre_ai_reason_codes") or []
+        )
         scope = self._ai_review_scope(
             review_trigger_payload=review_trigger_payload,
             open_positions=open_positions,
+            risk_adding_add_on=risk_adding_add_on,
         )
+        entry_like_scope = scope in {"new_entry", "risk_adding_add_on"}
         operating_state = str(runtime_state.get("operating_state") or "")
         data_quality = getattr(ai_context, "data_quality", None)
         account_state_trustworthy = bool(getattr(data_quality, "account_state_trustworthy", True))
@@ -10704,15 +10872,23 @@ class TradingOrchestrator:
             reason = "account_untrusted"
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
-        elif scope == "new_entry" and not bool(getattr(effective_settings, "enabled", True)):
+        elif risk_adding_add_on_pre_ai_block_reason is not None:
+            reason = risk_adding_add_on_pre_ai_block_reason
+            hard_skip_ai = True
+            skip_category = (
+                "cost_governance"
+                if reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+                else "hard_skip_ai"
+            )
+        elif entry_like_scope and not bool(getattr(effective_settings, "enabled", True)):
             reason = "symbol_disabled"
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
-        elif scope == "new_entry" and operating_state in ENTRY_BLOCKING_OPERATING_STATES:
+        elif entry_like_scope and operating_state in ENTRY_BLOCKING_OPERATING_STATES:
             reason = f"new_entry_blocked_{operating_state.lower()}"
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
-        elif scope == "new_entry" and (pre_ai_hard_block_reason := self._new_entry_pre_ai_hard_block_reason()):
+        elif entry_like_scope and (pre_ai_hard_block_reason := self._new_entry_pre_ai_hard_block_reason()):
             reason = pre_ai_hard_block_reason
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
@@ -10721,7 +10897,7 @@ class TradingOrchestrator:
             skip_category = "cadence_policy"
         elif not bool(getattr(openai_gate, "allowed", False)):
             reason = str(getattr(openai_gate, "reason", "") or "openai_gate_blocked").upper()
-            if reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE" and scope == "new_entry":
+            if reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE" and entry_like_scope:
                 hard_skip_ai = True
                 skip_category = "cost_governance"
             else:
@@ -10733,6 +10909,10 @@ class TradingOrchestrator:
                 hard_skip_reason_codes = self._unique_reason_codes(
                     [*hard_skip_reason_codes, *data_quality_reason_codes]
                 )
+        if risk_adding_add_on_pre_ai_reason_codes:
+            hard_skip_reason_codes = self._unique_reason_codes(
+                [*hard_skip_reason_codes, *risk_adding_add_on_pre_ai_reason_codes]
+            )
         return {
             "ai_call_event": AI_CALL_EVENT_SKIPPED if reason is not None else AI_CALL_EVENT_ALLOWED,
             "ai_call_allowed": reason is None,
@@ -10743,6 +10923,10 @@ class TradingOrchestrator:
             "skip_category": skip_category,
             "hard_skip_reason_codes": hard_skip_reason_codes,
             "allow_ai_but_later_risk_check": list(dict.fromkeys(allow_ai_but_later_risk_check)),
+            "risk_adding_add_on_candidate": risk_adding_add_on,
+            "risk_adding_add_on_pre_ai_blocked": bool(risk_adding_add_on_pre_ai_block_reason),
+            "risk_adding_add_on_pre_ai_block_reason": risk_adding_add_on_pre_ai_block_reason,
+            "risk_adding_add_on_pre_ai_reason_codes": risk_adding_add_on_pre_ai_reason_codes,
             "soft_signal_review_mode": (
                 "transition_watch"
                 if SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE in set(allow_ai_but_later_risk_check)
@@ -11125,6 +11309,33 @@ class TradingOrchestrator:
                     }
                 trigger_payload = None
                 last_ai_skip_reason = "account_untrusted"
+
+            exchange_permission_entry_block = (
+                self._risk_adding_exchange_permission_pre_ai_block(intent_type="entry")
+                if trigger_payload is not None and not open_positions
+                else None
+            )
+            if exchange_permission_entry_block is not None:
+                reason_code = str(exchange_permission_entry_block["reason_code"])
+                plan_ai_call_policy = {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": reason_code,
+                    "scope": "new_entry",
+                    "hard_skip_ai": True,
+                    "skip_category": "hard_skip_ai",
+                    "hard_skip_reason_codes": [reason_code],
+                    "allow_ai_but_later_risk_check": [],
+                    "exchange_permission": dict(exchange_permission_entry_block),
+                }
+                if isinstance(selection_context, dict):
+                    selection_context = {
+                        **selection_context,
+                        "ai_call_policy": plan_ai_call_policy,
+                    }
+                trigger_payload = None
+                last_ai_skip_reason = reason_code
 
             if (
                 trigger_payload is not None
@@ -11757,8 +11968,33 @@ class TradingOrchestrator:
                 2,
                 min(int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]), 5),
             ),
-            enforce_waste_guard=not bool(open_positions),
+            enforce_waste_guard=(
+                not bool(open_positions)
+                or bool(
+                    active_position_prompt_route_context.get("risk_adding_add_on_candidate")
+                    or active_position_prompt_route_context.get("allow_same_side_add_on")
+                )
+            ),
         )
+        risk_adding_add_on_pre_ai_block_reason = self._risk_adding_add_on_pre_ai_hard_block_reason(
+            active_position_prompt_route_context=active_position_prompt_route_context,
+            effective_settings=effective_settings,
+            runtime_state=runtime_state,
+            openai_gate=openai_gate,
+        )
+        if self._mark_risk_adding_add_on_pre_ai_blocked(
+            active_position_prompt_route_context,
+            risk_adding_add_on_pre_ai_block_reason,
+        ):
+            merged_strategy_engine_context = {
+                **_as_dict(effective_selection_context.get("strategy_engine_context")),
+                **active_position_prompt_route_context,
+            }
+            effective_selection_context = {
+                **effective_selection_context,
+                "strategy_engine_context": merged_strategy_engine_context,
+            }
+            risk_context["selection_context"] = dict(effective_selection_context)
         recent_tp_direction = (
             self._recent_tp_direction_from_selection_context(effective_selection_context)
             if not open_positions
@@ -11805,6 +12041,7 @@ class TradingOrchestrator:
             cadence_profile=cadence_profile,
             open_positions=open_positions,
             allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            active_position_prompt_route_context=active_position_prompt_route_context,
         )
         pre_ai_skip_reason = None
         ai_skipped_reason = str(ai_call_policy.get("reason") or "") or None

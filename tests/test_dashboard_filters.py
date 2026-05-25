@@ -3742,6 +3742,32 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert len(payload["audit_events"]) >= 1
 
 
+def test_operator_dashboard_home_exposes_readiness_reasons_without_full_profitability_payload(
+    testclient_db_factory,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_home_readiness.db")
+
+    with TestingSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator?view=home")
+
+    assert response.status_code == 200
+    payload = response.json()
+    readiness = payload["control"]["limited_live_readiness"]
+
+    assert payload["symbols"] == []
+    assert payload["market_signal"]["performance_windows"] == []
+    assert payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert readiness["status"] == "not_ready"
+    assert "insufficient_sample" in readiness["reason_codes"]
+    assert "productization_profitability_unverified" in readiness["reason_codes"]
+    assert readiness["recent_candidate_events"] >= 2
+    assert readiness["actual_entries"] == 1
+
+
 def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db_factory) -> None:
     TestingSessionLocal = testclient_db_factory("operator_projection.db")
 

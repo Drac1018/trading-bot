@@ -112,6 +112,7 @@ from trading_mvp.services.scheduler import (
 from trading_mvp.services.seed import seed_demo_data
 from trading_mvp.services.service_gate import build_service_switch_gate_snapshot
 from trading_mvp.services.settings import (
+    LiveApprovalWindowError,
     arm_live_execution,
     clear_operator_event_view,
     create_manual_no_trade_window,
@@ -120,6 +121,7 @@ from trading_mvp.services.settings import (
     get_or_create_settings,
     get_rollout_mode,
     live_arm_blocking_reason_codes,
+    resolve_live_approval_window_minutes,
     serialize_settings_ai_usage,
     serialize_settings_cadences,
     serialize_settings_view,
@@ -964,19 +966,23 @@ def _operator_rate_limit_exceeded(request: Request) -> tuple[bool, int]:
     return False, 0
 
 
+def _operator_rate_limit_response(retry_after_seconds: int) -> JSONResponse:
+    return JSONResponse(
+        {"detail": "Operator API rate limit exceeded."},
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        headers={
+            "Cache-Control": "no-store",
+            "Retry-After": str(retry_after_seconds),
+        },
+    )
+
+
 @app.middleware("http")
 async def rate_limit_operator_api(request: Request, call_next):
     if request.url.path.startswith("/api/") and request.method.upper() != "OPTIONS" and _operator_rate_limit_required():
         exceeded, retry_after_seconds = _operator_rate_limit_exceeded(request)
         if exceeded:
-            return JSONResponse(
-                {"detail": "Operator API rate limit exceeded."},
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                headers={
-                    "Cache-Control": "no-store",
-                    "Retry-After": str(retry_after_seconds),
-                },
-            )
+            return _operator_rate_limit_response(retry_after_seconds)
     return await call_next(request)
 
 
@@ -994,6 +1000,10 @@ async def require_operator_key_for_api_reads(request: Request, call_next):
                 headers={"Cache-Control": "no-store"},
             )
         if not _operator_api_key_valid(request.headers.get(OPERATOR_API_KEY_HEADER)):
+            if _operator_rate_limit_required():
+                exceeded, retry_after_seconds = _operator_rate_limit_exceeded(request)
+                if exceeded:
+                    return _operator_rate_limit_response(retry_after_seconds)
             return JSONResponse(
                 {"detail": "Invalid operator API key."},
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1720,7 +1730,29 @@ def arm_live(
             )
             db.commit()
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
-        row = arm_live_execution(db, payload.minutes if payload is not None else None)
+        requested_minutes = payload.minutes if payload is not None else None
+        effective_minutes = resolve_live_approval_window_minutes(current_row, requested_minutes)
+        try:
+            row = arm_live_execution(db, requested_minutes)
+        except LiveApprovalWindowError as exc:
+            detail = {
+                "reason_code": str(exc),
+                "requested_minutes": requested_minutes,
+                "effective_minutes": effective_minutes,
+                "configured_window_minutes": current_row.live_approval_window_minutes,
+                "message": "실거래 승인 창 시간이 1분 이상이어야 합니다.",
+            }
+            record_audit_event(
+                db,
+                event_type="live_approval_arm_denied",
+                entity_type="settings",
+                entity_id=str(current_row.id),
+                severity="warning",
+                message="Manual live execution window arm denied.",
+                payload=detail,
+            )
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
         record_audit_event(
             db,
             event_type="live_approval_armed",
@@ -1728,7 +1760,12 @@ def arm_live(
             entity_id=str(row.id),
             severity="warning",
             message="Manual live execution window armed.",
-            payload={"armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None},
+            payload={
+                "armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None,
+                "requested_minutes": requested_minutes,
+                "effective_minutes": effective_minutes,
+                "configured_window_minutes": row.live_approval_window_minutes,
+            },
         )
         db.commit()
         return serialize_settings_view(row)

@@ -914,8 +914,59 @@ def test_scale_in_and_reduce_policy_split_from_exit() -> None:
     )
 
     assert scale_in_plan.order_type == "LIMIT"
+    assert scale_in_plan.fallback_order_type == "NONE"
+    assert scale_in_plan.allow_market_fallback is False
     assert reduce_plan.order_type == "LIMIT"
     assert exit_plan.order_type == "MARKET"
+
+
+def test_scale_in_policy_blocks_or_pends_when_snapshot_is_stale() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(action="long", intent_type="scale_in"),
+        _snapshot(is_stale=True),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={"protected": True},
+    )
+
+    assert plan.order_type == "NONE"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.reason == "market_data_not_reliable_scale_in_block_or_pending"
+
+
+def test_scale_in_policy_blocks_or_pends_when_snapshot_is_incomplete() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(action="long", intent_type="scale_in"),
+        _snapshot(is_complete=False),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={"protected": True},
+    )
+
+    assert plan.order_type == "NONE"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.reason == "market_data_not_reliable_scale_in_block_or_pending"
+
+
+def test_scale_in_policy_disables_market_fallback_when_risk_forbids_it() -> None:
+    settings_row = SimpleNamespace(slippage_threshold_pct=0.002)
+    plan = select_execution_plan(
+        _intent(
+            action="long",
+            intent_type="scale_in",
+            required_order_policy="limit_only_or_post_only",
+            allow_market_fallback=False,
+        ),
+        _snapshot(),
+        settings_row,  # type: ignore[arg-type]
+        pre_trade_protection={"protected": True},
+    )
+
+    assert plan.order_type == "LIMIT"
+    assert plan.fallback_order_type == "NONE"
+    assert plan.allow_market_fallback is False
+    assert plan.required_order_policy == "limit_only_or_post_only"
+    assert plan.reason == "passive_scale_in_limit_only"
 
 
 def test_entry_policy_blocks_or_pends_when_snapshot_is_stale() -> None:
@@ -980,11 +1031,20 @@ def test_execute_live_trade_uses_policy_for_entry_and_scale_in(monkeypatch, db_s
         decision_run_id=11,
         decision=_decision("long"),
         market_snapshot=_snapshot(),
-        risk_result=_risk_result("long"),
+        risk_result=_risk_result(
+            "long",
+            required_order_policy="limit_only_or_post_only",
+            allow_market_fallback=False,
+            order_policy_reason="expected_cost_limit_only",
+        ),
     )
 
     assert scale_in_result["intent_type"] == "scale_in"
     assert scale_in_result["execution_policy"]["order_type"] == "LIMIT"
+    assert scale_in_result["execution_policy"]["fallback_order_type"] == "NONE"
+    assert scale_in_result["execution_policy"]["required_order_policy"] == "limit_only_or_post_only"
+    assert scale_in_result["execution_policy"]["allow_market_fallback"] is False
+    assert scale_in_result["execution_policy"]["order_policy_reason"] == "expected_cost_limit_only"
     assert scale_in_client.primary_order_calls[0]["order_type"] == "LIMIT"
 
 
@@ -1168,6 +1228,30 @@ def test_entry_execution_blocks_stale_snapshot_before_market_submission(monkeypa
     audit_rows = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id.asc())))
     assert audit_rows[-1].event_type == "live_execution_blocked"
     assert audit_rows[-1].payload["reason_code"] == "market_data_not_reliable_entry_block_or_pending"
+
+
+def test_scale_in_execution_blocks_stale_snapshot_before_market_submission(monkeypatch, db_session) -> None:
+    settings_row = _prime_live_settings(db_session)
+    client = PolicyCaptureClient(initial_position_qty=0.01, orders=_protected_open_orders())
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda _: client)
+
+    result = execute_live_trade(
+        db_session,
+        settings_row,
+        decision_run_id=153,
+        decision=_decision("long"),
+        market_snapshot=_snapshot(is_stale=True),
+        risk_result=_risk_result("long"),
+    )
+
+    assert result["status"] == "blocked"
+    assert result["intent_type"] == "scale_in"
+    assert result["execution_policy"]["order_type"] == "NONE"
+    assert result["execution_policy"]["fallback_order_type"] == "NONE"
+    assert client.primary_order_calls == []
+    audit_rows = list(db_session.scalars(select(AuditEvent).order_by(AuditEvent.id.asc())))
+    assert audit_rows[-1].event_type == "live_execution_blocked"
+    assert audit_rows[-1].payload["reason_code"] == "market_data_not_reliable_scale_in_block_or_pending"
 
 
 def test_partial_entry_fill_is_preserved_without_aggressive_fallback(monkeypatch, db_session) -> None:

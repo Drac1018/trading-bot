@@ -3,6 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE = "EXCHANGE_CAN_TRADE_UNKNOWN"
+EXCHANGE_CAN_TRADE_DISABLED_REASON_CODE = "EXCHANGE_AUTH_PERMISSION_REJECTED"
+RISK_ADDING_INTENT_TYPES = {"entry", "scale_in"}
+
 
 def _to_optional_bool(value: object) -> bool | None:
     if value in {None, ""}:
@@ -84,5 +88,50 @@ def resolve_exchange_trade_permission(
         "exchange_can_trade_note": (
             "Binance account response omitted canTrade; exchange trade permission is unknown and "
             "new entries must remain blocked."
+        ),
+    }
+
+
+def exchange_trade_permission_entry_blocker(
+    permission: Mapping[str, object],
+    *,
+    rollout_mode: str,
+    live_execution_armed: bool,
+    intent_type: str | None = None,
+) -> dict[str, object] | None:
+    if rollout_mode != "full_live" or not live_execution_armed:
+        return None
+    if intent_type is not None and intent_type not in RISK_ADDING_INTENT_TYPES:
+        return None
+
+    exchange_can_trade = _to_optional_bool(permission.get("exchange_can_trade"))
+    explicit_known = _to_optional_bool(permission.get("exchange_can_trade_known"))
+    exchange_can_trade_known = (
+        bool(explicit_known) if explicit_known is not None else exchange_can_trade is not None
+    ) and exchange_can_trade is not None
+    if exchange_can_trade_known and exchange_can_trade is True:
+        return None
+
+    source = str(permission.get("exchange_can_trade_source") or "unknown")
+    checked_at = permission.get("exchange_can_trade_checked_at")
+    if exchange_can_trade_known and exchange_can_trade is False:
+        return {
+            "reason_code": EXCHANGE_CAN_TRADE_DISABLED_REASON_CODE,
+            "exchange_can_trade": False,
+            "exchange_can_trade_known": True,
+            "exchange_can_trade_source": source,
+            "exchange_can_trade_checked_at": checked_at,
+            "exchange_can_trade_note": "Binance canTrade is confirmed false; new entries must remain blocked.",
+        }
+
+    return {
+        "reason_code": EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE,
+        "exchange_can_trade": None,
+        "exchange_can_trade_known": False,
+        "exchange_can_trade_source": source,
+        "exchange_can_trade_checked_at": checked_at,
+        "exchange_can_trade_note": str(
+            permission.get("exchange_can_trade_note")
+            or "Binance canTrade is unknown; new entries must remain blocked."
         ),
     }

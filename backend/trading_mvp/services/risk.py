@@ -49,6 +49,7 @@ from trading_mvp.services.drawdown_state import (
     build_drawdown_state_snapshot,
 )
 from trading_mvp.services.event_policy import derive_ai_event_view
+from trading_mvp.services.exchange_permission import exchange_trade_permission_entry_blocker
 from trading_mvp.services.holding_profile import (
     HOLDING_PROFILE_POSITION,
     HOLDING_PROFILE_SCALP,
@@ -76,6 +77,7 @@ from trading_mvp.services.runtime_state import (
     get_operating_state,
     get_reconciliation_blocking_reason_codes,
     get_reconciliation_detail,
+    get_sync_state_detail,
     sync_scope_blocks_new_entry,
 )
 from trading_mvp.services.settings import (
@@ -3792,6 +3794,7 @@ def evaluate_risk(
     recent_tp_reentry_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     range_mr_cooldown_gate: dict[str, Any] = {"applied": False, "status": "not_entry_decision"}
     safe_profile_selection: dict[str, Any] = {"status": "not_evaluated"}
+    exchange_permission_entry_block: dict[str, Any] | None = None
     decision_agreement = _decision_agreement_context(decision_context)
     setup_cluster_state = _setup_cluster_state_context(decision_context)
     suppression_context = _recent_performance_suppression_context(decision_context, decision)
@@ -3934,6 +3937,15 @@ def evaluate_risk(
         blocked_reason_codes.extend(_as_string_list(ai_decision_validity.get("reason_codes")))
     if is_entry_decision and bool(safe_profile_selection.get("active_profile_blocks_new_entry", False)):
         blocked_reason_codes.append(EXECUTION_RISK_PROFILE_BLOCK_REASON_CODE)
+    if is_entry_decision:
+        exchange_permission_entry_block = exchange_trade_permission_entry_blocker(
+            get_sync_state_detail(settings_row).get("account", {}),
+            rollout_mode=rollout_mode,
+            live_execution_armed=is_live_execution_armed(settings_row),
+            intent_type="scale_in" if same_side_pyramiding else "entry",
+        )
+        if exchange_permission_entry_block is not None:
+            blocked_reason_codes.append(str(exchange_permission_entry_block["reason_code"]))
 
     if settings_row.trading_paused and is_entry_decision:
         blocked_reason_codes.append("TRADING_PAUSED")
@@ -4653,6 +4665,7 @@ def evaluate_risk(
             ),
         },
         "binance_rest_summary": binance_rest_summary,
+        "exchange_permission_entry_block": exchange_permission_entry_block,
         "safe_profile_selector": safe_profile_selection,
         "ai_decision_validity": ai_decision_validity,
         "sync_timestamps": sync_timestamp_debug,

@@ -476,6 +476,7 @@ export type OperatorDashboardPayload = {
     approval_expires_at: string | null;
     trading_paused: boolean;
     operating_state: string;
+    guard_mode_reason_code: string | null;
     guard_mode_reason_message: string | null;
     pause_reason_code: string | null;
     pause_origin: string | null;

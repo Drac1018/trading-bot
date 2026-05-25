@@ -11,6 +11,48 @@ $runtime = Use-ProjectNodeRuntime -RepoRoot $repoRoot
 
 Set-Location (Join-Path $repoRoot "frontend")
 
+function Invoke-WithFrontendBuildLock {
+    param([Parameter(Mandatory = $true)][scriptblock]$ScriptBlock)
+
+    $lockPath = Join-Path $repoRoot ".next-build.lock"
+    $deadline = (Get-Date).AddMinutes(10)
+    $lockStream = $null
+    do {
+        try {
+            $lockStream = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            break
+        } catch {
+            if ((Get-Date) -ge $deadline) {
+                throw "Productization guard: timed out waiting for frontend build lock at $lockPath."
+            }
+            Start-Sleep -Seconds 2
+        }
+    } while ($null -eq $lockStream)
+
+    try {
+        $lockStream.SetLength(0)
+        $writer = [System.IO.StreamWriter]::new($lockStream, [System.Text.Encoding]::UTF8, 1024, $true)
+        try {
+            $writer.WriteLine("pid=$PID")
+            $writer.WriteLine("started_at=$((Get-Date).ToString('o'))")
+            $writer.Flush()
+        } finally {
+            $writer.Dispose()
+        }
+        & $ScriptBlock
+    } finally {
+        if ($null -ne $lockStream) {
+            $lockStream.Dispose()
+        }
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-DotEnvValue {
     param([Parameter(Mandatory = $true)][string]$Name)
 
@@ -186,16 +228,26 @@ function Ensure-FrontendBuild {
     $middlewareManifest = Join-Path $nextBuildPath "server\\middleware-manifest.json"
     $proxyBundle = Join-Path $nextBuildPath "server\\proxy.js"
     $middlewareBundle = Join-Path $nextBuildPath "server\\middleware.js"
+    $staticPath = Join-Path $nextBuildPath "static"
+    $staticChunksPath = Join-Path $staticPath "chunks"
+    $staticCssPath = Join-Path $staticPath "css"
+    $clientReferenceManifest = Get-ChildItem -LiteralPath (Join-Path $nextBuildPath "server\\app") -Recurse -Filter "*client-reference-manifest*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $staticChunk = Get-ChildItem -LiteralPath $staticChunksPath -File -Filter "*.js" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $staticCss = Get-ChildItem -LiteralPath $staticCssPath -File -Filter "*.css" -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 0 } | Select-Object -First 1
     if (
         (Test-Path -LiteralPath $buildId) -and
         (Test-Path -LiteralPath $pagesManifest) -and
         (Test-Path -LiteralPath $middlewareManifest) -and
-        ((Test-Path -LiteralPath $proxyBundle) -or (Test-Path -LiteralPath $middlewareBundle))
+        ((Test-Path -LiteralPath $proxyBundle) -or (Test-Path -LiteralPath $middlewareBundle)) -and
+        (Test-Path -LiteralPath $staticPath) -and
+        ($null -ne $staticChunk) -and
+        ($null -ne $staticCss) -and
+        ($null -ne $clientReferenceManifest)
     ) {
         return
     }
     if ($SkipBuild) {
-        throw "Productization guard: -SkipBuild requires an existing Next build with .next\\BUILD_ID, .next\\server\\pages-manifest.json, .next\\server\\middleware-manifest.json, and .next\\server\\proxy.js or .next\\server\\middleware.js."
+        throw "Productization guard: -SkipBuild requires a complete Next build with .next\\BUILD_ID, server manifests, proxy or middleware bundle, static chunks, static CSS, and app client-reference manifests."
     }
     foreach ($generatedPath in @(
         (Join-Path $nextBuildPath "BUILD_ID"),
@@ -236,7 +288,7 @@ function Ensure-FrontendBuild {
 }
 
 Ensure-FrontendDependencies
-Ensure-FrontendBuild
+Invoke-WithFrontendBuildLock -ScriptBlock { Ensure-FrontendBuild }
 
 $nextCli = Join-Path (Join-Path $PWD "node_modules\\next\\dist\\bin") "next"
 & $runtime.NodeExe $nextCli start --hostname $Hostname --port $Port

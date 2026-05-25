@@ -65,6 +65,12 @@
 프런트 변경이 있을 때는 아래도 함께 사용합니다.
 
 ```powershell
-C:\my-trading-bot\.tools\node-v24.14.1-win-x64\corepack.cmd pnpm -C C:\my-trading-bot\frontend lint
-C:\my-trading-bot\.tools\node-v24.14.1-win-x64\corepack.cmd pnpm -C C:\my-trading-bot\frontend build
+$corepack = 'C:\Program Files\nodejs\corepack.cmd'
+if (-not (Test-Path $corepack)) {
+  $corepack = 'C:\my-trading-bot\.tools\node-v22.21.1-win-x64\corepack.cmd'
+}
+& $corepack pnpm -C C:\my-trading-bot\frontend lint
+& $corepack pnpm -C C:\my-trading-bot\frontend build
 ```
+
+현재 `.tools\node-v24.14.1-win-x64\corepack.cmd`는 없으므로 검증 명령으로 사용하지 않습니다.

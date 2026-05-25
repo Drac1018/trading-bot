@@ -343,6 +343,7 @@ EXCHANGE_SYNC_WORKFLOW = "exchange_sync_cycle"
 EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS = 24
 EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE = "EXCHANGE_AUTH_PERMISSION_REJECTED"
 FULL_LIVE_SYNC_STALE_REASON_CODE = "FULL_LIVE_SYNC_STALE"
+LIVE_APPROVAL_WINDOW_INVALID_REASON_CODE = "LIVE_APPROVAL_WINDOW_INVALID"
 SYNC_SCOPE_GUARD_REASON_CODES = {
     "account": "ACCOUNT_STATE_STALE",
     "positions": "POSITION_STATE_STALE",
@@ -2543,14 +2544,21 @@ def _coerce_int(value: object, default: int = 0) -> int:
     return default
 
 
+class LiveApprovalWindowError(ValueError):
+    pass
+
+
 def is_live_execution_armed(settings_row: Setting) -> bool:
     return bool(
         settings_row.live_execution_armed
-        and (
-            settings_row.live_execution_armed_until is None
-            or settings_row.live_execution_armed_until > utcnow_naive()
-        )
+        and settings_row.live_execution_armed_until is not None
+        and settings_row.live_execution_armed_until > utcnow_naive()
     )
+
+
+def resolve_live_approval_window_minutes(settings_row: Setting, minutes: int | None = None) -> int:
+    requested_minutes = settings_row.live_approval_window_minutes if minutes is None else minutes
+    return _coerce_int(requested_minutes, default=0)
 
 
 def _parse_runtime_datetime(value: object) -> datetime | None:
@@ -3486,8 +3494,15 @@ def build_operational_status_payload(
 
 def arm_live_execution(session: Session, minutes: int | None = None) -> Setting:
     row = get_or_create_settings(session)
+    effective_minutes = resolve_live_approval_window_minutes(row, minutes)
+    if effective_minutes <= 0:
+        row.live_execution_armed = False
+        row.live_execution_armed_until = None
+        session.add(row)
+        session.flush()
+        raise LiveApprovalWindowError(LIVE_APPROVAL_WINDOW_INVALID_REASON_CODE)
     row.live_execution_armed = True
-    row.live_execution_armed_until = None
+    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=effective_minutes)
     session.add(row)
     session.flush()
     return row

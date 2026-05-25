@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from threading import Event, Thread
 from time import perf_counter, sleep
 
@@ -1767,7 +1767,38 @@ def test_serialize_settings_reports_live_readiness_guard_reason(db_session) -> N
     assert serialized["guard_mode_reason_message"] == "실거래 승인 창이 닫혀 있어 가드 모드입니다."
 
 
-def test_serialize_settings_treats_manual_live_approval_as_indefinite_when_armed(db_session) -> None:
+def test_arm_live_execution_sets_bounded_expiry_from_requested_minutes(db_session) -> None:
+    row = update_settings(db_session, build_settings_payload())
+    before = utcnow_naive()
+
+    armed = arm_live_execution(db_session, 15)
+    after = utcnow_naive()
+
+    assert armed.id == row.id
+    assert armed.live_execution_armed is True
+    assert armed.live_execution_armed_until is not None
+    assert before + timedelta(minutes=15) <= armed.live_execution_armed_until
+    assert armed.live_execution_armed_until <= after + timedelta(minutes=15, seconds=1)
+    assert serialize_settings(armed)["live_execution_armed"] is True
+
+
+def test_arm_live_execution_invalid_window_fails_closed(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(update={"live_approval_window_minutes": 0}),
+    )
+    row.live_execution_armed = True
+    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="LIVE_APPROVAL_WINDOW_INVALID"):
+        arm_live_execution(db_session)
+
+    assert row.live_execution_armed is False
+    assert row.live_execution_armed_until is None
+
+
+def test_serialize_settings_treats_manual_live_approval_null_expiry_as_closed(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
     row.live_execution_armed = True
     row.live_execution_armed_until = None
@@ -1775,8 +1806,9 @@ def test_serialize_settings_treats_manual_live_approval_as_indefinite_when_armed
 
     serialized = serialize_settings(row)
 
-    assert serialized["live_execution_ready"] is True
-    assert serialized["guard_mode_reason_code"] is None
+    assert serialized["live_execution_armed"] is False
+    assert serialized["live_execution_ready"] is False
+    assert serialized["guard_mode_reason_code"] == "LIVE_APPROVAL_REQUIRED"
 
 
 def test_serialize_settings_reports_operating_state_guard_reason(db_session) -> None:
@@ -2025,6 +2057,54 @@ def test_full_live_write_api_rejects_generic_operator_intent(tmp_path, monkeypat
     finally:
         app.dependency_overrides.clear()
         config_module.get_settings.cache_clear()
+
+
+def test_live_arm_endpoint_sets_bounded_expiry_and_audit_payload(
+    testclient_db_factory,
+    full_live_operator_headers,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_live_arm_window.db")
+    with TestingSessionLocal() as session:
+        row = update_settings(session, build_settings_payload())
+        now = utcnow_naive()
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_success(row, scope=scope, synced_at=now)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/settings/live/arm",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "settings.live_arm"},
+            json={"minutes": 15},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["live_execution_armed"] is True
+    assert payload["live_execution_armed_until"] is not None
+    armed_until = datetime.fromisoformat(payload["live_execution_armed_until"])
+    assert armed_until > utcnow_naive()
+
+    with TestingSessionLocal() as session:
+        event = session.execute(
+            text(
+                """
+                select json_extract(payload, '$.armed_until') as armed_until,
+                       json_extract(payload, '$.requested_minutes') as requested_minutes,
+                       json_extract(payload, '$.effective_minutes') as effective_minutes,
+                       json_extract(payload, '$.configured_window_minutes') as configured_window_minutes
+                from audit_events
+                where event_type = 'live_approval_armed'
+                order by id desc
+                limit 1
+                """
+            )
+        ).one()
+
+    assert event.armed_until == payload["live_execution_armed_until"]
+    assert event.requested_minutes == 15
+    assert event.effective_minutes == 15
+    assert event.configured_window_minutes == 15
 
 
 def test_full_live_live_arm_blocks_stale_exchange_sync(tmp_path, monkeypatch) -> None:

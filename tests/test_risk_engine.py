@@ -85,7 +85,17 @@ def _mock_expected_edge_gate_settings(
 def _mark_all_sync_scopes_fresh(settings_row) -> None:
     now = utcnow_naive()
     for scope in ("account", "positions", "open_orders", "protective_orders"):
-        mark_sync_success(settings_row, scope=scope, synced_at=now)
+        detail = (
+            {
+                "exchange_can_trade": True,
+                "exchange_can_trade_known": True,
+                "exchange_can_trade_source": "unit_test",
+                "exchange_can_trade_checked_at": now.isoformat(),
+            }
+            if scope == "account"
+            else None
+        )
+        mark_sync_success(settings_row, scope=scope, synced_at=now, detail=detail)
 
 
 def _seed_account_equity(db_session, equity: float = 100000.0) -> PnLSnapshot:
@@ -3018,7 +3028,17 @@ def test_flat_protective_order_staleness_does_not_block_when_position_scopes_are
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
     now = utcnow_naive()
-    mark_sync_success(settings_row, scope="account", synced_at=now)
+    mark_sync_success(
+        settings_row,
+        scope="account",
+        synced_at=now,
+        detail={
+            "exchange_can_trade": True,
+            "exchange_can_trade_known": True,
+            "exchange_can_trade_source": "unit_test",
+            "exchange_can_trade_checked_at": now.isoformat(),
+        },
+    )
     mark_sync_success(settings_row, scope="positions", synced_at=now)
     mark_sync_success(settings_row, scope="open_orders", synced_at=now)
     mark_sync_success(
@@ -3091,8 +3111,8 @@ def test_approval_closed_keeps_entry_blocked_without_auto_resize(db_session) -> 
     settings_row.max_largest_position_pct = 1.5
     settings_row.live_trading_enabled = True
     settings_row.manual_live_approval = True
-    settings_row.live_execution_armed = False
-    settings_row.live_execution_armed_until = utcnow_naive() - timedelta(minutes=1)
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = None
     settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
     settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
     _mark_all_sync_scopes_fresh(settings_row)
@@ -3342,6 +3362,73 @@ def test_live_entry_keeps_existing_path_when_sync_state_is_fresh(db_session) -> 
     assert "POSITION_STATE_STALE" not in result.reason_codes
     assert "OPEN_ORDERS_STATE_STALE" not in result.reason_codes
     assert "PROTECTION_STATE_UNVERIFIED" not in result.reason_codes
+
+
+def test_full_live_armed_blocks_entry_and_scale_in_when_exchange_can_trade_unknown(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    _seed_account_equity(db_session)
+    settings_row.live_trading_enabled = True
+    settings_row.rollout_mode = "full_live"
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_all_sync_scopes_fresh(settings_row)
+    now = utcnow_naive()
+    mark_sync_success(
+        settings_row,
+        scope="account",
+        synced_at=now,
+        detail={
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": "binance_account_info_missing_canTrade",
+            "exchange_can_trade_checked_at": now.isoformat(),
+        },
+    )
+    db_session.flush()
+
+    snapshot = build_market_snapshot("BTCUSDT", "15m", upto_index=140)
+    decision = _entry_decision(
+        entry_zone_min=snapshot.latest_price - 50.0,
+        entry_zone_max=snapshot.latest_price + 50.0,
+        stop_loss=snapshot.latest_price - 500.0,
+        take_profit=snapshot.latest_price + 800.0,
+        entry_mode="immediate",
+        max_chase_bps=20.0,
+    )
+
+    entry_result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=snapshot.latest_price - 200.0,
+            mark_price=snapshot.latest_price,
+            leverage=2.0,
+            stop_loss=snapshot.latest_price - 500.0,
+            take_profit=snapshot.latest_price + 800.0,
+            unrealized_pnl=2.0,
+        )
+    )
+    db_session.flush()
+    scale_in_result, _ = evaluate_risk(db_session, settings_row, decision, snapshot)
+
+    assert entry_result.allowed is False
+    assert scale_in_result.allowed is False
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in entry_result.reason_codes
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in scale_in_result.reason_codes
+    assert entry_result.debug_payload["exchange_permission_entry_block"]["exchange_can_trade_source"] == (
+        "binance_account_info_missing_canTrade"
+    )
+    assert scale_in_result.debug_payload["exchange_permission_entry_block"]["reason_code"] == (
+        "EXCHANGE_CAN_TRADE_UNKNOWN"
+    )
 
 
 def test_risk_blocks_plain_immediate_entry_without_confirmed_trigger_context(db_session) -> None:

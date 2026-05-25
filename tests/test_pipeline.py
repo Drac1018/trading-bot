@@ -60,10 +60,29 @@ from trading_mvp.services.settings import get_or_create_settings
 from trading_mvp.time_utils import utcnow_naive
 
 
-def _mark_pipeline_sync_fresh(settings_row) -> None:
+def _mark_pipeline_sync_fresh(
+    settings_row,
+    *,
+    account_detail: dict[str, object] | None = None,
+) -> None:
     now = utcnow_naive()
+    resolved_account_detail = (
+        account_detail
+        if account_detail is not None
+        else {
+            "exchange_can_trade": True,
+            "exchange_can_trade_known": True,
+            "exchange_can_trade_source": "unit_test",
+            "exchange_can_trade_checked_at": now.isoformat(),
+        }
+    )
     for scope in ("account", "positions", "open_orders", "protective_orders"):
-        mark_sync_success(settings_row, scope=scope, synced_at=now)
+        mark_sync_success(
+            settings_row,
+            scope=scope,
+            synced_at=now,
+            detail=resolved_account_detail if scope == "account" else None,
+        )
 
 
 def _pre_ai_gate_snapshot() -> MarketSnapshotPayload:
@@ -168,6 +187,19 @@ def _pre_ai_gate_open_position() -> Position:
         unrealized_pnl=6.0,
         metadata_json={},
     )
+
+
+def _pre_ai_gate_add_on_position_management_context() -> dict[str, object]:
+    return {
+        "holding_profile": "scalp",
+        "holding_profile_reason": "risk_adding_add_on_pre_ai_test",
+        "hard_stop_active": True,
+        "stop_widening_allowed": False,
+        "current_r_multiple": 0.8,
+        "break_even_eligible": True,
+        "tightened_stop_loss": 70020.0,
+        "reduce_reason_codes": [],
+    }
 
 
 class _AllowAiGate:
@@ -5114,6 +5146,71 @@ def test_interval_cycle_account_untrusted_skips_before_decision_cycle(monkeypatc
     assert audit.payload["hard_skip_ai"] is True
 
 
+def test_interval_cycle_full_live_can_trade_unknown_skips_before_decision_cycle(
+    monkeypatch,
+    db_session,
+) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.ai_enabled = True
+    settings_row.tracked_symbols = ["BTCUSDT"]
+    settings_row.live_trading_enabled = True
+    settings_row.rollout_mode = "full_live"
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+    _mark_pipeline_sync_fresh(
+        settings_row,
+        account_detail={
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": "binance_account_info_missing_canTrade",
+            "exchange_can_trade_checked_at": utcnow_naive().isoformat(),
+        },
+    )
+    db_session.add(settings_row)
+    db_session.flush()
+
+    selected_ranking = _ranking_candidate_payload(symbol="BTCUSDT", decision="long")
+    monkeypatch.setattr("trading_mvp.services.scheduler.attempt_auto_resume", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "_rank_candidate_symbols",
+        lambda self, **kwargs: {
+            "mode": "portfolio_rotation_top_n",
+            "breadth_regime": "mixed",
+            "breadth_summary": {"breadth_regime": "mixed"},
+            "capacity_reason": "mixed_breadth_moderate_capacity",
+            "drawdown_capacity_reason": None,
+            "drawdown_state": {},
+            "selected_symbols": ["BTCUSDT"],
+            "skipped_symbols": [],
+            "rankings": [selected_ranking],
+        },
+    )
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_decision_cycle",
+        lambda self, **kwargs: pytest.fail("canTrade-unknown interval plan must not create AgentRun"),
+    )
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    audit = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_ai_skipped", AuditEvent.entity_id == "BTCUSDT")
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+
+    outcome = result["results"][0]["outcome"]
+    assert outcome["ai_review_status"] == "skipped"
+    assert outcome["last_ai_skip_reason"] == "EXCHANGE_CAN_TRADE_UNKNOWN"
+    assert outcome["ai_call_policy"]["reason"] == "EXCHANGE_CAN_TRADE_UNKNOWN"
+    assert db_session.scalar(select(AgentRun).limit(1)) is None
+    assert audit is not None
+    assert audit.payload["reason"] == "EXCHANGE_CAN_TRADE_UNKNOWN"
+    assert audit.payload["hard_skip_ai"] is True
+
+
 def _run_pre_ai_gate_decision(
     monkeypatch,
     db_session,
@@ -5126,15 +5223,18 @@ def _run_pre_ai_gate_decision(
     selection_context: dict[str, object] | None = None,
     snapshot: MarketSnapshotPayload | None = None,
     sync_fresh: bool = True,
+    account_sync_detail: dict[str, object] | None = None,
     settings_mutator=None,
     auto_resume_checked: bool = False,
     seed_advisor_run: bool = False,
+    position_management_context: dict[str, object] | None = None,
+    openai_gate=None,
 ):
     settings_row = get_or_create_settings(db_session)
     settings_row.ai_enabled = True
     settings_row.tracked_symbols = ["BTCUSDT"]
     if sync_fresh:
-        _mark_pipeline_sync_fresh(settings_row)
+        _mark_pipeline_sync_fresh(settings_row, account_detail=account_sync_detail)
     if settings_mutator is not None:
         settings_mutator(settings_row)
     db_session.add(settings_row)
@@ -5145,7 +5245,15 @@ def _run_pre_ai_gate_decision(
     snapshot = snapshot or _pre_ai_gate_snapshot()
     trigger = _interval_review_plan(trigger_reason=trigger_reason)["plans"][0]["trigger"]
     monkeypatch.setattr("trading_mvp.services.orchestrator.compute_features", lambda *args, **kwargs: feature_payload)
-    monkeypatch.setattr("trading_mvp.services.orchestrator.get_openai_call_gate", lambda *args, **kwargs: _AllowAiGate())
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.get_openai_call_gate",
+        lambda *args, **kwargs: openai_gate or _AllowAiGate(),
+    )
+    if position_management_context is not None:
+        monkeypatch.setattr(
+            "trading_mvp.services.orchestrator.build_position_management_context",
+            lambda *args, **kwargs: dict(position_management_context),
+        )
 
     orchestrator = TradingOrchestrator(db_session)
     orchestrator.trading_agent = TradingDecisionAgent(provider)
@@ -5850,7 +5958,8 @@ def test_entry_candidate_live_approval_required_hard_skips_ai(monkeypatch, db_se
             setattr(settings_row, "live_trading_enabled", True),
             setattr(settings_row, "rollout_mode", "limited_live"),
             setattr(settings_row, "manual_live_approval", True),
-            setattr(settings_row, "live_execution_armed", False),
+            setattr(settings_row, "live_execution_armed", True),
+            setattr(settings_row, "live_execution_armed_until", None),
         ),
     )
 
@@ -5858,6 +5967,215 @@ def test_entry_candidate_live_approval_required_hard_skips_ai(monkeypatch, db_se
     assert result["last_ai_skip_reason"] == "LIVE_APPROVAL_REQUIRED"
     assert decision_row.metadata_json["ai_call_policy"]["hard_skip_ai"] is True
     assert "LIVE_APPROVAL_REQUIRED" in decision_row.metadata_json["ai_call_policy"]["hard_skip_reason_codes"]
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+@pytest.mark.parametrize(
+    ("account_sync_detail", "expected_reason"),
+    [
+        (
+            {
+                "exchange_can_trade": None,
+                "exchange_can_trade_known": False,
+                "exchange_can_trade_source": "binance_account_info_missing_canTrade",
+                "exchange_can_trade_checked_at": "2026-05-25T00:00:00",
+            },
+            "EXCHANGE_CAN_TRADE_UNKNOWN",
+        ),
+        (
+            {
+                "exchange_can_trade": False,
+                "exchange_can_trade_known": True,
+                "exchange_can_trade_source": "binance_account_info",
+                "exchange_can_trade_checked_at": "2026-05-25T00:00:00",
+            },
+            "EXCHANGE_AUTH_PERMISSION_REJECTED",
+        ),
+    ],
+)
+def test_entry_candidate_full_live_exchange_can_trade_pre_ai_gate_hard_skips_provider(
+    monkeypatch,
+    db_session,
+    account_sync_detail,
+    expected_reason,
+) -> None:
+    defaults = get_app_settings().model_copy(update={"live_trading_env_enabled": True})
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.get_settings",
+        lambda: defaults,
+    )
+    provider = _CountingDecisionProvider(decision="long")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        account_sync_detail=account_sync_detail,
+        settings_mutator=lambda settings_row: (
+            setattr(settings_row, "live_trading_enabled", True),
+            setattr(settings_row, "rollout_mode", "full_live"),
+            setattr(settings_row, "manual_live_approval", True),
+            setattr(settings_row, "live_execution_armed", True),
+            setattr(settings_row, "live_execution_armed_until", utcnow_naive() + timedelta(minutes=15)),
+            setattr(settings_row, "binance_api_key_encrypted", encrypt_secret("key", "change-me-local-dev-secret")),
+            setattr(settings_row, "binance_api_secret_encrypted", encrypt_secret("secret", "change-me-local-dev-secret")),
+        ),
+    )
+    audit = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_ai_skipped", AuditEvent.entity_id == str(decision_row.id))
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == expected_reason
+    assert decision_row.provider_name == "deterministic-mock"
+    assert decision_row.metadata_json["source"] == "deterministic"
+    assert decision_row.metadata_json["ai_call_policy"]["hard_skip_ai"] is True
+    assert expected_reason in decision_row.metadata_json["ai_call_policy"]["hard_skip_reason_codes"]
+    assert audit is not None
+    assert audit.payload["reason"] == expected_reason
+    assert audit.payload["hard_skip_ai"] is True
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_risk_adding_add_on_daily_loss_pre_ai_gate_disables_add_on_and_skips_provider(
+    monkeypatch,
+    db_session,
+) -> None:
+    db_session.add(
+        PnLSnapshot(
+            snapshot_date=utcnow_naive().date(),
+            equity=100_000.0,
+            cash_balance=100_000.0,
+            wallet_balance=100_000.0,
+            available_balance=100_000.0,
+            gross_realized_pnl=-6_000.0,
+            fee_total=0.0,
+            funding_total=0.0,
+            net_pnl=-6_000.0,
+            realized_pnl=-6_000.0,
+            unrealized_pnl=0.0,
+            daily_pnl=-6_000.0,
+            cumulative_pnl=-6_000.0,
+            consecutive_losses=1,
+        )
+    )
+    db_session.flush()
+    provider = _CountingDecisionProvider(decision="long")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        open_position=_pre_ai_gate_open_position(),
+        position_management_context=_pre_ai_gate_add_on_position_management_context(),
+    )
+    route_context = decision_row.metadata_json["active_position_prompt_route_context"]
+    ai_call_policy = decision_row.metadata_json["ai_call_policy"]
+    skipped_audit = db_session.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.event_type == "decision_ai_skipped", AuditEvent.entity_id == str(decision_row.id))
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == "DAILY_LOSS_LIMIT_REACHED"
+    assert route_context["risk_adding_add_on_candidate"] is True
+    assert route_context["allow_same_side_add_on"] is False
+    assert route_context["allowed_add_on_side"] is None
+    assert route_context["risk_adding_add_on_pre_ai_blocked"] is True
+    assert route_context["risk_adding_add_on_pre_ai_block_reason"] == "DAILY_LOSS_LIMIT_REACHED"
+    assert ai_call_policy["scope"] == "risk_adding_add_on"
+    assert ai_call_policy["hard_skip_ai"] is True
+    assert "DAILY_LOSS_LIMIT_REACHED" in ai_call_policy["hard_skip_reason_codes"]
+    assert skipped_audit is not None
+    assert skipped_audit.payload["risk_adding_add_on_pre_ai_blocked"] is True
+    assert skipped_audit.payload["risk_adding_add_on_pre_ai_block_reason"] == "DAILY_LOSS_LIMIT_REACHED"
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_risk_adding_add_on_live_approval_required_pre_ai_gate_disables_add_on(
+    monkeypatch,
+    db_session,
+) -> None:
+    defaults = get_app_settings().model_copy(update={"live_trading_env_enabled": True})
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.get_settings",
+        lambda: defaults,
+    )
+    provider = _CountingDecisionProvider(decision="long")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        open_position=_pre_ai_gate_open_position(),
+        position_management_context=_pre_ai_gate_add_on_position_management_context(),
+        settings_mutator=lambda settings_row: (
+            setattr(settings_row, "live_trading_enabled", True),
+            setattr(settings_row, "rollout_mode", "limited_live"),
+            setattr(settings_row, "manual_live_approval", True),
+            setattr(settings_row, "live_execution_armed", True),
+            setattr(settings_row, "live_execution_armed_until", None),
+        ),
+    )
+    route_context = decision_row.metadata_json["active_position_prompt_route_context"]
+    ai_call_policy = decision_row.metadata_json["ai_call_policy"]
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == "LIVE_APPROVAL_REQUIRED"
+    assert route_context["allow_same_side_add_on"] is False
+    assert route_context["risk_adding_add_on_pre_ai_blocked"] is True
+    assert route_context["risk_adding_add_on_pre_ai_block_reason"] == "LIVE_APPROVAL_REQUIRED"
+    assert ai_call_policy["scope"] == "risk_adding_add_on"
+    assert "LIVE_APPROVAL_REQUIRED" in ai_call_policy["hard_skip_reason_codes"]
+    assert db_session.scalar(select(Order).limit(1)) is None
+    assert db_session.scalar(select(Execution).limit(1)) is None
+
+
+def test_risk_adding_add_on_low_actionability_cost_gate_hard_skips_provider(
+    monkeypatch,
+    db_session,
+) -> None:
+    provider = _CountingDecisionProvider(decision="long")
+
+    result, decision_row = _run_pre_ai_gate_decision(
+        monkeypatch,
+        db_session,
+        trigger_reason="entry_candidate_event",
+        feature_payload=_pre_ai_gate_feature(volume_ratio=1.08, weak_volume=False),
+        provider=provider,
+        open_position=_pre_ai_gate_open_position(),
+        position_management_context=_pre_ai_gate_add_on_position_management_context(),
+        openai_gate=OpenAICallGate(
+            allowed=False,
+            reason="low_actionability_cost_guard_active",
+            retry_after_seconds=360 * 60,
+        ),
+    )
+    route_context = decision_row.metadata_json["active_position_prompt_route_context"]
+    ai_call_policy = decision_row.metadata_json["ai_call_policy"]
+
+    assert provider.calls == 0
+    assert result["last_ai_skip_reason"] == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+    assert route_context["allow_same_side_add_on"] is False
+    assert route_context["risk_adding_add_on_pre_ai_blocked"] is True
+    assert route_context["risk_adding_add_on_pre_ai_block_reason"] == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+    assert ai_call_policy["scope"] == "risk_adding_add_on"
+    assert ai_call_policy["skip_category"] == "cost_governance"
+    assert "LOW_ACTIONABILITY_COST_GUARD_ACTIVE" in ai_call_policy["hard_skip_reason_codes"]
     assert db_session.scalar(select(Order).limit(1)) is None
     assert db_session.scalar(select(Execution).limit(1)) is None
 

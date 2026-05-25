@@ -15,6 +15,7 @@ import {
   describeReasonCode,
   describeReasonCodeInContext,
   isEntryWaitReasonCodeInContext,
+  isOperationalControlReasonCode,
   lookupRiskReasonCode,
 } from "../lib/risk-reason-copy.js";
 import { buildExecutionRiskProfileSummary } from "../lib/execution-risk-profile-summary";
@@ -61,6 +62,14 @@ const reasonFallbackMap: Record<string, string> = {
   EMERGENCY_EXIT: "비상 청산 상태라 신규 진입을 막습니다.",
   HOLD_DECISION: "현재 AI 판단은 신규 진입 신호가 없어 대기 중입니다.",
   ENTRY_TRIGGER_NOT_MET: "현재 진입 조건이 아직 충족되지 않았습니다.",
+  insufficient_sample: "실거래 표본 부족",
+  productization_profitability_unverified: "제품화 수익성 미검증",
+  negative_expectancy: "기대 수익 음수",
+  excessive_drawdown: "최대 낙폭 초과",
+  protection_failures: "보호 주문 실패 이력",
+  execution_unknowns: "주문 제출 상태 미해결",
+  stale_data_frequency_high: "지연/누락 데이터 차단 빈도 높음",
+  ai_filter_underperforming: "AI 필터 실측 기여도 음수",
 };
 
 function unique(values: string[]) {
@@ -196,6 +205,19 @@ function isGlobalEntryBlocked(control: OperatorDashboardPayload["control"]) {
   return globalReasons.length > 0 || (blockScope !== "none" && blockScope !== "candidate");
 }
 
+function currentOperationalBlockerCode(control: OperatorDashboardPayload["control"]) {
+  if (control.can_enter_new_position) {
+    return null;
+  }
+  const summary = control.control_status_summary;
+  const candidates = unique([
+    ...(summary?.global_block_reason_codes ?? []),
+    ...(summary?.approval_control_blocked_reasons ?? []),
+    control.guard_mode_reason_code ?? "",
+  ]);
+  return candidates.find((code) => isOperationalControlReasonCode(code)) ?? null;
+}
+
 function exchangePermissionUnknown(control: OperatorDashboardPayload["control"]) {
   const summary = control.control_status_summary;
   return (
@@ -300,6 +322,7 @@ function mainState(operator: OperatorDashboardPayload) {
   const blockers = importantBlockers(control);
   const riskBlockers = currentRiskBlockers(control);
   const passiveRiskOnly = isPassiveRiskOnly(control);
+  const operationalBlocker = currentOperationalBlockerCode(control);
 
   if (exchangePermissionUnknown(control)) {
     return {
@@ -317,6 +340,14 @@ function mainState(operator: OperatorDashboardPayload) {
         translateReasonCode(control.pause_reason_code) ||
         (manualPause ? "운영자가 자동 거래를 일시정지했습니다." : "시스템 보호 조건으로 신규 진입을 보류했습니다."),
       tone: "danger" as const,
+    };
+  }
+
+  if (operationalBlocker) {
+    return {
+      title: operationalBlocker === "LIVE_APPROVAL_REQUIRED" ? "실거래 승인 대기" : "운영 제어로 신규 진입 차단",
+      detail: translateReasonCodeInContext(operationalBlocker, currentControlBlockers(control)),
+      tone: "warn" as const,
     };
   }
 
@@ -445,6 +476,13 @@ function entryPermissionStatus(control: OperatorDashboardPayload["control"]) {
   }
   if (control.trading_paused) {
     return { label: "보류", tone: "neutral" as const };
+  }
+  const operationalBlocker = currentOperationalBlockerCode(control);
+  if (operationalBlocker) {
+    return {
+      label: operationalBlocker === "LIVE_APPROVAL_REQUIRED" ? "승인 대기" : "운영 차단",
+      tone: "warn" as const,
+    };
   }
   if (control.can_enter_new_position && !isGlobalEntryBlocked(control)) {
     return { label: "준비됨", tone: "safe" as const };
@@ -889,6 +927,7 @@ function ProfitabilityCostPanel({
   const readiness = limitedLiveReadiness;
   const readinessStatusTone = readinessTone(readiness);
   const lacksRealizedProfitabilityEvidence = readiness ? readiness.actual_entries === 0 || readiness.fills === 0 : false;
+  const readinessReasonLabels = readiness?.reason_codes.map(translateReasonCode) ?? [];
   const warningLabels = cost?.warning_codes.map((code) => profitabilityWarningCopy[code] ?? code) ?? [];
   const statusLabel = !cost || cost.status === "no_data"
     ? "데이터 없음"
@@ -929,7 +968,7 @@ function ProfitabilityCostPanel({
           <p className="mt-2 leading-6">
             실제 진입 {formatNumber(readiness.actual_entries)}건, 체결 {formatNumber(readiness.fills)}건, 섀도우 후보{" "}
             {formatNumber(readiness.recent_candidate_events)}건
-            {readiness.reason_codes.length > 0 ? ` / ${readiness.reason_codes.join(", ")}` : ""}
+            {readinessReasonLabels.length > 0 ? ` / ${readinessReasonLabels.join(", ")}` : ""}
           </p>
           {lacksRealizedProfitabilityEvidence ? (
             <p className="mt-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 font-semibold text-amber-900">

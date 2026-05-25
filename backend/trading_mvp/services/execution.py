@@ -52,6 +52,7 @@ from trading_mvp.services.binance_user_stream import (
     normalize_user_stream_event,
 )
 from trading_mvp.services.exchange_permission import (
+    exchange_trade_permission_entry_blocker,
     fetch_account_config_for_permission,
     resolve_exchange_trade_permission,
 )
@@ -121,6 +122,7 @@ from trading_mvp.services.settings import (
     get_limited_live_max_notional,
     get_rollout_mode,
     get_runtime_credentials,
+    is_live_execution_armed,
     rollout_mode_allows_exchange_submit,
     set_trading_pause,
 )
@@ -1950,7 +1952,7 @@ def _execution_order_policy_from_risk_result(
     *,
     intent_type: str,
 ) -> tuple[str, bool, str | None]:
-    if intent_type != "entry":
+    if intent_type not in {"entry", "scale_in"}:
         return "market_allowed", True, None
     debug_payload = _as_object_dict(risk_result.debug_payload)
     expected_cost_gate = _as_object_dict(debug_payload.get("expected_cost_gate"))
@@ -1985,7 +1987,7 @@ def _execution_order_policy_from_risk_result(
     if required_order_policy == "market_allowed":
         required_order_policy = "limit_only_or_post_only"
         allow_market_fallback = False
-        order_policy_reason = order_policy_reason or "entry_market_fallback_disabled_by_default"
+        order_policy_reason = order_policy_reason or f"{intent_type}_market_fallback_disabled_by_default"
     return required_order_policy, allow_market_fallback, order_policy_reason
 
 
@@ -8994,6 +8996,11 @@ def _execute_live_trade_body(
         correlation_ids=execution_correlation_ids,
     )
     session.refresh(latest_pnl)
+    exchange_permission_detail = _exchange_permission_sync_detail(
+        account_info,
+        account_config=account_config,
+        account_config_error=account_config_error,
+    )
     _record_sync_success(
         session,
         settings_row,
@@ -9004,11 +9011,7 @@ def _execute_live_trade_body(
             "wallet_balance": latest_pnl.wallet_balance,
             "available_balance": latest_pnl.available_balance,
             "funding_sync": funding_sync,
-            **_exchange_permission_sync_detail(
-                account_info,
-                account_config=account_config,
-                account_config_error=account_config_error,
-            ),
+            **exchange_permission_detail,
         },
     )
     live_balances = _live_account_balances(account_info)
@@ -9083,6 +9086,39 @@ def _execute_live_trade_body(
         operating_state=operating_state,
     )
     intent_type = intent.intent_type
+    exchange_permission_entry_block = exchange_trade_permission_entry_blocker(
+        exchange_permission_detail,
+        rollout_mode=rollout_mode,
+        live_execution_armed=is_live_execution_armed(settings_row),
+        intent_type=intent_type,
+    )
+    if exchange_permission_entry_block is not None:
+        reason_code = str(exchange_permission_entry_block["reason_code"])
+        record_audit_event(
+            session,
+            event_type="live_execution_blocked",
+            entity_type="decision_run",
+            entity_id=str(decision_run_id or decision.symbol),
+            severity="warning",
+            message="Live execution skipped because Binance canTrade is not confirmed for a risk-adding intent.",
+            payload={
+                "symbol": decision.symbol,
+                "decision": decision.decision,
+                "intent_type": intent_type,
+                "reason_code": reason_code,
+                "exchange_permission": exchange_permission_entry_block,
+                "risk_check_id": risk_row.id if risk_row is not None else None,
+            },
+            correlation_ids=execution_correlation_ids,
+        )
+        session.flush()
+        return {
+            "status": "blocked",
+            "reason_codes": [reason_code],
+            "decision": decision.decision,
+            "intent_type": intent_type,
+            "exchange_permission": exchange_permission_entry_block,
+        }
     protection_verify_block = _get_symbol_protection_verify_block(settings_row, decision.symbol)
     if intent_type in PROTECTION_VERIFY_BLOCKING_INTENT_TYPES and protection_verify_block is not None:
         record_audit_event(

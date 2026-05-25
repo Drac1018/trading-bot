@@ -66,6 +66,54 @@ test("quality badges expose missing close executions and incomplete sources", as
   );
 });
 
+test("quality badges distinguish missing slippage samples from incomplete slippage data", async () => {
+  const { costBreakdownQualityBadges, costBreakdownWarningMessages, statusLabel } = await costBreakdownModule;
+
+  const badges = costBreakdownQualityBadges({
+    realized_pnl_confirmed: true,
+    execution_sync_status: "COMPLETE",
+    funding_sync_status: "COMPLETE",
+    slippage_data_status: "NO_SAMPLE",
+    missing_close_execution_count: 0,
+    slippage_weighting: "quantity",
+  });
+
+  assert.equal(statusLabel("NO_SAMPLE"), "표본 없음");
+  assert.deepEqual(
+    badges.map((badge) => badge.label),
+    ["실현 손익 확정", "슬리피지 표본 없음"],
+  );
+  assert.deepEqual(
+    costBreakdownWarningMessages({
+      period: "today",
+      timezone: "Asia/Seoul",
+      start_at: "2026-05-25T00:00:00+09:00",
+      end_at: "2026-05-26T00:00:00+09:00",
+      summary: {
+        net_pnl_usdt: 0,
+        gross_pnl_usdt: 0,
+        fee_usdt: 0,
+        funding_usdt: 0,
+        total_cost_usdt: 0,
+        fee_ratio_pct: null,
+        total_cost_ratio_pct: null,
+        signed_slippage_bps: null,
+        adverse_slippage_bps: null,
+      },
+      buckets: [],
+      data_quality: {
+        realized_pnl_confirmed: true,
+        execution_sync_status: "COMPLETE",
+        funding_sync_status: "COMPLETE",
+        slippage_data_status: "NO_SAMPLE",
+        missing_close_execution_count: 0,
+      },
+      warnings: ["slippage_data_status:NO_SAMPLE"],
+    }),
+    ["해당 기간에 체결 표본이 없어 평균 체결 불리도를 계산할 수 없습니다."],
+  );
+});
+
 test("warnings translate API quality codes and include high fee ratio notice", async () => {
   const { costBreakdownWarningMessages } = await costBreakdownModule;
 

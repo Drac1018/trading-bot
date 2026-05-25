@@ -47,7 +47,8 @@
 
 * 좁은 백엔드 변경은 `.\.venv\Scripts\python.exe -m compileall -q backend\trading_mvp`, `.\.venv\Scripts\python.exe -m ruff check backend tests workers`, 관련 `pytest`를 우선 실행한다.
 * 넓은 백엔드/제품화 변경은 `.\.venv\Scripts\python.exe -m pytest`와 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_productization_checks.ps1`를 우선 검토한다.
-* 프런트 변경은 `C:\my-trading-bot\.tools\node-v24.14.1-win-x64\corepack.cmd pnpm -C C:\my-trading-bot\frontend lint`와 `C:\my-trading-bot\.tools\node-v24.14.1-win-x64\corepack.cmd pnpm -C C:\my-trading-bot\frontend build`를 우선 실행한다.
+* 프런트 변경은 현재 검증된 Corepack 경로로 `& 'C:\Program Files\nodejs\corepack.cmd' pnpm -C C:\my-trading-bot\frontend lint`와 `& 'C:\Program Files\nodejs\corepack.cmd' pnpm -C C:\my-trading-bot\frontend build`를 우선 실행한다.
+* 위 경로가 없으면 `Test-Path 'C:\my-trading-bot\.tools\node-v22.21.1-win-x64\corepack.cmd'`를 확인한 뒤 해당 로컬 Corepack을 fallback으로 사용한다. 현재 `.tools\node-v24.14.1-win-x64\corepack.cmd`는 없으므로 검증 명령으로 쓰지 않는다.
 * 모든 코드/문서 변경 후에는 범위에 맞춰 `git diff --check`를 확인한다.
 * 추가 작업이나 검증을 마친 뒤 `127.0.0.1:8001` 또는 `127.0.0.1:3001`에 리스닝 프로세스가 남아 있으면, `8000/3000` 기준 운영과 충돌하지 않도록 해당 포트의 프로세스를 조회하고 자동 종료한다.
 * 사용자가 명시적으로 유지하라고 한 포트 프로세스는 종료하지 않는다.

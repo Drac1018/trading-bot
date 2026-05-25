@@ -233,6 +233,7 @@ export function statusLabel(value: string | null | undefined) {
   const labels: Record<string, string> = {
     COMPLETE: "완료",
     INCOMPLETE: "불완전",
+    NO_SAMPLE: "표본 없음",
     STALE: "오래됨",
     UNKNOWN: "확인 필요",
   };
@@ -270,7 +271,10 @@ export function costBreakdownQualityBadges(dataQuality: AnalyticsCostBreakdownDa
   }
 
   if (dataQuality.slippage_data_status !== "COMPLETE") {
-    badges.push({ label: "슬리피지 데이터 부족", tone: "warn" });
+    badges.push({
+      label: dataQuality.slippage_data_status === "NO_SAMPLE" ? "슬리피지 표본 없음" : "슬리피지 데이터 부족",
+      tone: "warn",
+    });
   }
 
   return badges;
@@ -285,6 +289,9 @@ export function costBreakdownWarningMessages(payload: AnalyticsCostBreakdownResp
       return "펀딩비 동기화가 불완전합니다.";
     }
     if (warning.startsWith("slippage_data_status")) {
+      if (warning.includes("NO_SAMPLE")) {
+        return "해당 기간에 체결 표본이 없어 평균 체결 불리도를 계산할 수 없습니다.";
+      }
       return "슬리피지 데이터가 부족해 평균 체결 불리도를 확정할 수 없습니다.";
     }
     if (warning.startsWith("fee_asset_unconverted")) {
@@ -315,7 +322,7 @@ export function costBreakdownBucketStatus(
     statuses.push("펀딩비 미확정");
   }
   if (dataQuality.slippage_data_status !== "COMPLETE") {
-    statuses.push("슬리피지 데이터 부족");
+    statuses.push(dataQuality.slippage_data_status === "NO_SAMPLE" ? "슬리피지 표본 없음" : "슬리피지 데이터 부족");
   }
   if (bucket.gross_pnl_usdt <= 0 && (bucket.fee_usdt > 0 || bucket.total_cost_usdt > 0)) {
     statuses.push("비율 N/A");

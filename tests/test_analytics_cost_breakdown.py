@@ -226,6 +226,21 @@ def test_month_cost_breakdown_reuses_today_formula_and_daily_buckets(db_session)
     assert may_first.net_pnl_usdt == pytest.approx(4.49, abs=1e-9)
 
 
+def test_cost_breakdown_marks_empty_period_slippage_as_no_sample(db_session) -> None:
+    _mark_account_sync_complete(db_session)
+
+    payload = get_analytics_cost_breakdown(db_session, period="month", year=2026, month=5)
+
+    assert payload.summary.net_pnl_usdt == pytest.approx(0.0, abs=1e-9)
+    assert payload.summary.signed_slippage_bps is None
+    assert payload.summary.adverse_slippage_bps is None
+    assert payload.data_quality.realized_pnl_confirmed is True
+    assert payload.data_quality.execution_sync_status == "COMPLETE"
+    assert payload.data_quality.funding_sync_status == "COMPLETE"
+    assert payload.data_quality.slippage_data_status == "NO_SAMPLE"
+    assert payload.warnings == ["slippage_data_status:NO_SAMPLE"]
+
+
 def test_year_cost_breakdown_returns_monthly_buckets(db_session) -> None:
     _mark_account_sync_complete(db_session)
     _seed_live_execution(

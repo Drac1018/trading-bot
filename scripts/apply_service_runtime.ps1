@@ -2,16 +2,58 @@
 param(
     [switch]$PreflightOnly,
     [switch]$IncludeWorker,
-    [switch]$PauseOnExit
+    [switch]$PauseOnExit,
+    [switch]$NoOpenDashboard,
+    [string]$DashboardUrl = "http://127.0.0.1:3000/dashboard/operations"
 )
 
 $ErrorActionPreference = "Stop"
 $script:RuntimeSwitchFailed = $false
+
+function Test-LocalPortReachable {
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    $client = [Net.Sockets.TcpClient]::new()
+    try {
+        $asyncResult = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        if (-not $asyncResult.AsyncWaitHandle.WaitOne(1000, $false)) {
+            return $false
+        }
+        $client.EndConnect($asyncResult)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+function Open-OperatorDashboard {
+    param([Parameter(Mandatory = $true)][string]$Context)
+
+    if ($NoOpenDashboard) {
+        Write-Host "Operator dashboard auto-open skipped by -NoOpenDashboard."
+        return
+    }
+    if (-not (Test-LocalPortReachable -Port 3000)) {
+        Write-Warning "Operator dashboard was not opened because http://127.0.0.1:3000 is not reachable."
+        return
+    }
+
+    try {
+        Write-Host "Opening operator dashboard ($Context): $DashboardUrl"
+        Start-Process $DashboardUrl | Out-Null
+    } catch {
+        Write-Warning "Failed to open operator dashboard: $($_.Exception.Message)"
+    }
+}
+
 trap {
     $script:RuntimeSwitchFailed = $true
     Write-Host ""
     Write-Host "Service runtime switch failed:"
     Write-Host $_
+    Open-OperatorDashboard -Context "restart blocked or failed; opening current reachable UI"
     try {
         Stop-Transcript | Out-Null
     } catch {
@@ -227,6 +269,7 @@ $listeners = Get-NetTCPConnection -LocalPort 8000,3000,8001,3001 -State Listen -
     ai_usage_second = $aiUsageSecond
     listeners = $listeners
 } | ConvertTo-Json -Depth 8
+Open-OperatorDashboard -Context "runtime switch completed"
 try {
     Stop-Transcript | Out-Null
 } catch {
