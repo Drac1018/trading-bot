@@ -128,7 +128,13 @@ async function withBrowserCsrfHeader(init: RequestInit): Promise<RequestInit> {
     throw new Error("Operator CSRF token is missing.");
   }
   headers.set(operatorCsrfHeader, payload.token);
-  return { ...init, headers };
+  return {
+    ...init,
+    headers,
+    credentials: init.credentials ?? "same-origin",
+    referrer: init.referrer ?? window.location.href,
+    referrerPolicy: init.referrerPolicy ?? "same-origin",
+  };
 }
 
 export async function withOperatorWriteProtection(path: string, init?: RequestInit): Promise<RequestInit> {

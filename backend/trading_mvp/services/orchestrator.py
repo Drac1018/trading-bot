@@ -160,16 +160,54 @@ from trading_mvp.time_utils import utcnow_naive
 ACTIVE_ENTRY_PLAN_STATUS = "armed"
 ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON = "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
 ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON = "ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT"
+ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_POLICY_REASON = "entry_candidate_weak_volume_preai_skip"
 ENTRY_CANDIDATE_EXTREME_LOW_VOLUME_RATIO = 0.10
-ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_MAX_RATIO = 0.20
 ENTRY_CANDIDATE_WEAK_VOLUME_REGIMES = frozenset(
     {"weak", "low", "thin", "dry", "illiquid", "low_participation"}
 )
 ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_REASON = "neutral_entry_review_hold_backoff_active"
 ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_SKIP_REASON = "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF"
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_REASON = "neutral_entry_context_preai_skip"
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_SKIP_REASON = "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI"
 ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS = frozenset(
     {"EXPECTANCY_NEUTRAL", "DERIVATIVES_NEUTRAL", "LEAD_MARKETS_NEUTRAL"}
 )
+ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_REASON = (
+    "entry_candidate_low_actionability_hold_backoff_active"
+)
+ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_SKIP_REASON = (
+    "ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF"
+)
+ENTRY_CANDIDATE_LOW_ACTIONABILITY_REASON_CODES = frozenset(
+    {
+        "EXPECTANCY_NEUTRAL",
+        "DERIVATIVES_NEUTRAL",
+        "LEAD_MARKETS_NEUTRAL",
+        "LEAD_MARKETS_DIVERGED",
+        "DERIVATIVES_HEADWIND",
+        "TOP_TRADER_LONG_CROWDED",
+        "TREND_MIXED",
+        "REGIME_TRANSITION",
+        "WEAK_VOLUME",
+        "MOMENTUM_WEAKENING",
+        "RANGE_WEAK_VOLUME_NO_TRADE_ZONE",
+        ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON,
+    }
+)
+ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_REASON = "entry_candidate_order_path_not_actionable"
+ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_SKIP_REASON = "ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE"
+ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_REASON = "entry_candidate_active_pending_plan_preai_skip"
+ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_SKIP_REASON = "ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI"
+ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_REASON = "entry_candidate_incomplete_trade_plan_preai_skip"
+ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_SKIP_REASON = "ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI"
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_REASON = (
+    "entry_candidate_ai_hold_fingerprint_cooldown_active"
+)
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_SKIP_REASON = (
+    "ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN"
+)
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES = 60
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_ROW_LIMIT = 40
 AI_CALL_EVENT_ALLOWED = "AI_CALL_ALLOWED"
 AI_CALL_EVENT_SKIPPED = "AI_CALL_SKIPPED"
 SOFT_SIGNAL_AI_REVIEW_REASON_CODE = "SOFT_SIGNAL_AI_REVIEW"
@@ -9801,11 +9839,7 @@ class TradingOrchestrator:
         )
         if volume_ratio is not None and volume_ratio <= ENTRY_CANDIDATE_EXTREME_LOW_VOLUME_RATIO:
             return ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON
-        if (
-            weak_volume_signal
-            and volume_ratio is not None
-            and volume_ratio <= ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_MAX_RATIO
-        ):
+        if weak_volume_signal:
             return ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON
         return None
 
@@ -10257,15 +10291,33 @@ class TradingOrchestrator:
         return {str(code) for code in values if code}
 
     @classmethod
-    def _selection_has_neutral_entry_context(cls, selection_context: dict[str, object]) -> bool:
+    def _entry_candidate_reason_codes(
+        cls,
+        selection_context: dict[str, object],
+        *,
+        extra_reason_codes: list[str] | None = None,
+    ) -> set[str]:
         candidate = _as_dict(selection_context.get("candidate"))
-        decision = str(candidate.get("decision") or "").lower()
-        if decision not in {"long", "short"}:
-            return False
         reason_codes = {
             *cls._reason_codes_from_payload(candidate),
             *cls._reason_codes_from_payload(selection_context),
         }
+        for code in extra_reason_codes or []:
+            if code:
+                reason_codes.add(str(code))
+        return reason_codes
+
+    @staticmethod
+    def _entry_candidate_decision(selection_context: dict[str, object]) -> str:
+        candidate = _as_dict(selection_context.get("candidate"))
+        return str(candidate.get("decision") or "").lower()
+
+    @classmethod
+    def _selection_has_neutral_entry_context(cls, selection_context: dict[str, object]) -> bool:
+        decision = cls._entry_candidate_decision(selection_context)
+        if decision not in {"long", "short"}:
+            return False
+        reason_codes = cls._entry_candidate_reason_codes(selection_context)
         return ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS.issubset(reason_codes)
 
     @classmethod
@@ -10280,6 +10332,289 @@ class TradingOrchestrator:
             *cls._reason_codes_from_payload(selection_candidate),
         }
         return ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS.issubset(reason_codes)
+
+    @classmethod
+    def _entry_candidate_weak_volume_context(
+        cls,
+        selection_context: dict[str, object],
+        *,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        reason_codes = cls._entry_candidate_reason_codes(
+            selection_context,
+            extra_reason_codes=allow_ai_but_later_risk_check,
+        )
+        snapshot = cls._soft_signal_review_snapshot(selection_context)
+        volume_regime = str(snapshot.get("volume_regime") or "").lower()
+        weak_volume = bool(snapshot.get("weak_volume", False))
+        momentum_weakening = bool(snapshot.get("momentum_weakening", False))
+        active = (
+            ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON in reason_codes
+            or ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON in reason_codes
+            or "WEAK_VOLUME" in reason_codes
+            or volume_regime in ENTRY_CANDIDATE_WEAK_VOLUME_REGIMES
+            or weak_volume
+        )
+        return {
+            "active": bool(active),
+            "reason_codes": sorted(reason_codes),
+            "volume_regime": volume_regime or None,
+            "weak_volume": weak_volume,
+            "momentum_weakening": momentum_weakening,
+        }
+
+    @classmethod
+    def _entry_candidate_low_actionability_signature(
+        cls,
+        selection_context: dict[str, object],
+        *,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object] | None:
+        decision = cls._entry_candidate_decision(selection_context)
+        if decision not in {"long", "short"}:
+            return None
+        reason_codes = cls._entry_candidate_reason_codes(
+            selection_context,
+            extra_reason_codes=allow_ai_but_later_risk_check,
+        )
+        snapshot = cls._soft_signal_review_snapshot(selection_context)
+        weak_context = cls._entry_candidate_weak_volume_context(
+            selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        low_reason_codes = {
+            code
+            for code in reason_codes
+            if code in ENTRY_CANDIDATE_LOW_ACTIONABILITY_REASON_CODES
+        }
+        if bool(weak_context.get("active")):
+            low_reason_codes.add(ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON)
+        if bool(snapshot.get("momentum_weakening", False)):
+            low_reason_codes.add("MOMENTUM_WEAKENING")
+        if not low_reason_codes:
+            return None
+        return {
+            "decision": decision,
+            "reason_codes": sorted(low_reason_codes),
+            "strategy_engine": str(
+                selection_context.get("strategy_engine")
+                or _as_dict(selection_context.get("candidate")).get("strategy_engine")
+                or ""
+            )
+            or None,
+        }
+
+    @classmethod
+    def _agent_run_low_actionability_signature(cls, row: AgentRun) -> dict[str, object] | None:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        selection_context = _as_dict(metadata.get("selection_context"))
+        if selection_context:
+            allow_reasons = [
+                str(code)
+                for code in metadata.get("allow_ai_but_later_risk_check", [])
+                if code
+            ] if isinstance(metadata.get("allow_ai_but_later_risk_check"), list) else []
+            ai_call_policy = _as_dict(metadata.get("ai_call_policy"))
+            if isinstance(ai_call_policy.get("allow_ai_but_later_risk_check"), list):
+                allow_reasons.extend(
+                    str(code)
+                    for code in ai_call_policy.get("allow_ai_but_later_risk_check", [])
+                    if code
+                )
+            return cls._entry_candidate_low_actionability_signature(
+                selection_context,
+                allow_ai_but_later_risk_check=list(dict.fromkeys(allow_reasons)),
+            )
+        return None
+
+    @staticmethod
+    def _entry_candidate_score_bucket(value: object, *, bucket_size: float = 0.05) -> float | None:
+        numeric_value = _safe_float(value, default=float("nan"))
+        if numeric_value != numeric_value:
+            return None
+        bucket = int(max(min(numeric_value, 1.0), -1.0) / bucket_size) * bucket_size
+        return round(bucket, 4)
+
+    @classmethod
+    def _entry_candidate_ai_hold_signature(
+        cls,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object] | None:
+        decision = cls._entry_candidate_decision(selection_context)
+        if decision not in {"long", "short"}:
+            return None
+        snapshot = cls._soft_signal_review_snapshot(selection_context)
+        reason_codes = cls._entry_candidate_reason_codes(
+            selection_context,
+            extra_reason_codes=allow_ai_but_later_risk_check,
+        )
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe or snapshot.get("timeframe") or None,
+            "decision": decision,
+            "scenario": snapshot.get("scenario") or None,
+            "strategy_engine": snapshot.get("strategy_engine") or None,
+            "holding_profile": snapshot.get("holding_profile") or None,
+            "entry_mode": snapshot.get("entry_mode") or None,
+            "reason_codes": sorted(reason_codes),
+            "primary_regime": snapshot.get("primary_regime") or None,
+            "trend_alignment": snapshot.get("trend_alignment") or None,
+            "volume_regime": snapshot.get("volume_regime") or None,
+            "weak_volume": bool(snapshot.get("weak_volume", False)),
+            "momentum_weakening": bool(snapshot.get("momentum_weakening", False)),
+            "score_bucket": cls._entry_candidate_score_bucket(snapshot.get("score_total")),
+            "lead_lag_alignment_bucket": cls._entry_candidate_score_bucket(
+                snapshot.get("lead_lag_alignment")
+            ),
+            "derivatives_alignment_bucket": cls._entry_candidate_score_bucket(
+                snapshot.get("derivatives_alignment")
+            ),
+            "lead_lag_state": snapshot.get("lead_lag_state") or {},
+            "derivatives_state": snapshot.get("derivatives_state") or {},
+        }
+
+    @classmethod
+    def _agent_run_entry_candidate_ai_hold_signature(cls, row: AgentRun) -> dict[str, object] | None:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        stored_signature = _as_dict(metadata.get("entry_candidate_ai_hold_fingerprint"))
+        if stored_signature:
+            return stored_signature
+        selection_context = _as_dict(metadata.get("selection_context"))
+        if not selection_context:
+            return None
+        allow_reasons = [
+            str(code)
+            for code in metadata.get("allow_ai_but_later_risk_check", [])
+            if code
+        ] if isinstance(metadata.get("allow_ai_but_later_risk_check"), list) else []
+        ai_call_policy = _as_dict(metadata.get("ai_call_policy"))
+        if isinstance(ai_call_policy.get("allow_ai_but_later_risk_check"), list):
+            allow_reasons.extend(
+                str(code)
+                for code in ai_call_policy.get("allow_ai_but_later_risk_check", [])
+                if code
+            )
+        output = row.output_payload if isinstance(row.output_payload, dict) else {}
+        symbol = str(
+            metadata.get("symbol")
+            or output.get("symbol")
+            or _as_dict(selection_context.get("candidate")).get("symbol")
+            or ""
+        )
+        timeframe = str(
+            metadata.get("timeframe")
+            or output.get("timeframe")
+            or _as_dict(selection_context.get("candidate")).get("timeframe")
+            or ""
+        ) or None
+        if not symbol:
+            return None
+        return cls._entry_candidate_ai_hold_signature(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            allow_ai_but_later_risk_check=list(dict.fromkeys(allow_reasons)),
+        )
+
+    def _entry_candidate_ai_hold_fingerprint_cooldown_status(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        current_signature = self._entry_candidate_ai_hold_signature(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if current_signature is None:
+            return {
+                "active": False,
+                "reason": "context_not_directional_entry_candidate",
+            }
+        cutoff = generated_at - timedelta(
+            minutes=ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES
+        )
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.role == AgentRole.TRADING_DECISION.value,
+                    AgentRun.trigger_event == TriggerEvent.REALTIME.value,
+                    AgentRun.created_at >= cutoff,
+                )
+                .order_by(desc(AgentRun.created_at))
+                .limit(ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_ROW_LIMIT)
+            )
+        )
+        matching_rows: list[AgentRun] = []
+        for row in rows:
+            if not self._agent_run_is_provider_attempt(row):
+                continue
+            if not self._agent_run_matches_symbol(row, symbol=symbol.upper(), timeframe=timeframe):
+                continue
+            if self._agent_run_entry_candidate_ai_hold_signature(row) != current_signature:
+                continue
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            if str(output.get("decision") or "").lower() != "hold":
+                continue
+            matching_rows.append(row)
+
+        if not matching_rows:
+            return {
+                "active": False,
+                "sample_count": 0,
+                "cooldown_minutes": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES,
+                "signature": current_signature,
+            }
+
+        run_ids = [int(row.id) for row in matching_rows if row.id is not None]
+        order_run_ids = {
+            int(run_id)
+            for run_id in self.session.scalars(
+                select(Order.decision_run_id).where(Order.decision_run_id.in_(run_ids))
+            )
+            if run_id is not None
+        } if run_ids else set()
+        plan_run_ids = {
+            int(run_id)
+            for run_id in self.session.scalars(
+                select(PendingEntryPlan.source_decision_run_id).where(
+                    PendingEntryPlan.source_decision_run_id.in_(run_ids)
+                )
+            )
+            if run_id is not None
+        } if run_ids else set()
+        reusable_rows = [
+            row
+            for row in matching_rows
+            if row.id is not None and int(row.id) not in order_run_ids and int(row.id) not in plan_run_ids
+        ]
+        latest_reusable = reusable_rows[0] if reusable_rows else None
+        return {
+            "active": latest_reusable is not None,
+            "sample_count": len(matching_rows),
+            "reusable_hold_count": len(reusable_rows),
+            "cooldown_minutes": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES,
+            "signature": current_signature,
+            "decision_run_ids": run_ids,
+            "order_decision_run_ids": sorted(order_run_ids),
+            "pending_plan_decision_run_ids": sorted(plan_run_ids),
+            "reused_decision_run_id": latest_reusable.id if latest_reusable is not None else None,
+            "last_provider_call_at": (
+                latest_reusable.created_at.isoformat()
+                if latest_reusable is not None and latest_reusable.created_at is not None
+                else None
+            ),
+        }
 
     @staticmethod
     def _risk_check_hold_blocked(row: RiskCheck) -> bool:
@@ -10375,6 +10710,186 @@ class TradingOrchestrator:
             "required_reason_codes": sorted(ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS),
             "last_provider_call_at": recent_rows[0].created_at.isoformat() if recent_rows else None,
             "oldest_provider_call_at": recent_rows[-1].created_at.isoformat() if recent_rows else None,
+        }
+
+    def _entry_candidate_low_actionability_hold_backoff_status(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        symbol_upper = symbol.upper()
+        current_signature = self._entry_candidate_low_actionability_signature(
+            selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if not symbol_upper or current_signature is None:
+            return {
+                "active": False,
+                "sample_count": 0,
+                "reason": "context_not_low_actionability_entry",
+            }
+        cutoff = generated_at - timedelta(minutes=SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES)
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.role == AgentRole.TRADING_DECISION.value,
+                    AgentRun.trigger_event == TriggerEvent.REALTIME.value,
+                    AgentRun.created_at >= cutoff,
+                )
+                .order_by(desc(AgentRun.created_at))
+                .limit(SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_ROW_LIMIT)
+            )
+        )
+        recent_rows: list[AgentRun] = []
+        for row in rows:
+            if not self._agent_run_is_provider_attempt(row):
+                continue
+            if not self._agent_run_matches_symbol(row, symbol=symbol_upper, timeframe=timeframe):
+                continue
+            if self._agent_run_low_actionability_signature(row) != current_signature:
+                continue
+            recent_rows.append(row)
+            if len(recent_rows) >= SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+                break
+        if len(recent_rows) < SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+            return {
+                "active": False,
+                "sample_count": len(recent_rows),
+                "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+                "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+                "signature": current_signature,
+            }
+
+        run_ids = [int(row.id) for row in recent_rows if row.id is not None]
+        risk_rows = list(
+            self.session.scalars(select(RiskCheck).where(RiskCheck.decision_run_id.in_(run_ids)))
+        )
+        risk_by_run_id: dict[int, list[RiskCheck]] = defaultdict(list)
+        for risk_row in risk_rows:
+            if risk_row.decision_run_id is not None:
+                risk_by_run_id[int(risk_row.decision_run_id)].append(risk_row)
+
+        outcomes: list[dict[str, object]] = []
+        for row in recent_rows:
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            decision_run_id = int(row.id) if row.id is not None else None
+            risk_hold_blocked = any(
+                self._risk_check_hold_blocked(risk_row)
+                for risk_row in risk_by_run_id.get(decision_run_id, [])
+                if decision_run_id is not None
+            )
+            outcomes.append(
+                {
+                    "decision_run_id": row.id,
+                    "decision": str(output.get("decision") or "").lower() or None,
+                    "risk_hold_blocked": risk_hold_blocked,
+                }
+            )
+
+        active = all(bool(item["decision"] == "hold" and item["risk_hold_blocked"]) for item in outcomes)
+        return {
+            "active": active,
+            "sample_count": len(recent_rows),
+            "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+            "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+            "decision_run_ids": run_ids,
+            "outcomes": outcomes,
+            "signature": current_signature,
+            "last_provider_call_at": recent_rows[0].created_at.isoformat() if recent_rows else None,
+            "oldest_provider_call_at": recent_rows[-1].created_at.isoformat() if recent_rows else None,
+        }
+
+    @staticmethod
+    def _entry_candidate_order_path_block_context(runtime_state: dict[str, object]) -> dict[str, object] | None:
+        reason_codes: list[str] = []
+        market_stream = _as_dict(runtime_state.get("market_stream_summary"))
+        redis_configured = bool(market_stream.get("redis_configured"))
+        redis_connected = market_stream.get("redis_connected")
+        cache_health = str(market_stream.get("cache_health") or "").strip().lower()
+        if redis_configured and (redis_connected is False or cache_health == "unavailable"):
+            reason_codes.append("REDIS_CACHE_UNAVAILABLE")
+
+        reconciliation = _as_dict(runtime_state.get("reconciliation_summary"))
+        if str(reconciliation.get("status") or "").strip().lower() not in {"", "synced"}:
+            reason_codes.append("RECONCILIATION_NOT_SYNCED")
+        if (
+            bool(reconciliation.get("unresolved_submission_badge"))
+            or int(_safe_float(reconciliation.get("unresolved_submission_count"), default=0.0)) > 0
+        ):
+            reason_codes.append("UNRESOLVED_SUBMISSION")
+
+        binance_rest = _as_dict(runtime_state.get("binance_rest_summary"))
+        rest_status = str(binance_rest.get("status") or "ok").strip().lower()
+        circuit_state = str(binance_rest.get("circuit_state") or "closed").strip().lower()
+        if rest_status not in {"", "ok"}:
+            reason_codes.append(str(binance_rest.get("reason_code") or "BINANCE_REST_NOT_READY"))
+        if circuit_state not in {"", "closed"}:
+            reason_codes.append("BINANCE_REST_CIRCUIT_OPEN")
+
+        unique_codes = list(dict.fromkeys(reason_codes))
+        if not unique_codes:
+            return None
+        return {
+            "active": True,
+            "reason_codes": unique_codes,
+            "market_stream": {
+                "redis_configured": redis_configured,
+                "redis_connected": redis_connected,
+                "cache_health": cache_health or None,
+                "cache_reject_reason": market_stream.get("cache_reject_reason"),
+            },
+            "reconciliation": {
+                "status": reconciliation.get("status"),
+                "unresolved_submission_badge": bool(reconciliation.get("unresolved_submission_badge")),
+                "unresolved_submission_count": int(
+                    _safe_float(reconciliation.get("unresolved_submission_count"), default=0.0)
+                ),
+            },
+            "binance_rest": {
+                "status": rest_status or None,
+                "circuit_state": circuit_state or None,
+                "reason_code": binance_rest.get("reason_code"),
+            },
+        }
+
+    def _entry_candidate_active_pending_plan_context(self, *, symbol: str) -> dict[str, object] | None:
+        plans = self._active_pending_entry_plans(symbol=symbol)
+        if not plans:
+            return None
+        return {
+            "active": True,
+            "active_plan_count": len(plans),
+            "plan_ids": [plan.id for plan in plans if plan.id is not None],
+            "statuses": list(dict.fromkeys(str(plan.plan_status or "") for plan in plans)),
+        }
+
+    @staticmethod
+    def _entry_candidate_incomplete_trade_plan_context(
+        selection_context: dict[str, object],
+    ) -> dict[str, object] | None:
+        candidate = _as_dict(selection_context.get("candidate"))
+        if not candidate:
+            return None
+        decision = str(candidate.get("decision") or "").lower()
+        if decision not in {"long", "short"}:
+            return None
+        required_fields = ("entry_zone_min", "entry_zone_max", "stop_loss", "take_profit")
+        missing_fields = [
+            field
+            for field in required_fields
+            if candidate.get(field) in {None, ""}
+        ]
+        if not missing_fields:
+            return None
+        return {
+            "active": True,
+            "missing_fields": missing_fields,
+            "decision": decision,
         }
 
     def _soft_signal_hold_backoff_status(
@@ -10667,10 +11182,34 @@ class TradingOrchestrator:
             generated_at=generated_at,
         )
         if not bool(backoff.get("active")):
+            if backoff.get("reason") == "context_not_neutral_entry":
+                return {
+                    "action": "allow",
+                    "last_ai_skip_reason": None,
+                    "neutral_entry_hold_backoff": backoff,
+                }
+            neutral_context = {
+                **backoff,
+                "active": True,
+                "reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_REASON,
+                "required_reason_codes": sorted(ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS),
+            }
             return {
-                "action": "allow",
-                "last_ai_skip_reason": None,
-                "neutral_entry_hold_backoff": backoff,
+                "action": "neutral_context_preai_skip",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_SKIP_REASON,
+                    "skip_category": "neutral_entry_context_preai",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "neutral_entry_context": neutral_context,
+                },
             }
         return {
             "action": "hold_backoff",
@@ -10680,6 +11219,7 @@ class TradingOrchestrator:
                 "ai_call_allowed": False,
                 "skip_ai": True,
                 "reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_REASON,
+                "pre_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_SKIP_REASON,
                 "skip_category": "neutral_entry_hold_backoff",
                 "scope": "new_entry",
                 "hard_skip_ai": False,
@@ -10687,6 +11227,188 @@ class TradingOrchestrator:
                 "allow_ai_but_later_risk_check": [],
                 "neutral_entry_hold_backoff": backoff,
             },
+        }
+
+    def _entry_candidate_pre_ai_eligibility_policy(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+        runtime_state: dict[str, object],
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        policy_reason_codes = {str(code) for code in allow_ai_but_later_risk_check or [] if code}
+        if SOFT_SIGNAL_AI_REVIEW_REASON_CODE in policy_reason_codes:
+            ai_hold_cooldown = self._entry_candidate_ai_hold_fingerprint_cooldown_status(
+                symbol=symbol,
+                timeframe=timeframe,
+                selection_context=selection_context,
+                generated_at=generated_at,
+                allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            )
+            return {
+                "action": "allow",
+                "last_ai_skip_reason": None,
+                "reason": "soft_signal_review_policy_owner",
+                "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+            }
+
+        active_pending_plan = self._entry_candidate_active_pending_plan_context(symbol=symbol)
+        if active_pending_plan is not None:
+            return {
+                "action": "active_pending_plan",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_SKIP_REASON,
+                    "skip_category": "entry_candidate_active_pending_plan",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "active_pending_plan": active_pending_plan,
+                },
+            }
+
+        neutral_entry_policy = self._neutral_entry_hold_backoff_policy(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+        )
+        if neutral_entry_policy.get("action") != "allow":
+            return neutral_entry_policy
+
+        weak_volume_context = self._entry_candidate_weak_volume_context(
+            selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if bool(weak_volume_context.get("active")):
+            return {
+                "action": "weak_volume_preai_skip",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_POLICY_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON,
+                    "skip_category": "entry_candidate_weak_volume_preai",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": list(
+                        dict.fromkeys(allow_ai_but_later_risk_check or [])
+                    ),
+                    "weak_volume_context": weak_volume_context,
+                },
+            }
+
+        low_actionability_backoff = self._entry_candidate_low_actionability_hold_backoff_status(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if bool(low_actionability_backoff.get("active")):
+            return {
+                "action": "low_actionability_hold_backoff",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_SKIP_REASON,
+                    "skip_category": "entry_candidate_low_actionability_hold_backoff",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": list(
+                        dict.fromkeys(allow_ai_but_later_risk_check or [])
+                    ),
+                    "low_actionability_hold_backoff": low_actionability_backoff,
+                },
+            }
+
+        incomplete_trade_plan = self._entry_candidate_incomplete_trade_plan_context(selection_context)
+        if incomplete_trade_plan is not None:
+            return {
+                "action": "incomplete_trade_plan",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_SKIP_REASON,
+                    "skip_category": "entry_candidate_incomplete_trade_plan",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "incomplete_trade_plan": incomplete_trade_plan,
+                },
+            }
+
+        ai_hold_cooldown = self._entry_candidate_ai_hold_fingerprint_cooldown_status(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if bool(ai_hold_cooldown.get("active")):
+            return {
+                "action": "ai_hold_fingerprint_cooldown",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_SKIP_REASON,
+                "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_SKIP_REASON,
+                    "skip_category": "entry_candidate_ai_hold_fingerprint_cooldown",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "entry_candidate_ai_hold_cooldown": ai_hold_cooldown,
+                    "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+                },
+            }
+
+        order_path_block = self._entry_candidate_order_path_block_context(runtime_state)
+        if order_path_block is not None:
+            return {
+                "action": "order_path_not_actionable",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_SKIP_REASON,
+                    "skip_category": "entry_candidate_order_path_not_actionable",
+                    "scope": "new_entry",
+                    "hard_skip_ai": True,
+                    "hard_skip_reason_codes": list(order_path_block["reason_codes"]),
+                    "allow_ai_but_later_risk_check": [],
+                    "order_path_block": order_path_block,
+                },
+            }
+        return {
+            "action": "allow",
+            "last_ai_skip_reason": None,
+            "low_actionability_hold_backoff": low_actionability_backoff,
+            "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
         }
 
     @staticmethod
@@ -10807,6 +11529,8 @@ class TradingOrchestrator:
         cadence_profile: dict[str, object],
         open_positions: list[Position],
         allow_ai_but_later_risk_check: list[str],
+        selection_context: dict[str, object] | None = None,
+        generated_at: datetime | None = None,
         active_position_prompt_route_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
         route_context = _as_dict(active_position_prompt_route_context)
@@ -10846,7 +11570,9 @@ class TradingOrchestrator:
         hard_skip_ai = False
         skip_category: str | None = None
         reason: str | None = None
+        pre_ai_skip_reason: str | None = None
         hard_skip_reason_codes: list[str] = []
+        extra_policy: dict[str, object] = {}
 
         if review_trigger_payload is not None and review_trigger_payload.trigger_reason == "protection_review_event":
             reason = "PROTECTION_REVIEW_DETERMINISTIC_ONLY"
@@ -10892,6 +11618,53 @@ class TradingOrchestrator:
             reason = pre_ai_hard_block_reason
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
+        elif (
+            scope == "new_entry"
+            and review_trigger_payload is not None
+            and review_trigger_payload.trigger_reason == "entry_candidate_event"
+            and isinstance(selection_context, dict)
+        ):
+            entry_pre_ai_policy = self._entry_candidate_pre_ai_eligibility_policy(
+                symbol=review_trigger_payload.symbol,
+                timeframe=review_trigger_payload.timeframe,
+                selection_context=selection_context,
+                generated_at=generated_at or utcnow_naive(),
+                runtime_state=runtime_state,
+                allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            )
+            entry_candidate_ai_hold_fingerprint = _as_dict(
+                entry_pre_ai_policy.get("entry_candidate_ai_hold_fingerprint")
+            )
+            if entry_candidate_ai_hold_fingerprint:
+                extra_policy["entry_candidate_ai_hold_fingerprint"] = entry_candidate_ai_hold_fingerprint
+            if entry_pre_ai_policy.get("action") != "allow":
+                entry_ai_policy = _as_dict(entry_pre_ai_policy.get("ai_call_policy"))
+                reason = str(entry_ai_policy.get("reason") or "") or None
+                pre_ai_skip_reason = str(
+                    entry_ai_policy.get("pre_ai_skip_reason")
+                    or entry_pre_ai_policy.get("last_ai_skip_reason")
+                    or ""
+                ) or None
+                hard_skip_ai = bool(entry_ai_policy.get("hard_skip_ai", False))
+                skip_category = str(entry_ai_policy.get("skip_category") or "") or None
+                hard_skip_reason_codes = list(entry_ai_policy.get("hard_skip_reason_codes") or [])
+                extra_policy = {
+                    key: value
+                    for key, value in entry_ai_policy.items()
+                    if key
+                    not in {
+                        "ai_call_event",
+                        "ai_call_allowed",
+                        "skip_ai",
+                        "reason",
+                        "pre_ai_skip_reason",
+                        "scope",
+                        "hard_skip_ai",
+                        "skip_category",
+                        "hard_skip_reason_codes",
+                        "allow_ai_but_later_risk_check",
+                    }
+                }
         elif str(cadence_profile.get("ai_skipped_reason") or ""):
             reason = str(cadence_profile.get("ai_skipped_reason") or "")
             skip_category = "cadence_policy"
@@ -10918,6 +11691,7 @@ class TradingOrchestrator:
             "ai_call_allowed": reason is None,
             "skip_ai": reason is not None,
             "reason": reason,
+            "pre_ai_skip_reason": pre_ai_skip_reason,
             "scope": scope,
             "hard_skip_ai": hard_skip_ai,
             "skip_category": skip_category,
@@ -10932,12 +11706,14 @@ class TradingOrchestrator:
                 if SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE in set(allow_ai_but_later_risk_check)
                 else None
             ),
+            **extra_policy,
         }
 
     def build_interval_decision_plan(
         self,
         *,
         symbols: list[str],
+        candidate_universe_symbols: list[str] | None = None,
         timeframe: str | None = None,
         upto_index: int | None = None,
         force_stale: bool = False,
@@ -10945,16 +11721,21 @@ class TradingOrchestrator:
     ) -> dict[str, object]:
         generated_at = triggered_at or utcnow_naive()
         tracked_symbols = [item.upper() for item in symbols if item]
+        selection_symbols = [
+            item.upper()
+            for item in (candidate_universe_symbols if candidate_universe_symbols is not None else symbols)
+            if item
+        ]
         runtime_state = summarize_runtime_state(self.settings_row)
         missing_protection_symbols = {
             str(item).upper()
             for item in runtime_state.get("missing_protection_symbols", [])
             if item
         }
-        effective_lookup = {
-            item.symbol: item
-            for item in get_effective_symbol_schedule(self.settings_row)
-            if item.enabled and item.symbol in tracked_symbols
+        effective_symbols = [item for item in get_effective_symbol_schedule(self.settings_row) if item.enabled]
+        effective_lookup = {item.symbol: item for item in effective_symbols if item.symbol in tracked_symbols}
+        selection_effective_lookup = {
+            item.symbol: item for item in effective_symbols if item.symbol in selection_symbols
         }
         if tracked_symbols and not effective_lookup:
             no_candidate_cycle_id = f"decision-plan:all:{uuid4().hex[:8]}"
@@ -10989,24 +11770,25 @@ class TradingOrchestrator:
                 entity_type="decision_plan",
                 entity_id="all",
             )
+        open_position_symbols = list(dict.fromkeys([*tracked_symbols, *selection_symbols]))
         open_positions_by_symbol = {
             symbol: list(get_open_positions(self.session, symbol))
-            for symbol in tracked_symbols
-            if symbol in effective_lookup
+            for symbol in open_position_symbols
+            if symbol in effective_lookup or symbol in selection_effective_lookup
         }
-        flat_symbols = [
+        selection_flat_symbols = [
             symbol
-            for symbol in tracked_symbols
-            if symbol in effective_lookup and not open_positions_by_symbol.get(symbol)
+            for symbol in selection_symbols
+            if symbol in selection_effective_lookup and not open_positions_by_symbol.get(symbol)
         ]
         candidate_selection = (
             self._rank_candidate_symbols(
-                decision_symbols=flat_symbols,
+                decision_symbols=selection_flat_symbols,
                 timeframe=timeframe,
                 upto_index=upto_index,
                 force_stale=force_stale,
             )
-            if flat_symbols
+            if selection_flat_symbols
             else {
                 "mode": "no_flat_symbols",
                 "breadth_summary": {},
@@ -11343,21 +12125,23 @@ class TradingOrchestrator:
                 and isinstance(selection_context, dict)
                 and trigger_payload.trigger_reason == "entry_candidate_event"
             ):
-                neutral_entry_policy = self._neutral_entry_hold_backoff_policy(
+                entry_pre_ai_policy = self._entry_candidate_pre_ai_eligibility_policy(
                     symbol=symbol,
                     timeframe=effective_timeframe,
                     selection_context=selection_context,
                     generated_at=generated_at,
+                    runtime_state=runtime_state,
+                    allow_ai_but_later_risk_check=list(trigger_payload.reason_codes),
                 )
-                if neutral_entry_policy.get("action") == "hold_backoff":
-                    plan_ai_call_policy = _as_dict(neutral_entry_policy.get("ai_call_policy"))
+                if entry_pre_ai_policy.get("action") != "allow":
+                    plan_ai_call_policy = _as_dict(entry_pre_ai_policy.get("ai_call_policy"))
                     selection_context = {
                         **selection_context,
                         "ai_call_policy": plan_ai_call_policy,
                     }
                     trigger_payload = None
                     last_ai_skip_reason = str(
-                        neutral_entry_policy.get("last_ai_skip_reason") or ""
+                        entry_pre_ai_policy.get("last_ai_skip_reason") or ""
                     ) or None
 
             if trigger_payload is not None and not open_positions and isinstance(selection_context, dict):
@@ -12041,10 +12825,12 @@ class TradingOrchestrator:
             cadence_profile=cadence_profile,
             open_positions=open_positions,
             allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            selection_context=effective_selection_context,
+            generated_at=utcnow_naive(),
             active_position_prompt_route_context=active_position_prompt_route_context,
         )
-        pre_ai_skip_reason = None
-        ai_skipped_reason = str(ai_call_policy.get("reason") or "") or None
+        pre_ai_skip_reason = str(ai_call_policy.get("pre_ai_skip_reason") or "") or None
+        ai_skipped_reason = pre_ai_skip_reason or str(ai_call_policy.get("reason") or "") or None
         use_ai = bool(ai_call_policy.get("ai_call_allowed", False)) and bool(openai_gate.allowed)
         if self._should_run_market_settings_before_trading_ai(
             use_ai=use_ai,
@@ -12163,6 +12949,12 @@ class TradingOrchestrator:
             "pre_ai_skip_reason": pre_ai_skip_reason,
             "ai_call_policy": ai_call_policy,
             "ai_call_event": ai_call_policy.get("ai_call_event"),
+            "entry_candidate_ai_hold_fingerprint": ai_call_policy.get(
+                "entry_candidate_ai_hold_fingerprint"
+            ),
+            "entry_candidate_ai_hold_cooldown": ai_call_policy.get(
+                "entry_candidate_ai_hold_cooldown"
+            ),
             "hard_skip_ai": bool(ai_call_policy.get("hard_skip_ai", False)),
             "hard_skip_ai_reason": ai_call_policy.get("reason") if ai_call_policy.get("hard_skip_ai") else None,
             "soft_signal_review_mode": ai_call_policy.get("soft_signal_review_mode"),
@@ -12499,6 +13291,12 @@ class TradingOrchestrator:
                     "skip_category": ai_call_policy.get("skip_category"),
                     "soft_signal_review_mode": ai_call_policy.get("soft_signal_review_mode"),
                     "hard_skip_reason_codes": list(ai_call_policy.get("hard_skip_reason_codes") or []),
+                    "entry_candidate_ai_hold_cooldown": ai_call_policy.get(
+                        "entry_candidate_ai_hold_cooldown"
+                    ),
+                    "entry_candidate_ai_hold_fingerprint": ai_call_policy.get(
+                        "entry_candidate_ai_hold_fingerprint"
+                    ),
                     "allow_ai_but_later_risk_check": list(
                         ai_call_policy.get("allow_ai_but_later_risk_check") or []
                     ),

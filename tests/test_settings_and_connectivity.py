@@ -242,6 +242,8 @@ def test_settings_update_preserves_ai_token_budget_when_older_payload_omits_it(d
 
 def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> None:
     row = update_settings(db_session, build_settings_payload())
+    row.live_execution_armed = True
+    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
 
     serialized = serialize_settings_view(row)
 
@@ -251,6 +253,8 @@ def test_serialize_settings_view_removes_dead_and_heavy_fields(db_session) -> No
     assert "pnl_summary" not in serialized
     assert serialized["default_symbol"] == "BTCUSDT"
     assert serialized["control_status_summary"]["rollout_mode"] == "full_live"
+    assert serialized["approval_armed"] is True
+    assert serialized["approval_expires_at"] is not None
     assert serialized["event_source_provider"] == "fred"
     assert serialized["event_source_bls_enrichment_url"] == "https://bls.settings/releases"
     assert serialized["event_source_bea_enrichment_url"] == "https://bea.settings/releases"
@@ -1782,17 +1786,59 @@ def test_arm_live_execution_sets_bounded_expiry_from_requested_minutes(db_sessio
     assert serialize_settings(armed)["live_execution_armed"] is True
 
 
-def test_arm_live_execution_invalid_window_fails_closed(db_session) -> None:
+def test_arm_live_execution_allows_unlimited_approval_window(db_session) -> None:
     row = update_settings(
         db_session,
         build_settings_payload().model_copy(update={"live_approval_window_minutes": 0}),
+    )
+
+    armed = arm_live_execution(db_session)
+
+    assert armed.id == row.id
+    assert armed.live_execution_armed is True
+    assert armed.live_execution_armed_until is None
+    serialized = serialize_settings(armed)
+    assert serialized["live_execution_armed"] is True
+    assert serialized["live_execution_ready"] is True
+    assert serialized["guard_mode_reason_code"] is None
+    assert serialized["operational_status"]["approval_armed"] is True
+    assert serialized["operational_status"]["approval_expires_at"] is None
+    assert serialized["control_status_summary"]["approval_window_open"] is True
+
+
+def test_arm_live_execution_zero_request_persists_unlimited_approval_window(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(update={"live_approval_window_minutes": 180}),
+    )
+
+    armed = arm_live_execution(db_session, 0)
+
+    assert armed.id == row.id
+    assert armed.live_approval_window_minutes == 0
+    assert armed.live_execution_armed is True
+    assert armed.live_execution_armed_until is None
+    serialized = serialize_settings(armed)
+    assert serialized["live_approval_window_minutes"] == 0
+    assert serialized["live_execution_armed"] is True
+    assert serialized["live_execution_ready"] is True
+    assert serialized["guard_mode_reason_code"] is None
+    assert serialized["operational_status"]["approval_armed"] is True
+    assert serialized["operational_status"]["approval_expires_at"] is None
+    assert serialized["control_status_summary"]["approval_window_open"] is True
+
+
+def test_arm_live_execution_invalid_negative_window_fails_closed(db_session) -> None:
+    row = update_settings(
+        db_session,
+        build_settings_payload().model_copy(update={"live_approval_window_minutes": 15}),
     )
     row.live_execution_armed = True
     row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
     db_session.flush()
 
     with pytest.raises(ValueError, match="LIVE_APPROVAL_WINDOW_INVALID"):
-        arm_live_execution(db_session)
+        arm_live_execution(db_session, -1)
 
     assert row.live_execution_armed is False
     assert row.live_execution_armed_until is None
@@ -1912,6 +1958,54 @@ def test_settings_api_splits_heavy_payloads(testclient_db_factory, full_live_ope
     assert usage_response.json()["ai_usage_today_timezone"] == "Asia/Seoul"
     assert usage_response.json()["recent_ai_calls_today_kst"] == 1
     assert usage_response.json()["recent_ai_calls_24h"] == 1
+
+
+def test_settings_api_publishes_approval_armed_top_level(
+    testclient_db_factory,
+    full_live_operator_headers,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_approval_publication.db")
+
+    with TestingSessionLocal() as session:
+        row = update_settings(session, build_settings_payload())
+        row.live_execution_armed = True
+        row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=15)
+        session.add(row)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/settings", headers=full_live_operator_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["approval_armed"] is True
+    assert payload["approval_expires_at"] is not None
+    assert payload["live_execution_armed"] is True
+    assert payload["live_execution_armed_until"] == payload["approval_expires_at"]
+
+
+def test_settings_api_publishes_closed_approval_as_false(
+    testclient_db_factory,
+    full_live_operator_headers,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_approval_closed_publication.db")
+
+    with TestingSessionLocal() as session:
+        row = update_settings(session, build_settings_payload())
+        row.live_execution_armed = False
+        row.live_execution_armed_until = None
+        session.add(row)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/settings", headers=full_live_operator_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["approval_armed"] is False
+    assert payload["approval_expires_at"] is None
+    assert payload["live_execution_armed"] is False
+    assert payload["live_execution_armed_until"] is None
 
 
 def test_settings_endpoint_allows_loopback_origin_without_port(testclient_db_factory) -> None:
@@ -2105,6 +2199,111 @@ def test_live_arm_endpoint_sets_bounded_expiry_and_audit_payload(
     assert event.requested_minutes == 15
     assert event.effective_minutes == 15
     assert event.configured_window_minutes == 15
+
+
+def test_live_arm_endpoint_accepts_unlimited_window_and_audit_payload(
+    testclient_db_factory,
+    full_live_operator_headers,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_live_arm_unlimited_window.db")
+    with TestingSessionLocal() as session:
+        row = update_settings(
+            session,
+            build_settings_payload().model_copy(update={"live_approval_window_minutes": 0}),
+        )
+        now = utcnow_naive()
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_success(row, scope=scope, synced_at=now)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/settings/live/arm",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "settings.live_arm"},
+            json={"minutes": 0},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["live_execution_armed"] is True
+    assert payload["live_execution_armed_until"] is None
+    assert payload["live_execution_ready"] is True
+    assert payload["guard_mode_reason_code"] is None
+
+    with TestingSessionLocal() as session:
+        event = session.execute(
+            text(
+                """
+                select json_extract(payload, '$.armed_until') as armed_until,
+                       json_extract(payload, '$.requested_minutes') as requested_minutes,
+                       json_extract(payload, '$.effective_minutes') as effective_minutes,
+                       json_extract(payload, '$.configured_window_minutes') as configured_window_minutes
+                from audit_events
+                where event_type = 'live_approval_armed'
+                order by id desc
+                limit 1
+                """
+            )
+        ).one()
+
+    assert event.armed_until is None
+    assert event.requested_minutes == 0
+    assert event.effective_minutes == 0
+    assert event.configured_window_minutes == 0
+
+
+def test_live_arm_endpoint_zero_request_persists_unlimited_window(
+    testclient_db_factory,
+    full_live_operator_headers,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("settings_live_arm_unlimited_request.db")
+    with TestingSessionLocal() as session:
+        row = update_settings(
+            session,
+            build_settings_payload().model_copy(update={"live_approval_window_minutes": 180}),
+        )
+        now = utcnow_naive()
+        for scope in ("account", "positions", "open_orders", "protective_orders"):
+            mark_sync_success(row, scope=scope, synced_at=now)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/settings/live/arm",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "settings.live_arm"},
+            json={"minutes": 0},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["live_approval_window_minutes"] == 0
+    assert payload["live_execution_armed"] is True
+    assert payload["live_execution_armed_until"] is None
+    assert payload["approval_armed"] is True
+    assert payload["approval_expires_at"] is None
+    assert payload["live_execution_ready"] is True
+    assert payload["guard_mode_reason_code"] is None
+
+    with TestingSessionLocal() as session:
+        event = session.execute(
+            text(
+                """
+                select json_extract(payload, '$.armed_until') as armed_until,
+                       json_extract(payload, '$.requested_minutes') as requested_minutes,
+                       json_extract(payload, '$.effective_minutes') as effective_minutes,
+                       json_extract(payload, '$.configured_window_minutes') as configured_window_minutes
+                from audit_events
+                where event_type = 'live_approval_armed'
+                order by id desc
+                limit 1
+                """
+            )
+        ).one()
+
+    assert event.armed_until is None
+    assert event.requested_minutes == 0
+    assert event.effective_minutes == 0
+    assert event.configured_window_minutes == 0
 
 
 def test_full_live_live_arm_blocks_stale_exchange_sync(tmp_path, monkeypatch) -> None:

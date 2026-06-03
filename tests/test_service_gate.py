@@ -2,8 +2,17 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from fastapi.testclient import TestClient
 from sqlalchemy import select
-from trading_mvp.models import AuditEvent, Order, PendingEntryPlan, Position
+from trading_mvp.main import app
+from trading_mvp.models import (
+    AuditEvent,
+    Order,
+    PendingEntryPlan,
+    Position,
+    SchedulerRun,
+    SystemHealthEvent,
+)
 from trading_mvp.services.runtime_state import (
     replace_market_stream_detail,
     set_reconciliation_detail,
@@ -82,6 +91,74 @@ def test_service_gate_ignores_triggered_terminal_pending_plan_history(db_session
     assert snapshot["triggered_terminal_history_entry_plans"][0]["gate_state"] == "triggered_terminal_history"
 
 
+def test_runtime_service_gate_endpoint_publishes_empty_root_cause_codes_when_clear(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("service_gate_clear_root_cause_contract.db")
+
+    with TestingSessionLocal() as session:
+        _synced_gate_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/runtime/service-gate")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["gate_clear"] is True
+    assert payload["blockers"] == []
+    assert "root_cause_codes" in payload
+    assert payload["root_cause_codes"] == []
+
+
+def test_runtime_service_gate_endpoint_publishes_db_connection_root_cause_codes(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("service_gate_db_root_cause_contract.db")
+
+    with TestingSessionLocal() as session:
+        _synced_gate_settings(session)
+        now = utcnow_naive()
+        failure_payload = {
+            "status": "error",
+            "error_category": "db_operational_error",
+            "db_connection_lost": True,
+            "session_recovered_before_logging": True,
+            "scheduler_failure_persisted": True,
+        }
+        session.add(
+            SchedulerRun(
+                schedule_window="30s",
+                workflow="market_refresh_cycle",
+                status="failed",
+                triggered_by="scheduler",
+                created_at=now,
+                outcome=failure_payload,
+            )
+        )
+        session.add(
+            SystemHealthEvent(
+                component="scheduler",
+                status="error",
+                message="Market refresh cycle failed.",
+                created_at=now,
+                payload=failure_payload,
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/runtime/service-gate")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["gate_clear"] is False
+    assert payload["blockers"] == ["recent_scheduler_non_success", "recent_health_errors"]
+    assert payload["root_cause_codes"] == ["DB_CONNECTION_LOST", "DB_OPERATIONAL_ERROR"]
+    scheduler_row = payload["recent_scheduler_non_success"][0]
+    health_row = payload["recent_health_errors"][0]
+    assert scheduler_row["root_cause_codes"] == ["DB_CONNECTION_LOST", "DB_OPERATIONAL_ERROR"]
+    assert scheduler_row["reason_code"] == "DB_CONNECTION_LOST"
+    assert health_row["root_cause_codes"] == ["DB_CONNECTION_LOST", "DB_OPERATIONAL_ERROR"]
+    assert health_row["reason_code"] == "DB_CONNECTION_LOST"
+
+
 def test_service_gate_blocks_armed_and_triggered_non_terminal_pending_plans(db_session) -> None:
     _synced_gate_settings(db_session)
     db_session.add_all(
@@ -101,6 +178,49 @@ def test_service_gate_blocks_armed_and_triggered_non_terminal_pending_plans(db_s
     assert snapshot["counts"]["armed_pending_entry_plans"] == 1
     assert snapshot["counts"]["triggered_non_terminal_pending_entry_plans"] == 1
     assert gate_states == {"active_waiting", "triggered_non_terminal"}
+
+
+def test_service_gate_publishes_active_pending_plan_reason_codes(db_session) -> None:
+    _synced_gate_settings(db_session)
+    db_session.add(
+        _pending_plan(
+            status="armed",
+            source_decision_run_id=9010,
+            metadata_json={
+                "last_watch_blocked_reason_codes": [" plan_late_chase_waiting_reentry "],
+                "source_blocked_reason_codes": ["HOLD_DECISION"],
+                "last_confirmation_tracking": {
+                    "blocked_reason_codes": ["zone_not_entered"],
+                    "confirmation_failed_reason": "confirmation_waiting",
+                },
+            },
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["gate_clear"] is False
+    assert snapshot["blockers"] == ["active_pending_entry_plans"]
+    assert snapshot["root_cause_codes"] == [
+        "PLAN_LATE_CHASE_WAITING_REENTRY",
+        "HOLD_DECISION",
+        "ZONE_NOT_ENTERED",
+        "CONFIRMATION_WAITING",
+    ]
+    plan = snapshot["active_pending_entry_plans"][0]
+    assert plan["blocked_reason_codes"] == [
+        "plan_late_chase_waiting_reentry",
+        "HOLD_DECISION",
+        "zone_not_entered",
+        "confirmation_waiting",
+    ]
+    assert plan["root_cause_codes"] == [
+        "PLAN_LATE_CHASE_WAITING_REENTRY",
+        "HOLD_DECISION",
+        "ZONE_NOT_ENTERED",
+        "CONFIRMATION_WAITING",
+    ]
 
 
 def test_service_gate_treats_expired_triggered_non_terminal_plan_as_stale_history(db_session) -> None:
@@ -143,9 +263,334 @@ def test_service_gate_blocks_when_configured_redis_is_unavailable(db_session) ->
     assert snapshot["gate_clear"] is False
     assert REDIS_CACHE_UNAVAILABLE_BLOCKER in snapshot["blockers"]
     assert snapshot["counts"][REDIS_CACHE_UNAVAILABLE_BLOCKER] == 1
+    assert snapshot["root_cause_codes"] == ["REDIS_CACHE_UNAVAILABLE"]
     assert snapshot["redis_cache"]["blocking"] is True
+    assert snapshot["redis_cache"]["reason_code"] == "REDIS_CACHE_UNAVAILABLE"
+    assert snapshot["redis_cache"]["root_cause_code"] == "REDIS_CACHE_UNAVAILABLE"
     assert snapshot["redis_cache"]["redis_configured"] is True
     assert snapshot["redis_cache"]["redis_connected"] is False
+
+
+def test_service_gate_recent_scheduler_and_health_rows_publish_root_cause_codes(db_session) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="exchange_sync_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome={
+                "status": "error",
+                "error": "Binance error -2015: Invalid API-key, IP, or permissions for action.",
+            },
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="live_sync",
+            status="error",
+            message="Binance error -2015: Invalid API-key, IP, or permissions for action.",
+            created_at=now,
+            payload={"status": "error"},
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["gate_clear"] is False
+    assert "recent_scheduler_non_success" in snapshot["blockers"]
+    assert "recent_health_errors" in snapshot["blockers"]
+    assert snapshot["root_cause_codes"] == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert scheduler_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert scheduler_row["root_cause_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert health_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert health_row["root_cause_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+
+
+def test_service_gate_preserves_multiple_published_root_cause_codes(db_session) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="exchange_sync_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome={
+                "status": "error",
+                "root_cause_codes": [
+                    "EXCHANGE_AUTH_PERMISSION_REJECTED",
+                    "REDIS_CACHE_UNAVAILABLE",
+                ],
+            },
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="live_sync",
+            status="error",
+            message="sync failed",
+            created_at=now,
+            payload={
+                "status": "error",
+                "reason_codes": [
+                    "RECENT_HEALTH_ERRORS",
+                    "EXCHANGE_AUTH_PERMISSION_REJECTED",
+                ],
+            },
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["root_cause_codes"] == [
+        "EXCHANGE_AUTH_PERMISSION_REJECTED",
+        "REDIS_CACHE_UNAVAILABLE",
+        "RECENT_HEALTH_ERRORS",
+    ]
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert scheduler_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert scheduler_row["root_cause_codes"] == [
+        "EXCHANGE_AUTH_PERMISSION_REJECTED",
+        "REDIS_CACHE_UNAVAILABLE",
+    ]
+    assert health_row["reason_code"] == "RECENT_HEALTH_ERRORS"
+    assert health_row["root_cause_codes"] == [
+        "RECENT_HEALTH_ERRORS",
+        "EXCHANGE_AUTH_PERMISSION_REJECTED",
+    ]
+
+
+def test_service_gate_root_cause_scans_nested_error_lists(db_session) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="exchange_sync_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome={
+                "status": "error",
+                "errors": [
+                    {
+                        "message": "Binance error -2015: Invalid API-key, IP, or permissions for action.",
+                    }
+                ],
+            },
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="live_sync",
+            status="error",
+            message="sync failed",
+            created_at=now,
+            payload={
+                "status": "error",
+                "sync_errors": [
+                    "Binance error -2015: Invalid API-key, IP, or permissions for action.",
+                ],
+            },
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert snapshot["root_cause_codes"] == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
+    assert scheduler_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert scheduler_row["root_cause_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert health_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert health_row["root_cause_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+
+
+def test_service_gate_root_cause_scans_numeric_binance_error_code(db_session) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="exchange_sync_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome={
+                "status": "error",
+                "code": -2015,
+                "msg": "Invalid API-key, IP, or permissions for action.",
+            },
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="live_sync",
+            status="error",
+            message="sync failed",
+            created_at=now,
+            payload={
+                "status": "error",
+                "error": {
+                    "code": -2015,
+                    "msg": "Invalid API-key, IP, or permissions for action.",
+                },
+            },
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert snapshot["root_cause_codes"] == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
+    assert scheduler_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert scheduler_row["root_cause_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert health_row["reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert health_row["root_cause_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+
+
+def test_service_gate_recent_scheduler_and_health_rows_publish_error_category_root_cause(db_session) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    failure_payload = {
+        "status": "error",
+        "error_category": "workflow_exception",
+        "db_connection_lost": False,
+        "scheduler_failure_persisted": True,
+    }
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="market_refresh_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome=failure_payload,
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="scheduler",
+            status="error",
+            message="Market refresh cycle failed.",
+            created_at=now,
+            payload=failure_payload,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["gate_clear"] is False
+    assert snapshot["root_cause_codes"] == ["WORKFLOW_EXCEPTION"]
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert scheduler_row["root_cause_codes"] == ["WORKFLOW_EXCEPTION"]
+    assert scheduler_row["reason_code"] == "WORKFLOW_EXCEPTION"
+    assert health_row["root_cause_codes"] == ["WORKFLOW_EXCEPTION"]
+    assert health_row["reason_code"] == "WORKFLOW_EXCEPTION"
+
+
+def test_service_gate_promotes_idle_transaction_timeout_root_cause(db_session) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    failure_payload = {
+        "status": "error",
+        "error_category": "workflow_exception",
+        "error": (
+            "(psycopg.errors.IdleInTransactionSessionTimeout) terminating connection "
+            "due to idle-in-transaction timeout"
+        ),
+        "db_connection_lost": False,
+        "session_recovered_before_logging": True,
+        "scheduler_failure_persisted": True,
+    }
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="market_refresh_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome=failure_payload,
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="scheduler",
+            status="error",
+            message="Market refresh cycle failed.",
+            created_at=now,
+            payload=failure_payload,
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["gate_clear"] is False
+    assert snapshot["root_cause_codes"] == ["DB_IDLE_IN_TRANSACTION_TIMEOUT"]
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert scheduler_row["root_cause_codes"] == ["DB_IDLE_IN_TRANSACTION_TIMEOUT"]
+    assert scheduler_row["reason_code"] == "DB_IDLE_IN_TRANSACTION_TIMEOUT"
+    assert health_row["root_cause_codes"] == ["DB_IDLE_IN_TRANSACTION_TIMEOUT"]
+    assert health_row["reason_code"] == "DB_IDLE_IN_TRANSACTION_TIMEOUT"
+
+
+def test_service_gate_recent_scheduler_and_health_rows_without_known_root_cause_publish_generic_reasons(
+    db_session,
+) -> None:
+    _synced_gate_settings(db_session)
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="15m",
+            workflow="interval_decision_cycle",
+            status="running",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome={},
+        )
+    )
+    db_session.add(
+        SystemHealthEvent(
+            component="worker",
+            status="degraded",
+            message="heartbeat stale",
+            created_at=now,
+            payload={},
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_service_switch_gate_snapshot(db_session)
+
+    assert snapshot["gate_clear"] is False
+    assert "recent_scheduler_non_success" in snapshot["blockers"]
+    assert "recent_health_errors" in snapshot["blockers"]
+    assert snapshot["root_cause_codes"] == [
+        "RECENT_SCHEDULER_NON_SUCCESS",
+        "RECENT_HEALTH_ERRORS",
+    ]
+    scheduler_row = snapshot["recent_scheduler_non_success"][0]
+    health_row = snapshot["recent_health_errors"][0]
+    assert scheduler_row["reason_code"] == "RECENT_SCHEDULER_NON_SUCCESS"
+    assert scheduler_row["root_cause_code"] == "RECENT_SCHEDULER_NON_SUCCESS"
+    assert health_row["reason_code"] == "RECENT_HEALTH_ERRORS"
+    assert health_row["root_cause_code"] == "RECENT_HEALTH_ERRORS"
 
 
 def test_normalize_stale_pending_entry_plan_history_expires_only_stale_triggered(db_session) -> None:

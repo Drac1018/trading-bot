@@ -16,15 +16,50 @@ export type AnalyticsCostBreakdownBucket = AnalyticsCostBreakdownSummary & {
   label: string;
   start_at: string;
   end_at: string;
+  slippage_data_status?: string | null;
+  slippage_data_reason?: string | null;
+  funding_sync_status?: string | null;
+  funding_sync_reason?: string | null;
+  slippage_sample_count?: number | null;
+  missing_slippage_sample_count?: number | null;
+  warning_codes?: string[] | null;
 };
 
 export type AnalyticsCostBreakdownDataQuality = {
   realized_pnl_confirmed: boolean;
   execution_sync_status: string;
   funding_sync_status: string;
+  funding_sync_reason?: string | null;
   slippage_data_status: string;
+  slippage_data_reason?: string | null;
+  slippage_sample_count?: number | null;
+  missing_slippage_sample_count?: number | null;
   missing_close_execution_count: number;
   slippage_weighting?: string;
+  warning_codes?: string[] | null;
+};
+
+export type SlippageDataQualityLike = {
+  slippage_data_status?: string | null;
+  slippage_data_reason?: string | null;
+  slippage_sample_count?: number | null;
+  missing_slippage_sample_count?: number | null;
+};
+
+export type ProfitabilityCostStatusLike = SlippageDataQualityLike & {
+  status?: string | null;
+  net_pnl?: number | null;
+  execution_sync_status?: string | null;
+  funding_sync_status?: string | null;
+  warning_codes?: string[] | null;
+};
+
+export type ProfitabilityCostTone = "safe" | "warn" | "danger" | "neutral";
+export type CostBreakdownTone = "good" | "warn" | "danger" | "neutral";
+
+export type ProfitabilityReadinessLike = {
+  status?: string | null;
+  reason_codes?: string[] | null;
 };
 
 export type AnalyticsCostBreakdownResponse = {
@@ -35,7 +70,7 @@ export type AnalyticsCostBreakdownResponse = {
   summary: AnalyticsCostBreakdownSummary;
   buckets: AnalyticsCostBreakdownBucket[];
   data_quality: AnalyticsCostBreakdownDataQuality;
-  warnings: string[];
+  warnings?: string[] | null;
 };
 
 export type CostBreakdownSelection = {
@@ -201,13 +236,23 @@ export function formatCostBreakdownBps(
   value: number | null | undefined,
   slippageStatus: string | null | undefined = "COMPLETE",
 ) {
-  if (slippageStatus !== "COMPLETE" || value === null || value === undefined || Number.isNaN(value)) {
+  if (normalizeSlippageDataStatus(slippageStatus) !== "COMPLETE" || value === null || value === undefined || Number.isNaN(value)) {
     return "N/A";
   }
   return `${signedPrefix(value)}${value.toLocaleString("ko-KR", {
     minimumFractionDigits: 0,
     maximumFractionDigits: 2,
   })} bps`;
+}
+
+export function formatProfitabilityCostSlippageBps(
+  value: number | null | undefined,
+  cost: ProfitabilityCostStatusLike | null | undefined,
+  unavailableLabel = "-",
+) {
+  const status = cost ? profitabilityCostSlippageStatus(cost) : "UNKNOWN";
+  const formatted = formatCostBreakdownBps(value, status);
+  return formatted === "N/A" ? unavailableLabel : formatted;
 }
 
 export function formatCostBreakdownDateTime(value: string | null | undefined, timezone = "Asia/Seoul") {
@@ -234,10 +279,488 @@ export function statusLabel(value: string | null | undefined) {
     COMPLETE: "완료",
     INCOMPLETE: "불완전",
     NO_SAMPLE: "표본 없음",
+    NOT_READY: "준비 안 됨",
+    BLOCKED: "차단됨",
     STALE: "오래됨",
     UNKNOWN: "확인 필요",
   };
-  return value ? labels[value] ?? "확인 필요" : "확인 필요";
+  return labels[normalizeStatusCode(value)] ?? "확인 필요";
+}
+
+function normalizeStatusCode(value: string | null | undefined) {
+  return value?.trim().toUpperCase() || "UNKNOWN";
+}
+
+export function costBreakdownStatusTone(value: string | null | undefined): CostBreakdownTone {
+  const status = normalizeStatusCode(value);
+  if (status === "COMPLETE") {
+    return "good";
+  }
+  if (status === "UNKNOWN" || status === "NOT_READY" || status === "BLOCKED") {
+    return "danger";
+  }
+  return "warn";
+}
+
+export function normalizeSlippageDataStatus(value: string | null | undefined) {
+  return normalizeStatusCode(value);
+}
+
+function publishedSlippageDataStatus(value: string | null | undefined) {
+  const normalized = value?.trim().toUpperCase();
+  return normalized && normalized.length > 0 ? normalized : null;
+}
+
+function inferredSlippageDataStatus(value: SlippageDataQualityLike) {
+  const reason = value.slippage_data_reason?.trim().toLowerCase();
+  if (reason === "no_execution_slippage_sample") {
+    return "NO_SAMPLE";
+  }
+  if (reason === "missing_execution_slippage_sample" || reason === "no_valid_slippage_sample") {
+    return "INCOMPLETE";
+  }
+  if (reason === "slippage_not_ready") {
+    return "NOT_READY";
+  }
+  if (reason === "slippage_blocked") {
+    return "BLOCKED";
+  }
+  if (reason === "slippage_status_unknown") {
+    return "UNKNOWN";
+  }
+  if ((value.missing_slippage_sample_count ?? 0) > 0) {
+    return "INCOMPLETE";
+  }
+  if (value.slippage_sample_count === 0) {
+    return "NO_SAMPLE";
+  }
+  return null;
+}
+
+function resolvePublishedOrInferredSlippageStatus(published: string | null, inferred: string | null) {
+  if (published === "UNKNOWN" && inferred && inferred !== "UNKNOWN") {
+    return inferred;
+  }
+  return published ?? inferred;
+}
+
+function slippageDataStatusFromQuality(value: SlippageDataQualityLike) {
+  const published = publishedSlippageDataStatus(value.slippage_data_status);
+  const inferred = inferredSlippageDataStatus(value);
+  return normalizeSlippageDataStatus(
+    resolvePublishedOrInferredSlippageStatus(published, inferred),
+  );
+}
+
+export function slippageDataQualityStatus(value: SlippageDataQualityLike) {
+  return slippageDataStatusFromQuality(value);
+}
+
+export function slippageDataReasonLabel(value: string | null | undefined) {
+  const labels: Record<string, string> = {
+    no_execution_slippage_sample: "체결 표본 없음",
+    missing_execution_slippage_sample: "일부 체결 슬리피지 누락",
+    no_valid_slippage_sample: "유효 슬리피지 표본 없음",
+    slippage_not_ready: "슬리피지 준비 상태 부족",
+    slippage_blocked: "슬리피지 게시 차단",
+    slippage_status_unknown: "상태 원인 미확정",
+  };
+  const normalized = value?.trim().toLowerCase();
+  return normalized ? labels[normalized] ?? value?.trim() : null;
+}
+
+export function slippageDataQualityLabel(dataQuality: SlippageDataQualityLike) {
+  const status = slippageDataStatusFromQuality(dataQuality);
+  if (status === "COMPLETE") {
+    const sampleCount = dataQuality.slippage_sample_count ?? 0;
+    return `슬리피지 표본 ${sampleCount.toLocaleString("ko-KR")}건`;
+  }
+  const reason = slippageDataReasonLabel(dataQuality.slippage_data_reason);
+  const missingCount = dataQuality.missing_slippage_sample_count ?? 0;
+  const base =
+    status === "NO_SAMPLE"
+      ? "슬리피지 표본 없음"
+      : status === "UNKNOWN"
+        ? "슬리피지 상태 확인 필요"
+        : status === "NOT_READY"
+          ? "슬리피지 준비 부족"
+          : status === "BLOCKED"
+            ? "슬리피지 게시 차단"
+            : "슬리피지 데이터 부족";
+  if (reason && missingCount > 0) {
+    return `${base}: ${reason} ${missingCount.toLocaleString("ko-KR")}건`;
+  }
+  return reason ? `${base}: ${reason}` : base;
+}
+
+export function slippageDataQualityTone(value: string | null | undefined): "warn" | "danger" {
+  const status = normalizeSlippageDataStatus(value);
+  return status === "UNKNOWN" || status === "NOT_READY" || status === "BLOCKED" ? "danger" : "warn";
+}
+
+export function costBreakdownBucketSlippageStatus(
+  bucket: SlippageDataQualityLike,
+  dataQuality: SlippageDataQualityLike,
+) {
+  const bucketStatus = publishedSlippageDataStatus(bucket.slippage_data_status);
+  const inferredBucketStatus = hasBucketSlippagePublication(bucket) ? inferredSlippageDataStatus(bucket) : null;
+  return normalizeSlippageDataStatus(
+    resolvePublishedOrInferredSlippageStatus(bucketStatus, inferredBucketStatus) ??
+      slippageDataStatusFromQuality(dataQuality),
+  );
+}
+
+function hasSlippagePublicationValue(value: string | number | null | undefined) {
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  return value !== null && value !== undefined;
+}
+
+function hasBucketSlippagePublication(bucket: SlippageDataQualityLike) {
+  return (
+    hasSlippagePublicationValue(bucket.slippage_data_status) ||
+    hasSlippagePublicationValue(bucket.slippage_data_reason) ||
+    hasSlippagePublicationValue(bucket.slippage_sample_count) ||
+    hasSlippagePublicationValue(bucket.missing_slippage_sample_count)
+  );
+}
+
+function profitabilityCostHasSlippageGap(cost: ProfitabilityCostStatusLike) {
+  return profitabilityCostSlippageStatus(cost) !== "COMPLETE";
+}
+
+function profitabilityCostHasBlockingSlippageStatus(cost: ProfitabilityCostStatusLike) {
+  const status = profitabilityCostSlippageStatus(cost);
+  return status === "UNKNOWN" || status === "NOT_READY" || status === "BLOCKED";
+}
+
+function normalizeProfitabilityCostStatus(value: string | null | undefined) {
+  return value?.trim().toLowerCase() || "";
+}
+
+export function profitabilityCostHasNoDataStatus(value: string | null | undefined) {
+  return normalizeProfitabilityCostStatus(value) === "no_data";
+}
+
+function profitabilityCostSlippageStatus(cost: ProfitabilityCostStatusLike) {
+  const published = publishedSlippageDataStatus(cost.slippage_data_status);
+  const inferred = inferredSlippageDataStatus(cost);
+  return normalizeSlippageDataStatus(
+    resolvePublishedOrInferredSlippageStatus(published, inferred),
+  );
+}
+
+export function profitabilityCostWarningCodes(cost: ProfitabilityCostStatusLike | null | undefined) {
+  if (!cost) {
+    return [];
+  }
+  const warningCodes: string[] = [];
+  for (const code of cost.warning_codes ?? []) {
+    appendNormalizedWarningCode(warningCodes, code);
+  }
+  const rawExecutionStatus = cost.execution_sync_status?.trim();
+  if (rawExecutionStatus) {
+    const executionStatus = normalizeStatusCode(rawExecutionStatus);
+    if (executionStatus !== "COMPLETE") {
+      appendNormalizedWarningCode(warningCodes, `execution_sync_status:${executionStatus}`);
+    }
+  }
+  const rawFundingStatus = cost.funding_sync_status?.trim();
+  if (rawFundingStatus) {
+    const fundingStatus = normalizeStatusCode(rawFundingStatus);
+    if (fundingStatus !== "COMPLETE") {
+      const fundingWarningCode = `funding_sync_status:${fundingStatus}`;
+      appendNormalizedWarningCode(warningCodes, fundingWarningCode);
+    }
+  }
+  const slippageStatus = profitabilityCostSlippageStatus(cost);
+  if (slippageStatus !== "COMPLETE") {
+    const slippageWarningCode = `slippage_data_status:${slippageStatus}`;
+    appendNormalizedWarningCode(warningCodes, slippageWarningCode);
+  }
+  return warningCodes;
+}
+
+export function profitabilityPublicationWarningCodes(
+  cost: ProfitabilityCostStatusLike | null | undefined,
+  readiness: ProfitabilityReadinessLike | null | undefined,
+) {
+  const costWarnings = profitabilityCostWarningCodes(cost);
+  const warningCodes = [...costWarnings];
+  const costSlippageStatus = cost ? publishedSlippageDataStatus(cost.slippage_data_status) : null;
+  const costExecutionStatus = cost?.execution_sync_status?.trim().toUpperCase() || null;
+  const costFundingStatus = cost?.funding_sync_status?.trim().toUpperCase() || null;
+  const costHasExplicitCompleteSlippage = costSlippageStatus === "COMPLETE";
+  const costHasExplicitCompleteExecution = costExecutionStatus === "COMPLETE";
+  const costHasExplicitCompleteFunding = costFundingStatus === "COMPLETE";
+
+  for (const reasonCode of readiness?.reason_codes ?? []) {
+    const normalizedCode = normalizeProfitabilityWarningCode(reasonCode);
+    const [prefix, value] = normalizedCode.split(":", 2);
+    if (
+      !value ||
+      (
+        prefix !== "execution_sync_status" &&
+        prefix !== "funding_sync_status" &&
+        prefix !== "slippage_data_status"
+      )
+    ) {
+      continue;
+    }
+    if (prefix === "slippage_data_status" && costHasExplicitCompleteSlippage) {
+      continue;
+    }
+    if (prefix === "execution_sync_status" && costHasExplicitCompleteExecution) {
+      continue;
+    }
+    if (prefix === "funding_sync_status" && costHasExplicitCompleteFunding) {
+      continue;
+    }
+    const existingCode = warningCodes.find((warningCode) => warningCode.startsWith(`${prefix}:`));
+    if (existingCode && !existingCode.endsWith(":UNKNOWN")) {
+      continue;
+    }
+    appendNormalizedWarningCode(warningCodes, normalizedCode);
+  }
+  return warningCodes;
+}
+
+export function profitabilityCostStatusLabel(cost: ProfitabilityCostStatusLike | null | undefined) {
+  if (!cost) {
+    return "데이터 없음";
+  }
+  const hasWarnings = profitabilityCostWarningCodes(cost).length > 0;
+  const hasSlippageGap = profitabilityCostHasSlippageGap(cost);
+  if (profitabilityCostHasNoDataStatus(cost.status)) {
+    return hasWarnings || hasSlippageGap ? "데이터 확인 필요" : "데이터 없음";
+  }
+  return hasWarnings || hasSlippageGap ? "비용 경고" : "정상";
+}
+
+export function profitabilityCostTone(cost: ProfitabilityCostStatusLike | null | undefined): ProfitabilityCostTone {
+  if (!cost) {
+    return "neutral";
+  }
+  const warningCodes = profitabilityCostWarningCodes(cost);
+  const hasWarnings = warningCodes.length > 0;
+  const hasSlippageGap = profitabilityCostHasSlippageGap(cost);
+  const hasBlockingSlippageStatus = profitabilityCostHasBlockingSlippageStatus(cost);
+  if (profitabilityCostHasNoDataStatus(cost.status)) {
+    if (hasBlockingSlippageStatus) {
+      return "danger";
+    }
+    return hasWarnings || hasSlippageGap ? "warn" : "neutral";
+  }
+  if (hasBlockingSlippageStatus) {
+    return "danger";
+  }
+  if (warningCodes.includes("positive_gross_negative_net") || (cost.net_pnl ?? 0) < 0) {
+    return "danger";
+  }
+  return hasWarnings || hasSlippageGap ? "warn" : "safe";
+}
+
+export function profitabilityReadinessTone(readiness: ProfitabilityReadinessLike | null | undefined): ProfitabilityCostTone {
+  const status = normalizeProfitabilityReadinessStatus(readiness?.status);
+  if (!status) {
+    return "neutral";
+  }
+  if (status === "blocked" || status === "not_ready") {
+    return "danger";
+  }
+  if (status === "limited_live_candidate" || status === "scale_up_candidate") {
+    return "safe";
+  }
+  return "warn";
+}
+
+function normalizeProfitabilityReadinessStatus(value: string | null | undefined) {
+  return value?.trim().toLowerCase() || "";
+}
+
+function profitabilityReadinessHasBlockingStatus(readiness: ProfitabilityReadinessLike | null | undefined) {
+  const status = normalizeProfitabilityReadinessStatus(readiness?.status);
+  return status === "blocked" || status === "not_ready";
+}
+
+function profitabilityReadinessReasonCodeSet(readiness: ProfitabilityReadinessLike | null | undefined) {
+  return new Set(
+    (readiness?.reason_codes ?? [])
+      .map((code) => code?.trim().toLowerCase())
+      .filter((code): code is string => Boolean(code)),
+  );
+}
+
+export function profitabilityReadinessStatusLabel(readiness: ProfitabilityReadinessLike | null | undefined) {
+  const rawStatus = readiness?.status?.trim();
+  const status = normalizeProfitabilityReadinessStatus(rawStatus);
+  if (!status) {
+    return "데이터 없음";
+  }
+  if (
+    status === "not_ready" &&
+    profitabilityReadinessReasonCodeSet(readiness).has("productization_profitability_unverified")
+  ) {
+    return "제품화 수익성 검증 부족";
+  }
+  const labels: Record<string, string> = {
+    not_ready: "제품화 준비 미달",
+    watch: "제품화 관찰 필요",
+    limited_live_candidate: "제한 실주문 후보",
+    scale_up_candidate: "확대 후보",
+    blocked: "제품화 차단",
+  };
+  return labels[status] ?? rawStatus ?? status;
+}
+
+export function profitabilityPublicationStatusLabel(
+  cost: ProfitabilityCostStatusLike | null | undefined,
+  readiness: ProfitabilityReadinessLike | null | undefined,
+) {
+  if (profitabilityReadinessHasBlockingStatus(readiness)) {
+    return profitabilityReadinessStatusLabel(readiness);
+  }
+  if (cost) {
+    return profitabilityCostStatusLabel(cost);
+  }
+  return profitabilityReadinessStatusLabel(readiness);
+}
+
+export function profitabilityPublicationTone(
+  cost: ProfitabilityCostStatusLike | null | undefined,
+  readiness: ProfitabilityReadinessLike | null | undefined,
+): ProfitabilityCostTone {
+  if (!cost) {
+    return profitabilityReadinessTone(readiness);
+  }
+  if (profitabilityReadinessHasBlockingStatus(readiness)) {
+    return "danger";
+  }
+  const warningCodes = profitabilityPublicationWarningCodes(cost, readiness);
+  const hasWarnings = warningCodes.length > 0;
+  const hasSlippageGap = profitabilityCostHasSlippageGap(cost);
+  const hasBlockingSlippageStatus = warningCodes.some((warningCode) => {
+    const normalizedCode = normalizeProfitabilityWarningCode(warningCode);
+    return (
+      normalizedCode === "slippage_data_status:UNKNOWN" ||
+      normalizedCode === "slippage_data_status:NOT_READY" ||
+      normalizedCode === "slippage_data_status:BLOCKED"
+    );
+  });
+  const hasBlockingExecutionStatus = warningCodes.some((warningCode) => {
+    const normalizedCode = normalizeProfitabilityWarningCode(warningCode);
+    if (!normalizedCode.startsWith("execution_sync_status")) {
+      return false;
+    }
+    const status = normalizedCode.split(":")[1] ?? "UNKNOWN";
+    return costBreakdownStatusTone(status) === "danger";
+  });
+  if (profitabilityCostHasNoDataStatus(cost.status)) {
+    if (hasBlockingSlippageStatus || hasBlockingExecutionStatus) {
+      return "danger";
+    }
+    return hasWarnings || hasSlippageGap ? "warn" : "neutral";
+  }
+  if (hasBlockingSlippageStatus || hasBlockingExecutionStatus) {
+    return "danger";
+  }
+  if (warningCodes.includes("positive_gross_negative_net") || (cost.net_pnl ?? 0) < 0) {
+    return "danger";
+  }
+  return hasWarnings || hasSlippageGap ? "warn" : "safe";
+}
+
+const profitabilityCostWarningCopy: Record<string, string> = {
+  fee_exceeds_gross_pnl: "수수료가 총손익보다 큽니다.",
+  cost_exceeds_gross_pnl: "수수료와 펀딩비가 총손익보다 큽니다.",
+  positive_gross_negative_net: "총손익은 양수지만 비용 반영 후 순손익은 음수입니다.",
+  adverse_slippage_positive: "평균 체결 불리도가 거래자에게 불리하게 누적되고 있습니다.",
+  "funding_sync_status:STALE": "펀딩비 동기화가 오래되어 비용 합계를 확정할 수 없습니다.",
+  "funding_sync_status:INCOMPLETE": "펀딩비 동기화가 불완전해 비용 합계를 확정할 수 없습니다.",
+  "funding_sync_status:UNKNOWN": "펀딩비 동기화 상태를 확인할 수 없습니다.",
+  "slippage_data_status:NO_SAMPLE": "슬리피지 체결 표본이 없어 평균 체결 불리도를 확정할 수 없습니다.",
+  "slippage_data_status:INCOMPLETE": "일부 체결에 슬리피지 값이 없어 평균 체결 불리도가 불완전합니다.",
+  "slippage_data_status:UNKNOWN": "슬리피지 데이터 상태를 확인할 수 없습니다.",
+  "slippage_data_status:NOT_READY": "슬리피지 준비 상태가 부족해 평균 체결 불리도를 확정할 수 없습니다.",
+  "slippage_data_status:BLOCKED": "슬리피지 산출이 차단되어 평균 체결 불리도를 확정할 수 없습니다.",
+  high_marketable_ratio_low_net_pnl: "즉시체결로 진입한 비중이 높고 순손익이 낮습니다.",
+};
+
+function normalizeProfitabilityWarningCode(code: string) {
+  const trimmed = code.trim();
+  const [prefix, value] = trimmed.split(":", 2);
+  const normalizedPrefix = prefix.toLowerCase();
+  if (
+    (normalizedPrefix === "execution_sync_status" ||
+      normalizedPrefix === "slippage_data_status" ||
+      normalizedPrefix === "funding_sync_status") &&
+    value
+  ) {
+    return `${normalizedPrefix}:${value.trim().toUpperCase()}`;
+  }
+  if (
+    normalizedPrefix === "fee_asset_conversion_unavailable" ||
+    normalizedPrefix === "funding_asset_conversion_unavailable"
+  ) {
+    const normalizedAsset = value?.trim().toUpperCase();
+    return normalizedAsset ? `${normalizedPrefix}:${normalizedAsset}` : normalizedPrefix;
+  }
+  return trimmed;
+}
+
+function appendNormalizedWarningCode(warningCodes: string[], code: string) {
+  const normalizedCode = normalizeProfitabilityWarningCode(code);
+  if (!normalizedCode) {
+    return;
+  }
+  const [prefix, value] = normalizedCode.split(":", 2);
+  const statusPrefix =
+    prefix === "execution_sync_status" ||
+    prefix === "slippage_data_status" ||
+    prefix === "funding_sync_status";
+  if (statusPrefix && value) {
+    if (value !== "UNKNOWN") {
+      const unknownIndex = warningCodes.indexOf(`${prefix}:UNKNOWN`);
+      if (unknownIndex >= 0) {
+        warningCodes.splice(unknownIndex, 1);
+      }
+    } else if (warningCodes.some((warningCode) => warningCode.startsWith(`${prefix}:`) && warningCode !== normalizedCode)) {
+      return;
+    }
+  }
+  if (!warningCodes.includes(normalizedCode)) {
+    warningCodes.push(normalizedCode);
+  }
+}
+
+export function profitabilityCostWarningLabel(code: string) {
+  const normalizedCode = normalizeProfitabilityWarningCode(code);
+  if (normalizedCode.startsWith("fee_asset_conversion_unavailable")) {
+    const asset = normalizedCode.split(":")[1]?.trim();
+    return asset
+      ? `${asset} 수수료를 USDT로 환산하지 못해 비용 합계에서 제외했습니다.`
+      : "USDT로 환산하지 못한 수수료 자산이 있어 비용 합계에서 제외했습니다.";
+  }
+  if (normalizedCode.startsWith("funding_asset_conversion_unavailable")) {
+    const asset = normalizedCode.split(":")[1]?.trim();
+    return asset
+      ? `${asset} 펀딩비를 USDT로 환산하지 못해 비용 합계에서 제외했습니다.`
+      : "USDT로 환산하지 못한 펀딩비 자산이 있어 비용 합계에서 제외했습니다.";
+  }
+  if (normalizedCode.startsWith("funding_sync_status")) {
+    return profitabilityCostWarningCopy[normalizedCode] ?? "펀딩비 동기화 상태를 확인해야 비용 합계를 확정할 수 있습니다.";
+  }
+  if (normalizedCode.startsWith("execution_sync_status")) {
+    return profitabilityCostWarningCopy[normalizedCode] ?? "체결 동기화 상태를 확인해야 실현 손익을 확정할 수 있습니다.";
+  }
+  if (normalizedCode.startsWith("slippage_data_status")) {
+    return (
+      profitabilityCostWarningCopy[normalizedCode] ??
+      "슬리피지 데이터 상태를 확인해야 평균 체결 불리도를 확정할 수 있습니다."
+    );
+  }
+  return profitabilityCostWarningCopy[normalizedCode] ?? code;
 }
 
 export function slippageWeightingLabel(value: string | null | undefined) {
@@ -250,7 +773,7 @@ export function slippageWeightingLabel(value: string | null | undefined) {
 }
 
 export function costBreakdownQualityBadges(dataQuality: AnalyticsCostBreakdownDataQuality) {
-  const badges: Array<{ label: string; tone: "good" | "warn" | "danger" | "neutral" }> = [];
+  const badges: Array<{ label: string; tone: CostBreakdownTone }> = [];
 
   if (dataQuality.realized_pnl_confirmed) {
     badges.push({ label: "실현 손익 확정", tone: "good" });
@@ -262,40 +785,135 @@ export function costBreakdownQualityBadges(dataQuality: AnalyticsCostBreakdownDa
     badges.push({ label: `청산 체결 누락 ${dataQuality.missing_close_execution_count}건`, tone: "danger" });
   }
 
-  if (dataQuality.execution_sync_status !== "COMPLETE") {
-    badges.push({ label: `체결 동기화 ${statusLabel(dataQuality.execution_sync_status)}`, tone: "warn" });
-  }
-
-  if (dataQuality.funding_sync_status !== "COMPLETE") {
-    badges.push({ label: `펀딩 동기화 ${statusLabel(dataQuality.funding_sync_status)}`, tone: "warn" });
-  }
-
-  if (dataQuality.slippage_data_status !== "COMPLETE") {
+  if (normalizeStatusCode(dataQuality.execution_sync_status) !== "COMPLETE") {
     badges.push({
-      label: dataQuality.slippage_data_status === "NO_SAMPLE" ? "슬리피지 표본 없음" : "슬리피지 데이터 부족",
-      tone: "warn",
+      label: `체결 동기화 ${statusLabel(dataQuality.execution_sync_status)}`,
+      tone: costBreakdownStatusTone(dataQuality.execution_sync_status),
+    });
+  }
+
+  if (normalizeStatusCode(dataQuality.funding_sync_status) !== "COMPLETE") {
+    badges.push({
+      label: `펀딩 동기화 ${statusLabel(dataQuality.funding_sync_status)}`,
+      tone: costBreakdownStatusTone(dataQuality.funding_sync_status),
+    });
+  }
+
+  const slippageStatus = slippageDataStatusFromQuality(dataQuality);
+  if (slippageStatus !== "COMPLETE") {
+    badges.push({
+      label: slippageDataQualityLabel(dataQuality),
+      tone: slippageDataQualityTone(slippageStatus),
     });
   }
 
   return badges;
 }
 
+function costBreakdownWarningCodes(payload: AnalyticsCostBreakdownResponse) {
+  const warnings: string[] = [];
+  const appendWarning = (warning: string) => {
+    appendNormalizedWarningCode(warnings, warning);
+  };
+
+  for (const warning of payload.warnings ?? []) {
+    appendWarning(warning);
+  }
+  for (const warning of payload.data_quality.warning_codes ?? []) {
+    appendWarning(warning);
+  }
+  for (const bucket of payload.buckets ?? []) {
+    for (const warning of bucket.warning_codes ?? []) {
+      appendWarning(warning);
+    }
+    const bucketSlippageStatus = costBreakdownBucketSlippageStatus(bucket, payload.data_quality);
+    if (hasBucketSlippagePublication(bucket) && bucketSlippageStatus !== "COMPLETE") {
+      appendWarning(`slippage_data_status:${bucketSlippageStatus}`);
+    }
+  }
+  const fundingStatus = payload.data_quality.funding_sync_status?.trim().toUpperCase();
+  if (fundingStatus && fundingStatus !== "COMPLETE") {
+    appendWarning(`funding_sync_status:${fundingStatus}`);
+  }
+  const executionStatus = payload.data_quality.execution_sync_status?.trim().toUpperCase();
+  if (executionStatus && executionStatus !== "COMPLETE") {
+    appendWarning(`execution_sync_status:${executionStatus}`);
+  }
+  const missingCloseExecutionCount = payload.data_quality.missing_close_execution_count;
+  if (Number.isFinite(missingCloseExecutionCount) && missingCloseExecutionCount > 0) {
+    appendWarning(`missing_close_execution_count:${missingCloseExecutionCount}`);
+  }
+  const slippageStatus = slippageDataStatusFromQuality(payload.data_quality);
+  if (slippageStatus !== "COMPLETE") {
+    appendWarning(`slippage_data_status:${slippageStatus}`);
+  }
+
+  return warnings;
+}
+
+function isCostBreakdownDangerWarning(warning: string) {
+  const normalizedWarning = normalizeProfitabilityWarningCode(warning);
+  const lowerWarning = normalizedWarning.toLowerCase();
+  if (lowerWarning.startsWith("missing_close_execution_count")) {
+    return true;
+  }
+  if (lowerWarning.startsWith("slippage_data_status")) {
+    const status = normalizedWarning.split(":")[1] ?? "UNKNOWN";
+    return slippageDataQualityTone(status) === "danger";
+  }
+  if (lowerWarning.startsWith("execution_sync_status")) {
+    const status = normalizedWarning.split(":")[1] ?? "UNKNOWN";
+    return costBreakdownStatusTone(status) === "danger";
+  }
+  return false;
+}
+
+export function costBreakdownWarningTone(payload: AnalyticsCostBreakdownResponse): "good" | "warn" | "danger" {
+  const warnings = costBreakdownWarningCodes(payload);
+  if (warnings.some(isCostBreakdownDangerWarning)) {
+    return "danger";
+  }
+  if (typeof payload.summary.fee_ratio_pct === "number" && payload.summary.fee_ratio_pct >= 15) {
+    return "warn";
+  }
+  return warnings.length > 0 ? "warn" : "good";
+}
+
 export function costBreakdownWarningMessages(payload: AnalyticsCostBreakdownResponse) {
-  const messages: string[] = payload.warnings.map((warning) => {
-    if (warning.startsWith("missing_close_execution_count")) {
+  const warnings = costBreakdownWarningCodes(payload);
+
+  const messages: string[] = warnings.map((warning) => {
+    const normalizedWarning = normalizeProfitabilityWarningCode(warning);
+    const lowerWarning = normalizedWarning.toLowerCase();
+    if (lowerWarning.startsWith("missing_close_execution_count")) {
       return "청산 체결 누락으로 실현 손익이 확정되지 않았습니다.";
     }
-    if (warning.startsWith("funding_sync_status")) {
-      return "펀딩비 동기화가 불완전합니다.";
+    if (lowerWarning.startsWith("funding_sync_status")) {
+      return profitabilityCostWarningLabel(normalizedWarning);
     }
-    if (warning.startsWith("slippage_data_status")) {
-      if (warning.includes("NO_SAMPLE")) {
-        return "해당 기간에 체결 표본이 없어 평균 체결 불리도를 계산할 수 없습니다.";
-      }
-      return "슬리피지 데이터가 부족해 평균 체결 불리도를 확정할 수 없습니다.";
+    if (lowerWarning.startsWith("execution_sync_status")) {
+      return profitabilityCostWarningLabel(normalizedWarning);
     }
-    if (warning.startsWith("fee_asset_unconverted")) {
-      return "USDT로 환산하지 못한 수수료 자산이 있습니다.";
+    if (lowerWarning.startsWith("slippage_data_status")) {
+      return profitabilityCostWarningLabel(normalizedWarning);
+    }
+    if (
+      lowerWarning.startsWith("fee_asset_conversion_unavailable") ||
+      lowerWarning.startsWith("funding_asset_conversion_unavailable")
+    ) {
+      return profitabilityCostWarningLabel(normalizedWarning);
+    }
+    if (lowerWarning.startsWith("fee_asset_unconverted")) {
+      const asset = normalizedWarning.split(":")[1]?.trim();
+      return asset
+        ? `${asset} 수수료를 USDT로 환산하지 못했습니다.`
+        : "USDT로 환산하지 못한 수수료 자산이 있습니다.";
+    }
+    if (lowerWarning.startsWith("funding_asset_unconverted")) {
+      const asset = normalizedWarning.split(":")[1]?.trim();
+      return asset
+        ? `${asset} 펀딩비를 USDT로 환산하지 못했습니다.`
+        : "USDT로 환산하지 못한 펀딩비 자산이 있습니다.";
     }
     return "알 수 없는 비용 경고";
   });
@@ -318,11 +936,15 @@ export function costBreakdownBucketStatus(
   if (dataQuality.missing_close_execution_count > 0) {
     statuses.push("청산 체결 누락");
   }
-  if (dataQuality.funding_sync_status !== "COMPLETE") {
+  if (normalizeStatusCode(dataQuality.funding_sync_status) !== "COMPLETE") {
     statuses.push("펀딩비 미확정");
   }
-  if (dataQuality.slippage_data_status !== "COMPLETE") {
-    statuses.push(dataQuality.slippage_data_status === "NO_SAMPLE" ? "슬리피지 표본 없음" : "슬리피지 데이터 부족");
+  const bucketSlippageStatus = costBreakdownBucketSlippageStatus(bucket, dataQuality);
+  if (bucketSlippageStatus !== "COMPLETE") {
+    const slippageContext = hasBucketSlippagePublication(bucket)
+      ? { ...bucket, slippage_data_status: bucketSlippageStatus }
+      : dataQuality;
+    statuses.push(slippageDataQualityLabel(slippageContext));
   }
   if (bucket.gross_pnl_usdt <= 0 && (bucket.fee_usdt > 0 || bucket.total_cost_usdt > 0)) {
     statuses.push("비율 N/A");

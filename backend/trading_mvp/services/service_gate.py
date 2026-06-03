@@ -49,6 +49,31 @@ TERMINAL_TRIGGERED_EXECUTION_STATUSES = frozenset(
 HEALTH_BLOCKING_STATUSES = frozenset({"error", "degraded"})
 SCHEDULER_NON_BLOCKING_STATUSES = frozenset({"success", "skipped"})
 REDIS_CACHE_UNAVAILABLE_BLOCKER = "redis_cache_unavailable"
+REDIS_CACHE_UNAVAILABLE_ROOT_CAUSE = "REDIS_CACHE_UNAVAILABLE"
+EXCHANGE_AUTH_PERMISSION_REJECTED = "EXCHANGE_AUTH_PERMISSION_REJECTED"
+RECENT_SCHEDULER_NON_SUCCESS_ROOT_CAUSE = "RECENT_SCHEDULER_NON_SUCCESS"
+RECENT_HEALTH_ERRORS_ROOT_CAUSE = "RECENT_HEALTH_ERRORS"
+DB_CONNECTION_LOST_ROOT_CAUSE = "DB_CONNECTION_LOST"
+DB_IDLE_IN_TRANSACTION_TIMEOUT_ROOT_CAUSE = "DB_IDLE_IN_TRANSACTION_TIMEOUT"
+_ROOT_CAUSE_BOOLEAN_FLAG_CODES = {
+    "db_connection_lost": DB_CONNECTION_LOST_ROOT_CAUSE,
+}
+_ROOT_CAUSE_CODE_KEYS = (
+    "root_cause_code",
+    "reason_code",
+    "blocked_reason_code",
+    "error_category",
+    "error_code",
+    "code",
+)
+_ROOT_CAUSE_TEXT_KEYS = (
+    "error",
+    "message",
+    "msg",
+    "detail",
+    "reason",
+    "exception",
+)
 
 
 def active_pending_entry_plan_statement(*, symbols: list[str] | tuple[str, ...] | None = None) -> Select[tuple[PendingEntryPlan]]:
@@ -94,10 +119,143 @@ def _dt(value: object) -> str | None:
     return value.isoformat() if hasattr(value, "isoformat") else None
 
 
+def _reason_code_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return [normalized] if normalized else []
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    for item in value:
+        normalized = str(item or "").strip()
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _pending_plan_reason_codes(row: PendingEntryPlan, metadata: dict[str, object]) -> list[str]:
+    tracking = metadata.get("last_confirmation_tracking")
+    tracking_payload = tracking if isinstance(tracking, dict) else {}
+    reason_codes: list[str] = []
+    for value in (
+        metadata.get("last_watch_blocked_reason_codes"),
+        metadata.get("source_blocked_reason_codes"),
+        metadata.get("blocked_reason_codes"),
+        metadata.get("reason_codes"),
+        metadata.get("root_cause_codes"),
+        tracking_payload.get("blocked_reason_codes"),
+        tracking_payload.get("reason_codes"),
+        tracking_payload.get("root_cause_codes"),
+        tracking_payload.get("confirmation_failed_reason"),
+        tracking_payload.get("plan_cancel_reason"),
+        row.canceled_reason,
+    ):
+        for code in _reason_code_list(value):
+            if code not in reason_codes:
+                reason_codes.append(code)
+    return reason_codes
+
+
+def _normalize_root_cause_code(value: object) -> str | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return EXCHANGE_AUTH_PERMISSION_REJECTED if value == -2015 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if (
+        EXCHANGE_AUTH_PERMISSION_REJECTED in upper
+        or "INVALID API-KEY" in upper
+        or "PERMISSIONS FOR ACTION" in upper
+        or "BINANCE ERROR -2015" in upper
+        or upper == "-2015"
+    ):
+        return EXCHANGE_AUTH_PERMISSION_REJECTED
+    compact = upper.replace("_", "").replace("-", "").replace(" ", "")
+    if (
+        "IDLEINTRANSACTIONSESSIONTIMEOUT" in compact
+        or "IDLEINTRANSACTIONTIMEOUT" in compact
+    ):
+        return DB_IDLE_IN_TRANSACTION_TIMEOUT_ROOT_CAUSE
+    if upper.replace("_", "").replace("-", "").replace(":", "").isalnum() and " " not in upper:
+        return upper
+    return None
+
+
+def _is_root_cause_container_key(key: object) -> bool:
+    normalized = str(key or "").strip().lower()
+    return any(token in normalized for token in ("error", "exception", "reason", "blocker", "issue", "failure"))
+
+
+def _root_cause_code_from_sequence(values: object, *, scan_strings: bool) -> str | None:
+    if not isinstance(values, (list, tuple, set)):
+        return None
+    for item in values:
+        code = _root_cause_code_from_value(item, scan_strings=scan_strings)
+        if code:
+            return code
+    return None
+
+
+def _root_cause_code_from_value(value: object, *, scan_strings: bool) -> str | None:
+    if isinstance(value, dict):
+        return _root_cause_code(value)
+    if isinstance(value, (list, tuple, set)):
+        return _root_cause_code_from_sequence(value, scan_strings=scan_strings)
+    if scan_strings:
+        return _normalize_root_cause_code(value)
+    return None
+
+
+def _root_cause_code(payload: object, *extra_text: object) -> str | None:
+    if isinstance(payload, dict):
+        for key, code in _ROOT_CAUSE_BOOLEAN_FLAG_CODES.items():
+            if payload.get(key) is True:
+                return code
+        for key in _ROOT_CAUSE_CODE_KEYS:
+            code = _root_cause_code_from_value(payload.get(key), scan_strings=True)
+            if code:
+                return code
+        for key in _ROOT_CAUSE_TEXT_KEYS:
+            code = _root_cause_code_from_value(payload.get(key), scan_strings=True)
+            if code:
+                return code
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                code = _root_cause_code(value)
+                if code:
+                    return code
+            elif isinstance(value, (list, tuple, set)):
+                code = _root_cause_code_from_sequence(
+                    value,
+                    scan_strings=_is_root_cause_container_key(key),
+                )
+                if code:
+                    return code
+    for value in extra_text:
+        code = _root_cause_code_from_value(value, scan_strings=True)
+        if code:
+            return code
+    return None
+
+
+def _pending_plan_root_cause_codes(reason_codes: list[str]) -> list[str]:
+    root_cause_codes: list[str] = []
+    for code in reason_codes:
+        normalized = _normalize_root_cause_code(code)
+        if normalized and normalized not in root_cause_codes:
+            root_cause_codes.append(normalized)
+    return root_cause_codes
+
+
 def _pending_plan_payload(row: PendingEntryPlan) -> dict[str, object]:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     tracking = metadata.get("last_confirmation_tracking")
     tracking_payload = tracking if isinstance(tracking, dict) else {}
+    reason_codes = _pending_plan_reason_codes(row, metadata)
+    root_cause_codes = _pending_plan_root_cause_codes(reason_codes)
     return {
         "id": row.id,
         "symbol": row.symbol,
@@ -112,7 +270,8 @@ def _pending_plan_payload(row: PendingEntryPlan) -> dict[str, object]:
         "triggered_at": _dt(row.triggered_at),
         "canceled_at": _dt(row.canceled_at),
         "canceled_reason": row.canceled_reason,
-        "blocked_reason_codes": tracking_payload.get("blocked_reason_codes") or [],
+        "blocked_reason_codes": reason_codes,
+        "root_cause_codes": root_cause_codes,
         "confirmation_failed_reason": tracking_payload.get("confirmation_failed_reason"),
     }
 
@@ -256,6 +415,11 @@ def _position_payload(row: Position) -> dict[str, object]:
 
 
 def _scheduler_payload(row: SchedulerRun) -> dict[str, object]:
+    outcome = row.outcome if isinstance(row.outcome, dict) else {}
+    root_cause_codes = _root_cause_codes_from_evidence(outcome)
+    if not root_cause_codes:
+        root_cause_codes = [RECENT_SCHEDULER_NON_SUCCESS_ROOT_CAUSE]
+    root_cause_code = root_cause_codes[0]
     return {
         "id": row.id,
         "workflow": row.workflow,
@@ -263,19 +427,106 @@ def _scheduler_payload(row: SchedulerRun) -> dict[str, object]:
         "status": row.status,
         "triggered_by": row.triggered_by,
         "created_at": _dt(row.created_at),
-        "outcome": row.outcome if isinstance(row.outcome, dict) else {},
+        "reason_code": root_cause_code,
+        "root_cause_code": root_cause_code,
+        "root_cause_codes": root_cause_codes,
+        "outcome": outcome,
     }
 
 
 def _health_payload(row: SystemHealthEvent) -> dict[str, object]:
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    root_cause_codes = _root_cause_codes_from_evidence(payload, row.message)
+    if not root_cause_codes:
+        root_cause_codes = [RECENT_HEALTH_ERRORS_ROOT_CAUSE]
+    root_cause_code = root_cause_codes[0]
     return {
         "id": row.id,
         "component": row.component,
         "status": row.status,
         "message": row.message,
         "created_at": _dt(row.created_at),
-        "payload": row.payload if isinstance(row.payload, dict) else {},
+        "reason_code": root_cause_code,
+        "root_cause_code": root_cause_code,
+        "root_cause_codes": root_cause_codes,
+        "payload": payload,
     }
+
+
+def _append_root_cause_code(codes: list[str], value: object) -> None:
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _append_root_cause_code(codes, item)
+        return
+    code = _normalize_root_cause_code(value)
+    if code and code not in codes:
+        codes.append(code)
+
+
+_ROOT_CAUSE_COLLECTION_KEYS = (
+    *_ROOT_CAUSE_CODE_KEYS,
+    "root_cause_codes",
+    "reason_codes",
+    "blocked_reason_codes",
+)
+
+
+def _append_root_cause_codes_from_value(codes: list[str], value: object, *, scan_strings: bool) -> None:
+    if isinstance(value, dict):
+        visited_keys = {*_ROOT_CAUSE_COLLECTION_KEYS, *_ROOT_CAUSE_TEXT_KEYS}
+        for key, code in _ROOT_CAUSE_BOOLEAN_FLAG_CODES.items():
+            if value.get(key) is True:
+                _append_root_cause_code(codes, code)
+        for key in _ROOT_CAUSE_COLLECTION_KEYS:
+            _append_root_cause_codes_from_value(codes, value.get(key), scan_strings=True)
+        for key in _ROOT_CAUSE_TEXT_KEYS:
+            _append_root_cause_codes_from_value(codes, value.get(key), scan_strings=True)
+        for key, nested in value.items():
+            if key in visited_keys:
+                continue
+            if isinstance(nested, dict):
+                _append_root_cause_codes_from_value(codes, nested, scan_strings=False)
+            elif isinstance(nested, (list, tuple, set)):
+                _append_root_cause_codes_from_value(
+                    codes,
+                    nested,
+                    scan_strings=_is_root_cause_container_key(key),
+                )
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _append_root_cause_codes_from_value(codes, item, scan_strings=scan_strings)
+        return
+    if scan_strings:
+        _append_root_cause_code(codes, value)
+
+
+def _root_cause_codes_from_evidence(payload: object, *extra_text: object) -> list[str]:
+    codes: list[str] = []
+    _append_root_cause_codes_from_value(codes, payload, scan_strings=False)
+    for value in extra_text:
+        _append_root_cause_codes_from_value(codes, value, scan_strings=True)
+    if DB_IDLE_IN_TRANSACTION_TIMEOUT_ROOT_CAUSE in codes and "WORKFLOW_EXCEPTION" in codes:
+        codes = [code for code in codes if code != "WORKFLOW_EXCEPTION"]
+    return codes
+
+
+def _root_cause_codes_from_payloads(*sections: list[dict[str, object]]) -> list[str]:
+    codes: list[str] = []
+    for section in sections:
+        for item in section:
+            if not isinstance(item, dict):
+                continue
+            for key in (
+                "root_cause_code",
+                "reason_code",
+                "blocked_reason_code",
+                "root_cause_codes",
+                "reason_codes",
+                "blocked_reason_codes",
+            ):
+                _append_root_cause_code(codes, item.get(key))
+    return codes
 
 
 def _setting_row(session: Session) -> Setting | None:
@@ -284,14 +535,17 @@ def _setting_row(session: Session) -> Setting | None:
 
 def _redis_cache_unavailable(settings_row: Setting | None) -> dict[str, object]:
     if settings_row is None:
-        return {"blocking": False}
+        return {"blocking": False, "reason_code": None, "root_cause_code": None}
     state = get_market_stream_detail(settings_row)
     redis_configured = bool(state.get("redis_configured"))
     redis_connected = state.get("redis_connected")
     cache_health = str(state.get("cache_health") or "").strip().lower()
     blocking = redis_configured and (redis_connected is False or cache_health == "unavailable")
+    root_cause_code = REDIS_CACHE_UNAVAILABLE_ROOT_CAUSE if blocking else None
     return {
         "blocking": blocking,
+        "reason_code": root_cause_code,
+        "root_cause_code": root_cause_code,
         "redis_configured": redis_configured,
         "redis_connected": redis_connected,
         "cache_health": cache_health or "unknown",
@@ -457,10 +711,24 @@ def build_service_switch_gate_snapshot(
     if redis_cache.get("blocking"):
         blockers.append(REDIS_CACHE_UNAVAILABLE_BLOCKER)
 
+    active_pending_payloads = [_pending_plan_payload(row) for row in blocking_pending]
+    unresolved_submission_payloads = [dict(row) for row in unresolved_submission_guards]
+    recent_scheduler_payloads = [_scheduler_payload(row) for row in scheduler_non_success]
+    recent_health_payloads = [_health_payload(row) for row in health_errors]
+    root_cause_codes = _root_cause_codes_from_payloads(
+        active_pending_payloads,
+        unresolved_submission_payloads,
+        recent_scheduler_payloads,
+        recent_health_payloads,
+        for_update_waits,
+        [redis_cache],
+    )
+
     return {
         "generated_at": now.isoformat(),
         "gate_clear": not blockers,
         "blockers": blockers,
+        "root_cause_codes": root_cause_codes,
         "counts": {
             "open_positions": len(open_positions),
             "active_orders": len(active_orders),
@@ -489,7 +757,7 @@ def build_service_switch_gate_snapshot(
         "redis_cache": redis_cache,
         "open_positions": [_position_payload(row) for row in open_positions],
         "active_orders": [_order_payload(row) for row in active_orders],
-        "active_pending_entry_plans": [_pending_plan_payload(row) for row in blocking_pending],
+        "active_pending_entry_plans": active_pending_payloads,
         "triggered_terminal_history_entry_plans": [
             _pending_plan_payload(row) for row in terminal_triggered[:20]
         ],
@@ -498,8 +766,8 @@ def build_service_switch_gate_snapshot(
         ],
         "reconciliation": reconciliation,
         "reconciliation_synced": reconciliation_synced,
-        "unresolved_submissions": [dict(row) for row in unresolved_submission_guards],
-        "recent_scheduler_non_success": [_scheduler_payload(row) for row in scheduler_non_success],
-        "recent_health_errors": [_health_payload(row) for row in health_errors],
+        "unresolved_submissions": unresolved_submission_payloads,
+        "recent_scheduler_non_success": recent_scheduler_payloads,
+        "recent_health_errors": recent_health_payloads,
         "for_update_lock_waits": for_update_waits,
     }

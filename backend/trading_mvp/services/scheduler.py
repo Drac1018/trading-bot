@@ -1340,9 +1340,11 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
     orchestrator = TradingOrchestrator(session)
     results: list[dict[str, object]] = []
     due_effective = []
+    candidate_universe_symbols: list[str] = []
     for effective in get_effective_symbol_schedule(settings_row):
         if not effective.enabled:
             continue
+        candidate_universe_symbols.append(effective.symbol)
         cadence_profile = _symbol_cadence_profile(
             orchestrator,
             symbol=effective.symbol,
@@ -1370,6 +1372,7 @@ def run_interval_decision_cycle(session: Session, triggered_by: str = "scheduler
         _commit_before_external_scheduler_work(session)
         decision_plan = orchestrator.build_interval_decision_plan(
             symbols=plan_symbols,
+            candidate_universe_symbols=candidate_universe_symbols if plan_symbols else None,
             triggered_at=utcnow_naive(),
         )
         ai_cycle_dispatch_budget = _apply_interval_ai_cycle_dispatch_budget(decision_plan)

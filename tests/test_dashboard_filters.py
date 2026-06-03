@@ -23,6 +23,7 @@ from trading_mvp.models import (
     RiskCheck,
     SchedulerRun,
 )
+from trading_mvp.schemas import OperationalStatusPayload, OperatorControlState
 from trading_mvp.services.audit import (
     SENSITIVE_REDACTED_VALUE,
     record_audit_event,
@@ -33,6 +34,7 @@ from trading_mvp.services.dashboard import (
     OPERATOR_RECENT_ROW_SCAN_LIMIT,
     _latest_rows_by_extracted_symbol,
     _latest_rows_by_symbol,
+    _profitability_window_since,
     classify_audit_event,
     get_alerts,
     get_audit_event_detail,
@@ -2015,6 +2017,149 @@ def test_operator_dashboard_exchange_sync_diagnostics_currently_permission_block
     assert diagnostics["currently_permission_blocked"] is True
     assert diagnostics["active_reason_codes"] == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
     assert diagnostics["permission_failure_count_24h"] == 1
+    assert payload.control.service_gate_gate_clear is False
+    assert "recent_scheduler_non_success" in payload.control.service_gate_blockers
+    assert payload.control.service_gate_root_cause_codes == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
+
+
+def test_operator_dashboard_includes_service_gate_top_level_root_cause_codes(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    def fake_service_gate_snapshot(_session):
+        return {
+            "gate_clear": False,
+            "blockers": ["redis_cache_unavailable"],
+            "root_cause_codes": [" redis_cache_unavailable ", "REDIS_CACHE_UNAVAILABLE"],
+            "counts": {"redis_cache_unavailable": 1},
+            "redis_cache": {
+                "configured": True,
+                "available": False,
+                "reason_code": "REDIS_CACHE_UNAVAILABLE",
+                "root_cause_code": "REDIS_CACHE_UNAVAILABLE",
+            },
+        }
+
+    monkeypatch.setattr(dashboard_module, "build_service_switch_gate_snapshot", fake_service_gate_snapshot)
+
+    payload = dashboard_module.get_operator_dashboard(db_session, view="home")
+
+    assert payload.control.service_gate_gate_clear is False
+    assert payload.control.service_gate_blockers == ["redis_cache_unavailable"]
+    assert payload.control.service_gate_root_cause_codes == ["REDIS_CACHE_UNAVAILABLE"]
+
+
+def test_operator_dashboard_publishes_service_gate_detail_rows(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    def fake_service_gate_snapshot(_session):
+        return {
+            "gate_clear": False,
+            "blockers": ["recent_scheduler_non_success", "recent_health_errors"],
+            "root_cause_codes": ["RECENT_SCHEDULER_NON_SUCCESS", "RECENT_HEALTH_ERRORS"],
+            "counts": {"recent_scheduler_non_success": 1, "recent_health_errors": 1},
+            "recent_scheduler_non_success": [
+                {
+                    "id": 2968,
+                    "workflow": "interval_decision_cycle",
+                    "status": "running",
+                    "root_cause_codes": ["RECENT_SCHEDULER_NON_SUCCESS"],
+                }
+            ],
+            "recent_health_errors": [
+                {
+                    "id": 41,
+                    "component": "live_sync",
+                    "status": "degraded",
+                    "root_cause_codes": ["EXCHANGE_POSITION_MODE_UNCLEAR"],
+                }
+            ],
+            "redis_cache": {"configured": True, "available": True, "blocking": False},
+        }
+
+    monkeypatch.setattr(dashboard_module, "build_service_switch_gate_snapshot", fake_service_gate_snapshot)
+
+    payload = dashboard_module.get_operator_dashboard(db_session, view="home")
+
+    assert payload.control.service_gate_gate_clear is False
+    assert payload.control.service_gate_counts == {
+        "recent_scheduler_non_success": 1,
+        "recent_health_errors": 1,
+    }
+    assert payload.control.service_gate_recent_scheduler_non_success == [
+        {
+            "id": 2968,
+            "workflow": "interval_decision_cycle",
+            "status": "running",
+            "root_cause_codes": ["RECENT_SCHEDULER_NON_SUCCESS"],
+        }
+    ]
+    assert payload.control.service_gate_recent_health_errors == [
+        {
+            "id": 41,
+            "component": "live_sync",
+            "status": "degraded",
+            "root_cause_codes": ["EXCHANGE_POSITION_MODE_UNCLEAR"],
+        }
+    ]
+    assert payload.control.service_gate_redis_cache == {
+        "configured": True,
+        "available": True,
+        "blocking": False,
+    }
+
+
+def test_operator_dashboard_publishes_active_pending_plan_service_gate_reason_codes(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    set_reconciliation_detail(
+        settings,
+        status="synced",
+        unresolved_submission_badge=False,
+        unresolved_submission_count=0,
+        unresolved_submission_symbols=[],
+        unresolved_submissions=[],
+    )
+    now = utcnow_naive()
+    db_session.add(
+        PendingEntryPlan(
+            symbol="BTCUSDT",
+            side="long",
+            plan_status="armed",
+            source_decision_run_id=9911,
+            source_timeframe="15m",
+            entry_mode="pullback_confirm",
+            entry_zone_min=100.0,
+            entry_zone_max=101.0,
+            invalidation_price=99.0,
+            max_chase_bps=10.0,
+            idea_ttl_minutes=30,
+            stop_loss=99.0,
+            take_profit=103.0,
+            risk_pct_cap=0.01,
+            leverage_cap=1.0,
+            expires_at=now + timedelta(minutes=30),
+            idempotency_key="pending-plan:BTCUSDT:long:9911:operator-service-gate-test",
+            metadata_json={
+                "last_watch_blocked_reason_codes": ["PLAN_LATE_CHASE_WAITING_REENTRY"],
+                "source_blocked_reason_codes": ["HOLD_DECISION"],
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session, view="home")
+
+    assert payload.control.service_gate_gate_clear is False
+    assert payload.control.service_gate_blockers == ["active_pending_entry_plans"]
+    assert payload.control.service_gate_root_cause_codes == [
+        "PLAN_LATE_CHASE_WAITING_REENTRY",
+        "HOLD_DECISION",
+    ]
 
 
 def test_operator_pending_plan_snapshot_uses_utc_naive_remaining_ttl(db_session) -> None:
@@ -2158,6 +2303,10 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     assert cost.net_pnl_including_funding == pytest.approx(7.35, abs=1e-9)
     assert cost.signed_slippage_bps_avg > 0.0
     assert cost.adverse_slippage_bps_avg > 0.0
+    assert cost.slippage_data_status == "COMPLETE"
+    assert cost.slippage_data_reason is None
+    assert cost.slippage_sample_count == 2
+    assert cost.missing_slippage_sample_count == 0
     assert cost.passive_entry_count == 3
     assert cost.passive_entry_ratio == pytest.approx(1.0, abs=1e-9)
     assert payload.windows[0].entry_quality["entry_passive_limit"].trade_count == 1
@@ -2176,6 +2325,79 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     assert payload.adaptive_signal_summary["status"] in {"active", "neutral", "insufficient_data", "disabled"}
     assert payload.latest_decision is not None
     assert payload.latest_risk is not None
+
+
+def test_profitability_dashboard_cost_breakdown_exposes_slippage_no_sample(db_session) -> None:
+    payload = get_profitability_dashboard(db_session)
+
+    today = next(item for item in payload.cost_breakdowns if item.window_label == "today")
+    assert today.status == "no_data"
+    assert today.signed_slippage_bps_avg is None
+    assert today.adverse_slippage_bps_avg is None
+    assert today.slippage_data_status == "NO_SAMPLE"
+    assert today.slippage_data_reason == "no_execution_slippage_sample"
+    assert today.slippage_sample_count == 0
+    assert today.missing_slippage_sample_count == 0
+    assert "slippage_data_status:NO_SAMPLE" in today.warning_codes
+
+
+def test_profitability_dashboard_api_exposes_incomplete_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_incomplete_slippage_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        now = utcnow_naive()
+        order = Order(
+            symbol="BTCUSDT",
+            side="buy",
+            order_type="limit",
+            mode="live",
+            status="filled",
+            external_order_id="missing-slippage-entry",
+            requested_quantity=0.01,
+            requested_price=0.0,
+            filled_quantity=0.01,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+            created_at=now - timedelta(minutes=5),
+            updated_at=now - timedelta(minutes=5),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="missing-slippage-fill",
+                fill_price=0.0,
+                fill_quantity=0.01,
+                fee_paid=0.1,
+                commission_asset="USDT",
+                realized_pnl=1.0,
+                payload={},
+                created_at=now - timedelta(minutes=4),
+                updated_at=now - timedelta(minutes=4),
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/profitability")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "ok"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "INCOMPLETE"
+    assert today["slippage_data_reason"] == "missing_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 1
+    assert "slippage_data_status:INCOMPLETE" in today["warning_codes"]
 
 
 def test_profitability_dashboard_cost_breakdown_flags_cost_leakage(db_session) -> None:
@@ -2326,6 +2548,17 @@ def test_profitability_dashboard_reports_latest_pnl_snapshot_and_fact_gate_diagn
 
 def test_profitability_dashboard_cache_returns_snapshot_when_enabled(db_session) -> None:
     _seed_profitability_dashboard_rows(db_session)
+    today_start = _profitability_window_since("today", None, utcnow_naive())
+    for index, order in enumerate(db_session.query(Order).filter(Order.mode == "live").all()):
+        order.created_at = today_start + timedelta(minutes=5 + index)
+        order.updated_at = order.created_at
+    for index, execution in enumerate(db_session.query(Execution).all()):
+        execution.created_at = today_start + timedelta(minutes=20 + index)
+        execution.updated_at = execution.created_at
+    for index, funding in enumerate(db_session.query(AccountLedgerEntry).all()):
+        funding.occurred_at = today_start + timedelta(minutes=40 + index)
+        funding.updated_at = funding.occurred_at
+    db_session.flush()
 
     cached = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
     for order in db_session.query(Order).filter(Order.reduce_only.is_(False), Order.close_only.is_(False)).all():
@@ -2340,9 +2573,86 @@ def test_profitability_dashboard_cache_returns_snapshot_when_enabled(db_session)
     cached_again = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
     fresh = get_profitability_dashboard(db_session)
 
+    for cost in (cached.cost_breakdowns[0], cached_again.cost_breakdowns[0], fresh.cost_breakdowns[0]):
+        assert cost.window_label == "today"
+        assert cost.slippage_data_status == "COMPLETE"
+        assert cost.slippage_data_reason is None
+        assert cost.slippage_sample_count == 2
+        assert cost.missing_slippage_sample_count == 0
+        assert all(not code.startswith("slippage_data_status:") for code in cost.warning_codes)
+
     assert cached_again.windows[0].cost_breakdown.passive_entry_ratio == cached.windows[0].cost_breakdown.passive_entry_ratio
     assert cached_again.windows[0].cost_breakdown.marketable_entry_ratio == cached.windows[0].cost_breakdown.marketable_entry_ratio
     assert fresh.windows[0].cost_breakdown.marketable_entry_ratio == pytest.approx(1.0, abs=1e-9)
+
+
+def test_profitability_dashboard_cache_remerges_slippage_reason_from_stale_payload(
+    db_session,
+    monkeypatch,
+) -> None:
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    profitability = get_profitability_dashboard(db_session)
+    warning_code = "slippage_data_status:NO_SAMPLE"
+    assert warning_code in profitability.cost_breakdowns[0].warning_codes
+    assert warning_code in profitability.limited_live_readiness.reason_codes
+    assert warning_code in profitability.windows[0].limited_live_readiness.reason_codes
+
+    stale_readiness = profitability.limited_live_readiness.model_copy(
+        update={
+            "reason_codes": [
+                code
+                for code in profitability.limited_live_readiness.reason_codes
+                if not code.startswith("slippage_data_status:")
+            ]
+        }
+    )
+    stale_windows = [
+        window.model_copy(
+            update={
+                "limited_live_readiness": window.limited_live_readiness.model_copy(
+                    update={
+                        "reason_codes": [
+                            code
+                            for code in window.limited_live_readiness.reason_codes
+                            if not code.startswith("slippage_data_status:")
+                        ]
+                    }
+                )
+            }
+        )
+        for window in profitability.windows
+    ]
+    stale_profitability = profitability.model_copy(
+        update={
+            "limited_live_readiness": stale_readiness,
+            "windows": stale_windows,
+        }
+    )
+    assert warning_code not in stale_profitability.limited_live_readiness.reason_codes
+    assert warning_code not in stale_profitability.windows[0].limited_live_readiness.reason_codes
+
+    build_calls = 0
+
+    def stale_uncached_profitability(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return stale_profitability
+
+    monkeypatch.setattr(
+        "trading_mvp.services.dashboard._build_profitability_dashboard_uncached",
+        stale_uncached_profitability,
+    )
+
+    cached = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
+    cached_again = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
+
+    assert build_calls == 1
+    assert warning_code in cached.limited_live_readiness.reason_codes
+    assert warning_code in cached.windows[0].limited_live_readiness.reason_codes
+    assert warning_code in cached_again.limited_live_readiness.reason_codes
+    assert warning_code in cached_again.windows[0].limited_live_readiness.reason_codes
 
 
 def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_session) -> None:
@@ -2616,6 +2926,152 @@ def test_operator_dashboard_exposes_weak_volume_preai_skip_reason(db_session) ->
     assert bnb.ai_decision.ai_trigger_summary == bnb.ai_decision.market_signal_summary
     assert bnb.ai_decision.market_signal_context.weak_volume is True
     assert bnb.ai_decision.market_signal_context.volume_ratio == 0.07
+
+
+def test_operator_dashboard_exposes_hold_diagnostic_for_no_edge_context(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "ETHUSDT"
+    settings.tracked_symbols = ["ETHUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    decision_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="eth no edge hold",
+        input_payload={
+            "features": {
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "weak",
+                    "weak_volume": True,
+                    "momentum_weakening": True,
+                },
+            },
+        },
+        output_payload={
+            "symbol": "ETHUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.18,
+            "rationale_codes": [
+                "NO_EDGE",
+                "EXPECTANCY_NEUTRAL",
+                "DERIVATIVES_NEUTRAL",
+                "LEAD_MARKETS_NEUTRAL",
+            ],
+            "explanation_short": "No actionable edge.",
+        },
+        metadata_json={
+            "source": "llm",
+            "selection_context": {
+                "assigned_slot": "slot_1",
+                "capacity_reason": "breadth_weak_reduce_capacity",
+                "entry_score_threshold": 0.48,
+                "slot_conviction_score": 0.52,
+                "score": {
+                    "total_score": 0.52,
+                    "derivatives_alignment": 0.24,
+                    "lead_lag_alignment": 0.50,
+                },
+                "universe_breadth": {
+                    "breadth_regime": "weak_breadth",
+                    "directional_bias": "neutral",
+                    "entry_candidates": 0,
+                    "structural_entry_candidates": 0,
+                    "decision_entry_candidates": 0,
+                },
+                "candidate": {
+                    "rationale_codes": [
+                        "NO_EDGE",
+                        "EXPECTANCY_NEUTRAL",
+                        "DERIVATIVES_NEUTRAL",
+                        "LEAD_MARKETS_NEUTRAL",
+                    ],
+                },
+            },
+            "analysis_context": {
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "weak",
+                },
+                "flags": {"weak_volume": True, "momentum_weakening": True},
+                "derivatives": {
+                    "available": True,
+                    "oi_expanding_with_price": False,
+                    "taker_flow_alignment": "neutral",
+                    "funding_bias": "neutral",
+                    "crowded_long_risk": True,
+                    "top_trader_long_crowded": True,
+                    "long_alignment_score": 0.24,
+                },
+                "lead_lag": {
+                    "leader_bias": "neutral",
+                    "bullish_alignment_score": 0.50,
+                },
+            },
+        },
+        schema_valid=True,
+        created_at=now,
+    )
+    db_session.add(decision_run)
+    db_session.flush()
+    db_session.add(
+        RiskCheck(
+            symbol="ETHUSDT",
+            decision_run_id=decision_run.id,
+            allowed=False,
+            decision="hold",
+            reason_codes=["HOLD_DECISION"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            created_at=now,
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session, view="decision")
+    eth = next(item for item in payload.symbols if item.symbol == "ETHUSDT")
+    diagnostic = eth.ai_decision.hold_diagnostic
+
+    assert diagnostic["status"] == "active"
+    assert diagnostic["summary_code"] == "no_entry_candidate"
+    assert diagnostic["metrics"]["entry_candidates"] == 0
+    assert diagnostic["metrics"]["entry_score_threshold"] == 0.48
+    assert diagnostic["metrics"]["slot_conviction_score"] == 0.52
+    assert diagnostic["metrics"]["derivatives_alignment"] == 0.24
+    assert diagnostic["metrics"]["lead_lag_alignment"] == 0.5
+    assert diagnostic["evidence"]["breadth_regime"] == "weak_breadth"
+    assert diagnostic["evidence"]["capacity_reason"] == "breadth_weak_reduce_capacity"
+    assert diagnostic["evidence"]["oi_expanding_with_price"] is False
+    assert diagnostic["evidence"]["leader_bias"] == "neutral"
+    assert {
+        "NO_EDGE",
+        "EXPECTANCY_NEUTRAL",
+        "DERIVATIVES_NEUTRAL",
+        "LEAD_MARKETS_NEUTRAL",
+        "WEAK_VOLUME",
+        "MOMENTUM_WEAKENING",
+        "WEAK_BREADTH",
+        "BREADTH_WEAK_REDUCE_CAPACITY",
+        "BREAKOUT_OI_NOT_EXPANDING",
+        "TOP_TRADER_LONG_CROWDED",
+        "DERIVATIVES_ALIGNMENT_HEADWIND",
+    }.issubset(set(diagnostic["reason_codes"]))
 
 
 def test_operator_dashboard_distinguishes_ai_invoked_hold_from_preai_skip(db_session) -> None:
@@ -3641,9 +4097,11 @@ def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_fac
     payload = response.json()
     assert payload["windows"][0]["window_label"] == "24h"
     assert payload["windows"][0]["cost_breakdown"]["net_pnl_including_funding"] == 7.35
+    assert payload["windows"][0]["cost_breakdown"]["slippage_data_status"] == "COMPLETE"
     assert payload["windows"][0]["entry_quality"]["entry_passive_limit"]["trade_count"] == 1
     assert payload["entry_quality"]["entry_passive_limit"]["trade_count"] == 1
     assert payload["cost_breakdowns"][0]["window_label"] == "today"
+    assert "slippage_data_status" in payload["cost_breakdowns"][0]
     assert "rationale_winners" in payload["windows"][0]
     assert "rationale_losers" in payload["windows"][0]
     assert payload["windows"][0]["limited_live_readiness"]["read_only"] is True
@@ -3651,6 +4109,282 @@ def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_fac
     assert "execution_windows" in payload
     assert payload["execution_windows"][0]["worst_profiles"]
     assert payload["hold_blocked_summary"]["latest_blocked_reasons"] == ["TRADING_PAUSED", "HOLD_DECISION"]
+
+
+def test_profitability_dashboard_api_exposes_no_sample_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_no_sample_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/profitability")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "no_data"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "NO_SAMPLE"
+    assert today["slippage_data_reason"] == "no_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 0
+    assert "slippage_data_status:NO_SAMPLE" in today["warning_codes"]
+    readiness = payload["limited_live_readiness"]
+    assert readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"]
+    window_readiness = payload["windows"][0]["limited_live_readiness"]
+    assert window_readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in window_readiness["reason_codes"]
+
+
+def test_operator_dashboard_api_exposes_no_sample_profitability_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_no_sample_profitability_cost_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["market_signal"]["profitability_cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "no_data"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "NO_SAMPLE"
+    assert today["slippage_data_reason"] == "no_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 0
+    assert "slippage_data_status:NO_SAMPLE" in today["warning_codes"]
+    readiness = payload["control"]["limited_live_readiness"]
+    assert readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"]
+
+
+def test_operator_dashboard_remerges_slippage_reason_from_stale_profitability_payload(
+    db_session,
+    monkeypatch,
+) -> None:
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    profitability = get_profitability_dashboard(db_session)
+    today = profitability.cost_breakdowns[0]
+    assert today.slippage_data_status == "NO_SAMPLE"
+    assert "slippage_data_status:NO_SAMPLE" in today.warning_codes
+
+    stale_readiness = profitability.limited_live_readiness.model_copy(
+        update={
+            "reason_codes": [
+                code
+                for code in profitability.limited_live_readiness.reason_codes
+                if not code.startswith("slippage_data_status:")
+            ]
+        }
+    )
+    assert "slippage_data_status:NO_SAMPLE" not in stale_readiness.reason_codes
+    stale_profitability = profitability.model_copy(update={"limited_live_readiness": stale_readiness})
+
+    monkeypatch.setattr(
+        "trading_mvp.services.dashboard.get_profitability_dashboard",
+        lambda *args, **kwargs: stale_profitability,
+    )
+
+    payload = get_operator_dashboard(db_session)
+
+    assert payload.control.limited_live_readiness.status == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in payload.control.limited_live_readiness.reason_codes
+
+
+def test_operator_dashboard_api_exposes_incomplete_profitability_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_incomplete_profitability_cost_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        now = utcnow_naive()
+        order = Order(
+            symbol="BTCUSDT",
+            side="buy",
+            order_type="limit",
+            mode="live",
+            status="filled",
+            external_order_id="operator-missing-slippage-entry",
+            requested_quantity=0.01,
+            requested_price=0.0,
+            filled_quantity=0.01,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+            created_at=now - timedelta(minutes=5),
+            updated_at=now - timedelta(minutes=5),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="operator-missing-slippage-fill",
+                fill_price=0.0,
+                fill_quantity=0.01,
+                fee_paid=0.1,
+                commission_asset="USDT",
+                realized_pnl=1.0,
+                payload={},
+                created_at=now - timedelta(minutes=4),
+                updated_at=now - timedelta(minutes=4),
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["market_signal"]["profitability_cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "ok"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "INCOMPLETE"
+    assert today["slippage_data_reason"] == "missing_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 1
+    assert "slippage_data_status:INCOMPLETE" in today["warning_codes"]
+
+
+def test_cost_conversion_warnings_match_cost_profitability_and_operator_apis(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("cost_conversion_warning_match.db")
+
+    with TestingSessionLocal() as session:
+        now = utcnow_naive()
+        settings = get_or_create_settings(session)
+        mark_sync_success(settings, scope="account", synced_at=now, stale_after_seconds=3600)
+        order = Order(
+            symbol="BTCUSDT",
+            side="buy",
+            order_type="market",
+            mode="live",
+            status="filled",
+            external_order_id="cost-conversion-warning-entry",
+            requested_quantity=1.0,
+            requested_price=100.0,
+            filled_quantity=1.0,
+            average_fill_price=100.0,
+            reason_codes=[],
+            metadata_json={},
+            created_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=10),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="cost-conversion-warning-fill",
+                fill_price=100.0,
+                fill_quantity=1.0,
+                fee_paid=0.1,
+                commission_asset="BNB",
+                realized_pnl=1.0,
+                payload={"signed_slippage_bps": 0.0},
+                created_at=now - timedelta(minutes=9),
+                updated_at=now - timedelta(minutes=9),
+            )
+        )
+        session.add(
+            AccountLedgerEntry(
+                entry_type="funding",
+                asset="BNB",
+                symbol="BTCUSDT",
+                amount=-0.2,
+                external_ref_id="cost-conversion-warning-funding",
+                occurred_at=now - timedelta(minutes=8),
+                payload={"incomeType": "FUNDING_FEE"},
+                created_at=now - timedelta(minutes=8),
+                updated_at=now - timedelta(minutes=8),
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        cost_response = client.get("/api/analytics/cost-breakdown?period=today")
+        profitability_response = client.get("/api/dashboard/profitability")
+        operator_response = client.get("/api/dashboard/operator")
+
+    assert cost_response.status_code == 200
+    assert profitability_response.status_code == 200
+    assert operator_response.status_code == 200
+    cost_payload = cost_response.json()
+    profitability_today = profitability_response.json()["cost_breakdowns"][0]
+    operator_today = operator_response.json()["market_signal"]["profitability_cost_breakdowns"][0]
+    expected_warning_codes = {
+        "fee_asset_conversion_unavailable:BNB",
+        "funding_asset_conversion_unavailable:BNB",
+    }
+
+    assert expected_warning_codes.issubset(set(cost_payload["warnings"]))
+    assert expected_warning_codes.issubset(set(cost_payload["buckets"][0]["warning_codes"]))
+    assert expected_warning_codes.issubset(set(profitability_today["warning_codes"]))
+    assert expected_warning_codes.issubset(set(operator_today["warning_codes"]))
+    assert cost_payload["summary"]["fee_usdt"] == pytest.approx(0.0, abs=1e-9)
+    assert cost_payload["summary"]["funding_usdt"] == pytest.approx(0.0, abs=1e-9)
+    assert profitability_today["fee"] == pytest.approx(cost_payload["summary"]["fee_usdt"], abs=1e-9)
+    assert profitability_today["funding"] == pytest.approx(cost_payload["summary"]["funding_usdt"], abs=1e-9)
+    assert operator_today["fee"] == pytest.approx(cost_payload["summary"]["fee_usdt"], abs=1e-9)
+    assert operator_today["funding"] == pytest.approx(cost_payload["summary"]["funding_usdt"], abs=1e-9)
+
+
+def test_profitability_window_cost_breakdown_excludes_unconverted_assets(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_window_conversion_warning.db")
+
+    with TestingSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        now = utcnow_naive()
+        settings = get_or_create_settings(session)
+        mark_sync_success(settings, scope="account", synced_at=now, stale_after_seconds=3600)
+        for execution in session.scalars(select(Execution)):
+            execution.commission_asset = "BNB"
+        for funding in session.scalars(select(AccountLedgerEntry).where(AccountLedgerEntry.entry_type == "funding")):
+            funding.asset = "BNB"
+        session.commit()
+
+    with TestClient(app) as client:
+        profitability_response = client.get("/api/dashboard/profitability")
+        operator_response = client.get("/api/dashboard/operator")
+
+    assert profitability_response.status_code == 200
+    assert operator_response.status_code == 200
+    profitability_payload = profitability_response.json()
+    operator_payload = operator_response.json()
+    window_cost = profitability_payload["windows"][0]["cost_breakdown"]
+    operator_window_cost = operator_payload["market_signal"]["performance_windows"][0]["cost_breakdown"]
+    top_cost = profitability_payload["cost_breakdowns"][0]
+    expected_warning_codes = {
+        "fee_asset_conversion_unavailable:BNB",
+        "funding_asset_conversion_unavailable:BNB",
+    }
+
+    assert expected_warning_codes.issubset(set(window_cost["warning_codes"]))
+    assert expected_warning_codes.issubset(set(operator_window_cost["warning_codes"]))
+    assert expected_warning_codes.issubset(set(top_cost["warning_codes"]))
+    assert window_cost["fee"] == pytest.approx(0.0, abs=1e-9)
+    assert window_cost["funding"] == pytest.approx(0.0, abs=1e-9)
+    assert operator_window_cost["fee"] == pytest.approx(0.0, abs=1e-9)
+    assert operator_window_cost["funding"] == pytest.approx(0.0, abs=1e-9)
+    assert window_cost["net_pnl_excluding_funding"] == pytest.approx(window_cost["realized_pnl"], abs=1e-9)
+    assert window_cost["net_pnl_including_funding"] == pytest.approx(window_cost["realized_pnl"], abs=1e-9)
 
 
 def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> None:
@@ -3676,6 +4410,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert payload["control"]["pnl_summary"]["account_snapshot_available"] is False
     assert payload["control"]["account_sync_summary"]["account_snapshot_available"] is False
     assert payload["control"]["limited_live_readiness"]["read_only"] is True
+    assert payload["control"]["service_gate_gate_clear"] is False
+    assert "open_positions" in payload["control"]["service_gate_blockers"]
+    assert payload["control"]["service_gate_root_cause_codes"] == []
     assert payload["market_signal"]["performance_windows"][0]["limited_live_readiness"]["read_only"] is True
     assert "entry_quality" in payload["market_signal"]["performance_windows"][0]
     assert payload["market_signal"]["profitability_cost_breakdowns"][0]["window_label"] == "today"
@@ -3742,6 +4479,78 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert len(payload["audit_events"]) >= 1
 
 
+def test_operator_dashboard_api_publishes_service_gate_clear_when_gate_clear(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_service_gate_clear_contract.db")
+
+    with TestingSessionLocal() as session:
+        settings = get_or_create_settings(session)
+        set_reconciliation_detail(
+            settings,
+            status="synced",
+            unresolved_submission_badge=False,
+            unresolved_submission_count=0,
+            unresolved_submission_symbols=[],
+            unresolved_submissions=[],
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["control"]["service_gate_gate_clear"] is True
+    assert payload["control"]["service_gate_blockers"] == []
+    assert payload["control"]["service_gate_root_cause_codes"] == []
+
+
+def test_operator_dashboard_compact_views_publish_service_gate_clear_when_gate_clear(
+    testclient_db_factory,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_compact_service_gate_clear_contract.db")
+
+    with TestingSessionLocal() as session:
+        settings = get_or_create_settings(session)
+        set_reconciliation_detail(
+            settings,
+            status="synced",
+            unresolved_submission_badge=False,
+            unresolved_submission_count=0,
+            unresolved_submission_symbols=[],
+            unresolved_submissions=[],
+        )
+        session.commit()
+
+    compact_views = ("home", "market", "scheduler", "decision", "risk")
+    with TestClient(app) as client:
+        responses = {
+            view: client.get(f"/api/dashboard/operator?view={view}")
+            for view in compact_views
+        }
+
+    for view, response in responses.items():
+        assert response.status_code == 200, view
+        payload = response.json()
+        assert "service_gate_gate_clear" in payload["control"], view
+        assert payload["control"]["service_gate_gate_clear"] is True, view
+        assert payload["control"]["service_gate_blockers"] == [], view
+        assert payload["control"]["service_gate_root_cause_codes"] == [], view
+
+
+def test_operator_control_state_defaults_service_gate_to_fail_closed() -> None:
+    control = OperatorControlState(
+        generated_at=utcnow_naive(),
+        operational_status=OperationalStatusPayload(),
+        mode="service_ready",
+        default_symbol="BTCUSDT",
+        default_timeframe="15m",
+    )
+
+    assert control.service_gate_gate_clear is False
+    assert control.service_gate_blockers == []
+    assert control.service_gate_root_cause_codes == []
+
+
 def test_operator_dashboard_home_exposes_readiness_reasons_without_full_profitability_payload(
     testclient_db_factory,
 ) -> None:
@@ -3766,6 +4575,64 @@ def test_operator_dashboard_home_exposes_readiness_reasons_without_full_profitab
     assert "productization_profitability_unverified" in readiness["reason_codes"]
     assert readiness["recent_candidate_events"] >= 2
     assert readiness["actual_entries"] == 1
+
+
+def test_operator_dashboard_home_exposes_no_sample_slippage_readiness_without_cost_payload(
+    testclient_db_factory,
+) -> None:
+    SeededSessionLocal = testclient_db_factory("operator_home_seeded_cache.db")
+
+    with SeededSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        seeded_response = client.get("/api/dashboard/operator?view=home")
+
+    assert seeded_response.status_code == 200
+
+    TestingSessionLocal = testclient_db_factory("operator_home_no_sample_slippage_readiness.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator?view=home")
+
+    assert response.status_code == 200
+    payload = response.json()
+    readiness = payload["control"]["limited_live_readiness"]
+
+    assert payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"]
+
+
+def test_operator_dashboard_compact_views_expose_no_sample_slippage_readiness_without_cost_payload(
+    testclient_db_factory,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_compact_no_sample_slippage_readiness.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    compact_views = ("home", "market", "scheduler", "decision", "risk")
+    with TestClient(app) as client:
+        responses = {
+            view: client.get(f"/api/dashboard/operator?view={view}")
+            for view in compact_views
+        }
+
+    for view, response in responses.items():
+        assert response.status_code == 200
+        payload = response.json()
+        readiness = payload["control"]["limited_live_readiness"]
+
+        assert payload["market_signal"]["profitability_cost_breakdowns"] == []
+        assert readiness["status"] == "not_ready"
+        assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"], view
 
 
 def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db_factory) -> None:

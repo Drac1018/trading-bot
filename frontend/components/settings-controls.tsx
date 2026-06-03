@@ -58,6 +58,7 @@ import { filterNonEntryWaitReasonCodesInContext } from "../lib/risk-reason-copy.
 import { buildSettingsEventPreviewSummary } from "../lib/settings-event-preview.js";
 import { handleOperatorApiAuthFailure, withOperatorWriteProtection } from "../lib/api";
 import { formatDisplayValue } from "../lib/ui-copy";
+import { resolveApprovalArmed } from "../lib/live-approval-state";
 
 const apiBaseUrl = "";
 const symbolOptions = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"];
@@ -125,6 +126,8 @@ export type SettingsPayload = {
   live_execution_armed_until: string | null;
   live_approval_window_minutes: number;
   live_execution_ready: boolean;
+  approval_armed?: boolean;
+  approval_expires_at?: string | null;
   trading_paused: boolean;
   guard_mode_reason_category: string | null;
   guard_mode_reason_code: string | null;
@@ -437,8 +440,8 @@ function resolveControlStatusSummary(state: SettingsPayload): ControlStatusSumma
     rollout_mode: summary?.rollout_mode ?? state.rollout_mode,
     exchange_submit_allowed: summary?.exchange_submit_allowed ?? state.exchange_submit_allowed,
     limited_live_max_notional: summary?.limited_live_max_notional ?? state.limited_live_max_notional,
-    app_live_armed: summary?.app_live_armed ?? state.live_execution_armed,
-    approval_window_open: summary?.approval_window_open ?? state.live_execution_armed,
+    app_live_armed: summary?.app_live_armed ?? resolveApprovalArmed(state),
+    approval_window_open: summary?.approval_window_open ?? resolveApprovalArmed(state),
     paused: summary?.paused ?? state.trading_paused,
     degraded: summary?.degraded ?? state.operating_state === "DEGRADED_MANAGE_ONLY",
     risk_allowed: summary?.risk_allowed ?? null,
@@ -999,6 +1002,11 @@ export function SettingsControls({
           onArm={() =>
             runPost("/api/settings/live/arm", "실거래 승인 창을 열었습니다.", "live_actions", syncSettings, {
               minutes: state.live_approval_window_minutes,
+            })
+          }
+          onArmUnlimited={() =>
+            runPost("/api/settings/live/arm", "실거래 승인 창을 무제한으로 열었습니다.", "live_actions", syncSettings, {
+              minutes: 0,
             })
           }
           onDisarm={() => runPost("/api/settings/live/disarm", "실거래 승인 창을 닫았습니다.", "live_actions", syncSettings)}

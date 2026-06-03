@@ -11,11 +11,13 @@ import {
   type SyncScopeStatus,
 } from "../lib/sync-freshness";
 import { type EventOperatorControlPayload } from "../lib/event-operator-control.js";
+import { serviceGateDetailSummary, serviceGateDisplayReasonCodes } from "../lib/operator-control";
 import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
 import {
   describeReasonCode,
   describeReasonCodeInContext,
   isEntryWaitReasonCodeInContext,
+  isReasonCode,
   lookupRiskReasonCode,
 } from "../lib/risk-reason-copy.js";
 
@@ -86,8 +88,14 @@ export type ProfitabilityCostBreakdown = {
   net_pnl: number;
   net_pnl_excluding_funding: number;
   net_pnl_including_funding: number;
-  signed_slippage_bps_avg: number;
-  adverse_slippage_bps_avg: number;
+  signed_slippage_bps_avg: number | null;
+  adverse_slippage_bps_avg: number | null;
+  slippage_data_status?: string | null;
+  slippage_data_reason?: string | null;
+  funding_sync_status?: string | null;
+  funding_sync_reason?: string | null;
+  slippage_sample_count?: number | null;
+  missing_slippage_sample_count?: number | null;
   entry_count: number;
   marketable_entry_count: number;
   passive_entry_count: number;
@@ -96,7 +104,7 @@ export type ProfitabilityCostBreakdown = {
   fee_to_gross_pnl_ratio: number | null;
   cost_to_gross_pnl_ratio: number | null;
   total_cost: number;
-  warning_codes: string[];
+  warning_codes?: string[] | null;
   basis: string;
 };
 
@@ -263,6 +271,7 @@ type OperatorDecisionSnapshot = {
     market_snapshot_at?: string | null;
     market_snapshot_id?: number | null;
   } | null;
+  hold_diagnostic?: Record<string, unknown>;
 };
 
 type OperatorRiskSnapshot = {
@@ -502,7 +511,13 @@ export type OperatorDashboardPayload = {
     account_sync_summary: Record<string, unknown>;
     exposure_summary: Record<string, unknown>;
     limited_live_readiness: LimitedLiveReadiness;
-    service_gate_blockers: string[];
+    service_gate_gate_clear?: boolean | null;
+    service_gate_blockers?: string[] | null;
+    service_gate_root_cause_codes?: string[] | null;
+    service_gate_counts?: Record<string, number> | null;
+    service_gate_recent_scheduler_non_success?: Array<Record<string, unknown>> | null;
+    service_gate_recent_health_errors?: Array<Record<string, unknown>> | null;
+    service_gate_redis_cache?: Record<string, unknown> | null;
     stale_pending_entry_plan_count: number;
     stale_pending_entry_plans: Array<Record<string, unknown>>;
     triggered_terminal_history_entry_plan_count: number;
@@ -1324,6 +1339,9 @@ function rolloutModeLabel(mode: RolloutMode) {
 
 function resolveControlStatusSummary(control: OperatorDashboardPayload["control"]): ControlStatusSummary {
   const summary = control.control_status_summary;
+  const serviceGateReasonCodes = serviceGateDisplayReasonCodes(control);
+  const currentCycleReasons = summary?.blocked_reasons_current_cycle ?? control.latest_blocked_reasons;
+  const blockedReasonCodes = summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? [];
   return {
     exchange_can_trade: summary?.exchange_can_trade ?? null,
     exchange_can_trade_known: summary?.exchange_can_trade_known ?? false,
@@ -1341,10 +1359,8 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
     paused: summary?.paused ?? control.trading_paused,
     degraded: summary?.degraded ?? control.operating_state === "DEGRADED_MANAGE_ONLY",
     risk_allowed: summary?.risk_allowed ?? null,
-    blocked_reasons_current_cycle: dedupeReasons(
-      summary?.blocked_reasons_current_cycle ?? control.latest_blocked_reasons,
-    ),
-    blocked_reason_codes: dedupeReasons(summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? []),
+    blocked_reasons_current_cycle: dedupeReasons([...serviceGateReasonCodes, ...currentCycleReasons]),
+    blocked_reason_codes: dedupeReasons([...serviceGateReasonCodes, ...blockedReasonCodes]),
     degraded_reason_codes: dedupeReasons(summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? []),
     protection_reason_codes: dedupeReasons(
       summary?.protection_reason_codes ?? control.protection_reason_codes ?? [],
@@ -1375,7 +1391,7 @@ function exchangeSyncGateCard(control: OperatorDashboardPayload["control"]) {
   const latestFailureAt = formatDateTime(diagnostics.latest_failure_at);
   const latestSuccessAt = formatDateTime(diagnostics.latest_success_at);
   const reason =
-    diagnostics.latest_failure_reason_code === "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    isReasonCode(diagnostics.latest_failure_reason_code, "EXCHANGE_AUTH_PERMISSION_REJECTED")
       ? "권한 거부"
       : diagnostics.latest_failure_reason_code ?? "실패";
 
@@ -1408,6 +1424,33 @@ function exchangeSyncGateCard(control: OperatorDashboardPayload["control"]) {
     value: "확인 중",
     hint: "exchange_sync_cycle 실행 이력 또는 sync freshness 근거가 부족합니다.",
     kind: "neutral" as const,
+  };
+}
+
+function serviceGateCard(control: OperatorDashboardPayload["control"]) {
+  const reasons = serviceGateDisplayReasonCodes(control);
+  const detail = serviceGateDetailSummary(control);
+  const reasonSuffix = reasons.length > 0 ? ` / reasons ${reasons.join(", ")}` : "";
+  const hasClearConflict = control.service_gate_gate_clear === true && reasons.length > 0;
+  return {
+    title: "service-gate",
+    value:
+      control.service_gate_gate_clear === true
+        ? hasClearConflict
+          ? "확인 필요"
+          : "정상"
+        : control.service_gate_gate_clear === false
+          ? "차단"
+          : "확인 중",
+    hint: `${detail}${reasonSuffix}`,
+    kind:
+      control.service_gate_gate_clear === false
+        ? ("danger" as const)
+        : hasClearConflict
+          ? ("warn" as const)
+          : control.service_gate_gate_clear === true
+            ? ("good" as const)
+            : ("neutral" as const),
   };
 }
 
@@ -1458,6 +1501,7 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
               : ("neutral" as const),
     },
     exchangeSyncGateCard(control),
+    serviceGateCard(control),
     {
       title: "앱 실거래 준비",
       value: summary.app_live_armed ? "준비됨" : "해제됨",

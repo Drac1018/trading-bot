@@ -12,7 +12,16 @@
 		X-Frame-Options "DENY"
 	}
 
-	reverse_proxy 127.0.0.1:3000 {
+	@backend_health path /health
+	reverse_proxy @backend_health {$BACKEND_UPSTREAM:127.0.0.1:8000} {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Operator-Client-IP {remote_host}
+	}
+
+	reverse_proxy {$OPERATOR_UPSTREAM:127.0.0.1:3000} {
 		header_up Host {host}
 		header_up X-Forwarded-Proto https
 		header_up X-Forwarded-For {remote_host}

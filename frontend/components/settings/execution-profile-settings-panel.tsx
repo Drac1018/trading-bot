@@ -134,6 +134,41 @@ const autoApplyModeOptions: Array<{
   { value: "manual_approval", label: "수동 승인" },
 ];
 
+const autoApplyModeDetails: Record<
+  ExecutionRiskProfilePolicySettings["auto_apply_mode"],
+  {
+    label: string;
+    effect: string;
+    blocks: string;
+    operatorAction: string;
+  }
+> = {
+  off: {
+    label: "자동 적용 안 함",
+    effect: "AI 추천을 최종 실행 프로파일에 반영하지 않고 기본 규칙 프로파일을 유지합니다.",
+    blocks: "AI 추천만으로 신규 진입을 막거나 풀지 않습니다. hard condition은 별도 안전 규칙으로 계속 차단됩니다.",
+    operatorAction: "AI 추천을 참고만 보고, 적용하려면 설정을 다른 모드로 저장해야 합니다.",
+  },
+  shadow: {
+    label: "관찰만",
+    effect: "기본 규칙 프로파일을 실제 적용값으로 유지하고, AI가 제안한 보수화 결과는 shadow 값으로만 기록합니다.",
+    blocks: "프로파일 이름이 STRESS/DEGRADED로 보이더라도 shadow 결과만으로 신규 진입을 차단하지 않습니다.",
+    operatorAction: "AI 추천 품질을 검수하는 단계입니다. 운영 차단 여부는 기존 리스크/승인/동기화 사유를 우선 확인합니다.",
+  },
+  conservative_only: {
+    label: "보수화만 적용",
+    effect: "AI가 기본 규칙보다 더 위험한 프로파일을 추천할 때만 최종 프로파일을 보수적으로 올립니다.",
+    blocks: "최종 적용 프로파일이 STRESS 또는 DEGRADED가 되면 신규 진입을 차단합니다. AI가 더 완화하자는 추천은 자동 적용하지 않습니다.",
+    operatorAction: "실운영에서 AI를 보수적 안전 보조장치로 쓰는 모드입니다. 완화는 연속 확인/유지 시간 조건을 통과해야 합니다.",
+  },
+  manual_approval: {
+    label: "수동 승인",
+    effect: "AI가 더 위험한 프로파일을 추천하면 자동으로 올리지 않고 수동 승인 필요 상태로 기록합니다.",
+    blocks: "기본 규칙 또는 유지 중인 최종 프로파일이 STRESS/DEGRADED이면 신규 진입을 차단합니다. AI 완화 추천은 계속 차단됩니다.",
+    operatorAction: "AI 추천을 사람 검토 신호로만 쓰고, 적용 전 운영자가 판단해야 하는 보수적 모드입니다.",
+  },
+};
+
 export function executionRiskProfilePolicyFromSettings(
   settings?: ExecutionRiskProfileSettings | null,
 ): ExecutionRiskProfilePolicySettings {
@@ -215,11 +250,17 @@ const recommendationStatusLabels: Record<string, string> = {
 };
 
 const selectedReasonLabels: Record<string, string> = {
+  deterministic_profile_selected: "기본 규칙 선택",
+  hard_condition: "하드 조건 우선",
   ai_tightened_conservative_only: "AI 보수화 적용",
   ai_relaxation_blocked: "AI 완화 차단",
+  ai_recommendation_ignored: "AI 추천 무시",
+  manual_approval_required: "수동 승인 필요",
+  off: "자동 적용 안 함",
   deterministic_fallback: "기본 규칙 유지",
   no_ai_recommendation: "AI 추천 없음",
   profile_relaxation_blocked: "프로파일 완화 차단",
+  profile_relaxed_after_confirmations: "완화 조건 통과",
   shadow_no_auto_apply: "관찰 모드",
 };
 
@@ -288,6 +329,31 @@ function profileTone(profile: ExecutionRiskProfileDefinition) {
     return "neutral" as const;
   }
   return "good" as const;
+}
+
+function AutoApplyModeGuide({ mode }: { mode: ExecutionRiskProfilePolicySettings["auto_apply_mode"] }) {
+  const selected = autoApplyModeDetails[mode];
+  return (
+    <details className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-3 lg:col-span-2">
+      <summary className="cursor-pointer list-none text-sm font-semibold text-slate-900">
+        자동 적용 모드 설명: {selected.label}
+      </summary>
+      <div className="mt-3 grid gap-3 text-sm leading-6 text-slate-700 md:grid-cols-2">
+        <div className="rounded-md bg-white px-4 py-3">
+          <p className="text-xs font-semibold text-slate-500">현재 선택 모드</p>
+          <p className="mt-2 font-medium text-slate-900">{selected.effect}</p>
+        </div>
+        <div className="rounded-md bg-white px-4 py-3">
+          <p className="text-xs font-semibold text-slate-500">신규 진입 차단 기준</p>
+          <p className="mt-2 font-medium text-slate-900">{selected.blocks}</p>
+        </div>
+        <div className="rounded-md bg-white px-4 py-3 md:col-span-2">
+          <p className="text-xs font-semibold text-slate-500">운영자가 봐야 할 점</p>
+          <p className="mt-2 font-medium text-slate-900">{selected.operatorAction}</p>
+        </div>
+      </div>
+    </details>
+  );
 }
 
 export function ExecutionProfileSettingsPanel({
@@ -404,6 +470,7 @@ export function ExecutionProfileSettingsPanel({
             ))}
           </select>
         </Field>
+        <AutoApplyModeGuide mode={form.auto_apply_mode} />
         <Field label="일반 검토 주기(분)">
           <input
             className={inputClass}

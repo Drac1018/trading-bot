@@ -16,11 +16,24 @@ import {
   describeReasonCodeInContext,
   isEntryWaitReasonCodeInContext,
   isOperationalControlReasonCode,
+  isReasonCode,
   lookupRiskReasonCode,
 } from "../lib/risk-reason-copy.js";
 import { buildExecutionRiskProfileSummary } from "../lib/execution-risk-profile-summary";
+import { serviceGateDisplayReasonCodes } from "../lib/operator-control";
 import { normalizeSyncScopeStatus } from "../lib/sync-freshness";
 import { handleOperatorApiAuthFailure, postJson, withOperatorWriteProtection } from "../lib/api";
+import {
+  profitabilityCostWarningLabel as profitabilityWarningLabel,
+  profitabilityCostHasNoDataStatus,
+  formatProfitabilityCostSlippageBps,
+  profitabilityPublicationStatusLabel,
+  profitabilityPublicationTone,
+  profitabilityPublicationWarningCodes,
+  profitabilityReadinessStatusLabel,
+  profitabilityReadinessTone,
+  slippageDataQualityLabel,
+} from "../lib/cost-breakdown";
 
 type Tone = "safe" | "warn" | "danger" | "neutral" | "info";
 type AuditEvent = OperatorDashboardPayload["audit_events"][number];
@@ -79,6 +92,9 @@ function unique(values: string[]) {
 function translateReasonCode(value: string | null | undefined) {
   if (!value) {
     return "추가 사유 없음";
+  }
+  if (value.startsWith("slippage_data_status:")) {
+    return profitabilityWarningLabel(value);
   }
   const copy = describeReasonCode(value);
   return copy.known ? copy.title_ko : lookupRiskReasonCode(value) ?? reasonFallbackMap[value] ?? value;
@@ -168,7 +184,15 @@ function currentControlBlockers(control: OperatorDashboardPayload["control"]) {
   const degraded = control.control_status_summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? [];
   const protection = control.control_status_summary?.protection_reason_codes ?? control.protection_reason_codes ?? [];
   const approvalControl = control.control_status_summary?.approval_control_blocked_reasons ?? [];
-  return unique([...explicitBlockers, ...currentCycle, ...degraded, ...protection, ...approvalControl]);
+  const serviceGateReasons = serviceGateDisplayReasonCodes(control);
+  return unique([
+    ...serviceGateReasons,
+    ...explicitBlockers,
+    ...currentCycle,
+    ...degraded,
+    ...protection,
+    ...approvalControl,
+  ]);
 }
 
 function hasActiveSyncProblem(control: OperatorDashboardPayload["control"]) {
@@ -438,7 +462,7 @@ function exchangeSyncPresentation(control: OperatorDashboardPayload["control"]) 
   const latestFailureAt = formatDateTime(diagnostics.latest_failure_at);
   const latestSuccessAt = formatDateTime(diagnostics.latest_success_at);
   const reason =
-    diagnostics.latest_failure_reason_code === "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    isReasonCode(diagnostics.latest_failure_reason_code, "EXCHANGE_AUTH_PERMISSION_REJECTED")
       ? "권한 거부"
       : diagnostics.latest_failure_reason_code ?? "실패";
 
@@ -720,14 +744,6 @@ function exposureCards(operator: OperatorDashboardPayload) {
   ];
 }
 
-const profitabilityWarningCopy: Record<string, string> = {
-  fee_exceeds_gross_pnl: "수수료가 총손익보다 큽니다.",
-  cost_exceeds_gross_pnl: "수수료와 펀딩비가 총손익보다 큽니다.",
-  positive_gross_negative_net: "총손익은 양수지만 비용 반영 후 순손익은 음수입니다.",
-  adverse_slippage_positive: "평균 체결 슬리피지가 거래자에게 불리하게 누적되고 있습니다.",
-  high_marketable_ratio_low_net_pnl: "즉시체결형 진입 비중이 높고 순손익이 낮습니다.",
-};
-
 function costWindowLabel(value: string | null | undefined) {
   const labels: Record<string, string> = {
     today: "오늘",
@@ -765,47 +781,12 @@ function primaryEntryQuality(operator: OperatorDashboardPayload): EntryQualityBr
     .filter((item): item is EntryQualityBreakdown => Boolean(item));
 }
 
-function profitabilityTone(cost: ProfitabilityCostBreakdown | null): Tone {
-  if (!cost || cost.status === "no_data") {
-    return "neutral";
-  }
-  if (cost.warning_codes.includes("positive_gross_negative_net") || cost.net_pnl < 0) {
-    return "danger";
-  }
-  return cost.warning_codes.length > 0 ? "warn" : "safe";
-}
-
 function readinessTone(readiness: LimitedLiveReadiness | null | undefined): Tone {
-  if (!readiness) {
-    return "neutral";
-  }
-  if (readiness.status === "blocked" || readiness.status === "not_ready") {
-    return "danger";
-  }
-  if (readiness.status === "limited_live_candidate" || readiness.status === "scale_up_candidate") {
-    return "safe";
-  }
-  return "warn";
+  return profitabilityReadinessTone(readiness);
 }
 
 function readinessLabel(readiness: LimitedLiveReadiness | null | undefined) {
-  if (!readiness) {
-    return "준비도 미확인";
-  }
-  if (
-    readiness.status === "not_ready" &&
-    readiness.reason_codes.includes("productization_profitability_unverified")
-  ) {
-    return "제품화 수익성 검증 부족";
-  }
-  const labels: Record<string, string> = {
-    not_ready: "제품화 준비 미달",
-    watch: "제품화 관찰 필요",
-    limited_live_candidate: "제한 실주문 후보",
-    scale_up_candidate: "확대 후보",
-    blocked: "제품화 차단",
-  };
-  return labels[readiness.status] ?? readiness.status;
+  return profitabilityReadinessStatusLabel(readiness);
 }
 
 function formatBps(value: number | null | undefined) {
@@ -813,6 +794,10 @@ function formatBps(value: number | null | undefined) {
     return "-";
   }
   return `${formatNumber(value, 2)} bps`;
+}
+
+function formatCostSlippageBps(value: number | null | undefined, status: string | null | undefined) {
+  return formatProfitabilityCostSlippageBps(value, { slippage_data_status: status });
 }
 
 function toneClass(tone: Tone) {
@@ -923,17 +908,15 @@ function ProfitabilityCostPanel({
   entryQuality: EntryQualityBreakdown[];
   limitedLiveReadiness: LimitedLiveReadiness | null | undefined;
 }) {
-  const tone = profitabilityTone(cost);
   const readiness = limitedLiveReadiness;
+  const tone = profitabilityPublicationTone(cost, readiness);
   const readinessStatusTone = readinessTone(readiness);
   const lacksRealizedProfitabilityEvidence = readiness ? readiness.actual_entries === 0 || readiness.fills === 0 : false;
   const readinessReasonLabels = readiness?.reason_codes.map(translateReasonCode) ?? [];
-  const warningLabels = cost?.warning_codes.map((code) => profitabilityWarningCopy[code] ?? code) ?? [];
-  const statusLabel = !cost || cost.status === "no_data"
-    ? "데이터 없음"
-    : warningLabels.length > 0
-      ? "비용 경고"
-      : "정상";
+  const warningLabels = profitabilityPublicationWarningCodes(cost, readiness).map(profitabilityWarningLabel);
+  const slippageStatus = cost?.slippage_data_status ?? "UNKNOWN";
+  const slippageStatusHint = cost ? slippageDataQualityLabel(cost) : "슬리피지 데이터 상태 확인 필요";
+  const statusLabel = profitabilityPublicationStatusLabel(cost, readiness);
   const visibleBreakdowns = breakdowns.length > 0 ? breakdowns : cost ? [cost] : [];
   const visibleEntryQuality = entryQuality.filter((item) => item.trade_count > 0);
 
@@ -982,14 +965,18 @@ function ProfitabilityCostPanel({
         <>
           <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {[
-              ["기간", costWindowLabel(cost.window_label), cost.status === "no_data" ? "집계 데이터 없음" : "비용 확인 기준"],
+              [
+                "기간",
+                costWindowLabel(cost.window_label),
+                profitabilityCostHasNoDataStatus(cost.status) ? "집계 데이터 없음" : "비용 확인 기준",
+              ],
               ["순손익", formatMoney(cost.net_pnl, 2), `펀딩비 포함 ${formatMoney(cost.net_pnl_including_funding, 2)}`],
               ["총손익", formatMoney(cost.gross_pnl, 2), `실현 손익 ${formatMoney(cost.realized_pnl, 2)}`],
               ["수수료", formatMoney(cost.fee, 2), `총손익 대비 ${formatPct(cost.fee_to_gross_pnl_ratio)}`],
               ["펀딩비", formatMoney(cost.funding, 2), "양수는 수취, 음수는 비용"],
               ["총 비용", formatMoney(cost.total_cost, 2), `총손익 대비 ${formatPct(cost.cost_to_gross_pnl_ratio)}`],
-              ["평균 슬리피지", formatBps(cost.signed_slippage_bps_avg), "양수는 불리한 평균 체결"],
-              ["불리한 슬리피지", formatBps(cost.adverse_slippage_bps_avg), "불리한 방향만 누적한 평균"],
+              ["평균 슬리피지", formatCostSlippageBps(cost.signed_slippage_bps_avg, slippageStatus), slippageStatusHint],
+              ["불리한 슬리피지", formatCostSlippageBps(cost.adverse_slippage_bps_avg, slippageStatus), slippageStatusHint],
             ].map(([label, value, hint]) => (
               <div key={label} className="rounded-md border border-slate-100 bg-slate-50 p-4">
                 <p className="text-sm text-slate-500">{label}</p>
@@ -1097,6 +1084,13 @@ function ProfitabilityCostPanel({
         </>
       ) : (
         <div className="mt-5 rounded-md border border-dashed border-slate-200 bg-slate-50 p-5 text-sm text-slate-500">
+          {warningLabels.length > 0 ? (
+            <ul className={`mb-3 space-y-2 rounded-md border p-3 ${toneClass(tone)}`}>
+              {warningLabels.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
           아직 비용 분해에 사용할 거래 데이터가 없습니다.
         </div>
       )}

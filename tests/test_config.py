@@ -166,7 +166,12 @@ def test_https_proxy_script_uses_caddy_loopback_frontend() -> None:
     assert "infra\\caddy\\operator.Caddyfile" in script
     assert "TradingMvpHttpsProxy" in installer
     assert "run_https_proxy.ps1" in installer
-    assert "reverse_proxy 127.0.0.1:3000" in caddyfile
+    assert "@backend_health path /health" in caddyfile
+    assert "reverse_proxy @backend_health {$BACKEND_UPSTREAM:127.0.0.1:8000}" in caddyfile
+    assert caddyfile.index("@backend_health path /health") < caddyfile.index(
+        "reverse_proxy {$OPERATOR_UPSTREAM:127.0.0.1:3000}"
+    )
+    assert "reverse_proxy {$OPERATOR_UPSTREAM:127.0.0.1:3000}" in caddyfile
     assert "X-Forwarded-Proto https" in caddyfile
     assert "X-Forwarded-For {remote_host}" in caddyfile
     assert "X-Operator-Client-IP {remote_host}" in caddyfile
@@ -223,6 +228,7 @@ def test_operator_forwarded_headers_require_trusted_proxy_secret() -> None:
     next_proxy = (PROJECT_ROOT / "frontend" / "app" / "api" / "[...path]" / "route.ts").read_text(encoding="utf-8")
     trusted_proxy = (PROJECT_ROOT / "frontend" / "lib" / "operator-trusted-proxy.ts").read_text(encoding="utf-8")
     csrf = (PROJECT_ROOT / "frontend" / "lib" / "operator-csrf.ts").read_text(encoding="utf-8")
+    api_client = (PROJECT_ROOT / "frontend" / "lib" / "api.ts").read_text(encoding="utf-8")
     playwright_config = (PROJECT_ROOT / "frontend" / "playwright.config.ts").read_text(encoding="utf-8")
     service = (PROJECT_ROOT / "scripts" / "run_frontend_service.ps1").read_text(encoding="utf-8")
     productization = (PROJECT_ROOT / "scripts" / "run_productization_services.ps1").read_text(encoding="utf-8")
@@ -236,7 +242,11 @@ def test_operator_forwarded_headers_require_trusted_proxy_secret() -> None:
     assert "requestHasTrustedProxySecret" in trusted_proxy
     assert "trustOperatorForwardedHeaders(request.headers) && forwardedProtoIsHttps(request)" in proxy
     assert "if (!trustOperatorForwardedHeaders(request.headers))" in next_proxy
+    assert 'headers.get("sec-fetch-site")' in next_proxy
+    assert '=== "same-origin"' in next_proxy
     assert "!safeEqual(submittedToken, operatorCsrfToken())" in next_proxy
+    assert 'credentials: init.credentials ?? "same-origin"' in api_client
+    assert 'referrerPolicy: init.referrerPolicy ?? "same-origin"' in api_client
     assert "process.env.FRONTEND_AUTH_SECRET" in csrf
     assert "process.env.OPERATOR_AUTH_TOKEN" in csrf
     assert "process.env.OPERATOR_API_KEY" not in csrf

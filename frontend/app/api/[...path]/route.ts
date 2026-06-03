@@ -166,9 +166,13 @@ function sameOriginWriteRequest(request: Request): boolean {
   }
 }
 
+function sameOriginFetchMetadata(request: Request): boolean {
+  return request.headers.get("sec-fetch-site")?.trim().toLowerCase() === "same-origin";
+}
+
 function validateUnsafeOperatorRequest(request: Request): Response | null {
-  if (!sameOriginWriteRequest(request)) {
-    return forbidden("Operator write requests require same-origin Origin or Referer.");
+  if (!sameOriginWriteRequest(request) && !sameOriginFetchMetadata(request)) {
+    return forbidden("Operator write requests require same-origin Origin, Referer, or Fetch Metadata.");
   }
   if (!operatorCsrfConfigured()) {
     return Response.json(

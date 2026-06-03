@@ -187,6 +187,7 @@ _binance_account_cache_refresh_guard = threading.Lock()
 _operator_home_cache_guard = threading.Lock()
 _operator_rate_limit_guard = threading.Lock()
 _operator_home_cache_started = 0.0
+_operator_home_cache_key: str | None = None
 _operator_home_cache_payload: dict[str, object] | None = None
 _operator_rate_limit_buckets: dict[str, list[float]] = {}
 _exchange_sync_read_refresh_inflight = False
@@ -475,19 +476,27 @@ def require_operator_write_intent(expected_intent: str) -> Callable[..., None]:
     return dependency
 
 
+def _operator_home_db_identity(db: Session) -> str:
+    bind = db.get_bind()
+    return str(bind.url) if bind is not None else "unknown"
+
+
 def _get_operator_home_dashboard_payload(db: Session) -> dict[str, object]:
-    global _operator_home_cache_payload, _operator_home_cache_started
+    global _operator_home_cache_key, _operator_home_cache_payload, _operator_home_cache_started
 
     now = monotonic()
+    cache_key = _operator_home_db_identity(db)
     with _operator_home_cache_guard:
         if (
             _operator_home_cache_payload is not None
+            and _operator_home_cache_key == cache_key
             and now - _operator_home_cache_started <= OPERATOR_HOME_CACHE_TTL_SECONDS
         ):
             return dict(_operator_home_cache_payload)
 
     payload = get_operator_dashboard(db, view="home").model_dump(mode="json")
     with _operator_home_cache_guard:
+        _operator_home_cache_key = cache_key
         _operator_home_cache_started = monotonic()
         _operator_home_cache_payload = dict(payload)
     return payload
@@ -1177,10 +1186,12 @@ def runtime_service_gate(
     recent_minutes: int = 30,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    return build_service_switch_gate_snapshot(
+    snapshot = build_service_switch_gate_snapshot(
         db,
         recent_minutes=_bounded_limit(recent_minutes, default=30, maximum=180),
     )
+    snapshot.setdefault("root_cause_codes", [])
+    return snapshot
 
 
 @app.post("/api/system/seed")

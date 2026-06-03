@@ -8,10 +8,17 @@ import {
   type ReasonCodeCategory,
 } from "../../lib/risk-reason-copy.js";
 import { formatDisplayValue } from "../../lib/ui-copy";
+import {
+  resolveApprovalArmed,
+  resolveApprovalExpiresAt,
+  resolveUnlimitedApproval,
+} from "../../lib/live-approval-state";
 import { type AutoResumeAttemptResult, type ControlStatusSummary, type LiveSyncResult, type RolloutMode } from "./types";
 
 type LiveControlState = {
   trading_paused: boolean;
+  approval_armed?: boolean | null;
+  approval_expires_at?: string | null;
   live_execution_armed: boolean;
   live_execution_ready: boolean;
   exchange_submit_allowed: boolean;
@@ -59,6 +66,20 @@ function rolloutModeLabel(mode: RolloutMode) {
 function formatCodeList(values: string[] | null | undefined, empty = "-") {
   if (!values || values.length === 0) return empty;
   return values.map((item) => reasonCodeTitleInContext(item, values)).join(", ");
+}
+
+function approvalWindowLabel(minutes: number) {
+  return minutes === 0 ? "무제한" : `${minutes}분`;
+}
+
+function approvalStateText(state: LiveControlState) {
+  const approvalArmed = resolveApprovalArmed(state);
+  const approvalExpiresAt = resolveApprovalExpiresAt(state);
+  if (!approvalArmed) return "닫힘";
+  if (approvalExpiresAt) {
+    return `열림 (${formatDisplayValue(approvalExpiresAt, "live_execution_armed_until")})`;
+  }
+  return resolveUnlimitedApproval(state) ? "무제한 승인" : "열림";
 }
 
 function autoResumeAttemptText(result: AutoResumeAttemptResult) {
@@ -159,6 +180,7 @@ function ControlStatusPanel({
   summary: ControlStatusSummary;
 }) {
   const currentCycleBlockedReasons = summary.blocked_reasons_current_cycle;
+  const approvalExpiresAt = resolveApprovalExpiresAt(state);
   const approvalBlockedReasons = summary.approval_control_blocked_reasons ?? [];
   const approvalReasonContext = [...approvalBlockedReasons, ...currentCycleBlockedReasons, ...(summary.blocked_reason_codes ?? [])];
   const hardApprovalBlockedReasons = approvalBlockedReasons.filter(
@@ -202,9 +224,11 @@ function ControlStatusPanel({
       label: "실거래 승인 창",
       value: summary.approval_window_open ? "열림" : "닫힘",
       detail: summary.approval_window_open
-        ? state.live_execution_armed_until
-          ? `만료 ${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")}`
-          : "실거래 승인 창이 현재 유효합니다."
+        ? approvalExpiresAt
+          ? `만료 ${formatDisplayValue(approvalExpiresAt, "live_execution_armed_until")}`
+          : resolveUnlimitedApproval(state)
+            ? "무제한 승인 상태입니다."
+            : "실거래 승인 창이 현재 유효합니다."
         : "신규 진입 전 실거래 승인 창을 다시 열어야 합니다.",
       tone: summary.approval_window_open ? ("good" as const) : ("warn" as const),
     },
@@ -443,6 +467,7 @@ export function LiveControlPanel({
   onResume,
   onAttemptResume,
   onArm,
+  onArmUnlimited,
   onDisarm,
   onSync,
   onFieldChange,
@@ -460,11 +485,14 @@ export function LiveControlPanel({
   onResume: () => void;
   onAttemptResume: () => void;
   onArm: () => void;
+  onArmUnlimited: () => void;
   onDisarm: () => void;
   onSync: () => void;
   onFieldChange: (field: keyof LiveControlForm, value: LiveControlForm[keyof LiveControlForm]) => void;
 }) {
   const systemPause = state.trading_paused && state.pause_origin !== "manual";
+  const approvalArmed = resolveApprovalArmed(state);
+  const approvalExpiresAt = resolveApprovalExpiresAt(state);
   return (
     <section className="rounded-lg border border-slate-200 bg-slate-50 p-4 sm:p-5">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
@@ -479,8 +507,14 @@ export function LiveControlPanel({
           <StatusPill tone={state.trading_paused ? "danger" : "good"}>
             {state.trading_paused ? "운영 중지" : "운영 중"}
           </StatusPill>
-          <StatusPill tone={state.live_execution_armed ? "good" : "warn"}>
-            {state.live_execution_armed ? "승인 창 열림" : "승인 창 닫힘"}
+          <StatusPill tone={approvalArmed ? "good" : "warn"}>
+            {approvalArmed
+              ? approvalExpiresAt
+                ? "승인 창 열림"
+                : resolveUnlimitedApproval(state)
+                  ? "무제한 승인"
+                  : "승인 창 열림"
+              : "승인 창 닫힘"}
           </StatusPill>
           <StatusPill tone={state.live_execution_ready ? "good" : "warn"}>
             {state.live_execution_ready ? "실거래 경로 준비" : "실거래 경로 제한"}
@@ -542,6 +576,14 @@ export function LiveControlPanel({
                 >
                   승인 열기
                 </button>
+                <button
+                  className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+                  disabled={liveArmBlocked}
+                  onClick={onArmUnlimited}
+                  type="button"
+                >
+                  무제한 승인
+                </button>
                 <button className="rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700" onClick={onDisarm} type="button">
                   승인 닫기
                 </button>
@@ -555,7 +597,7 @@ export function LiveControlPanel({
             </div>
           </div>
           <p className="mt-3 text-xs leading-5 text-slate-500">
-            실거래 승인 시간: 저장값 {state.live_approval_window_minutes}분 / 동기화 심볼: 저장값 {state.default_symbol}
+            실거래 승인 시간: 저장값 {approvalWindowLabel(state.live_approval_window_minutes)} / 동기화 심볼: 저장값 {state.default_symbol}
             {actionsUseSavedSettings ? " / 현재 입력값과 저장값이 다르면 저장 후 다시 실행하세요." : ""}
           </p>
           <div className="mt-3">
@@ -603,6 +645,7 @@ export function LiveControlPanel({
                 value={form.live_approval_window_minutes}
                 onChange={(event) => onFieldChange("live_approval_window_minutes", Number(event.target.value))}
               />
+              <p className="mt-2 text-xs leading-5 text-slate-500">0은 무제한 승인으로 저장됩니다.</p>
             </Field>
             <Field label="제한 실거래 주문당 최대 금액">
               <input
@@ -623,9 +666,7 @@ export function LiveControlPanel({
             <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
               <p className="text-xs text-slate-500">승인 창 상태</p>
               <p className="mt-2 text-sm font-semibold text-slate-900">
-                {state.live_execution_armed
-                  ? `열림 (${formatDisplayValue(state.live_execution_armed_until, "live_execution_armed_until")})`
-                  : "닫힘"}
+                {approvalStateText(state)}
               </p>
             </div>
           </div>

@@ -53,6 +53,14 @@ Cost breakdown no-sample publication runbook:
 - Do not fix this by inserting fake executions, editing production DB rows, loosening approval or risk gates, creating live orders, changing `.env`, or marking profitability ready without real evidence.
 - Done condition: the live endpoint reflects `NO_SAMPLE` for empty windows, productization remains blocked until profitability/slippage readiness has sufficient real evidence, and no live-entry safety flag was relaxed.
 
+Funding sync stale cost-readiness runbook:
+
+- Treat `funding_sync_status=STALE` from `/api/analytics/cost-breakdown` as cost data-quality evidence, not as a backend code fix by default. It can coexist with `slippage_data_status=UNKNOWN` and keeps productization evidence incomplete until refreshed or explicitly accepted as a blocked observation.
+- Accepted read-only proof: capture `data_quality.funding_sync_status`, warning codes, cost summary fields, `/api/dashboard/profitability` readiness, and the no-entry flags from `/api/settings`, `/api/runtime/service-gate`, and `/api/dashboard/operator`.
+- Operator action required: refresh funding data through the approved non-destructive operational path or record why the observation window is blocked. Keep profitability/slippage readiness separate from exchange-auth and live-entry gate status.
+- Do not fix this by editing funding rows, deleting warnings, backfilling synthetic costs, creating live orders, changing `.env`, loosening approval/risk gates, or marking profitability ready from incomplete data.
+- Done condition: funding sync status is `COMPLETE` or the stale funding evidence is explicitly recorded as a productization blocker, unresolved slippage/readiness blockers remain visible, and no live-entry safety flag was relaxed.
+
 AI usage cost-readiness runbook:
 
 - Treat `/api/settings/ai-usage` as cost observability, not as a release gate override. A quiet 24h window does not prove profitability readiness when 7d usage, monthly projected cost, service-gate blockers, or profitability readiness still contradict release.
@@ -68,3 +76,35 @@ Runtime proof timestamp freshness runbook:
 - Operator action required: refresh the full read-only GET set before productization decisions, handoffs, or blocker closure. If endpoint timestamps disagree or look stale, keep the blocker open and classify the gap as runtime-publication or evidence-freshness until a controlled refresh proves otherwise.
 - Do not fix this by editing timestamps, deleting older evidence, restarting services only to hide stale data, weakening readiness gates, or using a green `/health` response as a substitute for endpoint-specific freshness.
 - Done condition: the current evidence block includes collection time plus endpoint timestamps, unresolved blockers remain explicit, and no live-entry safety flag was relaxed.
+
+Enabled flag versus readiness runbook:
+
+- Treat `live_trading_enabled=true`, `exchange_submit_allowed=true`, or `rollout_mode=full_live` as configuration posture only. They are not productization-ready proof when service-gate blockers, pause state, approval state, profitability readiness, or slippage quality still block entry.
+- Accepted read-only proof: capture those enabled flags together with `/api/settings.can_enter_new_position`, `live_execution_ready`, `approval_armed`, `trading_paused`, `guard_mode_reason_code`, `/api/runtime/service-gate.gate_clear`, `/api/dashboard/operator.control`, profitability readiness, and cost-breakdown data-quality status.
+- Operator action required: report the contradiction explicitly, for example "live-capable configuration is present, but runtime entry remains fail-closed." Keep release blocked until all normal readiness gates clear through approved operational flow.
+- Do not fix this by changing enabled defaults, arming approval, unpausing trading, editing `.env`, suppressing guard reasons, restarting services to hide blockers, or treating `full_live` as sufficient evidence.
+- Done condition: productization reports distinguish configuration posture from runtime readiness, unresolved blockers stay visible, and no live-entry safety flag was relaxed.
+
+Service-gate count field contract runbook:
+
+- Treat `/api/runtime/service-gate.counts` field names as an exact read-only contract. For submission safety, use `unresolved_submission_count`; do not invent adjacent aliases such as `unresolved_exchange_submissions` when summarizing proof.
+- Accepted read-only proof: record the raw `counts` keys used for publication decisions, including `open_positions`, `active_orders`, `active_pending_entry_plans`, `armed_pending_entry_plans`, `unresolved_submission_count`, `recent_scheduler_non_success`, `recent_health_errors`, `for_update_lock_waits`, and `redis_cache_unavailable`.
+- Operator action required: if a report script projects an expected count as `null` or missing, classify it as an evidence parsing gap and refresh the raw service-gate payload before claiming the count is zero.
+- Do not fix this by renaming runtime fields in reports, treating `null` as safe, clearing submission guards, suppressing service-gate blockers, or changing execution/order behavior.
+- Done condition: productization reports use the exact service-gate count names, missing fields remain visible as evidence gaps, and no live-entry safety flag was relaxed.
+
+Service-gate capped recent-row sample runbook:
+
+- Treat `recent_scheduler_non_success=20` or `recent_health_errors=20` as a capped recent-row sample from `/api/runtime/service-gate`, not proof that exactly 20 failures exist in the runtime window.
+- Accepted read-only proof: record the collection timestamp, whether the default service-gate window was used or a non-default `recent_minutes` query value was supplied, blocker names, count fields, and a sanitized detail sample that identifies the blocker family without printing secrets.
+- Operator action required: if either recent count is at the cap, report it as "20 visible recent rows" or "at least the displayed cap" and use detail samples for root-cause classification. Do not claim total failure volume without a separate approved read-only DB/reporting query.
+- Do not fix this by increasing service-gate limits in production, deleting scheduler or health rows, suppressing blockers, restarting services to hide the window, editing `.env`, or weakening publication checks.
+- Done condition: productization reports distinguish capped displayed samples from exact totals, unresolved blockers stay visible, and no live-entry safety flag was relaxed.
+
+Cost-breakdown data-quality warning runbook:
+
+- Treat each `/api/analytics/cost-breakdown` data-quality warning as a separate evidence gap. `funding_sync_status:STALE` is a funding-data freshness blocker, while `slippage_data_status:UNKNOWN` is a slippage/runtime-publication blocker; neither should be collapsed into a generic analytics warning or used to mark profitability ready.
+- Accepted read-only proof: capture `data_quality.funding_sync_status`, `data_quality.slippage_data_status`, the `warnings` list, `/api/dashboard/profitability.limited_live_readiness`, `/api/settings` no-entry flags, and `/api/runtime/service-gate` blockers in the same timestamped evidence block.
+- Operator action required: route stale funding data through the controlled funding sync or publication path, and route slippage `UNKNOWN` through the controlled `NO_SAMPLE` publication proof path. Keep the two blockers separate in reports.
+- Do not fix this by editing analytics rows, inserting fake fills or funding samples, creating live orders, suppressing warning strings, weakening profitability readiness, restarting services to hide stale data, or changing `.env`.
+- Done condition: data-quality warnings are individually classified, profitability remains blocked until real evidence is sufficient, and no live-entry safety flag was relaxed.

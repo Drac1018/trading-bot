@@ -930,23 +930,62 @@ def _entry_order_style(order_row: Order) -> str:
     return "unknown"
 
 
+def _analytics_today_start_utc_naive(now: datetime) -> datetime:
+    reference_utc = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    local_now = reference_utc.astimezone(_analytics_cost_timezone())
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_start.astimezone(UTC).replace(tzinfo=None)
+
+
 def _profitability_window_since(window_label: str, window_hours: int | None, now: datetime) -> datetime | None:
     if window_label == "today":
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return _analytics_today_start_utc_naive(now)
     if window_hours is not None:
         return now - timedelta(hours=window_hours)
     return None
 
 
 def _funding_total_for_window(session: Session, since: datetime | None, until: datetime | None = None) -> float:
-    statement = select(func.coalesce(func.sum(AccountLedgerEntry.amount), 0.0)).where(
+    total, _warnings = _funding_total_and_conversion_warnings_for_window(session, since, until)
+    return total
+
+
+def _execution_fee_total_and_conversion_warnings(
+    execution_rows: Sequence[tuple[Execution, Order]],
+) -> tuple[float, list[str]]:
+    fee = 0.0
+    skipped_fee_assets: set[str] = set()
+    for execution_row, _order_row in execution_rows:
+        asset = _execution_commission_asset(execution_row)
+        if asset != "USDT":
+            skipped_fee_assets.add(asset)
+            continue
+        fee += abs(_as_float(execution_row.fee_paid, default=0.0))
+    return fee, [f"fee_asset_conversion_unavailable:{asset}" for asset in sorted(skipped_fee_assets)]
+
+
+def _funding_total_and_conversion_warnings_for_window(
+    session: Session,
+    since: datetime | None,
+    until: datetime | None = None,
+) -> tuple[float, list[str]]:
+    statement = select(AccountLedgerEntry).where(
         AccountLedgerEntry.entry_type == "funding"
     )
     if since is not None:
         statement = statement.where(AccountLedgerEntry.occurred_at >= since)
     if until is not None:
         statement = statement.where(AccountLedgerEntry.occurred_at < until)
-    return _as_float(session.scalar(statement), default=0.0)
+    statement = statement.order_by(AccountLedgerEntry.occurred_at.asc(), AccountLedgerEntry.id.asc())
+    funding = 0.0
+    skipped_funding_assets: set[str] = set()
+    for funding_row in session.scalars(statement):
+        asset = str(funding_row.asset or "USDT").upper()
+        if asset != "USDT":
+            skipped_funding_assets.add(asset)
+            continue
+        funding += _as_float(funding_row.amount, default=0.0)
+    return funding, [f"funding_asset_conversion_unavailable:{asset}" for asset in sorted(skipped_funding_assets)]
 
 
 def _build_profitability_cost_breakdown(
@@ -983,40 +1022,46 @@ def _build_profitability_cost_breakdown(
         execution_statement = execution_statement.where(Execution.created_at >= since)
     if until is not None:
         execution_statement = execution_statement.where(Execution.created_at < until)
-    execution_rows = list(session.execute(execution_statement))
+    execution_rows = [(execution_row, order_row) for execution_row, order_row in session.execute(execution_statement)]
+    fee_from_ledger, fee_conversion_warning_codes = _execution_fee_total_and_conversion_warnings(execution_rows)
+    funding_from_ledger, funding_conversion_warning_codes = _funding_total_and_conversion_warnings_for_window(
+        session,
+        since,
+        until,
+    )
 
-    signed_weighted_sum = 0.0
-    adverse_weighted_sum = 0.0
-    signed_weight = 0.0
-    for execution_row, order_row in execution_rows:
-        signed_bps = _execution_signed_slippage_bps(execution_row, order_row)
-        if signed_bps is None:
-            continue
-        weight = abs(_as_float(execution_row.fill_quantity, default=0.0)) or 1.0
-        signed_weighted_sum += signed_bps * weight
-        adverse_weighted_sum += max(signed_bps, 0.0) * weight
-        signed_weight += weight
-
-    signed_slippage_bps_avg = signed_weighted_sum / signed_weight if signed_weight > 0 else 0.0
-    adverse_slippage_bps_avg = adverse_weighted_sum / signed_weight if signed_weight > 0 else 0.0
+    signed_slippage_bps, adverse_slippage_bps, slippage_data_status, missing_slippage_count = (
+        _analytics_slippage_metrics(execution_rows)
+    )
+    slippage_sample_count = max(len(execution_rows) - missing_slippage_count, 0)
+    signed_slippage_bps_avg = signed_slippage_bps
+    adverse_slippage_bps_avg = adverse_slippage_bps
 
     if summary is not None:
         gross_pnl = _as_float(summary.gross_pnl_total, default=0.0)
         realized_pnl = _as_float(summary.realized_pnl_total, default=0.0)
-        fee = _as_float(summary.fee_total, default=0.0)
-        funding = _as_float(summary.funding_total, default=0.0)
-        net_pnl_excluding_funding = _as_float(summary.net_pnl_excluding_funding, default=realized_pnl - fee)
-        net_pnl_including_funding = _as_float(
-            summary.net_pnl_including_funding,
-            default=net_pnl_excluding_funding + funding,
+        fee = fee_from_ledger if fee_conversion_warning_codes else _as_float(summary.fee_total, default=0.0)
+        funding = (
+            funding_from_ledger
+            if funding_conversion_warning_codes
+            else _as_float(summary.funding_total, default=0.0)
         )
+        if fee_conversion_warning_codes or funding_conversion_warning_codes:
+            net_pnl_excluding_funding = realized_pnl - fee
+            net_pnl_including_funding = net_pnl_excluding_funding + funding
+        else:
+            net_pnl_excluding_funding = _as_float(summary.net_pnl_excluding_funding, default=realized_pnl - fee)
+            net_pnl_including_funding = _as_float(
+                summary.net_pnl_including_funding,
+                default=net_pnl_excluding_funding + funding,
+            )
         data_count = summary.decisions + len(order_rows) + len(execution_rows)
         basis = "decision_performance_summary_plus_execution_ledger"
     else:
         realized_pnl = sum(_as_float(row.realized_pnl, default=0.0) for row, _order in execution_rows)
         gross_pnl = realized_pnl
-        fee = sum(abs(_as_float(row.fee_paid, default=0.0)) for row, _order in execution_rows)
-        funding = _funding_total_for_window(session, since, until)
+        fee = fee_from_ledger
+        funding = funding_from_ledger
         net_pnl_excluding_funding = realized_pnl - fee
         net_pnl_including_funding = net_pnl_excluding_funding + funding
         data_count = len(order_rows) + len(execution_rows)
@@ -1030,14 +1075,33 @@ def _build_profitability_cost_breakdown(
     cost_to_gross_pnl_ratio = total_cost / gross_pnl if gross_pnl > 0 else None
 
     warning_codes: list[str] = []
+    _append_unique_warnings(warning_codes, fee_conversion_warning_codes)
+    _append_unique_warnings(warning_codes, funding_conversion_warning_codes)
+    funding_sync_status = _analytics_funding_sync_status(_latest_settings_row(session))
+    sync_start_at = since or datetime.min
+    sync_end_at = until or utcnow_naive()
+    missing_close_execution_count = _missing_close_execution_count_for_range(
+        session,
+        start_at=sync_start_at,
+        end_at=sync_end_at,
+    )
+    execution_sync_status = "INCOMPLETE" if missing_close_execution_count > 0 else "COMPLETE"
+    if missing_close_execution_count > 0:
+        warning_codes.append(f"missing_close_execution_count:{missing_close_execution_count}")
+    if execution_sync_status != "COMPLETE":
+        warning_codes.append(f"execution_sync_status:{execution_sync_status}")
+    if funding_sync_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
+        warning_codes.append(f"funding_sync_status:{funding_sync_status}")
     if gross_pnl > 0 and fee > gross_pnl:
         warning_codes.append("fee_exceeds_gross_pnl")
     if gross_pnl > 0 and total_cost > gross_pnl:
         warning_codes.append("cost_exceeds_gross_pnl")
     if gross_pnl > 0 and net_pnl_including_funding < 0:
         warning_codes.append("positive_gross_negative_net")
-    if adverse_slippage_bps_avg > 0:
+    if adverse_slippage_bps_avg is not None and adverse_slippage_bps_avg > 0:
         warning_codes.append("adverse_slippage_positive")
+    if slippage_data_status in {"INCOMPLETE", "NO_SAMPLE", "UNKNOWN"}:
+        warning_codes.append(f"slippage_data_status:{slippage_data_status}")
     if (
         marketable_entry_count > 0
         and marketable_entry_ratio >= MARKETABLE_ENTRY_WARNING_RATIO
@@ -1058,6 +1122,17 @@ def _build_profitability_cost_breakdown(
         net_pnl_including_funding=net_pnl_including_funding,
         signed_slippage_bps_avg=signed_slippage_bps_avg,
         adverse_slippage_bps_avg=adverse_slippage_bps_avg,
+        slippage_data_status=slippage_data_status,
+        slippage_data_reason=_slippage_data_reason(
+            status=slippage_data_status,
+            sample_count=slippage_sample_count,
+            missing_count=missing_slippage_count,
+        ),
+        execution_sync_status=execution_sync_status,
+        missing_close_execution_count=missing_close_execution_count,
+        funding_sync_status=funding_sync_status,
+        slippage_sample_count=slippage_sample_count,
+        missing_slippage_sample_count=missing_slippage_count,
         entry_count=entry_count,
         marketable_entry_count=marketable_entry_count,
         passive_entry_count=passive_entry_count,
@@ -1267,9 +1342,25 @@ def _analytics_cost_summary_for_range(
     *,
     start_at: datetime,
     end_at: datetime,
-) -> tuple[AnalyticsCostBreakdownSummary, str, list[str]]:
+) -> tuple[AnalyticsCostBreakdownSummary, str, int, int, list[str]]:
     execution_rows, funding_rows = _analytics_cost_source_rows_for_range(session, start_at=start_at, end_at=end_at)
     return _analytics_cost_summary_from_rows(execution_rows=execution_rows, funding_rows=funding_rows)
+
+
+def _slippage_data_reason(*, status: str, sample_count: int, missing_count: int) -> str | None:
+    if status == "NO_SAMPLE":
+        return "no_execution_slippage_sample"
+    if status == "INCOMPLETE":
+        return "missing_execution_slippage_sample" if missing_count > 0 else "no_valid_slippage_sample"
+    if status == "NOT_READY":
+        return "slippage_not_ready"
+    if status == "BLOCKED":
+        return "slippage_blocked"
+    if status == "UNKNOWN":
+        return "slippage_status_unknown"
+    if sample_count <= 0:
+        return "no_valid_slippage_sample"
+    return None
 
 
 def _analytics_cost_source_rows_for_range(
@@ -1288,7 +1379,7 @@ def _analytics_cost_summary_from_rows(
     *,
     execution_rows: Sequence[tuple[Execution, Order]],
     funding_rows: Sequence[AccountLedgerEntry],
-) -> tuple[AnalyticsCostBreakdownSummary, str, list[str]]:
+) -> tuple[AnalyticsCostBreakdownSummary, str, int, int, list[str]]:
     warnings: list[str] = []
 
     gross_pnl = sum(_as_float(execution_row.realized_pnl, default=0.0) for execution_row, _order_row in execution_rows)
@@ -1310,9 +1401,10 @@ def _analytics_cost_summary_from_rows(
             continue
         funding += _as_float(funding_row.amount, default=0.0)
 
-    signed_slippage_bps, adverse_slippage_bps, slippage_status, _missing_slippage_count = _analytics_slippage_metrics(
+    signed_slippage_bps, adverse_slippage_bps, slippage_status, missing_slippage_count = _analytics_slippage_metrics(
         execution_rows
     )
+    slippage_sample_count = max(len(execution_rows) - missing_slippage_count, 0)
     total_cost = fee + max(-funding, 0.0)
     fee_ratio_pct = (fee / gross_pnl) * 100.0 if gross_pnl > 0 else None
     total_cost_ratio_pct = (total_cost / gross_pnl) * 100.0 if gross_pnl > 0 else None
@@ -1335,6 +1427,8 @@ def _analytics_cost_summary_from_rows(
             adverse_slippage_bps=adverse_slippage_bps,
         ),
         slippage_status,
+        slippage_sample_count,
+        missing_slippage_count,
         warnings,
     )
 
@@ -1462,6 +1556,8 @@ def _analytics_data_quality(
     start_at: datetime,
     end_at: datetime,
     slippage_status: str,
+    slippage_sample_count: int,
+    missing_slippage_count: int,
 ) -> AnalyticsCostBreakdownDataQuality:
     missing_close_execution_count = _missing_close_execution_count_for_range(session, start_at=start_at, end_at=end_at)
     return AnalyticsCostBreakdownDataQuality(
@@ -1469,6 +1565,13 @@ def _analytics_data_quality(
         execution_sync_status="INCOMPLETE" if missing_close_execution_count > 0 else "COMPLETE",
         funding_sync_status=_analytics_funding_sync_status(_latest_settings_row(session)),
         slippage_data_status=slippage_status,
+        slippage_data_reason=_slippage_data_reason(
+            status=slippage_status,
+            sample_count=slippage_sample_count,
+            missing_count=missing_slippage_count,
+        ),
+        slippage_sample_count=slippage_sample_count,
+        missing_slippage_sample_count=missing_slippage_count,
         missing_close_execution_count=missing_close_execution_count,
         slippage_weighting="quantity",
     )
@@ -1480,6 +1583,12 @@ def _analytics_cost_bucket_from_summary(
     start_at: datetime,
     end_at: datetime,
     summary: AnalyticsCostBreakdownSummary,
+    slippage_status: str,
+    slippage_sample_count: int,
+    missing_slippage_count: int,
+    funding_sync_status: str | None = None,
+    funding_sync_reason: str | None = None,
+    warning_codes: Sequence[str] | None = None,
 ) -> AnalyticsCostBreakdownBucket:
     return (
         AnalyticsCostBreakdownBucket(
@@ -1495,6 +1604,17 @@ def _analytics_cost_bucket_from_summary(
             total_cost_ratio_pct=summary.total_cost_ratio_pct,
             signed_slippage_bps=summary.signed_slippage_bps,
             adverse_slippage_bps=summary.adverse_slippage_bps,
+            slippage_data_status=slippage_status,
+            slippage_data_reason=_slippage_data_reason(
+                status=slippage_status,
+                sample_count=slippage_sample_count,
+                missing_count=missing_slippage_count,
+            ),
+            funding_sync_status=funding_sync_status,
+            funding_sync_reason=funding_sync_reason,
+            slippage_sample_count=slippage_sample_count,
+            missing_slippage_sample_count=missing_slippage_count,
+            warning_codes=list(warning_codes or []),
         )
     )
 
@@ -1566,7 +1686,13 @@ def get_analytics_cost_breakdown(
     execution_rows, funding_rows = _analytics_cost_source_rows_for_range(
         session, start_at=start_at_utc, end_at=end_at_utc
     )
-    summary, slippage_status, warnings = _analytics_cost_summary_from_rows(
+    (
+        summary,
+        slippage_status,
+        slippage_sample_count,
+        missing_slippage_count,
+        warnings,
+    ) = _analytics_cost_summary_from_rows(
         execution_rows=execution_rows,
         funding_rows=funding_rows,
     )
@@ -1575,9 +1701,13 @@ def get_analytics_cost_breakdown(
         start_at=start_at_utc,
         end_at=end_at_utc,
         slippage_status=slippage_status,
+        slippage_sample_count=slippage_sample_count,
+        missing_slippage_count=missing_slippage_count,
     )
     if data_quality.missing_close_execution_count > 0:
         warnings.append(f"missing_close_execution_count:{data_quality.missing_close_execution_count}")
+    if data_quality.execution_sync_status != "COMPLETE":
+        warnings.append(f"execution_sync_status:{data_quality.execution_sync_status}")
     if data_quality.funding_sync_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
         warnings.append(f"funding_sync_status:{data_quality.funding_sync_status}")
     if data_quality.slippage_data_status in {"INCOMPLETE", "NO_SAMPLE", "UNKNOWN"}:
@@ -1600,7 +1730,13 @@ def get_analytics_cost_breakdown(
 
     buckets: list[AnalyticsCostBreakdownBucket] = []
     for label, bucket_start_at, bucket_end_at in bucket_bounds:
-        bucket_summary, _bucket_slippage_status, bucket_warnings = _analytics_cost_summary_from_rows(
+        (
+            bucket_summary,
+            bucket_slippage_status,
+            bucket_slippage_sample_count,
+            bucket_missing_slippage_count,
+            bucket_warnings,
+        ) = _analytics_cost_summary_from_rows(
             execution_rows=execution_rows_by_bucket.get(label, []),
             funding_rows=funding_rows_by_bucket.get(label, []),
         )
@@ -1610,6 +1746,12 @@ def get_analytics_cost_breakdown(
                 start_at=bucket_start_at,
                 end_at=bucket_end_at,
                 summary=bucket_summary,
+                slippage_status=bucket_slippage_status,
+                funding_sync_status=data_quality.funding_sync_status,
+                funding_sync_reason=data_quality.funding_sync_reason,
+                slippage_sample_count=bucket_slippage_sample_count,
+                missing_slippage_count=bucket_missing_slippage_count,
+                warning_codes=bucket_warnings,
             )
         )
         _append_unique_warnings(warnings, bucket_warnings)
@@ -2272,6 +2414,238 @@ def _as_optional_int(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _as_optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
+def _first_optional_float(*values: object) -> float | None:
+    for value in values:
+        result = _as_optional_float(value)
+        if result is not None:
+            return result
+    return None
+
+
+def _first_optional_int(*values: object) -> int | None:
+    for value in values:
+        result = _as_optional_int(value)
+        if result is not None:
+            return result
+    return None
+
+
+def _first_optional_bool(*values: object) -> bool | None:
+    for value in values:
+        result = _as_optional_bool(value)
+        if result is not None:
+            return result
+    return None
+
+
+def _diagnostic_has_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _append_unique_reason_code(target: list[str], value: object) -> None:
+    code = str(value or "").strip()
+    if code and code not in target:
+        target.append(code)
+
+
+def _build_hold_diagnostic(row: AgentRun | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    payload = _as_dict(row.output_payload)
+    metadata = _as_dict(row.metadata_json)
+    decision = str(payload.get("decision") or "").strip().lower()
+    ai_skip_reason = _last_ai_skip_reason_from_decision_row(row)
+    if decision != "hold" and ai_skip_reason is None:
+        return {}
+
+    input_payload = _as_dict(row.input_payload)
+    features = _as_dict(input_payload.get("features"))
+    feature_regime = _as_dict(features.get("regime"))
+    selection_context = _as_dict(metadata.get("selection_context"))
+    slot_allocation = _as_dict(metadata.get("slot_allocation"))
+    if not slot_allocation:
+        slot_allocation = _as_dict(selection_context.get("slot_allocation"))
+    ai_call_policy = _as_dict(metadata.get("ai_call_policy"))
+    analysis_context = _as_dict(metadata.get("analysis_context"))
+    regime = _first_non_empty_dict(
+        selection_context.get("regime_summary"),
+        analysis_context.get("regime"),
+        feature_regime,
+    )
+    flags = _as_dict(analysis_context.get("flags"))
+    universe_breadth = _first_non_empty_dict(
+        selection_context.get("universe_breadth"),
+        selection_context.get("breadth_summary"),
+        analysis_context.get("universe_breadth"),
+    )
+    strategy_engine_context = _first_non_empty_dict(
+        selection_context.get("strategy_engine_context"),
+        metadata.get("strategy_engine"),
+    )
+    selected_engine = _first_non_empty_dict(
+        strategy_engine_context.get("selected_engine"),
+        selection_context.get("selected_engine"),
+    )
+    candidate = _as_dict(selection_context.get("candidate"))
+    score = _as_dict(selection_context.get("score"))
+    derivatives = _first_non_empty_dict(
+        analysis_context.get("derivatives"),
+        candidate.get("derivatives_summary"),
+        features.get("derivatives"),
+    )
+    lead_lag = _first_non_empty_dict(
+        analysis_context.get("lead_lag"),
+        candidate.get("lead_lag_summary"),
+        features.get("lead_lag"),
+    )
+
+    reason_codes: list[str] = []
+    primary_reason_codes: list[str] = []
+    for source in (
+        payload.get("rationale_codes"),
+        selection_context.get("reason_codes"),
+        candidate.get("rationale_codes"),
+        selected_engine.get("reasons"),
+    ):
+        for code in _as_string_list(source):
+            if code == "HOLD_DECISION":
+                continue
+            _append_unique_reason_code(reason_codes, code)
+            _append_unique_reason_code(primary_reason_codes, code)
+    for source in (
+        ai_call_policy.get("hard_skip_reason_codes"),
+        ai_call_policy.get("allow_ai_but_later_risk_check"),
+    ):
+        for code in _as_string_list(source):
+            _append_unique_reason_code(reason_codes, code)
+    _append_unique_reason_code(reason_codes, ai_skip_reason)
+    _append_unique_reason_code(reason_codes, ai_call_policy.get("pre_ai_skip_reason"))
+
+    weak_volume = _first_optional_bool(flags.get("weak_volume"), regime.get("weak_volume"))
+    momentum_weakening = _first_optional_bool(flags.get("momentum_weakening"), regime.get("momentum_weakening"))
+    breadth_regime = str(
+        universe_breadth.get("breadth_regime")
+        or selection_context.get("breadth_regime")
+        or ""
+    ).strip()
+    capacity_reason = str(
+        selection_context.get("capacity_reason")
+        or slot_allocation.get("capacity_reason")
+        or ""
+    ).strip()
+    derivatives_available = _first_optional_bool(derivatives.get("available"))
+    oi_expanding_with_price = _first_optional_bool(derivatives.get("oi_expanding_with_price"))
+    crowded_long_risk = _first_optional_bool(
+        derivatives.get("crowded_long_risk"),
+        derivatives.get("top_trader_long_crowded"),
+    )
+    top_trader_long_crowded = _first_optional_bool(derivatives.get("top_trader_long_crowded"))
+    leader_bias = str(lead_lag.get("leader_bias") or "").strip().lower()
+    derivatives_alignment = _first_optional_float(
+        selection_context.get("derivatives_alignment"),
+        score.get("derivatives_alignment"),
+        derivatives.get("long_alignment_score"),
+    )
+
+    if weak_volume is True:
+        _append_unique_reason_code(reason_codes, "WEAK_VOLUME")
+    if momentum_weakening is True:
+        _append_unique_reason_code(reason_codes, "MOMENTUM_WEAKENING")
+    if breadth_regime.lower() in {"weak_breadth", "transition_fragile"}:
+        _append_unique_reason_code(reason_codes, "WEAK_BREADTH")
+    if capacity_reason.lower() in {"breadth_weak_reduce_capacity", "transition_breadth_reduce_capacity"}:
+        _append_unique_reason_code(reason_codes, "BREADTH_WEAK_REDUCE_CAPACITY")
+    if oi_expanding_with_price is False and derivatives_available is not False:
+        _append_unique_reason_code(reason_codes, "BREAKOUT_OI_NOT_EXPANDING")
+    if crowded_long_risk is True or top_trader_long_crowded is True:
+        _append_unique_reason_code(reason_codes, "TOP_TRADER_LONG_CROWDED")
+    if leader_bias == "neutral":
+        _append_unique_reason_code(reason_codes, "LEAD_MARKETS_NEUTRAL")
+    if derivatives_alignment is not None and derivatives_alignment < 0.45:
+        _append_unique_reason_code(reason_codes, "DERIVATIVES_ALIGNMENT_HEADWIND")
+    if str(ai_call_policy.get("reason") or "").strip().lower() == "low_actionability_cost_guard_active":
+        _append_unique_reason_code(reason_codes, "LOW_ACTIONABILITY_COST_GUARD_ACTIVE")
+
+    metrics = {
+        "entry_candidates": _first_optional_int(universe_breadth.get("entry_candidates")),
+        "structural_entry_candidates": _first_optional_int(universe_breadth.get("structural_entry_candidates")),
+        "decision_entry_candidates": _first_optional_int(universe_breadth.get("decision_entry_candidates")),
+        "entry_score_threshold": _first_optional_float(selection_context.get("entry_score_threshold")),
+        "slot_conviction_score": _first_optional_float(
+            selection_context.get("slot_conviction_score"),
+            slot_allocation.get("slot_conviction_score"),
+            score.get("total_score"),
+        ),
+        "lead_lag_alignment": _first_optional_float(
+            selection_context.get("lead_lag_alignment"),
+            score.get("lead_lag_alignment"),
+            lead_lag.get("bullish_alignment_score"),
+        ),
+        "derivatives_alignment": derivatives_alignment,
+        "confidence": _first_optional_float(payload.get("confidence")),
+    }
+    evidence = {
+        "breadth_regime": breadth_regime,
+        "capacity_reason": capacity_reason,
+        "primary_regime": regime.get("primary_regime"),
+        "trend_alignment": regime.get("trend_alignment"),
+        "volume_regime": regime.get("volume_regime"),
+        "weak_volume": weak_volume,
+        "momentum_weakening": momentum_weakening,
+        "selected_engine": selected_engine.get("engine_name") or selection_context.get("strategy_engine"),
+        "selected_engine_reasons": _as_string_list(selected_engine.get("reasons"))[:6],
+        "oi_expanding_with_price": oi_expanding_with_price,
+        "taker_flow_alignment": derivatives.get("taker_flow_alignment"),
+        "funding_bias": derivatives.get("funding_bias"),
+        "crowded_long_risk": crowded_long_risk,
+        "top_trader_long_crowded": top_trader_long_crowded,
+        "leader_bias": leader_bias,
+        "ai_call_policy_reason": ai_call_policy.get("reason"),
+        "pre_ai_skip_reason": ai_call_policy.get("pre_ai_skip_reason") or ai_skip_reason,
+    }
+    metrics = {key: value for key, value in metrics.items() if _diagnostic_has_value(value)}
+    evidence = {key: value for key, value in evidence.items() if _diagnostic_has_value(value)}
+    if not reason_codes and not metrics and not evidence:
+        return {}
+
+    summary_code = "hold_context"
+    if ai_skip_reason:
+        summary_code = "pre_ai_skip"
+    elif metrics.get("entry_candidates") == 0:
+        summary_code = "no_entry_candidate"
+    elif any(code in reason_codes for code in ("NO_EDGE", "EXPECTANCY_NEUTRAL")):
+        summary_code = "low_edge_hold"
+
+    return {
+        "status": "active",
+        "summary_code": summary_code,
+        "reason_codes": reason_codes[:16],
+        "primary_reason_codes": primary_reason_codes[:8] or reason_codes[:8],
+        "metrics": metrics,
+        "evidence": evidence,
+        "source": "agent_run",
+        "decision_run_id": row.id,
+    }
 
 
 def _has_actual_release_enrichment(event_context: dict[str, Any], vendor: str) -> bool:
@@ -4256,6 +4630,7 @@ def _profitability_dashboard_cache_key(
         _profitability_dashboard_db_identity(session),
         tuple(performance_window_specs or ()),
         tuple(cost_window_specs or PROFITABILITY_COST_WINDOW_SPECS),
+        _analytics_funding_sync_status(_latest_settings_row(session)),
     )
 
 
@@ -4265,10 +4640,161 @@ def _copy_profitability_dashboard_payload(
     return payload.model_copy(deep=False)
 
 
+_SLIPPAGE_READINESS_WARNING_STATUSES = {"INCOMPLETE", "NO_SAMPLE", "NOT_READY", "BLOCKED", "UNKNOWN"}
+_EXECUTION_READINESS_WARNING_STATUSES = {"INCOMPLETE", "UNKNOWN"}
+_FUNDING_READINESS_WARNING_STATUSES = {"INCOMPLETE", "STALE", "UNKNOWN"}
+
+
+def _normalized_slippage_readiness_warning_code(value: object) -> str | None:
+    raw = str(value or "").strip()
+    prefix, separator, raw_status = raw.partition(":")
+    if separator != ":" or prefix.strip().upper() != "SLIPPAGE_DATA_STATUS":
+        return None
+    status = raw_status.strip().upper()
+    if status not in _SLIPPAGE_READINESS_WARNING_STATUSES:
+        return None
+    return f"slippage_data_status:{status}"
+
+
+def _normalized_funding_readiness_warning_code(value: object) -> str | None:
+    raw = str(value or "").strip()
+    prefix, separator, raw_status = raw.partition(":")
+    if separator != ":" or prefix.strip().upper() != "FUNDING_SYNC_STATUS":
+        return None
+    status = raw_status.strip().upper()
+    if status not in _FUNDING_READINESS_WARNING_STATUSES:
+        return None
+    return f"funding_sync_status:{status}"
+
+
+def _normalized_execution_readiness_warning_code(value: object) -> str | None:
+    raw = str(value or "").strip()
+    prefix, separator, raw_status = raw.partition(":")
+    if separator != ":" or prefix.strip().upper() != "EXECUTION_SYNC_STATUS":
+        return None
+    status = raw_status.strip().upper()
+    if status not in _EXECUTION_READINESS_WARNING_STATUSES:
+        return None
+    return f"execution_sync_status:{status}"
+
+
+def _normalized_profitability_readiness_reason_code(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return (
+        _normalized_slippage_readiness_warning_code(raw)
+        or _normalized_execution_readiness_warning_code(raw)
+        or _normalized_funding_readiness_warning_code(raw)
+        or raw
+    )
+
+
+def _readiness_with_profitability_cost_reasons(
+    readiness: LimitedLiveReadinessReport,
+    cost_breakdowns: Sequence[DashboardProfitabilityCostBreakdown],
+) -> LimitedLiveReadinessReport:
+    if not cost_breakdowns:
+        return readiness
+    today_cost = next((item for item in cost_breakdowns if item.window_label == "today"), cost_breakdowns[0])
+    readiness_reason_codes: list[str] = []
+    for code in readiness.reason_codes:
+        normalized_code = _normalized_profitability_readiness_reason_code(code)
+        if normalized_code is not None and normalized_code not in readiness_reason_codes:
+            readiness_reason_codes.append(normalized_code)
+    readiness_reasons_changed = readiness_reason_codes != list(readiness.reason_codes)
+    cost_reason_codes: list[str] = []
+    for code in today_cost.warning_codes:
+        for warning_code in (
+            _normalized_slippage_readiness_warning_code(code),
+            _normalized_execution_readiness_warning_code(code),
+            _normalized_funding_readiness_warning_code(code),
+        ):
+            if (
+                warning_code is not None
+                and warning_code not in readiness_reason_codes
+                and warning_code not in cost_reason_codes
+            ):
+                cost_reason_codes.append(warning_code)
+    slippage_status = str(today_cost.slippage_data_status or "").strip().upper()
+    if slippage_status in _SLIPPAGE_READINESS_WARNING_STATUSES:
+        slippage_warning_code = f"slippage_data_status:{slippage_status}"
+        if (
+            slippage_warning_code not in readiness_reason_codes
+            and slippage_warning_code not in cost_reason_codes
+        ):
+            cost_reason_codes.append(slippage_warning_code)
+    funding_status = str(getattr(today_cost, "funding_sync_status", "") or "").strip().upper()
+    if funding_status in _FUNDING_READINESS_WARNING_STATUSES:
+        funding_warning_code = f"funding_sync_status:{funding_status}"
+        if (
+            funding_warning_code not in readiness_reason_codes
+            and funding_warning_code not in cost_reason_codes
+        ):
+            cost_reason_codes.append(funding_warning_code)
+    execution_status = str(getattr(today_cost, "execution_sync_status", "") or "").strip().upper()
+    if execution_status in _EXECUTION_READINESS_WARNING_STATUSES:
+        execution_warning_code = f"execution_sync_status:{execution_status}"
+        if (
+            execution_warning_code not in readiness_reason_codes
+            and execution_warning_code not in cost_reason_codes
+        ):
+            cost_reason_codes.append(execution_warning_code)
+    if not cost_reason_codes and not readiness_reasons_changed:
+        return readiness
+    status = readiness.status
+    has_cost_blocking_reason = any(
+        _normalized_slippage_readiness_warning_code(code) is not None
+        or _normalized_execution_readiness_warning_code(code) is not None
+        or _normalized_funding_readiness_warning_code(code) is not None
+        for code in [*readiness_reason_codes, *cost_reason_codes]
+    )
+    if has_cost_blocking_reason and status in {"watch", "limited_live_candidate", "scale_up_candidate"}:
+        status = "not_ready"
+    return readiness.model_copy(
+        update={
+            "status": status,
+            "reason_codes": [*readiness_reason_codes, *cost_reason_codes],
+        }
+    )
+
+
+def _profitability_dashboard_with_cost_readiness_reasons(
+    payload: DashboardProfitabilityResponse,
+) -> DashboardProfitabilityResponse:
+    updates: dict[str, Any] = {}
+    limited_live_readiness = _readiness_with_profitability_cost_reasons(
+        payload.limited_live_readiness,
+        payload.cost_breakdowns,
+    )
+    if limited_live_readiness != payload.limited_live_readiness:
+        updates["limited_live_readiness"] = limited_live_readiness
+
+    windows: list[DashboardProfitabilityWindow] = []
+    windows_changed = False
+    for window in payload.windows:
+        window_readiness = _readiness_with_profitability_cost_reasons(
+            window.limited_live_readiness,
+            [window.cost_breakdown],
+        )
+        if window_readiness != window.limited_live_readiness:
+            windows.append(window.model_copy(update={"limited_live_readiness": window_readiness}))
+            windows_changed = True
+        else:
+            windows.append(window)
+    if windows_changed:
+        updates["windows"] = windows
+
+    if not updates:
+        return payload
+    return payload.model_copy(update=updates)
+
+
 def _store_profitability_dashboard_cache(
     cache_key: tuple[object, ...],
     payload: DashboardProfitabilityResponse,
 ) -> None:
+    payload = _profitability_dashboard_with_cost_readiness_reasons(payload)
     with _profitability_dashboard_cache_lock:
         _profitability_dashboard_cache[cache_key] = _ProfitabilityDashboardCacheEntry(
             payload=_copy_profitability_dashboard_payload(payload),
@@ -4475,15 +5001,19 @@ def _build_profitability_dashboard_uncached(
 
     windows: list[DashboardProfitabilityWindow] = []
     for window in performance_report.windows:
+        window_cost_breakdown = cost_breakdown_by_label[window.window_label]
         windows.append(
             DashboardProfitabilityWindow(
                 window_label=window.window_label,
                 window_hours=window.window_hours,
                 summary=window.summary,
-                cost_breakdown=cost_breakdown_by_label[window.window_label],
+                cost_breakdown=window_cost_breakdown,
                 entry_quality=window.entry_quality,
                 ai_baseline_comparison=window.ai_baseline_comparison,
-                limited_live_readiness=window.limited_live_readiness,
+                limited_live_readiness=_readiness_with_profitability_cost_reasons(
+                    window.limited_live_readiness,
+                    [window_cost_breakdown],
+                ),
                 rationale_winners=_top_positive_entries(window.rationale_codes),
                 rationale_losers=_top_negative_entries(window.rationale_codes),
                 top_regimes=_top_positive_entries(window.regimes, limit=4),
@@ -4525,6 +5055,10 @@ def _build_profitability_dashboard_uncached(
         primary_window.limited_live_readiness
         if primary_window is not None
         else LimitedLiveReadinessReport()
+    )
+    limited_live_readiness = _readiness_with_profitability_cost_reasons(
+        limited_live_readiness,
+        cost_breakdowns,
     )
     hold_blocked_summary = DashboardHoldBlockedSummary(
         hold_top_conditions=(
@@ -4594,7 +5128,9 @@ def get_profitability_dashboard(
         )
         if cached is not None and cache_age_seconds is not None:
             if cache_age_seconds <= PROFITABILITY_DASHBOARD_CACHE_TTL_SECONDS:
-                return _copy_profitability_dashboard_payload(cached.payload)
+                return _profitability_dashboard_with_cost_readiness_reasons(
+                    _copy_profitability_dashboard_payload(cached.payload)
+                )
             if allow_stale and cache_age_seconds <= PROFITABILITY_DASHBOARD_STALE_SECONDS:
                 stale_payload = _copy_profitability_dashboard_payload(cached.payload)
 
@@ -4604,13 +5140,15 @@ def get_profitability_dashboard(
             performance_window_specs=performance_window_specs,
             cost_window_specs=cost_window_specs,
         )
-        return stale_payload
+        return _profitability_dashboard_with_cost_readiness_reasons(stale_payload)
 
-    payload = _build_profitability_dashboard_uncached(
-        session,
-        overview=overview,
-        performance_window_specs=performance_window_specs,
-        cost_window_specs=cost_window_specs,
+    payload = _profitability_dashboard_with_cost_readiness_reasons(
+        _build_profitability_dashboard_uncached(
+            session,
+            overview=overview,
+            performance_window_specs=performance_window_specs,
+            cost_window_specs=cost_window_specs,
+        )
     )
     _store_profitability_dashboard_cache(cache_key, payload)
     return payload
@@ -4765,6 +5303,7 @@ def _build_decision_snapshot(row: AgentRun | None) -> OperatorDecisionSnapshot:
         scenario_note=str(payload.get("scenario_note") or metadata.get("scenario_note") or "") or None,
         psychology_scene_review=psychology_scene_review,
         decision_reference=decision_reference,
+        hold_diagnostic=_build_hold_diagnostic(row),
         raw_output={},
     )
 
@@ -6139,7 +6678,57 @@ def _operator_limited_live_readiness(session: Session) -> LimitedLiveReadinessRe
         limit=OPERATOR_PERFORMANCE_ENTRY_LIMIT,
     )
     first_window = report.windows[0] if report.windows else None
-    return first_window.limited_live_readiness if first_window is not None else LimitedLiveReadinessReport()
+    readiness = first_window.limited_live_readiness if first_window is not None else LimitedLiveReadinessReport()
+    now = utcnow_naive()
+    today_cost = _build_profitability_cost_breakdown(
+        session,
+        window_label="today",
+        window_hours=None,
+        since=_profitability_window_since("today", None, now),
+        summary=None,
+    )
+    return _readiness_with_profitability_cost_reasons(readiness, [today_cost])
+
+
+def _service_gate_root_cause_codes(snapshot: Mapping[str, Any]) -> list[str]:
+    codes: list[str] = []
+
+    def append(value: object) -> None:
+        values = [value] if isinstance(value, str) else _as_string_list(value)
+        for raw_code in values:
+            code = _as_non_empty_string(raw_code)
+            if code is None:
+                continue
+            normalized_code = code.upper()
+            if normalized_code not in codes:
+                codes.append(normalized_code)
+
+    append(snapshot.get("root_cause_code"))
+    append(snapshot.get("reason_code"))
+    append(snapshot.get("blocked_reason_code"))
+    append(snapshot.get("root_cause_codes"))
+    append(snapshot.get("reason_codes"))
+    append(snapshot.get("blocked_reason_codes"))
+    for section in (
+        "redis_cache",
+        "recent_scheduler_non_success",
+        "recent_health_errors",
+        "unresolved_submissions",
+        "active_pending_entry_plans",
+        "for_update_lock_waits",
+    ):
+        section_payload = snapshot.get(section)
+        items = [section_payload] if isinstance(section_payload, Mapping) else section_payload or []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            append(item.get("root_cause_code"))
+            append(item.get("reason_code"))
+            append(item.get("blocked_reason_code"))
+            append(item.get("root_cause_codes"))
+            append(item.get("reason_codes"))
+            append(item.get("blocked_reason_codes"))
+    return codes
 
 
 def get_operator_dashboard(session: Session, *, view: str | None = None) -> OperatorDashboardResponse:
@@ -6210,7 +6799,12 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
         ]
     )
     limited_live_readiness = (
-        _operator_limited_live_readiness(session) if profitability is None else profitability.limited_live_readiness
+        _operator_limited_live_readiness(session)
+        if profitability is None
+        else _readiness_with_profitability_cost_reasons(
+            profitability.limited_live_readiness,
+            profitability.cost_breakdowns,
+        )
     )
     service_gate_snapshot = build_service_switch_gate_snapshot(session)
     audit_rows = get_audit_timeline(session, limit=OPERATOR_AUDIT_LIMIT) if include_audit_events else []
@@ -6266,7 +6860,25 @@ def get_operator_dashboard(session: Session, *, view: str | None = None) -> Oper
             user_stream_summary=overview.user_stream_summary,
             reconciliation_summary=overview.reconciliation_summary,
             candidate_selection_summary=overview.candidate_selection_summary,
+            service_gate_gate_clear=service_gate_snapshot.get("gate_clear") is True,
             service_gate_blockers=_as_string_list(service_gate_snapshot.get("blockers")),
+            service_gate_root_cause_codes=_service_gate_root_cause_codes(service_gate_snapshot),
+            service_gate_counts={
+                str(key): int(value)
+                for key, value in _as_dict(service_gate_snapshot.get("counts")).items()
+                if isinstance(value, int)
+            },
+            service_gate_recent_scheduler_non_success=[
+                dict(item)
+                for item in (service_gate_snapshot.get("recent_scheduler_non_success") or [])
+                if isinstance(item, dict)
+            ],
+            service_gate_recent_health_errors=[
+                dict(item)
+                for item in (service_gate_snapshot.get("recent_health_errors") or [])
+                if isinstance(item, dict)
+            ],
+            service_gate_redis_cache=_as_dict(service_gate_snapshot.get("redis_cache")),
             stale_pending_entry_plan_count=int(
                 _as_dict(service_gate_snapshot.get("counts")).get("triggered_stale_history_entry_plans") or 0
             ),

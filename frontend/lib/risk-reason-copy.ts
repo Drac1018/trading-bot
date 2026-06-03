@@ -93,6 +93,40 @@ const aiSkipReasonDefinitions: Record<string, AiSkipReasonDefinition> = {
     detail_ko: "같은 중립 후보가 반복되어 AI 비용을 쓰기 전에 관망 처리했습니다.",
     next_step_ko: "새 신호나 방향성이 생기면 다시 검토합니다.",
   },
+  ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI: {
+    title_ko: "중립 신호라 AI 검토를 생략했습니다",
+    detail_ko:
+      "기대값, 파생시장, 선행시장 근거가 모두 중립이라 신규 진입 AI 호출 전에 검토를 중단했습니다.",
+    next_step_ko: "방향성 근거가 회복되면 다음 판단 주기에서 다시 검토합니다.",
+  },
+  ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF: {
+    title_ko: "반복 저효용 후보라 AI 검토를 쉬고 있습니다",
+    detail_ko:
+      "같은 성격의 후보가 최근 AI 검토에서 계속 hold로 끝났고 주문으로 이어지지 않아 비용 보호를 위해 호출을 생략했습니다.",
+    next_step_ko: "후보 점수, 파생시장, 선행시장, 체결 가능성이 달라지면 다시 호출합니다.",
+  },
+  ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE: {
+    title_ko: "주문 경로가 준비되지 않아 AI 검토를 생략했습니다",
+    detail_ko:
+      "Redis, 동기화, Binance REST, 미해결 제출 상태 중 주문 가능성을 막는 항목이 있어 신규 진입 AI 호출 전에 중단했습니다.",
+    next_step_ko: "서비스 게이트와 동기화 상태가 회복되면 다음 판단 주기에서 다시 검토합니다.",
+  },
+  ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI: {
+    title_ko: "이미 대기 중인 진입안이 있어 AI 검토를 생략했습니다",
+    detail_ko: "같은 심볼에 활성 pending entry plan이 있어 중복 신규 진입 검토를 만들지 않았습니다.",
+    next_step_ko: "기존 대기 진입안이 체결, 취소, 만료되면 새 후보를 다시 평가합니다.",
+  },
+  ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI: {
+    title_ko: "진입 구조가 불완전해 AI 검토를 생략했습니다",
+    detail_ko: "후보에 진입 구간, 손절, 익절 중 필요한 값이 빠져 있어 provider 호출 전에 보류했습니다.",
+    next_step_ko: "진입 구간과 손익 구조가 완성되면 다시 검토합니다.",
+  },
+  ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN: {
+    title_ko: "같은 장면의 최근 AI hold 판단을 재사용했습니다",
+    detail_ko:
+      "동일한 후보 fingerprint에서 최근 OpenAI 판단이 hold였고 주문이나 대기 진입안으로 이어지지 않아 중복 호출을 막았습니다.",
+    next_step_ko: "가격, 점수, 체제, 선행시장, 파생시장 상태가 의미 있게 바뀌면 다시 검토합니다.",
+  },
   MACRO_EVENT_IMMINENT: {
     title_ko: "주요 경제 이벤트 임박",
     detail_ko: "주요 경제 이벤트가 가까워 신규 진입 AI 검토를 보수적으로 생략했습니다.",
@@ -151,6 +185,14 @@ const aiSkipReasonDefinitions: Record<string, AiSkipReasonDefinition> = {
   },
 };
 
+const aiSkipReasonAliases: Record<string, string> = {
+  NEUTRAL_ENTRY_CONTEXT_PREAI_SKIP: "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI",
+  ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_ACTIVE: "ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF",
+  ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI_SKIP: "ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI",
+  ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI_SKIP: "ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI",
+  ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_ACTIVE: "ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN",
+};
+
 function normalizeAiSkipReason(value: string | null | undefined) {
   return (value ?? "").trim().toUpperCase();
 }
@@ -163,6 +205,15 @@ const entryWaitReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     auto_clear_hint_ko: "다음 판단 주기에서 진입 신호가 생기면 자동으로 다시 검토됩니다.",
     operator_action_ko: "운영 상태가 정상이라면 별도 조치 없이 다음 판단 주기를 기다립니다.",
     check_location_ko: "AI 의견 / 이번 판단 주기 상태",
+  },
+  AI_ENTRY_OUTPUT_INCOMPLETE: {
+    category: "entry_wait",
+    title_ko: "AI 출력에 주문 가능한 진입 구조가 없어 대기합니다",
+    detail_ko:
+      "AI가 long/short를 제안했지만 진입 구간, 손절, 익절, 무효화 가격 중 필요한 값이 빠져 hold로 정규화했습니다.",
+    auto_clear_hint_ko: "다음 AI 호출에서 완전한 진입 구조가 나오면 리스크 점검으로 넘어갑니다.",
+    operator_action_ko: "AgentRun의 entry_output_quality_guard.missing_fields와 ai_call_policy를 확인하세요.",
+    check_location_ko: "AI 의견 / AgentRun metadata > entry_output_quality_guard",
   },
   DERIVATIVES_ALIGNMENT_HEADWIND: {
     category: "entry_wait",
@@ -466,6 +517,97 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     operator_action_ko: "reconciliation status와 blocked session을 확인합니다.",
     check_location_ko: "안전 점검 > reconciliation",
   },
+  REDIS_CACHE_UNAVAILABLE: {
+    category: "safety_block",
+    title_ko: "Redis 공유 캐시를 사용할 수 없어 서비스 전환이 차단되었습니다",
+    detail_ko: "시장 스트림 공유 캐시가 설정되어 있지만 연결 또는 상태가 정상으로 확인되지 않았습니다.",
+    auto_clear_hint_ko: "Redis 연결과 cache_health가 정상으로 돌아오면 자동 해소될 수 있습니다.",
+    operator_action_ko: "service-gate의 redis_cache 세부 상태와 cache_reject_reason을 확인합니다.",
+    check_location_ko: "안전 점검 > service-gate / Redis cache",
+  },
+  SERVICE_GATE_BLOCKED: {
+    category: "safety_block",
+    title_ko: "서비스 게이트가 신규 진입을 차단했습니다",
+    detail_ko:
+      "서비스 게이트가 clear 상태가 아니어서 신규 진입을 막고 있습니다. 원인 배열이 비어 있으면 runtime publication 또는 reason 전달 경로를 확인해야 합니다.",
+    auto_clear_hint_ko: "service-gate blockers/root cause가 해소되고 gate_clear가 true로 게시되면 해소됩니다.",
+    operator_action_ko: "service-gate 응답의 blockers, root_cause_codes, detail rows와 scheduler/health 상태를 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate",
+  },
+  ACTIVE_PENDING_ENTRY_PLANS: {
+    category: "safety_block",
+    title_ko: "활성 진입 대기 계획이 신규 진입을 차단했습니다",
+    detail_ko:
+      "service-gate에 active_pending_entry_plans blocker가 게시되어 기존 대기 계획이 정리되기 전까지 새 진입을 막고 있습니다.",
+    auto_clear_hint_ko: "대기 계획이 체결, 취소, 만료, 또는 재평가되어 active count가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko: "pending entry plans의 gate_state, blocked_reason_codes, PLAN_* root cause를 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / 진입 대기 계획",
+  },
+  SERVICE_GATE_STATUS_UNKNOWN: {
+    category: "safety_block",
+    title_ko: "서비스 게이트 게시 상태를 확인해야 합니다",
+    detail_ko:
+      "operator payload에서 service_gate_gate_clear가 누락/null이거나 clear=true와 blocker/root cause가 동시에 게시되어 서비스 게이트 통과 여부를 이 화면에서 확정할 수 없습니다.",
+    auto_clear_hint_ko:
+      "operator payload가 clear=true와 빈 blocker/root cause 또는 clear=false와 명확한 blocker/root cause를 일관되게 게시하면 해소됩니다.",
+    operator_action_ko: "/api/runtime/service-gate와 /api/dashboard/operator의 control.service_gate_gate_clear 게시 상태를 비교하세요.",
+    check_location_ko: "안전 평가 > service-gate / operator dashboard",
+  },
+  RECENT_SCHEDULER_NON_SUCCESS: {
+    category: "safety_block",
+    title_ko: "최근 스케줄러 실행 실패가 신규 진입을 차단했습니다",
+    detail_ko: "최근 scheduler_runs에 성공이 아닌 실행이 누적되어 서비스 게이트가 신규 진입을 막고 있습니다.",
+    auto_clear_hint_ko: "스케줄러가 정상 성공하고 recent_scheduler_non_success가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko: "scheduler_runs 최신 실패 reason/root_cause와 live_sync 또는 exchange_sync_cycle 결과를 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / scheduler_runs",
+  },
+  RECENT_HEALTH_ERRORS: {
+    category: "safety_block",
+    title_ko: "최근 헬스체크 오류가 신규 진입을 차단했습니다",
+    detail_ko: "최근 health/audit 오류가 누적되어 서비스 게이트가 신규 진입을 막고 있습니다.",
+    auto_clear_hint_ko: "헬스체크가 정상화되고 recent_health_errors가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko: "health check 오류와 audit_events root cause, exchange/auth 상태를 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / health",
+  },
+  DB_CONNECTION_LOST: {
+    category: "safety_block",
+    title_ko: "DB 연결 손실로 서비스 게이트가 차단되었습니다",
+    detail_ko:
+      "스케줄러 또는 헬스체크가 DB 연결 손실을 감지했습니다. 상태가 정상화되기 전까지 신규 진입을 막습니다.",
+    auto_clear_hint_ko: "DB 연결이 회복되고 scheduler/health recent blocker가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko:
+      "service-gate detail row의 db_connection_lost, error_category, scheduler_failure_persisted 값을 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / scheduler health",
+  },
+  DB_OPERATIONAL_ERROR: {
+    category: "safety_block",
+    title_ko: "DB 작업 오류로 서비스 게이트가 차단되었습니다",
+    detail_ko:
+      "스케줄러 또는 헬스체크가 DB operational error를 기록했습니다. DB 상태가 안정화되기 전까지 신규 진입을 막습니다.",
+    auto_clear_hint_ko: "DB 작업 오류가 사라지고 scheduler/health recent blocker가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko: "service-gate detail row의 error_category와 DB 연결/세션 복구 로그를 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / database",
+  },
+  DB_IDLE_IN_TRANSACTION_TIMEOUT: {
+    category: "safety_block",
+    title_ko: "DB idle transaction timeout으로 서비스 게이트가 차단되었습니다",
+    detail_ko:
+      "스케줄러 또는 헬스체크가 idle-in-transaction timeout을 기록했습니다. DB 세션이 정상적으로 회복되기 전까지 신규 진입을 막습니다.",
+    auto_clear_hint_ko:
+      "idle transaction timeout이 더 이상 발생하지 않고 recent scheduler/health blocker가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko:
+      "service-gate detail row의 error, error_class, stage, scheduler_failure_persisted와 Postgres idle-in-transaction timeout 설정을 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / database session",
+  },
+  WORKFLOW_EXCEPTION: {
+    category: "safety_block",
+    title_ko: "스케줄러 workflow 예외로 서비스 게이트가 차단되었습니다",
+    detail_ko:
+      "최근 스케줄러 또는 헬스체크 detail row가 workflow_exception을 기록했습니다. 원인 workflow가 정상화되기 전까지 신규 진입을 막습니다.",
+    auto_clear_hint_ko: "해당 workflow가 정상 성공하고 recent scheduler/health blocker가 0으로 돌아오면 해소됩니다.",
+    operator_action_ko: "service-gate detail row의 workflow, stage, error_category, error 값을 확인합니다.",
+    check_location_ko: "안전 평가 > service-gate / scheduler workflow",
+  },
   PROTECTION_REQUIRED: {
     category: "safety_block",
     title_ko: "보호 주문 복구가 필요합니다",
@@ -498,6 +640,17 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     operator_action_ko: "계좌 동기화와 reconciliation status를 확인합니다.",
     check_location_ko: "안전 점검 > 계좌 / reconciliation",
   },
+  EXCHANGE_AUTH_PERMISSION_REJECTED: {
+    category: "safety_block",
+    title_ko: "거래소 API 권한 거부로 신규 진입이 차단되었습니다",
+    detail_ko:
+      "Binance가 API 키 권한, IP 허용 목록, 또는 계정 권한 문제로 요청을 거부했습니다. 권한이 확인될 때까지 신규 주문을 보내지 않습니다.",
+    auto_clear_hint_ko:
+      "API 키 권한, IP allowlist, 계정 거래 권한이 정상화되고 live sync가 성공하면 해소될 수 있습니다.",
+    operator_action_ko:
+      "Binance API key permissions, IP allowlist, account canTrade 상태와 service-gate root cause를 확인합니다.",
+    check_location_ko: "안전 점검 > 거래소 권한 / service-gate",
+  },
   EXCHANGE_CAN_TRADE_UNKNOWN: {
     category: "safety_block",
     title_ko: "거래소 주문 권한 확인값이 unknown입니다",
@@ -505,6 +658,16 @@ const safetyReasonDefinitions: Record<string, ReasonCodeDefinition> = {
     auto_clear_hint_ko: "계좌 동기화가 성공하고 exchange_can_trade가 확인되면 해소될 수 있습니다.",
     operator_action_ko: "live sync와 Binance 계좌 권한, exchange_can_trade_checked_at을 확인합니다.",
     check_location_ko: "안전 점검 > 거래소 계좌 권한",
+  },
+  EXCHANGE_POSITION_MODE_UNCLEAR: {
+    category: "safety_block",
+    title_ko: "거래소 포지션 모드 확인이 필요합니다",
+    detail_ko:
+      "거래소 포지션 모드가 명확하게 확인되지 않아 service-gate가 신규 진입을 차단했습니다.",
+    auto_clear_hint_ko: "position mode 동기화가 성공하고 mode guard가 정상화되면 해소될 수 있습니다.",
+    operator_action_ko:
+      "service-gate root cause와 reconciliation_summary.mode_guard_reason_code, exchange position mode 동기화 로그를 확인합니다.",
+    check_location_ko: "안전 점검 > 거래소 포지션 모드 / reconciliation",
   },
   PORTFOLIO_RISK_UNCERTAIN: {
     category: "safety_block",
@@ -692,6 +855,7 @@ const compatibilityDetailMap: Record<string, string> = {
   REPLACED_BY_NEW_APPROVED_PLAN: "더 최신 승인 플랜으로 대체되어 이전 대기 플랜 감시를 중단했습니다.",
   EXCHANGE_ACCOUNT_STATE_UNAVAILABLE: "거래소 계좌 상태를 확인할 수 없습니다.",
   EXCHANGE_CAN_TRADE_UNKNOWN: "거래소 주문 권한 확인값이 unknown이라 신규 진입을 보류합니다.",
+  EXCHANGE_POSITION_MODE_UNCLEAR: "거래소 포지션 모드가 명확하지 않아 신규 진입을 차단했습니다.",
   EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE: "거래소 또는 네트워크 연결이 일시적으로 불안정합니다.",
   TEMPORARY_MARKET_DATA_FAILURE: "시장 데이터 확인 중 일시적인 오류가 발생했습니다.",
   TEMPORARY_SYNC_FAILURE: "거래소 상태 동기화 중 일시적인 오류가 발생했습니다.",
@@ -773,8 +937,63 @@ const slippageEntryWaitDefinition: ReasonCodeDefinition = {
   check_location_ko: "진입 대기 계획 > 진입 구간 / 현재가 / 허용 가격 괴리",
 };
 
+const slippagePublicationTitles: Record<string, string> = {
+  NO_SAMPLE: "슬리피지 체결 표본이 없습니다",
+  INCOMPLETE: "슬리피지 체결 표본이 불완전합니다",
+  UNKNOWN: "슬리피지 데이터 상태 확인이 필요합니다",
+  NOT_READY: "슬리피지 준비 상태가 부족합니다",
+  BLOCKED: "슬리피지 산출이 차단되었습니다",
+};
+
+const slippagePublicationDetails: Record<string, string> = {
+  NO_SAMPLE: "실제 체결 표본이 없어 평균 체결 불리도를 확정할 수 없습니다.",
+  INCOMPLETE: "일부 체결에 슬리피지 값이 없어 평균 체결 불리도가 불완전합니다.",
+  UNKNOWN: "런타임이 슬리피지 데이터 상태를 확정하지 못했습니다.",
+  NOT_READY: "슬리피지 준비 상태가 부족해 평균 체결 불리도를 확정할 수 없습니다.",
+  BLOCKED: "슬리피지 산출이 차단되어 평균 체결 불리도를 확정할 수 없습니다.",
+};
+
+const fundingPublicationTitles: Record<string, string> = {
+  STALE: "펀딩비 동기화 상태가 오래되었습니다",
+  INCOMPLETE: "펀딩비 동기화가 불완전합니다",
+  UNKNOWN: "펀딩비 동기화 상태 확인이 필요합니다",
+};
+
+function publicationReasonDefinition(code: string): ReasonCodeDefinition | null {
+  const [prefix, rawStatus] = code.split(":", 2);
+  const status = rawStatus?.trim().toUpperCase() ?? "";
+  if (prefix === "SLIPPAGE_DATA_STATUS" && status) {
+    const detail =
+      slippagePublicationDetails[status] ?? `슬리피지 데이터 상태가 ${status}로 게시되었습니다.`;
+    return {
+      category: "safety_block",
+      title_ko: slippagePublicationTitles[status] ?? "슬리피지 데이터 상태 확인이 필요합니다",
+      detail_ko: detail,
+      auto_clear_hint_ko: "실제 체결 표본과 슬리피지 산출 근거가 충분해지면 readiness에서 해소될 수 있습니다.",
+      operator_action_ko:
+        "수익성/비용 분석에서 slippage_data_status, slippage_data_reason, sample count를 함께 확인하세요.",
+      check_location_ko: "대시보드 > 수익성/비용 분석",
+    };
+  }
+  if (prefix === "FUNDING_SYNC_STATUS" && status) {
+    return {
+      category: "safety_block",
+      title_ko: fundingPublicationTitles[status] ?? "펀딩비 동기화 상태 확인이 필요합니다",
+      detail_ko: `펀딩비 동기화 상태가 ${status}라 비용 합계를 확정하기 어렵습니다.`,
+      auto_clear_hint_ko: "펀딩비 동기화가 최신 COMPLETE 상태로 회복되면 readiness에서 해소될 수 있습니다.",
+      operator_action_ko: "비용 분석과 동기화 상태에서 funding_sync_status와 최신 동기화 시각을 확인하세요.",
+      check_location_ko: "대시보드 > 비용 분석 / 상태 동기화",
+    };
+  }
+  return null;
+}
+
 function normalizeReasonCode(value: string | null | undefined) {
   return value?.trim().toUpperCase() ?? "";
+}
+
+export function isReasonCode(value: string | null | undefined, expected: string) {
+  return normalizeReasonCode(value) === normalizeReasonCode(expected);
 }
 
 function normalizeReasonCodeList(values: string[] | null | undefined) {
@@ -877,6 +1096,15 @@ export function describeReasonCode(value: string | null | undefined): ReasonCode
     };
   }
 
+  const publicationDefinition = publicationReasonDefinition(code);
+  if (publicationDefinition) {
+    return {
+      raw_code: raw || code,
+      known: true,
+      ...publicationDefinition,
+    };
+  }
+
   const compatibilityDetail = compatibilityDetailMap[code];
   const category = inferCategory(code);
   const hints = fallbackHint(category);
@@ -914,7 +1142,7 @@ export function describeAiSkipReason(value: string | null | undefined): AiSkipRe
     };
   }
 
-  const definition = aiSkipReasonDefinitions[code];
+  const definition = aiSkipReasonDefinitions[code] ?? aiSkipReasonDefinitions[aiSkipReasonAliases[code] ?? ""];
   if (definition) {
     return {
       raw_code: raw || code,

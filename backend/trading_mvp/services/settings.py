@@ -2549,6 +2549,13 @@ class LiveApprovalWindowError(ValueError):
 
 
 def is_live_execution_armed(settings_row: Setting) -> bool:
+    if (
+        settings_row.manual_live_approval
+        and settings_row.live_execution_armed
+        and settings_row.live_approval_window_minutes == 0
+        and settings_row.live_execution_armed_until is None
+    ):
+        return True
     return bool(
         settings_row.live_execution_armed
         and settings_row.live_execution_armed_until is not None
@@ -3495,14 +3502,18 @@ def build_operational_status_payload(
 def arm_live_execution(session: Session, minutes: int | None = None) -> Setting:
     row = get_or_create_settings(session)
     effective_minutes = resolve_live_approval_window_minutes(row, minutes)
-    if effective_minutes <= 0:
+    if effective_minutes < 0:
         row.live_execution_armed = False
         row.live_execution_armed_until = None
         session.add(row)
         session.flush()
         raise LiveApprovalWindowError(LIVE_APPROVAL_WINDOW_INVALID_REASON_CODE)
+    if effective_minutes == 0:
+        row.live_approval_window_minutes = 0
     row.live_execution_armed = True
-    row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=effective_minutes)
+    row.live_execution_armed_until = (
+        None if effective_minutes == 0 else utcnow_naive() + timedelta(minutes=effective_minutes)
+    )
     session.add(row)
     session.flush()
     return row
@@ -3961,6 +3972,8 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         live_approval_window_minutes=settings_row.live_approval_window_minutes,
         live_execution_ready=operational_status.live_execution_ready,
         trading_paused=operational_status.trading_paused,
+        approval_armed=operational_status.approval_armed,
+        approval_expires_at=operational_status.approval_expires_at,
         guard_mode_reason_category=operational_status.guard_mode_reason_category,
         guard_mode_reason_code=operational_status.guard_mode_reason_code,
         guard_mode_reason_message=operational_status.guard_mode_reason_message,

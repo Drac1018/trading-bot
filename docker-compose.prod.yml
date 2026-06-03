@@ -1,0 +1,154 @@
+services:
+  postgres:
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in the production env file}
+      POSTGRES_USER: ${POSTGRES_USER:?Set a non-default POSTGRES_USER in the production env file}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a non-default POSTGRES_PASSWORD in the production env file}
+    ports: !reset []
+    expose:
+      - "5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: !reset []
+    expose:
+      - "6379"
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  backend:
+    env_file:
+      - path: ${TRADING_MVP_PROD_ENV_FILE:-.env.production}
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_SECRET_SEED: ${APP_SECRET_SEED:?Set APP_SECRET_SEED to a private production value}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL with rotated PostgreSQL credentials}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      OPERATOR_API_KEY: ${OPERATOR_API_KEY:?Set OPERATOR_API_KEY}
+      TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER: ${TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER:-true}
+      TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM: ${TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM:-true}
+      LIVE_TRADING_ENABLED: ${LIVE_TRADING_ENABLED:-false}
+      TRACKED_SYMBOLS: ${TRACKED_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+      MANUAL_LIVE_APPROVAL: ${MANUAL_LIVE_APPROVAL:-true}
+    ports: !reset []
+    expose:
+      - "8000"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import sys, urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5); sys.exit(0 if r.status < 400 else 1)\"",
+        ]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 40s
+
+  worker:
+    env_file:
+      - path: ${TRADING_MVP_PROD_ENV_FILE:-.env.production}
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_SECRET_SEED: ${APP_SECRET_SEED:?Set APP_SECRET_SEED to a private production value}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL with rotated PostgreSQL credentials}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      OPERATOR_API_KEY: ${OPERATOR_API_KEY:?Set OPERATOR_API_KEY}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os, sys; from sqlalchemy import create_engine, text; engine = create_engine(os.environ['DATABASE_URL']); conn = engine.connect(); conn.execute(text('select 1')); conn.close(); sys.exit(0)\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 40s
+
+  frontend:
+    env_file:
+      - path: ${TRADING_MVP_PROD_ENV_FILE:-.env.production}
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      NODE_ENV: production
+      API_BASE_URL: http://backend:8000
+      NEXT_PUBLIC_API_BASE_URL: ""
+      OPERATOR_API_KEY: ${OPERATOR_API_KEY:?Set OPERATOR_API_KEY}
+      OPERATOR_UI_USERNAME: ${OPERATOR_UI_USERNAME:-operator}
+      OPERATOR_UI_PASSWORD: ${OPERATOR_UI_PASSWORD:?Set OPERATOR_UI_PASSWORD with at least 16 characters}
+      FRONTEND_AUTH_SECRET: ${FRONTEND_AUTH_SECRET:?Set FRONTEND_AUTH_SECRET with at least 32 characters}
+      FRONTEND_AUTH_COOKIE_SECURE: ${FRONTEND_AUTH_COOKIE_SECURE:-1}
+      OPERATOR_UI_BEHIND_TLS_PROXY: "1"
+      OPERATOR_UI_TRUSTED_PROXY_SECRET: ${OPERATOR_UI_TRUSTED_PROXY_SECRET:?Set OPERATOR_UI_TRUSTED_PROXY_SECRET}
+    ports: !reset []
+    expose:
+      - "3000"
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://127.0.0.1:3000/login', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 40s
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      CADDY_STORAGE_PATH: /data/caddy
+      OPERATOR_HTTPS_HOST: ${OPERATOR_HTTPS_HOST:?Set OPERATOR_HTTPS_HOST}
+      BACKEND_UPSTREAM: backend:8000
+      OPERATOR_UPSTREAM: frontend:3000
+      OPERATOR_UI_TRUSTED_PROXY_SECRET: ${OPERATOR_UI_TRUSTED_PROXY_SECRET:?Set OPERATOR_UI_TRUSTED_PROXY_SECRET}
+    ports:
+      - "${OPERATOR_HTTP_BIND:-80}:80"
+      - "${OPERATOR_HTTPS_BIND:-443}:443"
+    volumes:
+      - ./infra/caddy/operator.Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_healthy
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:

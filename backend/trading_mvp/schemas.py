@@ -28,6 +28,8 @@ RegimeExecution = Literal["clean", "normal", "stress", "unavailable"]
 PersistenceClass = Literal["early", "established", "extended"]
 TransitionRisk = Literal["low", "medium", "high"]
 DataQualityGrade = Literal["complete", "partial", "degraded", "unavailable"]
+SlippageDataStatus = Literal["COMPLETE", "INCOMPLETE", "NO_SAMPLE", "NOT_READY", "BLOCKED", "UNKNOWN"]
+FundingSyncStatus = Literal["COMPLETE", "INCOMPLETE", "STALE", "UNKNOWN"]
 LeadContextStatus = Literal["ok", "partial", "unavailable"]
 EventSourceStatus = Literal["fixture", "stub", "external_api", "unavailable", "stale", "incomplete", "error"]
 EventSourceProvenance = Literal["fixture", "stub", "external_api"]
@@ -84,6 +86,102 @@ AdvisorNewEntryPolicy = Literal[
 ]
 ExecutionRiskProfileAutoApplyMode = Literal["off", "shadow", "conservative_only", "manual_approval"]
 AI_CONTEXT_VERSION = "2026-04-context-v1"
+
+
+def _default_slippage_data_reason(
+    status: str | None,
+    *,
+    sample_count: int | None = None,
+    missing_count: int | None = None,
+) -> str | None:
+    if status == "COMPLETE":
+        return None
+    if status == "NO_SAMPLE":
+        return "no_execution_slippage_sample"
+    if status == "INCOMPLETE":
+        return "missing_execution_slippage_sample" if (missing_count or 0) > 0 else "no_valid_slippage_sample"
+    if status == "NOT_READY":
+        return "slippage_not_ready"
+    if status == "BLOCKED":
+        return "slippage_blocked"
+    if status == "UNKNOWN":
+        return "slippage_status_unknown"
+    if (sample_count or 0) <= 0:
+        return "no_valid_slippage_sample"
+    return None
+
+
+def _default_funding_sync_reason(status: str | None) -> str | None:
+    normalized = str(status or "").strip().upper()
+    if not normalized or normalized == "COMPLETE":
+        return None
+    if normalized == "INCOMPLETE":
+        return "funding_sync_incomplete"
+    if normalized == "STALE":
+        return "funding_sync_stale"
+    if normalized == "UNKNOWN":
+        return "funding_sync_unknown"
+    return None
+
+
+def _normalize_publication_warning_code(value: str | None) -> str | None:
+    code = str(value or "").strip()
+    if not code:
+        return None
+    prefix, separator, raw_status = code.partition(":")
+    normalized_prefix = prefix.strip().lower()
+    if separator == ":" and normalized_prefix in {
+        "execution_sync_status",
+        "slippage_data_status",
+        "funding_sync_status",
+    }:
+        status = raw_status.strip().upper()
+        if status:
+            return f"{normalized_prefix}:{status}"
+    if normalized_prefix in {
+        "fee_asset_conversion_unavailable",
+        "funding_asset_conversion_unavailable",
+    }:
+        asset = raw_status.strip().upper() if separator == ":" else ""
+        return f"{normalized_prefix}:{asset}" if asset else normalized_prefix
+    return code
+
+
+def _normalize_publication_warning_codes(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        _append_publication_warning_code(result, value)
+    return result
+
+
+def _publication_warning_status_parts(value: str) -> tuple[str, str] | None:
+    prefix, separator, status = value.partition(":")
+    if (
+        separator == ":"
+        and prefix in {"execution_sync_status", "slippage_data_status", "funding_sync_status"}
+        and status
+    ):
+        return prefix, status
+    return None
+
+
+def _append_publication_warning_code(target: list[str], value: str) -> None:
+    warning_code = _normalize_publication_warning_code(value)
+    if not warning_code:
+        return
+    status_parts = _publication_warning_status_parts(warning_code)
+    if status_parts is not None:
+        prefix, status = status_parts
+        unknown_code = f"{prefix}:UNKNOWN"
+        if status != "UNKNOWN":
+            target[:] = [existing for existing in target if existing != unknown_code]
+        elif any(
+            existing.startswith(f"{prefix}:") and existing != unknown_code
+            for existing in target
+        ):
+            return
+    if warning_code not in target:
+        target.append(warning_code)
 
 
 class StrictBaseModel(BaseModel):
@@ -1315,8 +1413,16 @@ class DashboardProfitabilityCostBreakdown(StrictBaseModel):
     net_pnl: float = 0.0
     net_pnl_excluding_funding: float = 0.0
     net_pnl_including_funding: float = 0.0
-    signed_slippage_bps_avg: float = 0.0
-    adverse_slippage_bps_avg: float = 0.0
+    signed_slippage_bps_avg: float | None = None
+    adverse_slippage_bps_avg: float | None = None
+    slippage_data_status: SlippageDataStatus = "UNKNOWN"
+    slippage_data_reason: str | None = None
+    execution_sync_status: str | None = None
+    missing_close_execution_count: int = Field(default=0, ge=0)
+    funding_sync_status: FundingSyncStatus | None = None
+    funding_sync_reason: str | None = None
+    slippage_sample_count: int = Field(default=0, ge=0)
+    missing_slippage_sample_count: int = Field(default=0, ge=0)
     entry_count: int = Field(default=0, ge=0)
     marketable_entry_count: int = Field(default=0, ge=0)
     passive_entry_count: int = Field(default=0, ge=0)
@@ -1327,6 +1433,44 @@ class DashboardProfitabilityCostBreakdown(StrictBaseModel):
     total_cost: float = 0.0
     warning_codes: list[str] = Field(default_factory=list)
     basis: str = "decision_performance_summary_plus_execution_ledger"
+
+    @model_validator(mode="after")
+    def _backfill_slippage_publication(self) -> DashboardProfitabilityCostBreakdown:
+        self.warning_codes = _normalize_publication_warning_codes(self.warning_codes)
+        execution_status = str(self.execution_sync_status or "").strip().upper()
+        if self.missing_close_execution_count > 0 and execution_status in {"", "COMPLETE"}:
+            execution_status = "INCOMPLETE"
+        if execution_status:
+            self.execution_sync_status = execution_status
+            if execution_status != "COMPLETE":
+                _append_publication_warning_code(
+                    self.warning_codes,
+                    f"execution_sync_status:{execution_status}",
+                )
+        if self.missing_close_execution_count > 0:
+            _append_publication_warning_code(
+                self.warning_codes,
+                f"missing_close_execution_count:{self.missing_close_execution_count}",
+            )
+        if self.slippage_data_status != "COMPLETE" and not self.slippage_data_reason:
+            self.slippage_data_reason = _default_slippage_data_reason(
+                self.slippage_data_status,
+                sample_count=self.slippage_sample_count,
+                missing_count=self.missing_slippage_sample_count,
+            )
+        if self.slippage_data_status != "COMPLETE":
+            _append_publication_warning_code(
+                self.warning_codes,
+                f"slippage_data_status:{self.slippage_data_status}",
+            )
+        funding_status = str(self.funding_sync_status or "").strip().upper()
+        if funding_status:
+            self.funding_sync_status = funding_status  # type: ignore[assignment]
+            if funding_status != "COMPLETE" and not self.funding_sync_reason:
+                self.funding_sync_reason = _default_funding_sync_reason(funding_status)
+            if funding_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
+                _append_publication_warning_code(self.warning_codes, f"funding_sync_status:{funding_status}")
+        return self
 
 
 class DashboardPnlSnapshotBreakdown(StrictBaseModel):
@@ -1398,15 +1542,83 @@ class AnalyticsCostBreakdownBucket(StrictBaseModel):
     total_cost_ratio_pct: float | None = None
     signed_slippage_bps: float | None = None
     adverse_slippage_bps: float | None = None
+    slippage_data_status: SlippageDataStatus = "UNKNOWN"
+    slippage_data_reason: str | None = None
+    funding_sync_status: FundingSyncStatus | None = None
+    funding_sync_reason: str | None = None
+    slippage_sample_count: int = Field(default=0, ge=0)
+    missing_slippage_sample_count: int = Field(default=0, ge=0)
+    warning_codes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _backfill_slippage_publication(self) -> AnalyticsCostBreakdownBucket:
+        self.warning_codes = _normalize_publication_warning_codes(self.warning_codes)
+        if self.slippage_data_status != "COMPLETE" and not self.slippage_data_reason:
+            self.slippage_data_reason = _default_slippage_data_reason(
+                self.slippage_data_status,
+                sample_count=self.slippage_sample_count,
+                missing_count=self.missing_slippage_sample_count,
+            )
+        if self.slippage_data_status != "COMPLETE":
+            _append_publication_warning_code(
+                self.warning_codes,
+                f"slippage_data_status:{self.slippage_data_status}",
+            )
+        funding_status = str(self.funding_sync_status or "").strip().upper()
+        if funding_status:
+            self.funding_sync_status = funding_status  # type: ignore[assignment]
+            if funding_status != "COMPLETE" and not self.funding_sync_reason:
+                self.funding_sync_reason = _default_funding_sync_reason(funding_status)
+            if funding_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
+                _append_publication_warning_code(self.warning_codes, f"funding_sync_status:{funding_status}")
+        return self
 
 
 class AnalyticsCostBreakdownDataQuality(StrictBaseModel):
     realized_pnl_confirmed: bool = True
     execution_sync_status: str = "COMPLETE"
     funding_sync_status: str = "UNKNOWN"
-    slippage_data_status: str = "UNKNOWN"
+    funding_sync_reason: str | None = None
+    slippage_data_status: SlippageDataStatus = "UNKNOWN"
+    slippage_data_reason: str | None = None
+    slippage_sample_count: int = Field(default=0, ge=0)
+    missing_slippage_sample_count: int = Field(default=0, ge=0)
     missing_close_execution_count: int = Field(default=0, ge=0)
     slippage_weighting: str = "quantity"
+    warning_codes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _backfill_data_quality_publication(self) -> AnalyticsCostBreakdownDataQuality:
+        self.warning_codes = _normalize_publication_warning_codes(self.warning_codes)
+        execution_status = str(self.execution_sync_status or "").strip().upper()
+        if execution_status:
+            self.execution_sync_status = execution_status
+        if execution_status and execution_status != "COMPLETE":
+            _append_publication_warning_code(self.warning_codes, f"execution_sync_status:{execution_status}")
+        if self.slippage_data_status != "COMPLETE" and not self.slippage_data_reason:
+            self.slippage_data_reason = _default_slippage_data_reason(
+                self.slippage_data_status,
+                sample_count=self.slippage_sample_count,
+                missing_count=self.missing_slippage_sample_count,
+            )
+        if self.missing_close_execution_count > 0:
+            _append_publication_warning_code(
+                self.warning_codes,
+                f"missing_close_execution_count:{self.missing_close_execution_count}",
+            )
+        funding_status = str(self.funding_sync_status or "").strip().upper()
+        if funding_status:
+            self.funding_sync_status = funding_status
+        if funding_status != "COMPLETE" and not self.funding_sync_reason:
+            self.funding_sync_reason = _default_funding_sync_reason(funding_status)
+        if funding_status in {"INCOMPLETE", "STALE", "UNKNOWN"}:
+            _append_publication_warning_code(self.warning_codes, f"funding_sync_status:{funding_status}")
+        if self.slippage_data_status != "COMPLETE":
+            _append_publication_warning_code(
+                self.warning_codes,
+                f"slippage_data_status:{self.slippage_data_status}",
+            )
+        return self
 
 
 class AnalyticsCostBreakdownResponse(StrictBaseModel):
@@ -1418,6 +1630,17 @@ class AnalyticsCostBreakdownResponse(StrictBaseModel):
     buckets: list[AnalyticsCostBreakdownBucket] = Field(default_factory=list)
     data_quality: AnalyticsCostBreakdownDataQuality
     warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _backfill_data_quality_warnings(self) -> AnalyticsCostBreakdownResponse:
+        self.warnings = _normalize_publication_warning_codes(self.warnings)
+        nested_warning_codes = [
+            *self.data_quality.warning_codes,
+            *(warning_code for bucket in self.buckets for warning_code in bucket.warning_codes),
+        ]
+        for warning_code in nested_warning_codes:
+            _append_publication_warning_code(self.warnings, warning_code)
+        return self
 
 
 class DashboardProfitabilityWindow(StrictBaseModel):
@@ -1650,7 +1873,13 @@ class OperatorControlState(StrictBaseModel):
     user_stream_summary: dict[str, Any] = Field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = Field(default_factory=dict, exclude=True)
     candidate_selection_summary: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    service_gate_gate_clear: bool = False
     service_gate_blockers: list[str] = Field(default_factory=list)
+    service_gate_root_cause_codes: list[str] = Field(default_factory=list)
+    service_gate_counts: dict[str, int] = Field(default_factory=dict)
+    service_gate_recent_scheduler_non_success: list[dict[str, Any]] = Field(default_factory=list)
+    service_gate_recent_health_errors: list[dict[str, Any]] = Field(default_factory=list)
+    service_gate_redis_cache: dict[str, Any] = Field(default_factory=dict)
     stale_pending_entry_plan_count: int = 0
     stale_pending_entry_plans: list[dict[str, Any]] = Field(default_factory=list)
     triggered_terminal_history_entry_plan_count: int = 0
@@ -1768,6 +1997,7 @@ class OperatorDecisionSnapshot(StrictBaseModel):
     psychology_scene_review: PsychologySceneReview | None = None
     psychology_scene_performance: dict[str, Any] = Field(default_factory=dict)
     decision_reference: DecisionReferencePayload = Field(default_factory=DecisionReferencePayload)
+    hold_diagnostic: dict[str, Any] = Field(default_factory=dict)
     raw_output: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -3036,6 +3266,8 @@ class AppSettingsViewResponse(StrictBaseModel):
     live_approval_window_minutes: int
     live_execution_ready: bool
     trading_paused: bool
+    approval_armed: bool = False
+    approval_expires_at: datetime | None = None
     guard_mode_reason_category: str | None = None
     guard_mode_reason_code: str | None = None
     guard_mode_reason_message: str | None = None

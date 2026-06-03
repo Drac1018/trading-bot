@@ -143,6 +143,7 @@ type OperatorAiDecisionReadModel = OperatorSymbol["ai_decision"] & {
   market_signal_context?: Record<string, unknown> | null;
   macro_event_context_summary?: MacroEventContextSummary | null;
   macro_event_risk_summary?: MacroEventContextSummary | null;
+  hold_diagnostic?: Record<string, unknown> | null;
 };
 type OperatorProtectionReadModel = OperatorSymbol["protection_status"] & {
   blocked_reason_code?: string | null;
@@ -353,6 +354,13 @@ const reasonCodeLabelMap: Record<string, string> = {
   ENTRY_CANDIDATE_SELECTED: "신규 진입 후보 선정",
   ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
   ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF: "반복 중립 후보라 AI 검토 생략",
+  ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI: "중립 신호라 AI 검토 생략",
+  ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF: "반복 저효용 후보라 AI 검토 생략",
+  ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE: "주문 경로 미준비로 AI 검토 생략",
+  ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI: "기존 대기 진입안으로 AI 검토 생략",
+  ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI: "진입 구조 불완전으로 AI 검토 생략",
+  ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN: "최근 같은 장면의 AI hold 판단 재사용",
+  AI_ENTRY_OUTPUT_INCOMPLETE: "AI 진입안 구조 불완전으로 hold 정규화",
   ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "일일 AI 토큰 예산 소진",
   SOFT_SIGNAL_AI_REVIEW: "약한 후보 AI 검토 대상",
   SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE: "약한 관망 후보라 AI 호출 전 억제",
@@ -2905,6 +2913,49 @@ function aiMarketSignalSummary(symbol: OperatorSymbol) {
   );
 }
 
+function holdDiagnosticReadModel(symbol: OperatorSymbol) {
+  const diagnostic = asRecord(aiDecisionReadModel(symbol).hold_diagnostic);
+  return asNonEmptyString(diagnostic?.status) === "active" ? diagnostic : null;
+}
+
+function holdDiagnosticSummary(symbol: OperatorSymbol) {
+  const diagnostic = holdDiagnosticReadModel(symbol);
+  if (!diagnostic) {
+    return null;
+  }
+  const summaryCode = asNonEmptyString(diagnostic.summary_code);
+  const labels: Record<string, string> = {
+    no_entry_candidate: "진입 후보가 0개라 AI/리스크 이후가 아니라 후보 단계에서 관망 중입니다.",
+    low_edge_hold: "기대값, 파생시장, 선행시장 근거가 중립이라 거래 우위가 부족합니다.",
+    pre_ai_skip: "저효용 후보라 provider 호출 전 관망 처리했습니다.",
+    hold_context: "신규 진입보다 관망이 유리한 조건으로 판단했습니다.",
+  };
+  return labels[summaryCode ?? ""] ?? labels.hold_context;
+}
+
+function holdDiagnosticReasonCodes(symbol: OperatorSymbol) {
+  const diagnostic = holdDiagnosticReadModel(symbol);
+  return diagnostic ? asStringArray(diagnostic.reason_codes) : [];
+}
+
+function holdDiagnosticMetricText(symbol: OperatorSymbol) {
+  const diagnostic = holdDiagnosticReadModel(symbol);
+  const metrics = asRecord(diagnostic?.metrics);
+  const entryCandidates = asFiniteNumber(metrics?.entry_candidates);
+  const threshold = asFiniteNumber(metrics?.entry_score_threshold);
+  const slotScore = asFiniteNumber(metrics?.slot_conviction_score);
+  const derivatives = asFiniteNumber(metrics?.derivatives_alignment);
+  const leadLag = asFiniteNumber(metrics?.lead_lag_alignment);
+  const parts = [
+    entryCandidates !== null ? `후보 ${formatCount(entryCandidates)}개` : null,
+    threshold !== null ? `기준 ${formatNumber(threshold, 2)}` : null,
+    slotScore !== null ? `슬롯 ${formatNumber(slotScore, 2)}` : null,
+    derivatives !== null ? `파생 ${formatNumber(derivatives, 2)}` : null,
+    leadLag !== null ? `선행 ${formatNumber(leadLag, 2)}` : null,
+  ].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join(" / ") : "세부 점수 없음";
+}
+
 function aiMacroEventContext(symbol: OperatorSymbol) {
   const ai = aiDecisionReadModel(symbol);
   return (
@@ -3565,6 +3616,9 @@ function EntryLifecycleSummaryPanel({
   const macroEventDetail = formatMacroEventContextDetail(macroEventContext);
   const riskReasons = symbolRiskReasonCodes(symbol);
   const rationaleBadges = summarizeInternalCodeBadges(symbol.ai_decision.rationale_codes);
+  const holdDiagnosticText = holdDiagnosticSummary(symbol);
+  const holdDiagnosticCodes = holdDiagnosticReasonCodes(symbol);
+  const holdDiagnosticBadges = summarizeInternalCodeBadges(holdDiagnosticCodes);
 
   return (
     <div className="space-y-4">
@@ -3601,6 +3655,32 @@ function EntryLifecycleSummaryPanel({
             <span className="text-sm text-slate-500">근거 코드 없음</span>
           )}
         </div>
+        {holdDiagnosticText ? (
+          <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3">
+            <p className="text-xs font-semibold text-amber-900">관망 진단</p>
+            <p className="mt-1 text-sm leading-6 text-amber-950">{holdDiagnosticText}</p>
+            <p className="mt-1 text-xs leading-5 text-amber-800">{holdDiagnosticMetricText(symbol)}</p>
+            {holdDiagnosticBadges.visible.length > 0 ? (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {holdDiagnosticBadges.visible.map((badge) => (
+                  <span
+                    key={badge.key}
+                    title={badge.codes.join(", ")}
+                    className="rounded-full bg-white px-3 py-1 text-xs font-medium text-amber-900"
+                  >
+                    {badge.label}
+                    {badge.count > 1 ? ` ${badge.count}개` : ""}
+                  </span>
+                ))}
+                {holdDiagnosticBadges.hiddenCount > 0 ? (
+                  <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-amber-900">
+                    외 {holdDiagnosticBadges.hiddenCount}개
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {rawCodeDetails("AI 내부 근거 보기", symbol.ai_decision.rationale_codes)}
       </div>
       <AiSceneReviewPanel symbol={symbol} />
@@ -5362,6 +5442,13 @@ function formatInternalCodeLabel(value: string | null | undefined) {
     transition_fragile: "전환 레짐이 불안정",
     top_trader_long_crowded: "상위 트레이더 롱 쏠림",
     low_edge_hold_candidate: "우위가 약해 대기",
+    ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI: "중립 신호라 AI 검토 생략",
+    ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF: "반복 저효용 후보라 AI 검토 생략",
+    ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE: "주문 경로 미준비로 AI 검토 생략",
+    ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI: "기존 대기 진입안으로 AI 검토 생략",
+    ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI: "진입 구조 불완전으로 AI 검토 생략",
+    ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN: "최근 같은 장면의 AI hold 판단 재사용",
+    AI_ENTRY_OUTPUT_INCOMPLETE: "AI 진입안 구조 불완전으로 hold 정규화",
     ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "일일 AI 토큰 예산 소진",
     SOFT_SIGNAL_AI_REVIEW: "약한 후보 AI 검토 대상",
     SOFT_SIGNAL_TRANSITION_WATCH: "약한 후보 전환감시",
@@ -5374,6 +5461,15 @@ function formatInternalCodeLabel(value: string | null | undefined) {
     DERIVATIVES_ALIGNMENT_HEADWIND: "파생시장 정합성 부족",
     BREAKOUT_OI_SPREAD_FILTER: "돌파 OI/스프레드 조건 부족",
     BREAKOUT_OI_NOT_EXPANDING: "돌파 OI 확장 없음",
+    EXPECTANCY_NEUTRAL: "기대값 중립",
+    DERIVATIVES_NEUTRAL: "파생시장 중립",
+    DERIVATIVES_HEADWIND: "파생시장 역풍",
+    LEAD_MARKETS_NEUTRAL: "선행시장 중립",
+    TOP_TRADER_LONG_CROWDED: "상위 트레이더 롱 쏠림",
+    WEAK_BREADTH: "시장 폭 약화",
+    BREADTH_WEAK_REDUCE_CAPACITY: "시장 폭 약화로 진입 여력 축소",
+    WEAK_VOLUME: "거래량 확인 약함",
+    MOMENTUM_WEAKENING: "모멘텀 약화",
     low_conviction_slot_excluded: "확신도 낮음으로 미선정",
     underperforming_expectancy_bucket: "최근 기대값 버킷 약화",
     expectancy_below_threshold: "기대값 기준 부족",

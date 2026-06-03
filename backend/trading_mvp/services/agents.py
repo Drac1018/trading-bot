@@ -100,6 +100,14 @@ MODEL_OWNED_TRADE_DECISION_FIELDS = {
     "quality_penalty_level",
     "provider_not_called_due_to_quality",
 }
+AI_ENTRY_OUTPUT_INCOMPLETE_REASON_CODE = "AI_ENTRY_OUTPUT_INCOMPLETE"
+AI_ENTRY_OUTPUT_REQUIRED_FIELDS = (
+    "entry_zone_min",
+    "entry_zone_max",
+    "stop_loss",
+    "take_profit",
+    "invalidation_price",
+)
 BRACKET_FEE_TO_GROSS_TOO_HIGH_REASON_CODE = "fee_to_gross_ratio_too_high"
 BRACKET_BTC_LONG_TP_TOO_TIGHT_REASON_CODE = "btc_long_tp_too_tight"
 BRACKET_MIN_GROSS_BPS_DEFAULT = 40.0
@@ -2023,6 +2031,127 @@ class TradingDecisionAgent:
                 "idea_ttl_minutes": normalized_idea_ttl_minutes,
                 "max_holding_minutes": normalized_max_holding_minutes,
                 "rationale_codes": normalized_rationale_codes,
+            }
+        )
+
+    @staticmethod
+    def _raw_output_has_value(payload: dict[str, Any], field: str) -> bool:
+        return payload.get(field) not in {None, ""}
+
+    @classmethod
+    def _entry_output_quality_guard_context(
+        cls,
+        decision: TradeDecision,
+        *,
+        raw_output: dict[str, Any],
+        route,
+        ai_context: AIDecisionContextPacket | None,
+        has_open_position: bool,
+    ) -> dict[str, Any]:
+        if (
+            decision.decision not in {"long", "short"}
+            or has_open_position
+            or not bool(getattr(route, "allow_new_entry", False))
+            or (ai_context is not None and ai_context.trigger_type != "entry_candidate_event")
+        ):
+            return {"active": False}
+        selection_summary = (
+            dict(ai_context.selection_context_summary)
+            if ai_context is not None and isinstance(ai_context.selection_context_summary, dict)
+            else {}
+        )
+        if selection_summary.get("selected") is False:
+            return {
+                "active": False,
+                "reason": "soft_signal_or_rejected_candidate_review",
+            }
+
+        entry_zone_payload = raw_output.get("entry_zone")
+        entry_zone = dict(entry_zone_payload) if isinstance(entry_zone_payload, dict) else {}
+        has_entry_zone_min = cls._raw_output_has_value(raw_output, "entry_zone_min") or cls._raw_output_has_value(
+            entry_zone,
+            "low",
+        )
+        has_entry_zone_max = cls._raw_output_has_value(raw_output, "entry_zone_max") or cls._raw_output_has_value(
+            entry_zone,
+            "high",
+        )
+        has_invalidation = cls._raw_output_has_value(raw_output, "invalidation_price") or cls._raw_output_has_value(
+            raw_output,
+            "invalidation_level",
+        )
+        missing_fields = [
+            field
+            for field, present in (
+                ("entry_zone_min", has_entry_zone_min),
+                ("entry_zone_max", has_entry_zone_max),
+                ("stop_loss", cls._raw_output_has_value(raw_output, "stop_loss")),
+                ("take_profit", cls._raw_output_has_value(raw_output, "take_profit")),
+                ("invalidation_price", has_invalidation),
+            )
+            if not present
+        ]
+        if not missing_fields:
+            return {
+                "active": False,
+                "required_fields": list(AI_ENTRY_OUTPUT_REQUIRED_FIELDS),
+            }
+        return {
+            "active": True,
+            "reason": "new_entry_direct_intent_missing_required_trade_geometry",
+            "missing_fields": missing_fields,
+            "required_fields": list(AI_ENTRY_OUTPUT_REQUIRED_FIELDS),
+            "decision": decision.decision,
+            "prompt_family": getattr(route, "prompt_family", None),
+            "trigger_type": ai_context.trigger_type if ai_context is not None else None,
+        }
+
+    @classmethod
+    def _apply_entry_output_quality_guard(
+        cls,
+        decision: TradeDecision,
+        *,
+        quality_context: dict[str, Any],
+    ) -> TradeDecision:
+        if not bool(quality_context.get("active")):
+            return decision
+        reason_codes = [AI_ENTRY_OUTPUT_INCOMPLETE_REASON_CODE]
+        no_trade_reason_codes = cls._unique_reason_codes(decision.no_trade_reason_codes, reason_codes)
+        fallback_reason_codes = cls._unique_reason_codes(decision.fallback_reason_codes, reason_codes)
+        return decision.model_copy(
+            update={
+                "decision": "hold",
+                "entry_mode": "none",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
+                "entry_zone": None,
+                "watch_entry_plan": None,
+                "invalidation_price": None,
+                "invalidation_level": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "confidence": min(decision.confidence, 0.45),
+                "should_abstain": True,
+                "no_trade_reason_codes": no_trade_reason_codes,
+                "abstain_reason_codes": cls._unique_reason_codes(
+                    decision.abstain_reason_codes,
+                    no_trade_reason_codes,
+                ),
+                "primary_reason_codes": cls._unique_reason_codes(
+                    decision.primary_reason_codes,
+                    reason_codes,
+                ),
+                "rationale_codes": cls._unique_reason_codes(decision.rationale_codes, reason_codes),
+                "fallback_reason_codes": fallback_reason_codes,
+                "bounded_output_applied": True,
+                "reason_summary": "AI entry output was missing required trade geometry.",
+                "explanation_short": "AI entry output was bounded to hold.",
+                "explanation_detailed": (
+                    "The provider proposed a direct entry without all required entry zone, stop, target, "
+                    "and invalidation fields, so the intent was normalized to hold before risk evaluation."
+                ),
             }
         )
 
@@ -4022,8 +4151,20 @@ class TradingDecisionAgent:
             sanitized_output, model_owned_fields_stripped = self._strip_model_owned_trade_decision_fields(
                 provider_result.output
             )
+            raw_decision = TradeDecision.model_validate(sanitized_output)
+            entry_output_quality_guard = self._entry_output_quality_guard_context(
+                raw_decision,
+                raw_output=sanitized_output,
+                route=prompt_route,
+                ai_context=resolved_ai_context,
+                has_open_position=bool(open_positions),
+            )
+            raw_decision = self._apply_entry_output_quality_guard(
+                raw_decision,
+                quality_context=entry_output_quality_guard,
+            )
             decision = self._normalize_entry_trigger_fields(
-                TradeDecision.model_validate(sanitized_output),
+                raw_decision,
                 market_snapshot=market_snapshot,
                 features=features,
             )
@@ -4101,6 +4242,8 @@ class TradingDecisionAgent:
             metadata["fallback_reason_codes"] = list(bounded_result.fallback_reason_codes)
             metadata["fail_closed_applied"] = bounded_result.fail_closed_applied
             metadata["model_owned_fields_stripped"] = model_owned_fields_stripped
+            metadata["entry_output_quality_guard"] = entry_output_quality_guard
+            metadata["entry_output_quality_bounded"] = bool(entry_output_quality_guard.get("active"))
             metadata["should_abstain"] = decision.should_abstain
             metadata["abstain_reason_codes"] = list(bounded_result.abstain_reason_codes)
             metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
