@@ -26,6 +26,13 @@
 * 정리할지 애매한 dirty 파일은 보존하고, 파일 경로와 판단 사유를 보고한다.
 * 최소 변경을 기본값으로 두고, 하위 `backend/AGENTS.md`, `backend/trading_mvp/services/AGENTS.md`, `frontend/AGENTS.md`의 세부 지침을 각 영역에서 함께 따른다.
 
+## Codex 자동화 상태 하네스
+
+* 제품화, Docker prod runtime, service-gate, profitability, cost-breakdown, operator dashboard, readiness 상태 게시 관련 자동화는 `AGENTS.md` 다음에 `docs/ops/codex_automation_state.md`를 반드시 읽는다.
+* `docs/ops/codex_automation_state.md`에 `forced_source_repair` 하네스가 있으면, 사용자가 더 좁은 범위를 지정하지 않은 한 그 문서의 모드, 금지 범위, 허용 수정 범위, Docker runtime proof, 검증, 완료 출력 계약을 우선 적용한다.
+* 이 하네스는 자유도를 넓히기 위한 문서지만 live write, risk_guard 완화, execution/order path 완화, secret 출력, READY 강제 전환, destructive migration을 허용하지 않는다.
+* 자동화가 실제 source/test 수정을 완료하지 못하면 docs-only/report-only 완료로 포장하지 말고, 문서가 지정한 partial 또는 blocked 모드로 종료한다.
+
 ## 운영 상태 검증
 
 * 운영 상태, 실거래 안전, 상태 불일치, stale runtime, 제품화 보안, 성능/비용 진단은 `AGENTS.md`만 보지 말고 실제 런타임 근거와 함께 판단한다.
