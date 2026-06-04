@@ -113,6 +113,8 @@ export type OperatorDetailSymbolLike = {
     event_risk_acknowledgement?: string | null;
     confidence_penalty_reason?: string | null;
     scenario_note?: string | null;
+    psychology_scene_review?: Record<string, unknown> | null;
+    psychology_scene_performance?: Record<string, unknown> | null;
   };
   risk_guard: {
     allowed: boolean | null;
@@ -134,6 +136,10 @@ export type OperatorDetailSymbolLike = {
     execution_status: string | null;
     order_status: string | null;
   };
+  open_position?: {
+    is_open?: boolean | null;
+    position_exit_review?: Record<string, unknown> | null;
+  } | null;
   blocked_reasons: string[];
   stale_flags: string[];
 };
@@ -284,6 +290,26 @@ const displayValueMap: Record<string, string> = {
   deduped: "중복 생략",
   ENTRY_CANDIDATE_SELECTED: "신규 진입 후보 선정",
   ENTRY_CANDIDATE_WEAK_VOLUME_PREAI: "거래량 부족으로 AI 검토 생략",
+  ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF: "반복 중립 후보라 AI 검토 생략",
+  ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI: "중립 신호라 AI 검토 생략",
+  ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF: "반복 저효용 후보라 AI 검토 생략",
+  ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE: "주문 경로 미준비로 AI 검토 생략",
+  ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI: "기존 대기 진입안으로 AI 검토 생략",
+  ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI: "진입 구조 불완전으로 AI 검토 생략",
+  ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN: "최근 같은 장면의 AI hold 판단 재사용",
+  AI_ENTRY_OUTPUT_INCOMPLETE: "AI 진입안 구조 불완전으로 hold 정규화",
+  ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "일일 AI 토큰 예산 소진",
+  SOFT_SIGNAL_AI_REVIEW: "약한 후보 AI 검토 대상",
+  SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE: "약한 관망 후보라 AI 호출 전 억제",
+  SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE: "약한 후보 전환감시 쿨다운",
+  SOFT_SIGNAL_REVIEW_NO_MATERIAL_CHANGE: "약한 후보 변화 부족으로 AI 생략",
+  AI_CYCLE_BUDGET_EXHAUSTED: "사이클 AI 예산 초과로 신규 후보 검토 생략",
+  SOFT_SIGNAL_TRANSITION_WATCH: "약한 후보 전환감시",
+  SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH: "직접 진입 대신 대기 계획",
+  SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD: "약한 후보 직접 진입 차단",
+  DERIVATIVES_ALIGNMENT_HEADWIND: "파생시장 정합성 부족",
+  BREAKOUT_OI_SPREAD_FILTER: "돌파 OI/스프레드 조건 부족",
+  BREAKOUT_OI_NOT_EXPANDING: "돌파 OI 확장 없음",
   MACRO_EVENT_IMMINENT: "주요 경제 이벤트 임박으로 신규 진입 보수화",
   MACRO_EVENT_RISK_WINDOW_ACTIVE: "거시 이벤트 리스크 구간",
   MACRO_RELEASE_REACTION_WINDOW: "발표 직후 변동성 구간",

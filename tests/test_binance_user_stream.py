@@ -46,6 +46,17 @@ class _KeepaliveClient:
             yield listen_key
 
 
+class _KeepaliveFailClient(_KeepaliveClient):
+    def keepalive_futures_listen_key(self, listen_key: str) -> dict[str, Any]:
+        self.keepalives.append(listen_key)
+        raise RuntimeError("keepalive failed")
+
+
+class _CloseFailClient(_KeepaliveClient):
+    def close_futures_listen_key(self, listen_key: str) -> dict[str, Any]:
+        raise RuntimeError("close failed")
+
+
 class _DisconnectOnceClient(_KeepaliveClient):
     def __init__(self) -> None:
         super().__init__()
@@ -111,6 +122,16 @@ class _InvalidListenKeyRecoveryClient(_KeepaliveClient):
     def close_futures_listen_key(self, listen_key: str) -> dict[str, Any]:
         self.closed.append(listen_key)
         return {"listenKey": listen_key}
+
+
+def _assert_issue_payloads_mask_listen_key(issues: list[dict[str, Any]]) -> None:
+    assert issues
+    for issue in issues:
+        payload = issue.get("payload") or {}
+        assert "listen_key" not in payload
+        assert "listen-key" not in repr(payload)
+        if "listen_key_present" in payload:
+            assert payload["listen_key_present"] is True
 
 
 def test_normalize_user_stream_event_distinguishes_order_and_execution() -> None:
@@ -210,6 +231,38 @@ def test_user_stream_listener_collect_once_marks_backoff_on_disconnect() -> None
     assert state["backoff_seconds"] == 1.0
     assert state["next_retry_at"] is not None
     assert any(issue["reason_code"] == "USER_STREAM_CONNECTION_DROPPED" for issue in issues)
+    _assert_issue_payloads_mask_listen_key(issues)
+
+
+def test_user_stream_listener_registration_failure_masks_listen_key_in_issue_payload() -> None:
+    base = datetime(2026, 4, 17, 12, 0, 0)
+    client = _KeepaliveFailClient()
+    listener = BinanceUserStreamListener(client, now_fn=lambda: base)
+
+    state, issues = listener.ensure_registration(
+        {
+            "status": "connected",
+            "listen_key": "listen-key-old",
+            "listen_key_refreshed_at": (base - timedelta(minutes=30)).isoformat(),
+        }
+    )
+
+    assert state["status"] == "degraded"
+    assert state["listen_key"] == "listen-key-old"
+    assert any(issue["reason_code"] == "USER_STREAM_REGISTRATION_FAILED" for issue in issues)
+    _assert_issue_payloads_mask_listen_key(issues)
+
+
+def test_user_stream_listener_close_failure_masks_listen_key_in_issue_payload() -> None:
+    base = datetime(2026, 4, 17, 12, 0, 0)
+    client = _CloseFailClient()
+    listener = BinanceUserStreamListener(client, now_fn=lambda: base)
+
+    state, issues = listener.close_registration({"status": "connected", "listen_key": "listen-key-old"})
+
+    assert state["listen_key"] == "listen-key-old"
+    assert any(issue["reason_code"] == "USER_STREAM_CLOSE_FAILED" for issue in issues)
+    _assert_issue_payloads_mask_listen_key(issues)
 
 
 def test_next_reconnect_backoff_saturates_for_large_reconnect_count() -> None:
@@ -298,6 +351,7 @@ def test_user_stream_listener_rotation_failure_keeps_fallback_and_entry_guard_st
     assert state["next_retry_at"] is not None
     assert state["backoff_seconds"] > 0
     assert "USER_STREAM_LISTEN_KEY_ROTATE_FAILED" in issue_codes
+    _assert_issue_payloads_mask_listen_key(result["issues"])
 
 
 def test_user_stream_listener_registration_recovers_connected_after_rotation_failure() -> None:
@@ -352,3 +406,4 @@ def test_user_stream_listener_recreates_invalid_listen_key_and_resets_reconnect_
     assert "USER_STREAM_LISTEN_KEY_RECREATED" in issue_codes
     assert client.keepalive_attempts == ["listen-key-old"]
     assert client.closed == ["listen-key-old"]
+    _assert_issue_payloads_mask_listen_key(issues)

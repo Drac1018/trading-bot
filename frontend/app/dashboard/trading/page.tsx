@@ -106,7 +106,7 @@ export default async function TradingPage({
       <PageShell
         eyebrow="거래 상태"
         title="거래 상태 통합"
-        description="계좌, 포지션, 주문/체결을 거래 상태 축으로 묶어 확인합니다. 이 화면 진입만으로 계좌 새로고침 POST나 설정 저장은 실행하지 않습니다."
+        description="계좌, 포지션, 주문/체결을 거래 상태 축으로 묶어 확인합니다. 이 화면 진입만으로 계좌 새로고침 요청이나 설정 저장은 실행하지 않습니다."
         compact
       />
       <DashboardSectionTabs tabs={tabs(query)} active={activeSection} />

@@ -10,6 +10,7 @@ from trading_mvp.main import app
 from trading_mvp.models import (
     AgentRun,
     AuditEvent,
+    DecisionPerformanceFact,
     FeatureSnapshot,
     MarketSnapshot,
     PnLSnapshot,
@@ -35,6 +36,7 @@ from trading_mvp.services.event_policy import (
 from trading_mvp.services.market_data import build_market_snapshot
 from trading_mvp.services.risk import evaluate_risk
 from trading_mvp.services.settings import (
+    _latest_symbol_decision,
     build_event_operator_control_payload,
     clear_operator_event_view,
     create_manual_no_trade_window,
@@ -256,6 +258,51 @@ def test_event_operator_control_uses_fresh_snapshot_over_stale_decision_context(
     assert btc_summary.event_context_summary["next_event_name"] == "CPI"
     assert btc_summary.event_operator_control is not None
     assert btc_summary.event_operator_control.event_context.next_event_name == "CPI"
+
+
+def test_latest_symbol_decision_uses_performance_fact_before_json_scan(db_session, monkeypatch) -> None:
+    run_time = utcnow_naive() - timedelta(minutes=2)
+    decision = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="test",
+        summary="fact indexed decision",
+        input_payload={"features": {"event_context": {"source_status": "available"}}},
+        output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "hold"},
+        metadata_json={},
+        schema_valid=True,
+        started_at=run_time,
+        completed_at=run_time,
+        created_at=run_time,
+        updated_at=run_time,
+    )
+    db_session.add(decision)
+    db_session.flush()
+    db_session.add(
+        DecisionPerformanceFact(
+            decision_run_id=decision.id,
+            provider_name="test",
+            symbol="BTCUSDT",
+            timeframe="15m",
+            decision="hold",
+            rationale_codes=[],
+            regime="range",
+            trend_alignment="neutral",
+            weak_volume=False,
+            volatility_expanded=False,
+            momentum_weakening=False,
+        )
+    )
+    db_session.commit()
+
+    def fail_json_scan(*_args, **_kwargs):
+        raise AssertionError("fallback AgentRun JSON scan should not be used")
+
+    monkeypatch.setattr(db_session, "scalars", fail_json_scan)
+
+    assert _latest_symbol_decision(db_session, symbol="BTCUSDT", timeframe="15m").id == decision.id
 
 
 def test_event_operator_control_attaches_previous_complete_reference_for_incomplete_latest_snapshot(db_session) -> None:
@@ -756,45 +803,62 @@ def test_risk_audit_compact_payload_keeps_event_context_visibility_fields() -> N
     }
 
 
-def test_event_operator_control_write_api_and_invalid_time_range(testclient_db_factory) -> None:
+def test_event_operator_control_write_api_and_invalid_time_range(testclient_db_factory, monkeypatch) -> None:
+    from trading_mvp.config import get_settings
+
     testing_session = testclient_db_factory("event_operator_control_api.db")
+    monkeypatch.setenv("OPERATOR_API_KEY", "pytest-operator-key")
+    get_settings.cache_clear()
+    event_headers = {
+        "X-Operator-API-Key": "pytest-operator-key",
+        "X-Operator-Intent": "settings.operator_event_view",
+    }
+    manual_window_headers = {
+        "X-Operator-API-Key": "pytest-operator-key",
+        "X-Operator-Intent": "settings.manual_no_trade_window",
+    }
 
-    with TestClient(app) as client:
-        operator_response = client.put(
-            "/api/settings/operator-event-view",
-            json={
-                "operator_bias": "neutral",
-                "operator_risk_state": "neutral",
-                "applies_to_symbols": ["BTCUSDT"],
-                "horizon": "event-day",
-                "valid_from": "2026-04-20T10:00:00Z",
-                "valid_to": "2026-04-20T12:00:00Z",
-                "enforcement_mode": "observe_only",
-                "note": "observe only",
-                "created_by": "operator-ui",
-            },
-        )
-        assert operator_response.status_code == 200
-        assert operator_response.json()["event_operator_control"]["operator_event_view"]["operator_bias"] == "neutral"
-        assert operator_response.json()["event_operator_control"]["operator_event_view_configured"] is True
+    try:
+        with TestClient(app) as client:
+            operator_response = client.put(
+                "/api/settings/operator-event-view",
+                headers=event_headers,
+                json={
+                    "operator_bias": "neutral",
+                    "operator_risk_state": "neutral",
+                    "applies_to_symbols": ["BTCUSDT"],
+                    "horizon": "event-day",
+                    "valid_from": "2026-04-20T10:00:00Z",
+                    "valid_to": "2026-04-20T12:00:00Z",
+                    "enforcement_mode": "observe_only",
+                    "note": "observe only",
+                    "created_by": "operator-ui",
+                },
+            )
+            assert operator_response.status_code == 200
+            assert operator_response.json()["event_operator_control"]["operator_event_view"]["operator_bias"] == "neutral"
+            assert operator_response.json()["event_operator_control"]["operator_event_view_configured"] is True
 
-        invalid_window_response = client.post(
-            "/api/settings/manual-no-trade-windows",
-            json={
-                "scope": {"scope_type": "symbols", "symbols": ["BTCUSDT"]},
-                "start_at": "2026-04-20T12:00:00Z",
-                "end_at": "2026-04-20T11:00:00Z",
-                "reason": "invalid range",
-                "auto_resume": False,
-                "require_manual_rearm": False,
-                "created_by": "operator-ui",
-            },
-        )
-        assert invalid_window_response.status_code == 422
+            invalid_window_response = client.post(
+                "/api/settings/manual-no-trade-windows",
+                headers=manual_window_headers,
+                json={
+                    "scope": {"scope_type": "symbols", "symbols": ["BTCUSDT"]},
+                    "start_at": "2026-04-20T12:00:00Z",
+                    "end_at": "2026-04-20T11:00:00Z",
+                    "reason": "invalid range",
+                    "auto_resume": False,
+                    "require_manual_rearm": False,
+                    "created_by": "operator-ui",
+                },
+            )
+            assert invalid_window_response.status_code == 422
 
-    with testing_session() as session:
-        audit_types = list(session.scalars(select(AuditEvent.event_type).order_by(AuditEvent.id.asc())))
-        assert "operator_event_view_created" in audit_types
+        with testing_session() as session:
+            audit_types = list(session.scalars(select(AuditEvent.event_type).order_by(AuditEvent.id.asc())))
+            assert "operator_event_view_created" in audit_types
+    finally:
+        get_settings.cache_clear()
 
 
 def test_risk_guard_blocks_entry_for_manual_no_trade_window_and_audits(db_session) -> None:

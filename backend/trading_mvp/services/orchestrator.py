@@ -37,6 +37,7 @@ from trading_mvp.schemas import (
     TradeDecision,
     TradeDecisionCandidate,
     TradeDecisionCandidateScore,
+    WatchEntryPlan,
 )
 from trading_mvp.services.account import (
     account_snapshot_to_dict,
@@ -47,6 +48,7 @@ from trading_mvp.services.adaptive_signal import build_adaptive_signal_context
 from trading_mvp.services.agents import (
     ChiefReviewAgent,
     MarketSettingsAdvisorAgent,
+    PositionExitReviewAgent,
     TradingDecisionAgent,
     build_market_settings_advisor_input_payload,
     build_trading_decision_input_payload,
@@ -69,6 +71,10 @@ from trading_mvp.services.drawdown_state import (
     build_drawdown_state_snapshot,
 )
 from trading_mvp.services.event_context import EventContextProvider, resolve_event_context_provider
+from trading_mvp.services.exchange_permission import (
+    EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE,
+    exchange_trade_permission_entry_blocker,
+)
 from trading_mvp.services.execution import (
     apply_position_management,
     execute_live_trade,
@@ -99,9 +105,13 @@ from trading_mvp.services.pending_entry_time import (
     pending_entry_remaining_ttl_seconds,
     pending_entry_utc_naive,
 )
-from trading_mvp.services.performance_reporting import _extract_analysis_context
+from trading_mvp.services.performance_reporting import (
+    _extract_analysis_context,
+    refresh_decision_performance_fact_usefulness,
+)
 from trading_mvp.services.position_management import build_position_management_context
 from trading_mvp.services.risk import (
+    HARD_MAX_DAILY_LOSS,
     HARD_MAX_GLOBAL_LEVERAGE,
     HARD_MAX_RISK_PER_TRADE,
     build_ai_risk_budget_context,
@@ -117,6 +127,7 @@ from trading_mvp.services.runtime_state import (
     PROTECTION_REQUIRED_STATE,
     build_sync_freshness_summary,
     get_drawdown_state_detail,
+    get_sync_state_detail,
     get_unresolved_submission_guard,
     mark_sync_skipped,
     set_candidate_selection_detail,
@@ -124,6 +135,7 @@ from trading_mvp.services.runtime_state import (
     summarize_runtime_state,
     sync_scope_blocks_new_entry,
 )
+from trading_mvp.services.service_gate import active_pending_entry_plan_statement
 from trading_mvp.services.settings import (
     build_operational_status_payload,
     get_effective_symbol_schedule,
@@ -131,7 +143,10 @@ from trading_mvp.services.settings import (
     get_effective_symbols,
     get_execution_risk_profile_policy,
     get_or_create_settings,
+    get_rollout_mode,
     get_runtime_credentials,
+    is_live_execution_armed,
+    rollout_mode_allows_exchange_submit,
     serialize_settings,
 )
 from trading_mvp.services.skip_quality import build_skip_quality_report, record_skip_event
@@ -145,14 +160,71 @@ from trading_mvp.time_utils import utcnow_naive
 ACTIVE_ENTRY_PLAN_STATUS = "armed"
 ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON = "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"
 ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON = "ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT"
+ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_POLICY_REASON = "entry_candidate_weak_volume_preai_skip"
 ENTRY_CANDIDATE_EXTREME_LOW_VOLUME_RATIO = 0.10
-ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_MAX_RATIO = 0.20
 ENTRY_CANDIDATE_WEAK_VOLUME_REGIMES = frozenset(
     {"weak", "low", "thin", "dry", "illiquid", "low_participation"}
 )
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_REASON = "neutral_entry_review_hold_backoff_active"
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_SKIP_REASON = "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF"
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_REASON = "neutral_entry_context_preai_skip"
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_SKIP_REASON = "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI"
+ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS = frozenset(
+    {"EXPECTANCY_NEUTRAL", "DERIVATIVES_NEUTRAL", "LEAD_MARKETS_NEUTRAL"}
+)
+ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_REASON = (
+    "entry_candidate_low_actionability_hold_backoff_active"
+)
+ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_SKIP_REASON = (
+    "ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF"
+)
+ENTRY_CANDIDATE_LOW_ACTIONABILITY_REASON_CODES = frozenset(
+    {
+        "EXPECTANCY_NEUTRAL",
+        "DERIVATIVES_NEUTRAL",
+        "LEAD_MARKETS_NEUTRAL",
+        "LEAD_MARKETS_DIVERGED",
+        "DERIVATIVES_HEADWIND",
+        "TOP_TRADER_LONG_CROWDED",
+        "TREND_MIXED",
+        "REGIME_TRANSITION",
+        "WEAK_VOLUME",
+        "MOMENTUM_WEAKENING",
+        "RANGE_WEAK_VOLUME_NO_TRADE_ZONE",
+        ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON,
+    }
+)
+ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_REASON = "entry_candidate_order_path_not_actionable"
+ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_SKIP_REASON = "ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE"
+ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_REASON = "entry_candidate_active_pending_plan_preai_skip"
+ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_SKIP_REASON = "ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI"
+ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_REASON = "entry_candidate_incomplete_trade_plan_preai_skip"
+ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_SKIP_REASON = "ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI"
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_REASON = (
+    "entry_candidate_ai_hold_fingerprint_cooldown_active"
+)
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_SKIP_REASON = (
+    "ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN"
+)
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES = 60
+ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_ROW_LIMIT = 40
 AI_CALL_EVENT_ALLOWED = "AI_CALL_ALLOWED"
 AI_CALL_EVENT_SKIPPED = "AI_CALL_SKIPPED"
 SOFT_SIGNAL_AI_REVIEW_REASON_CODE = "SOFT_SIGNAL_AI_REVIEW"
+SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE = "SOFT_SIGNAL_TRANSITION_WATCH"
+SOFT_SIGNAL_TRANSITION_WATCH_FORCED_REASON = "soft_signal_transition_watch_due"
+SOFT_SIGNAL_AI_REVIEW_SUPPRESSED_REASON = "soft_signal_review_suppressed_weak_candidate"
+SOFT_SIGNAL_AI_REVIEW_SUPPRESSED_SKIP_REASON = "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+SOFT_SIGNAL_TRANSITION_WATCH_COOLDOWN_SKIP_REASON = "SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE"
+SOFT_SIGNAL_TRANSITION_WATCH_NO_MATERIAL_CHANGE_REASON = "soft_signal_review_no_material_change"
+SOFT_SIGNAL_TRANSITION_WATCH_NO_MATERIAL_CHANGE_SKIP_REASON = "SOFT_SIGNAL_REVIEW_NO_MATERIAL_CHANGE"
+SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH = "SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH"
+SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD = "SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD"
+SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_REASON = "soft_signal_review_hold_backoff_active"
+SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_SKIP_REASON = "SOFT_SIGNAL_REVIEW_HOLD_BACKOFF_ACTIVE"
+SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS = 3
+SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES = 360
+SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_ROW_LIMIT = 100
 AI_REVIEW_SOFT_REJECTED_REASONS = frozenset(
     {
         "breadth_hold_bias",
@@ -162,6 +234,15 @@ AI_REVIEW_SOFT_REJECTED_REASONS = frozenset(
     }
 )
 SOFT_SIGNAL_AI_REVIEW_MIN_INTERVAL_MINUTES = 15
+SOFT_SIGNAL_TRANSITION_WATCH_MAX_SCORE_GAP = 0.02
+SOFT_SIGNAL_TRANSITION_WATCH_COOLDOWN_MINUTES = 60
+SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_SCORE_DELTA = 0.015
+SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_PROBABILITY_DELTA = 0.04
+SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_ALIGNMENT_DELTA = 0.08
+SOFT_SIGNAL_LOW_EDGE_HOLD_MAX_SLOT_CONVICTION = 0.58
+SOFT_SIGNAL_LOW_EDGE_HOLD_MAX_META_GATE_PROBABILITY = 0.55
+SOFT_SIGNAL_ACTIONABLE_REVIEW_MIN_SLOT_CONVICTION = 0.62
+SOFT_SIGNAL_ACTIONABLE_REVIEW_MIN_META_GATE_PROBABILITY = 0.58
 ENTRY_CANDIDATE_LATE_LONG_SKIP_REASON = "late_long_no_pullback"
 ENTRY_CANDIDATE_LATE_LONG_REASON_CODE = "LATE_LONG_NO_PULLBACK"
 ENTRY_CANDIDATE_LONG_EXTENSION_DERIVATIVES_REASON_CODE = "LONG_EXTENSION_DERIVATIVES_HEADWIND"
@@ -185,6 +266,7 @@ ACTIVE_POSITION_ENTRY_SUPPRESSION_REASON_CODES = frozenset(
 ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS = {
     "CHASE_LIMIT_EXCEEDED",
     "ENTRY_TRIGGER_NOT_MET",
+    "EXCHANGE_CAN_TRADE_UNKNOWN",
     "SLIPPAGE_THRESHOLD_EXCEEDED",
 }
 ENTRY_PLAN_WATCH_STORAGE_BLOCKERS = {
@@ -406,6 +488,38 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+_MARKET_SETTINGS_INCOMPLETE_DATA_FLAG_CODES = frozenset(
+    {
+        "INCOMPLETE_MARKET_DATA",
+        "MARKET_DATA_INCOMPLETE",
+        "MISSING_MARKET_DATA",
+        "MISSING_CANDLES",
+        "MISSING_CLOSE",
+        "MISSING_PRICE",
+    }
+)
+
+
+def _market_settings_has_incomplete_data_flags(flags: object) -> bool:
+    if not isinstance(flags, (list, tuple, set)):
+        return False
+    for item in flags:
+        code = str(item or "").strip().upper()
+        if code in _MARKET_SETTINGS_INCOMPLETE_DATA_FLAG_CODES:
+            return True
+    return False
+
+
+def _market_settings_volatility_spike_min_pct() -> float:
+    raw_threshold = _safe_float(
+        getattr(get_settings(), "ai_decision_volatility_spike_min_pct", 0.02),
+        0.02,
+    )
+    if 0.0 < raw_threshold <= 0.1:
+        return raw_threshold * 100.0
+    return raw_threshold
 
 
 def _strategy_engine_name_from_payload(
@@ -678,6 +792,7 @@ class TradingOrchestrator:
         )
         self.trading_agent = TradingDecisionAgent(provider)
         self.market_settings_advisor = MarketSettingsAdvisorAgent(provider)
+        self.position_exit_review_agent = PositionExitReviewAgent(provider)
         self.chief_review_agent = ChiefReviewAgent()
 
     def build_keep_kill_report(
@@ -783,8 +898,7 @@ class TradingOrchestrator:
             "min_confidence_to_apply": float(policy["min_confidence_to_apply"]),
         }
 
-    def _latest_market_settings_advisor_run(self, *, symbol: str) -> AgentRun | None:
-        symbol_key = symbol.upper()
+    def _latest_market_settings_advisor_run(self, *, symbol: str | None = None) -> AgentRun | None:
         rows = list(
             self.session.scalars(
                 select(AgentRun)
@@ -793,6 +907,9 @@ class TradingOrchestrator:
                 .limit(100)
             )
         )
+        if symbol is None:
+            return rows[0] if rows else None
+        symbol_key = symbol.upper()
         for row in rows:
             metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
             output_payload = row.output_payload if isinstance(row.output_payload, dict) else {}
@@ -834,10 +951,13 @@ class TradingOrchestrator:
 
         if market_snapshot.is_stale or bool(getattr(feature_payload.event_context, "is_stale", False)):
             add("STALE_MARKET_DATA")
-        if not market_snapshot.is_complete or bool(feature_payload.data_quality_flags):
+        if not market_snapshot.is_complete or _market_settings_has_incomplete_data_flags(
+            feature_payload.data_quality_flags
+        ):
             add("INCOMPLETE_MARKET_DATA")
-        if feature_payload.regime.volatility_regime == "expanded" or feature_payload.volatility_pct >= float(
-            getattr(get_settings(), "ai_decision_volatility_spike_min_pct", 0.02) or 0.02
+        if (
+            feature_payload.regime.volatility_regime == "expanded"
+            or feature_payload.volatility_pct >= _market_settings_volatility_spike_min_pct()
         ):
             add("HIGH_VOLATILITY")
         if feature_payload.regime.volume_regime == "weak" or feature_payload.volume_ratio < 0.4:
@@ -860,6 +980,292 @@ class TradingOrchestrator:
         return flags
 
     @staticmethod
+    def _market_settings_symbol_context_from_payload(
+        *,
+        symbol: str,
+        timeframe: str,
+        source: str,
+        feature_time: datetime,
+        feature_payload: dict[str, object],
+        market_payload: dict[str, object],
+        now: datetime,
+    ) -> dict[str, object]:
+        regime = _as_dict(feature_payload.get("regime"))
+        breakout = _as_dict(feature_payload.get("breakout"))
+        derivatives = _as_dict(feature_payload.get("derivatives"))
+        event_context = _as_dict(feature_payload.get("event_context"))
+        flags = [
+            str(item)
+            for item in feature_payload.get("data_quality_flags", [])
+            if str(item or "").strip()
+        ] if isinstance(feature_payload.get("data_quality_flags"), list) else []
+        feature_time_naive = feature_time.replace(tzinfo=None) if feature_time.tzinfo is not None else feature_time
+        data_age_seconds = max(int((now - feature_time_naive).total_seconds()), 0)
+        is_stale = bool(market_payload.get("is_stale", False)) or bool(event_context.get("is_stale", False))
+        is_complete = bool(market_payload.get("is_complete", True)) and not _market_settings_has_incomplete_data_flags(
+            flags
+        )
+        spread_stress = bool(derivatives.get("spread_stress", False))
+        spread_headwind = bool(derivatives.get("spread_headwind", False))
+        volatility_pct = _safe_float(feature_payload.get("volatility_pct"))
+        volume_ratio = _safe_float(feature_payload.get("volume_ratio"), 1.0)
+        range_breakout_direction = str(breakout.get("range_breakout_direction") or "none")
+        risk_flags: list[str] = []
+        if is_stale:
+            risk_flags.append("STALE_MARKET_DATA")
+        if not is_complete:
+            risk_flags.append("INCOMPLETE_MARKET_DATA")
+        if (
+            str(regime.get("volatility_regime") or "") == "expanded"
+            or volatility_pct >= _market_settings_volatility_spike_min_pct()
+        ):
+            risk_flags.append("HIGH_VOLATILITY")
+        if str(regime.get("volume_regime") or "") == "weak" or volume_ratio < 0.4:
+            risk_flags.append("THIN_LIQUIDITY")
+        if spread_stress or spread_headwind:
+            risk_flags.append("SPREAD_STRESS")
+        if range_breakout_direction in {"up", "down"}:
+            risk_flags.append("RANGE_BREAK")
+
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "source": source,
+            "feature_time": feature_time.isoformat(),
+            "data_age_seconds": data_age_seconds,
+            "latest_price": market_payload.get("latest_price"),
+            "data_quality": {
+                "is_stale": is_stale,
+                "is_complete": is_complete,
+                "candle_count": market_payload.get("candle_count"),
+                "flags": flags,
+            },
+            "regime": {
+                "primary_regime": regime.get("primary_regime"),
+                "trend_alignment": regime.get("trend_alignment"),
+                "volatility_regime": regime.get("volatility_regime"),
+                "volume_regime": regime.get("volume_regime"),
+                "momentum_weakening": bool(regime.get("momentum_weakening", False)),
+            },
+            "market_metrics": {
+                "trend_score": _safe_float(feature_payload.get("trend_score")),
+                "momentum_score": _safe_float(feature_payload.get("momentum_score")),
+                "volatility_pct": volatility_pct,
+                "atr_pct": feature_payload.get("atr_pct"),
+                "volume_ratio": volume_ratio,
+                "rsi": feature_payload.get("rsi"),
+                "range_breakout_direction": range_breakout_direction,
+            },
+            "liquidity_and_derivatives": {
+                "available": bool(derivatives.get("available", False)),
+                "spread_bps": derivatives.get("spread_bps"),
+                "spread_stress": spread_stress,
+                "spread_headwind": spread_headwind,
+                "funding_bias": derivatives.get("funding_bias"),
+                "taker_flow_alignment": derivatives.get("taker_flow_alignment"),
+                "entry_veto_reason_codes": list(derivatives.get("entry_veto_reason_codes", []))
+                if isinstance(derivatives.get("entry_veto_reason_codes"), list)
+                else [],
+                "breakout_veto_reason_codes": list(derivatives.get("breakout_veto_reason_codes", []))
+                if isinstance(derivatives.get("breakout_veto_reason_codes"), list)
+                else [],
+            },
+            "event_context": {
+                "active_risk_window": bool(event_context.get("active_risk_window", False)),
+                "next_event_name": event_context.get("next_event_name"),
+                "minutes_to_next_event": event_context.get("minutes_to_next_event"),
+                "severity": event_context.get("severity"),
+            },
+            "risk_flags": risk_flags,
+        }
+
+    def _market_settings_universe_context(
+        self,
+        *,
+        symbol_scope: list[str],
+        timeframe: str,
+        market_snapshot: MarketSnapshotPayload,
+        feature_payload: FeaturePayload,
+    ) -> dict[str, object]:
+        now = utcnow_naive()
+        symbol_order = list(dict.fromkeys(item.upper() for item in symbol_scope if item))
+        contexts: dict[str, dict[str, object]] = {
+            market_snapshot.symbol.upper(): self._market_settings_symbol_context_from_payload(
+                symbol=market_snapshot.symbol,
+                timeframe=market_snapshot.timeframe,
+                source="current_cycle",
+                feature_time=market_snapshot.snapshot_time,
+                feature_payload=feature_payload.model_dump(mode="json"),
+                market_payload={
+                    "latest_price": market_snapshot.latest_price,
+                    "candle_count": market_snapshot.candle_count,
+                    "is_stale": market_snapshot.is_stale,
+                    "is_complete": market_snapshot.is_complete,
+                },
+                now=now,
+            )
+        }
+        rows = list(
+            self.session.scalars(
+                select(FeatureSnapshot)
+                .where(FeatureSnapshot.symbol.in_(symbol_order), FeatureSnapshot.timeframe == timeframe)
+                .order_by(desc(FeatureSnapshot.feature_time))
+                .limit(max(len(symbol_order) * 4, 20))
+            )
+        )
+        market_ids = [row.market_snapshot_id for row in rows if row.market_snapshot_id is not None]
+        market_rows = {
+            row.id: row
+            for row in self.session.scalars(select(MarketSnapshot).where(MarketSnapshot.id.in_(market_ids)))
+        } if market_ids else {}
+        for row in rows:
+            symbol_key = row.symbol.upper()
+            if symbol_key in contexts:
+                continue
+            market_row = market_rows.get(row.market_snapshot_id)
+            contexts[symbol_key] = self._market_settings_symbol_context_from_payload(
+                symbol=row.symbol,
+                timeframe=row.timeframe,
+                source="stored_latest",
+                feature_time=row.feature_time,
+                feature_payload=row.payload if isinstance(row.payload, dict) else {},
+                market_payload={
+                    "latest_price": market_row.latest_price if market_row is not None else None,
+                    "candle_count": market_row.candle_count if market_row is not None else None,
+                    "is_stale": bool(market_row.is_stale) if market_row is not None else False,
+                    "is_complete": bool(market_row.is_complete) if market_row is not None else True,
+                },
+                now=now,
+            )
+            if len(contexts) >= len(symbol_order):
+                break
+
+        ordered_contexts = [contexts[symbol] for symbol in symbol_order if symbol in contexts]
+        missing_symbols = [symbol for symbol in symbol_order if symbol not in contexts]
+        breadth_items = []
+        for item in ordered_contexts:
+            regime = _as_dict(item.get("regime"))
+            metrics = _as_dict(item.get("market_metrics"))
+            breadth_items.append(
+                {
+                    "symbol": item.get("symbol"),
+                    "primary_regime": regime.get("primary_regime"),
+                    "trend_alignment": regime.get("trend_alignment"),
+                    "weak_volume": _safe_float(metrics.get("volume_ratio"), 1.0) < 0.4
+                    or str(regime.get("volume_regime") or "") == "weak",
+                    "momentum_weakening": bool(regime.get("momentum_weakening", False)),
+                }
+            )
+        breadth = summarize_universe_breadth(breadth_items)
+        risk_flag_counts: dict[str, int] = defaultdict(int)
+        stressed_symbols: list[str] = []
+        for item in ordered_contexts:
+            risk_flags = [
+                str(flag)
+                for flag in item.get("risk_flags", [])
+                if str(flag or "").strip()
+            ] if isinstance(item.get("risk_flags"), list) else []
+            if risk_flags:
+                stressed_symbols.append(str(item.get("symbol")))
+            for flag in risk_flags:
+                risk_flag_counts[flag] += 1
+        return {
+            "context_version": "market_settings_advisor_universe_v1",
+            "market_breadth": {
+                **breadth,
+                "tracked_symbols": len(symbol_order),
+                "context_symbols": len(ordered_contexts),
+                "missing_symbols": missing_symbols,
+                "stressed_symbols": stressed_symbols,
+                "risk_flag_counts": dict(sorted(risk_flag_counts.items())),
+            },
+            "symbols": ordered_contexts,
+        }
+
+    @staticmethod
+    def _market_settings_universe_risk_flags(universe_context: dict[str, object]) -> list[str]:
+        breadth = _as_dict(universe_context.get("market_breadth"))
+        counts = _as_dict(breadth.get("risk_flag_counts"))
+        flags = [str(flag) for flag, count in counts.items() if _safe_float(count) > 0]
+        if breadth.get("missing_symbols"):
+            flags.append("MARKET_CONTEXT_PARTIAL")
+        breadth_regime = str(breadth.get("breadth_regime") or "")
+        if breadth_regime in {"weak_breadth", "transition_fragile"}:
+            flags.append("MARKET_BREADTH_WEAK")
+        return list(dict.fromkeys(flag for flag in flags if flag))
+
+    @staticmethod
+    def _market_settings_advisor_fingerprint_material(
+        *,
+        symbol_scope: list[str],
+        market_state: dict[str, object],
+        universe_context: dict[str, object],
+        observed_risk_flags: list[str],
+        runtime_state: dict[str, object],
+    ) -> dict[str, object]:
+        breadth = _as_dict(universe_context.get("market_breadth"))
+        return {
+            "symbol_scope": [str(symbol).upper() for symbol in symbol_scope],
+            "operating_state": str(runtime_state.get("operating_state") or ""),
+            "observed_risk_flags": sorted(dict.fromkeys(observed_risk_flags)),
+            "market_state": {
+                "primary_regime": market_state.get("primary_regime"),
+                "trend_alignment": market_state.get("trend_alignment"),
+                "volatility_regime": market_state.get("volatility_regime"),
+                "range_breakout_direction": market_state.get("range_breakout_direction"),
+                "spread_stress": market_state.get("spread_stress"),
+            },
+            "market_breadth": {
+                "breadth_regime": breadth.get("breadth_regime"),
+                "directional_bias": breadth.get("directional_bias"),
+                "missing_symbols": sorted(str(symbol) for symbol in breadth.get("missing_symbols", []) or []),
+                "stressed_symbols": sorted(str(symbol) for symbol in breadth.get("stressed_symbols", []) or []),
+                "risk_flag_counts": _as_dict(breadth.get("risk_flag_counts")),
+            },
+        }
+
+    @staticmethod
+    def _market_settings_advisor_fingerprint(material: dict[str, object]) -> str:
+        encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _record_market_settings_provider_skip(
+        self,
+        *,
+        skip_reason: str,
+        gate: dict[str, object] | None,
+        observed_risk_flags: list[str],
+        advisor_fingerprint: str,
+        fingerprint_changed: bool,
+        symbol_scope: list[str],
+        cycle_id: str,
+        snapshot_id: int,
+        retry_after_seconds: int = 0,
+    ) -> None:
+        payload = {
+            "status": "skipped",
+            "skip_reason": skip_reason,
+            "gate": gate,
+            "observed_risk_flags": observed_risk_flags,
+            "advisor_fingerprint": advisor_fingerprint,
+            "fingerprint_changed": fingerprint_changed,
+            "symbol_scope": symbol_scope,
+            "retry_after_seconds": retry_after_seconds,
+            "risk_guard_unchanged": True,
+        }
+        record_audit_event(
+            self.session,
+            event_type="ai_market_settings_provider_skipped",
+            entity_type="settings",
+            entity_id=str(self.settings_row.id),
+            severity="warning" if gate is not None else "info",
+            message="AI market settings advisor provider call skipped before invocation.",
+            payload=payload,
+            correlation_ids=normalize_correlation_ids(cycle_id=cycle_id, snapshot_id=snapshot_id),
+        )
+        self.session.flush()
+
+    @staticmethod
     def _market_settings_advisor_status(
         *,
         recommendation: AIMarketSettingsRecommendation,
@@ -874,6 +1280,169 @@ class TradingOrchestrator:
         if ignored_reason_codes:
             return "ignored", ignored_reason_codes
         return "shadow_generated", []
+
+    @staticmethod
+    def _market_settings_advisor_trading_context(
+        advisor_result: dict[str, object] | None,
+        *,
+        include_shadow_policy: bool = False,
+    ) -> dict[str, object]:
+        if not isinstance(advisor_result, dict) or not advisor_result:
+            return {}
+        recommendation = _as_dict(advisor_result.get("recommendation"))
+        status = str(advisor_result.get("status") or "").strip().lower()
+        raw_shadow = advisor_result.get("shadow")
+        shadow = bool(raw_shadow) if raw_shadow is not None else status == "shadow_generated"
+        context: dict[str, object] = {
+            "status": advisor_result.get("status"),
+            "provider": advisor_result.get("provider"),
+            "agent_run_id": advisor_result.get("agent_run_id"),
+            "shadow": shadow,
+            "risk_guard_unchanged": bool(advisor_result.get("risk_guard_unchanged", True)),
+            "observed_risk_flags": list(advisor_result.get("observed_risk_flags") or []),
+        }
+        if advisor_result.get("skip_reason"):
+            context["skip_reason"] = advisor_result.get("skip_reason")
+        if advisor_result.get("retry_after_seconds") is not None:
+            context["retry_after_seconds"] = advisor_result.get("retry_after_seconds")
+        for key in (
+            "reuse_age_seconds",
+            "reuse_ttl_seconds",
+            "reused_until",
+            "advisor_fingerprint",
+            "fingerprint_changed",
+        ):
+            if advisor_result.get(key) is not None:
+                context[key] = advisor_result.get(key)
+        if recommendation:
+            context["recommendation"] = {
+                "recommended_profile_id": recommendation.get("recommended_profile_id"),
+                "confidence": recommendation.get("confidence"),
+                "do_not_relax": recommendation.get("do_not_relax"),
+                "reason_codes": list(recommendation.get("reason_codes") or []),
+                "valid_until": recommendation.get("valid_until"),
+            }
+            if include_shadow_policy or not shadow:
+                context["recommendation"]["suggested_new_entry_policy"] = recommendation.get(
+                    "suggested_new_entry_policy"
+                )
+        return {
+            key: value
+            for key, value in context.items()
+            if value is not None and value != "" and value != []
+        }
+
+    @classmethod
+    def _risk_context_with_market_settings_advisor(
+        cls,
+        risk_context: dict[str, object],
+        advisor_result: dict[str, object] | None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        advisor_context = cls._market_settings_advisor_trading_context(advisor_result)
+        if not advisor_context:
+            return risk_context, {}
+        status = str(advisor_context.get("status") or "").strip().lower()
+        if status in {"skipped", "ignored"}:
+            return risk_context, advisor_context
+        if not _as_dict(advisor_context.get("recommendation")):
+            return risk_context, advisor_context
+        if bool(advisor_context.get("shadow", False)):
+            return risk_context, advisor_context
+        execution_constraints = dict(risk_context.get("execution_constraints_summary") or {})
+        execution_constraints["execution_risk_profile_advisor"] = advisor_context
+        return {
+            **risk_context,
+            "market_settings_advisor": advisor_context,
+            "execution_risk_profile_advisor": advisor_context,
+            "execution_constraints_summary": execution_constraints,
+        }, advisor_context
+
+    @staticmethod
+    def _risk_context_with_advisor_prompt_context(
+        risk_context: dict[str, object],
+        advisor_context: dict[str, object],
+    ) -> dict[str, object]:
+        status = str(advisor_context.get("status") or "").strip().lower()
+        if status in {"skipped", "ignored"} or not _as_dict(advisor_context.get("recommendation")):
+            return risk_context
+        execution_constraints = dict(risk_context.get("execution_constraints_summary") or {})
+        execution_constraints["execution_risk_profile_advisor"] = advisor_context
+        return {
+            **risk_context,
+            "market_settings_advisor": advisor_context,
+            "execution_risk_profile_advisor": advisor_context,
+            "execution_constraints_summary": execution_constraints,
+        }
+
+    @staticmethod
+    def _advisor_datetime_as_utc(value: object) -> datetime | None:
+        parsed = _coerce_datetime(value)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    @classmethod
+    def _cached_market_settings_advisor_result(
+        cls,
+        *,
+        latest_run: AgentRun | None,
+        defaults: dict[str, object],
+        advisor_fingerprint: str,
+        previous_fingerprint: str,
+        observed_risk_flags: list[str],
+        now_naive: datetime,
+    ) -> dict[str, object] | None:
+        if latest_run is None or previous_fingerprint != advisor_fingerprint:
+            return None
+        recommendation = _as_dict(latest_run.output_payload)
+        if not recommendation or not recommendation.get("recommended_profile_id"):
+            return None
+        metadata = _as_dict(latest_run.metadata_json)
+        if str(metadata.get("status") or latest_run.status or "").lower() == "ignored":
+            return None
+        created_at = latest_run.created_at
+        if created_at is None:
+            return None
+        if created_at.tzinfo is not None:
+            created_at = created_at.astimezone(UTC).replace(tzinfo=None)
+        ttl_seconds = max(int(defaults["recommendation_ttl_seconds"]), 1)
+        elapsed_seconds = max(int((now_naive - created_at).total_seconds()), 0)
+        if elapsed_seconds > ttl_seconds:
+            return None
+        now_aware = now_naive.replace(tzinfo=UTC)
+        valid_until = cls._advisor_datetime_as_utc(recommendation.get("valid_until"))
+        if valid_until is not None and valid_until <= now_aware:
+            return None
+        reused_until = valid_until or (created_at.replace(tzinfo=UTC) + timedelta(seconds=ttl_seconds))
+        return {
+            "status": "reused",
+            "skip_reason": "advisor_recommendation_reused",
+            "agent_run_id": latest_run.id,
+            "provider": latest_run.provider_name,
+            "schema_valid": bool(latest_run.schema_valid),
+            "recommendation": recommendation,
+            "ignored_reason_codes": list(metadata.get("ignored_reason_codes") or []),
+            "observed_risk_flags": observed_risk_flags,
+            "shadow": bool(metadata.get("shadow", True)),
+            "risk_guard_unchanged": True,
+            "advisor_fingerprint": advisor_fingerprint,
+            "fingerprint_changed": False,
+            "reuse_age_seconds": elapsed_seconds,
+            "reuse_ttl_seconds": ttl_seconds,
+            "reused_until": reused_until.isoformat(),
+        }
+
+    @staticmethod
+    def _should_run_market_settings_before_trading_ai(
+        *,
+        use_ai: bool,
+        review_trigger_payload: AIReviewTriggerPayload | None,
+    ) -> bool:
+        if not use_ai or review_trigger_payload is None:
+            return False
+        return review_trigger_payload.trigger_reason != "protection_review_event"
 
     def _write_market_settings_advisor_state(
         self,
@@ -903,26 +1472,72 @@ class TradingOrchestrator:
         cycle_id: str,
         snapshot_id: int,
         force: bool = False,
+        reuse_cached: bool = False,
     ) -> dict[str, object] | None:
         defaults = self._market_settings_advisor_defaults()
         if not bool(defaults["enabled"]):
             return None
 
-        latest_run = self._latest_market_settings_advisor_run(symbol=symbol)
+        latest_run = self._latest_market_settings_advisor_run()
         previous_metadata = latest_run.metadata_json if latest_run is not None and isinstance(latest_run.metadata_json, dict) else {}
         previous_state = _as_dict(previous_metadata.get("market_state"))
+        symbol_scope = list(
+            dict.fromkeys(
+                effective.symbol
+                for effective in get_effective_symbol_schedule(self.settings_row)
+                if effective.enabled
+            )
+        ) or [symbol.upper()]
+        universe_context = self._market_settings_universe_context(
+            symbol_scope=symbol_scope,
+            timeframe=market_snapshot.timeframe,
+            market_snapshot=market_snapshot,
+            feature_payload=feature_payload,
+        )
         observed_risk_flags = self._market_settings_observed_risk_flags(
             market_snapshot=market_snapshot,
             feature_payload=feature_payload,
             runtime_state=runtime_state,
             previous_state=previous_state,
         )
+        observed_risk_flags = list(
+            dict.fromkeys(
+                [
+                    *observed_risk_flags,
+                    *self._market_settings_universe_risk_flags(universe_context),
+                ]
+            )
+        )
+        market_state = self._market_settings_current_state(
+            market_snapshot=market_snapshot,
+            feature_payload=feature_payload,
+        )
+        fingerprint_material = self._market_settings_advisor_fingerprint_material(
+            symbol_scope=symbol_scope,
+            market_state=market_state,
+            universe_context=universe_context,
+            observed_risk_flags=observed_risk_flags,
+            runtime_state=runtime_state,
+        )
+        advisor_fingerprint = self._market_settings_advisor_fingerprint(fingerprint_material)
+        previous_fingerprint = str(previous_metadata.get("advisor_fingerprint") or "")
         elevated = bool(observed_risk_flags)
         interval_seconds = int(
             defaults["elevated_interval_seconds"] if elevated else defaults["normal_interval_seconds"]
         )
         min_recheck_seconds = int(defaults["min_recheck_interval_seconds"])
         now_naive = utcnow_naive()
+        if latest_run is not None and reuse_cached and not force:
+            cached_result = self._cached_market_settings_advisor_result(
+                latest_run=latest_run,
+                defaults=defaults,
+                advisor_fingerprint=advisor_fingerprint,
+                previous_fingerprint=previous_fingerprint,
+                observed_risk_flags=observed_risk_flags,
+                now_naive=now_naive,
+            )
+            if cached_result is not None:
+                return cached_result
         if latest_run is not None and not force:
             elapsed_seconds = max(int((now_naive - latest_run.created_at).total_seconds()), 0)
             if elapsed_seconds < min_recheck_seconds:
@@ -939,6 +1554,25 @@ class TradingOrchestrator:
                     "retry_after_seconds": interval_seconds - elapsed_seconds,
                     "observed_risk_flags": observed_risk_flags,
                 }
+            if previous_fingerprint == advisor_fingerprint:
+                self._record_market_settings_provider_skip(
+                    skip_reason="advisor_fingerprint_unchanged",
+                    gate=None,
+                    observed_risk_flags=observed_risk_flags,
+                    advisor_fingerprint=advisor_fingerprint,
+                    fingerprint_changed=False,
+                    symbol_scope=symbol_scope,
+                    cycle_id=cycle_id,
+                    snapshot_id=snapshot_id,
+                )
+                return {
+                    "status": "skipped",
+                    "skip_reason": "advisor_fingerprint_unchanged",
+                    "advisor_fingerprint": advisor_fingerprint,
+                    "fingerprint_changed": False,
+                    "observed_risk_flags": observed_risk_flags,
+                    "risk_guard_unchanged": True,
+                }
 
         gate = get_openai_call_gate(
             self.session,
@@ -946,19 +1580,33 @@ class TradingOrchestrator:
             AgentRole.MARKET_SETTINGS_ADVISOR.value,
             trigger_event,
             has_openai_key=bool(self.credentials.openai_api_key),
-            symbol=symbol,
         )
         if not gate.allowed:
+            gate_metadata = gate.as_metadata()
+            self._record_market_settings_provider_skip(
+                skip_reason=gate.reason,
+                gate=gate_metadata,
+                observed_risk_flags=observed_risk_flags,
+                advisor_fingerprint=advisor_fingerprint,
+                fingerprint_changed=previous_fingerprint != advisor_fingerprint,
+                symbol_scope=symbol_scope,
+                cycle_id=cycle_id,
+                snapshot_id=snapshot_id,
+                retry_after_seconds=gate.retry_after_seconds,
+            )
             return {
                 "status": "skipped",
                 "skip_reason": gate.reason,
-                "gate": gate.as_metadata(),
+                "gate": gate_metadata,
+                "advisor_fingerprint": advisor_fingerprint,
+                "fingerprint_changed": previous_fingerprint != advisor_fingerprint,
                 "observed_risk_flags": observed_risk_flags,
+                "risk_guard_unchanged": True,
             }
 
         settings_policy = {
             **defaults,
-            "symbol_scope": [symbol.upper()],
+            "symbol_scope": symbol_scope,
             "allowed_profiles": [
                 "NORMAL",
                 "CAUTION",
@@ -985,6 +1633,7 @@ class TradingOrchestrator:
                 if latest_run is not None and isinstance(latest_run.output_payload, dict)
                 else None
             ),
+            universe_context=universe_context,
         )
         recommendation, provider_name, metadata = self.market_settings_advisor.run(
             market_snapshot=market_snapshot,
@@ -995,6 +1644,7 @@ class TradingOrchestrator:
             previous_recommendation=input_payload.get("previous_recommendation")
             if isinstance(input_payload.get("previous_recommendation"), dict)
             else None,
+            universe_context=universe_context,
             use_ai=True,
         )
         now_aware = datetime.now(UTC)
@@ -1018,23 +1668,39 @@ class TradingOrchestrator:
             )
             output_payload = recommendation.model_dump(mode="json")
 
-        market_state = self._market_settings_current_state(
-            market_snapshot=market_snapshot,
-            feature_payload=feature_payload,
-        )
         metadata = {
             **metadata,
             "status": status,
             "ignored_reason_codes": ignored_reason_codes,
-            "symbol_scope": [symbol.upper()],
+            "symbol": symbol.upper(),
+            "representative_symbol": symbol.upper(),
+            "symbol_scope": symbol_scope,
             "observed_risk_flags": observed_risk_flags,
             "settings_policy": settings_policy,
             "market_state": market_state,
+            "market_breadth": universe_context.get("market_breadth"),
+            "advisor_fingerprint": advisor_fingerprint,
+            "advisor_fingerprint_material": fingerprint_material,
+            "fingerprint_changed": previous_fingerprint != advisor_fingerprint,
             "gate": gate.as_metadata(),
             "cycle_id": cycle_id,
             "snapshot_id": snapshot_id,
             "source": "llm_ignored" if status == "ignored" else metadata.get("source", "llm"),
         }
+        metadata.setdefault("model", self.settings_row.ai_model)
+        metadata.setdefault("ai_model", self.settings_row.ai_model)
+        usage_payload = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else None
+        if usage_payload is not None:
+            estimated_cost_usd = estimate_ai_usage_cost_usd(
+                model=str(metadata.get("ai_model") or self.settings_row.ai_model),
+                usage=usage_payload,
+            )
+            metadata["estimated_cost_usd"] = estimated_cost_usd
+            metadata["cost_estimate_status"] = (
+                "unknown_model_rate" if estimated_cost_usd is None else "estimated"
+            )
+        else:
+            metadata["cost_estimate_status"] = "missing_usage"
         advisor_run = persist_agent_run(
             self.session,
             AgentRole.MARKET_SETTINGS_ADVISOR,
@@ -1055,6 +1721,8 @@ class TradingOrchestrator:
             "would_apply": bool(status != "ignored"),
             "min_confidence_to_apply": defaults["min_confidence_to_apply"],
             "observed_risk_flags": observed_risk_flags,
+            "advisor_fingerprint": advisor_fingerprint,
+            "fingerprint_changed": previous_fingerprint != advisor_fingerprint,
         }
         if ignored_reason_codes:
             audit_payload["ignored_reason_codes"] = ignored_reason_codes
@@ -1455,6 +2123,7 @@ class TradingOrchestrator:
             ),
         )
         self.session.flush()
+        refresh_decision_performance_fact_usefulness(self.session, plan.source_decision_run_id)
         return payload
 
     @classmethod
@@ -1724,6 +2393,7 @@ class TradingOrchestrator:
             "capacity_reason": candidate_selection.get("capacity_reason"),
             "drawdown_capacity_reason": candidate_selection.get("drawdown_capacity_reason"),
             "drawdown_state": dict(candidate_selection.get("drawdown_state") or {}),
+            "regime_summary": _as_dict(ranking_payload.get("regime_summary")),
             "portfolio_weight": ranking_payload.get("portfolio_weight"),
             "candidate_weight": ranking_payload.get("candidate_weight"),
             "holding_profile": ranking_payload.get("holding_profile") or candidate_payload.get("holding_profile"),
@@ -1745,6 +2415,7 @@ class TradingOrchestrator:
             "slot_notional_multiplier": ranking_payload.get("slot_notional_multiplier"),
             "slot_applies_soft_cap": ranking_payload.get("slot_applies_soft_cap"),
             "slot_allocation": slot_allocation,
+            "entry_score_threshold": ranking_payload.get("entry_score_threshold"),
             "breadth_score_multiplier": ranking_payload.get("breadth_score_multiplier"),
             "breadth_score_adjustment": ranking_payload.get("breadth_score_adjustment"),
             "breadth_hold_bias": ranking_payload.get("breadth_hold_bias"),
@@ -1759,6 +2430,7 @@ class TradingOrchestrator:
             "expected_scenario": candidate_payload.get("scenario"),
             "candidate": candidate_payload,
             "score": _as_dict(ranking_payload.get("score")),
+            "performance_summary": _as_dict(ranking_payload.get("performance_summary")),
             "reason_codes": list(candidate_payload.get("rationale_codes") or []),
         }
 
@@ -3110,6 +3782,7 @@ class TradingOrchestrator:
                 if str(metadata.get("last_watch_snapshot_id") or "").isdigit()
                 else None
             ),
+            psychology_scene_review=_as_dict(metadata.get("psychology_scene_review")) or None,
             trigger_details=dict(trigger_details) if isinstance(trigger_details, dict) else {},
             confirmation_tracking=(
                 dict(confirmation_tracking)
@@ -3619,7 +4292,7 @@ class TradingOrchestrator:
         *,
         symbol: str | None = None,
     ) -> list[PendingEntryPlan]:
-        query = select(PendingEntryPlan).where(PendingEntryPlan.plan_status == ACTIVE_ENTRY_PLAN_STATUS)
+        query = active_pending_entry_plan_statement()
         if symbol is not None:
             query = query.where(PendingEntryPlan.symbol == symbol.upper())
         return list(self.session.scalars(query.order_by(PendingEntryPlan.created_at.desc())))
@@ -3718,6 +4391,7 @@ class TradingOrchestrator:
                 decision_id=correlation_payload.get("decision_id") or plan.source_decision_run_id,
             ),
         )
+        refresh_decision_performance_fact_usefulness(self.session, plan.source_decision_run_id)
         return plan
 
     def _defer_pending_entry_plan(
@@ -3858,6 +4532,12 @@ class TradingOrchestrator:
         if decision_side not in {"long", "short"}:
             return False
         blockers = set(getattr(risk_result, "blocked_reason_codes", []) or getattr(risk_result, "reason_codes", []))
+        if (
+            EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE in blockers
+            and get_rollout_mode(self.settings_row) == "full_live"
+            and rollout_mode_allows_exchange_submit(self.settings_row)
+        ):
+            return False
         storage_blockers = ENTRY_PLAN_WATCH_STORAGE_BLOCKERS if watch_entry_plan else ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
         return len(blockers - storage_blockers) == 0
 
@@ -3877,7 +4557,7 @@ class TradingOrchestrator:
 
     def _watch_entry_plan_decision(self, decision: TradeDecision) -> TradeDecision | None:
         watch_plan = getattr(decision, "watch_entry_plan", None)
-        if decision.decision != "hold" or watch_plan is None or bool(decision.should_abstain):
+        if decision.decision != "hold" or watch_plan is None:
             return None
         side = str(getattr(watch_plan, "side", "") or "").lower()
         if side not in {"long", "short"}:
@@ -3912,6 +4592,11 @@ class TradingOrchestrator:
                 ENTRY_PLAN_WATCH_REASON_CODE,
             ]
         )
+        source_abstain_reason_codes = [
+            str(code)
+            for code in getattr(decision, "abstain_reason_codes", []) or []
+            if str(code or "").strip()
+        ]
         return decision.model_copy(
             update={
                 "decision": side,
@@ -3930,14 +4615,137 @@ class TradingOrchestrator:
                 "take_profit": take_profit,
                 "rationale_codes": rationale_codes,
                 "primary_reason_codes": self._unique_reason_codes(
-                    [*list(decision.primary_reason_codes or []), *watch_reason_codes, ENTRY_PLAN_WATCH_REASON_CODE]
+                    [
+                        *list(decision.primary_reason_codes or []),
+                        *watch_reason_codes,
+                        *source_abstain_reason_codes,
+                        ENTRY_PLAN_WATCH_REASON_CODE,
+                    ]
                 ),
-                "no_trade_reason_codes": list(decision.no_trade_reason_codes or []),
+                "no_trade_reason_codes": self._unique_reason_codes(
+                    [*list(decision.no_trade_reason_codes or []), *source_abstain_reason_codes]
+                ),
                 "abstain_reason_codes": [],
                 "should_abstain": False,
                 "explanation_short": f"Watch {side} entry plan armed for recheck at the zone.",
             }
         )
+
+    def _bound_transition_watch_direct_entry(
+        self,
+        decision: TradeDecision,
+    ) -> tuple[TradeDecision, dict[str, object]]:
+        if decision.decision not in {"long", "short"}:
+            return decision, {}
+        side = decision.decision
+        entry_zone_min = _safe_float(decision.entry_zone_min, default=0.0)
+        entry_zone_max = _safe_float(decision.entry_zone_max, default=0.0)
+        reference_price = self._reference_price_from_zone(
+            entry_zone_min=entry_zone_min,
+            entry_zone_max=entry_zone_max,
+            fallback_price=entry_zone_min,
+        )
+        if (
+            entry_zone_min > 0.0
+            and entry_zone_max > 0.0
+            and self._watch_entry_plan_side_is_consistent(
+                side=side,
+                reference_price=reference_price,
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+            )
+        ):
+            reason_codes = self._unique_reason_codes(
+                [
+                    *list(decision.rationale_codes or []),
+                    SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH,
+                    ENTRY_PLAN_WATCH_REASON_CODE,
+                ]
+            )
+            watch_plan = WatchEntryPlan(
+                side=side,
+                entry_zone_min=entry_zone_min,
+                entry_zone_max=entry_zone_max,
+                entry_mode=decision.entry_mode or "pullback_confirm",
+                invalidation_price=decision.invalidation_price or decision.stop_loss,
+                max_chase_bps=decision.max_chase_bps,
+                idea_ttl_minutes=decision.idea_ttl_minutes or 15,
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+                reason_codes=[SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH, ENTRY_PLAN_WATCH_REASON_CODE],
+            )
+            return decision.model_copy(
+                update={
+                    "decision": "hold",
+                    "entry_zone_min": None,
+                    "entry_zone_max": None,
+                    "entry_mode": "none",
+                    "watch_entry_plan": watch_plan,
+                    "invalidation_price": None,
+                    "max_chase_bps": None,
+                    "idea_ttl_minutes": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "rationale_codes": reason_codes,
+                    "primary_reason_codes": self._unique_reason_codes(
+                        [
+                            *list(decision.primary_reason_codes or []),
+                            SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH,
+                            ENTRY_PLAN_WATCH_REASON_CODE,
+                        ]
+                    ),
+                    "no_trade_reason_codes": self._unique_reason_codes(
+                        [
+                            *list(decision.no_trade_reason_codes or []),
+                            SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH,
+                        ]
+                    ),
+                    "bounded_output_applied": True,
+                    "explanation_short": "Soft signal review can only arm a watch entry plan.",
+                }
+            ), {
+                "watch_only_bounded": True,
+                "soft_signal_original_decision": side,
+                "soft_signal_bounded_action": "watch_entry_plan",
+                "bounded_output_applied": True,
+                "fallback_reason_codes": [SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_WATCH],
+            }
+
+        hold_codes = self._unique_reason_codes(
+            [
+                *list(decision.no_trade_reason_codes or decision.rationale_codes or []),
+                SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD,
+            ]
+        )
+        return decision.model_copy(
+            update={
+                "decision": "hold",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
+                "entry_mode": "none",
+                "watch_entry_plan": None,
+                "invalidation_price": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "rationale_codes": self._unique_reason_codes(
+                    [*list(decision.rationale_codes or []), SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD]
+                ),
+                "primary_reason_codes": self._unique_reason_codes(
+                    [*list(decision.primary_reason_codes or []), SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD]
+                ),
+                "no_trade_reason_codes": hold_codes,
+                "bounded_output_applied": True,
+                "explanation_short": "Soft signal review cannot execute a direct entry.",
+            }
+        ), {
+            "watch_only_bounded": True,
+            "soft_signal_original_decision": side,
+            "soft_signal_bounded_action": "hold",
+            "bounded_output_applied": True,
+            "fallback_reason_codes": [SOFT_SIGNAL_DIRECT_ENTRY_BOUNDED_TO_HOLD],
+        }
 
     @staticmethod
     def _unique_reason_codes(values: list[object]) -> list[str]:
@@ -3953,24 +4761,49 @@ class TradingOrchestrator:
         cls,
         operational_status,
     ) -> tuple[bool, list[str]]:
-        reason_codes = cls._unique_reason_codes(
+        raw_reason_codes = cls._unique_reason_codes(
             [
                 *list(getattr(operational_status, "blocked_reasons", []) or []),
                 *list(getattr(operational_status, "blocked_reason_codes", []) or []),
             ]
         )
+        reason_codes = list(raw_reason_codes)
         reason_codes = [
             code
             for code in reason_codes
             if code not in ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
         ]
         guard_reason_code = str(getattr(operational_status, "guard_mode_reason_code", "") or "").strip()
-        if guard_reason_code and guard_reason_code not in ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES:
+        if (
+            guard_reason_code
+            and guard_reason_code not in ENTRY_PLAN_SIMULATION_GUARD_REASON_CODES
+            and guard_reason_code not in ENTRY_PLAN_NON_STRUCTURAL_BLOCKERS
+        ):
             reason_codes = cls._unique_reason_codes([*reason_codes, guard_reason_code])
+        rollout_mode = str(getattr(operational_status, "rollout_mode", "") or "")
+        if (
+            EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE in raw_reason_codes
+            and rollout_mode == "full_live"
+            and bool(getattr(operational_status, "exchange_submit_allowed", False))
+        ):
+            reason_codes = cls._unique_reason_codes(
+                [*reason_codes, EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE]
+            )
         if bool(getattr(operational_status, "can_enter_new_position", False)):
             return False, reason_codes
 
-        rollout_mode = str(getattr(operational_status, "rollout_mode", "") or "")
+        exchange_unknown_only = (
+            EXCHANGE_CAN_TRADE_UNKNOWN_REASON_CODE in raw_reason_codes
+            and not reason_codes
+            and rollout_mode in ENTRY_PLAN_SIMULATION_ROLLOUT_MODES
+            and bool(getattr(operational_status, "live_execution_ready", False))
+            and not bool(getattr(operational_status, "trading_paused", False))
+            and str(getattr(operational_status, "operating_state", "") or "") == "TRADABLE"
+            and not bool(getattr(operational_status, "exchange_submit_allowed", False))
+        )
+        if exchange_unknown_only:
+            return False, []
+
         simulation_without_submit = (
             rollout_mode in ENTRY_PLAN_SIMULATION_ROLLOUT_MODES
             and not bool(getattr(operational_status, "exchange_submit_allowed", False))
@@ -4035,6 +4868,17 @@ class TradingOrchestrator:
                 correlation_ids=decision_correlation_ids,
             )
         source_decision_metadata = _as_dict(getattr(decision_run, "metadata_json", None))
+        source_decision_output = _as_dict(getattr(decision_run, "output_payload", None))
+        decision_scene_review = getattr(decision, "psychology_scene_review", None)
+        psychology_scene_review = (
+            dict(decision_scene_review.model_dump(mode="json"))
+            if hasattr(decision_scene_review, "model_dump")
+            else (
+                _as_dict(source_decision_metadata.get("psychology_scene_review"))
+                or _as_dict(source_decision_output.get("psychology_scene_review"))
+                or None
+            )
+        )
         trade_performance_tags = _as_dict(source_decision_metadata.get("trade_performance_tags"))
         strategy_id = _safe_str(trade_performance_tags.get("strategy_id"))
         if strategy_id in {"unspecified", "unspecified_engine"}:
@@ -4088,6 +4932,8 @@ class TradingOrchestrator:
                 "source_risk_check_id": risk_row_id,
                 "source_blocked_reason_codes": list(getattr(risk_result, "blocked_reason_codes", [])),
                 "source_adjustment_reason_codes": list(getattr(risk_result, "adjustment_reason_codes", [])),
+                "source_no_trade_reason_codes": list(getattr(decision, "no_trade_reason_codes", []) or []),
+                "source_primary_reason_codes": list(getattr(decision, "primary_reason_codes", []) or []),
                 "strategy_id": strategy_id,
                 "regime_id": regime_id,
                 "entry_confirmation_type": entry_confirmation_type,
@@ -4099,6 +4945,7 @@ class TradingOrchestrator:
                 },
                 "holding_profile": str(getattr(decision, "holding_profile", "scalp") or "scalp"),
                 "holding_profile_reason": str(getattr(decision, "holding_profile_reason", "") or "") or None,
+                "psychology_scene_review": psychology_scene_review,
                 "trigger_details": {
                     "volume_profile": self._pending_plan_volume_profile_details(feature_payload, decision),
                 },
@@ -4132,6 +4979,7 @@ class TradingOrchestrator:
                 "entry_zone_max": plan.entry_zone_max,
                 "expires_at": plan.expires_at.isoformat(),
                 "idempotency_key": plan.idempotency_key,
+                **({"psychology_scene_review": psychology_scene_review} if psychology_scene_review else {}),
             },
             correlation_ids=decision_correlation_ids,
         )
@@ -4158,6 +5006,7 @@ class TradingOrchestrator:
             entity_id=str(plan.id),
             correlation_ids=decision_correlation_ids,
         )
+        refresh_decision_performance_fact_usefulness(self.session, decision_run.id)
         return plan
 
     def _cancel_symbol_entry_plans_from_decision(
@@ -4464,6 +5313,9 @@ class TradingOrchestrator:
         generated_at: datetime,
         retry_after_seconds: int = 0,
         gate_payload: dict[str, object] | None = None,
+        hard_skip_ai: bool = False,
+        skip_category: str | None = None,
+        hard_skip_reason_codes: list[str] | None = None,
         correlation_ids: dict[str, object] | None = None,
     ) -> dict[str, object]:
         metadata = self._pending_entry_plan_metadata(plan)
@@ -4479,7 +5331,13 @@ class TradingOrchestrator:
             "symbol": plan.symbol,
             "scope": "entry_plan_recheck",
             "reason": reason,
-            "hard_skip_ai": False,
+            "hard_skip_ai": hard_skip_ai,
+            "skip_category": skip_category,
+            "hard_skip_reason_codes": list(
+                hard_skip_reason_codes
+                if hard_skip_reason_codes is not None
+                else [reason] if hard_skip_ai else []
+            ),
             "plan_id": plan.id,
             "source_decision_run_id": plan.source_decision_run_id,
             "retry_after_seconds": retry_after_seconds,
@@ -4599,6 +5457,7 @@ class TradingOrchestrator:
             symbol=plan.symbol,
             cooldown_minutes_override=0,
             manual_guard_minutes_override=0,
+            enforce_waste_guard=True,
         )
         gate_payload = openai_gate.as_metadata()
         if not openai_gate.allowed:
@@ -5109,6 +5968,7 @@ class TradingOrchestrator:
                 execution_id=correlation_payload.get("execution_id") or dict(execution_result).get("order_id"),
             ),
         )
+        refresh_decision_performance_fact_usefulness(self.session, plan.source_decision_run_id)
         return plan
 
     def _latest_decision_run(self, *, decision_run_id: int | None) -> AgentRun | None:
@@ -6688,6 +7548,8 @@ class TradingOrchestrator:
                 "execution_quality_score": slot_allocation_payload.get("execution_quality_score"),
                 "breadth_alignment_score": slot_allocation_payload.get("breadth_alignment_score"),
                 "performance_summary": performance_summary,
+                "regime_summary": dict(item.get("regime_summary") or {}),
+                "scenario_signature": item.get("scenario_signature"),
                 "entry_mode": item.get("entry_mode"),
                 "strategy_engine": item.get("strategy_engine"),
                 "strategy_engine_context": item.get("strategy_engine_context"),
@@ -6895,6 +7757,95 @@ class TradingOrchestrator:
             "exchange_sync": exchange_sync_result,
         }
 
+    def _record_position_exit_review(
+        self,
+        *,
+        position: Position,
+        market_snapshot: MarketSnapshotPayload,
+        feature_payload: FeaturePayload,
+        position_management_context: dict[str, object],
+        trigger_event: str,
+    ) -> dict[str, object] | None:
+        if not self.settings_row.ai_enabled:
+            return None
+        if position.status != "open" or (position.quantity or 0) <= 0:
+            return None
+
+        provider_name = str(getattr(self.position_exit_review_agent.provider, "name", "deterministic-mock"))
+        gate_metadata: dict[str, object] = {
+            "allowed": provider_name != "openai",
+            "reason": "provider_not_openai_or_mock" if provider_name != "openai" else "not_checked",
+        }
+        use_ai = provider_name == "openai"
+        if provider_name == "openai":
+            gate = get_openai_call_gate(
+                self.session,
+                self.settings_row,
+                AgentRole.POSITION_EXIT_REVIEW.value,
+                trigger_event,
+                has_openai_key=bool(self.credentials.openai_api_key),
+                symbol=position.symbol,
+            )
+            gate_metadata = gate.as_metadata()
+            use_ai = gate.allowed
+
+        sync_freshness_summary = build_sync_freshness_summary(self.settings_row)
+        review, provider_label, metadata, input_payload = self.position_exit_review_agent.run(
+            market_snapshot=market_snapshot,
+            features=feature_payload,
+            position=position,
+            position_management_context=dict(position_management_context),
+            sync_freshness_summary=sync_freshness_summary,
+            use_ai=use_ai,
+        )
+        metadata.update(
+            {
+                "role": AgentRole.POSITION_EXIT_REVIEW.value,
+                "symbol": position.symbol,
+                "position_id": position.id,
+                "trigger_event": trigger_event,
+                "gate": gate_metadata,
+                "advisory_only": True,
+                "execution_boundary": "metadata_only_no_order_authority",
+                "order_execution_connected": False,
+                "stop_loss_changed": False,
+                "protective_order_changed": False,
+                "new_entry_mixed": False,
+            }
+        )
+        review_payload = review.model_dump(mode="json")
+        metadata.setdefault("position_exit_review", review_payload)
+        run_row = persist_agent_run(
+            self.session,
+            AgentRole.POSITION_EXIT_REVIEW,
+            trigger_event,
+            input_payload,
+            review,
+            provider_name=provider_label,
+            metadata_json=metadata,
+            status="completed" if bool(gate_metadata.get("allowed", True)) else "skipped",
+        )
+        review_payload_with_source = {
+            **review_payload,
+            "agent_run_id": run_row.id,
+            "provider_name": provider_label,
+            "generated_at": run_row.created_at.isoformat() if run_row.created_at is not None else None,
+        }
+        position_metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
+        position_metadata["position_exit_review"] = review_payload_with_source
+        position_metadata["position_exit_review_source"] = {
+            "agent_run_id": run_row.id,
+            "provider_name": provider_label,
+            "trigger_event": trigger_event,
+            "gate": gate_metadata,
+            "advisory_only": True,
+            "execution_boundary": "metadata_only_no_order_authority",
+        }
+        position.metadata_json = position_metadata
+        self.session.add(position)
+        self.session.flush()
+        return review_payload_with_source
+
     def run_position_management_cycle(
         self,
         *,
@@ -6937,6 +7888,19 @@ class TradingOrchestrator:
         }
         feature_payload = compute_features(market_snapshot, higher_timeframe_context)
         feature_row = persist_feature_snapshot(self.session, market_row.id, market_snapshot, feature_payload)
+        managed_position = open_positions[0]
+        position_management_context = build_position_management_context(
+            managed_position,
+            feature_payload=feature_payload,
+            settings_row=self.settings_row,
+        )
+        position_exit_review = self._record_position_exit_review(
+            position=managed_position,
+            market_snapshot=market_snapshot,
+            feature_payload=feature_payload,
+            position_management_context=position_management_context,
+            trigger_event=trigger_event,
+        )
         result = apply_position_management(
             self.session,
             self.settings_row,
@@ -6952,6 +7916,7 @@ class TradingOrchestrator:
             "new_entries_allowed": False,
             "execution": result.get("position_management_action"),
             "position_management": result,
+            "position_exit_review": position_exit_review,
             "trigger_event": trigger_event,
         }
 
@@ -7031,6 +7996,9 @@ class TradingOrchestrator:
             entry_control_blocked, entry_control_blocked_reasons = self._entry_plan_control_block(
                 operational_status
             )
+            entry_exchange_permission_pre_ai_block = self._risk_adding_exchange_permission_pre_ai_block(
+                intent_type="entry"
+            )
             entry_capacity_risk_budget: dict[str, object] | None = None
             symbol_results: list[dict[str, object]] = []
             for plan in active_plans:
@@ -7071,6 +8039,24 @@ class TradingOrchestrator:
                     symbol_results.append(result_item)
                     continue
                 if stale_scopes:
+                    if (
+                        pending_entry_plan_is_expired(plan.expires_at, now=generated_at)
+                        and "PLAN_WAITING_FOR_FRESH_SYNC"
+                        in (metadata.get("last_watch_blocked_reason_codes") or [])
+                    ):
+                        self._cancel_pending_entry_plan(
+                            plan,
+                            reason="PLAN_TTL_EXPIRED",
+                            cancel_status="expired",
+                            detail={
+                                "observed_at": generated_at.isoformat(),
+                                "expired_while_waiting_for_fresh_sync": True,
+                                "stale_scopes": list(stale_scopes),
+                            },
+                        )
+                        result_item["status"] = "expired"
+                        symbol_results.append(result_item)
+                        continue
                     self._defer_pending_entry_plan(
                         plan,
                         reason="PLAN_WAITING_FOR_FRESH_SYNC",
@@ -7164,17 +8150,49 @@ class TradingOrchestrator:
                     result_item["status"] = "expired"
                     symbol_results.append(result_item)
                     continue
-                if entry_control_blocked:
+                if entry_control_blocked or entry_exchange_permission_pre_ai_block is not None:
+                    blocked_reasons = list(entry_control_blocked_reasons)
+                    exchange_permission_payload: dict[str, object] | None = None
+                    if entry_exchange_permission_pre_ai_block is not None:
+                        reason_code = str(entry_exchange_permission_pre_ai_block["reason_code"])
+                        blocked_reasons = self._unique_reason_codes([*blocked_reasons, reason_code])
+                        exchange_permission_payload = dict(entry_exchange_permission_pre_ai_block)
+                        ai_recheck = self._record_entry_plan_ai_recheck_skip(
+                            plan=plan,
+                            reason=reason_code,
+                            generated_at=generated_at,
+                            gate_payload={"exchange_permission": exchange_permission_payload},
+                            hard_skip_ai=True,
+                            skip_category="hard_skip_ai",
+                            hard_skip_reason_codes=[reason_code],
+                            correlation_ids=normalize_correlation_ids(
+                                cycle_id=f"entry-plan-watch:{plan.id}:{market_row.id}",
+                                snapshot_id=market_row.id,
+                                decision_id=plan.source_decision_run_id,
+                            ),
+                        )
+                        result_item["ai_recheck"] = {
+                            "status": ai_recheck.get("status"),
+                            "skip_reason": ai_recheck.get("skip_reason"),
+                            "retry_after_seconds": ai_recheck.get("retry_after_seconds"),
+                            "decision_run_id": None,
+                            "decision": None,
+                            "ai_call_policy": ai_recheck.get("ai_call_policy"),
+                            "trigger": None,
+                        }
                     self._defer_pending_entry_plan(
                         plan,
                         reason="PLAN_WAITING_FOR_ENTRY_CONTROL",
                         generated_at=generated_at,
                         market_row_id=market_row.id,
-                        detail={"blocked_reasons": list(entry_control_blocked_reasons)},
+                        detail={
+                            "blocked_reasons": blocked_reasons,
+                            "exchange_permission": exchange_permission_payload,
+                        },
                     )
                     result_item["plan"] = self._pending_entry_plan_snapshot(plan).model_dump(mode="json")
                     result_item["status"] = "control_blocked"
-                    result_item["blocked_reasons"] = list(entry_control_blocked_reasons)
+                    result_item["blocked_reasons"] = blocked_reasons
                     symbol_results.append(result_item)
                     continue
                 if self._plan_invalidation_broken(plan, market_snapshot):
@@ -7632,6 +8650,7 @@ class TradingOrchestrator:
                     snapshot_id=market_row.id,
                     idempotency_key=plan.idempotency_key,
                 )
+                refresh_decision_performance_fact_usefulness(self.session, recheck_decision_run.id)
                 result_item["execution"] = execution_result
                 success_status = str(execution_result.get("status") or "")
                 if success_status in {
@@ -8283,6 +9302,11 @@ class TradingOrchestrator:
             "allowed_add_on_side": None,
             "entry_proposal_suppression_active": False,
             "entry_proposal_suppressed_reason_code": None,
+            "risk_adding_add_on_candidate": False,
+            "risk_adding_add_on_side": None,
+            "risk_adding_add_on_pre_ai_blocked": False,
+            "risk_adding_add_on_pre_ai_block_reason": None,
+            "risk_adding_add_on_pre_ai_reason_codes": [],
         }
         if recovery_active:
             return route_context, None
@@ -8378,6 +9402,8 @@ class TradingOrchestrator:
             allowed_add_on_side = "long"
         elif bool(short_add_on_context.get("candidate")) and bool(short_add_on_context.get("allowed")):
             allowed_add_on_side = "short"
+        route_context["risk_adding_add_on_candidate"] = bool(allowed_add_on_side)
+        route_context["risk_adding_add_on_side"] = allowed_add_on_side
         route_context["allow_same_side_add_on"] = bool(allowed_add_on_side)
         route_context["allowed_add_on_side"] = allowed_add_on_side
         sync_freshness_summary = _as_dict(decision_reference.get("sync_freshness_summary"))
@@ -8411,17 +9437,50 @@ class TradingOrchestrator:
         return route_context, fingerprint_basis
 
     @staticmethod
+    def _mark_risk_adding_add_on_pre_ai_blocked(
+        route_context: dict[str, object] | None,
+        reason_code: str | None,
+    ) -> bool:
+        if not route_context or not reason_code:
+            return False
+        if not bool(
+            route_context.get("risk_adding_add_on_candidate")
+            or route_context.get("allow_same_side_add_on")
+        ):
+            return False
+        route_context["allow_same_side_add_on"] = False
+        route_context["allowed_add_on_side"] = None
+        route_context["risk_adding_add_on_pre_ai_blocked"] = True
+        route_context["risk_adding_add_on_pre_ai_block_reason"] = reason_code
+        route_context["risk_adding_add_on_pre_ai_reason_codes"] = [reason_code]
+        return True
+
+    @staticmethod
     def _active_position_suppression_audit_payload(route_context: dict[str, object] | None) -> dict[str, object]:
         context = _as_dict(route_context)
         if not context:
             return {}
         allowed_add_on_side = str(context.get("allowed_add_on_side") or "").lower()
+        risk_adding_add_on_side = str(context.get("risk_adding_add_on_side") or "").lower()
         return {
             "suppression_active": bool(context.get("entry_proposal_suppression_active")),
             "suppression_reason_code": str(context.get("entry_proposal_suppressed_reason_code") or "") or None,
             "allow_same_side_add_on": bool(context.get("allow_same_side_add_on")),
             "allowed_add_on_side": (
                 allowed_add_on_side if allowed_add_on_side in {"long", "short"} else None
+            ),
+            "risk_adding_add_on_candidate": bool(context.get("risk_adding_add_on_candidate")),
+            "risk_adding_add_on_side": (
+                risk_adding_add_on_side if risk_adding_add_on_side in {"long", "short"} else None
+            ),
+            "risk_adding_add_on_pre_ai_blocked": bool(
+                context.get("risk_adding_add_on_pre_ai_blocked")
+            ),
+            "risk_adding_add_on_pre_ai_block_reason": (
+                str(context.get("risk_adding_add_on_pre_ai_block_reason") or "") or None
+            ),
+            "risk_adding_add_on_pre_ai_reason_codes": list(
+                context.get("risk_adding_add_on_pre_ai_reason_codes") or []
             ),
         }
 
@@ -8780,11 +9839,7 @@ class TradingOrchestrator:
         )
         if volume_ratio is not None and volume_ratio <= ENTRY_CANDIDATE_EXTREME_LOW_VOLUME_RATIO:
             return ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON
-        if (
-            weak_volume_signal
-            and volume_ratio is not None
-            and volume_ratio <= ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_MAX_RATIO
-        ):
+        if weak_volume_signal:
             return ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON
         return None
 
@@ -8814,6 +9869,9 @@ class TradingOrchestrator:
         rejected_reason = str(selection_context.get("rejected_reason") or "").strip().lower()
         if rejected_reason in AI_REVIEW_SOFT_REJECTED_REASONS:
             reason_codes.append(SOFT_SIGNAL_AI_REVIEW_REASON_CODE)
+        selection_ai_policy = _as_dict(selection_context.get("ai_call_policy"))
+        if str(selection_ai_policy.get("soft_signal_review_mode") or "") == "transition_watch":
+            reason_codes.append(SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE)
         return list(dict.fromkeys(reason_codes))
 
     @staticmethod
@@ -8844,8 +9902,1514 @@ class TradingOrchestrator:
 
     @staticmethod
     def _soft_signal_ai_review_cooldown_minutes(effective_settings: object) -> int:
-        base_minutes = max(int(getattr(effective_settings, "ai_call_interval_minutes", 5) or 5), 1)
-        return max(SOFT_SIGNAL_AI_REVIEW_MIN_INTERVAL_MINUTES, base_minutes * 3)
+        del effective_settings
+        return SOFT_SIGNAL_TRANSITION_WATCH_COOLDOWN_MINUTES
+
+    @staticmethod
+    def _soft_signal_review_metrics(selection_context: dict[str, object]) -> dict[str, object]:
+        score_payload = _as_dict(selection_context.get("score"))
+        score_total = _safe_float(score_payload.get("total_score"), default=0.0)
+        entry_score_threshold = _safe_float(selection_context.get("entry_score_threshold"), default=0.0)
+        threshold_gap = (
+            round(entry_score_threshold - score_total, 6)
+            if entry_score_threshold > 0.0 and score_total > 0.0
+            else None
+        )
+        return {
+            "score_total": score_total,
+            "entry_score_threshold": entry_score_threshold if entry_score_threshold > 0.0 else None,
+            "threshold_gap": threshold_gap,
+            "slot_conviction_score": _safe_float(
+                selection_context.get("slot_conviction_score"),
+                default=0.0,
+            ),
+            "meta_gate_probability": _safe_float(
+                selection_context.get("meta_gate_probability"),
+                default=0.0,
+            ),
+        }
+
+    @staticmethod
+    def _optional_summary_float(value: object) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return round(float(value), 6)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _reason_suffix(reason_codes: list[str], prefix: str) -> str | None:
+        for code in reason_codes:
+            if code.startswith(prefix):
+                return code.removeprefix(prefix).lower()
+        return None
+
+    @classmethod
+    def _soft_signal_review_snapshot(
+        cls,
+        selection_context: dict[str, object],
+    ) -> dict[str, object]:
+        selection = _as_dict(selection_context)
+        candidate = _as_dict(selection.get("candidate"))
+        score_payload = _as_dict(selection.get("score"))
+        metrics = cls._soft_signal_review_metrics(selection)
+        regime_summary = _as_dict(selection.get("regime_summary"))
+        reason_codes = [
+            str(code)
+            for code in (
+                candidate.get("rationale_codes")
+                or selection.get("reason_codes")
+                or []
+            )
+            if code
+        ]
+        primary_regime = str(regime_summary.get("primary_regime") or "").lower()
+        if not primary_regime:
+            primary_regime = cls._reason_suffix(reason_codes, "REGIME_") or ""
+        trend_alignment = str(regime_summary.get("trend_alignment") or "").lower()
+        if not trend_alignment:
+            trend_alignment = cls._reason_suffix(reason_codes, "TREND_") or ""
+        lead_lag_summary = _as_dict(candidate.get("lead_lag_summary"))
+        derivatives_summary = _as_dict(candidate.get("derivatives_summary"))
+        return {
+            "decision": str(candidate.get("decision") or "").lower(),
+            "scenario": str(candidate.get("scenario") or selection.get("scenario") or "").lower(),
+            "strategy_engine": str(
+                selection.get("strategy_engine") or candidate.get("strategy_engine") or ""
+            ),
+            "holding_profile": str(
+                selection.get("holding_profile") or candidate.get("holding_profile") or ""
+            ),
+            "entry_mode": str(selection.get("entry_mode") or "").lower(),
+            "breadth_regime": str(selection.get("breadth_regime") or "").lower(),
+            "capacity_reason": str(selection.get("capacity_reason") or "").lower(),
+            "primary_regime": primary_regime,
+            "trend_alignment": trend_alignment,
+            "volume_regime": str(regime_summary.get("volume_regime") or "").lower(),
+            "weak_volume": bool(regime_summary.get("weak_volume", False)),
+            "momentum_weakening": bool(regime_summary.get("momentum_weakening", False)),
+            "score_total": cls._optional_summary_float(metrics.get("score_total")),
+            "entry_score_threshold": cls._optional_summary_float(
+                metrics.get("entry_score_threshold")
+            ),
+            "threshold_gap": cls._optional_summary_float(metrics.get("threshold_gap")),
+            "slot_conviction_score": cls._optional_summary_float(
+                metrics.get("slot_conviction_score")
+            ),
+            "meta_gate_probability": cls._optional_summary_float(
+                metrics.get("meta_gate_probability")
+            ),
+            "lead_lag_alignment": cls._optional_summary_float(
+                score_payload.get("lead_lag_alignment")
+            ),
+            "derivatives_alignment": cls._optional_summary_float(
+                score_payload.get("derivatives_alignment")
+            ),
+            "lead_lag_state": {
+                "leader_bias": str(lead_lag_summary.get("leader_bias") or "").lower(),
+                "strong_reference_confirmation": bool(
+                    lead_lag_summary.get("strong_reference_confirmation", False)
+                ),
+                "weak_reference_confirmation": bool(
+                    lead_lag_summary.get("weak_reference_confirmation", False)
+                ),
+                "bullish_breakout_confirmed": bool(
+                    lead_lag_summary.get("bullish_breakout_confirmed", False)
+                ),
+                "bearish_breakout_confirmed": bool(
+                    lead_lag_summary.get("bearish_breakout_confirmed", False)
+                ),
+                "bullish_breakout_ahead": bool(
+                    lead_lag_summary.get("bullish_breakout_ahead", False)
+                ),
+                "bearish_breakout_ahead": bool(
+                    lead_lag_summary.get("bearish_breakout_ahead", False)
+                ),
+            },
+            "derivatives_state": {
+                "taker_flow_alignment": str(
+                    derivatives_summary.get("taker_flow_alignment") or ""
+                ).lower(),
+                "funding_bias": str(derivatives_summary.get("funding_bias") or "").lower(),
+                "crowding_bias": str(derivatives_summary.get("crowding_bias") or "").lower(),
+                "spread_headwind": bool(derivatives_summary.get("spread_headwind", False)),
+                "spread_stress": bool(derivatives_summary.get("spread_stress", False)),
+                "veto_reason_codes": sorted(
+                    str(code)
+                    for code in derivatives_summary.get("veto_reason_codes", [])
+                    if code
+                ),
+            },
+        }
+
+    @classmethod
+    def _previous_soft_signal_review_snapshot(
+        cls,
+        latest_decision_metadata: dict[str, object],
+    ) -> dict[str, object]:
+        snapshot = _as_dict(latest_decision_metadata.get("soft_signal_review_snapshot"))
+        if snapshot:
+            return snapshot
+        selection_context = _as_dict(latest_decision_metadata.get("selection_context"))
+        if selection_context:
+            return cls._soft_signal_review_snapshot(selection_context)
+        return {}
+
+    @classmethod
+    def _soft_signal_review_material_change(
+        cls,
+        *,
+        current_snapshot: dict[str, object],
+        previous_snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        if not previous_snapshot:
+            return {
+                "material_changed": True,
+                "reason": "missing_previous_snapshot",
+                "changed_fields": ["previous_snapshot"],
+                "current_snapshot": current_snapshot,
+                "previous_snapshot": {},
+            }
+        categorical_keys = [
+            "decision",
+            "scenario",
+            "strategy_engine",
+            "holding_profile",
+            "entry_mode",
+            "breadth_regime",
+            "capacity_reason",
+            "primary_regime",
+            "trend_alignment",
+            "volume_regime",
+            "weak_volume",
+            "momentum_weakening",
+            "lead_lag_state",
+            "derivatives_state",
+        ]
+        changed_fields = [
+            key
+            for key in categorical_keys
+            if current_snapshot.get(key) != previous_snapshot.get(key)
+        ]
+        numeric_thresholds = {
+            "score_total": SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_SCORE_DELTA,
+            "threshold_gap": SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_SCORE_DELTA,
+            "slot_conviction_score": SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_PROBABILITY_DELTA,
+            "meta_gate_probability": SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_PROBABILITY_DELTA,
+            "lead_lag_alignment": SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_ALIGNMENT_DELTA,
+            "derivatives_alignment": SOFT_SIGNAL_TRANSITION_WATCH_MATERIAL_ALIGNMENT_DELTA,
+        }
+        deltas: dict[str, float] = {}
+        for key, threshold in numeric_thresholds.items():
+            current_value = cls._optional_summary_float(current_snapshot.get(key))
+            previous_value = cls._optional_summary_float(previous_snapshot.get(key))
+            if current_value is None or previous_value is None:
+                continue
+            delta = round(current_value - previous_value, 6)
+            deltas[key] = delta
+            if abs(delta) >= threshold:
+                changed_fields.append(key)
+        material_changed = bool(changed_fields)
+        return {
+            "material_changed": material_changed,
+            "reason": "material_change_detected" if material_changed else "no_material_change",
+            "changed_fields": list(dict.fromkeys(changed_fields)),
+            "deltas": deltas,
+            "thresholds": numeric_thresholds,
+            "current_snapshot": current_snapshot,
+            "previous_snapshot": previous_snapshot,
+        }
+
+    @classmethod
+    def _soft_signal_actionable_review_context(
+        cls,
+        *,
+        selection_context: dict[str, object],
+        current_snapshot: dict[str, object],
+        material_change: dict[str, object] | None,
+    ) -> dict[str, object]:
+        slot_conviction_score = _safe_float(
+            selection_context.get("slot_conviction_score"),
+            default=0.0,
+        )
+        meta_gate_probability = _safe_float(
+            selection_context.get("meta_gate_probability"),
+            default=0.0,
+        )
+        lead_lag_state = _as_dict(current_snapshot.get("lead_lag_state"))
+        derivatives_state = _as_dict(current_snapshot.get("derivatives_state"))
+        strong_lead_lag = any(
+            bool(lead_lag_state.get(key))
+            for key in (
+                "strong_reference_confirmation",
+                "bullish_breakout_confirmed",
+                "bearish_breakout_confirmed",
+                "bullish_breakout_ahead",
+                "bearish_breakout_ahead",
+            )
+        )
+        directional_derivatives = any(
+            str(derivatives_state.get(key) or "").lower()
+            not in {"", "neutral", "unknown", "mixed", "none"}
+            for key in ("taker_flow_alignment", "funding_bias", "crowding_bias")
+        )
+        changed_fields = {
+            str(field)
+            for field in _as_dict(material_change).get("changed_fields", [])
+            if field
+        }
+        material_changed = bool(
+            material_change
+            and material_change.get("material_changed")
+            and material_change.get("reason") != "missing_previous_snapshot"
+        )
+        structural_change = bool(
+            material_changed
+            and changed_fields.intersection(
+                {
+                    "decision",
+                    "scenario",
+                    "strategy_engine",
+                    "holding_profile",
+                    "primary_regime",
+                    "trend_alignment",
+                    "volume_regime",
+                    "lead_lag_state",
+                    "derivatives_state",
+                }
+            )
+        )
+        quality_exception = (
+            slot_conviction_score >= SOFT_SIGNAL_ACTIONABLE_REVIEW_MIN_SLOT_CONVICTION
+            or meta_gate_probability >= SOFT_SIGNAL_ACTIONABLE_REVIEW_MIN_META_GATE_PROBABILITY
+            or strong_lead_lag
+            or directional_derivatives
+        )
+        return {
+            "actionable_review": bool(quality_exception or structural_change),
+            "slot_conviction_score": round(slot_conviction_score, 6),
+            "meta_gate_probability": round(meta_gate_probability, 6),
+            "quality_exception": bool(quality_exception),
+            "structural_change": bool(structural_change),
+            "strong_lead_lag": bool(strong_lead_lag),
+            "directional_derivatives": bool(directional_derivatives),
+            "changed_fields": sorted(changed_fields),
+        }
+
+    @classmethod
+    def _soft_signal_low_edge_hold_suppression_context(
+        cls,
+        *,
+        selection_context: dict[str, object],
+        current_snapshot: dict[str, object],
+        soft_rejected_reason: str,
+        material_change: dict[str, object] | None,
+    ) -> dict[str, object]:
+        candidate = _as_dict(selection_context.get("candidate"))
+        candidate_decision = str(candidate.get("decision") or "").lower()
+        if candidate_decision != "hold" or soft_rejected_reason != "low_edge_hold_candidate":
+            return {"active": False, "candidate_decision": candidate_decision}
+
+        slot_conviction_score = _safe_float(
+            selection_context.get("slot_conviction_score"),
+            default=0.0,
+        )
+        meta_gate_probability = _safe_float(
+            selection_context.get("meta_gate_probability"),
+            default=0.0,
+        )
+        weak_quality = (
+            slot_conviction_score <= SOFT_SIGNAL_LOW_EDGE_HOLD_MAX_SLOT_CONVICTION
+            and meta_gate_probability <= SOFT_SIGNAL_LOW_EDGE_HOLD_MAX_META_GATE_PROBABILITY
+        )
+        actionable_context = cls._soft_signal_actionable_review_context(
+            selection_context=selection_context,
+            current_snapshot=current_snapshot,
+            material_change=material_change,
+        )
+        return {
+            "active": bool(weak_quality and not actionable_context["actionable_review"]),
+            "candidate_decision": candidate_decision,
+            "weak_quality": bool(weak_quality),
+            "soft_rejected_reason": soft_rejected_reason,
+            "slot_conviction_score": round(slot_conviction_score, 6),
+            "meta_gate_probability": round(meta_gate_probability, 6),
+            "max_slot_conviction": SOFT_SIGNAL_LOW_EDGE_HOLD_MAX_SLOT_CONVICTION,
+            "max_meta_gate_probability": SOFT_SIGNAL_LOW_EDGE_HOLD_MAX_META_GATE_PROBABILITY,
+            "agreement_level_hint": str(selection_context.get("agreement_level_hint") or "") or None,
+            "agreement_alignment_score": cls._optional_summary_float(
+                selection_context.get("agreement_alignment_score")
+            ),
+            "actionable_context": actionable_context,
+        }
+
+    @staticmethod
+    def _agent_run_is_provider_attempt(row: AgentRun) -> bool:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        return row.provider_name == "openai" or str(metadata.get("source") or "") in {
+            "llm",
+            "llm_fallback",
+        }
+
+    @staticmethod
+    def _agent_run_has_soft_signal_context(row: AgentRun) -> bool:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        ai_call_policy = _as_dict(metadata.get("ai_call_policy"))
+        ai_trigger = _as_dict(metadata.get("ai_trigger"))
+        raw_reason_values: list[object] = []
+        for raw_values in (
+            metadata.get("allow_ai_but_later_risk_check"),
+            ai_call_policy.get("allow_ai_but_later_risk_check"),
+            ai_trigger.get("reason_codes"),
+        ):
+            if isinstance(raw_values, list):
+                raw_reason_values.extend(raw_values)
+            elif isinstance(raw_values, str):
+                raw_reason_values.append(raw_values)
+        reason_codes = {
+            str(code)
+            for code in raw_reason_values
+            if code
+        }
+        return (
+            SOFT_SIGNAL_AI_REVIEW_REASON_CODE in reason_codes
+            or SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE in reason_codes
+            or str(metadata.get("soft_signal_review_mode") or "")
+            in {"transition_watch", "transition_watch_cooldown", "transition_watch_no_material_change"}
+        )
+
+    @staticmethod
+    def _reason_codes_from_payload(payload: dict[str, object]) -> set[str]:
+        values: list[object] = []
+        for key in ("rationale_codes", "reason_codes", "no_trade_reason_codes"):
+            raw_values = payload.get(key)
+            if isinstance(raw_values, list):
+                values.extend(raw_values)
+            elif isinstance(raw_values, str):
+                values.append(raw_values)
+        return {str(code) for code in values if code}
+
+    @classmethod
+    def _entry_candidate_reason_codes(
+        cls,
+        selection_context: dict[str, object],
+        *,
+        extra_reason_codes: list[str] | None = None,
+    ) -> set[str]:
+        candidate = _as_dict(selection_context.get("candidate"))
+        reason_codes = {
+            *cls._reason_codes_from_payload(candidate),
+            *cls._reason_codes_from_payload(selection_context),
+        }
+        for code in extra_reason_codes or []:
+            if code:
+                reason_codes.add(str(code))
+        return reason_codes
+
+    @staticmethod
+    def _entry_candidate_decision(selection_context: dict[str, object]) -> str:
+        candidate = _as_dict(selection_context.get("candidate"))
+        return str(candidate.get("decision") or "").lower()
+
+    @classmethod
+    def _selection_has_neutral_entry_context(cls, selection_context: dict[str, object]) -> bool:
+        decision = cls._entry_candidate_decision(selection_context)
+        if decision not in {"long", "short"}:
+            return False
+        reason_codes = cls._entry_candidate_reason_codes(selection_context)
+        return ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS.issubset(reason_codes)
+
+    @classmethod
+    def _agent_run_has_neutral_entry_context(cls, row: AgentRun) -> bool:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        output = row.output_payload if isinstance(row.output_payload, dict) else {}
+        selection_context = _as_dict(metadata.get("selection_context"))
+        selection_candidate = _as_dict(selection_context.get("candidate"))
+        reason_codes = {
+            *cls._reason_codes_from_payload(output),
+            *cls._reason_codes_from_payload(selection_context),
+            *cls._reason_codes_from_payload(selection_candidate),
+        }
+        return ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS.issubset(reason_codes)
+
+    @classmethod
+    def _entry_candidate_weak_volume_context(
+        cls,
+        selection_context: dict[str, object],
+        *,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        reason_codes = cls._entry_candidate_reason_codes(
+            selection_context,
+            extra_reason_codes=allow_ai_but_later_risk_check,
+        )
+        snapshot = cls._soft_signal_review_snapshot(selection_context)
+        volume_regime = str(snapshot.get("volume_regime") or "").lower()
+        weak_volume = bool(snapshot.get("weak_volume", False))
+        momentum_weakening = bool(snapshot.get("momentum_weakening", False))
+        active = (
+            ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON in reason_codes
+            or ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON in reason_codes
+            or "WEAK_VOLUME" in reason_codes
+            or volume_regime in ENTRY_CANDIDATE_WEAK_VOLUME_REGIMES
+            or weak_volume
+        )
+        return {
+            "active": bool(active),
+            "reason_codes": sorted(reason_codes),
+            "volume_regime": volume_regime or None,
+            "weak_volume": weak_volume,
+            "momentum_weakening": momentum_weakening,
+        }
+
+    @classmethod
+    def _entry_candidate_low_actionability_signature(
+        cls,
+        selection_context: dict[str, object],
+        *,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object] | None:
+        decision = cls._entry_candidate_decision(selection_context)
+        if decision not in {"long", "short"}:
+            return None
+        reason_codes = cls._entry_candidate_reason_codes(
+            selection_context,
+            extra_reason_codes=allow_ai_but_later_risk_check,
+        )
+        snapshot = cls._soft_signal_review_snapshot(selection_context)
+        weak_context = cls._entry_candidate_weak_volume_context(
+            selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        low_reason_codes = {
+            code
+            for code in reason_codes
+            if code in ENTRY_CANDIDATE_LOW_ACTIONABILITY_REASON_CODES
+        }
+        if bool(weak_context.get("active")):
+            low_reason_codes.add(ENTRY_CANDIDATE_WEAK_VOLUME_CONTEXT_REASON)
+        if bool(snapshot.get("momentum_weakening", False)):
+            low_reason_codes.add("MOMENTUM_WEAKENING")
+        if not low_reason_codes:
+            return None
+        return {
+            "decision": decision,
+            "reason_codes": sorted(low_reason_codes),
+            "strategy_engine": str(
+                selection_context.get("strategy_engine")
+                or _as_dict(selection_context.get("candidate")).get("strategy_engine")
+                or ""
+            )
+            or None,
+        }
+
+    @classmethod
+    def _agent_run_low_actionability_signature(cls, row: AgentRun) -> dict[str, object] | None:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        selection_context = _as_dict(metadata.get("selection_context"))
+        if selection_context:
+            allow_reasons = [
+                str(code)
+                for code in metadata.get("allow_ai_but_later_risk_check", [])
+                if code
+            ] if isinstance(metadata.get("allow_ai_but_later_risk_check"), list) else []
+            ai_call_policy = _as_dict(metadata.get("ai_call_policy"))
+            if isinstance(ai_call_policy.get("allow_ai_but_later_risk_check"), list):
+                allow_reasons.extend(
+                    str(code)
+                    for code in ai_call_policy.get("allow_ai_but_later_risk_check", [])
+                    if code
+                )
+            return cls._entry_candidate_low_actionability_signature(
+                selection_context,
+                allow_ai_but_later_risk_check=list(dict.fromkeys(allow_reasons)),
+            )
+        return None
+
+    @staticmethod
+    def _entry_candidate_score_bucket(value: object, *, bucket_size: float = 0.05) -> float | None:
+        numeric_value = _safe_float(value, default=float("nan"))
+        if numeric_value != numeric_value:
+            return None
+        bucket = int(max(min(numeric_value, 1.0), -1.0) / bucket_size) * bucket_size
+        return round(bucket, 4)
+
+    @classmethod
+    def _entry_candidate_ai_hold_signature(
+        cls,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object] | None:
+        decision = cls._entry_candidate_decision(selection_context)
+        if decision not in {"long", "short"}:
+            return None
+        snapshot = cls._soft_signal_review_snapshot(selection_context)
+        reason_codes = cls._entry_candidate_reason_codes(
+            selection_context,
+            extra_reason_codes=allow_ai_but_later_risk_check,
+        )
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe or snapshot.get("timeframe") or None,
+            "decision": decision,
+            "scenario": snapshot.get("scenario") or None,
+            "strategy_engine": snapshot.get("strategy_engine") or None,
+            "holding_profile": snapshot.get("holding_profile") or None,
+            "entry_mode": snapshot.get("entry_mode") or None,
+            "reason_codes": sorted(reason_codes),
+            "primary_regime": snapshot.get("primary_regime") or None,
+            "trend_alignment": snapshot.get("trend_alignment") or None,
+            "volume_regime": snapshot.get("volume_regime") or None,
+            "weak_volume": bool(snapshot.get("weak_volume", False)),
+            "momentum_weakening": bool(snapshot.get("momentum_weakening", False)),
+            "score_bucket": cls._entry_candidate_score_bucket(snapshot.get("score_total")),
+            "lead_lag_alignment_bucket": cls._entry_candidate_score_bucket(
+                snapshot.get("lead_lag_alignment")
+            ),
+            "derivatives_alignment_bucket": cls._entry_candidate_score_bucket(
+                snapshot.get("derivatives_alignment")
+            ),
+            "lead_lag_state": snapshot.get("lead_lag_state") or {},
+            "derivatives_state": snapshot.get("derivatives_state") or {},
+        }
+
+    @classmethod
+    def _agent_run_entry_candidate_ai_hold_signature(cls, row: AgentRun) -> dict[str, object] | None:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        stored_signature = _as_dict(metadata.get("entry_candidate_ai_hold_fingerprint"))
+        if stored_signature:
+            return stored_signature
+        selection_context = _as_dict(metadata.get("selection_context"))
+        if not selection_context:
+            return None
+        allow_reasons = [
+            str(code)
+            for code in metadata.get("allow_ai_but_later_risk_check", [])
+            if code
+        ] if isinstance(metadata.get("allow_ai_but_later_risk_check"), list) else []
+        ai_call_policy = _as_dict(metadata.get("ai_call_policy"))
+        if isinstance(ai_call_policy.get("allow_ai_but_later_risk_check"), list):
+            allow_reasons.extend(
+                str(code)
+                for code in ai_call_policy.get("allow_ai_but_later_risk_check", [])
+                if code
+            )
+        output = row.output_payload if isinstance(row.output_payload, dict) else {}
+        symbol = str(
+            metadata.get("symbol")
+            or output.get("symbol")
+            or _as_dict(selection_context.get("candidate")).get("symbol")
+            or ""
+        )
+        timeframe = str(
+            metadata.get("timeframe")
+            or output.get("timeframe")
+            or _as_dict(selection_context.get("candidate")).get("timeframe")
+            or ""
+        ) or None
+        if not symbol:
+            return None
+        return cls._entry_candidate_ai_hold_signature(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            allow_ai_but_later_risk_check=list(dict.fromkeys(allow_reasons)),
+        )
+
+    def _entry_candidate_ai_hold_fingerprint_cooldown_status(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        current_signature = self._entry_candidate_ai_hold_signature(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if current_signature is None:
+            return {
+                "active": False,
+                "reason": "context_not_directional_entry_candidate",
+            }
+        cutoff = generated_at - timedelta(
+            minutes=ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES
+        )
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.role == AgentRole.TRADING_DECISION.value,
+                    AgentRun.trigger_event == TriggerEvent.REALTIME.value,
+                    AgentRun.created_at >= cutoff,
+                )
+                .order_by(desc(AgentRun.created_at))
+                .limit(ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_ROW_LIMIT)
+            )
+        )
+        matching_rows: list[AgentRun] = []
+        for row in rows:
+            if not self._agent_run_is_provider_attempt(row):
+                continue
+            if not self._agent_run_matches_symbol(row, symbol=symbol.upper(), timeframe=timeframe):
+                continue
+            if self._agent_run_entry_candidate_ai_hold_signature(row) != current_signature:
+                continue
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            if str(output.get("decision") or "").lower() != "hold":
+                continue
+            matching_rows.append(row)
+
+        if not matching_rows:
+            return {
+                "active": False,
+                "sample_count": 0,
+                "cooldown_minutes": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES,
+                "signature": current_signature,
+            }
+
+        run_ids = [int(row.id) for row in matching_rows if row.id is not None]
+        order_run_ids = {
+            int(run_id)
+            for run_id in self.session.scalars(
+                select(Order.decision_run_id).where(Order.decision_run_id.in_(run_ids))
+            )
+            if run_id is not None
+        } if run_ids else set()
+        plan_run_ids = {
+            int(run_id)
+            for run_id in self.session.scalars(
+                select(PendingEntryPlan.source_decision_run_id).where(
+                    PendingEntryPlan.source_decision_run_id.in_(run_ids)
+                )
+            )
+            if run_id is not None
+        } if run_ids else set()
+        reusable_rows = [
+            row
+            for row in matching_rows
+            if row.id is not None and int(row.id) not in order_run_ids and int(row.id) not in plan_run_ids
+        ]
+        latest_reusable = reusable_rows[0] if reusable_rows else None
+        return {
+            "active": latest_reusable is not None,
+            "sample_count": len(matching_rows),
+            "reusable_hold_count": len(reusable_rows),
+            "cooldown_minutes": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_MINUTES,
+            "signature": current_signature,
+            "decision_run_ids": run_ids,
+            "order_decision_run_ids": sorted(order_run_ids),
+            "pending_plan_decision_run_ids": sorted(plan_run_ids),
+            "reused_decision_run_id": latest_reusable.id if latest_reusable is not None else None,
+            "last_provider_call_at": (
+                latest_reusable.created_at.isoformat()
+                if latest_reusable is not None and latest_reusable.created_at is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _risk_check_hold_blocked(row: RiskCheck) -> bool:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        reason_codes = {
+            str(code)
+            for code in [
+                *list(row.reason_codes or []),
+                *list(payload.get("reason_codes") or []),
+                *list(payload.get("blocked_reason_codes") or []),
+            ]
+            if code
+        }
+        return bool(row.allowed is False and row.decision == "hold" and "HOLD_DECISION" in reason_codes)
+
+    def _neutral_entry_hold_backoff_status(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        symbol_upper = symbol.upper()
+        if not symbol_upper or not self._selection_has_neutral_entry_context(selection_context):
+            return {"active": False, "sample_count": 0, "reason": "context_not_neutral_entry"}
+        cutoff = generated_at - timedelta(minutes=SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES)
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.role == AgentRole.TRADING_DECISION.value,
+                    AgentRun.trigger_event == TriggerEvent.REALTIME.value,
+                    AgentRun.created_at >= cutoff,
+                )
+                .order_by(desc(AgentRun.created_at))
+                .limit(SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_ROW_LIMIT)
+            )
+        )
+        recent_rows: list[AgentRun] = []
+        for row in rows:
+            if not self._agent_run_is_provider_attempt(row):
+                continue
+            if not self._agent_run_matches_symbol(row, symbol=symbol_upper, timeframe=timeframe):
+                continue
+            if not self._agent_run_has_neutral_entry_context(row):
+                continue
+            recent_rows.append(row)
+            if len(recent_rows) >= SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+                break
+        if len(recent_rows) < SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+            return {
+                "active": False,
+                "sample_count": len(recent_rows),
+                "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+                "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+            }
+
+        run_ids = [int(row.id) for row in recent_rows if row.id is not None]
+        risk_rows = list(
+            self.session.scalars(select(RiskCheck).where(RiskCheck.decision_run_id.in_(run_ids)))
+        )
+        risk_by_run_id: dict[int, list[RiskCheck]] = defaultdict(list)
+        for risk_row in risk_rows:
+            if risk_row.decision_run_id is not None:
+                risk_by_run_id[int(risk_row.decision_run_id)].append(risk_row)
+
+        outcomes: list[dict[str, object]] = []
+        for row in recent_rows:
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            decision_run_id = int(row.id) if row.id is not None else None
+            risk_hold_blocked = any(
+                self._risk_check_hold_blocked(risk_row)
+                for risk_row in risk_by_run_id.get(decision_run_id, [])
+                if decision_run_id is not None
+            )
+            outcomes.append(
+                {
+                    "decision_run_id": row.id,
+                    "decision": str(output.get("decision") or "").lower() or None,
+                    "risk_hold_blocked": risk_hold_blocked,
+                }
+            )
+
+        active = all(bool(item["decision"] == "hold" and item["risk_hold_blocked"]) for item in outcomes)
+        return {
+            "active": active,
+            "sample_count": len(recent_rows),
+            "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+            "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+            "decision_run_ids": run_ids,
+            "outcomes": outcomes,
+            "required_reason_codes": sorted(ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS),
+            "last_provider_call_at": recent_rows[0].created_at.isoformat() if recent_rows else None,
+            "oldest_provider_call_at": recent_rows[-1].created_at.isoformat() if recent_rows else None,
+        }
+
+    def _entry_candidate_low_actionability_hold_backoff_status(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        symbol_upper = symbol.upper()
+        current_signature = self._entry_candidate_low_actionability_signature(
+            selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if not symbol_upper or current_signature is None:
+            return {
+                "active": False,
+                "sample_count": 0,
+                "reason": "context_not_low_actionability_entry",
+            }
+        cutoff = generated_at - timedelta(minutes=SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES)
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.role == AgentRole.TRADING_DECISION.value,
+                    AgentRun.trigger_event == TriggerEvent.REALTIME.value,
+                    AgentRun.created_at >= cutoff,
+                )
+                .order_by(desc(AgentRun.created_at))
+                .limit(SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_ROW_LIMIT)
+            )
+        )
+        recent_rows: list[AgentRun] = []
+        for row in rows:
+            if not self._agent_run_is_provider_attempt(row):
+                continue
+            if not self._agent_run_matches_symbol(row, symbol=symbol_upper, timeframe=timeframe):
+                continue
+            if self._agent_run_low_actionability_signature(row) != current_signature:
+                continue
+            recent_rows.append(row)
+            if len(recent_rows) >= SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+                break
+        if len(recent_rows) < SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+            return {
+                "active": False,
+                "sample_count": len(recent_rows),
+                "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+                "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+                "signature": current_signature,
+            }
+
+        run_ids = [int(row.id) for row in recent_rows if row.id is not None]
+        risk_rows = list(
+            self.session.scalars(select(RiskCheck).where(RiskCheck.decision_run_id.in_(run_ids)))
+        )
+        risk_by_run_id: dict[int, list[RiskCheck]] = defaultdict(list)
+        for risk_row in risk_rows:
+            if risk_row.decision_run_id is not None:
+                risk_by_run_id[int(risk_row.decision_run_id)].append(risk_row)
+
+        outcomes: list[dict[str, object]] = []
+        for row in recent_rows:
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            decision_run_id = int(row.id) if row.id is not None else None
+            risk_hold_blocked = any(
+                self._risk_check_hold_blocked(risk_row)
+                for risk_row in risk_by_run_id.get(decision_run_id, [])
+                if decision_run_id is not None
+            )
+            outcomes.append(
+                {
+                    "decision_run_id": row.id,
+                    "decision": str(output.get("decision") or "").lower() or None,
+                    "risk_hold_blocked": risk_hold_blocked,
+                }
+            )
+
+        active = all(bool(item["decision"] == "hold" and item["risk_hold_blocked"]) for item in outcomes)
+        return {
+            "active": active,
+            "sample_count": len(recent_rows),
+            "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+            "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+            "decision_run_ids": run_ids,
+            "outcomes": outcomes,
+            "signature": current_signature,
+            "last_provider_call_at": recent_rows[0].created_at.isoformat() if recent_rows else None,
+            "oldest_provider_call_at": recent_rows[-1].created_at.isoformat() if recent_rows else None,
+        }
+
+    @staticmethod
+    def _entry_candidate_order_path_block_context(runtime_state: dict[str, object]) -> dict[str, object] | None:
+        reason_codes: list[str] = []
+        market_stream = _as_dict(runtime_state.get("market_stream_summary"))
+        redis_configured = bool(market_stream.get("redis_configured"))
+        redis_connected = market_stream.get("redis_connected")
+        cache_health = str(market_stream.get("cache_health") or "").strip().lower()
+        if redis_configured and (redis_connected is False or cache_health == "unavailable"):
+            reason_codes.append("REDIS_CACHE_UNAVAILABLE")
+
+        reconciliation = _as_dict(runtime_state.get("reconciliation_summary"))
+        if str(reconciliation.get("status") or "").strip().lower() not in {"", "synced"}:
+            reason_codes.append("RECONCILIATION_NOT_SYNCED")
+        if (
+            bool(reconciliation.get("unresolved_submission_badge"))
+            or int(_safe_float(reconciliation.get("unresolved_submission_count"), default=0.0)) > 0
+        ):
+            reason_codes.append("UNRESOLVED_SUBMISSION")
+
+        binance_rest = _as_dict(runtime_state.get("binance_rest_summary"))
+        rest_status = str(binance_rest.get("status") or "ok").strip().lower()
+        circuit_state = str(binance_rest.get("circuit_state") or "closed").strip().lower()
+        if rest_status not in {"", "ok"}:
+            reason_codes.append(str(binance_rest.get("reason_code") or "BINANCE_REST_NOT_READY"))
+        if circuit_state not in {"", "closed"}:
+            reason_codes.append("BINANCE_REST_CIRCUIT_OPEN")
+
+        unique_codes = list(dict.fromkeys(reason_codes))
+        if not unique_codes:
+            return None
+        return {
+            "active": True,
+            "reason_codes": unique_codes,
+            "market_stream": {
+                "redis_configured": redis_configured,
+                "redis_connected": redis_connected,
+                "cache_health": cache_health or None,
+                "cache_reject_reason": market_stream.get("cache_reject_reason"),
+            },
+            "reconciliation": {
+                "status": reconciliation.get("status"),
+                "unresolved_submission_badge": bool(reconciliation.get("unresolved_submission_badge")),
+                "unresolved_submission_count": int(
+                    _safe_float(reconciliation.get("unresolved_submission_count"), default=0.0)
+                ),
+            },
+            "binance_rest": {
+                "status": rest_status or None,
+                "circuit_state": circuit_state or None,
+                "reason_code": binance_rest.get("reason_code"),
+            },
+        }
+
+    def _entry_candidate_active_pending_plan_context(self, *, symbol: str) -> dict[str, object] | None:
+        plans = self._active_pending_entry_plans(symbol=symbol)
+        if not plans:
+            return None
+        return {
+            "active": True,
+            "active_plan_count": len(plans),
+            "plan_ids": [plan.id for plan in plans if plan.id is not None],
+            "statuses": list(dict.fromkeys(str(plan.plan_status or "") for plan in plans)),
+        }
+
+    @staticmethod
+    def _entry_candidate_incomplete_trade_plan_context(
+        selection_context: dict[str, object],
+    ) -> dict[str, object] | None:
+        candidate = _as_dict(selection_context.get("candidate"))
+        if not candidate:
+            return None
+        decision = str(candidate.get("decision") or "").lower()
+        if decision not in {"long", "short"}:
+            return None
+        required_fields = ("entry_zone_min", "entry_zone_max", "stop_loss", "take_profit")
+        missing_fields = [
+            field
+            for field in required_fields
+            if candidate.get(field) in {None, ""}
+        ]
+        if not missing_fields:
+            return None
+        return {
+            "active": True,
+            "missing_fields": missing_fields,
+            "decision": decision,
+        }
+
+    def _soft_signal_hold_backoff_status(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        symbol_upper = symbol.upper()
+        if not symbol_upper:
+            return {"active": False, "sample_count": 0}
+        cutoff = generated_at - timedelta(minutes=SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES)
+        rows = list(
+            self.session.scalars(
+                select(AgentRun)
+                .where(
+                    AgentRun.role == AgentRole.TRADING_DECISION.value,
+                    AgentRun.created_at >= cutoff,
+                )
+                .order_by(desc(AgentRun.created_at))
+                .limit(SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_ROW_LIMIT)
+            )
+        )
+        recent_rows: list[AgentRun] = []
+        for row in rows:
+            if not self._agent_run_is_provider_attempt(row):
+                continue
+            if not self._agent_run_matches_symbol(row, symbol=symbol_upper, timeframe=timeframe):
+                continue
+            if not self._agent_run_has_soft_signal_context(row):
+                continue
+            recent_rows.append(row)
+            if len(recent_rows) >= SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+                break
+        if len(recent_rows) < SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS:
+            return {
+                "active": False,
+                "sample_count": len(recent_rows),
+                "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+                "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+            }
+
+        run_ids = [int(row.id) for row in recent_rows if row.id is not None]
+        risk_rows = list(
+            self.session.scalars(select(RiskCheck).where(RiskCheck.decision_run_id.in_(run_ids)))
+        )
+        risk_by_run_id: dict[int, list[RiskCheck]] = defaultdict(list)
+        for risk_row in risk_rows:
+            if risk_row.decision_run_id is not None:
+                risk_by_run_id[int(risk_row.decision_run_id)].append(risk_row)
+
+        outcomes: list[dict[str, object]] = []
+        for row in recent_rows:
+            output = row.output_payload if isinstance(row.output_payload, dict) else {}
+            decision_run_id = int(row.id) if row.id is not None else None
+            risk_hold_blocked = any(
+                self._risk_check_hold_blocked(risk_row)
+                for risk_row in risk_by_run_id.get(decision_run_id, [])
+                if decision_run_id is not None
+            )
+            outcomes.append(
+                {
+                    "decision_run_id": row.id,
+                    "decision": str(output.get("decision") or "").lower() or None,
+                    "risk_hold_blocked": risk_hold_blocked,
+                }
+            )
+
+        active = all(bool(item["decision"] == "hold" and item["risk_hold_blocked"]) for item in outcomes)
+        return {
+            "active": active,
+            "sample_count": len(recent_rows),
+            "min_provider_calls": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_MIN_CALLS,
+            "lookback_minutes": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_LOOKBACK_MINUTES,
+            "decision_run_ids": run_ids,
+            "outcomes": outcomes,
+            "last_provider_call_at": recent_rows[0].created_at.isoformat() if recent_rows else None,
+            "oldest_provider_call_at": recent_rows[-1].created_at.isoformat() if recent_rows else None,
+        }
+
+    def _soft_signal_review_policy(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        soft_rejected_reason: str,
+        last_ai_invoked_at: datetime | None,
+        latest_decision_metadata: dict[str, object],
+        generated_at: datetime,
+        effective_settings: object,
+    ) -> dict[str, object]:
+        metrics = self._soft_signal_review_metrics(selection_context)
+        current_snapshot = self._soft_signal_review_snapshot(selection_context)
+        previous_snapshot = self._previous_soft_signal_review_snapshot(latest_decision_metadata)
+        previous_soft_mode = str(latest_decision_metadata.get("soft_signal_review_mode") or "")
+        threshold_gap = metrics.get("threshold_gap")
+        transition_watch_candidate = (
+            isinstance(threshold_gap, (int, float))
+            and float(threshold_gap) <= SOFT_SIGNAL_TRANSITION_WATCH_MAX_SCORE_GAP
+        )
+        common_payload = {
+            "scope": "new_entry",
+            "hard_skip_ai": False,
+            "hard_skip_reason_codes": [],
+            "allow_ai_but_later_risk_check": [SOFT_SIGNAL_AI_REVIEW_REASON_CODE],
+            "soft_rejected_reason": soft_rejected_reason,
+            "soft_signal_review_metrics": metrics,
+            "slot_conviction_score": metrics["slot_conviction_score"],
+            "score_total": metrics["score_total"],
+            "entry_score_threshold": metrics["entry_score_threshold"],
+            "threshold_gap": metrics["threshold_gap"],
+            "soft_signal_review_snapshot": current_snapshot,
+        }
+        if not transition_watch_candidate:
+            return {
+                "action": "suppress",
+                "last_ai_skip_reason": SOFT_SIGNAL_AI_REVIEW_SUPPRESSED_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": SOFT_SIGNAL_AI_REVIEW_SUPPRESSED_REASON,
+                    "skip_category": "cost_saved_weak_candidate",
+                    "soft_signal_review_mode": "cost_saved_weak_candidate",
+                    **common_payload,
+                },
+            }
+
+        material_change = None
+        if previous_soft_mode == "transition_watch":
+            material_change = self._soft_signal_review_material_change(
+                current_snapshot=current_snapshot,
+                previous_snapshot=previous_snapshot,
+            )
+        actionable_review_context = self._soft_signal_actionable_review_context(
+            selection_context=selection_context,
+            current_snapshot=current_snapshot,
+            material_change=material_change,
+        )
+
+        low_edge_hold_suppression = self._soft_signal_low_edge_hold_suppression_context(
+            selection_context=selection_context,
+            current_snapshot=current_snapshot,
+            soft_rejected_reason=soft_rejected_reason,
+            material_change=material_change,
+        )
+        if bool(low_edge_hold_suppression.get("active")):
+            return {
+                "action": "low_edge_hold_suppressed",
+                "last_ai_skip_reason": SOFT_SIGNAL_AI_REVIEW_SUPPRESSED_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": SOFT_SIGNAL_AI_REVIEW_SUPPRESSED_REASON,
+                    "skip_category": "cost_saved_low_edge_hold_candidate",
+                    "soft_signal_review_mode": "cost_saved_low_edge_hold_candidate",
+                    "low_edge_hold_suppression": low_edge_hold_suppression,
+                    "soft_signal_review_material_change": material_change,
+                    **common_payload,
+                },
+            }
+
+        adaptive_backoff = self._soft_signal_hold_backoff_status(
+            symbol=symbol,
+            timeframe=timeframe,
+            generated_at=generated_at,
+        )
+        adaptive_backoff_override = None
+        if bool(adaptive_backoff.get("active")) and isinstance(material_change, dict):
+            if (
+                bool(material_change.get("material_changed"))
+                and bool(material_change.get("previous_snapshot"))
+                and bool(actionable_review_context.get("actionable_review"))
+            ):
+                adaptive_backoff_override = {
+                    "active": True,
+                    "reason": "material_actionable_change",
+                    "adaptive_hold_backoff": adaptive_backoff,
+                    "actionable_context": actionable_review_context,
+                }
+        if bool(adaptive_backoff.get("active")) and adaptive_backoff_override is None:
+            return {
+                "action": "hold_backoff",
+                "last_ai_skip_reason": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": SOFT_SIGNAL_ADAPTIVE_HOLD_BACKOFF_REASON,
+                    "skip_category": "transition_watch_hold_backoff",
+                    "soft_signal_review_mode": "transition_watch_hold_backoff",
+                    "adaptive_hold_backoff": adaptive_backoff,
+                    **common_payload,
+                },
+            }
+
+        soft_cooldown_minutes = self._soft_signal_ai_review_cooldown_minutes(effective_settings)
+        if last_ai_invoked_at is not None:
+            retry_at = last_ai_invoked_at + timedelta(minutes=soft_cooldown_minutes)
+            if retry_at > generated_at:
+                retry_after_seconds = max(int((retry_at - generated_at).total_seconds()), 1)
+                return {
+                    "action": "cooldown",
+                    "last_ai_skip_reason": SOFT_SIGNAL_TRANSITION_WATCH_COOLDOWN_SKIP_REASON,
+                    "ai_call_policy": {
+                        "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                        "ai_call_allowed": False,
+                        "skip_ai": True,
+                        "reason": "soft_signal_review_cooldown_active",
+                        "skip_category": "transition_watch_cooldown",
+                        "retry_after_seconds": retry_after_seconds,
+                        "cooldown_minutes": soft_cooldown_minutes,
+                        "last_ai_invoked_at": last_ai_invoked_at.isoformat(),
+                        "soft_signal_review_mode": "transition_watch_cooldown",
+                        **common_payload,
+                    },
+                }
+
+        if previous_soft_mode == "transition_watch":
+            if not bool(material_change.get("material_changed", True)):
+                return {
+                    "action": "no_material_change",
+                    "last_ai_skip_reason": (
+                        SOFT_SIGNAL_TRANSITION_WATCH_NO_MATERIAL_CHANGE_SKIP_REASON
+                    ),
+                    "ai_call_policy": {
+                        "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                        "ai_call_allowed": False,
+                        "skip_ai": True,
+                        "reason": SOFT_SIGNAL_TRANSITION_WATCH_NO_MATERIAL_CHANGE_REASON,
+                        "skip_category": "transition_watch_no_material_change",
+                        "last_ai_invoked_at": (
+                            last_ai_invoked_at.isoformat()
+                            if last_ai_invoked_at is not None
+                            else None
+                        ),
+                        "soft_signal_review_mode": "transition_watch_no_material_change",
+                        "soft_signal_review_material_change": material_change,
+                        **common_payload,
+                    },
+                }
+
+        return {
+            "action": "allow_transition_watch",
+            "last_ai_skip_reason": None,
+            "ai_call_policy": {
+                "ai_call_event": AI_CALL_EVENT_ALLOWED,
+                "ai_call_allowed": True,
+                "skip_ai": False,
+                "reason": None,
+                "skip_category": None,
+                "soft_signal_review_mode": "transition_watch",
+                "transition_watch_ai_invoked": True,
+                "cooldown_minutes": soft_cooldown_minutes,
+                "soft_signal_review_material_change": (
+                    material_change
+                    or {
+                        "material_changed": True,
+                        "reason": "no_previous_transition_watch",
+                        "current_snapshot": current_snapshot,
+                        "previous_snapshot": previous_snapshot,
+                    }
+                ),
+                "adaptive_hold_backoff_override": adaptive_backoff_override,
+                **{
+                    **common_payload,
+                    "allow_ai_but_later_risk_check": [
+                        SOFT_SIGNAL_AI_REVIEW_REASON_CODE,
+                        SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE,
+                    ],
+                },
+            },
+        }
+
+    def _neutral_entry_hold_backoff_policy(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+    ) -> dict[str, object]:
+        backoff = self._neutral_entry_hold_backoff_status(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+        )
+        if not bool(backoff.get("active")):
+            if backoff.get("reason") == "context_not_neutral_entry":
+                return {
+                    "action": "allow",
+                    "last_ai_skip_reason": None,
+                    "neutral_entry_hold_backoff": backoff,
+                }
+            neutral_context = {
+                **backoff,
+                "active": True,
+                "reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_REASON,
+                "required_reason_codes": sorted(ENTRY_CANDIDATE_NEUTRAL_CONTEXT_REQUIRED_REASONS),
+            }
+            return {
+                "action": "neutral_context_preai_skip",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI_SKIP_REASON,
+                    "skip_category": "neutral_entry_context_preai",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "neutral_entry_context": neutral_context,
+                },
+            }
+        return {
+            "action": "hold_backoff",
+            "last_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_SKIP_REASON,
+            "ai_call_policy": {
+                "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                "ai_call_allowed": False,
+                "skip_ai": True,
+                "reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_REASON,
+                "pre_ai_skip_reason": ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF_SKIP_REASON,
+                "skip_category": "neutral_entry_hold_backoff",
+                "scope": "new_entry",
+                "hard_skip_ai": False,
+                "hard_skip_reason_codes": [],
+                "allow_ai_but_later_risk_check": [],
+                "neutral_entry_hold_backoff": backoff,
+            },
+        }
+
+    def _entry_candidate_pre_ai_eligibility_policy(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None,
+        selection_context: dict[str, object],
+        generated_at: datetime,
+        runtime_state: dict[str, object],
+        allow_ai_but_later_risk_check: list[str] | None = None,
+    ) -> dict[str, object]:
+        policy_reason_codes = {str(code) for code in allow_ai_but_later_risk_check or [] if code}
+        if SOFT_SIGNAL_AI_REVIEW_REASON_CODE in policy_reason_codes:
+            ai_hold_cooldown = self._entry_candidate_ai_hold_fingerprint_cooldown_status(
+                symbol=symbol,
+                timeframe=timeframe,
+                selection_context=selection_context,
+                generated_at=generated_at,
+                allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            )
+            return {
+                "action": "allow",
+                "last_ai_skip_reason": None,
+                "reason": "soft_signal_review_policy_owner",
+                "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+            }
+
+        active_pending_plan = self._entry_candidate_active_pending_plan_context(symbol=symbol)
+        if active_pending_plan is not None:
+            return {
+                "action": "active_pending_plan",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_SKIP_REASON,
+                    "skip_category": "entry_candidate_active_pending_plan",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "active_pending_plan": active_pending_plan,
+                },
+            }
+
+        neutral_entry_policy = self._neutral_entry_hold_backoff_policy(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+        )
+        if neutral_entry_policy.get("action") != "allow":
+            return neutral_entry_policy
+
+        weak_volume_context = self._entry_candidate_weak_volume_context(
+            selection_context,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if bool(weak_volume_context.get("active")):
+            return {
+                "action": "weak_volume_preai_skip",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_POLICY_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_WEAK_VOLUME_PREAI_REASON,
+                    "skip_category": "entry_candidate_weak_volume_preai",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": list(
+                        dict.fromkeys(allow_ai_but_later_risk_check or [])
+                    ),
+                    "weak_volume_context": weak_volume_context,
+                },
+            }
+
+        low_actionability_backoff = self._entry_candidate_low_actionability_hold_backoff_status(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if bool(low_actionability_backoff.get("active")):
+            return {
+                "action": "low_actionability_hold_backoff",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF_SKIP_REASON,
+                    "skip_category": "entry_candidate_low_actionability_hold_backoff",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": list(
+                        dict.fromkeys(allow_ai_but_later_risk_check or [])
+                    ),
+                    "low_actionability_hold_backoff": low_actionability_backoff,
+                },
+            }
+
+        incomplete_trade_plan = self._entry_candidate_incomplete_trade_plan_context(selection_context)
+        if incomplete_trade_plan is not None:
+            return {
+                "action": "incomplete_trade_plan",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_SKIP_REASON,
+                    "skip_category": "entry_candidate_incomplete_trade_plan",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "incomplete_trade_plan": incomplete_trade_plan,
+                },
+            }
+
+        ai_hold_cooldown = self._entry_candidate_ai_hold_fingerprint_cooldown_status(
+            symbol=symbol,
+            timeframe=timeframe,
+            selection_context=selection_context,
+            generated_at=generated_at,
+            allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+        )
+        if bool(ai_hold_cooldown.get("active")):
+            return {
+                "action": "ai_hold_fingerprint_cooldown",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_SKIP_REASON,
+                "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN_SKIP_REASON,
+                    "skip_category": "entry_candidate_ai_hold_fingerprint_cooldown",
+                    "scope": "new_entry",
+                    "hard_skip_ai": False,
+                    "hard_skip_reason_codes": [],
+                    "allow_ai_but_later_risk_check": [],
+                    "entry_candidate_ai_hold_cooldown": ai_hold_cooldown,
+                    "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+                },
+            }
+
+        order_path_block = self._entry_candidate_order_path_block_context(runtime_state)
+        if order_path_block is not None:
+            return {
+                "action": "order_path_not_actionable",
+                "last_ai_skip_reason": ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_SKIP_REASON,
+                "ai_call_policy": {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_REASON,
+                    "pre_ai_skip_reason": ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE_SKIP_REASON,
+                    "skip_category": "entry_candidate_order_path_not_actionable",
+                    "scope": "new_entry",
+                    "hard_skip_ai": True,
+                    "hard_skip_reason_codes": list(order_path_block["reason_codes"]),
+                    "allow_ai_but_later_risk_check": [],
+                    "order_path_block": order_path_block,
+                },
+            }
+        return {
+            "action": "allow",
+            "last_ai_skip_reason": None,
+            "low_actionability_hold_backoff": low_actionability_backoff,
+            "entry_candidate_ai_hold_fingerprint": ai_hold_cooldown.get("signature"),
+        }
 
     @staticmethod
     def _account_untrusted_sync_reason_codes(sync_freshness_summary: dict[str, object]) -> list[str]:
@@ -8863,17 +11427,95 @@ class TradingOrchestrator:
                 reason_codes.append(f"{scope}_sync_incomplete")
         return reason_codes
 
+    def _risk_adding_exchange_permission_pre_ai_block(
+        self,
+        *,
+        intent_type: str,
+    ) -> dict[str, object] | None:
+        return exchange_trade_permission_entry_blocker(
+            get_sync_state_detail(self.settings_row).get("account", {}),
+            rollout_mode=get_rollout_mode(self.settings_row),
+            live_execution_armed=is_live_execution_armed(self.settings_row),
+            intent_type=intent_type,
+        )
+
     @staticmethod
     def _ai_review_scope(
         *,
         review_trigger_payload: AIReviewTriggerPayload | None,
         open_positions: list[Position],
+        risk_adding_add_on: bool = False,
     ) -> str:
         if review_trigger_payload is not None and review_trigger_payload.trigger_reason == "protection_review_event":
             return "protective_recovery"
+        if risk_adding_add_on:
+            return "risk_adding_add_on"
         if open_positions:
             return "position_management"
         return "new_entry"
+
+    def _new_entry_pre_ai_hard_block_reason(self, *, intent_type: str = "entry") -> str | None:
+        latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
+        daily_equity = max(_safe_float(getattr(latest_pnl, "equity", None), default=0.0), 1.0)
+        daily_loss_cap = min(
+            _safe_float(getattr(self.settings_row, "max_daily_loss", None), default=HARD_MAX_DAILY_LOSS),
+            HARD_MAX_DAILY_LOSS,
+        )
+        if (
+            _safe_float(getattr(latest_pnl, "daily_pnl", None), default=0.0) < 0.0
+            and abs(_safe_float(getattr(latest_pnl, "daily_pnl", None), default=0.0)) / daily_equity
+            >= daily_loss_cap
+        ):
+            return "DAILY_LOSS_LIMIT_REACHED"
+        max_consecutive_losses = int(getattr(self.settings_row, "max_consecutive_losses", 0) or 0)
+        if (
+            max_consecutive_losses > 0
+            and int(getattr(latest_pnl, "consecutive_losses", 0) or 0) >= max_consecutive_losses
+        ):
+            return "MAX_CONSECUTIVE_LOSSES_REACHED"
+        if rollout_mode_allows_exchange_submit(self.settings_row):
+            defaults = get_settings()
+            if not defaults.live_trading_env_enabled:
+                return "LIVE_ENV_DISABLED"
+            if not bool(getattr(self.settings_row, "manual_live_approval", False)):
+                return "LIVE_APPROVAL_POLICY_DISABLED"
+            if not is_live_execution_armed(self.settings_row):
+                return "LIVE_APPROVAL_REQUIRED"
+        exchange_permission_entry_block = self._risk_adding_exchange_permission_pre_ai_block(
+            intent_type=intent_type
+        )
+        if exchange_permission_entry_block is not None:
+            return str(exchange_permission_entry_block["reason_code"])
+        return None
+
+    def _risk_adding_add_on_pre_ai_hard_block_reason(
+        self,
+        *,
+        active_position_prompt_route_context: dict[str, object] | None,
+        effective_settings: object,
+        runtime_state: dict[str, object],
+        openai_gate: object,
+    ) -> str | None:
+        route_context = _as_dict(active_position_prompt_route_context)
+        if not bool(
+            route_context.get("risk_adding_add_on_candidate")
+            or route_context.get("allow_same_side_add_on")
+        ):
+            return None
+        if not bool(getattr(effective_settings, "enabled", True)):
+            return "symbol_disabled"
+        operating_state = str(runtime_state.get("operating_state") or "")
+        if operating_state in ENTRY_BLOCKING_OPERATING_STATES:
+            return f"new_entry_blocked_{operating_state.lower()}"
+        if pre_ai_hard_block_reason := self._new_entry_pre_ai_hard_block_reason(intent_type="scale_in"):
+            return pre_ai_hard_block_reason
+        openai_gate_reason = str(getattr(openai_gate, "reason", "") or "").upper()
+        if (
+            not bool(getattr(openai_gate, "allowed", False))
+            and openai_gate_reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+        ):
+            return openai_gate_reason
+        return None
 
     def _ai_call_policy(
         self,
@@ -8887,11 +11529,27 @@ class TradingOrchestrator:
         cadence_profile: dict[str, object],
         open_positions: list[Position],
         allow_ai_but_later_risk_check: list[str],
+        selection_context: dict[str, object] | None = None,
+        generated_at: datetime | None = None,
+        active_position_prompt_route_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        route_context = _as_dict(active_position_prompt_route_context)
+        risk_adding_add_on = bool(
+            route_context.get("risk_adding_add_on_candidate")
+            or route_context.get("allow_same_side_add_on")
+        )
+        risk_adding_add_on_pre_ai_block_reason = (
+            str(route_context.get("risk_adding_add_on_pre_ai_block_reason") or "") or None
+        )
+        risk_adding_add_on_pre_ai_reason_codes = list(
+            route_context.get("risk_adding_add_on_pre_ai_reason_codes") or []
+        )
         scope = self._ai_review_scope(
             review_trigger_payload=review_trigger_payload,
             open_positions=open_positions,
+            risk_adding_add_on=risk_adding_add_on,
         )
+        entry_like_scope = scope in {"new_entry", "risk_adding_add_on"}
         operating_state = str(runtime_state.get("operating_state") or "")
         data_quality = getattr(ai_context, "data_quality", None)
         account_state_trustworthy = bool(getattr(data_quality, "account_state_trustworthy", True))
@@ -8912,7 +11570,9 @@ class TradingOrchestrator:
         hard_skip_ai = False
         skip_category: str | None = None
         reason: str | None = None
+        pre_ai_skip_reason: str | None = None
         hard_skip_reason_codes: list[str] = []
+        extra_policy: dict[str, object] = {}
 
         if review_trigger_payload is not None and review_trigger_payload.trigger_reason == "protection_review_event":
             reason = "PROTECTION_REVIEW_DETERMINISTIC_ONLY"
@@ -8938,20 +11598,83 @@ class TradingOrchestrator:
             reason = "account_untrusted"
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
-        elif scope == "new_entry" and not bool(getattr(effective_settings, "enabled", True)):
+        elif risk_adding_add_on_pre_ai_block_reason is not None:
+            reason = risk_adding_add_on_pre_ai_block_reason
+            hard_skip_ai = True
+            skip_category = (
+                "cost_governance"
+                if reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE"
+                else "hard_skip_ai"
+            )
+        elif entry_like_scope and not bool(getattr(effective_settings, "enabled", True)):
             reason = "symbol_disabled"
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
-        elif scope == "new_entry" and operating_state in ENTRY_BLOCKING_OPERATING_STATES:
+        elif entry_like_scope and operating_state in ENTRY_BLOCKING_OPERATING_STATES:
             reason = f"new_entry_blocked_{operating_state.lower()}"
             hard_skip_ai = True
             skip_category = "hard_skip_ai"
+        elif entry_like_scope and (pre_ai_hard_block_reason := self._new_entry_pre_ai_hard_block_reason()):
+            reason = pre_ai_hard_block_reason
+            hard_skip_ai = True
+            skip_category = "hard_skip_ai"
+        elif (
+            scope == "new_entry"
+            and review_trigger_payload is not None
+            and review_trigger_payload.trigger_reason == "entry_candidate_event"
+            and isinstance(selection_context, dict)
+        ):
+            entry_pre_ai_policy = self._entry_candidate_pre_ai_eligibility_policy(
+                symbol=review_trigger_payload.symbol,
+                timeframe=review_trigger_payload.timeframe,
+                selection_context=selection_context,
+                generated_at=generated_at or utcnow_naive(),
+                runtime_state=runtime_state,
+                allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            )
+            entry_candidate_ai_hold_fingerprint = _as_dict(
+                entry_pre_ai_policy.get("entry_candidate_ai_hold_fingerprint")
+            )
+            if entry_candidate_ai_hold_fingerprint:
+                extra_policy["entry_candidate_ai_hold_fingerprint"] = entry_candidate_ai_hold_fingerprint
+            if entry_pre_ai_policy.get("action") != "allow":
+                entry_ai_policy = _as_dict(entry_pre_ai_policy.get("ai_call_policy"))
+                reason = str(entry_ai_policy.get("reason") or "") or None
+                pre_ai_skip_reason = str(
+                    entry_ai_policy.get("pre_ai_skip_reason")
+                    or entry_pre_ai_policy.get("last_ai_skip_reason")
+                    or ""
+                ) or None
+                hard_skip_ai = bool(entry_ai_policy.get("hard_skip_ai", False))
+                skip_category = str(entry_ai_policy.get("skip_category") or "") or None
+                hard_skip_reason_codes = list(entry_ai_policy.get("hard_skip_reason_codes") or [])
+                extra_policy = {
+                    key: value
+                    for key, value in entry_ai_policy.items()
+                    if key
+                    not in {
+                        "ai_call_event",
+                        "ai_call_allowed",
+                        "skip_ai",
+                        "reason",
+                        "pre_ai_skip_reason",
+                        "scope",
+                        "hard_skip_ai",
+                        "skip_category",
+                        "hard_skip_reason_codes",
+                        "allow_ai_but_later_risk_check",
+                    }
+                }
         elif str(cadence_profile.get("ai_skipped_reason") or ""):
             reason = str(cadence_profile.get("ai_skipped_reason") or "")
             skip_category = "cadence_policy"
         elif not bool(getattr(openai_gate, "allowed", False)):
             reason = str(getattr(openai_gate, "reason", "") or "openai_gate_blocked").upper()
-            skip_category = "budget_cooldown_dedup"
+            if reason == "LOW_ACTIONABILITY_COST_GUARD_ACTIVE" and entry_like_scope:
+                hard_skip_ai = True
+                skip_category = "cost_governance"
+            else:
+                skip_category = "budget_cooldown_dedup"
 
         if reason is not None:
             hard_skip_reason_codes.append(reason)
@@ -8959,22 +11682,38 @@ class TradingOrchestrator:
                 hard_skip_reason_codes = self._unique_reason_codes(
                     [*hard_skip_reason_codes, *data_quality_reason_codes]
                 )
+        if risk_adding_add_on_pre_ai_reason_codes:
+            hard_skip_reason_codes = self._unique_reason_codes(
+                [*hard_skip_reason_codes, *risk_adding_add_on_pre_ai_reason_codes]
+            )
         return {
             "ai_call_event": AI_CALL_EVENT_SKIPPED if reason is not None else AI_CALL_EVENT_ALLOWED,
             "ai_call_allowed": reason is None,
             "skip_ai": reason is not None,
             "reason": reason,
+            "pre_ai_skip_reason": pre_ai_skip_reason,
             "scope": scope,
             "hard_skip_ai": hard_skip_ai,
             "skip_category": skip_category,
             "hard_skip_reason_codes": hard_skip_reason_codes,
             "allow_ai_but_later_risk_check": list(dict.fromkeys(allow_ai_but_later_risk_check)),
+            "risk_adding_add_on_candidate": risk_adding_add_on,
+            "risk_adding_add_on_pre_ai_blocked": bool(risk_adding_add_on_pre_ai_block_reason),
+            "risk_adding_add_on_pre_ai_block_reason": risk_adding_add_on_pre_ai_block_reason,
+            "risk_adding_add_on_pre_ai_reason_codes": risk_adding_add_on_pre_ai_reason_codes,
+            "soft_signal_review_mode": (
+                "transition_watch"
+                if SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE in set(allow_ai_but_later_risk_check)
+                else None
+            ),
+            **extra_policy,
         }
 
     def build_interval_decision_plan(
         self,
         *,
         symbols: list[str],
+        candidate_universe_symbols: list[str] | None = None,
         timeframe: str | None = None,
         upto_index: int | None = None,
         force_stale: bool = False,
@@ -8982,16 +11721,21 @@ class TradingOrchestrator:
     ) -> dict[str, object]:
         generated_at = triggered_at or utcnow_naive()
         tracked_symbols = [item.upper() for item in symbols if item]
+        selection_symbols = [
+            item.upper()
+            for item in (candidate_universe_symbols if candidate_universe_symbols is not None else symbols)
+            if item
+        ]
         runtime_state = summarize_runtime_state(self.settings_row)
         missing_protection_symbols = {
             str(item).upper()
             for item in runtime_state.get("missing_protection_symbols", [])
             if item
         }
-        effective_lookup = {
-            item.symbol: item
-            for item in get_effective_symbol_schedule(self.settings_row)
-            if item.enabled and item.symbol in tracked_symbols
+        effective_symbols = [item for item in get_effective_symbol_schedule(self.settings_row) if item.enabled]
+        effective_lookup = {item.symbol: item for item in effective_symbols if item.symbol in tracked_symbols}
+        selection_effective_lookup = {
+            item.symbol: item for item in effective_symbols if item.symbol in selection_symbols
         }
         if tracked_symbols and not effective_lookup:
             no_candidate_cycle_id = f"decision-plan:all:{uuid4().hex[:8]}"
@@ -9026,24 +11770,25 @@ class TradingOrchestrator:
                 entity_type="decision_plan",
                 entity_id="all",
             )
+        open_position_symbols = list(dict.fromkeys([*tracked_symbols, *selection_symbols]))
         open_positions_by_symbol = {
             symbol: list(get_open_positions(self.session, symbol))
-            for symbol in tracked_symbols
-            if symbol in effective_lookup
+            for symbol in open_position_symbols
+            if symbol in effective_lookup or symbol in selection_effective_lookup
         }
-        flat_symbols = [
+        selection_flat_symbols = [
             symbol
-            for symbol in tracked_symbols
-            if symbol in effective_lookup and not open_positions_by_symbol.get(symbol)
+            for symbol in selection_symbols
+            if symbol in selection_effective_lookup and not open_positions_by_symbol.get(symbol)
         ]
         candidate_selection = (
             self._rank_candidate_symbols(
-                decision_symbols=flat_symbols,
+                decision_symbols=selection_flat_symbols,
                 timeframe=timeframe,
                 upto_index=upto_index,
                 force_stale=force_stale,
             )
-            if flat_symbols
+            if selection_flat_symbols
             else {
                 "mode": "no_flat_symbols",
                 "breadth_summary": {},
@@ -9347,41 +12092,117 @@ class TradingOrchestrator:
                 trigger_payload = None
                 last_ai_skip_reason = "account_untrusted"
 
+            exchange_permission_entry_block = (
+                self._risk_adding_exchange_permission_pre_ai_block(intent_type="entry")
+                if trigger_payload is not None and not open_positions
+                else None
+            )
+            if exchange_permission_entry_block is not None:
+                reason_code = str(exchange_permission_entry_block["reason_code"])
+                plan_ai_call_policy = {
+                    "ai_call_event": AI_CALL_EVENT_SKIPPED,
+                    "ai_call_allowed": False,
+                    "skip_ai": True,
+                    "reason": reason_code,
+                    "scope": "new_entry",
+                    "hard_skip_ai": True,
+                    "skip_category": "hard_skip_ai",
+                    "hard_skip_reason_codes": [reason_code],
+                    "allow_ai_but_later_risk_check": [],
+                    "exchange_permission": dict(exchange_permission_entry_block),
+                }
+                if isinstance(selection_context, dict):
+                    selection_context = {
+                        **selection_context,
+                        "ai_call_policy": plan_ai_call_policy,
+                    }
+                trigger_payload = None
+                last_ai_skip_reason = reason_code
+
+            if (
+                trigger_payload is not None
+                and not open_positions
+                and isinstance(selection_context, dict)
+                and trigger_payload.trigger_reason == "entry_candidate_event"
+            ):
+                entry_pre_ai_policy = self._entry_candidate_pre_ai_eligibility_policy(
+                    symbol=symbol,
+                    timeframe=effective_timeframe,
+                    selection_context=selection_context,
+                    generated_at=generated_at,
+                    runtime_state=runtime_state,
+                    allow_ai_but_later_risk_check=list(trigger_payload.reason_codes),
+                )
+                if entry_pre_ai_policy.get("action") != "allow":
+                    plan_ai_call_policy = _as_dict(entry_pre_ai_policy.get("ai_call_policy"))
+                    selection_context = {
+                        **selection_context,
+                        "ai_call_policy": plan_ai_call_policy,
+                    }
+                    trigger_payload = None
+                    last_ai_skip_reason = str(
+                        entry_pre_ai_policy.get("last_ai_skip_reason") or ""
+                    ) or None
+
             if trigger_payload is not None and not open_positions and isinstance(selection_context, dict):
                 soft_rejected_reason = str(
                     selection_context.get("rejected_reason")
                     or selection_context.get("selection_reason")
                     or ""
                 ).strip().lower()
-                if (
-                    soft_rejected_reason in AI_REVIEW_SOFT_REJECTED_REASONS
-                    and last_ai_invoked_at is not None
-                ):
-                    soft_cooldown_minutes = self._soft_signal_ai_review_cooldown_minutes(effective)
-                    retry_at = last_ai_invoked_at + timedelta(minutes=soft_cooldown_minutes)
-                    if retry_at > generated_at:
-                        retry_after_seconds = max(int((retry_at - generated_at).total_seconds()), 1)
-                        plan_ai_call_policy = {
-                            "ai_call_event": AI_CALL_EVENT_SKIPPED,
-                            "ai_call_allowed": False,
-                            "skip_ai": True,
-                            "reason": "soft_signal_review_cooldown_active",
-                            "scope": "new_entry",
-                            "hard_skip_ai": False,
-                            "skip_category": "budget_cooldown_dedup",
-                            "hard_skip_reason_codes": [],
-                            "allow_ai_but_later_risk_check": [SOFT_SIGNAL_AI_REVIEW_REASON_CODE],
-                            "retry_after_seconds": retry_after_seconds,
-                            "cooldown_minutes": soft_cooldown_minutes,
-                            "last_ai_invoked_at": last_ai_invoked_at.isoformat(),
-                            "soft_rejected_reason": soft_rejected_reason,
-                        }
-                        selection_context = {
-                            **selection_context,
-                            "ai_call_policy": plan_ai_call_policy,
-                        }
+                weak_soft_review = (
+                    SOFT_SIGNAL_AI_REVIEW_REASON_CODE in set(trigger_payload.reason_codes)
+                    and soft_rejected_reason in AI_REVIEW_SOFT_REJECTED_REASONS
+                    and not bool(selection_context.get("selected"))
+                )
+                if weak_soft_review:
+                    soft_policy = self._soft_signal_review_policy(
+                        symbol=symbol,
+                        timeframe=effective_timeframe,
+                        selection_context=selection_context,
+                        soft_rejected_reason=soft_rejected_reason,
+                        last_ai_invoked_at=last_ai_invoked_at,
+                        latest_decision_metadata=latest_metadata,
+                        generated_at=generated_at,
+                        effective_settings=effective,
+                    )
+                    plan_ai_call_policy = _as_dict(soft_policy.get("ai_call_policy"))
+                    selection_context = {
+                        **selection_context,
+                        "ai_call_policy": plan_ai_call_policy,
+                    }
+                    if soft_policy.get("action") in {
+                        "suppress",
+                        "low_edge_hold_suppressed",
+                        "cooldown",
+                        "no_material_change",
+                        "hold_backoff",
+                    }:
                         trigger_payload = None
-                        last_ai_skip_reason = "SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE"
+                        last_ai_skip_reason = str(soft_policy.get("last_ai_skip_reason") or "") or None
+                    elif soft_policy.get("action") == "allow_transition_watch":
+                        trigger_payload = trigger_payload.model_copy(
+                            update={
+                                "reason_codes": list(
+                                    dict.fromkeys(
+                                        [
+                                            *trigger_payload.reason_codes,
+                                            SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE,
+                                        ]
+                                    )
+                                ),
+                                "forced_review_reason": SOFT_SIGNAL_TRANSITION_WATCH_FORCED_REASON,
+                                "fingerprint_changed_fields": list(
+                                    dict.fromkeys(
+                                        [
+                                            *trigger_payload.fingerprint_changed_fields,
+                                            "soft_signal_transition_watch_due",
+                                        ]
+                                    )
+                                ),
+                            }
+                        )
+                        last_ai_skip_reason = None
 
             if (
                 trigger_payload is not None
@@ -9609,15 +12430,8 @@ class TradingOrchestrator:
             )
         latest_pnl = get_latest_pnl_snapshot(self.session, self.settings_row)
         runtime_state = summarize_runtime_state(self.settings_row)
-        market_settings_advisor_result = self._maybe_run_market_settings_advisor(
-            symbol=symbol,
-            trigger_event=trigger_event,
-            market_snapshot=market_snapshot,
-            feature_payload=feature_payload,
-            runtime_state=runtime_state,
-            cycle_id=cycle_id,
-            snapshot_id=market_row.id,
-        )
+        market_settings_advisor_result: dict[str, object] | None = None
+        market_settings_advisor_context: dict[str, object] = {}
         latest_decision_run = self._latest_symbol_decision_run(
             symbol=symbol,
             timeframe=timeframe,
@@ -9938,22 +12752,49 @@ class TradingOrchestrator:
                 2,
                 min(int(cadence_profile["effective_cadence"]["ai_call_interval_minutes"]), 5),
             ),
+            enforce_waste_guard=(
+                not bool(open_positions)
+                or bool(
+                    active_position_prompt_route_context.get("risk_adding_add_on_candidate")
+                    or active_position_prompt_route_context.get("allow_same_side_add_on")
+                )
+            ),
         )
+        risk_adding_add_on_pre_ai_block_reason = self._risk_adding_add_on_pre_ai_hard_block_reason(
+            active_position_prompt_route_context=active_position_prompt_route_context,
+            effective_settings=effective_settings,
+            runtime_state=runtime_state,
+            openai_gate=openai_gate,
+        )
+        if self._mark_risk_adding_add_on_pre_ai_blocked(
+            active_position_prompt_route_context,
+            risk_adding_add_on_pre_ai_block_reason,
+        ):
+            merged_strategy_engine_context = {
+                **_as_dict(effective_selection_context.get("strategy_engine_context")),
+                **active_position_prompt_route_context,
+            }
+            effective_selection_context = {
+                **effective_selection_context,
+                "strategy_engine_context": merged_strategy_engine_context,
+            }
+            risk_context["selection_context"] = dict(effective_selection_context)
         recent_tp_direction = (
             self._recent_tp_direction_from_selection_context(effective_selection_context)
             if not open_positions
             else None
+        )
+        recent_tp_lookback_minutes = self._recent_tp_close_lookback_minutes(
+            cadence_profile=cadence_profile,
+            selection_context=effective_selection_context,
+            ai_call_interval_minutes=self.settings_row.ai_call_interval_minutes,
         )
         ai_risk_context = self._risk_context_with_recent_tp_close_summary(
             risk_context,
             symbol=symbol,
             direction=recent_tp_direction,
             generated_at=utcnow_naive(),
-            lookback_minutes=self._recent_tp_close_lookback_minutes(
-                cadence_profile=cadence_profile,
-                selection_context=effective_selection_context,
-                ai_call_interval_minutes=self.settings_row.ai_call_interval_minutes,
-            ),
+            lookback_minutes=recent_tp_lookback_minutes,
         )
         ai_context = build_ai_decision_context(
             market_snapshot=market_snapshot,
@@ -9984,10 +12825,64 @@ class TradingOrchestrator:
             cadence_profile=cadence_profile,
             open_positions=open_positions,
             allow_ai_but_later_risk_check=allow_ai_but_later_risk_check,
+            selection_context=effective_selection_context,
+            generated_at=utcnow_naive(),
+            active_position_prompt_route_context=active_position_prompt_route_context,
         )
-        pre_ai_skip_reason = None
-        ai_skipped_reason = str(ai_call_policy.get("reason") or "") or None
+        pre_ai_skip_reason = str(ai_call_policy.get("pre_ai_skip_reason") or "") or None
+        ai_skipped_reason = pre_ai_skip_reason or str(ai_call_policy.get("reason") or "") or None
         use_ai = bool(ai_call_policy.get("ai_call_allowed", False)) and bool(openai_gate.allowed)
+        if self._should_run_market_settings_before_trading_ai(
+            use_ai=use_ai,
+            review_trigger_payload=review_trigger_payload,
+        ):
+            market_settings_advisor_result = self._maybe_run_market_settings_advisor(
+                symbol=symbol,
+                trigger_event=trigger_event,
+                market_snapshot=market_snapshot,
+                feature_payload=feature_payload,
+                runtime_state=runtime_state,
+                cycle_id=cycle_id,
+                snapshot_id=market_row.id,
+                reuse_cached=True,
+            )
+            risk_context, market_settings_advisor_context = (
+                self._risk_context_with_market_settings_advisor(
+                    risk_context,
+                    market_settings_advisor_result,
+                )
+            )
+            ai_market_settings_advisor_context = market_settings_advisor_context
+            if bool(market_settings_advisor_context.get("shadow", False)):
+                ai_market_settings_advisor_context = self._market_settings_advisor_trading_context(
+                    market_settings_advisor_result,
+                    include_shadow_policy=True,
+                )
+            ai_risk_context = self._risk_context_with_recent_tp_close_summary(
+                risk_context,
+                symbol=symbol,
+                direction=recent_tp_direction,
+                generated_at=utcnow_naive(),
+                lookback_minutes=recent_tp_lookback_minutes,
+            )
+            if ai_market_settings_advisor_context:
+                ai_risk_context = self._risk_context_with_advisor_prompt_context(
+                    ai_risk_context,
+                    ai_market_settings_advisor_context,
+                )
+                market_settings_advisor_context = ai_market_settings_advisor_context
+            ai_context = build_ai_decision_context(
+                market_snapshot=market_snapshot,
+                features=feature_payload,
+                risk_context=ai_risk_context,
+                selection_context=effective_selection_context,
+                review_trigger=review_trigger_payload,
+                decision_reference=decision_reference,
+                previous_decision_output=latest_decision_output,
+                previous_decision_metadata=latest_decision_metadata,
+                previous_input_payload=latest_decision_input,
+                previous_ai_invoked_at=previous_ai_invoked_at,
+            )
         prior_read_debug: dict[str, object] = {}
         ai_prior_context = build_ai_prior_context(
             self.session,
@@ -10008,6 +12903,25 @@ class TradingOrchestrator:
             logic_variant=logic_variant,
             ai_context=ai_context,
         )
+        transition_watch_review = (
+            SOFT_SIGNAL_TRANSITION_WATCH_REASON_CODE
+            in set(ai_call_policy.get("allow_ai_but_later_risk_check") or [])
+        )
+        transition_watch_bound_metadata: dict[str, object] = {}
+        if transition_watch_review:
+            decision, transition_watch_bound_metadata = self._bound_transition_watch_direct_entry(decision)
+            if transition_watch_bound_metadata:
+                existing_fallback_codes = list(decision_metadata.get("fallback_reason_codes") or [])
+                decision_metadata = {
+                    **decision_metadata,
+                    **transition_watch_bound_metadata,
+                    "fallback_reason_codes": self._unique_reason_codes(
+                        [
+                            *existing_fallback_codes,
+                            *list(transition_watch_bound_metadata.get("fallback_reason_codes") or []),
+                        ]
+                    ),
+                }
         meta_gate_result = evaluate_meta_gate(
             decision,
             feature_payload=feature_payload,
@@ -10035,8 +12949,23 @@ class TradingOrchestrator:
             "pre_ai_skip_reason": pre_ai_skip_reason,
             "ai_call_policy": ai_call_policy,
             "ai_call_event": ai_call_policy.get("ai_call_event"),
+            "entry_candidate_ai_hold_fingerprint": ai_call_policy.get(
+                "entry_candidate_ai_hold_fingerprint"
+            ),
+            "entry_candidate_ai_hold_cooldown": ai_call_policy.get(
+                "entry_candidate_ai_hold_cooldown"
+            ),
             "hard_skip_ai": bool(ai_call_policy.get("hard_skip_ai", False)),
             "hard_skip_ai_reason": ai_call_policy.get("reason") if ai_call_policy.get("hard_skip_ai") else None,
+            "soft_signal_review_mode": ai_call_policy.get("soft_signal_review_mode"),
+            "soft_signal_review_snapshot": ai_call_policy.get("soft_signal_review_snapshot"),
+            "soft_signal_review_material_change": ai_call_policy.get(
+                "soft_signal_review_material_change"
+            ),
+            "transition_watch_ai_invoked": bool(transition_watch_review),
+            "watch_only_bounded": bool(decision_metadata.get("watch_only_bounded", False)),
+            "soft_signal_bounded_action": decision_metadata.get("soft_signal_bounded_action"),
+            "soft_signal_original_decision": decision_metadata.get("soft_signal_original_decision"),
             "allow_ai_but_later_risk_check": list(
                 ai_call_policy.get("allow_ai_but_later_risk_check") or []
             ),
@@ -10046,6 +12975,18 @@ class TradingOrchestrator:
                 universe_breadth=effective_selection_context.get("universe_breadth") if effective_selection_context else None,
             ),
             "selection_context": effective_selection_context or None,
+            "market_settings_advisor": market_settings_advisor_result,
+            "market_settings_advisor_context": market_settings_advisor_context or None,
+            "market_settings_advisor_pre_trade_refresh": bool(
+                market_settings_advisor_result is not None
+                and use_ai
+                and market_settings_advisor_result.get("status") not in {"reused", "skipped"}
+            ),
+            "market_settings_advisor_pre_trade_status": (
+                market_settings_advisor_result.get("status")
+                if market_settings_advisor_result is not None
+                else None
+            ),
             "active_position_prompt_route_context": active_position_prompt_route_context or None,
             "active_position_entry_fingerprint_basis": active_position_entry_fingerprint_basis,
             "slot_allocation": (
@@ -10229,6 +13170,10 @@ class TradingOrchestrator:
                 "ai_call_event": decision_metadata.get("ai_call_event"),
                 "hard_skip_ai": decision_metadata.get("hard_skip_ai"),
                 "hard_skip_ai_reason": decision_metadata.get("hard_skip_ai_reason"),
+                "soft_signal_review_mode": decision_metadata.get("soft_signal_review_mode"),
+                "transition_watch_ai_invoked": decision_metadata.get("transition_watch_ai_invoked"),
+                "watch_only_bounded": decision_metadata.get("watch_only_bounded"),
+                "soft_signal_bounded_action": decision_metadata.get("soft_signal_bounded_action"),
                 "allow_ai_but_later_risk_check": decision_metadata.get("allow_ai_but_later_risk_check"),
                 "prompt_family": decision_metadata.get("prompt_family"),
                 "bounded_output_applied": decision_metadata.get("bounded_output_applied"),
@@ -10285,6 +13230,10 @@ class TradingOrchestrator:
                     "provider": provider_name,
                     "scope": ai_call_policy.get("scope"),
                     "hard_skip_ai": False,
+                    "soft_signal_review_mode": ai_call_policy.get("soft_signal_review_mode"),
+                    "transition_watch_ai_invoked": bool(transition_watch_review),
+                    "watch_only_bounded": decision_metadata.get("watch_only_bounded"),
+                    "soft_signal_bounded_action": decision_metadata.get("soft_signal_bounded_action"),
                     "allow_ai_but_later_risk_check": list(
                         ai_call_policy.get("allow_ai_but_later_risk_check") or []
                     ),
@@ -10340,7 +13289,14 @@ class TradingOrchestrator:
                     "scope": ai_call_policy.get("scope"),
                     "hard_skip_ai": bool(ai_call_policy.get("hard_skip_ai", False)),
                     "skip_category": ai_call_policy.get("skip_category"),
+                    "soft_signal_review_mode": ai_call_policy.get("soft_signal_review_mode"),
                     "hard_skip_reason_codes": list(ai_call_policy.get("hard_skip_reason_codes") or []),
+                    "entry_candidate_ai_hold_cooldown": ai_call_policy.get(
+                        "entry_candidate_ai_hold_cooldown"
+                    ),
+                    "entry_candidate_ai_hold_fingerprint": ai_call_policy.get(
+                        "entry_candidate_ai_hold_fingerprint"
+                    ),
                     "allow_ai_but_later_risk_check": list(
                         ai_call_policy.get("allow_ai_but_later_risk_check") or []
                     ),
@@ -10575,6 +13531,7 @@ class TradingOrchestrator:
             payload=risk_result.model_dump(mode="json"),
             correlation_ids=risk_correlation_ids,
         )
+        refresh_decision_performance_fact_usefulness(self.session, decision_run.id)
         entry_plan_decision = decision
         entry_plan_risk_result = risk_result
         entry_plan_risk_row = risk_row
@@ -10615,6 +13572,7 @@ class TradingOrchestrator:
                 },
                 correlation_ids=watch_risk_correlation_ids,
             )
+            refresh_decision_performance_fact_usefulness(self.session, decision_run.id)
             if str(decision_metadata.get("source") or "") == "llm":
                 watch_risk_event = (
                     "AI_DECISION_APPROVED_BY_RISK"
@@ -10737,6 +13695,7 @@ class TradingOrchestrator:
             armed_entry_plan is None
             and risk_result.allowed
             and decision.decision != "hold"
+            and not transition_watch_review
             and self._should_execute_live(trigger_event)
         ):
             execution_result = execute_live_trade(
@@ -10750,7 +13709,13 @@ class TradingOrchestrator:
                 cycle_id=cycle_id,
                 snapshot_id=market_row.id,
             )
-        elif armed_entry_plan is None and risk_result.allowed and decision.decision != "hold":
+            refresh_decision_performance_fact_usefulness(self.session, decision_run.id)
+        elif (
+            armed_entry_plan is None
+            and risk_result.allowed
+            and decision.decision != "hold"
+            and not transition_watch_review
+        ):
             record_audit_event(
                 self.session,
                 event_type="live_execution_skipped",

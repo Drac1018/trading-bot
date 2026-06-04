@@ -8,9 +8,12 @@ import {
   type CostBreakdownSelection,
   buildCostBreakdownApiPath,
   buildCostBreakdownPageHref,
+  costBreakdownBucketSlippageStatus,
   costBreakdownBucketStatus,
   costBreakdownQualityBadges,
+  costBreakdownStatusTone,
   costBreakdownWarningMessages,
+  costBreakdownWarningTone,
   costMetricDescription,
   costMetricLabel,
   formatCostBreakdownBps,
@@ -18,6 +21,9 @@ import {
   formatCostBreakdownPercent,
   formatCostBreakdownUsdt,
   resolveCostBreakdownSelection,
+  slippageDataQualityLabel,
+  slippageDataQualityStatus,
+  slippageDataQualityTone,
   slippageWeightingLabel,
   statusLabel,
 } from "../lib/cost-breakdown";
@@ -31,6 +37,24 @@ function badgeClass(tone: "good" | "warn" | "danger" | "neutral") {
     warn: "border-amber-200 bg-amber-50 text-amber-800",
     danger: "border-rose-200 bg-rose-50 text-rose-800",
     neutral: "border-slate-200 bg-slate-50 text-slate-700",
+  }[tone];
+}
+
+function warningItemClass(tone: "good" | "warn" | "danger" | "neutral") {
+  return {
+    good: "border-emerald-200 bg-emerald-50 text-emerald-800",
+    warn: "border-amber-200 bg-amber-50 text-amber-900",
+    danger: "border-rose-200 bg-rose-50 text-rose-900",
+    neutral: "border-slate-200 bg-slate-50 text-slate-700",
+  }[tone];
+}
+
+function dataQualityTileClass(tone: "good" | "warn" | "danger" | "neutral") {
+  return {
+    good: "border-emerald-200 bg-emerald-50 text-emerald-900",
+    warn: "border-amber-200 bg-amber-50 text-amber-950",
+    danger: "border-rose-200 bg-rose-50 text-rose-950",
+    neutral: "border-slate-200 bg-slate-50 text-slate-900",
   }[tone];
 }
 
@@ -168,11 +192,13 @@ function PeriodControls({ selection }: { selection: CostBreakdownSelection }) {
 function SummaryGrid({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
   const summary = payload.summary;
   const pnlMuted = !payload.data_quality.realized_pnl_confirmed;
-  const slippageStatus = payload.data_quality.slippage_data_status;
+  const slippageStatus = slippageDataQualityStatus(payload.data_quality);
+  const slippageStatusDetail = slippageDataQualityLabel(payload.data_quality);
+  const slippageComplete = slippageStatus === "COMPLETE";
   const slippageHint =
-    slippageStatus === "COMPLETE" ? "양수는 운영자에게 불리한 평균 체결입니다." : "데이터 부족으로 확정할 수 없습니다.";
+    slippageComplete ? "양수는 운영자에게 불리한 평균 체결입니다." : slippageStatusDetail;
   const adverseHint =
-    slippageStatus === "COMPLETE" ? "불리한 방향의 체결 차이만 누적한 평균입니다." : "데이터 부족으로 확정할 수 없습니다.";
+    slippageComplete ? "불리한 방향의 체결 차이만 누적한 평균입니다." : slippageStatusDetail;
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
@@ -184,11 +210,22 @@ function SummaryGrid({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
             {periodRangeLabel(payload)} / {payload.timezone}
           </p>
         </div>
-        {!payload.data_quality.realized_pnl_confirmed ? (
-          <span className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${badgeClass("danger")}`}>
-            실현 손익 미확정
-          </span>
-        ) : null}
+        <div className="flex flex-wrap gap-2">
+          {!payload.data_quality.realized_pnl_confirmed ? (
+            <span className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${badgeClass("danger")}`}>
+              실현 손익 미확정
+            </span>
+          ) : null}
+          {!slippageComplete ? (
+            <span
+              className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${badgeClass(
+                slippageDataQualityTone(slippageStatus),
+              )}`}
+            >
+              {slippageStatusDetail}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -236,6 +273,7 @@ function SummaryGrid({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
 
 function WarningsPanel({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
   const messages = costBreakdownWarningMessages(payload);
+  const tone = costBreakdownWarningTone(payload);
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
@@ -246,7 +284,7 @@ function WarningsPanel({ payload }: { payload: AnalyticsCostBreakdownResponse })
         </div>
         <span
           className={`w-fit rounded-md border px-3 py-2 text-sm font-semibold ${
-            messages.length > 0 ? badgeClass("warn") : badgeClass("good")
+            badgeClass(tone)
           }`}
         >
           {messages.length > 0 ? `${messages.length}건` : "경고 없음"}
@@ -254,9 +292,9 @@ function WarningsPanel({ payload }: { payload: AnalyticsCostBreakdownResponse })
       </div>
 
       {messages.length > 0 ? (
-        <ul className="mt-4 space-y-2 text-sm leading-6 text-amber-900">
+        <ul className="mt-4 space-y-2 text-sm leading-6">
           {messages.map((message) => (
-            <li key={message} className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3">
+            <li key={message} className={`rounded-md border px-4 py-3 ${warningItemClass(tone)}`}>
               {message}
             </li>
           ))}
@@ -272,6 +310,9 @@ function WarningsPanel({ payload }: { payload: AnalyticsCostBreakdownResponse })
 
 function DataQualityPanel({ payload }: { payload: AnalyticsCostBreakdownResponse }) {
   const badges = costBreakdownQualityBadges(payload.data_quality);
+  const executionTone = costBreakdownStatusTone(payload.data_quality.execution_sync_status);
+  const fundingTone = costBreakdownStatusTone(payload.data_quality.funding_sync_status);
+  const slippageTone = costBreakdownStatusTone(slippageDataQualityStatus(payload.data_quality));
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
@@ -285,17 +326,17 @@ function DataQualityPanel({ payload }: { payload: AnalyticsCostBreakdownResponse
         ))}
       </div>
       <dl className="mt-5 grid gap-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
-        <div className="rounded-md border border-slate-200 bg-slate-50 p-4">
-          <dt className="font-medium text-slate-500">체결 동기화</dt>
-          <dd className="mt-2 font-semibold text-slate-950">{statusLabel(payload.data_quality.execution_sync_status)}</dd>
+        <div className={`rounded-md border p-4 ${dataQualityTileClass(executionTone)}`}>
+          <dt className="font-medium opacity-75">체결 동기화</dt>
+          <dd className="mt-2 font-semibold">{statusLabel(payload.data_quality.execution_sync_status)}</dd>
         </div>
-        <div className="rounded-md border border-slate-200 bg-slate-50 p-4">
-          <dt className="font-medium text-slate-500">펀딩비 동기화</dt>
-          <dd className="mt-2 font-semibold text-slate-950">{statusLabel(payload.data_quality.funding_sync_status)}</dd>
+        <div className={`rounded-md border p-4 ${dataQualityTileClass(fundingTone)}`}>
+          <dt className="font-medium opacity-75">펀딩비 동기화</dt>
+          <dd className="mt-2 font-semibold">{statusLabel(payload.data_quality.funding_sync_status)}</dd>
         </div>
-        <div className="rounded-md border border-slate-200 bg-slate-50 p-4">
-          <dt className="font-medium text-slate-500">슬리피지 데이터</dt>
-          <dd className="mt-2 font-semibold text-slate-950">{statusLabel(payload.data_quality.slippage_data_status)}</dd>
+        <div className={`rounded-md border p-4 ${dataQualityTileClass(slippageTone)}`}>
+          <dt className="font-medium opacity-75">슬리피지 데이터</dt>
+          <dd className="mt-2 font-semibold">{slippageDataQualityLabel(payload.data_quality)}</dd>
         </div>
         <div className="rounded-md border border-slate-200 bg-slate-50 p-4">
           <dt className="font-medium text-slate-500">슬리피지 가중 방식</dt>
@@ -315,7 +356,7 @@ function BucketRow({
   bucket: AnalyticsCostBreakdownBucket;
   payload: AnalyticsCostBreakdownResponse;
 }) {
-  const slippageStatus = payload.data_quality.slippage_data_status;
+  const slippageStatus = costBreakdownBucketSlippageStatus(bucket, payload.data_quality);
 
   return (
     <tr className="border-b border-slate-100 last:border-b-0">
@@ -331,6 +372,53 @@ function BucketRow({
       <td className="whitespace-nowrap px-4 py-3">{formatCostBreakdownBps(bucket.adverse_slippage_bps, slippageStatus)}</td>
       <td className="min-w-48 px-4 py-3 text-slate-600">{costBreakdownBucketStatus(bucket, payload.data_quality)}</td>
     </tr>
+  );
+}
+
+function BucketCard({
+  bucket,
+  payload,
+}: {
+  bucket: AnalyticsCostBreakdownBucket;
+  payload: AnalyticsCostBreakdownResponse;
+}) {
+  const slippageStatus = costBreakdownBucketSlippageStatus(bucket, payload.data_quality);
+
+  return (
+    <article className="rounded-md border border-slate-200 bg-slate-50 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-950">{bucket.label}</h3>
+          <p className="mt-1 text-xs text-slate-500">{costBreakdownBucketStatus(bucket, payload.data_quality)}</p>
+        </div>
+        <span className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs font-semibold text-slate-600">
+          {periodLabel(payload.period)}
+        </span>
+      </div>
+      <dl className="mt-4 grid gap-3 text-sm">
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">순손익</dt>
+          <dd className="font-semibold text-slate-950">{formatCostBreakdownUsdt(bucket.net_pnl_usdt)}</dd>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">총손익</dt>
+          <dd className="font-semibold text-slate-950">{formatCostBreakdownUsdt(bucket.gross_pnl_usdt)}</dd>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">수수료 / 총 비용</dt>
+          <dd className="font-semibold text-slate-950">
+            {formatCostBreakdownUsdt(bucket.fee_usdt)} / {formatCostBreakdownUsdt(bucket.total_cost_usdt)}
+          </dd>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <dt className="text-slate-500">슬리피지</dt>
+          <dd className="font-semibold text-slate-950">
+            {formatCostBreakdownBps(bucket.signed_slippage_bps, slippageStatus)} /{" "}
+            {formatCostBreakdownBps(bucket.adverse_slippage_bps, slippageStatus)}
+          </dd>
+        </div>
+      </dl>
+    </article>
   );
 }
 
@@ -352,7 +440,13 @@ function BreakdownTable({ payload }: { payload: AnalyticsCostBreakdownResponse }
       </div>
 
       {payload.buckets.length > 0 ? (
-        <div className="mt-5 overflow-x-auto rounded-md border border-slate-200">
+        <>
+        <div className="mt-5 grid gap-3 md:hidden">
+          {payload.buckets.map((bucket) => (
+            <BucketCard key={bucket.label} bucket={bucket} payload={payload} />
+          ))}
+        </div>
+        <div className="mt-5 hidden overflow-x-auto rounded-md border border-slate-200 md:block">
           <table className="min-w-[1180px] text-left text-sm">
             <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">
               <tr>
@@ -376,6 +470,7 @@ function BreakdownTable({ payload }: { payload: AnalyticsCostBreakdownResponse }
             </tbody>
           </table>
         </div>
+        </>
       ) : (
         <p className="mt-5 rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
           이 기간 응답에는 상세 구간 데이터가 없습니다. 상단 요약 기준으로만 확인하세요.

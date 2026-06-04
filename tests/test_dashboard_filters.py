@@ -10,24 +10,36 @@ from sqlalchemy import desc, select
 from trading_mvp.main import app
 from trading_mvp.models import (
     AccountLedgerEntry,
+    Alert,
     AuditEvent,
+    DecisionPerformanceFact,
     Execution,
     FeatureSnapshot,
     MarketSnapshot,
     Order,
     PendingEntryPlan,
+    PnLSnapshot,
     Position,
     RiskCheck,
     SchedulerRun,
+)
+from trading_mvp.schemas import OperationalStatusPayload, OperatorControlState
+from trading_mvp.services.audit import (
+    SENSITIVE_REDACTED_VALUE,
+    record_audit_event,
+    redact_sensitive_payload,
 )
 from trading_mvp.services.dashboard import (
     OPERATOR_EXTRACTED_SYMBOL_FALLBACK_SCAN_LIMIT,
     OPERATOR_RECENT_ROW_SCAN_LIMIT,
     _latest_rows_by_extracted_symbol,
     _latest_rows_by_symbol,
+    _profitability_window_since,
     classify_audit_event,
-    get_audit_timeline,
+    get_alerts,
     get_audit_event_detail,
+    get_audit_timeline,
+    get_decisions,
     get_executions,
     get_operator_dashboard,
     get_orders,
@@ -37,6 +49,7 @@ from trading_mvp.services.dashboard import (
     get_risk_checks,
 )
 from trading_mvp.services.runtime_state import (
+    mark_sync_issue,
     mark_sync_success,
     replace_market_stream_detail,
     set_candidate_selection_detail,
@@ -433,7 +446,7 @@ def test_latest_rows_by_extracted_symbol_bounds_offset_fallback(db_session) -> N
 
 
 def _seed_multi_symbol_operator_rows(db_session) -> None:
-    from trading_mvp.models import AgentRun, MarketSnapshot
+    from trading_mvp.models import AgentRun, DecisionPerformanceFact, MarketSnapshot
 
     now = utcnow_naive()
     settings = get_or_create_settings(db_session)
@@ -729,6 +742,38 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
     db_session.flush()
     btc_run.created_at = now - timedelta(minutes=6)
     eth_run.created_at = now - timedelta(minutes=3)
+    db_session.add_all(
+        [
+            DecisionPerformanceFact(
+                decision_run_id=btc_run.id,
+                provider_name=btc_run.provider_name,
+                symbol="BTCUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["TREND_UP"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                telemetry_metadata={"source": "llm"},
+                telemetry_output={"decision": "long"},
+                created_at=btc_run.created_at,
+                updated_at=btc_run.updated_at,
+            ),
+            DecisionPerformanceFact(
+                decision_run_id=eth_run.id,
+                provider_name=eth_run.provider_name,
+                symbol="ETHUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["PULLBACK_ENTRY"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                telemetry_metadata={"source": "llm"},
+                telemetry_output={"decision": "long"},
+                created_at=eth_run.created_at,
+                updated_at=eth_run.updated_at,
+            ),
+        ]
+    )
 
     btc_risk = RiskCheck(
         symbol="BTCUSDT",
@@ -820,7 +865,22 @@ def _seed_multi_symbol_operator_rows(db_session) -> None:
                 "ai_stop_management_allowed": True,
                 "hard_stop_active": True,
                 "stop_widening_allowed": False,
-            }
+            },
+            "position_exit_review": {
+                "recommendation": "hold_runner",
+                "confidence": 0.61,
+                "profit_take_bias": "let_runner_work",
+                "runner_state": "healthy",
+                "exit_urgency": "watch",
+                "summary": "Runner still has supportive trend context.",
+                "reason_codes": ["RUNNER_TREND_SUPPORT"],
+                "profit_protection_cues": ["current_r=1.2"],
+                "runner_invalidation_cues": [],
+                "data_quality_notes": [],
+                "advisory_only": True,
+                "execution_boundary": "metadata_only_no_order_authority",
+                "agent_run_id": 9999,
+            },
         },
     )
     db_session.add(btc_position)
@@ -1448,6 +1508,135 @@ def test_audit_compact_list_filters_and_detail_lazy_payload(db_session) -> None:
     assert detail["event_category"] == "risk"
 
 
+def test_get_alerts_can_filter_acknowledged_rows(db_session) -> None:
+    db_session.add_all(
+        [
+            Alert(
+                category="execution",
+                severity="error",
+                title="Open orders sync failed",
+                message="old permission error",
+                acknowledged=True,
+                payload={"reason_code": "EXCHANGE_AUTH_PERMISSION_REJECTED"},
+            ),
+            Alert(
+                category="risk",
+                severity="warning",
+                title="Risk gate active",
+                message="current unresolved alert",
+                acknowledged=False,
+                payload={"reason_code": "HOLD_DECISION"},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    rows = get_alerts(db_session, acknowledged=False)
+
+    assert [row["title"] for row in rows] == ["Risk gate active"]
+
+
+def test_audit_payload_redaction_masks_recursive_sensitive_keys() -> None:
+    payload = {
+        "user_stream_summary": {
+            "listen_key": "listen-key-raw",
+            "listenKey": "listen-key-camel",
+            "listen_key_present": True,
+            "listen_key_created_at": "2026-05-24T00:00:00",
+        },
+        "openai_api_key": "sk-raw",
+        "binance_api_secret": "binance-secret-raw",
+        "nested": [
+            {"refresh_token": "refresh-raw"},
+            {"token": "token-raw"},
+            {"password": "password-raw"},
+        ],
+        "usage": {"ai_total_tokens": 1234},
+    }
+
+    redacted = redact_sensitive_payload(payload)
+
+    assert redacted["user_stream_summary"]["listen_key"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["user_stream_summary"]["listenKey"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["user_stream_summary"]["listen_key_present"] is True
+    assert redacted["user_stream_summary"]["listen_key_created_at"] == "2026-05-24T00:00:00"
+    assert redacted["openai_api_key"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["binance_api_secret"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["nested"][0]["refresh_token"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["nested"][1]["token"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["nested"][2]["password"] == SENSITIVE_REDACTED_VALUE
+    assert redacted["usage"]["ai_total_tokens"] == 1234
+
+
+def test_record_audit_event_redacts_sensitive_payload_before_storage(db_session) -> None:
+    event = record_audit_event(
+        db_session,
+        event_type="scheduler_live_poll_sync",
+        entity_type="scheduler_run",
+        entity_id="live",
+        message="Live poll synchronized.",
+        payload={
+            "user_stream_summary": {
+                "listen_key": "listen-key-raw",
+                "status": "connected",
+            },
+            "api_key": "api-key-raw",
+            "safe": "visible",
+        },
+    )
+    db_session.flush()
+
+    stored = db_session.get(AuditEvent, event.id)
+
+    assert stored is not None
+    assert stored.payload["user_stream_summary"]["listen_key"] == SENSITIVE_REDACTED_VALUE
+    assert stored.payload["user_stream_summary"]["status"] == "connected"
+    assert stored.payload["api_key"] == SENSITIVE_REDACTED_VALUE
+    assert stored.payload["safe"] == "visible"
+
+
+def test_audit_api_redacts_legacy_sensitive_payload_rows(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("audit_redaction.db")
+
+    with TestingSessionLocal() as session:
+        legacy = AuditEvent(
+            event_type="scheduler_live_poll_sync",
+            entity_type="scheduler_run",
+            entity_id="live",
+            severity="info",
+            message="Live poll synchronized.",
+            payload={
+                "user_stream_summary": {
+                    "listen_key": "legacy-listen-key",
+                    "status": "connected",
+                },
+                "api_key": "legacy-api-key",
+                "secret": "legacy-secret",
+                "nested": {"token": "legacy-token", "safe": "visible"},
+            },
+        )
+        session.add(legacy)
+        session.commit()
+        event_id = legacy.id
+
+    with TestClient(app) as client:
+        list_response = client.get("/api/audit", params={"event_type": "scheduler_live_poll_sync", "limit": 1})
+        detail_response = client.get(f"/api/audit/{event_id}")
+
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    list_payload = list_response.json()[0]["payload"]
+    detail_payload = detail_response.json()["payload"]
+
+    for payload in (list_payload, detail_payload):
+        assert payload["user_stream_summary"]["listen_key"] == SENSITIVE_REDACTED_VALUE
+        assert payload["user_stream_summary"]["status"] == "connected"
+        assert payload["api_key"] == SENSITIVE_REDACTED_VALUE
+        assert payload["secret"] == SENSITIVE_REDACTED_VALUE
+        assert payload["nested"]["token"] == SENSITIVE_REDACTED_VALUE
+        assert payload["nested"]["safe"] == "visible"
+
+
 def test_audit_timeline_projects_active_position_suppression_without_fingerprint(db_session) -> None:
     from trading_mvp.models import AgentRun
 
@@ -1717,6 +1906,262 @@ def test_operator_dashboard_exposes_sync_freshness_summary(db_session) -> None:
     assert payload.control.can_enter_new_position is False
 
 
+def test_operator_dashboard_exposes_scheduler_freshness_summary(db_session) -> None:
+    now = utcnow_naive()
+    db_session.add(
+        SchedulerRun(
+            schedule_window="60s",
+            workflow="exchange_sync_cycle",
+            status="success",
+            triggered_by="scheduler",
+            created_at=now - timedelta(minutes=20),
+            next_run_at=now - timedelta(minutes=19),
+            outcome={"status": "ok"},
+        )
+    )
+    db_session.flush()
+
+    payload = get_operator_dashboard(db_session, view="scheduler")
+    summary = payload.control.scheduler_freshness_summary
+
+    assert summary["status"] == "stale"
+    assert summary["stale"] is True
+    assert summary["reason_code"] == "SCHEDULER_NEXT_RUN_MISSED"
+    assert summary["source"] == "scheduler_runs"
+    assert payload.control.scheduler_last_run_at is not None
+
+
+def test_operator_dashboard_exchange_sync_diagnostics_recovered_after_permission_failure(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        mark_sync_success(settings, scope=scope, synced_at=now)
+    db_session.add_all(
+        [
+            SchedulerRun(
+                schedule_window="30s",
+                workflow="exchange_sync_cycle",
+                status="failed",
+                triggered_by="scheduler",
+                created_at=now - timedelta(hours=2),
+                outcome={
+                    "status": "error",
+                    "error": "Binance error -2015: Invalid API-key, IP, or permissions for action.",
+                },
+            ),
+            SchedulerRun(
+                schedule_window="30s",
+                workflow="exchange_sync_cycle",
+                status="success",
+                triggered_by="scheduler",
+                created_at=now - timedelta(hours=1),
+                outcome={"status": "ok"},
+            ),
+        ]
+    )
+    db_session.flush()
+
+    payload = get_operator_dashboard(db_session)
+    diagnostics = payload.control.exchange_sync_diagnostics
+
+    assert diagnostics["status"] == "recovered"
+    assert diagnostics["current_block_state"] == "recovered"
+    assert diagnostics["currently_blocking_new_entries"] is False
+    assert diagnostics["permission_failure_count_24h"] == 1
+    assert diagnostics["failure_count_24h"] == 1
+    assert diagnostics["success_count_24h"] == 1
+    assert diagnostics["latest_failure_reason_code"] == "EXCHANGE_AUTH_PERMISSION_REJECTED"
+    assert diagnostics["latest_failure_at"] is not None
+    assert diagnostics["latest_success_at"] is not None
+    assert (
+        payload.control.control_status_summary.exchange_sync_diagnostics["current_block_state"]
+        == "recovered"
+    )
+
+
+def test_operator_dashboard_exchange_sync_diagnostics_currently_permission_blocked(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    mark_sync_success(settings, scope="account", synced_at=now)
+    mark_sync_success(settings, scope="positions", synced_at=now)
+    mark_sync_success(settings, scope="protective_orders", synced_at=now)
+    mark_sync_issue(
+        settings,
+        scope="open_orders",
+        status="failed",
+        reason_code="EXCHANGE_AUTH_PERMISSION_REJECTED",
+        observed_at=now,
+    )
+    db_session.add(
+        SchedulerRun(
+            schedule_window="30s",
+            workflow="exchange_sync_cycle",
+            status="failed",
+            triggered_by="scheduler",
+            created_at=now,
+            outcome={
+                "status": "error",
+                "reason_code": "EXCHANGE_AUTH_PERMISSION_REJECTED",
+                "error": "EXCHANGE_AUTH_PERMISSION_REJECTED",
+            },
+        )
+    )
+    db_session.flush()
+
+    payload = get_operator_dashboard(db_session)
+    diagnostics = payload.control.exchange_sync_diagnostics
+
+    assert diagnostics["status"] == "blocked"
+    assert diagnostics["current_block_state"] == "currently_blocked"
+    assert diagnostics["currently_blocking_new_entries"] is True
+    assert diagnostics["currently_permission_blocked"] is True
+    assert diagnostics["active_reason_codes"] == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
+    assert diagnostics["permission_failure_count_24h"] == 1
+    assert payload.control.service_gate_gate_clear is False
+    assert "recent_scheduler_non_success" in payload.control.service_gate_blockers
+    assert payload.control.service_gate_root_cause_codes == ["EXCHANGE_AUTH_PERMISSION_REJECTED"]
+
+
+def test_operator_dashboard_includes_service_gate_top_level_root_cause_codes(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    def fake_service_gate_snapshot(_session):
+        return {
+            "gate_clear": False,
+            "blockers": ["redis_cache_unavailable"],
+            "root_cause_codes": [" redis_cache_unavailable ", "REDIS_CACHE_UNAVAILABLE"],
+            "counts": {"redis_cache_unavailable": 1},
+            "redis_cache": {
+                "configured": True,
+                "available": False,
+                "reason_code": "REDIS_CACHE_UNAVAILABLE",
+                "root_cause_code": "REDIS_CACHE_UNAVAILABLE",
+            },
+        }
+
+    monkeypatch.setattr(dashboard_module, "build_service_switch_gate_snapshot", fake_service_gate_snapshot)
+
+    payload = dashboard_module.get_operator_dashboard(db_session, view="home")
+
+    assert payload.control.service_gate_gate_clear is False
+    assert payload.control.service_gate_blockers == ["redis_cache_unavailable"]
+    assert payload.control.service_gate_root_cause_codes == ["REDIS_CACHE_UNAVAILABLE"]
+
+
+def test_operator_dashboard_publishes_service_gate_detail_rows(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    def fake_service_gate_snapshot(_session):
+        return {
+            "gate_clear": False,
+            "blockers": ["recent_scheduler_non_success", "recent_health_errors"],
+            "root_cause_codes": ["RECENT_SCHEDULER_NON_SUCCESS", "RECENT_HEALTH_ERRORS"],
+            "counts": {"recent_scheduler_non_success": 1, "recent_health_errors": 1},
+            "recent_scheduler_non_success": [
+                {
+                    "id": 2968,
+                    "workflow": "interval_decision_cycle",
+                    "status": "running",
+                    "root_cause_codes": ["RECENT_SCHEDULER_NON_SUCCESS"],
+                }
+            ],
+            "recent_health_errors": [
+                {
+                    "id": 41,
+                    "component": "live_sync",
+                    "status": "degraded",
+                    "root_cause_codes": ["EXCHANGE_POSITION_MODE_UNCLEAR"],
+                }
+            ],
+            "redis_cache": {"configured": True, "available": True, "blocking": False},
+        }
+
+    monkeypatch.setattr(dashboard_module, "build_service_switch_gate_snapshot", fake_service_gate_snapshot)
+
+    payload = dashboard_module.get_operator_dashboard(db_session, view="home")
+
+    assert payload.control.service_gate_gate_clear is False
+    assert payload.control.service_gate_counts == {
+        "recent_scheduler_non_success": 1,
+        "recent_health_errors": 1,
+    }
+    assert payload.control.service_gate_recent_scheduler_non_success == [
+        {
+            "id": 2968,
+            "workflow": "interval_decision_cycle",
+            "status": "running",
+            "root_cause_codes": ["RECENT_SCHEDULER_NON_SUCCESS"],
+        }
+    ]
+    assert payload.control.service_gate_recent_health_errors == [
+        {
+            "id": 41,
+            "component": "live_sync",
+            "status": "degraded",
+            "root_cause_codes": ["EXCHANGE_POSITION_MODE_UNCLEAR"],
+        }
+    ]
+    assert payload.control.service_gate_redis_cache == {
+        "configured": True,
+        "available": True,
+        "blocking": False,
+    }
+
+
+def test_operator_dashboard_publishes_active_pending_plan_service_gate_reason_codes(db_session) -> None:
+    settings = get_or_create_settings(db_session)
+    set_reconciliation_detail(
+        settings,
+        status="synced",
+        unresolved_submission_badge=False,
+        unresolved_submission_count=0,
+        unresolved_submission_symbols=[],
+        unresolved_submissions=[],
+    )
+    now = utcnow_naive()
+    db_session.add(
+        PendingEntryPlan(
+            symbol="BTCUSDT",
+            side="long",
+            plan_status="armed",
+            source_decision_run_id=9911,
+            source_timeframe="15m",
+            entry_mode="pullback_confirm",
+            entry_zone_min=100.0,
+            entry_zone_max=101.0,
+            invalidation_price=99.0,
+            max_chase_bps=10.0,
+            idea_ttl_minutes=30,
+            stop_loss=99.0,
+            take_profit=103.0,
+            risk_pct_cap=0.01,
+            leverage_cap=1.0,
+            expires_at=now + timedelta(minutes=30),
+            idempotency_key="pending-plan:BTCUSDT:long:9911:operator-service-gate-test",
+            metadata_json={
+                "last_watch_blocked_reason_codes": ["PLAN_LATE_CHASE_WAITING_REENTRY"],
+                "source_blocked_reason_codes": ["HOLD_DECISION"],
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session, view="home")
+
+    assert payload.control.service_gate_gate_clear is False
+    assert payload.control.service_gate_blockers == ["active_pending_entry_plans"]
+    assert payload.control.service_gate_root_cause_codes == [
+        "PLAN_LATE_CHASE_WAITING_REENTRY",
+        "HOLD_DECISION",
+    ]
+
+
 def test_operator_pending_plan_snapshot_uses_utc_naive_remaining_ttl(db_session) -> None:
     settings = get_or_create_settings(db_session)
     settings.tracked_symbols = ["BTCUSDT"]
@@ -1858,6 +2303,10 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     assert cost.net_pnl_including_funding == pytest.approx(7.35, abs=1e-9)
     assert cost.signed_slippage_bps_avg > 0.0
     assert cost.adverse_slippage_bps_avg > 0.0
+    assert cost.slippage_data_status == "COMPLETE"
+    assert cost.slippage_data_reason is None
+    assert cost.slippage_sample_count == 2
+    assert cost.missing_slippage_sample_count == 0
     assert cost.passive_entry_count == 3
     assert cost.passive_entry_ratio == pytest.approx(1.0, abs=1e-9)
     assert payload.windows[0].entry_quality["entry_passive_limit"].trade_count == 1
@@ -1876,6 +2325,79 @@ def test_profitability_dashboard_groups_performance_execution_and_blocked_contex
     assert payload.adaptive_signal_summary["status"] in {"active", "neutral", "insufficient_data", "disabled"}
     assert payload.latest_decision is not None
     assert payload.latest_risk is not None
+
+
+def test_profitability_dashboard_cost_breakdown_exposes_slippage_no_sample(db_session) -> None:
+    payload = get_profitability_dashboard(db_session)
+
+    today = next(item for item in payload.cost_breakdowns if item.window_label == "today")
+    assert today.status == "no_data"
+    assert today.signed_slippage_bps_avg is None
+    assert today.adverse_slippage_bps_avg is None
+    assert today.slippage_data_status == "NO_SAMPLE"
+    assert today.slippage_data_reason == "no_execution_slippage_sample"
+    assert today.slippage_sample_count == 0
+    assert today.missing_slippage_sample_count == 0
+    assert "slippage_data_status:NO_SAMPLE" in today.warning_codes
+
+
+def test_profitability_dashboard_api_exposes_incomplete_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_incomplete_slippage_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        now = utcnow_naive()
+        order = Order(
+            symbol="BTCUSDT",
+            side="buy",
+            order_type="limit",
+            mode="live",
+            status="filled",
+            external_order_id="missing-slippage-entry",
+            requested_quantity=0.01,
+            requested_price=0.0,
+            filled_quantity=0.01,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+            created_at=now - timedelta(minutes=5),
+            updated_at=now - timedelta(minutes=5),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="missing-slippage-fill",
+                fill_price=0.0,
+                fill_quantity=0.01,
+                fee_paid=0.1,
+                commission_asset="USDT",
+                realized_pnl=1.0,
+                payload={},
+                created_at=now - timedelta(minutes=4),
+                updated_at=now - timedelta(minutes=4),
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/profitability")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "ok"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "INCOMPLETE"
+    assert today["slippage_data_reason"] == "missing_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 1
+    assert "slippage_data_status:INCOMPLETE" in today["warning_codes"]
 
 
 def test_profitability_dashboard_cost_breakdown_flags_cost_leakage(db_session) -> None:
@@ -1902,6 +2424,235 @@ def test_profitability_dashboard_cost_breakdown_flags_cost_leakage(db_session) -
         "adverse_slippage_positive",
         "high_marketable_ratio_low_net_pnl",
     }.issubset(set(cost.warning_codes))
+
+
+def test_profitability_dashboard_reports_latest_pnl_snapshot_and_fact_gate_diagnostic(db_session) -> None:
+    now = utcnow_naive().replace(second=0, microsecond=0)
+    db_session.add_all(
+        [
+            PnLSnapshot(
+                snapshot_date=(now - timedelta(days=1)).date(),
+                equity=100000.0,
+                cash_balance=100000.0,
+                gross_realized_pnl=1.0,
+                fee_total=0.1,
+                funding_total=0.0,
+                net_pnl=0.9,
+                realized_pnl=1.0,
+                daily_pnl=0.9,
+                cumulative_pnl=0.9,
+                created_at=now - timedelta(days=1),
+            ),
+            PnLSnapshot(
+                snapshot_date=now.date(),
+                equity=100008.0,
+                cash_balance=100008.0,
+                gross_realized_pnl=12.0,
+                fee_total=3.0,
+                funding_total=-1.0,
+                net_pnl=8.0,
+                realized_pnl=12.0,
+                daily_pnl=8.0,
+                cumulative_pnl=8.0,
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.add_all(
+        [
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=15),
+                latest_price=101.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=30),
+                latest_price=102.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            MarketSnapshot(
+                symbol="BTCUSDT",
+                timeframe="15m",
+                snapshot_time=now + timedelta(minutes=60),
+                latest_price=104.0,
+                latest_volume=100.0,
+                candle_count=1,
+                is_stale=False,
+                is_complete=True,
+                payload={},
+            ),
+            DecisionPerformanceFact(
+                decision_run_id=9001,
+                provider_name="openai",
+                symbol="BTCUSDT",
+                timeframe="15m",
+                decision="long",
+                rationale_codes=["EXPECTED_EDGE_MARGIN_TOO_THIN"],
+                regime="bullish",
+                trend_alignment="bullish_aligned",
+                entry_zone_min=99.0,
+                entry_zone_max=101.0,
+                stop_loss=98.0,
+                take_profit=104.0,
+                baseline_decision="long",
+                ai_used=True,
+                comparison_bucket="ai_rejected_baseline_entry",
+                ai_actionable=True,
+                ai_blocked_by_risk=True,
+                ai_led_to_order=False,
+                ai_led_to_fill=False,
+                ai_usefulness_status="risk_blocked",
+                expected_edge_bps=40.0,
+                expected_total_cost_bps=12.0,
+                net_expected_edge_bps=28.0,
+                pnl_data_confidence="not_realized",
+                telemetry_metadata={},
+                telemetry_output={"decision": "long"},
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    payload = get_profitability_dashboard(db_session)
+
+    snapshot = payload.latest_pnl_snapshot_breakdown
+    assert snapshot.status == "ok"
+    assert snapshot.gross_pnl == pytest.approx(12.0, abs=1e-9)
+    assert snapshot.fee == pytest.approx(3.0, abs=1e-9)
+    assert snapshot.funding == pytest.approx(-1.0, abs=1e-9)
+    assert snapshot.net_pnl_excluding_funding == pytest.approx(9.0, abs=1e-9)
+    assert snapshot.net_pnl_including_funding == pytest.approx(8.0, abs=1e-9)
+
+    diagnostic = payload.candidate_gate_diagnostic
+    assert diagnostic.recommendation == "diagnose_candidate_quality_and_cost_before_entry_relaxation"
+    assert diagnostic.diagnostic_order[0] == "net_after_fees"
+    assert diagnostic.source_counts["decision_performance_fact"] == 1
+    assert diagnostic.evaluated_candidates == 1
+    assert diagnostic.net_positive_blocked_or_canceled_candidates == 1
+    missed_reason_codes = {item["reason_code"] for item in diagnostic.missed_opportunity_reason_codes}
+    assert "EXPECTED_EDGE_MARGIN_TOO_THIN" in missed_reason_codes
+
+
+def test_profitability_dashboard_cache_returns_snapshot_when_enabled(db_session) -> None:
+    _seed_profitability_dashboard_rows(db_session)
+    today_start = _profitability_window_since("today", None, utcnow_naive())
+    for index, order in enumerate(db_session.query(Order).filter(Order.mode == "live").all()):
+        order.created_at = today_start + timedelta(minutes=5 + index)
+        order.updated_at = order.created_at
+    for index, execution in enumerate(db_session.query(Execution).all()):
+        execution.created_at = today_start + timedelta(minutes=20 + index)
+        execution.updated_at = execution.created_at
+    for index, funding in enumerate(db_session.query(AccountLedgerEntry).all()):
+        funding.occurred_at = today_start + timedelta(minutes=40 + index)
+        funding.updated_at = funding.occurred_at
+    db_session.flush()
+
+    cached = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
+    for order in db_session.query(Order).filter(Order.reduce_only.is_(False), Order.close_only.is_(False)).all():
+        order.order_type = "market"
+        metadata = dict(order.metadata_json) if isinstance(order.metadata_json, dict) else {}
+        execution_policy = dict(metadata.get("execution_policy") or {})
+        execution_policy["execution_style"] = "marketable"
+        metadata["execution_policy"] = execution_policy
+        order.metadata_json = metadata
+    db_session.flush()
+
+    cached_again = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
+    fresh = get_profitability_dashboard(db_session)
+
+    for cost in (cached.cost_breakdowns[0], cached_again.cost_breakdowns[0], fresh.cost_breakdowns[0]):
+        assert cost.window_label == "today"
+        assert cost.slippage_data_status == "COMPLETE"
+        assert cost.slippage_data_reason is None
+        assert cost.slippage_sample_count == 2
+        assert cost.missing_slippage_sample_count == 0
+        assert all(not code.startswith("slippage_data_status:") for code in cost.warning_codes)
+
+    assert cached_again.windows[0].cost_breakdown.passive_entry_ratio == cached.windows[0].cost_breakdown.passive_entry_ratio
+    assert cached_again.windows[0].cost_breakdown.marketable_entry_ratio == cached.windows[0].cost_breakdown.marketable_entry_ratio
+    assert fresh.windows[0].cost_breakdown.marketable_entry_ratio == pytest.approx(1.0, abs=1e-9)
+
+
+def test_profitability_dashboard_cache_remerges_slippage_reason_from_stale_payload(
+    db_session,
+    monkeypatch,
+) -> None:
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    profitability = get_profitability_dashboard(db_session)
+    warning_code = "slippage_data_status:NO_SAMPLE"
+    assert warning_code in profitability.cost_breakdowns[0].warning_codes
+    assert warning_code in profitability.limited_live_readiness.reason_codes
+    assert warning_code in profitability.windows[0].limited_live_readiness.reason_codes
+
+    stale_readiness = profitability.limited_live_readiness.model_copy(
+        update={
+            "reason_codes": [
+                code
+                for code in profitability.limited_live_readiness.reason_codes
+                if not code.startswith("slippage_data_status:")
+            ]
+        }
+    )
+    stale_windows = [
+        window.model_copy(
+            update={
+                "limited_live_readiness": window.limited_live_readiness.model_copy(
+                    update={
+                        "reason_codes": [
+                            code
+                            for code in window.limited_live_readiness.reason_codes
+                            if not code.startswith("slippage_data_status:")
+                        ]
+                    }
+                )
+            }
+        )
+        for window in profitability.windows
+    ]
+    stale_profitability = profitability.model_copy(
+        update={
+            "limited_live_readiness": stale_readiness,
+            "windows": stale_windows,
+        }
+    )
+    assert warning_code not in stale_profitability.limited_live_readiness.reason_codes
+    assert warning_code not in stale_profitability.windows[0].limited_live_readiness.reason_codes
+
+    build_calls = 0
+
+    def stale_uncached_profitability(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return stale_profitability
+
+    monkeypatch.setattr(
+        "trading_mvp.services.dashboard._build_profitability_dashboard_uncached",
+        stale_uncached_profitability,
+    )
+
+    cached = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
+    cached_again = get_profitability_dashboard(db_session, use_cache=True, allow_stale=False)
+
+    assert build_calls == 1
+    assert warning_code in cached.limited_live_readiness.reason_codes
+    assert warning_code in cached.windows[0].limited_live_readiness.reason_codes
+    assert warning_code in cached_again.limited_live_readiness.reason_codes
+    assert warning_code in cached_again.windows[0].limited_live_readiness.reason_codes
 
 
 def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_session) -> None:
@@ -2002,6 +2753,9 @@ def test_operator_dashboard_groups_global_control_and_symbol_summaries(db_sessio
     assert btc.open_position.hard_stop_active is True
     assert btc.open_position.ai_stop_management_allowed is True
     assert btc.open_position.stop_widening_allowed is False
+    assert btc.open_position.position_exit_review is not None
+    assert btc.open_position.position_exit_review.recommendation == "hold_runner"
+    assert btc.open_position.position_exit_review.execution_boundary == "metadata_only_no_order_authority"
     assert btc.protection_status.status == "missing"
     assert btc.protection_status.recovery_status == "recovery_pending"
     assert btc.protection_status.auto_recovery_active is True
@@ -2172,6 +2926,152 @@ def test_operator_dashboard_exposes_weak_volume_preai_skip_reason(db_session) ->
     assert bnb.ai_decision.ai_trigger_summary == bnb.ai_decision.market_signal_summary
     assert bnb.ai_decision.market_signal_context.weak_volume is True
     assert bnb.ai_decision.market_signal_context.volume_ratio == 0.07
+
+
+def test_operator_dashboard_exposes_hold_diagnostic_for_no_edge_context(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "ETHUSDT"
+    settings.tracked_symbols = ["ETHUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    decision_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="eth no edge hold",
+        input_payload={
+            "features": {
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "weak",
+                    "weak_volume": True,
+                    "momentum_weakening": True,
+                },
+            },
+        },
+        output_payload={
+            "symbol": "ETHUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.18,
+            "rationale_codes": [
+                "NO_EDGE",
+                "EXPECTANCY_NEUTRAL",
+                "DERIVATIVES_NEUTRAL",
+                "LEAD_MARKETS_NEUTRAL",
+            ],
+            "explanation_short": "No actionable edge.",
+        },
+        metadata_json={
+            "source": "llm",
+            "selection_context": {
+                "assigned_slot": "slot_1",
+                "capacity_reason": "breadth_weak_reduce_capacity",
+                "entry_score_threshold": 0.48,
+                "slot_conviction_score": 0.52,
+                "score": {
+                    "total_score": 0.52,
+                    "derivatives_alignment": 0.24,
+                    "lead_lag_alignment": 0.50,
+                },
+                "universe_breadth": {
+                    "breadth_regime": "weak_breadth",
+                    "directional_bias": "neutral",
+                    "entry_candidates": 0,
+                    "structural_entry_candidates": 0,
+                    "decision_entry_candidates": 0,
+                },
+                "candidate": {
+                    "rationale_codes": [
+                        "NO_EDGE",
+                        "EXPECTANCY_NEUTRAL",
+                        "DERIVATIVES_NEUTRAL",
+                        "LEAD_MARKETS_NEUTRAL",
+                    ],
+                },
+            },
+            "analysis_context": {
+                "regime": {
+                    "primary_regime": "bullish",
+                    "trend_alignment": "bullish_aligned",
+                    "volume_regime": "weak",
+                },
+                "flags": {"weak_volume": True, "momentum_weakening": True},
+                "derivatives": {
+                    "available": True,
+                    "oi_expanding_with_price": False,
+                    "taker_flow_alignment": "neutral",
+                    "funding_bias": "neutral",
+                    "crowded_long_risk": True,
+                    "top_trader_long_crowded": True,
+                    "long_alignment_score": 0.24,
+                },
+                "lead_lag": {
+                    "leader_bias": "neutral",
+                    "bullish_alignment_score": 0.50,
+                },
+            },
+        },
+        schema_valid=True,
+        created_at=now,
+    )
+    db_session.add(decision_run)
+    db_session.flush()
+    db_session.add(
+        RiskCheck(
+            symbol="ETHUSDT",
+            decision_run_id=decision_run.id,
+            allowed=False,
+            decision="hold",
+            reason_codes=["HOLD_DECISION"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+            created_at=now,
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session, view="decision")
+    eth = next(item for item in payload.symbols if item.symbol == "ETHUSDT")
+    diagnostic = eth.ai_decision.hold_diagnostic
+
+    assert diagnostic["status"] == "active"
+    assert diagnostic["summary_code"] == "no_entry_candidate"
+    assert diagnostic["metrics"]["entry_candidates"] == 0
+    assert diagnostic["metrics"]["entry_score_threshold"] == 0.48
+    assert diagnostic["metrics"]["slot_conviction_score"] == 0.52
+    assert diagnostic["metrics"]["derivatives_alignment"] == 0.24
+    assert diagnostic["metrics"]["lead_lag_alignment"] == 0.5
+    assert diagnostic["evidence"]["breadth_regime"] == "weak_breadth"
+    assert diagnostic["evidence"]["capacity_reason"] == "breadth_weak_reduce_capacity"
+    assert diagnostic["evidence"]["oi_expanding_with_price"] is False
+    assert diagnostic["evidence"]["leader_bias"] == "neutral"
+    assert {
+        "NO_EDGE",
+        "EXPECTANCY_NEUTRAL",
+        "DERIVATIVES_NEUTRAL",
+        "LEAD_MARKETS_NEUTRAL",
+        "WEAK_VOLUME",
+        "MOMENTUM_WEAKENING",
+        "WEAK_BREADTH",
+        "BREADTH_WEAK_REDUCE_CAPACITY",
+        "BREAKOUT_OI_NOT_EXPANDING",
+        "TOP_TRADER_LONG_CROWDED",
+        "DERIVATIVES_ALIGNMENT_HEADWIND",
+    }.issubset(set(diagnostic["reason_codes"]))
 
 
 def test_operator_dashboard_distinguishes_ai_invoked_hold_from_preai_skip(db_session) -> None:
@@ -2349,6 +3249,156 @@ def test_operator_dashboard_distinguishes_ai_invoked_hold_from_preai_skip(db_ses
     assert skip.ai_decision.market_signal_summary is not None
     assert "거래량" in skip.ai_decision.market_signal_summary
     assert skip.ai_decision.market_signal_context.weak_volume is True
+
+
+def test_operator_dashboard_current_interval_preai_skip_overrides_stale_provider_review(db_session) -> None:
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    old_ai_at = now - timedelta(hours=8)
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BTCUSDT"
+    settings.tracked_symbols = ["BTCUSDT"]
+    db_session.add(settings)
+    db_session.flush()
+
+    ai_run = AgentRun(
+        role="trading_decision",
+        trigger_event="realtime_cycle",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="old ai hold",
+        input_payload={
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "old-provider-trigger",
+            },
+            "market_snapshot": {
+                "symbol": "BTCUSDT",
+                "timeframe": "15m",
+                "snapshot_time": old_ai_at.isoformat(),
+            },
+        },
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.6,
+            "rationale_codes": ["TEST_OLD_AI_HOLD"],
+            "explanation_short": "Old provider review held",
+        },
+        metadata_json={
+            "source": "llm",
+            "ai_trigger": {
+                "trigger_reason": "entry_candidate_event",
+                "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                "trigger_fingerprint": "old-provider-trigger",
+            },
+            "last_ai_trigger_reason": "entry_candidate_event",
+            "last_ai_invoked_at": old_ai_at.isoformat(),
+            "trigger_fingerprint": "old-provider-trigger",
+        },
+        schema_valid=True,
+        created_at=old_ai_at,
+    )
+    db_session.add(ai_run)
+    db_session.flush()
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision_run_id=ai_run.id,
+            allowed=False,
+            decision="hold",
+            reason_codes=["HOLD_DECISION"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={
+                "allowed": False,
+                "decision": "hold",
+                "reason_codes": ["HOLD_DECISION"],
+                "blocked_reason_codes": ["HOLD_DECISION"],
+            },
+        )
+    )
+    db_session.add(
+        SchedulerRun(
+            schedule_window="15m",
+            workflow="interval_decision_cycle",
+            status="success",
+            triggered_by="scheduler",
+            next_run_at=now + timedelta(minutes=15),
+            created_at=now,
+            outcome={
+                "symbol": "BTCUSDT",
+                "status": "skipped",
+                "ai_review_status": "skipped",
+                "last_ai_trigger_reason": "entry_candidate_event",
+                "last_ai_invoked_at": old_ai_at.isoformat(),
+                "last_ai_skip_reason": "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE",
+                "trigger_fingerprint": "current-weak-soft-signal",
+                "trigger": {
+                    "trigger_reason": "entry_candidate_event",
+                    "reason_codes": ["ENTRY_CANDIDATE_SELECTED"],
+                    "trigger_fingerprint": "current-weak-soft-signal",
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session, view="decision")
+    btc = next(item for item in payload.symbols if item.symbol == "BTCUSDT")
+
+    assert btc.ai_decision.last_ai_invoked_at is not None
+    assert btc.ai_decision.last_ai_skip_reason == "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+    assert btc.ai_decision.ai_skip_reason == "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+    assert btc.ai_decision.ai_review.skip_reason == "SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE"
+    assert btc.ai_decision.ai_review.provider_invoked is False
+    assert btc.ai_decision.ai_review.provider_skipped is True
+    assert btc.ai_decision.ai_review.provider_status == "skipped_pre_ai"
+    assert btc.ai_decision.ai_review.invoked_at is None
+    assert btc.ai_decision.ai_review.provider_name is None
+    assert btc.ai_decision.ai_review.provider_source is None
+
+
+def test_operator_dashboard_exposes_stale_triggered_pending_plan_warning(db_session) -> None:
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BTCUSDT"
+    settings.tracked_symbols = ["BTCUSDT"]
+    db_session.add(settings)
+    db_session.add(
+        PendingEntryPlan(
+            symbol="BTCUSDT",
+            side="long",
+            plan_status="triggered",
+            source_decision_run_id=9101,
+            source_timeframe="15m",
+            entry_mode="pullback_confirm",
+            entry_zone_min=100.0,
+            entry_zone_max=101.0,
+            invalidation_price=99.0,
+            max_chase_bps=10.0,
+            idea_ttl_minutes=15,
+            stop_loss=99.0,
+            take_profit=104.0,
+            risk_pct_cap=0.01,
+            leverage_cap=1.0,
+            expires_at=now - timedelta(hours=2),
+            triggered_at=now - timedelta(hours=3),
+            idempotency_key="stale-triggered-plan-warning",
+            metadata_json={"execution_result": {"status": "partially_filled"}},
+        )
+    )
+    db_session.commit()
+
+    payload = get_operator_dashboard(db_session)
+
+    assert payload.control.stale_pending_entry_plan_count == 1
+    assert payload.control.stale_pending_entry_plans
+    assert payload.control.stale_pending_entry_plans[0]["gate_state"] == "triggered_stale_history"
 
 
 def test_operator_dashboard_exposes_decision_macro_event_context_and_enrichment(db_session) -> None:
@@ -3047,9 +4097,11 @@ def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_fac
     payload = response.json()
     assert payload["windows"][0]["window_label"] == "24h"
     assert payload["windows"][0]["cost_breakdown"]["net_pnl_including_funding"] == 7.35
+    assert payload["windows"][0]["cost_breakdown"]["slippage_data_status"] == "COMPLETE"
     assert payload["windows"][0]["entry_quality"]["entry_passive_limit"]["trade_count"] == 1
     assert payload["entry_quality"]["entry_passive_limit"]["trade_count"] == 1
     assert payload["cost_breakdowns"][0]["window_label"] == "today"
+    assert "slippage_data_status" in payload["cost_breakdowns"][0]
     assert "rationale_winners" in payload["windows"][0]
     assert "rationale_losers" in payload["windows"][0]
     assert payload["windows"][0]["limited_live_readiness"]["read_only"] is True
@@ -3057,6 +4109,282 @@ def test_profitability_dashboard_api_returns_windowed_snapshot(testclient_db_fac
     assert "execution_windows" in payload
     assert payload["execution_windows"][0]["worst_profiles"]
     assert payload["hold_blocked_summary"]["latest_blocked_reasons"] == ["TRADING_PAUSED", "HOLD_DECISION"]
+
+
+def test_profitability_dashboard_api_exposes_no_sample_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_no_sample_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/profitability")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "no_data"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "NO_SAMPLE"
+    assert today["slippage_data_reason"] == "no_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 0
+    assert "slippage_data_status:NO_SAMPLE" in today["warning_codes"]
+    readiness = payload["limited_live_readiness"]
+    assert readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"]
+    window_readiness = payload["windows"][0]["limited_live_readiness"]
+    assert window_readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in window_readiness["reason_codes"]
+
+
+def test_operator_dashboard_api_exposes_no_sample_profitability_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_no_sample_profitability_cost_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["market_signal"]["profitability_cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "no_data"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "NO_SAMPLE"
+    assert today["slippage_data_reason"] == "no_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 0
+    assert "slippage_data_status:NO_SAMPLE" in today["warning_codes"]
+    readiness = payload["control"]["limited_live_readiness"]
+    assert readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"]
+
+
+def test_operator_dashboard_remerges_slippage_reason_from_stale_profitability_payload(
+    db_session,
+    monkeypatch,
+) -> None:
+    get_or_create_settings(db_session)
+    db_session.commit()
+
+    profitability = get_profitability_dashboard(db_session)
+    today = profitability.cost_breakdowns[0]
+    assert today.slippage_data_status == "NO_SAMPLE"
+    assert "slippage_data_status:NO_SAMPLE" in today.warning_codes
+
+    stale_readiness = profitability.limited_live_readiness.model_copy(
+        update={
+            "reason_codes": [
+                code
+                for code in profitability.limited_live_readiness.reason_codes
+                if not code.startswith("slippage_data_status:")
+            ]
+        }
+    )
+    assert "slippage_data_status:NO_SAMPLE" not in stale_readiness.reason_codes
+    stale_profitability = profitability.model_copy(update={"limited_live_readiness": stale_readiness})
+
+    monkeypatch.setattr(
+        "trading_mvp.services.dashboard.get_profitability_dashboard",
+        lambda *args, **kwargs: stale_profitability,
+    )
+
+    payload = get_operator_dashboard(db_session)
+
+    assert payload.control.limited_live_readiness.status == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in payload.control.limited_live_readiness.reason_codes
+
+
+def test_operator_dashboard_api_exposes_incomplete_profitability_slippage_reason(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_incomplete_profitability_cost_api.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        now = utcnow_naive()
+        order = Order(
+            symbol="BTCUSDT",
+            side="buy",
+            order_type="limit",
+            mode="live",
+            status="filled",
+            external_order_id="operator-missing-slippage-entry",
+            requested_quantity=0.01,
+            requested_price=0.0,
+            filled_quantity=0.01,
+            average_fill_price=0.0,
+            reason_codes=[],
+            metadata_json={},
+            created_at=now - timedelta(minutes=5),
+            updated_at=now - timedelta(minutes=5),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="operator-missing-slippage-fill",
+                fill_price=0.0,
+                fill_quantity=0.01,
+                fee_paid=0.1,
+                commission_asset="USDT",
+                realized_pnl=1.0,
+                payload={},
+                created_at=now - timedelta(minutes=4),
+                updated_at=now - timedelta(minutes=4),
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    today = payload["market_signal"]["profitability_cost_breakdowns"][0]
+    assert today["window_label"] == "today"
+    assert today["status"] == "ok"
+    assert today["signed_slippage_bps_avg"] is None
+    assert today["adverse_slippage_bps_avg"] is None
+    assert today["slippage_data_status"] == "INCOMPLETE"
+    assert today["slippage_data_reason"] == "missing_execution_slippage_sample"
+    assert today["slippage_sample_count"] == 0
+    assert today["missing_slippage_sample_count"] == 1
+    assert "slippage_data_status:INCOMPLETE" in today["warning_codes"]
+
+
+def test_cost_conversion_warnings_match_cost_profitability_and_operator_apis(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("cost_conversion_warning_match.db")
+
+    with TestingSessionLocal() as session:
+        now = utcnow_naive()
+        settings = get_or_create_settings(session)
+        mark_sync_success(settings, scope="account", synced_at=now, stale_after_seconds=3600)
+        order = Order(
+            symbol="BTCUSDT",
+            side="buy",
+            order_type="market",
+            mode="live",
+            status="filled",
+            external_order_id="cost-conversion-warning-entry",
+            requested_quantity=1.0,
+            requested_price=100.0,
+            filled_quantity=1.0,
+            average_fill_price=100.0,
+            reason_codes=[],
+            metadata_json={},
+            created_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=10),
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            Execution(
+                order_id=order.id,
+                symbol="BTCUSDT",
+                status="filled",
+                external_trade_id="cost-conversion-warning-fill",
+                fill_price=100.0,
+                fill_quantity=1.0,
+                fee_paid=0.1,
+                commission_asset="BNB",
+                realized_pnl=1.0,
+                payload={"signed_slippage_bps": 0.0},
+                created_at=now - timedelta(minutes=9),
+                updated_at=now - timedelta(minutes=9),
+            )
+        )
+        session.add(
+            AccountLedgerEntry(
+                entry_type="funding",
+                asset="BNB",
+                symbol="BTCUSDT",
+                amount=-0.2,
+                external_ref_id="cost-conversion-warning-funding",
+                occurred_at=now - timedelta(minutes=8),
+                payload={"incomeType": "FUNDING_FEE"},
+                created_at=now - timedelta(minutes=8),
+                updated_at=now - timedelta(minutes=8),
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        cost_response = client.get("/api/analytics/cost-breakdown?period=today")
+        profitability_response = client.get("/api/dashboard/profitability")
+        operator_response = client.get("/api/dashboard/operator")
+
+    assert cost_response.status_code == 200
+    assert profitability_response.status_code == 200
+    assert operator_response.status_code == 200
+    cost_payload = cost_response.json()
+    profitability_today = profitability_response.json()["cost_breakdowns"][0]
+    operator_today = operator_response.json()["market_signal"]["profitability_cost_breakdowns"][0]
+    expected_warning_codes = {
+        "fee_asset_conversion_unavailable:BNB",
+        "funding_asset_conversion_unavailable:BNB",
+    }
+
+    assert expected_warning_codes.issubset(set(cost_payload["warnings"]))
+    assert expected_warning_codes.issubset(set(cost_payload["buckets"][0]["warning_codes"]))
+    assert expected_warning_codes.issubset(set(profitability_today["warning_codes"]))
+    assert expected_warning_codes.issubset(set(operator_today["warning_codes"]))
+    assert cost_payload["summary"]["fee_usdt"] == pytest.approx(0.0, abs=1e-9)
+    assert cost_payload["summary"]["funding_usdt"] == pytest.approx(0.0, abs=1e-9)
+    assert profitability_today["fee"] == pytest.approx(cost_payload["summary"]["fee_usdt"], abs=1e-9)
+    assert profitability_today["funding"] == pytest.approx(cost_payload["summary"]["funding_usdt"], abs=1e-9)
+    assert operator_today["fee"] == pytest.approx(cost_payload["summary"]["fee_usdt"], abs=1e-9)
+    assert operator_today["funding"] == pytest.approx(cost_payload["summary"]["funding_usdt"], abs=1e-9)
+
+
+def test_profitability_window_cost_breakdown_excludes_unconverted_assets(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("profitability_window_conversion_warning.db")
+
+    with TestingSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        now = utcnow_naive()
+        settings = get_or_create_settings(session)
+        mark_sync_success(settings, scope="account", synced_at=now, stale_after_seconds=3600)
+        for execution in session.scalars(select(Execution)):
+            execution.commission_asset = "BNB"
+        for funding in session.scalars(select(AccountLedgerEntry).where(AccountLedgerEntry.entry_type == "funding")):
+            funding.asset = "BNB"
+        session.commit()
+
+    with TestClient(app) as client:
+        profitability_response = client.get("/api/dashboard/profitability")
+        operator_response = client.get("/api/dashboard/operator")
+
+    assert profitability_response.status_code == 200
+    assert operator_response.status_code == 200
+    profitability_payload = profitability_response.json()
+    operator_payload = operator_response.json()
+    window_cost = profitability_payload["windows"][0]["cost_breakdown"]
+    operator_window_cost = operator_payload["market_signal"]["performance_windows"][0]["cost_breakdown"]
+    top_cost = profitability_payload["cost_breakdowns"][0]
+    expected_warning_codes = {
+        "fee_asset_conversion_unavailable:BNB",
+        "funding_asset_conversion_unavailable:BNB",
+    }
+
+    assert expected_warning_codes.issubset(set(window_cost["warning_codes"]))
+    assert expected_warning_codes.issubset(set(operator_window_cost["warning_codes"]))
+    assert expected_warning_codes.issubset(set(top_cost["warning_codes"]))
+    assert window_cost["fee"] == pytest.approx(0.0, abs=1e-9)
+    assert window_cost["funding"] == pytest.approx(0.0, abs=1e-9)
+    assert operator_window_cost["fee"] == pytest.approx(0.0, abs=1e-9)
+    assert operator_window_cost["funding"] == pytest.approx(0.0, abs=1e-9)
+    assert window_cost["net_pnl_excluding_funding"] == pytest.approx(window_cost["realized_pnl"], abs=1e-9)
+    assert window_cost["net_pnl_including_funding"] == pytest.approx(window_cost["realized_pnl"], abs=1e-9)
 
 
 def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> None:
@@ -3082,6 +4410,9 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert payload["control"]["pnl_summary"]["account_snapshot_available"] is False
     assert payload["control"]["account_sync_summary"]["account_snapshot_available"] is False
     assert payload["control"]["limited_live_readiness"]["read_only"] is True
+    assert payload["control"]["service_gate_gate_clear"] is False
+    assert "open_positions" in payload["control"]["service_gate_blockers"]
+    assert payload["control"]["service_gate_root_cause_codes"] == []
     assert payload["market_signal"]["performance_windows"][0]["limited_live_readiness"]["read_only"] is True
     assert "entry_quality" in payload["market_signal"]["performance_windows"][0]
     assert payload["market_signal"]["profitability_cost_breakdowns"][0]["window_label"] == "today"
@@ -3123,6 +4454,8 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert btc["open_position"]["holding_profile"] == "swing"
     assert btc["open_position"]["hard_stop_active"] is True
     assert btc["open_position"]["stop_widening_allowed"] is False
+    assert btc["open_position"]["position_exit_review"]["recommendation"] == "hold_runner"
+    assert "agent_run_id" not in btc["open_position"]["position_exit_review"]
     assert eth["latest_price"] == 3400.0
     assert eth["ai_decision"]["next_ai_review_due_at"] is None
     assert eth["ai_decision"]["ai_review"]["provider_status"] == "invoked"
@@ -3146,6 +4479,162 @@ def test_operator_dashboard_api_returns_operator_flow(testclient_db_factory) -> 
     assert len(payload["audit_events"]) >= 1
 
 
+def test_operator_dashboard_api_publishes_service_gate_clear_when_gate_clear(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_service_gate_clear_contract.db")
+
+    with TestingSessionLocal() as session:
+        settings = get_or_create_settings(session)
+        set_reconciliation_detail(
+            settings,
+            status="synced",
+            unresolved_submission_badge=False,
+            unresolved_submission_count=0,
+            unresolved_submission_symbols=[],
+            unresolved_submissions=[],
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["control"]["service_gate_gate_clear"] is True
+    assert payload["control"]["service_gate_blockers"] == []
+    assert payload["control"]["service_gate_root_cause_codes"] == []
+
+
+def test_operator_dashboard_compact_views_publish_service_gate_clear_when_gate_clear(
+    testclient_db_factory,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_compact_service_gate_clear_contract.db")
+
+    with TestingSessionLocal() as session:
+        settings = get_or_create_settings(session)
+        set_reconciliation_detail(
+            settings,
+            status="synced",
+            unresolved_submission_badge=False,
+            unresolved_submission_count=0,
+            unresolved_submission_symbols=[],
+            unresolved_submissions=[],
+        )
+        session.commit()
+
+    compact_views = ("home", "market", "scheduler", "decision", "risk")
+    with TestClient(app) as client:
+        responses = {
+            view: client.get(f"/api/dashboard/operator?view={view}")
+            for view in compact_views
+        }
+
+    for view, response in responses.items():
+        assert response.status_code == 200, view
+        payload = response.json()
+        assert "service_gate_gate_clear" in payload["control"], view
+        assert payload["control"]["service_gate_gate_clear"] is True, view
+        assert payload["control"]["service_gate_blockers"] == [], view
+        assert payload["control"]["service_gate_root_cause_codes"] == [], view
+
+
+def test_operator_control_state_defaults_service_gate_to_fail_closed() -> None:
+    control = OperatorControlState(
+        generated_at=utcnow_naive(),
+        operational_status=OperationalStatusPayload(),
+        mode="service_ready",
+        default_symbol="BTCUSDT",
+        default_timeframe="15m",
+    )
+
+    assert control.service_gate_gate_clear is False
+    assert control.service_gate_blockers == []
+    assert control.service_gate_root_cause_codes == []
+
+
+def test_operator_dashboard_home_exposes_readiness_reasons_without_full_profitability_payload(
+    testclient_db_factory,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_home_readiness.db")
+
+    with TestingSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator?view=home")
+
+    assert response.status_code == 200
+    payload = response.json()
+    readiness = payload["control"]["limited_live_readiness"]
+
+    assert payload["symbols"] == []
+    assert payload["market_signal"]["performance_windows"] == []
+    assert payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert readiness["status"] == "not_ready"
+    assert "insufficient_sample" in readiness["reason_codes"]
+    assert "productization_profitability_unverified" in readiness["reason_codes"]
+    assert readiness["recent_candidate_events"] >= 2
+    assert readiness["actual_entries"] == 1
+
+
+def test_operator_dashboard_home_exposes_no_sample_slippage_readiness_without_cost_payload(
+    testclient_db_factory,
+) -> None:
+    SeededSessionLocal = testclient_db_factory("operator_home_seeded_cache.db")
+
+    with SeededSessionLocal() as session:
+        _seed_profitability_dashboard_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        seeded_response = client.get("/api/dashboard/operator?view=home")
+
+    assert seeded_response.status_code == 200
+
+    TestingSessionLocal = testclient_db_factory("operator_home_no_sample_slippage_readiness.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/operator?view=home")
+
+    assert response.status_code == 200
+    payload = response.json()
+    readiness = payload["control"]["limited_live_readiness"]
+
+    assert payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert readiness["status"] == "not_ready"
+    assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"]
+
+
+def test_operator_dashboard_compact_views_expose_no_sample_slippage_readiness_without_cost_payload(
+    testclient_db_factory,
+) -> None:
+    TestingSessionLocal = testclient_db_factory("operator_compact_no_sample_slippage_readiness.db")
+
+    with TestingSessionLocal() as session:
+        get_or_create_settings(session)
+        session.commit()
+
+    compact_views = ("home", "market", "scheduler", "decision", "risk")
+    with TestClient(app) as client:
+        responses = {
+            view: client.get(f"/api/dashboard/operator?view={view}")
+            for view in compact_views
+        }
+
+    for view, response in responses.items():
+        assert response.status_code == 200
+        payload = response.json()
+        readiness = payload["control"]["limited_live_readiness"]
+
+        assert payload["market_signal"]["profitability_cost_breakdowns"] == []
+        assert readiness["status"] == "not_ready"
+        assert "slippage_data_status:NO_SAMPLE" in readiness["reason_codes"], view
+
+
 def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db_factory) -> None:
     TestingSessionLocal = testclient_db_factory("operator_projection.db")
 
@@ -3156,9 +4645,13 @@ def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db
     with TestClient(app) as client:
         market_response = client.get("/api/dashboard/operator?view=market")
         scheduler_response = client.get("/api/dashboard/operator?view=scheduler")
+        decision_response = client.get("/api/dashboard/operator?view=decision")
+        risk_response = client.get("/api/dashboard/operator?view=risk")
 
     assert market_response.status_code == 200
     assert scheduler_response.status_code == 200
+    assert decision_response.status_code == 200
+    assert risk_response.status_code == 200
 
     market_payload = market_response.json()
     market_btc = next(item for item in market_payload["symbols"] if item["symbol"] == "BTCUSDT")
@@ -3187,6 +4680,107 @@ def test_operator_dashboard_route_projection_skips_unused_sections(testclient_db
     assert scheduler_btc["execution"]["order_id"] is None
     assert scheduler_btc["protection_status"]["status"] == "unknown"
     assert scheduler_btc["audit_events"] == []
+
+    decision_payload = decision_response.json()
+    decision_btc = next(item for item in decision_payload["symbols"] if item["symbol"] == "BTCUSDT")
+
+    assert decision_payload["market_signal"]["performance_windows"] == []
+    assert decision_payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert decision_payload["execution_windows"] == []
+    assert decision_payload["audit_events"] == []
+    assert decision_btc["ai_decision"]["decision"] == "long"
+    assert decision_btc["risk_guard"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert decision_btc["execution"]["order_id"] is not None
+    assert decision_btc["open_position"]["is_open"] is True
+    assert decision_btc["event_operator_control"] is None
+    assert decision_btc["audit_events"] == []
+
+    risk_payload = risk_response.json()
+    risk_btc = next(item for item in risk_payload["symbols"] if item["symbol"] == "BTCUSDT")
+
+    assert risk_payload["market_signal"]["performance_windows"] == []
+    assert risk_payload["market_signal"]["profitability_cost_breakdowns"] == []
+    assert risk_payload["execution_windows"] == []
+    assert risk_payload["audit_events"] == []
+    assert risk_btc["ai_decision"]["decision_run_id"] is None
+    assert risk_btc["risk_guard"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
+    assert risk_btc["execution"]["order_id"] is not None
+    assert risk_btc["protection_status"]["status"] == "unknown"
+    assert risk_btc["event_operator_control"] is None
+    assert risk_btc["audit_events"] == []
+
+
+def test_operator_dashboard_compact_view_skips_overview_decision_snapshot(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+    from trading_mvp.models import AgentRun
+
+    now = utcnow_naive()
+    settings = get_or_create_settings(db_session)
+    settings.default_symbol = "BTCUSDT"
+    settings.tracked_symbols = ["BTCUSDT"]
+    db_session.add(
+        MarketSnapshot(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            snapshot_time=now,
+            latest_price=70500.0,
+            latest_volume=1000.0,
+            candle_count=120,
+            is_stale=False,
+            is_complete=True,
+            payload={},
+        )
+    )
+    db_session.add(
+        AgentRun(
+            role="trading_decision",
+            trigger_event="realtime_cycle",
+            schema_name="TradeDecision",
+            status="completed",
+            provider_name="deterministic-mock",
+            summary="heavy latest decision",
+            input_payload={"large": ["value"] * 100},
+            output_payload={"symbol": "BTCUSDT", "timeframe": "15m", "decision": "long"},
+            metadata_json={},
+            schema_valid=True,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db_session.commit()
+
+    def fail_on_overview_decision_snapshot(*args, **kwargs):
+        raise AssertionError("compact market view should not build decision snapshots")
+
+    monkeypatch.setattr(dashboard_module, "_build_decision_snapshot", fail_on_overview_decision_snapshot)
+
+    payload = dashboard_module.get_operator_dashboard(db_session, view="market")
+
+    assert payload.control.last_decision_at == now
+    assert payload.symbols[0].symbol == "BTCUSDT"
+    assert payload.symbols[0].ai_decision.decision_run_id is None
+
+
+def test_get_overview_uses_thin_runtime_summary(db_session, monkeypatch) -> None:
+    import trading_mvp.services.dashboard as dashboard_module
+
+    calls: list[dict[str, object]] = []
+    original = dashboard_module.serialize_settings_runtime_summary
+
+    def wrapped_runtime_summary(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_module, "serialize_settings_runtime_summary", wrapped_runtime_summary)
+
+    dashboard_module.get_overview(db_session)
+
+    assert calls == [
+        {
+            "include_operational_status": False,
+            "include_event_operator_control": False,
+        }
+    ]
 
 
 def test_scheduler_operator_projection_uses_decision_fact_for_deep_history(db_session) -> None:
@@ -3314,6 +4908,19 @@ def test_scheduler_operator_projection_uses_decision_fact_for_deep_history(db_se
     assert btc.protection_status.status == "unknown"
     assert btc.audit_events == []
 
+    decision_payload = get_operator_dashboard(db_session, view="decision")
+    decision_btc = next(item for item in decision_payload.symbols if item.symbol == "BTCUSDT")
+
+    assert decision_btc.ai_decision.decision_run_id == target_run.id
+    assert decision_btc.risk_guard.blocked_reason_codes == ["POSITION_STATE_STALE"]
+    assert decision_btc.audit_events == []
+
+    full_payload = get_operator_dashboard(db_session)
+    full_btc = next(item for item in full_payload.symbols if item.symbol == "BTCUSDT")
+
+    assert full_btc.ai_decision.decision_run_id == target_run.id
+    assert full_btc.risk_guard.blocked_reason_codes == ["POSITION_STATE_STALE"]
+
 
 def test_scheduler_api_compact_omits_outcome(testclient_db_factory) -> None:
     TestingSessionLocal = testclient_db_factory("scheduler_compact.db")
@@ -3324,7 +4931,7 @@ def test_scheduler_api_compact_omits_outcome(testclient_db_factory) -> None:
 
     with TestClient(app) as client:
         compact_response = client.get("/api/scheduler?limit=20&compact=true")
-        full_response = client.get("/api/scheduler?limit=20")
+        full_response = client.get("/api/scheduler?limit=20&include_payload=true")
 
     assert compact_response.status_code == 200
     assert full_response.status_code == 200
@@ -3335,6 +4942,7 @@ def test_scheduler_api_compact_omits_outcome(testclient_db_factory) -> None:
     assert full_payload
     assert "outcome" not in compact_payload[0]
     assert "outcome" in full_payload[0]
+    assert "ai_skip_reason" in compact_payload[0]
     assert compact_payload[0]["workflow"] == full_payload[0]["workflow"]
 
 
@@ -3494,6 +5102,299 @@ def test_risk_checks_api_compact_omits_debug_payload(testclient_db_factory) -> N
     assert btc["payload"]["blocked_reason_codes"] == ["POSITION_STATE_STALE"]
     assert "debug_payload" not in btc["payload"]
     assert "exposure_metrics" not in btc["payload"]
+
+
+def test_risk_checks_api_compact_includes_reason_evidence(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("risk_checks_reason_evidence_compact.db")
+
+    with TestingSessionLocal() as session:
+        session.add(
+            RiskCheck(
+                symbol="BTCUSDT",
+                allowed=False,
+                decision="short",
+                reason_codes=["SYMBOL_RECENT_PERFORMANCE_NEGATIVE", "CORRELATED_EXPOSURE_LIMIT_REACHED"],
+                approved_risk_pct=0.0,
+                approved_leverage=0.0,
+                payload={
+                    "allowed": False,
+                    "decision": "short",
+                    "blocked_reason_codes": [
+                        "SYMBOL_RECENT_PERFORMANCE_NEGATIVE",
+                        "CORRELATED_EXPOSURE_LIMIT_REACHED",
+                    ],
+                    "debug_payload": {
+                        "symbol_recent_performance_gate": {
+                            "applied": True,
+                            "status": "blocked",
+                            "symbol": "BTCUSDT",
+                            "lookback_days": 30,
+                            "execution_count": 27,
+                            "gross_realized_pnl": -2.843,
+                            "fee_total": 3.373105,
+                            "net_pnl_after_fees": -6.216105,
+                            "raw_executions": [{"id": 1}],
+                        },
+                        "portfolio_exposure_gate": {
+                            "status": "blocked",
+                            "candidate_symbol": "BTCUSDT",
+                            "candidate_direction": "short",
+                            "combined_BTC_ETH_directional_exposure_pct": 2.993049,
+                            "limits": {"max_same_direction_major_exposure_pct": 2.0},
+                            "raw_positions": [{"symbol": "ETHUSDT"}],
+                        },
+                    },
+                },
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get("/api/risk/checks?limit=1&compact=true")
+
+    assert response.status_code == 200
+    btc = response.json()[0]
+
+    assert btc["payload_mode"] == "compact"
+    assert "debug_payload" not in btc["payload"]
+    evidence = btc["payload"]["reason_evidence"]
+    symbol_gate = evidence["symbol_recent_performance_gate"]
+    portfolio_gate = evidence["portfolio_exposure_gate"]
+    assert symbol_gate["net_pnl_after_fees"] == -6.216105
+    assert symbol_gate["execution_count"] == 27
+    assert "raw_executions" not in symbol_gate
+    assert portfolio_gate["combined_BTC_ETH_directional_exposure_pct"] == 2.993049
+    assert portfolio_gate["limits"]["max_same_direction_major_exposure_pct"] == 2.0
+    assert "raw_positions" not in portfolio_gate
+
+
+def test_history_payload_endpoints_default_to_compact_with_raw_opt_in(testclient_db_factory) -> None:
+    TestingSessionLocal = testclient_db_factory("history_payload_defaults_compact.db")
+
+    with TestingSessionLocal() as session:
+        _seed_multi_symbol_operator_rows(session)
+        session.commit()
+
+    with TestClient(app) as client:
+        decisions_default = client.get("/api/decisions?limit=12")
+        decisions_raw = client.get("/api/decisions?limit=12&include_payload=true")
+        agents_default = client.get("/api/agents?limit=12")
+        agents_raw = client.get("/api/agents?limit=12&include_payload=true")
+        risk_default = client.get("/api/risk/checks?limit=12")
+        risk_raw = client.get("/api/risk/checks?limit=12&include_payload=true")
+        scheduler_default = client.get("/api/scheduler?limit=12")
+        scheduler_raw = client.get("/api/scheduler?limit=12&compact=false")
+
+    assert decisions_default.status_code == 200
+    assert decisions_raw.status_code == 200
+    assert agents_default.status_code == 200
+    assert agents_raw.status_code == 200
+    assert risk_default.status_code == 200
+    assert risk_raw.status_code == 200
+    assert scheduler_default.status_code == 200
+    assert scheduler_raw.status_code == 200
+
+    default_decision = next(item for item in decisions_default.json() if item["symbol"] == "BTCUSDT")
+    raw_decision = next(item for item in decisions_raw.json() if item["symbol"] == "BTCUSDT")
+    assert "features" not in default_decision["input_payload"]
+    assert raw_decision["input_payload"]["features"]["trend_score"] == 1.48
+
+    default_agent = next(item for item in agents_default.json() if item["summary"] == "btc blocked long")
+    raw_agent = next(item for item in agents_raw.json() if item["summary"] == "btc blocked long")
+    assert default_agent["payload_mode"] == "compact"
+    assert "market_snapshot" not in default_agent["input_payload"]
+    assert raw_agent["input_payload"]["market_snapshot"]["symbol"] == "BTCUSDT"
+
+    default_risk = next(item for item in risk_default.json() if item["symbol"] == "BTCUSDT")
+    raw_risk = next(item for item in risk_raw.json() if item["symbol"] == "BTCUSDT")
+    assert default_risk["payload_mode"] == "compact"
+    assert "debug_payload" not in default_risk["payload"]
+    assert raw_risk["payload"]["debug_payload"]["slot_allocation"]["assigned_slot"] == "slot_1"
+
+    default_scheduler = scheduler_default.json()[0]
+    raw_scheduler = scheduler_raw.json()[0]
+    assert "outcome" not in default_scheduler
+    assert raw_scheduler["outcome"]["symbol"] in {"BTCUSDT", "ETHUSDT"}
+
+
+def test_operator_snapshots_expose_psychology_scene_review(db_session) -> None:
+    from trading_mvp.models import AgentRun
+    from trading_mvp.services.dashboard import (
+        _build_decision_snapshot,
+        _build_pending_entry_plan_snapshot,
+    )
+
+    review = {
+        "market_psychology": "Pullback buyers are waiting for confirmation.",
+        "psychology_bias": "bullish",
+        "scene_scenario": "Trend pullback needs a clean zone reclaim.",
+        "scene_type": "trend_pullback",
+        "entry_choreography": "Watch the zone and let the watcher require confirmation.",
+        "preferred_entry_timing": "watch_zone",
+        "confirmation_cues": ["zone_touch", "1m_reclaim"],
+        "invalidation_cues": ["support_lost"],
+        "reason_codes": ["SCENE_TREND_PULLBACK"],
+        "summary": "Metadata-only scene review.",
+        "execution_boundary": "metadata_only_no_order_authority",
+        "future_extra_key": "ignored for strict snapshot compatibility",
+    }
+    decision_run = AgentRun(
+        role="trading_decision",
+        trigger_event="entry_candidate_event",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="scene review",
+        input_payload={"ai_trigger": {"symbol": "BTCUSDT", "timeframe": "15m"}},
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "hold",
+            "confidence": 0.61,
+            "rationale_codes": ["AI_WATCH_ENTRY_PLAN"],
+            "psychology_scene_review": review,
+        },
+        metadata_json={},
+        schema_valid=True,
+    )
+    db_session.add(decision_run)
+    db_session.flush()
+    plan = PendingEntryPlan(
+        symbol="BTCUSDT",
+        side="long",
+        plan_status="armed",
+        source_decision_run_id=decision_run.id,
+        regime="bullish",
+        posture="pullback_watch",
+        rationale_codes=["AI_WATCH_ENTRY_PLAN"],
+        source_timeframe="15m",
+        entry_mode="pullback_confirm",
+        entry_zone_min=69800.0,
+        entry_zone_max=69950.0,
+        invalidation_price=69400.0,
+        max_chase_bps=12.0,
+        idea_ttl_minutes=18,
+        stop_loss=69400.0,
+        take_profit=71000.0,
+        risk_pct_cap=0.01,
+        leverage_cap=1.0,
+        expires_at=utcnow_naive() + timedelta(minutes=18),
+        idempotency_key="scene-review-snapshot-test",
+        metadata_json={"psychology_scene_review": review},
+    )
+    db_session.add(plan)
+    db_session.flush()
+
+    decision_snapshot = _build_decision_snapshot(decision_run)
+    plan_snapshot = _build_pending_entry_plan_snapshot(plan)
+
+    assert decision_snapshot.psychology_scene_review is not None
+    assert decision_snapshot.psychology_scene_review.scene_type == "trend_pullback"
+    assert decision_snapshot.psychology_scene_review.execution_boundary == "metadata_only_no_order_authority"
+    assert plan_snapshot.psychology_scene_review is not None
+    assert plan_snapshot.psychology_scene_review.preferred_entry_timing == "watch_zone"
+
+
+def test_get_decisions_includes_decision_quality_payload(db_session) -> None:
+    from trading_mvp.models import AgentRun, DecisionPerformanceFact
+
+    decision_run = AgentRun(
+        role="trading_decision",
+        trigger_event="manual",
+        schema_name="TradeDecision",
+        status="completed",
+        provider_name="openai",
+        summary="quality row",
+        input_payload={"ai_trigger": {"symbol": "BTCUSDT", "timeframe": "15m"}},
+        output_payload={
+            "symbol": "BTCUSDT",
+            "timeframe": "15m",
+            "decision": "long",
+            "confidence": 0.82,
+            "rationale_codes": ["TEST"],
+        },
+        metadata_json={"source": "llm"},
+        schema_valid=True,
+    )
+    db_session.add(decision_run)
+    db_session.flush()
+    db_session.add(
+        DecisionPerformanceFact(
+            decision_run_id=decision_run.id,
+            provider_name="openai",
+            symbol="BTCUSDT",
+            timeframe="15m",
+            decision="long",
+            rationale_codes=["TEST"],
+            regime="bullish",
+            trend_alignment="bullish_aligned",
+            ai_used=True,
+            ai_actionable=True,
+            ai_blocked_by_risk=True,
+            ai_usefulness_status="risk_blocked",
+            ai_known_cost_usd=0.00042,
+            ai_total_tokens=1234,
+            expected_edge_bps=40.0,
+            expected_total_cost_bps=12.0,
+            net_expected_edge_bps=28.0,
+            pnl_data_confidence="not_realized",
+            telemetry_metadata={
+                "scene_review": {
+                    "has_review": True,
+                    "scene_type": "trend_pullback",
+                    "preferred_entry_timing": "watch_zone",
+                },
+                "scene_plan_outcome": {
+                    "outcome_bucket": "waiting_confirm_quality_low",
+                    "pending_plan_count": 1,
+                    "plan_confirm_quality_low_count": 1,
+                    "plan_invalidated_count": 0,
+                    "order_observed": False,
+                    "fill_observed": False,
+                    "reason_codes": ["PLAN_CONFIRM_QUALITY_LOW"],
+                },
+            },
+            telemetry_output={"decision": "long"},
+        )
+    )
+    db_session.add(
+        RiskCheck(
+            symbol="BTCUSDT",
+            decision_run_id=decision_run.id,
+            allowed=False,
+            decision="long",
+            reason_codes=["EXPECTED_COST_EXCEEDS_EDGE"],
+            approved_risk_pct=0.0,
+            approved_leverage=0.0,
+            payload={
+                "debug_payload": {
+                    "expected_cost_gate": {
+                        "status": "blocked",
+                        "expected_edge_bps": 40.0,
+                        "expected_total_cost_bps": 12.0,
+                        "net_expected_edge_bps": 28.0,
+                    }
+                }
+            },
+        )
+    )
+    db_session.flush()
+
+    rows = get_decisions(db_session, limit=5, compact=True)
+    row = next(item for item in rows if item["id"] == decision_run.id)
+    quality = row["decision_quality"]
+
+    assert quality["ai_usefulness_status"] == "risk_blocked"
+    assert quality["ai_actionable"] is True
+    assert quality["ai_blocked_by_risk"] is True
+    assert quality["ai_known_cost_usd"] == pytest.approx(0.00042)
+    assert quality["ai_total_tokens"] == 1234
+    assert quality["net_expected_edge_bps"] == pytest.approx(28.0)
+    assert quality["risk_allowed"] is False
+    assert quality["risk_reason_codes"] == ["EXPECTED_COST_EXCEEDS_EDGE"]
+    assert quality["scene_review"]["scene_type"] == "trend_pullback"
+    assert quality["scene_plan_outcome"]["outcome_bucket"] == "waiting_confirm_quality_low"
+    assert quality["scene_plan_outcome"]["plan_confirm_quality_low_count"] == 1
 
 
 def test_risk_checks_api_includes_ai_trigger_summary(testclient_db_factory) -> None:

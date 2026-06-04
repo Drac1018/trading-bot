@@ -67,7 +67,7 @@ test("buildSafetyCheckSummaryView keeps the initial list to operator summary fie
   assert.equal(view.intentLabel, "숏 진입");
   assert.equal(view.resultLabel, "차단");
   assert.equal(view.blockedReasonSummary, "시장 데이터가 오래됨");
-  assert.equal(view.auditEventLabel, "audit event #9001");
+  assert.equal(view.auditEventLabel, "감사 이벤트 #9001");
   assert.equal(view.hasAuditEvent, true);
 });
 

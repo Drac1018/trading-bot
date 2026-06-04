@@ -9,6 +9,7 @@ type IntegrationForm = {
   ai_model: string;
   ai_temperature: number;
   ai_max_input_candles: number;
+  ai_trading_decision_daily_token_budget: number;
   openai_api_key: string;
   clear_openai_api_key: boolean;
   event_source_provider: "" | EventSourceProvider;
@@ -237,6 +238,19 @@ export function IntegrationSettingsPanel({
                 max={200}
                 value={form.ai_max_input_candles}
                 onChange={(event) => onFieldChange("ai_max_input_candles", Number(event.target.value))}
+              />
+            </Field>
+            <Field label="trading_decision 24h 토큰 예산" hint="이 값에 도달하면 제공자 호출만 일시 차단하고 리스크/실행 안전 로직은 바꾸지 않습니다.">
+              <input
+                className={inputClass}
+                type="number"
+                min={10000}
+                max={50000000}
+                step={10000}
+                value={form.ai_trading_decision_daily_token_budget}
+                onChange={(event) =>
+                  onFieldChange("ai_trading_decision_daily_token_budget", Number(event.target.value))
+                }
               />
             </Field>
             <Field label="OpenAI API 키">

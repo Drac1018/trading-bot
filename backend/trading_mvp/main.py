@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import re
+import secrets
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from time import monotonic
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, sessionmaker
 
-from trading_mvp.config import get_settings
+from trading_mvp.config import (
+    app_env_is_production,
+    get_settings,
+    split_csv,
+    validate_runtime_secret_seed,
+)
 from trading_mvp.database import Base, engine, get_db
 from trading_mvp.schemas import (
     AppSettingsUpdateRequest,
@@ -26,6 +35,7 @@ from trading_mvp.schemas import (
     OperatorEventViewRequest,
     ReplayValidationRequest,
 )
+from trading_mvp.services.ai_usage import warm_ai_usage_metrics_cache
 from trading_mvp.services.audit import record_audit_event, record_health_event
 from trading_mvp.services.binance_account import (
     get_binance_account_snapshot,
@@ -47,8 +57,8 @@ from trading_mvp.services.connectivity import (
 from trading_mvp.services.dashboard import (
     get_agent_runs,
     get_alerts,
-    get_audit_event_detail,
     get_analytics_cost_breakdown,
+    get_audit_event_detail,
     get_audit_timeline,
     get_decisions,
     get_execution_quality_report,
@@ -63,6 +73,7 @@ from trading_mvp.services.dashboard import (
     get_profitability_dashboard,
     get_risk_checks,
     get_scheduler_runs,
+    warm_profitability_dashboard_cache,
 )
 from trading_mvp.services.execution import (
     poll_live_user_stream,
@@ -81,7 +92,12 @@ from trading_mvp.services.market_data_cache import (
 )
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pause_control import attempt_auto_resume
-from trading_mvp.services.performance_reporting import build_signal_performance_report
+from trading_mvp.services.performance_reporting import (
+    build_opportunity_attribution_report,
+    build_opportunity_attribution_summary,
+    build_signal_performance_report,
+    warm_opportunity_attribution_summary_cache,
+)
 from trading_mvp.services.replay_validation import build_replay_validation_report
 from trading_mvp.services.runtime_state import replace_market_stream_detail
 from trading_mvp.services.safety_checks import get_safety_check_detail, get_safety_check_summaries
@@ -94,13 +110,18 @@ from trading_mvp.services.scheduler import (
     run_window,
 )
 from trading_mvp.services.seed import seed_demo_data
+from trading_mvp.services.service_gate import build_service_switch_gate_snapshot
 from trading_mvp.services.settings import (
+    LiveApprovalWindowError,
     arm_live_execution,
     clear_operator_event_view,
     create_manual_no_trade_window,
     disarm_live_execution,
     end_manual_no_trade_window,
     get_or_create_settings,
+    get_rollout_mode,
+    live_arm_blocking_reason_codes,
+    resolve_live_approval_window_minutes,
     serialize_settings_ai_usage,
     serialize_settings_cadences,
     serialize_settings_view,
@@ -109,13 +130,66 @@ from trading_mvp.services.settings import (
     update_settings,
     upsert_operator_event_view,
 )
+from trading_mvp.services.strategy_performance_report import build_short_side_drag_report
 
 READ_REFRESH_DISPATCH_DEBOUNCE_SECONDS = 20.0
+OPERATOR_HOME_CACHE_TTL_SECONDS = 2.0
 LOCAL_DEV_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+LOCAL_DEV_ALLOWED_ORIGINS = [
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+OPERATOR_API_KEY_HEADER = "X-Operator-API-Key"
+OPERATOR_INTENT_HEADER = "X-Operator-Intent"
+OPERATOR_WRITE_ANY_INTENT = "operator.write"
+OPERATOR_CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "OPTIONS"]
+OPERATOR_CORS_ALLOW_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    OPERATOR_API_KEY_HEADER,
+    OPERATOR_INTENT_HEADER,
+]
+OPERATOR_READ_METHODS = {"GET", "HEAD"}
+OPERATOR_ROLE_VIEWER = "viewer"
+OPERATOR_ROLE_OPERATOR = "operator"
+OPERATOR_ROLE_ADMIN = "admin"
+OPERATOR_ROLE_ORDER = {
+    OPERATOR_ROLE_VIEWER: 10,
+    OPERATOR_ROLE_OPERATOR: 20,
+    OPERATOR_ROLE_ADMIN: 30,
+}
+OPERATOR_WRITE_INTENT_MIN_ROLE = {
+    "system.seed": OPERATOR_ROLE_ADMIN,
+    "binance.account_refresh": OPERATOR_ROLE_OPERATOR,
+    "settings.update": OPERATOR_ROLE_ADMIN,
+    "settings.operator_event_view": OPERATOR_ROLE_OPERATOR,
+    "settings.operator_event_view_clear": OPERATOR_ROLE_OPERATOR,
+    "settings.manual_no_trade_window": OPERATOR_ROLE_OPERATOR,
+    "settings.pause": OPERATOR_ROLE_OPERATOR,
+    "settings.resume": OPERATOR_ROLE_OPERATOR,
+    "settings.resume_attempt": OPERATOR_ROLE_OPERATOR,
+    "settings.live_arm": OPERATOR_ROLE_ADMIN,
+    "settings.live_disarm": OPERATOR_ROLE_OPERATOR,
+    "settings.integration_test": OPERATOR_ROLE_OPERATOR,
+    "settings.live_test_order": OPERATOR_ROLE_ADMIN,
+    "cycle.run": OPERATOR_ROLE_OPERATOR,
+    "review.run": OPERATOR_ROLE_OPERATOR,
+    "replay.run": OPERATOR_ROLE_OPERATOR,
+    "replay.validation": OPERATOR_ROLE_OPERATOR,
+    "live.sync": OPERATOR_ROLE_OPERATOR,
+}
 MAX_LIST_LIMIT = 200
 _sqlite_background_write_guard = threading.Lock()
 _exchange_sync_read_refresh_guard = threading.Lock()
 _binance_account_cache_refresh_guard = threading.Lock()
+_operator_home_cache_guard = threading.Lock()
+_operator_rate_limit_guard = threading.Lock()
+_operator_home_cache_started = 0.0
+_operator_home_cache_key: str | None = None
+_operator_home_cache_payload: dict[str, object] | None = None
+_operator_rate_limit_buckets: dict[str, list[float]] = {}
 _exchange_sync_read_refresh_inflight = False
 _exchange_sync_read_refresh_last_started = 0.0
 
@@ -128,6 +202,306 @@ def _bounded_limit(value: int, *, default: int = 50, maximum: int = MAX_LIST_LIM
     return max(1, min(normalized, maximum))
 
 
+def _history_response_compact(compact: bool | None, *, include_payload: bool) -> bool:
+    if include_payload:
+        return False
+    return True if compact is None else compact
+
+
+def _cors_allowed_origins() -> list[str]:
+    settings = get_settings()
+    explicit_origins = split_csv(settings.cors_allowed_origins)
+    if explicit_origins or app_env_is_production(settings.app_env):
+        return explicit_origins
+    return LOCAL_DEV_ALLOWED_ORIGINS if settings.cors_allow_local_dev_origins else []
+
+
+def _cors_origin_regex() -> str | None:
+    settings = get_settings()
+    if split_csv(settings.cors_allowed_origins) or app_env_is_production(settings.app_env):
+        return None
+    return LOCAL_DEV_ORIGIN_REGEX if settings.cors_allow_local_dev_origins else None
+
+
+def _operator_api_key_required(*, rollout_mode: object | None = None) -> bool:
+    settings = get_settings()
+    return (
+        bool(settings.operator_api_key.strip())
+        or bool(settings.operator_viewer_api_key.strip())
+        or bool(settings.operator_trader_api_key.strip())
+        or bool(settings.operator_admin_api_key.strip())
+        or app_env_is_production(settings.app_env)
+        or str(rollout_mode or "").strip().lower() == "full_live"
+    )
+
+
+def _operator_auth_unavailable_message() -> str:
+    return "OPERATOR_API_KEY or role-specific operator API keys are required for write APIs in production/full_live runtime."
+
+
+def _operator_read_auth_unavailable_message() -> str:
+    return "OPERATOR_API_KEY or role-specific operator API keys are required for read APIs in production/full_live runtime."
+
+
+def _operator_read_api_key_required() -> bool:
+    settings = get_settings()
+    return (
+        bool(settings.operator_api_key.strip())
+        or bool(settings.operator_viewer_api_key.strip())
+        or bool(settings.operator_trader_api_key.strip())
+        or bool(settings.operator_admin_api_key.strip())
+        or app_env_is_production(settings.app_env)
+    )
+
+
+def _operator_configured_credentials() -> list[tuple[str, str]]:
+    settings = get_settings()
+    credentials: list[tuple[str, str]] = []
+    # OPERATOR_API_KEY remains admin-equivalent for backward compatibility with deployed services.
+    for key, role in (
+        (settings.operator_api_key, OPERATOR_ROLE_ADMIN),
+        (settings.operator_viewer_api_key, OPERATOR_ROLE_VIEWER),
+        (settings.operator_trader_api_key, OPERATOR_ROLE_OPERATOR),
+        (settings.operator_admin_api_key, OPERATOR_ROLE_ADMIN),
+    ):
+        normalized = key.strip()
+        if normalized:
+            credentials.append((normalized, role))
+    return credentials
+
+
+def _operator_credential_role(submitted: str | None) -> str | None:
+    normalized = str(submitted or "").strip()
+    if not normalized:
+        return None
+    for expected, role in _operator_configured_credentials():
+        if secrets.compare_digest(normalized, expected):
+            return role
+    return None
+
+
+def _operator_role_allowed(role: str | None, minimum_role: str) -> bool:
+    return OPERATOR_ROLE_ORDER.get(str(role or ""), 0) >= OPERATOR_ROLE_ORDER[minimum_role]
+
+
+def _operator_api_key_valid(submitted: str | None) -> bool:
+    return _operator_credential_role(submitted) is not None
+
+
+def _operator_rate_limit_required() -> bool:
+    settings = get_settings()
+    return bool(_operator_configured_credentials()) or app_env_is_production(settings.app_env)
+
+
+def _raise_runtime_configuration_error(db: Session) -> None:
+    settings = get_settings()
+    settings_row = get_or_create_settings(db)
+    rollout_mode = get_rollout_mode(settings_row)
+    validate_runtime_secret_seed(settings, rollout_mode=rollout_mode)
+
+
+def _runtime_configuration_error(db: Session) -> str | None:
+    try:
+        _raise_runtime_configuration_error(db)
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
+def _require_operator_key_for_rollout(rollout_mode: object | None) -> None:
+    if _operator_api_key_required(rollout_mode=rollout_mode) and not _operator_configured_credentials():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_operator_auth_unavailable_message())
+
+
+def require_operator_api_key(
+    x_operator_api_key: str | None = Header(default=None, alias=OPERATOR_API_KEY_HEADER),
+    db: Session = Depends(get_db),
+) -> None:
+    settings_row = get_or_create_settings(db)
+    rollout_mode = get_rollout_mode(settings_row)
+    if not _operator_api_key_required(rollout_mode=rollout_mode):
+        return
+    if not _operator_configured_credentials():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_operator_auth_unavailable_message())
+    submitted_role = _operator_credential_role(x_operator_api_key)
+    if submitted_role is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid operator API key.")
+    if not _operator_role_allowed(submitted_role, OPERATOR_ROLE_OPERATOR):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Operator role is not allowed for write APIs.")
+
+
+def _request_origin_allowed(request: Request) -> bool:
+    origin = str(request.headers.get("origin") or "").strip()
+    if not origin:
+        return True
+    if origin in set(_cors_allowed_origins()):
+        return True
+    origin_regex = _cors_origin_regex()
+    if origin_regex and re.fullmatch(origin_regex, origin):
+        return True
+    return origin == f"{request.url.scheme}://{request.headers.get('host')}"
+
+
+def _operator_generic_intent_allowed(*, rollout_mode: object | None = None) -> bool:
+    settings = get_settings()
+    return not (
+        app_env_is_production(settings.app_env)
+        or str(rollout_mode or "").strip().lower() == "full_live"
+    )
+
+
+def _operator_intent_matches(submitted: str | None, expected: str, *, allow_generic: bool = True) -> bool:
+    normalized = str(submitted or "").strip()
+    return normalized == expected or (allow_generic and normalized == OPERATOR_WRITE_ANY_INTENT)
+
+
+def _record_operator_write_gate(
+    db: Session,
+    request: Request,
+    *,
+    allowed: bool,
+    expected_intent: str,
+    submitted_intent: str | None,
+    operator_role: str | None = None,
+    reason_code: str | None = None,
+    commit: bool = False,
+) -> None:
+    record_audit_event(
+        db,
+        event_type="operator_write_authorized" if allowed else "operator_write_denied",
+        entity_type="operator_write_gate",
+        entity_id=f"{request.method} {request.url.path}",
+        severity="info" if allowed else "warning",
+        message="Operator write gate authorized request." if allowed else "Operator write gate denied request.",
+        payload={
+            "method": request.method,
+            "path": request.url.path,
+            "expected_intent": expected_intent,
+            "submitted_intent": submitted_intent,
+            "operator_role": operator_role,
+            "origin": request.headers.get("origin"),
+            "reason_code": reason_code,
+        },
+    )
+    if commit:
+        db.commit()
+
+
+def require_operator_write_intent(expected_intent: str) -> Callable[..., None]:
+    def dependency(
+        request: Request,
+        x_operator_api_key: str | None = Header(default=None, alias=OPERATOR_API_KEY_HEADER),
+        x_operator_intent: str | None = Header(default=None, alias=OPERATOR_INTENT_HEADER),
+        db: Session = Depends(get_db),
+    ) -> None:
+        settings_row = get_or_create_settings(db)
+        rollout_mode = get_rollout_mode(settings_row)
+        credentials = _operator_configured_credentials()
+        if not credentials:
+            _record_operator_write_gate(
+                db,
+                request,
+                allowed=False,
+                expected_intent=expected_intent,
+                submitted_intent=x_operator_intent,
+                operator_role=None,
+                reason_code="operator_auth_unavailable",
+                commit=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_operator_auth_unavailable_message(),
+            )
+        submitted_role = _operator_credential_role(x_operator_api_key)
+        if submitted_role is None:
+            _record_operator_write_gate(
+                db,
+                request,
+                allowed=False,
+                expected_intent=expected_intent,
+                submitted_intent=x_operator_intent,
+                operator_role=None,
+                reason_code="operator_auth_failed",
+                commit=True,
+            )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid operator API key.")
+        minimum_role = OPERATOR_WRITE_INTENT_MIN_ROLE.get(expected_intent, OPERATOR_ROLE_OPERATOR)
+        if not _operator_role_allowed(submitted_role, minimum_role):
+            _record_operator_write_gate(
+                db,
+                request,
+                allowed=False,
+                expected_intent=expected_intent,
+                submitted_intent=x_operator_intent,
+                operator_role=submitted_role,
+                reason_code="operator_role_forbidden",
+                commit=True,
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Operator role is not allowed.")
+        if not _request_origin_allowed(request):
+            _record_operator_write_gate(
+                db,
+                request,
+                allowed=False,
+                expected_intent=expected_intent,
+                submitted_intent=x_operator_intent,
+                operator_role=submitted_role,
+                reason_code="origin_not_allowed",
+                commit=True,
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Operator write origin is not allowed.")
+        allow_generic_intent = _operator_generic_intent_allowed(rollout_mode=rollout_mode)
+        if not _operator_intent_matches(x_operator_intent, expected_intent, allow_generic=allow_generic_intent):
+            _record_operator_write_gate(
+                db,
+                request,
+                allowed=False,
+                expected_intent=expected_intent,
+                submitted_intent=x_operator_intent,
+                operator_role=submitted_role,
+                reason_code="operator_intent_mismatch",
+                commit=True,
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Operator intent header is required.")
+        _record_operator_write_gate(
+            db,
+            request,
+            allowed=True,
+            expected_intent=expected_intent,
+            submitted_intent=x_operator_intent,
+            operator_role=submitted_role,
+            commit=True,
+        )
+
+    return dependency
+
+
+def _operator_home_db_identity(db: Session) -> str:
+    bind = db.get_bind()
+    return str(bind.url) if bind is not None else "unknown"
+
+
+def _get_operator_home_dashboard_payload(db: Session) -> dict[str, object]:
+    global _operator_home_cache_key, _operator_home_cache_payload, _operator_home_cache_started
+
+    now = monotonic()
+    cache_key = _operator_home_db_identity(db)
+    with _operator_home_cache_guard:
+        if (
+            _operator_home_cache_payload is not None
+            and _operator_home_cache_key == cache_key
+            and now - _operator_home_cache_started <= OPERATOR_HOME_CACHE_TTL_SECONDS
+        ):
+            return dict(_operator_home_cache_payload)
+
+    payload = get_operator_dashboard(db, view="home").model_dump(mode="json")
+    with _operator_home_cache_guard:
+        _operator_home_cache_key = cache_key
+        _operator_home_cache_started = monotonic()
+        _operator_home_cache_payload = dict(payload)
+    return payload
+
+
 def _env_flag(name: str, *, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -135,18 +509,22 @@ def _env_flag(name: str, *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _background_loop_default_enabled() -> bool:
+    return engine.dialect.name != "sqlite" and _env_flag("TRADING_MVP_SERVICE_RUNTIME", default=False)
+
+
 def _background_scheduler_enabled() -> bool:
-    default = engine.dialect.name != "sqlite"
+    default = _background_loop_default_enabled()
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER", default=default)
 
 
 def _background_user_stream_enabled() -> bool:
-    default = engine.dialect.name != "sqlite"
+    default = _background_loop_default_enabled()
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM", default=default)
 
 
 def _background_market_stream_enabled() -> bool:
-    default = engine.dialect.name != "sqlite"
+    default = _background_loop_default_enabled()
     return _env_flag("TRADING_MVP_ENABLE_BACKGROUND_MARKET_STREAM", default=default)
 
 
@@ -357,7 +735,11 @@ def _run_background_scheduler_tick() -> int:
                 severity="error",
                 component="scheduler",
                 message="Background scheduler loop failed.",
-                payload={"error": str(exc)},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "session_rolled_back_before_logging": True,
+                },
             )
         return interval_seconds
 
@@ -384,7 +766,11 @@ def _run_background_exchange_sync_tick() -> int:
                 severity="error",
                 component="exchange_sync",
                 message="Background exchange sync loop failed.",
-                payload={"error": str(exc)},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "session_rolled_back_before_logging": True,
+                },
             )
         return interval_seconds
 
@@ -519,6 +905,8 @@ def _persist_background_market_stream_state(state: dict[str, object], issues: ob
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
+    with sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)() as session:
+        _raise_runtime_configuration_error(session)
     tasks: list[asyncio.Task[None]] = []
     if _background_scheduler_enabled():
         tasks.append(asyncio.create_task(_background_exchange_sync_loop()))
@@ -527,6 +915,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         tasks.append(asyncio.create_task(_background_user_stream_loop()))
     if _background_market_stream_enabled():
         tasks.append(asyncio.create_task(_background_market_stream_loop()))
+    if engine.dialect.name != "sqlite":
+        read_model_session_factory = sessionmaker(
+            bind=engine,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
+        warm_profitability_dashboard_cache(read_model_session_factory, synchronous=True)
+        warm_ai_usage_metrics_cache(read_model_session_factory, synchronous=True)
+        warm_opportunity_attribution_summary_cache(read_model_session_factory, synchronous=True)
     try:
         yield
     finally:
@@ -538,19 +936,89 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Trading MVP API", version="0.2.0", lifespan=lifespan)
+_app_cors_allowed_origins = _cors_allowed_origins()
+_app_cors_origin_regex = _cors_origin_regex()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost",
-        "http://127.0.0.1",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_origin_regex=LOCAL_DEV_ORIGIN_REGEX,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_app_cors_allowed_origins,
+    allow_origin_regex=_app_cors_origin_regex,
+    allow_credentials=bool(_app_cors_allowed_origins or _app_cors_origin_regex),
+    allow_methods=OPERATOR_CORS_ALLOW_METHODS,
+    allow_headers=OPERATOR_CORS_ALLOW_HEADERS,
 )
+
+
+def _operator_rate_limit_exceeded(request: Request) -> tuple[bool, int]:
+    settings = get_settings()
+    limit = (
+        settings.operator_api_rate_limit_per_minute
+        if request.method.upper() in OPERATOR_READ_METHODS
+        else settings.operator_api_write_rate_limit_per_minute
+    )
+    submitted = str(request.headers.get(OPERATOR_API_KEY_HEADER) or "").strip()
+    submitted_role = _operator_credential_role(submitted) if submitted else None
+    client_host = request.client.host if request.client else "unknown"
+    scope = "key" if submitted_role else "client"
+    principal = submitted if submitted_role else client_host
+    raw_bucket_key = f"{scope}:{principal}:{request.method.upper()}"
+    bucket_key = hashlib.sha256(raw_bucket_key.encode("utf-8")).hexdigest()
+    now = monotonic()
+    cutoff = now - 60.0
+
+    with _operator_rate_limit_guard:
+        bucket = [item for item in _operator_rate_limit_buckets.get(bucket_key, []) if item >= cutoff]
+        if len(bucket) >= limit:
+            _operator_rate_limit_buckets[bucket_key] = bucket
+            return True, 60
+        bucket.append(now)
+        _operator_rate_limit_buckets[bucket_key] = bucket
+    return False, 0
+
+
+def _operator_rate_limit_response(retry_after_seconds: int) -> JSONResponse:
+    return JSONResponse(
+        {"detail": "Operator API rate limit exceeded."},
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        headers={
+            "Cache-Control": "no-store",
+            "Retry-After": str(retry_after_seconds),
+        },
+    )
+
+
+@app.middleware("http")
+async def rate_limit_operator_api(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.method.upper() != "OPTIONS" and _operator_rate_limit_required():
+        exceeded, retry_after_seconds = _operator_rate_limit_exceeded(request)
+        if exceeded:
+            return _operator_rate_limit_response(retry_after_seconds)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def require_operator_key_for_api_reads(request: Request, call_next):
+    if (
+        request.method.upper() in OPERATOR_READ_METHODS
+        and request.url.path.startswith("/api/")
+        and _operator_read_api_key_required()
+    ):
+        if not _operator_configured_credentials():
+            return JSONResponse(
+                {"detail": _operator_read_auth_unavailable_message()},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not _operator_api_key_valid(request.headers.get(OPERATOR_API_KEY_HEADER)):
+            if _operator_rate_limit_required():
+                exceeded, retry_after_seconds = _operator_rate_limit_exceeded(request)
+                if exceeded:
+                    return _operator_rate_limit_response(retry_after_seconds)
+            return JSONResponse(
+                {"detail": "Invalid operator API key."},
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                headers={"Cache-Control": "no-store"},
+            )
+    return await call_next(request)
 
 
 def _run_exchange_sync_read_refresh(triggered_by: str) -> None:
@@ -571,14 +1039,24 @@ def _run_exchange_sync_read_refresh(triggered_by: str) -> None:
                 entity_id="exchange_sync_cycle",
                 severity="warning",
                 message="Read-triggered exchange sync refresh failed.",
-                payload={"error": str(exc), "triggered_by": triggered_by},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "triggered_by": triggered_by,
+                    "session_recovered_before_logging": True,
+                },
             )
             record_health_event(
                 session,
                 component="exchange_sync",
                 status="error",
                 message="Read-triggered exchange sync refresh failed.",
-                payload={"error": str(exc), "triggered_by": triggered_by},
+                payload={
+                    "error": str(exc),
+                    "error_class": exc.__class__.__name__,
+                    "triggered_by": triggered_by,
+                    "session_recovered_before_logging": True,
+                },
             )
             session.commit()
     finally:
@@ -688,12 +1166,39 @@ def _run_binance_account_cache_refresh() -> None:
 
 
 @app.get("/health")
-def health() -> dict[str, object]:
+def health(db: Session = Depends(get_db)) -> dict[str, object]:
+    config_error = _runtime_configuration_error(db)
+    if config_error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "error",
+                "mode": "configuration_error",
+                "database": "ready",
+                "reason": config_error,
+            },
+        )
     return {"status": "ok", "mode": "service_ready", "database": "ready"}
 
 
+@app.get("/api/runtime/service-gate")
+def runtime_service_gate(
+    recent_minutes: int = 30,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    snapshot = build_service_switch_gate_snapshot(
+        db,
+        recent_minutes=_bounded_limit(recent_minutes, default=30, maximum=180),
+    )
+    snapshot.setdefault("root_cause_codes", [])
+    return snapshot
+
+
 @app.post("/api/system/seed")
-def seed_system(db: Session = Depends(get_db)) -> dict[str, object]:
+def seed_system(
+    _operator: None = Depends(require_operator_write_intent("system.seed")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         return seed_demo_data(db)
 
@@ -707,12 +1212,14 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict[str, object]:
 @app.get("/api/dashboard/operator")
 def dashboard_operator(view: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
     _refresh_exchange_sync_for_read(triggered_by="api_dashboard_operator")
+    if str(view or "").strip().lower() == "home":
+        return _get_operator_home_dashboard_payload(db)
     return get_operator_dashboard(db, view=view).model_dump(mode="json")
 
 
 @app.get("/api/dashboard/profitability")
 def dashboard_profitability(db: Session = Depends(get_db)) -> dict[str, object]:
-    return get_profitability_dashboard(db).model_dump(mode="json")
+    return get_profitability_dashboard(db, use_cache=True, allow_stale=True).model_dump(mode="json")
 
 
 @app.get("/api/analytics/cost-breakdown")
@@ -727,6 +1234,68 @@ def analytics_cost_breakdown(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return payload.model_dump(mode="json")
+
+
+@app.get("/api/analytics/short-drag")
+def analytics_short_drag(
+    days: int = 7,
+    limit: int = 10,
+    mode: str | None = "live",
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return build_short_side_drag_report(
+        db,
+        days=_bounded_limit(days, default=7, maximum=90),
+        limit=_bounded_limit(limit, default=10, maximum=50),
+        mode=mode,
+    )
+
+
+@app.get("/api/analytics/opportunity-attribution")
+def analytics_opportunity_attribution(
+    lookback_hours: int = 24,
+    limit: int = 120,
+    notional_usdt: float = 100.0,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return build_opportunity_attribution_report(
+        db,
+        lookback_hours=lookback_hours,
+        limit=_bounded_limit(limit, default=120, maximum=500),
+        notional_usdt=notional_usdt,
+    )
+
+
+@app.get("/api/analytics/opportunity-attribution/summary")
+def analytics_opportunity_attribution_summary(
+    limit: int = 120,
+    notional_usdt: float = 100.0,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return build_opportunity_attribution_summary(
+        db,
+        limit=_bounded_limit(limit, default=120, maximum=500),
+        notional_usdt=notional_usdt,
+        use_cache=True,
+        allow_stale=True,
+    )
+
+
+def _compact_opportunity_attribution_summary(window_label: str, report: dict[str, object]) -> dict[str, object]:
+    return {
+        "window_label": window_label,
+        "generated_at": report.get("generated_at"),
+        "lookback_hours": report.get("lookback_hours"),
+        "since": report.get("since"),
+        "virtual_notional_usdt": report.get("virtual_notional_usdt"),
+        "basis": report.get("basis"),
+        "overall": report.get("overall"),
+        "missed_opportunity_reason_codes": list(report.get("missed_opportunity_reason_codes") or [])[:12],
+        "loss_prevention_reason_codes": list(report.get("loss_prevention_reason_codes") or [])[:12],
+        "pending_quality_summary": report.get("pending_quality_summary"),
+        "pending_quality_threshold_review": report.get("pending_quality_threshold_review"),
+        "ai_flow_summary": report.get("ai_flow_summary"),
+    }
 
 
 @app.get("/api/market/snapshots")
@@ -761,8 +1330,17 @@ def market_chart_markers(
 
 
 @app.get("/api/decisions")
-def decisions(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_decisions(db, limit=_bounded_limit(limit), compact=compact)
+def decisions(
+    limit: int = 50,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_decisions(
+        db,
+        limit=_bounded_limit(limit),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/positions")
@@ -822,8 +1400,17 @@ def execution_quality_report(db: Session = Depends(get_db)) -> dict[str, object]
 
 
 @app.get("/api/risk/checks")
-def risk_checks(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_risk_checks(db, limit=_bounded_limit(limit), compact=compact)
+def risk_checks(
+    limit: int = 50,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_risk_checks(
+        db,
+        limit=_bounded_limit(limit),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/risk/checks/summary")
@@ -840,13 +1427,31 @@ def risk_check_detail(risk_check_id: int, db: Session = Depends(get_db)) -> dict
 
 
 @app.get("/api/agents")
-def agents(limit: int = 100, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_agent_runs(db, limit=_bounded_limit(limit, default=100), compact=compact)
+def agents(
+    limit: int = 100,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_agent_runs(
+        db,
+        limit=_bounded_limit(limit, default=100),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/scheduler")
-def scheduler(limit: int = 50, compact: bool = False, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_scheduler_runs(db, limit=_bounded_limit(limit), compact=compact)
+def scheduler(
+    limit: int = 50,
+    compact: bool | None = None,
+    include_payload: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_scheduler_runs(
+        db,
+        limit=_bounded_limit(limit),
+        compact=_history_response_compact(compact, include_payload=include_payload),
+    )
 
 
 @app.get("/api/audit")
@@ -883,8 +1488,12 @@ def audit_detail(audit_event_id: int, db: Session = Depends(get_db)) -> dict[str
 
 
 @app.get("/api/alerts")
-def alerts(limit: int = 50, db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return get_alerts(db, limit=_bounded_limit(limit))
+def alerts(
+    limit: int = 50,
+    acknowledged: bool | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return get_alerts(db, limit=_bounded_limit(limit), acknowledged=acknowledged)
 
 
 @app.get("/api/settings")
@@ -920,7 +1529,10 @@ def binance_account_cache(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/binance/account/refresh")
-def binance_account_refresh(db: Session = Depends(get_db)) -> dict[str, object]:
+def binance_account_refresh(
+    _operator: None = Depends(require_operator_write_intent("binance.account_refresh")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     acquired = _binance_account_cache_refresh_guard.acquire(blocking=False)
     try:
         with _sqlite_write_lock():
@@ -945,7 +1557,12 @@ def binance_account_refresh(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.put("/api/settings")
-def settings_update(payload: AppSettingsUpdateRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+def settings_update(
+    payload: AppSettingsUpdateRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.update")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    _require_operator_key_for_rollout(payload.rollout_mode)
     with _sqlite_write_lock():
         row = update_settings(db, payload)
         record_audit_event(
@@ -963,6 +1580,7 @@ def settings_update(payload: AppSettingsUpdateRequest, db: Session = Depends(get
 @app.put("/api/settings/operator-event-view")
 def operator_event_view_upsert(
     payload: OperatorEventViewRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.operator_event_view")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -974,6 +1592,7 @@ def operator_event_view_upsert(
 @app.post("/api/settings/operator-event-view/clear")
 def operator_event_view_clear(
     payload: OperatorEventViewClearRequest | None = None,
+    _operator: None = Depends(require_operator_write_intent("settings.operator_event_view_clear")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -986,6 +1605,7 @@ def operator_event_view_clear(
 @app.post("/api/settings/manual-no-trade-windows")
 def manual_no_trade_window_create(
     payload: ManualNoTradeWindowRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.manual_no_trade_window")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -998,6 +1618,7 @@ def manual_no_trade_window_create(
 def manual_no_trade_window_update(
     window_id: str,
     payload: ManualNoTradeWindowRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.manual_no_trade_window")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -1015,6 +1636,7 @@ def manual_no_trade_window_update(
 def manual_no_trade_window_end(
     window_id: str,
     payload: ManualNoTradeWindowEndRequest | None = None,
+    _operator: None = Depends(require_operator_write_intent("settings.manual_no_trade_window")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -1034,7 +1656,10 @@ def manual_no_trade_window_end(
 
 
 @app.post("/api/settings/pause")
-def pause_trading(db: Session = Depends(get_db)) -> dict[str, object]:
+def pause_trading(
+    _operator: None = Depends(require_operator_write_intent("settings.pause")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         row = set_trading_pause(
             db,
@@ -1057,7 +1682,10 @@ def pause_trading(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/settings/resume")
-def resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
+def resume_trading(
+    _operator: None = Depends(require_operator_write_intent("settings.resume")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         row = set_trading_pause(db, False)
         record_audit_event(
@@ -1074,7 +1702,10 @@ def resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/settings/resume/attempt")
-def attempt_resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
+def attempt_resume_trading(
+    _operator: None = Depends(require_operator_write_intent("settings.resume_attempt")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         row = get_or_create_settings(db)
         result = attempt_auto_resume(db, row, trigger_source="operator_ui")
@@ -1087,10 +1718,52 @@ def attempt_resume_trading(db: Session = Depends(get_db)) -> dict[str, object]:
 @app.post("/api/settings/live/arm")
 def arm_live(
     payload: ManualLiveApprovalRequest | None = None,
+    _operator: None = Depends(require_operator_write_intent("settings.live_arm")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
-        row = arm_live_execution(db, payload.minutes if payload is not None else None)
+        current_row = get_or_create_settings(db)
+        sync_blockers = live_arm_blocking_reason_codes(current_row)
+        if sync_blockers:
+            detail = {
+                "reason_code": "FULL_LIVE_SYNC_STALE",
+                "blocked_reason_codes": sync_blockers,
+                "message": "full_live 실거래 승인 전 거래소 동기화가 최신이어야 합니다.",
+            }
+            record_audit_event(
+                db,
+                event_type="live_approval_arm_denied",
+                entity_type="settings",
+                entity_id=str(current_row.id),
+                severity="warning",
+                message="Manual live execution window arm denied.",
+                payload=detail,
+            )
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+        requested_minutes = payload.minutes if payload is not None else None
+        effective_minutes = resolve_live_approval_window_minutes(current_row, requested_minutes)
+        try:
+            row = arm_live_execution(db, requested_minutes)
+        except LiveApprovalWindowError as exc:
+            detail = {
+                "reason_code": str(exc),
+                "requested_minutes": requested_minutes,
+                "effective_minutes": effective_minutes,
+                "configured_window_minutes": current_row.live_approval_window_minutes,
+                "message": "실거래 승인 창 시간이 1분 이상이어야 합니다.",
+            }
+            record_audit_event(
+                db,
+                event_type="live_approval_arm_denied",
+                entity_type="settings",
+                entity_id=str(current_row.id),
+                severity="warning",
+                message="Manual live execution window arm denied.",
+                payload=detail,
+            )
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
         record_audit_event(
             db,
             event_type="live_approval_armed",
@@ -1098,14 +1771,22 @@ def arm_live(
             entity_id=str(row.id),
             severity="warning",
             message="Manual live execution window armed.",
-            payload={"armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None},
+            payload={
+                "armed_until": row.live_execution_armed_until.isoformat() if row.live_execution_armed_until else None,
+                "requested_minutes": requested_minutes,
+                "effective_minutes": effective_minutes,
+                "configured_window_minutes": row.live_approval_window_minutes,
+            },
         )
         db.commit()
         return serialize_settings_view(row)
 
 
 @app.post("/api/settings/live/disarm")
-def disarm_live(db: Session = Depends(get_db)) -> dict[str, object]:
+def disarm_live(
+    _operator: None = Depends(require_operator_write_intent("settings.live_disarm")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         row = disarm_live_execution(db)
         record_audit_event(
@@ -1124,6 +1805,7 @@ def disarm_live(db: Session = Depends(get_db)) -> dict[str, object]:
 @app.post("/api/settings/test/openai")
 def openai_connection_test(
     payload: OpenAIConnectionTestRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.integration_test")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -1152,6 +1834,7 @@ def openai_connection_test(
 @app.post("/api/settings/test/binance")
 def binance_connection_test(
     payload: BinanceConnectionTestRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.integration_test")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -1180,6 +1863,7 @@ def binance_connection_test(
 @app.post("/api/settings/test/binance/live-order")
 def binance_live_order_test(
     payload: BinanceLiveTestOrderRequest,
+    _operator: None = Depends(require_operator_write_intent("settings.live_test_order")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():
@@ -1199,7 +1883,10 @@ def binance_live_order_test(
 
 
 @app.post("/api/cycles/run")
-def run_cycle(db: Session = Depends(get_db)) -> dict[str, object]:
+def run_cycle(
+    _operator: None = Depends(require_operator_write_intent("cycle.run")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         output = TradingOrchestrator(db).run_selected_symbols_cycle(trigger_event="manual")
         db.commit()
@@ -1207,7 +1894,11 @@ def run_cycle(db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/reviews/{window}")
-def run_review(window: str, db: Session = Depends(get_db)) -> dict[str, object]:
+def run_review(
+    window: str,
+    _operator: None = Depends(require_operator_write_intent("review.run")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         if window != "1h":
             raise HTTPException(status_code=400, detail="Only 1h review window is enabled in current live-core scope.")
@@ -1217,7 +1908,12 @@ def run_review(window: str, db: Session = Depends(get_db)) -> dict[str, object]:
 
 
 @app.post("/api/replay/run")
-def run_replay(cycles: int = 5, start_index: int = 120, db: Session = Depends(get_db)) -> dict[str, object]:
+def run_replay(
+    cycles: int = 5,
+    start_index: int = 120,
+    _operator: None = Depends(require_operator_write_intent("replay.run")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     with _sqlite_write_lock():
         orchestrator = TradingOrchestrator(db)
         results: list[dict[str, object]] = []
@@ -1232,6 +1928,7 @@ def run_replay(cycles: int = 5, start_index: int = 120, db: Session = Depends(ge
 @app.post("/api/replay/validation")
 def replay_validation(
     payload: ReplayValidationRequest,
+    _operator: None = Depends(require_operator_write_intent("replay.validation")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     report = build_replay_validation_report(db, payload)
@@ -1242,6 +1939,7 @@ def replay_validation(
 def live_sync(
     symbol: str | None = None,
     allow_protection_recovery: bool = True,
+    _operator: None = Depends(require_operator_write_intent("live.sync")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     with _sqlite_write_lock():

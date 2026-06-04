@@ -5,7 +5,6 @@ import re
 import sys
 from pathlib import Path
 
-
 BRIDGE_SECTION_PATTERN = re.compile(r"^##\s+운영자 표현과 내부 키\s*$", re.MULTILINE)
 MONITORED_KEYS = (
     "decision_cycle_interval_minutes",

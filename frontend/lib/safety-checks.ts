@@ -110,9 +110,11 @@ const REASON_LABELS: Record<string, string> = {
   CHASE_LIMIT_EXCEEDED: "추격 진입 한도 초과",
   DAILY_LOSS_LIMIT_REACHED: "일일 손실 한도 도달",
   DEGRADED_MANAGE_ONLY: "관리 전용 모드",
+  DETERMINISTIC_BASELINE_DISAGREEMENT: "AI 판단과 규칙 기반 기준선 불일치",
   DIRECTIONAL_BIAS_LIMIT_REACHED: "방향 편중 한도 초과",
   EMERGENCY_EXIT: "비상 청산 경로",
   EXPECTED_COST_GATE_FAILED: "예상 비용 대비 기대값 부족",
+  ALT_ENTRY_LEAD_CONTEXT_UNAVAILABLE: "대체 진입 선행 근거 부족",
   GROSS_EXPOSURE_LIMIT_REACHED: "총 노출도 한도 초과",
   HOLD_DECISION: "AI 판단이 보류임",
   LARGEST_POSITION_LIMIT_REACHED: "단일 포지션 비중 한도 초과",
@@ -205,8 +207,9 @@ function mergeCodes(...values: unknown[]): string[] {
   const codes: string[] = [];
   for (const value of values) {
     for (const code of asStringArray(value)) {
-      if (!codes.includes(code)) {
-        codes.push(code);
+      const normalizedCode = code.trim().replace(/[\s-]+/g, "_").toUpperCase();
+      if (normalizedCode && !codes.includes(normalizedCode)) {
+        codes.push(normalizedCode);
       }
     }
   }
@@ -308,7 +311,8 @@ function boolStateLabel(value: unknown, trueLabel: string, falseLabel: string): 
 }
 
 function reasonLabel(code: string): string {
-  return REASON_LABELS[code] ?? code.replaceAll("_", " ").toLowerCase();
+  const normalizedCode = code.trim().replace(/[\s-]+/g, "_").toUpperCase();
+  return REASON_LABELS[normalizedCode] ?? normalizedCode.replaceAll("_", " ").toLowerCase();
 }
 
 function actionLabel(raw: string | null): string {
@@ -626,57 +630,57 @@ function buildDetailSections(row: SafetyCheckRow, payload: Record<string, unknow
 
   return [
     {
-      title: "market snapshot 요약",
+      title: "시장 스냅샷 요약",
       rows: [
-        label("market snapshot id", payload.snapshot_id ?? row.market_snapshot_id),
-        label("market signal", row.market_signal_summary ?? row.ai_trigger_summary),
-        label("market signal context", row.market_signal_context),
-        label("macro event risk", row.macro_event_risk_summary ?? payload.macro_event_risk_summary),
-        label("derivatives context", debugPayload?.market_derivatives_context),
+        label("시장 스냅샷 ID", payload.snapshot_id ?? row.market_snapshot_id),
+        label("시장 신호", row.market_signal_summary ?? row.ai_trigger_summary),
+        label("시장 신호 맥락", row.market_signal_context),
+        label("거시 이벤트 리스크", row.macro_event_risk_summary ?? payload.macro_event_risk_summary),
+        label("파생상품 맥락", debugPayload?.market_derivatives_context),
       ],
     },
     {
-      title: "account snapshot 요약",
+      title: "계정 스냅샷 요약",
       rows: [
-        label("account freshness", syncFreshness?.account),
-        label("open orders freshness", syncFreshness?.open_orders),
-        label("protective orders freshness", syncFreshness?.protective_orders),
-        label("exchange leverage", debugPayload?.exchange_leverage),
-        label("reconciliation state", debugPayload?.reconciliation_state),
+        label("계정 최신성", syncFreshness?.account),
+        label("미체결 주문 최신성", syncFreshness?.open_orders),
+        label("보호 주문 최신성", syncFreshness?.protective_orders),
+        label("거래소 레버리지", debugPayload?.exchange_leverage),
+        label("정합성 확인 상태", debugPayload?.reconciliation_state),
       ],
     },
     {
-      title: "positions snapshot 요약",
+      title: "포지션 스냅샷 요약",
       rows: [
-        label("positions freshness", syncFreshness?.positions),
-        label("open position count", exposureMetrics?.open_position_count, formatNumber),
-        label("long exposure", exposureMetrics?.long_exposure_pct_equity, formatPercent),
-        label("short exposure", exposureMetrics?.short_exposure_pct_equity, formatPercent),
-        label("decision symbol notional", exposureMetrics?.decision_symbol_notional, formatUsdt),
+        label("포지션 최신성", syncFreshness?.positions),
+        label("열린 포지션 수", exposureMetrics?.open_position_count, formatNumber),
+        label("롱 노출", exposureMetrics?.long_exposure_pct_equity, formatPercent),
+        label("숏 노출", exposureMetrics?.short_exposure_pct_equity, formatPercent),
+        label("판단 심볼 주문가치", exposureMetrics?.decision_symbol_notional, formatUsdt),
       ],
     },
     {
-      title: "risk input 요약",
+      title: "리스크 입력 요약",
       rows: [
-        label("decision", payload.decision ?? row.decision),
-        label("symbol", row.symbol ?? payload.symbol),
-        label("requested notional", debugPayload?.requested_notional ?? payload.raw_projected_notional, formatUsdt),
-        label("requested quantity", debugPayload?.requested_quantity, formatNumber),
-        label("expected cost gate", debugPayload?.expected_cost_gate),
-        label("pending entry plan", pendingPlan),
+        label("AI 판단", payload.decision ?? row.decision),
+        label("심볼", row.symbol ?? payload.symbol),
+        label("요청 주문가치", debugPayload?.requested_notional ?? payload.raw_projected_notional, formatUsdt),
+        label("요청 수량", debugPayload?.requested_quantity, formatNumber),
+        label("예상 비용 점검", debugPayload?.expected_cost_gate),
+        label("대기 진입 계획", pendingPlan),
       ],
     },
     {
-      title: "risk output 요약",
+      title: "리스크 결과 요약",
       rows: [
-        label("allowed", riskResult.allowed ?? payload.allowed ?? row.allowed, (value) =>
+        label("승인 여부", riskResult.allowed ?? payload.allowed ?? row.allowed, (value) =>
           boolStateLabel(value, "승인", "차단"),
         ),
-        label("approved risk pct", riskResult.approved_risk_pct ?? payload.approved_risk_pct, formatPercent),
-        label("approved leverage", riskResult.approved_leverage ?? payload.approved_leverage, formatNumber),
-        label("approved notional", payload.approved_notional ?? payload.approved_projected_notional, formatUsdt),
-        label("reason codes", riskResult.reason_codes ?? payload.reason_codes),
-        label("blocked reason codes", riskResult.blocked_reason_codes ?? payload.blocked_reason_codes),
+        label("승인 리스크 비율", riskResult.approved_risk_pct ?? payload.approved_risk_pct, formatPercent),
+        label("승인 레버리지", riskResult.approved_leverage ?? payload.approved_leverage, formatNumber),
+        label("승인 주문가치", payload.approved_notional ?? payload.approved_projected_notional, formatUsdt),
+        label("사유 코드", riskResult.reason_codes ?? payload.reason_codes),
+        label("차단 사유 코드", riskResult.blocked_reason_codes ?? payload.blocked_reason_codes),
       ],
     },
   ];
@@ -758,12 +762,12 @@ export function buildSafetyCheckSummaryView(row: SafetyCheckSummaryRow): SafetyC
 
   return {
     id: riskCheckId,
-    auditEventLabel: auditEventId ? `audit event #${auditEventId}` : hasAuditEvent ? "audit event 있음" : "audit event 없음",
+    auditEventLabel: auditEventId ? `감사 이벤트 #${auditEventId}` : hasAuditEvent ? "감사 이벤트 있음" : "감사 이벤트 없음",
     hasAuditEvent,
     symbol: asString(row.symbol ?? payload.symbol) ?? "심볼 없음",
     createdAtLabel: formatDateTime(row.created_at),
     requestedAction: actionLabel(action),
-    intentLabel: intent ? actionLabel(intent) : "intent 없음",
+    intentLabel: intent ? actionLabel(intent) : "의도 없음",
     resultLabel,
     resultTone,
     blockedReasonSummary,

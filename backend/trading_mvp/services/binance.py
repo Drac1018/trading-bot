@@ -619,6 +619,10 @@ class BinanceClient:
         payload = self._request("GET", "/fapi/v3/account", signed=True)
         return self._as_dict(payload, "Unexpected Binance account response.")
 
+    def get_account_config(self) -> dict[str, object]:
+        payload = self._request("GET", "/fapi/v1/accountConfig", signed=True)
+        return self._as_dict(payload, "Unexpected Binance account config response.")
+
     def get_exchange_info(self, symbol: str | None = None) -> dict[str, object]:
         payload = self._request("GET", "/fapi/v1/exchangeInfo")
         result = self._as_dict(payload, "Unexpected Binance exchange info response.")

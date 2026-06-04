@@ -60,7 +60,7 @@
 
 - `exchange_sync_interval_seconds = 30~60` (`거래소 동기화 주기`)
 - `market_refresh_interval_minutes = 1` (`시장 갱신 주기`)
-- `decision_cycle_interval_minutes = 1` (`재검토 확인 주기`)
+- `decision_cycle_interval_minutes <= 5` (`재검토 확인 주기`)
 
 의미:
 

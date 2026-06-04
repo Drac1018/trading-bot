@@ -118,6 +118,69 @@ def test_hold_decision_does_not_become_guard_mode_reason(db_session) -> None:
     assert serialized["guard_mode_reason_category"] != "risk_block"
 
 
+def test_full_live_armed_unknown_exchange_permission_degrades_new_entries(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "full_live"
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = True
+    settings_row.live_execution_armed_until = utcnow_naive() + timedelta(minutes=10)
+    settings_row.trading_paused = False
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    _mark_fresh_sync_state(db_session, settings_row)
+    _seed_market_snapshot(db_session, settings_row)
+    db_session.add(
+        RiskCheck(
+            symbol=settings_row.default_symbol,
+            decision="long",
+            allowed=True,
+            reason_codes=[],
+            approved_risk_pct=0.01,
+            approved_leverage=2.0,
+            payload={"allowed": True, "decision": "long", "reason_codes": []},
+        )
+    )
+    db_session.flush()
+
+    serialized = serialize_settings(settings_row)
+    operational = serialized["operational_status"]
+    summary = operational["control_status_summary"]
+
+    assert summary["exchange_can_trade_known"] is False
+    assert summary["exchange_connectivity_state"] == "degraded"
+    assert summary["risk_allowed"] is False
+    assert operational["can_enter_new_position"] is False
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in summary["blocked_reasons_current_cycle"]
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in summary["degraded_reason_codes"]
+
+
+def test_full_live_stale_sync_disables_live_arm_control(db_session) -> None:
+    settings_row = get_or_create_settings(db_session)
+    settings_row.rollout_mode = "full_live"
+    settings_row.live_trading_enabled = True
+    settings_row.manual_live_approval = True
+    settings_row.live_execution_armed = False
+    settings_row.trading_paused = False
+    settings_row.binance_api_key_encrypted = encrypt_secret("key", "change-me-local-dev-secret")
+    settings_row.binance_api_secret_encrypted = encrypt_secret("secret", "change-me-local-dev-secret")
+    stale_at = utcnow_naive() - timedelta(hours=2)
+    mark_sync_success(settings_row, scope="account", synced_at=stale_at, stale_after_seconds=60)
+    _seed_market_snapshot(db_session, settings_row)
+    db_session.add(settings_row)
+    db_session.flush()
+
+    serialized = serialize_settings(settings_row)
+    operational = serialized["operational_status"]
+    summary = operational["control_status_summary"]
+
+    assert operational["can_enter_new_position"] is False
+    assert summary["live_arm_disabled"] is True
+    assert summary["live_arm_disable_reason_code"] == "FULL_LIVE_SYNC_STALE"
+    assert "FULL_LIVE_SYNC_STALE" in summary["approval_control_blocked_reasons"]
+    assert "ACCOUNT_STATE_STALE" in summary["approval_control_blocked_reasons"]
+
+
 def test_resolved_sync_blockers_from_latest_risk_do_not_remain_current_control_blockers(db_session) -> None:
     settings_row = get_or_create_settings(db_session)
     settings_row.manual_live_approval = True

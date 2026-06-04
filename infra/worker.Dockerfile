@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1-labs
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -6,15 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 COPY pyproject.toml README.md alembic.ini ./
-COPY backend ./backend
-COPY alembic ./alembic
-COPY workers ./workers
-COPY scripts ./scripts
-COPY prompts ./prompts
-COPY docs ./docs
-COPY schemas ./schemas
+COPY --parents backend/** ./
+COPY --parents alembic/** ./
+COPY --parents workers/** ./
+COPY --parents scripts/** ./
+COPY --parents prompts/** ./
+COPY --parents docs/** ./
+COPY --parents schemas/** ./
 
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -e .
 
 CMD ["python", "workers/worker.py"]
-

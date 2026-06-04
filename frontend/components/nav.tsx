@@ -28,7 +28,7 @@ const operatorItems: NavItem[] = [
   { href: "/dashboard/trading", label: "거래 상태", icon: "order" },
   { href: "/dashboard/market", label: "시장 상태", icon: "market" },
   { href: "/dashboard/analytics", label: "비용 분석", icon: "position" },
-  { href: "/dashboard/audit", label: "감사 / 디버그", icon: "audit" },
+  { href: "/dashboard/audit", label: "감사 / 원인 추적", icon: "audit" },
   { href: "/dashboard/settings", label: "설정", icon: "settings" },
 ];
 

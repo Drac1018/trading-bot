@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 from trading_mvp.models import AuditEvent, PendingEntryPlan, Position, RiskCheck
 from trading_mvp.schemas import MarketCandle, MarketSnapshotPayload, RiskCheckResult, TradeDecision
+from trading_mvp.services.ai_usage import OpenAICallGate
 from trading_mvp.services.dashboard import get_overview
 from trading_mvp.services.orchestrator import TradingOrchestrator
 from trading_mvp.services.pending_entry_time import (
@@ -27,7 +29,17 @@ from trading_mvp.time_utils import utcnow_naive
 def _mark_all_sync_fresh(settings_row) -> None:
     now = utcnow_naive()
     for scope in ("account", "positions", "open_orders", "protective_orders"):
-        mark_sync_success(settings_row, scope=scope, synced_at=now)
+        detail = (
+            {
+                "exchange_can_trade": True,
+                "exchange_can_trade_known": True,
+                "exchange_can_trade_source": "unit_test",
+                "exchange_can_trade_checked_at": now.isoformat(),
+            }
+            if scope == "account"
+            else None
+        )
+        mark_sync_success(settings_row, scope=scope, synced_at=now, detail=detail)
 
 
 def _enable_live_settings(db_session) -> None:
@@ -249,6 +261,13 @@ def _build_stubbed_risk_result(decision: TradeDecision) -> RiskCheckResult:
     )
 
 
+def _allow_entry_plan_recheck_gate(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.get_openai_call_gate",
+        lambda *args, **kwargs: OpenAICallGate(allowed=True, reason="allowed"),
+    )
+
+
 def _arm_plan(monkeypatch, db_session, *, snapshot_time=None) -> tuple[TradingOrchestrator, dict[str, object]]:
     _enable_live_settings(db_session)
 
@@ -327,8 +346,9 @@ def test_decision_cycle_arms_pullback_entry_plan_without_immediate_order(monkeyp
     assert result["entry_plan"]["plan_id"] == plan.id
 
 
-def test_entry_plan_watcher_executes_after_zone_entry_and_confirm_without_new_ai_call(monkeypatch, db_session) -> None:
+def test_entry_plan_watcher_executes_after_zone_entry_confirm_and_ai_recheck(monkeypatch, db_session) -> None:
     orchestrator, result = _arm_plan(monkeypatch, db_session)
+    _allow_entry_plan_recheck_gate(monkeypatch)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
     assert plan is not None
 
@@ -372,6 +392,7 @@ def test_entry_plan_watcher_executes_after_zone_entry_and_confirm_without_new_ai
 
 def test_entry_plan_confirmation_passed_but_final_risk_blocked_is_tracked(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    _allow_entry_plan_recheck_gate(monkeypatch)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
     assert plan is not None
 
@@ -505,7 +526,14 @@ def test_entry_plan_watcher_cancels_when_open_position_has_no_additional_capacit
     db_session.flush()
     refreshed = db_session.get(PendingEntryPlan, plan.id)
     skipped_event = db_session.scalar(
-        select(AuditEvent).where(AuditEvent.event_type == "decision_ai_skipped")
+        select(AuditEvent)
+        .where(
+            AuditEvent.event_type == "decision_ai_skipped",
+            AuditEvent.entity_type == "pending_entry_plan",
+            AuditEvent.entity_id == str(plan.id),
+        )
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
     )
 
     assert watch_result["results"][0]["plans"][0]["status"] == "canceled"
@@ -523,6 +551,7 @@ def test_entry_plan_watcher_cancels_when_open_position_has_no_additional_capacit
 
 def test_entry_plan_watcher_marks_shadow_execution_terminal(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    _allow_entry_plan_recheck_gate(monkeypatch)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
     assert plan is not None
     settings_row = get_or_create_settings(db_session)
@@ -1107,6 +1136,7 @@ def test_entry_plan_watcher_waits_on_stale_sync_without_canceling_plan(monkeypat
     mark_sync_success(settings_row, scope="account", synced_at=utcnow_naive())
     db_session.add(settings_row)
     db_session.flush()
+    _allow_entry_plan_recheck_gate(monkeypatch)
 
     retry_result = orchestrator.run_entry_plan_watcher_cycle(
         symbols=["BTCUSDT"],
@@ -1120,6 +1150,117 @@ def test_entry_plan_watcher_waits_on_stale_sync_without_canceling_plan(monkeypat
     assert execute_called is True
     assert retried is not None
     assert retried.plan_status == "triggered"
+
+
+def test_entry_plan_watcher_expires_stale_sync_plan_after_ttl(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    plan.expires_at = utcnow_naive() - timedelta(seconds=1)
+    plan.metadata_json = {
+        **dict(plan.metadata_json or {}),
+        "last_watch_blocked_reason_codes": ["PLAN_WAITING_FOR_FRESH_SYNC"],
+    }
+    settings_row = get_or_create_settings(db_session)
+    mark_sync_issue(
+        settings_row,
+        scope="account",
+        status="incomplete",
+        reason_code="ACCOUNT_STATE_STALE",
+        observed_at=utcnow_naive(),
+    )
+    db_session.add_all([settings_row, plan])
+    db_session.flush()
+
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.execute_live_trade",
+        lambda *args, **kwargs: pytest.fail("expired stale-sync plan should not execute"),
+    )
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+
+    assert watch_result["results"][0]["plans"][0]["status"] == "expired"
+    assert refreshed is not None
+    assert refreshed.plan_status == "expired"
+    assert refreshed.canceled_reason == "PLAN_TTL_EXPIRED"
+    event = db_session.scalar(
+        select(AuditEvent)
+        .where(
+            AuditEvent.event_type == "pending_entry_plan_expired",
+            AuditEvent.entity_id == str(plan.id),
+        )
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+    assert event is not None
+    assert event.payload["reason"] == "PLAN_TTL_EXPIRED"
+    assert event.payload["detail"]["expired_while_waiting_for_fresh_sync"] is True
+    assert event.payload["detail"]["stale_scopes"] == ["account"]
+
+
+def test_entry_plan_watcher_can_trade_unknown_skips_ai_recheck(monkeypatch, db_session) -> None:
+    orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    _allow_entry_plan_recheck_gate(monkeypatch)
+    plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
+    assert plan is not None
+    settings_row = get_or_create_settings(db_session)
+    now = utcnow_naive()
+    mark_sync_success(
+        settings_row,
+        scope="account",
+        synced_at=now,
+        detail={
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": "binance_account_info_missing_canTrade",
+            "exchange_can_trade_checked_at": now.isoformat(),
+        },
+    )
+    db_session.add(settings_row)
+    db_session.flush()
+    orchestrator.trading_agent.run = lambda *args, **kwargs: pytest.fail(
+        "canTrade-unknown entry plan must not invoke AI recheck"
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.orchestrator.execute_live_trade",
+        lambda *args, **kwargs: pytest.fail("canTrade-unknown entry plan must not execute"),
+    )
+
+    watch_result = orchestrator.run_entry_plan_watcher_cycle(
+        symbols=["BTCUSDT"],
+        exchange_sync_checked=True,
+        market_snapshot_override=_watch_snapshot(snapshot_time=utcnow_naive(), latest_price=69420.0),
+    )
+    db_session.flush()
+    refreshed = db_session.get(PendingEntryPlan, plan.id)
+    skipped_event = db_session.scalar(
+        select(AuditEvent)
+        .where(
+            AuditEvent.event_type == "decision_ai_skipped",
+            AuditEvent.entity_type == "pending_entry_plan",
+            AuditEvent.entity_id == str(plan.id),
+        )
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+
+    plan_result = watch_result["results"][0]["plans"][0]
+    assert plan_result["status"] == "control_blocked"
+    assert plan_result["blocked_reasons"] == ["EXCHANGE_CAN_TRADE_UNKNOWN"]
+    assert plan_result["ai_recheck"]["status"] == "skipped"
+    assert plan_result["ai_recheck"]["skip_reason"] == "EXCHANGE_CAN_TRADE_UNKNOWN"
+    assert refreshed is not None
+    assert refreshed.plan_status == "armed"
+    assert skipped_event is not None
+    assert skipped_event.payload["reason"] == "EXCHANGE_CAN_TRADE_UNKNOWN"
+    assert skipped_event.payload["hard_skip_ai"] is True
+    assert skipped_event.payload["hard_skip_reason_codes"] == ["EXCHANGE_CAN_TRADE_UNKNOWN"]
 
 
 def test_entry_plan_watcher_waits_on_other_symbol_protection_state(monkeypatch, db_session) -> None:
@@ -1205,10 +1346,11 @@ def test_entry_plan_watcher_cancels_on_same_symbol_protection_state(monkeypatch,
 
 def test_entry_plan_watcher_respects_approval_and_prevents_duplicate_execution(monkeypatch, db_session) -> None:
     orchestrator, _ = _arm_plan(monkeypatch, db_session)
+    _allow_entry_plan_recheck_gate(monkeypatch)
     plan = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
     assert plan is not None
     settings_row = get_or_create_settings(db_session)
-    settings_row.live_execution_armed = False
+    settings_row.live_execution_armed = True
     settings_row.live_execution_armed_until = None
     db_session.add_all([plan, settings_row])
     db_session.flush()
@@ -1229,7 +1371,9 @@ def test_entry_plan_watcher_respects_approval_and_prevents_duplicate_execution(m
     )
     db_session.flush()
     still_armed = db_session.scalar(select(PendingEntryPlan).where(PendingEntryPlan.plan_status == "armed"))
-    assert blocked_result["results"][0]["plans"][0]["status"] == "control_blocked"
+    blocked_plan = blocked_result["results"][0]["plans"][0]
+    assert blocked_plan["status"] == "control_blocked"
+    assert blocked_plan["blocked_reasons"] == ["LIVE_APPROVAL_REQUIRED"]
     assert still_armed is not None
     assert still_armed.plan_status == "armed"
 

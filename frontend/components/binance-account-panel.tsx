@@ -13,6 +13,12 @@ type AccountSummary = {
   message: string;
   testnet_enabled: boolean;
   futures_enabled: boolean;
+  can_trade?: boolean | null;
+  exchange_can_trade?: boolean | null;
+  exchange_can_trade_known?: boolean;
+  exchange_can_trade_source?: string;
+  exchange_can_trade_checked_at?: string | null;
+  exchange_can_trade_note?: string | null;
   available_balance: number;
   total_wallet_balance: number;
   total_unrealized_profit: number;
@@ -107,6 +113,30 @@ function cacheStatusLabel(status: string) {
   return "로컬 기준";
 }
 
+function exchangeTradePermissionLabel(summary: AccountSummary) {
+  if (!summary.exchange_can_trade_known || summary.exchange_can_trade === null || summary.exchange_can_trade === undefined) {
+    return "원본 권한 미확인";
+  }
+  return summary.exchange_can_trade ? "거래소 주문 가능" : "거래소 권한 차단";
+}
+
+function exchangeTradePermissionTone(summary: AccountSummary): "neutral" | "good" | "warn" | "danger" {
+  if (!summary.exchange_can_trade_known || summary.exchange_can_trade === null || summary.exchange_can_trade === undefined) {
+    return "neutral";
+  }
+  return summary.exchange_can_trade ? "good" : "danger";
+}
+
+function accountNoteLabel(note: string | null | undefined) {
+  if (!note) {
+    return "최근 로컬 동기화에는 거래소 원본 주문 권한 정보가 포함되지 않았습니다.";
+  }
+  if (note === "Local account snapshot does not include Binance canTrade; original exchange permission is unknown.") {
+    return "최근 로컬 동기화에는 거래소 원본 주문 권한 정보가 포함되지 않았습니다.";
+  }
+  return note;
+}
+
 const accountCacheStaleAfterMs = 15 * 60 * 1000;
 
 function parseApiDate(value: string | null | undefined) {
@@ -182,7 +212,7 @@ function LoadingPanel() {
         <StatusBadge tone="neutral" label="계정 상태 확인 중" />
       </div>
       <p className="mt-5 text-sm leading-7 text-slate-700">
-        캐시된 Binance 원본 응답이나 최근 로컬 동기화 정보를 불러오고 있습니다.
+        캐시된 거래소 원본 응답이나 최근 로컬 동기화 정보를 불러오고 있습니다.
       </p>
     </section>
   );
@@ -249,11 +279,11 @@ function SnapshotSourcePanel({
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap gap-2">
-            <StatusBadge tone={sourceTone} label={cacheStale ? "Binance 원본 캐시 지연" : isCachedLive ? "캐시된 Binance 원본" : "최근 로컬 동기화"} />
+            <StatusBadge tone={sourceTone} label={cacheStale ? "거래소 원본 캐시 지연" : isCachedLive ? "캐시된 거래소 원본" : "최근 로컬 동기화"} />
             <StatusBadge tone={statusTone} label={cacheStale ? "원본 캐시 오래됨" : cacheStatusLabel(cache.status)} />
           </div>
           <p className="mt-4 text-sm leading-7 text-slate-700">
-            {cache.message} 이 화면은 첫 진입 시 캐시 갱신 POST를 보내지 않고, 사용 가능한 최근 계정 기준을 즉시 표시합니다.
+            {cache.message} 이 화면은 첫 진입 시 자동 새로고침 요청을 보내지 않고, 사용 가능한 최근 계정 기준을 즉시 표시합니다.
           </p>
           <p className="mt-2 text-sm leading-6 text-slate-500">
             {refreshedText}
@@ -262,7 +292,7 @@ function SnapshotSourcePanel({
           </p>
           {cacheStale ? (
             <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-900">
-              Binance 원본 캐시가 {cacheAgeText ?? "기준 시간 초과"} 전 값입니다. 자동 갱신하지 않습니다. 최신 계정 원본이 필요하면 수동 새로고침 버튼을 누르세요.
+              거래소 원본 캐시가 {cacheAgeText ?? "기준 시간 초과"} 전 값입니다. 자동 갱신하지 않습니다. 최신 계정 원본이 필요하면 수동 새로고침 버튼을 누르세요.
             </p>
           ) : null}
           {cacheError ? (
@@ -276,9 +306,9 @@ function SnapshotSourcePanel({
           onClick={onRefreshCache}
           disabled={refreshingCache}
           className="inline-flex min-h-11 items-center justify-center rounded-md border border-amber-300 bg-amber-50 px-4 text-sm font-semibold text-amber-900 transition hover:border-amber-400 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
-          aria-label="계정 캐시 새로고침 POST 요청"
+          aria-label="거래소 계정 원본 새로고침 요청"
         >
-          {refreshingCache ? "계정 캐시 새로고침 요청됨" : "계정 캐시 새로고침 (수동 POST)"}
+          {refreshingCache ? "새로고침 요청됨" : "거래소 계정 원본 새로고침"}
         </button>
       </div>
     </section>
@@ -302,16 +332,21 @@ function AccountContent({
   const cacheAgeMs = accountCacheAgeMs(cache.refreshed_at);
   const hasExchangeOpenOrders = cache.source === "cached_live";
   const displayedOpenOrders = hasExchangeOpenOrders ? payload.open_orders : [];
-  const sourceLabel = cache.source === "cached_live" ? "Binance 원본 캐시" : "최근 로컬 동기화";
+  const sourceLabel = cache.source === "cached_live" ? "거래소 원본 캐시" : "최근 로컬 동기화";
   const openOrdersSourceDescription = hasExchangeOpenOrders
     ? `${sourceLabel} 기준 미체결 주문 목록입니다.`
-    : "Binance 원본 캐시가 준비된 경우에만 미체결 주문을 표시합니다.";
+    : "거래소 원본 캐시가 준비된 경우에만 미체결 주문을 표시합니다.";
   const openOrdersMetricValue = hasExchangeOpenOrders
     ? formatDisplayValue(summary.open_orders, "open_orders")
     : "원본 캐시 필요";
   const openOrdersMetricHint = hasExchangeOpenOrders
     ? "거래소 원본에서 가져온 미체결 주문 수입니다."
-    : "로컬 DB 주문 기록은 미체결 주문으로 표시하지 않습니다. 캐시 갱신 후 Binance 원본 주문만 표시합니다.";
+    : "로컬 DB 주문 기록은 미체결 주문으로 표시하지 않습니다. 캐시 갱신 후 거래소 원본 주문만 표시합니다.";
+  const exchangePermissionLabel = exchangeTradePermissionLabel(summary);
+  const exchangePermissionHint =
+    summary.exchange_can_trade_known && summary.exchange_can_trade_checked_at
+      ? `거래소 원본 권한 확인: ${summary.exchange_can_trade_checked_at}`
+      : accountNoteLabel(summary.exchange_can_trade_note);
   const exchangeSummaryRow: Record<string, unknown> = {
     data_source: sourceLabel,
     cache_status: cacheStale ? "원본 캐시 오래됨" : cacheStatusLabel(cache.status),
@@ -320,6 +355,10 @@ function AccountContent({
     connected: summary.connected,
     testnet_enabled: summary.testnet_enabled,
     futures_enabled: summary.futures_enabled,
+    exchange_can_trade: summary.exchange_can_trade ?? "unknown",
+    exchange_can_trade_known: Boolean(summary.exchange_can_trade_known),
+    exchange_can_trade_source: summary.exchange_can_trade_source ?? "unknown",
+    exchange_can_trade_checked_at: summary.exchange_can_trade_checked_at ?? null,
     available_balance: summary.available_balance,
     total_wallet_balance: summary.total_wallet_balance,
     total_unrealized_profit: summary.total_unrealized_profit,
@@ -348,6 +387,7 @@ function AccountContent({
           />
           <StatusBadge tone={summary.futures_enabled ? "good" : "warn"} label={summary.futures_enabled ? "선물 계정 사용" : "선물 계정 꺼짐"} />
           <StatusBadge tone={summary.testnet_enabled ? "neutral" : "good"} label={summary.testnet_enabled ? "테스트넷" : "실거래 계정"} />
+          <StatusBadge tone={exchangeTradePermissionTone(summary)} label={exchangePermissionLabel} />
         </div>
 
         <div className="mt-5 rounded-md border border-slate-200 bg-slate-50 p-5 text-sm leading-7 text-slate-700">
@@ -365,6 +405,7 @@ function AccountContent({
           <MetricCard label="마진 잔고" value={formatDisplayValue(summary.total_margin_balance, "total_margin_balance")} />
           <MetricCard label="열린 포지션" value={formatDisplayValue(summary.open_positions, "open_positions")} />
           <MetricCard label="미체결 주문" value={openOrdersMetricValue} hint={openOrdersMetricHint} />
+          <MetricCard label="거래소 권한" value={exchangePermissionLabel} hint={exchangePermissionHint} />
           <MetricCard label="현재 안내" value={summary.connected ? "응답 정상" : "연결 확인 필요"} hint={summary.message} />
         </div>
       </section>
@@ -385,10 +426,10 @@ function AccountContent({
           title="미체결 주문"
           description={openOrdersSourceDescription}
           rows={displayedOpenOrders}
-          emptyStateTitle={hasExchangeOpenOrders ? "거래소 미체결 주문이 없습니다." : "Binance 원본 캐시가 필요합니다."}
+          emptyStateTitle={hasExchangeOpenOrders ? "거래소 미체결 주문이 없습니다." : "거래소 원본 캐시가 필요합니다."}
           emptyStateDescription={
             hasExchangeOpenOrders
-              ? "현재 캐시된 Binance 원본 응답 기준으로 열린 주문이 없습니다."
+              ? "현재 캐시된 거래소 원본 응답 기준으로 열린 주문이 없습니다."
               : "화면에서 로컬 테스트/이관 주문 로그를 미체결 주문으로 표시하지 않도록 차단했습니다."
           }
         />
@@ -485,7 +526,7 @@ export function BinanceAccountPanel() {
       <PageShell
         eyebrow="계좌 상태"
         title="거래소 계정 / 자산 현황"
-        description="Binance 원본 캐시 또는 최근 로컬 동기화 기준으로 잔고와 계정 원본 상태를 확인합니다. 최종 진입 가능 여부는 개요 화면의 운영 상태를 따릅니다."
+        description="거래소 원본 캐시 또는 최근 로컬 동기화 기준으로 잔고와 계정 원본 상태를 확인합니다. 최종 진입 가능 여부는 개요 화면의 운영 상태를 따릅니다."
       />
 
       {errorMessage ? (

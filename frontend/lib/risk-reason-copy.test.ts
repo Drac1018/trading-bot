@@ -28,11 +28,11 @@ test("lookupRiskReasonCode translates common risk_guard codes for operator-facin
   );
   assert.equal(
     lookupRiskReasonCode("DETERMINISTIC_BASELINE_DISAGREEMENT"),
-    "AI는 진입을 제안했지만, 결정론적 기준선과 일치하지 않아 안전상 즉시 주문하지 않았습니다.",
+    "AI는 진입을 제안했지만, 규칙 기반 기준선과 일치하지 않아 안전상 즉시 주문하지 않았습니다.",
   );
   assert.equal(
     lookupRiskReasonCode("confidence_below_min_entry_threshold"),
-    "AI가 감시용 진입 계획은 제안했지만 confidence가 최소 진입 기준보다 낮아 pending plan을 만들지 않았습니다.",
+    "AI가 감시용 진입 계획은 제안했지만 신뢰도가 최소 진입 기준보다 낮아 대기 진입 계획을 만들지 않았습니다.",
   );
   assert.equal(
     lookupRiskReasonCode("PLAN_CANCELED_NO_ENTRY_CAPACITY"),
@@ -57,5 +57,241 @@ test("confidence threshold block is shown as entry-wait reason", async () => {
   assert.equal(copy.known, true);
   assert.equal(copy.category, "entry_wait");
   assert.equal(copy.title_ko, "진입 신뢰도가 기준보다 낮아 대기 중입니다");
-  assert.equal(copy.check_location_ko, "AI 의견 / 리스크 점검 > expected cost gate");
+  assert.equal(copy.check_location_ko, "AI 의견 / 리스크 점검 > 예상 비용 점검");
+});
+
+test("exchange auth permission rejection is operator-facing", async () => {
+  const { describeReasonCode, lookupRiskReasonCode } = await riskReasonCopyModule;
+
+  const copy = describeReasonCode("EXCHANGE_AUTH_PERMISSION_REJECTED");
+
+  assert.equal(copy.known, true);
+  assert.equal(copy.category, "safety_block");
+  assert.equal(copy.title_ko, "거래소 API 권한 거부로 신규 진입이 차단되었습니다");
+  assert.match(copy.detail_ko, /Binance/);
+  assert.match(copy.operator_action_ko, /service-gate root cause/);
+  assert.equal(lookupRiskReasonCode("EXCHANGE_AUTH_PERMISSION_REJECTED"), copy.detail_ko);
+});
+
+test("reason-code matcher canonicalizes exchange auth publication variants", async () => {
+  const { isReasonCode } = await riskReasonCopyModule;
+
+  assert.equal(isReasonCode(" exchange_auth_permission_rejected ", "EXCHANGE_AUTH_PERMISSION_REJECTED"), true);
+  assert.equal(isReasonCode("EXCHANGE_AUTH_PERMISSION_REJECTED", " exchange_auth_permission_rejected "), true);
+  assert.equal(isReasonCode("RECENT_HEALTH_ERRORS", "EXCHANGE_AUTH_PERMISSION_REJECTED"), false);
+  assert.equal(isReasonCode(null, "EXCHANGE_AUTH_PERMISSION_REJECTED"), false);
+});
+
+test("redis cache service-gate blocker is operator-facing", async () => {
+  const { describeReasonCode, lookupRiskReasonCode } = await riskReasonCopyModule;
+
+  const copy = describeReasonCode("REDIS_CACHE_UNAVAILABLE");
+
+  assert.equal(copy.known, true);
+  assert.equal(copy.category, "safety_block");
+  assert.equal(copy.title_ko, "Redis 공유 캐시를 사용할 수 없어 서비스 전환이 차단되었습니다");
+  assert.match(copy.operator_action_ko, /redis_cache/);
+  assert.equal(lookupRiskReasonCode("REDIS_CACHE_UNAVAILABLE"), copy.detail_ko);
+});
+
+test("generic service-gate blockers are operator-facing", async () => {
+  const { describeReasonCode, lookupRiskReasonCode } = await riskReasonCopyModule;
+
+  const generic = describeReasonCode("SERVICE_GATE_BLOCKED");
+  assert.equal(generic.known, true);
+  assert.equal(generic.category, "safety_block");
+  assert.match(generic.title_ko, /서비스 게이트/);
+  assert.equal(lookupRiskReasonCode("SERVICE_GATE_BLOCKED"), generic.detail_ko);
+
+  const unknownPublication = describeReasonCode("SERVICE_GATE_STATUS_UNKNOWN");
+  assert.equal(unknownPublication.known, true);
+  assert.equal(unknownPublication.category, "safety_block");
+  assert.match(unknownPublication.title_ko, /게시 상태/);
+  assert.match(unknownPublication.detail_ko, /누락/);
+  assert.match(unknownPublication.detail_ko, /null/);
+  assert.match(unknownPublication.detail_ko, /동시에/);
+  assert.equal(lookupRiskReasonCode("SERVICE_GATE_STATUS_UNKNOWN"), unknownPublication.detail_ko);
+
+  const scheduler = describeReasonCode("recent_scheduler_non_success");
+  assert.equal(scheduler.known, true);
+  assert.equal(scheduler.category, "safety_block");
+  assert.match(scheduler.title_ko, /스케줄러/);
+  assert.equal(lookupRiskReasonCode("recent_scheduler_non_success"), scheduler.detail_ko);
+
+  const health = describeReasonCode("recent_health_errors");
+  assert.equal(health.known, true);
+  assert.equal(health.category, "safety_block");
+  assert.match(health.title_ko, /헬스체크/);
+
+  const exchangePositionMode = describeReasonCode("EXCHANGE_POSITION_MODE_UNCLEAR");
+  assert.equal(exchangePositionMode.known, true);
+  assert.equal(exchangePositionMode.category, "safety_block");
+  assert.match(exchangePositionMode.title_ko, /포지션 모드/);
+  assert.match(exchangePositionMode.detail_ko, /service-gate/);
+  assert.match(exchangePositionMode.operator_action_ko, /mode_guard_reason_code/);
+  assert.equal(lookupRiskReasonCode("EXCHANGE_POSITION_MODE_UNCLEAR"), exchangePositionMode.detail_ko);
+
+  const dbConnection = describeReasonCode("DB_CONNECTION_LOST");
+  assert.equal(dbConnection.known, true);
+  assert.equal(dbConnection.category, "safety_block");
+  assert.match(dbConnection.title_ko, /DB 연결/);
+  assert.match(dbConnection.operator_action_ko, /db_connection_lost/);
+  assert.equal(lookupRiskReasonCode("DB_CONNECTION_LOST"), dbConnection.detail_ko);
+
+  const dbOperational = describeReasonCode("DB_OPERATIONAL_ERROR");
+  assert.equal(dbOperational.known, true);
+  assert.equal(dbOperational.category, "safety_block");
+  assert.match(dbOperational.title_ko, /DB 작업/);
+
+  const dbIdleTimeout = describeReasonCode("DB_IDLE_IN_TRANSACTION_TIMEOUT");
+  assert.equal(dbIdleTimeout.known, true);
+  assert.equal(dbIdleTimeout.category, "safety_block");
+  assert.match(dbIdleTimeout.title_ko, /idle transaction timeout/);
+  assert.match(dbIdleTimeout.operator_action_ko, /idle-in-transaction/);
+  assert.equal(lookupRiskReasonCode("DB_IDLE_IN_TRANSACTION_TIMEOUT"), dbIdleTimeout.detail_ko);
+
+  const workflowException = describeReasonCode("WORKFLOW_EXCEPTION");
+  assert.equal(workflowException.known, true);
+  assert.equal(workflowException.category, "safety_block");
+  assert.match(workflowException.title_ko, /workflow/);
+  assert.match(workflowException.operator_action_ko, /error_category/);
+
+  const activePending = describeReasonCode("active_pending_entry_plans");
+  assert.equal(activePending.known, true);
+  assert.equal(activePending.category, "safety_block");
+  assert.match(activePending.title_ko, /진입 대기 계획/);
+  assert.match(activePending.operator_action_ko, /pending entry plans/);
+  assert.equal(lookupRiskReasonCode("active_pending_entry_plans"), activePending.detail_ko);
+});
+
+test("cost publication reason codes are operator-facing", async () => {
+  const { describeReasonCode, lookupRiskReasonCode } = await riskReasonCopyModule;
+
+  const noSample = describeReasonCode("slippage_data_status:NO_SAMPLE");
+  assert.equal(noSample.known, true);
+  assert.equal(noSample.category, "safety_block");
+  assert.equal(noSample.raw_code, "slippage_data_status:NO_SAMPLE");
+  assert.equal(noSample.title_ko, "슬리피지 체결 표본이 없습니다");
+  assert.equal(noSample.detail_ko, "실제 체결 표본이 없어 평균 체결 불리도를 확정할 수 없습니다.");
+  assert.equal(
+    lookupRiskReasonCode("slippage_data_status:not_ready"),
+    "슬리피지 준비 상태가 부족해 평균 체결 불리도를 확정할 수 없습니다.",
+  );
+
+  const funding = describeReasonCode("funding_sync_status:stale");
+  assert.equal(funding.known, true);
+  assert.equal(funding.title_ko, "펀딩비 동기화 상태가 오래되었습니다");
+});
+
+test("decision hold rationale and AI budget skip codes are operator-facing", async () => {
+  const { describeReasonCode, lookupRiskReasonCode } = await riskReasonCopyModule;
+
+  const derivatives = describeReasonCode("DERIVATIVES_ALIGNMENT_HEADWIND");
+  assert.equal(derivatives.known, true);
+  assert.equal(derivatives.category, "entry_wait");
+  assert.equal(derivatives.title_ko, "파생시장 정합성이 진입 방향을 뒷받침하지 않습니다");
+
+  const breakout = describeReasonCode("BREAKOUT_OI_NOT_EXPANDING");
+  assert.equal(breakout.known, true);
+  assert.equal(breakout.category, "entry_wait");
+  assert.equal(breakout.title_ko, "돌파 확인에 필요한 OI 증가가 없습니다");
+
+  const budget = describeReasonCode("ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED");
+  assert.equal(budget.known, true);
+  assert.equal(budget.category, "operational_control");
+  assert.equal(lookupRiskReasonCode("ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED"), budget.detail_ko);
+});
+
+test("entry candidate pre-AI skip reasons are operator-facing", async () => {
+  const { describeAiSkipReason, aiSkipReasonTitle, describeReasonCode, lookupRiskReasonCode } =
+    await riskReasonCopyModule;
+
+  const neutral = describeAiSkipReason("ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI");
+  assert.equal(neutral.known, true);
+  assert.equal(neutral.title_ko, "중립 신호라 AI 검토를 생략했습니다");
+  assert.match(neutral.detail_ko, /기대값, 파생시장, 선행시장/);
+
+  const backoff = describeAiSkipReason("entry_candidate_low_actionability_hold_backoff");
+  assert.equal(backoff.known, true);
+  assert.equal(backoff.title_ko, "반복 저효용 후보라 AI 검토를 쉬고 있습니다");
+
+  assert.equal(
+    aiSkipReasonTitle("ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN"),
+    "같은 장면의 최근 AI hold 판단을 재사용했습니다",
+  );
+  assert.equal(
+    describeAiSkipReason("ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE").title_ko,
+    "주문 경로가 준비되지 않아 AI 검토를 생략했습니다",
+  );
+  assert.equal(
+    describeAiSkipReason("ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI").title_ko,
+    "이미 대기 중인 진입안이 있어 AI 검토를 생략했습니다",
+  );
+  assert.equal(
+    describeAiSkipReason("ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI").title_ko,
+    "진입 구조가 불완전해 AI 검토를 생략했습니다",
+  );
+
+  const incompleteOutput = describeReasonCode("AI_ENTRY_OUTPUT_INCOMPLETE");
+  assert.equal(incompleteOutput.known, true);
+  assert.equal(incompleteOutput.category, "entry_wait");
+  assert.equal(incompleteOutput.title_ko, "AI 출력에 주문 가능한 진입 구조가 없어 대기합니다");
+  assert.equal(lookupRiskReasonCode("AI_ENTRY_OUTPUT_INCOMPLETE"), incompleteOutput.detail_ko);
+});
+
+test("position exit review local filter codes are operator-facing", async () => {
+  const { describeReasonCode, lookupRiskReasonCode } = await riskReasonCopyModule;
+
+  const partialNotReady = describeReasonCode("POSITION_EXIT_REVIEW_PARTIAL_NOT_READY");
+  assert.equal(partialNotReady.known, true);
+  assert.equal(partialNotReady.category, "safety_block");
+  assert.equal(partialNotReady.title_ko, "부분익절 조건이 아직 충족되지 않았습니다");
+  assert.match(partialNotReady.detail_ko, /부분익절 준비 상태/);
+
+  const scalpRunnerBlocked = describeReasonCode("POSITION_EXIT_REVIEW_SCALP_RUNNER_BLOCKED");
+  assert.equal(scalpRunnerBlocked.known, true);
+  assert.equal(scalpRunnerBlocked.title_ko, "단타 포지션: 잔여 수량 축소 근거가 부족합니다");
+  assert.match(scalpRunnerBlocked.operator_action_ko, /보유전략이 단타/);
+
+  const swingSignal = describeReasonCode("POSITION_EXIT_REVIEW_SWING_RUNNER_SIGNAL_REQUIRED");
+  assert.equal(swingSignal.known, true);
+  assert.equal(swingSignal.title_ko, "스윙 포지션: 잔여 수량 훼손 근거가 아직 부족합니다");
+
+  const positionTooEarly = describeReasonCode("POSITION_EXIT_REVIEW_POSITION_EXIT_TOO_EARLY");
+  assert.equal(positionTooEarly.known, true);
+  assert.equal(positionTooEarly.title_ko, "장기 보유 포지션: 전량 익절 근거가 아직 이릅니다");
+
+  assert.equal(
+    lookupRiskReasonCode("POSITION_EXIT_REVIEW_STOP_RELAXATION_IGNORED"),
+    "AI 출력에 손절을 넓히거나 약화시키는 내용이 감지되어 적용하지 않고 감사 기록만 남겼습니다. 손절 권한은 규칙 기반 고정 손절에 남아 있습니다.",
+  );
+});
+
+test("BTC long recent performance and exposure block is explained in operator Korean", async () => {
+  const { describeReasonCode, describeReasonCodeInContext } = await riskReasonCopyModule;
+
+  const symbolPerformance = describeReasonCode("SYMBOL_RECENT_PERFORMANCE_NEGATIVE");
+  assert.equal(symbolPerformance.known, true);
+  assert.equal(symbolPerformance.category, "safety_block");
+  assert.equal(symbolPerformance.title_ko, "최근 BTCUSDT 실거래 성과가 수수료 차감 후 손실입니다");
+  assert.match(symbolPerformance.detail_ko, /순손익/);
+
+  const bucketPerformance = describeReasonCode("DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE");
+  assert.equal(bucketPerformance.title_ko, "BTCUSDT long 전환장 버킷의 최근 기대값이 음수입니다");
+  assert.match(bucketPerformance.operator_action_ko, /기대값/);
+
+  const exposure = describeReasonCode("CORRELATED_EXPOSURE_LIMIT_REACHED");
+  assert.equal(exposure.title_ko, "BTC/ETH 같은 방향 노출 한도를 넘습니다");
+  assert.match(exposure.operator_action_ko, /combined_BTC_ETH_directional_exposure_pct/);
+
+  const combined = describeReasonCodeInContext("SYMBOL_RECENT_PERFORMANCE_NEGATIVE", [
+    "SYMBOL_RECENT_PERFORMANCE_NEGATIVE",
+    "DECISION_BUCKET_RECENT_PERFORMANCE_NEGATIVE",
+    "CORRELATED_EXPOSURE_LIMIT_REACHED",
+  ]);
+  assert.equal(
+    combined.title_ko,
+    "BTCUSDT long 후보는 AI 승인 주문이 아니라 리스크 평가에서 차단된 관찰 후보입니다",
+  );
+  assert.match(combined.detail_ko, /AI 최종 판단은 HOLD/);
 });

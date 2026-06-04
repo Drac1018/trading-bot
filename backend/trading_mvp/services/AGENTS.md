@@ -23,12 +23,12 @@
 * `docs/architecture.md`
 * `docs/codex-drafts-and-auto-resume.md`
 
-## 현재 운영 기본값
+## 전략 / 운영 기본값 확인
 
-* 신규 진입의 기본 운영 편향은 `scalp`다
-* 신규 진입 기본 `entry_mode`는 `pullback_confirm`이다
-* `breakout_confirm`은 드문 예외로만 허용하고 기본 경로로 쓰지 말 것
-* `swing` / `position`은 강한 구조적 레짐, breadth, lead-lag, relative strength, derivatives 상태가 동시에 지지할 때만 예외로 허용할 것
+* 진입 성격, `entry_mode`, `holding_profile`, 전략 편향은 고정 문구가 아니라 런타임 settings와 source-of-truth 모듈을 확인한 뒤 판단한다
+* 관련 source-of-truth는 `settings.py`, `orchestrator.py`, `scheduler.py`, `ai_prompt_routing.py`, `agents.py`, `risk.py`와 전략/리스크 문서다
+* AGENTS 문구만 근거로 전략 기본값을 바꾸거나 신규 진입 경로를 넓히지 말 것
+* `breakout`, `swing`, `position` 성격의 변경은 데이터 품질, lead-lag, relative strength, derivatives, risk gate와 실행 경계까지 함께 검증할 것
 
 ## 손절과 보호주문 원칙
 

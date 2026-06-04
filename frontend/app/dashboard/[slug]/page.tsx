@@ -18,6 +18,8 @@ import { dashboardPages } from "../../../lib/page-config";
 import { ordersDataEndpoints } from "../../../lib/orders-query";
 import { ALL_SYMBOLS, resolveSelectedSymbol } from "../../../lib/selected-symbol";
 
+export const dynamic = "force-dynamic";
+
 function queryValue(value: string | string[] | undefined) {
   if (Array.isArray(value)) {
     return value[0] ?? null;
@@ -119,6 +121,12 @@ function resolveMarketChartZoomRange(value: string | string[] | undefined): Mark
 function operatorDashboardEndpoint(slug: string) {
   if (slug === "market" || slug === "scheduler") {
     return `/api/dashboard/operator?view=${slug}`;
+  }
+  if (slug === "decisions") {
+    return "/api/dashboard/operator?view=decision";
+  }
+  if (slug === "risk") {
+    return "/api/dashboard/operator?view=risk";
   }
   return "/api/dashboard/operator";
 }

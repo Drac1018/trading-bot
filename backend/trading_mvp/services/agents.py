@@ -26,6 +26,7 @@ from trading_mvp.schemas import (
     ChiefReviewSummary,
     FeaturePayload,
     MarketSnapshotPayload,
+    PositionExitReview,
     RiskCheckResult,
     TradeDecision,
     WatchEntryPlan,
@@ -87,6 +88,26 @@ BRACKET_TP_WIDENED_FOR_COST_REASON_CODE = "bracket_tp_widened_for_cost"
 BRACKET_DEMOTED_TO_WATCH_REASON_CODE = "bracket_demoted_to_watch_due_to_thin_net_edge"
 BRACKET_EXPECTED_GROSS_TOO_TIGHT_REASON_CODE = "expected_gross_bps_too_tight"
 BRACKET_EXPECTED_NET_TOO_LOW_REASON_CODE = "expected_net_bps_too_low"
+MODEL_OWNED_TRADE_DECISION_FIELDS = {
+    "bounded_output_applied",
+    "fallback_reason_codes",
+    "fail_closed_applied",
+    "provider_status",
+    "data_quality_fail_closed_applied",
+    "data_quality_block_reason_codes",
+    "minimum_quality_required",
+    "abstain_due_to_data_quality",
+    "quality_penalty_level",
+    "provider_not_called_due_to_quality",
+}
+AI_ENTRY_OUTPUT_INCOMPLETE_REASON_CODE = "AI_ENTRY_OUTPUT_INCOMPLETE"
+AI_ENTRY_OUTPUT_REQUIRED_FIELDS = (
+    "entry_zone_min",
+    "entry_zone_max",
+    "stop_loss",
+    "take_profit",
+    "invalidation_price",
+)
 BRACKET_FEE_TO_GROSS_TOO_HIGH_REASON_CODE = "fee_to_gross_ratio_too_high"
 BRACKET_BTC_LONG_TP_TOO_TIGHT_REASON_CODE = "btc_long_tp_too_tight"
 BRACKET_MIN_GROSS_BPS_DEFAULT = 40.0
@@ -95,6 +116,13 @@ BRACKET_MIN_RISK_REWARD_RATIO = 1.25
 BRACKET_SYMBOL_SIDE_MIN_GROSS_BPS_DEFAULTS = {
     "BTCUSDT:long": 40.0,
     "ETHUSDT:long": 0.0,
+}
+TAKE_PROFIT_PROFILE_RANGE_ADJUSTED_REASON_CODE = "TAKE_PROFIT_PROFILE_RANGE_ADJUSTED"
+TAKE_PROFIT_WEAK_SIGNAL_CAP_REASON_CODE = "TAKE_PROFIT_WEAK_SIGNAL_CAP"
+TAKE_PROFIT_PROFILE_BPS_BOUNDS = {
+    HOLDING_PROFILE_SCALP: (60.0, 120.0),
+    HOLDING_PROFILE_SWING: (120.0, 220.0),
+    HOLDING_PROFILE_POSITION: (200.0, 300.0),
 }
 SIZE_REDUCED_LOW_NET_EDGE_REASON_CODE = "size_reduced_due_to_low_net_edge"
 SIZE_CAPPED_HIGH_FEE_REASON_CODE = "size_capped_due_to_high_fee_to_gross"
@@ -158,9 +186,17 @@ def persist_agent_run(
     output_payload = output.model_dump(mode="json") if isinstance(output, BaseModel) else output
     if role == AgentRole.TRADING_DECISION:
         metadata.setdefault("generated_at", now.isoformat())
+        if isinstance(output_payload, dict):
+            psychology_scene_review = output_payload.get("psychology_scene_review")
+            if isinstance(psychology_scene_review, dict):
+                metadata.setdefault("psychology_scene_review", psychology_scene_review)
         validity_payload = dict(metadata.get("ai_decision_validity") or {})
         validity_payload.setdefault("generated_at", metadata["generated_at"])
         metadata["ai_decision_validity"] = validity_payload
+    elif role == AgentRole.POSITION_EXIT_REVIEW:
+        metadata.setdefault("generated_at", now.isoformat())
+        if isinstance(output_payload, dict):
+            metadata.setdefault("position_exit_review", output_payload)
     row = AgentRun(
         role=role.value,
         trigger_event=trigger_event,
@@ -209,6 +245,9 @@ def _provider_metadata(result: ProviderResult | None, *, source: str) -> dict[st
         metadata["usage"] = result.usage
     if result.request_id:
         metadata["request_id"] = result.request_id
+    if result.model:
+        metadata["model"] = result.model
+        metadata["ai_model"] = result.model
     return metadata
 
 
@@ -345,6 +384,15 @@ def _take_profit_for_gross_bps(*, side: str, entry_price: float, gross_bps: floa
     return round(target, 2) if target > 0.0 else None
 
 
+def _take_profit_for_target_bps(*, side: str, entry_price: float, gross_bps: float) -> float | None:
+    if entry_price <= 0.0 or gross_bps <= 0.0:
+        return None
+    if side == "long":
+        return round(entry_price * (1.0 + gross_bps / 10_000), 8)
+    target = entry_price * (1.0 - gross_bps / 10_000)
+    return round(target, 8) if target > 0.0 else None
+
+
 def build_trading_decision_input_payload(
     *,
     market_snapshot: MarketSnapshotPayload,
@@ -408,6 +456,18 @@ class TradingDecisionAgent:
         if isinstance(ai_context, dict) and ai_context:
             return dict(ai_context)
         return None
+
+    @staticmethod
+    def _strip_model_owned_trade_decision_fields(raw_output: object) -> tuple[object, list[str]]:
+        if not isinstance(raw_output, dict):
+            return raw_output, []
+        stripped_fields = sorted(field for field in MODEL_OWNED_TRADE_DECISION_FIELDS if field in raw_output)
+        if not stripped_fields:
+            return raw_output, []
+        sanitized = dict(raw_output)
+        for field in stripped_fields:
+            sanitized.pop(field, None)
+        return sanitized, stripped_fields
 
     @staticmethod
     def _provider_status_from_exception(exc: Exception) -> str:
@@ -1974,6 +2034,127 @@ class TradingDecisionAgent:
             }
         )
 
+    @staticmethod
+    def _raw_output_has_value(payload: dict[str, Any], field: str) -> bool:
+        return payload.get(field) not in {None, ""}
+
+    @classmethod
+    def _entry_output_quality_guard_context(
+        cls,
+        decision: TradeDecision,
+        *,
+        raw_output: dict[str, Any],
+        route,
+        ai_context: AIDecisionContextPacket | None,
+        has_open_position: bool,
+    ) -> dict[str, Any]:
+        if (
+            decision.decision not in {"long", "short"}
+            or has_open_position
+            or not bool(getattr(route, "allow_new_entry", False))
+            or (ai_context is not None and ai_context.trigger_type != "entry_candidate_event")
+        ):
+            return {"active": False}
+        selection_summary = (
+            dict(ai_context.selection_context_summary)
+            if ai_context is not None and isinstance(ai_context.selection_context_summary, dict)
+            else {}
+        )
+        if selection_summary.get("selected") is False:
+            return {
+                "active": False,
+                "reason": "soft_signal_or_rejected_candidate_review",
+            }
+
+        entry_zone_payload = raw_output.get("entry_zone")
+        entry_zone = dict(entry_zone_payload) if isinstance(entry_zone_payload, dict) else {}
+        has_entry_zone_min = cls._raw_output_has_value(raw_output, "entry_zone_min") or cls._raw_output_has_value(
+            entry_zone,
+            "low",
+        )
+        has_entry_zone_max = cls._raw_output_has_value(raw_output, "entry_zone_max") or cls._raw_output_has_value(
+            entry_zone,
+            "high",
+        )
+        has_invalidation = cls._raw_output_has_value(raw_output, "invalidation_price") or cls._raw_output_has_value(
+            raw_output,
+            "invalidation_level",
+        )
+        missing_fields = [
+            field
+            for field, present in (
+                ("entry_zone_min", has_entry_zone_min),
+                ("entry_zone_max", has_entry_zone_max),
+                ("stop_loss", cls._raw_output_has_value(raw_output, "stop_loss")),
+                ("take_profit", cls._raw_output_has_value(raw_output, "take_profit")),
+                ("invalidation_price", has_invalidation),
+            )
+            if not present
+        ]
+        if not missing_fields:
+            return {
+                "active": False,
+                "required_fields": list(AI_ENTRY_OUTPUT_REQUIRED_FIELDS),
+            }
+        return {
+            "active": True,
+            "reason": "new_entry_direct_intent_missing_required_trade_geometry",
+            "missing_fields": missing_fields,
+            "required_fields": list(AI_ENTRY_OUTPUT_REQUIRED_FIELDS),
+            "decision": decision.decision,
+            "prompt_family": getattr(route, "prompt_family", None),
+            "trigger_type": ai_context.trigger_type if ai_context is not None else None,
+        }
+
+    @classmethod
+    def _apply_entry_output_quality_guard(
+        cls,
+        decision: TradeDecision,
+        *,
+        quality_context: dict[str, Any],
+    ) -> TradeDecision:
+        if not bool(quality_context.get("active")):
+            return decision
+        reason_codes = [AI_ENTRY_OUTPUT_INCOMPLETE_REASON_CODE]
+        no_trade_reason_codes = cls._unique_reason_codes(decision.no_trade_reason_codes, reason_codes)
+        fallback_reason_codes = cls._unique_reason_codes(decision.fallback_reason_codes, reason_codes)
+        return decision.model_copy(
+            update={
+                "decision": "hold",
+                "entry_mode": "none",
+                "entry_zone_min": None,
+                "entry_zone_max": None,
+                "entry_zone": None,
+                "watch_entry_plan": None,
+                "invalidation_price": None,
+                "invalidation_level": None,
+                "max_chase_bps": None,
+                "idea_ttl_minutes": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "confidence": min(decision.confidence, 0.45),
+                "should_abstain": True,
+                "no_trade_reason_codes": no_trade_reason_codes,
+                "abstain_reason_codes": cls._unique_reason_codes(
+                    decision.abstain_reason_codes,
+                    no_trade_reason_codes,
+                ),
+                "primary_reason_codes": cls._unique_reason_codes(
+                    decision.primary_reason_codes,
+                    reason_codes,
+                ),
+                "rationale_codes": cls._unique_reason_codes(decision.rationale_codes, reason_codes),
+                "fallback_reason_codes": fallback_reason_codes,
+                "bounded_output_applied": True,
+                "reason_summary": "AI entry output was missing required trade geometry.",
+                "explanation_short": "AI entry output was bounded to hold.",
+                "explanation_detailed": (
+                    "The provider proposed a direct entry without all required entry zone, stop, target, "
+                    "and invalidation fields, so the intent was normalized to hold before risk evaluation."
+                ),
+            }
+        )
+
     def _apply_holding_profile_fields(
         self,
         decision: TradeDecision,
@@ -2026,6 +2207,7 @@ class TradingDecisionAgent:
             updated_decision,
             market_snapshot=market_snapshot,
             features=features,
+            risk_context=risk_context,
         )
         return updated_decision, {
             **holding_profile_context,
@@ -2042,12 +2224,117 @@ class TradingDecisionAgent:
             return (decision.entry_zone_min + decision.entry_zone_max) / 2
         return market_snapshot.latest_price
 
+    @staticmethod
+    def _breadth_is_weak_for_take_profit(risk_context: dict[str, Any] | None) -> bool:
+        if not isinstance(risk_context, dict):
+            return False
+        selection_context = (
+            dict(risk_context.get("selection_context"))
+            if isinstance(risk_context.get("selection_context"), dict)
+            else {}
+        )
+        breadth_summary = (
+            risk_context.get("universe_breadth")
+            if isinstance(risk_context.get("universe_breadth"), dict)
+            else selection_context.get("universe_breadth")
+            if isinstance(selection_context.get("universe_breadth"), dict)
+            else selection_context.get("breadth_summary")
+            if isinstance(selection_context.get("breadth_summary"), dict)
+            else {}
+        )
+        breadth_regime = str(breadth_summary.get("breadth_regime") or risk_context.get("breadth_regime") or "").lower()
+        if breadth_regime in {"weak_breadth", "transition_fragile"}:
+            return True
+        capacity_reason = str(
+            risk_context.get("capacity_reason")
+            or selection_context.get("capacity_reason")
+            or ""
+        ).lower()
+        if capacity_reason in {"breadth_weak_reduce_capacity", "transition_breadth_reduce_capacity"}:
+            return True
+        hold_bias = breadth_summary.get("hold_bias_multiplier")
+        try:
+            return float(hold_bias) >= 1.15
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _take_profit_profile_bounds(
+        decision: TradeDecision,
+        *,
+        features: FeaturePayload,
+        risk_context: dict[str, Any] | None = None,
+    ) -> tuple[float, float, bool]:
+        profile = str(
+            decision.recommended_holding_profile
+            if decision.recommended_holding_profile in TAKE_PROFIT_PROFILE_BPS_BOUNDS
+            else decision.holding_profile
+            or HOLDING_PROFILE_SCALP
+        ).strip().lower()
+        if profile not in TAKE_PROFIT_PROFILE_BPS_BOUNDS:
+            profile = HOLDING_PROFILE_SCALP
+        weak_signal = bool(features.regime.weak_volume) or features.regime.momentum_state == "weakening"
+        weak_signal = weak_signal or TradingDecisionAgent._breadth_is_weak_for_take_profit(risk_context)
+        if weak_signal:
+            return (*TAKE_PROFIT_PROFILE_BPS_BOUNDS[HOLDING_PROFILE_SCALP], True)
+        return (*TAKE_PROFIT_PROFILE_BPS_BOUNDS[profile], False)
+
+    def _apply_take_profit_profile_range(
+        self,
+        decision: TradeDecision,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        risk_context: dict[str, Any] | None = None,
+    ) -> TradeDecision:
+        if decision.decision not in {"long", "short"} or decision.take_profit is None:
+            return decision
+        if set(decision.rationale_codes) & SETUP_CLUSTER_EXEMPT_RATIONALE_CODES:
+            return decision
+        reference_price = self._deterministic_entry_reference_price(
+            decision,
+            market_snapshot=market_snapshot,
+        )
+        current_bps = _expected_gross_bps_for_tp(
+            side=decision.decision,
+            entry_price=reference_price,
+            take_profit=decision.take_profit,
+        )
+        if current_bps is None:
+            return decision
+        min_bps, max_bps, weak_signal = self._take_profit_profile_bounds(
+            decision,
+            features=features,
+            risk_context=risk_context,
+        )
+        target_bps = min(max(current_bps, min_bps), max_bps)
+        if abs(target_bps - current_bps) <= 1e-6:
+            return decision
+        take_profit = _take_profit_for_target_bps(
+            side=decision.decision,
+            entry_price=reference_price,
+            gross_bps=target_bps,
+        )
+        if take_profit is None:
+            return decision
+        reason_codes = [TAKE_PROFIT_PROFILE_RANGE_ADJUSTED_REASON_CODE]
+        if weak_signal and current_bps > max_bps:
+            reason_codes.append(TAKE_PROFIT_WEAK_SIGNAL_CAP_REASON_CODE)
+        return decision.model_copy(
+            update={
+                "take_profit": take_profit,
+                "rationale_codes": self._unique_reason_codes(decision.rationale_codes, reason_codes),
+                "primary_reason_codes": self._unique_reason_codes(decision.primary_reason_codes, reason_codes),
+            }
+        )
+
     def _apply_deterministic_entry_brackets(
         self,
         decision: TradeDecision,
         *,
         market_snapshot: MarketSnapshotPayload,
         features: FeaturePayload,
+        risk_context: dict[str, Any] | None = None,
     ) -> TradeDecision:
         if decision.decision not in {"long", "short"}:
             return decision
@@ -2078,10 +2365,17 @@ class TradingDecisionAgent:
                 "rationale_codes": normalized_rationale_codes,
             }
         )
+        updated_decision = self._apply_take_profit_profile_range(
+            updated_decision,
+            market_snapshot=market_snapshot,
+            features=features,
+            risk_context=risk_context,
+        )
         return self._apply_bracket_cost_guard_to_decision(
             updated_decision,
             market_snapshot=market_snapshot,
             features=features,
+            risk_context=risk_context,
         )
 
     def _apply_bracket_cost_guard_to_decision(
@@ -2090,6 +2384,7 @@ class TradingDecisionAgent:
         *,
         market_snapshot: MarketSnapshotPayload,
         features: FeaturePayload,
+        risk_context: dict[str, Any] | None = None,
     ) -> TradeDecision:
         if decision.decision not in {"long", "short"}:
             return decision
@@ -2097,6 +2392,12 @@ class TradingDecisionAgent:
             return decision
         if decision.stop_loss is None or decision.take_profit is None:
             return decision
+        decision = self._apply_take_profit_profile_range(
+            decision,
+            market_snapshot=market_snapshot,
+            features=features,
+            risk_context=risk_context,
+        )
         reference_price = self._deterministic_entry_reference_price(
             decision,
             market_snapshot=market_snapshot,
@@ -2116,7 +2417,7 @@ class TradingDecisionAgent:
 
         reason_codes = self._unique_reason_codes(decision.rationale_codes, bracket_guard.reason_codes)
         if not bracket_guard.demote_to_watch:
-            return decision.model_copy(
+            updated_decision = decision.model_copy(
                 update={
                     "take_profit": bracket_guard.take_profit,
                     "rationale_codes": reason_codes,
@@ -2126,6 +2427,13 @@ class TradingDecisionAgent:
                     ),
                 }
             )
+            updated_decision = self._apply_take_profit_profile_range(
+                updated_decision,
+                market_snapshot=market_snapshot,
+                features=features,
+                risk_context=risk_context,
+            )
+            return updated_decision
 
         watch_reason_codes = self._unique_reason_codes(
             bracket_guard.reason_codes,
@@ -3794,6 +4102,7 @@ class TradingDecisionAgent:
                     "decision_authority": "intent_only_no_order_execution",
                     "final_execution_gate": "deterministic_risk_guard",
                     "default_when_uncertain": "hold",
+                    "model_must_not_populate": sorted(MODEL_OWNED_TRADE_DECISION_FIELDS),
                     "review_required": [
                         "regime",
                         "volatility",
@@ -3802,6 +4111,9 @@ class TradingDecisionAgent:
                         "range_structure",
                         "momentum",
                         "vwap_context",
+                        "market_psychology",
+                        "scene_scenario",
+                        "entry_choreography",
                         "expected_rr",
                         "slippage",
                         "fees",
@@ -3816,11 +4128,13 @@ class TradingDecisionAgent:
                         "confidence",
                         "reason_summary",
                         "entry_intent",
+                        "watch_entry_plan",
                         "entry_zone",
                         "invalidation_level",
                         "risk_notes",
                         "required_confirmations",
                         "hard_blocks_observed",
+                        "psychology_scene_review",
                     ],
                 },
                 "logic_variant": logic_variant,
@@ -3834,8 +4148,23 @@ class TradingDecisionAgent:
                 response_model=TradeDecision,
                 instructions=render_prompt_instructions(route=prompt_route),
             )
+            sanitized_output, model_owned_fields_stripped = self._strip_model_owned_trade_decision_fields(
+                provider_result.output
+            )
+            raw_decision = TradeDecision.model_validate(sanitized_output)
+            entry_output_quality_guard = self._entry_output_quality_guard_context(
+                raw_decision,
+                raw_output=sanitized_output,
+                route=prompt_route,
+                ai_context=resolved_ai_context,
+                has_open_position=bool(open_positions),
+            )
+            raw_decision = self._apply_entry_output_quality_guard(
+                raw_decision,
+                quality_context=entry_output_quality_guard,
+            )
             decision = self._normalize_entry_trigger_fields(
-                TradeDecision.model_validate(provider_result.output),
+                raw_decision,
                 market_snapshot=market_snapshot,
                 features=features,
             )
@@ -3912,6 +4241,9 @@ class TradingDecisionAgent:
             metadata["bounded_output_applied"] = bounded_result.bounded_output_applied
             metadata["fallback_reason_codes"] = list(bounded_result.fallback_reason_codes)
             metadata["fail_closed_applied"] = bounded_result.fail_closed_applied
+            metadata["model_owned_fields_stripped"] = model_owned_fields_stripped
+            metadata["entry_output_quality_guard"] = entry_output_quality_guard
+            metadata["entry_output_quality_bounded"] = bool(entry_output_quality_guard.get("active"))
             metadata["should_abstain"] = decision.should_abstain
             metadata["abstain_reason_codes"] = list(bounded_result.abstain_reason_codes)
             metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
@@ -3993,6 +4325,7 @@ class TradingDecisionAgent:
             metadata["bounded_output_applied"] = decision.bounded_output_applied
             metadata["fallback_reason_codes"] = list(decision.fallback_reason_codes)
             metadata["fail_closed_applied"] = decision.fail_closed_applied
+            metadata["model_owned_fields_stripped"] = []
             metadata["should_abstain"] = decision.should_abstain
             metadata["abstain_reason_codes"] = list(decision.abstain_reason_codes)
             metadata.update(deterministic_stop_management_payload(hard_stop_active=decision.stop_loss is not None))
@@ -4008,6 +4341,399 @@ class TradingDecisionAgent:
             )
             metadata.update(prior_metadata)
             return decision, "deterministic-mock", metadata
+
+
+def render_position_exit_review_instructions() -> str:
+    return (
+        "You are the Position Exit Director for an already-open Binance Futures position. "
+        "Review only take-profit, partial take-profit, and runner management quality. "
+        "This is candidate-only advice: you cannot submit, cancel, reduce, close, or modify any order. "
+        "Your output may only be consumed by deterministic position management, risk.py, and execution.py gates. "
+        "Never change stop loss, never widen or remove a protective order, and never recommend that protection checks "
+        "be bypassed. Do not mix this review with fresh-entry analysis. "
+        "If data is stale, sync is uncertain, protection state is uncertain, or the position is not clearly open, "
+        "return recommendation=no_action with conservative reason_codes. "
+        "Allowed recommendation values for guarded execution candidates are full_take_profit, partial_take_profit, "
+        "tighten_trailing, move_to_breakeven, and reduce_risk_only. "
+        "Use partial_take_profit only when the existing deterministic position-management context already shows "
+        "partial_take_profit_ready. Use full_take_profit or reduce_risk_only only when runner invalidation is clear; "
+        "Apply holding_profile-specific discipline before choosing a recommendation: for scalp, prefer fast profit "
+        "protection and only use full_take_profit or reduce_risk_only when scalp_early_fail_ready, time_to_fail_ready, "
+        "time_stop_ready, regime_transition_detected, momentum_weakening, or countertrend_pressure is visible; "
+        "do not treat scalp as a runner-management position. For swing, use partial_take_profit only when "
+        "partial_take_profit_ready is true, and use full_take_profit or reduce_risk_only only after partial profit or "
+        "when MFE rollback, reduce_reason_codes, or other runner invalidation is visible. For position, be patient: "
+        "prefer tighten_trailing or move_to_breakeven, use partial_take_profit only when deterministic context is ready, "
+        "and use full_take_profit only when local EXIT reason codes are already present. "
+        "execution remains outside your authority. "
+        "Set advisory_only=true and execution_boundary=metadata_only_no_order_authority. "
+        "Return exactly one JSON object matching the schema."
+    )
+
+
+def build_position_exit_review_input_payload(
+    *,
+    market_snapshot: MarketSnapshotPayload,
+    features: FeaturePayload,
+    position: Position,
+    position_management_context: dict[str, Any],
+    sync_freshness_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    def compact_sync_summary(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        compact: dict[str, object] = {}
+        for scope, payload in value.items():
+            if not isinstance(payload, dict):
+                continue
+            compact[str(scope)] = {
+                key: payload.get(key)
+                for key in (
+                    "status",
+                    "raw_status",
+                    "age_seconds",
+                    "stale_after_seconds",
+                    "last_sync_at",
+                    "last_attempt_at",
+                    "last_error",
+                    "last_skip_reason",
+                )
+                if payload.get(key) not in (None, "", [])
+            }
+        return compact
+
+    def compact_context(value: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "enabled",
+            "status",
+            "side",
+            "symbol",
+            "entry_price",
+            "mark_price",
+            "current_stop_loss",
+            "initial_stop_loss",
+            "initial_take_profit",
+            "holding_profile",
+            "holding_profile_reason",
+            "initial_stop_type",
+            "ai_stop_management_allowed",
+            "hard_stop_active",
+            "stop_widening_allowed",
+            "time_in_trade_minutes",
+            "current_r_multiple",
+            "mfe_r",
+            "mae_r",
+            "favorable_progress_r",
+            "mfe_rollback_pct",
+            "mfe_rollback_threshold",
+            "mfe_protection_action",
+            "mfe_rollback_triggered",
+            "management_stage",
+            "partial_take_profit_ready",
+            "partial_take_profit_taken",
+            "partial_take_profit_trigger_r",
+            "partial_take_profit_fraction",
+            "runner_after_partial_take_profit",
+            "time_to_fail_ready",
+            "time_to_fail_action",
+            "time_to_fail_reason",
+            "time_stop_ready",
+            "time_stop_action",
+            "holding_edge_decay_active",
+            "regime_transition_detected",
+            "momentum_weakening",
+            "countertrend_pressure",
+            "strong_trend_regime",
+            "weak_trend_regime",
+            "reduce_reason_codes",
+            "applied_rule_candidates",
+        )
+        return {key: value.get(key) for key in keys if key in value}
+
+    position_metadata = dict(position.metadata_json) if isinstance(position.metadata_json, dict) else {}
+    management_metadata = (
+        dict(position_metadata.get("position_management"))
+        if isinstance(position_metadata.get("position_management"), dict)
+        else {}
+    )
+    candles = market_snapshot.candles[-8:]
+    return {
+        "review_role": "position_exit_review",
+        "authority": {
+            "can_execute_orders": False,
+            "can_submit_reduce_or_close_orders": False,
+            "can_change_stop_loss": False,
+            "can_remove_or_relax_protective_orders": False,
+            "can_override_risk_or_execution": False,
+            "scope": ["take_profit", "partial_take_profit", "runner_management"],
+            "execution_boundary": "metadata_only_no_order_authority",
+        },
+        "position": {
+            "position_id": position.id,
+            "symbol": position.symbol,
+            "side": position.side,
+            "status": position.status,
+            "quantity": position.quantity,
+            "entry_price": position.entry_price,
+            "mark_price": position.mark_price,
+            "unrealized_pnl": position.unrealized_pnl,
+            "realized_pnl": position.realized_pnl,
+            "leverage": position.leverage,
+            "opened_at": position.opened_at.isoformat() if position.opened_at is not None else None,
+            "has_stop_loss": position.stop_loss is not None,
+            "has_take_profit": position.take_profit is not None,
+            "holding_profile": management_metadata.get("holding_profile"),
+            "initial_stop_type": management_metadata.get("initial_stop_type"),
+            "hard_stop_active": management_metadata.get("hard_stop_active"),
+            "stop_widening_allowed": management_metadata.get("stop_widening_allowed"),
+        },
+        "market_snapshot": {
+            "symbol": market_snapshot.symbol,
+            "timeframe": market_snapshot.timeframe,
+            "snapshot_time": market_snapshot.snapshot_time.isoformat(),
+            "latest_price": market_snapshot.latest_price,
+            "latest_volume": market_snapshot.latest_volume,
+            "is_stale": market_snapshot.is_stale,
+            "is_complete": market_snapshot.is_complete,
+            "candle_count": market_snapshot.candle_count,
+            "candles": [
+                {
+                    "t": candle.timestamp.isoformat(),
+                    "o": candle.open,
+                    "h": candle.high,
+                    "l": candle.low,
+                    "c": candle.close,
+                    "v": candle.volume,
+                }
+                for candle in candles
+            ],
+        },
+        "features": {
+            "trend_score": features.trend_score,
+            "momentum_score": features.momentum_score,
+            "volatility_pct": features.volatility_pct,
+            "atr_pct": features.atr_pct,
+            "volume_ratio": features.volume_ratio,
+            "rsi": features.rsi,
+            "regime": features.regime.model_dump(mode="json"),
+            "breakout": features.breakout.model_dump(mode="json"),
+            "pullback_context": features.pullback_context.model_dump(mode="json"),
+            "data_quality_flags": list(features.data_quality_flags),
+        },
+        "position_management_context": compact_context(position_management_context),
+        "sync_freshness_summary": compact_sync_summary(sync_freshness_summary),
+        "hard_boundaries": {
+            "stop_loss_owner": "deterministic_hard_stop_and_protective_order_flow",
+            "take_profit_review_mode": "ai_metadata_only",
+            "execution_owner": "execution.py_reduce_only_close_only_paths",
+            "risk_owner": "risk.py_and_position_management_deterministic_rules",
+        },
+    }
+
+
+class PositionExitReviewAgent:
+    def __init__(self, provider: StructuredModelProvider | None = None) -> None:
+        self.provider = provider
+
+    @staticmethod
+    def _context_float(context: dict[str, Any], key: str) -> float | None:
+        value = context.get(key)
+        if value in {None, ""}:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _deterministic_review(
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        position: Position,
+        position_management_context: dict[str, Any],
+    ) -> PositionExitReview:
+        reason_codes: list[str] = []
+        if position.status != "open" or (position.quantity or 0) <= 0:
+            return PositionExitReview(
+                recommendation="no_action",
+                confidence=0.9,
+                profit_take_bias="stand_aside",
+                runner_state="not_applicable",
+                summary="No open position is available for exit review.",
+                reason_codes=["NO_OPEN_POSITION"],
+            )
+        if market_snapshot.is_stale or not market_snapshot.is_complete or features.data_quality_flags:
+            return PositionExitReview(
+                recommendation="no_action",
+                confidence=0.78,
+                profit_take_bias="stand_aside",
+                runner_state="unknown",
+                summary="Market data quality is not trustworthy enough for an exit review.",
+                reason_codes=["MARKET_DATA_UNTRUSTED", *list(features.data_quality_flags)],
+                data_quality_notes=list(features.data_quality_flags),
+            )
+
+        current_r = PositionExitReviewAgent._context_float(position_management_context, "current_r_multiple")
+        mfe_r = PositionExitReviewAgent._context_float(position_management_context, "mfe_r")
+        mfe_rollback_pct = PositionExitReviewAgent._context_float(position_management_context, "mfe_rollback_pct")
+        reduce_reason_codes = [
+            str(item)
+            for item in position_management_context.get("reduce_reason_codes", [])
+            if str(item or "").strip()
+        ]
+        applied_rule_candidates = [
+            str(item)
+            for item in position_management_context.get("applied_rule_candidates", [])
+            if str(item or "").strip()
+        ]
+
+        if bool(position_management_context.get("partial_take_profit_ready")):
+            return PositionExitReview(
+                recommendation="partial_take_profit",
+                confidence=0.72,
+                profit_take_bias="protect_unrealized",
+                runner_state="extended",
+                exit_urgency="soon",
+                summary="Existing deterministic context already marks partial take-profit as ready.",
+                reason_codes=["PARTIAL_TP_READY", *applied_rule_candidates],
+                profit_protection_cues=[
+                    f"current_r={current_r}" if current_r is not None else "partial_tp_threshold_met",
+                ],
+            )
+        if any("EXIT" in code for code in reduce_reason_codes):
+            return PositionExitReview(
+                recommendation="full_take_profit",
+                confidence=0.68,
+                profit_take_bias="protect_unrealized",
+                runner_state="exhausted",
+                exit_urgency="now",
+                summary="Runner invalidation is already visible in deterministic position-management reason codes.",
+                reason_codes=reduce_reason_codes,
+                runner_invalidation_cues=reduce_reason_codes[:8],
+            )
+        if reduce_reason_codes:
+            return PositionExitReview(
+                recommendation="reduce_risk_only",
+                confidence=0.64,
+                profit_take_bias="protect_unrealized",
+                runner_state="fragile",
+                exit_urgency="soon",
+                summary="Deterministic context shows runner protection or reassessment pressure.",
+                reason_codes=reduce_reason_codes,
+                runner_invalidation_cues=reduce_reason_codes[:8],
+            )
+        if bool(position_management_context.get("mfe_rollback_triggered")):
+            return PositionExitReview(
+                recommendation="hold_runner",
+                confidence=0.58,
+                profit_take_bias="protect_unrealized",
+                runner_state="fragile",
+                exit_urgency="watch",
+                summary="MFE rollback is visible, but deterministic context has not requested reduce or exit.",
+                reason_codes=["MFE_ROLLBACK_WATCH"],
+                runner_invalidation_cues=[
+                    f"mfe_rollback_pct={mfe_rollback_pct}" if mfe_rollback_pct is not None else "mfe_rollback_triggered",
+                ],
+            )
+        if current_r is not None and current_r >= 1.0 and bool(position_management_context.get("strong_trend_regime")):
+            return PositionExitReview(
+                recommendation="hold_runner",
+                confidence=0.61,
+                profit_take_bias="let_runner_work",
+                runner_state="healthy",
+                exit_urgency="watch",
+                summary="Position is in profit and the runner still has supportive trend context.",
+                reason_codes=["RUNNER_TREND_SUPPORT"],
+                profit_protection_cues=[
+                    f"current_r={current_r}",
+                    f"mfe_r={mfe_r}" if mfe_r is not None else "mfe_unavailable",
+                ],
+            )
+        if current_r is not None and current_r > 0:
+            reason_codes.append("PROFIT_OPEN_BUT_NO_EXIT_TRIGGER")
+        else:
+            reason_codes.append("NO_PROFIT_TAKE_TRIGGER")
+        return PositionExitReview(
+            recommendation="no_action",
+            confidence=0.55,
+            profit_take_bias="defer_to_existing_plan",
+            runner_state="unknown",
+            exit_urgency="none",
+            summary="No deterministic profit-taking or runner invalidation trigger is visible.",
+            reason_codes=reason_codes,
+        )
+
+    def run(
+        self,
+        *,
+        market_snapshot: MarketSnapshotPayload,
+        features: FeaturePayload,
+        position: Position,
+        position_management_context: dict[str, Any],
+        sync_freshness_summary: dict[str, Any] | None,
+        use_ai: bool,
+    ) -> tuple[PositionExitReview, str, dict[str, Any], dict[str, Any]]:
+        payload = build_position_exit_review_input_payload(
+            market_snapshot=market_snapshot,
+            features=features,
+            position=position,
+            position_management_context=position_management_context,
+            sync_freshness_summary=sync_freshness_summary,
+        )
+        baseline = self._deterministic_review(
+            market_snapshot=market_snapshot,
+            features=features,
+            position=position,
+            position_management_context=position_management_context,
+        )
+        if not use_ai or self.provider is None:
+            return baseline, "deterministic-mock", {
+                "source": "deterministic_shadow",
+                "schema_status": "valid",
+                "shadow": True,
+                "baseline_used": True,
+                "advisory_only": True,
+                "execution_boundary": "metadata_only_no_order_authority",
+            }, payload
+
+        provider_result: ProviderResult | None = None
+        try:
+            provider_result = self.provider.generate(
+                AgentRole.POSITION_EXIT_REVIEW.value,
+                payload,
+                response_model=PositionExitReview,
+                instructions=render_position_exit_review_instructions(),
+            )
+            review = PositionExitReview.model_validate(provider_result.output).model_copy(
+                update={
+                    "advisory_only": True,
+                    "execution_boundary": "metadata_only_no_order_authority",
+                }
+            )
+            return review, provider_result.provider, {
+                **_provider_metadata(provider_result, source="llm"),
+                "schema_status": "valid",
+                "shadow": True,
+                "baseline_review": baseline.model_dump(mode="json"),
+                "advisory_only": True,
+                "execution_boundary": "metadata_only_no_order_authority",
+            }, payload
+        except Exception as exc:
+            provider_name = provider_result.provider if provider_result is not None else (
+                self.provider.name if self.provider is not None else "deterministic-mock"
+            )
+            raw_output = provider_result.output if provider_result is not None else None
+            return baseline, provider_name, {
+                **_provider_metadata(provider_result, source="llm_fallback"),
+                "schema_status": "invalid" if isinstance(exc, ValidationError) else "provider_error",
+                "error": str(exc),
+                "raw_output": raw_output,
+                "shadow": True,
+                "baseline_review": baseline.model_dump(mode="json"),
+                "advisory_only": True,
+                "execution_boundary": "metadata_only_no_order_authority",
+            }, payload
 
 
 MARKET_SETTINGS_ALLOWED_PROFILES = (
@@ -4052,7 +4778,180 @@ def build_market_settings_advisor_input_payload(
     settings_policy: dict[str, Any],
     observed_risk_flags: list[str],
     previous_recommendation: dict[str, Any] | None = None,
+    universe_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    def limited_strings(value: object, *, limit: int = 8) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item or "").strip()][:limit]
+
+    def has_value(value: object) -> bool:
+        return value is not None and value != "" and value != []
+
+    def market_data_is_complete(flags: list[str]) -> bool:
+        incomplete_codes = {
+            "INCOMPLETE_MARKET_DATA",
+            "MARKET_DATA_INCOMPLETE",
+            "MISSING_MARKET_DATA",
+            "MISSING_CANDLES",
+            "MISSING_CLOSE",
+            "MISSING_PRICE",
+        }
+        return not any(str(item or "").strip().upper() in incomplete_codes for item in flags)
+
+    def compact_sync_summary(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        compact: dict[str, object] = {}
+        for scope, payload in value.items():
+            if not isinstance(payload, dict):
+                continue
+            compact[str(scope)] = {
+                key: payload.get(key)
+                for key in (
+                    "status",
+                    "raw_status",
+                    "age_seconds",
+                    "stale_after_seconds",
+                    "last_sync_at",
+                    "last_attempt_at",
+                    "last_error",
+                    "last_skip_reason",
+                )
+                if has_value(payload.get(key))
+            }
+        return compact
+
+    def compact_previous(value: dict[str, Any] | None) -> dict[str, object] | None:
+        if not isinstance(value, dict) or not value:
+            return None
+        keys = (
+            "recommendation_id",
+            "generated_at",
+            "valid_until",
+            "symbol_scope",
+            "recommended_profile_id",
+            "confidence",
+            "reason_summary",
+            "reason_codes",
+            "observed_risk_flags",
+            "suggested_new_entry_policy",
+            "do_not_relax",
+            "status",
+        )
+        return {key: value[key] for key in keys if key in value}
+
+    derivatives = features.derivatives
+    event_context = features.event_context
+    symbol_scope = [
+        str(item).upper()
+        for item in settings_policy.get("symbol_scope", [market_snapshot.symbol])
+        if str(item or "").strip()
+    ] or [market_snapshot.symbol.upper()]
+    current_symbol_context = {
+        "symbol": market_snapshot.symbol.upper(),
+        "timeframe": market_snapshot.timeframe,
+        "source": "current_cycle",
+        "feature_time": market_snapshot.snapshot_time.isoformat(),
+        "latest_price": market_snapshot.latest_price,
+        "data_quality": {
+            "is_stale": market_snapshot.is_stale or bool(getattr(event_context, "is_stale", False)),
+            "is_complete": market_snapshot.is_complete
+            and market_data_is_complete(list(features.data_quality_flags)),
+            "candle_count": market_snapshot.candle_count,
+            "flags": list(features.data_quality_flags),
+        },
+        "regime": {
+            "primary_regime": features.regime.primary_regime,
+            "trend_alignment": features.regime.trend_alignment,
+            "volatility_regime": features.regime.volatility_regime,
+            "volume_regime": features.regime.volume_regime,
+            "momentum_weakening": features.regime.momentum_weakening,
+        },
+        "market_metrics": {
+            "trend_score": features.trend_score,
+            "momentum_score": features.momentum_score,
+            "volatility_pct": features.volatility_pct,
+            "atr_pct": features.atr_pct,
+            "volume_ratio": features.volume_ratio,
+            "rsi": features.rsi,
+            "range_breakout_direction": features.breakout.range_breakout_direction,
+        },
+        "liquidity_and_derivatives": {
+            "available": derivatives.available,
+            "spread_bps": derivatives.spread_bps,
+            "spread_stress": derivatives.spread_stress,
+            "spread_headwind": derivatives.spread_headwind,
+            "funding_bias": derivatives.funding_bias,
+            "taker_flow_alignment": derivatives.taker_flow_alignment,
+            "top_trader_long_crowded": derivatives.top_trader_long_crowded,
+            "top_trader_short_crowded": derivatives.top_trader_short_crowded,
+            "entry_veto_reason_codes": list(derivatives.entry_veto_reason_codes),
+            "breakout_veto_reason_codes": list(derivatives.breakout_veto_reason_codes),
+        },
+        "event_context": {
+            "active_risk_window": getattr(event_context, "active_risk_window", False),
+            "next_event_name": getattr(event_context, "next_event_name", None),
+            "minutes_to_next_event": getattr(event_context, "minutes_to_next_event", None),
+            "severity": getattr(event_context, "severity", None),
+        },
+    }
+    if isinstance(universe_context, dict):
+        market_breadth = universe_context.get("market_breadth")
+        symbol_contexts = universe_context.get("symbols")
+    else:
+        market_breadth = None
+        symbol_contexts = None
+    if not isinstance(market_breadth, dict):
+        market_breadth = {
+            "tracked_symbols": len(symbol_scope),
+            "context_symbols": 1,
+            "missing_symbols": [item for item in symbol_scope if item != market_snapshot.symbol.upper()],
+            "stressed_symbols": [market_snapshot.symbol.upper()] if observed_risk_flags else [],
+            "directional_bias": "unknown",
+            "breadth_regime": "single_symbol_fallback",
+        }
+    if not isinstance(symbol_contexts, list) or not symbol_contexts:
+        symbol_contexts = [current_symbol_context]
+    runtime_compact = {
+        "operating_state": runtime_state.get("operating_state"),
+        "protection_recovery_status": runtime_state.get("protection_recovery_status"),
+        "protection_recovery_active": bool(runtime_state.get("protection_recovery_active", False)),
+        "protection_recovery_failure_count": runtime_state.get("protection_recovery_failure_count"),
+        "missing_protection_symbols": limited_strings(runtime_state.get("missing_protection_symbols")),
+        "protection_verification_blocked_symbols": limited_strings(
+            runtime_state.get("protection_verification_blocked_symbols")
+        ),
+        "sync_freshness_summary": compact_sync_summary(runtime_state.get("sync_freshness_summary")),
+    }
+    candidate_selection = runtime_state.get("candidate_selection_summary")
+    if isinstance(candidate_selection, dict):
+        runtime_compact["candidate_selection_summary"] = {
+            key: candidate_selection.get(key)
+            for key in (
+                "status",
+                "breadth_regime",
+                "directional_bias",
+                "selected_symbols",
+                "rejected_symbols",
+                "entry_candidates",
+            )
+            if has_value(candidate_selection.get(key))
+        }
+    drawdown_state = runtime_state.get("drawdown_state_summary")
+    if isinstance(drawdown_state, dict):
+        runtime_compact["drawdown_state_summary"] = {
+            key: drawdown_state.get(key)
+            for key in (
+                "current_drawdown_state",
+                "drawdown_depth_pct",
+                "recent_net_pnl",
+                "recent_net_pnl_pct",
+                "consecutive_losses",
+            )
+            if has_value(drawdown_state.get(key))
+        }
+
     return {
         "advisor_role": "market_settings_advisor",
         "authority": {
@@ -4063,26 +4962,20 @@ def build_market_settings_advisor_input_payload(
             "allowed_new_entry_policies": list(MARKET_SETTINGS_ALLOWED_NEW_ENTRY_POLICIES),
             "mode": "shadow",
         },
-        "market_snapshot": market_snapshot.model_dump(mode="json"),
-        "features": {
-            "symbol": features.symbol,
-            "timeframe": features.timeframe,
-            "trend_score": features.trend_score,
-            "volatility_pct": features.volatility_pct,
-            "volume_ratio": features.volume_ratio,
-            "rsi": features.rsi,
-            "atr_pct": features.atr_pct,
-            "momentum_score": features.momentum_score,
-            "regime": features.regime.model_dump(mode="json"),
-            "breakout": features.breakout.model_dump(mode="json"),
-            "derivatives": features.derivatives.model_dump(mode="json"),
-            "event_context": features.event_context.model_dump(mode="json"),
-            "data_quality_flags": list(features.data_quality_flags),
+        "compact_market_context": {
+            "context_version": "market_settings_advisor_compact_v2",
+            "scope": "global_risk_profile",
+            "representative_symbol": market_snapshot.symbol.upper(),
+            "symbol_scope": symbol_scope,
+            "timeframe": market_snapshot.timeframe,
+            "snapshot_time": market_snapshot.snapshot_time.isoformat(),
+            "market_breadth": market_breadth,
+            "symbols": symbol_contexts,
+            "runtime_state": runtime_compact,
         },
-        "runtime_state": dict(runtime_state),
         "settings_policy": dict(settings_policy),
         "observed_risk_flags": list(observed_risk_flags),
-        "previous_recommendation": previous_recommendation or None,
+        "previous_recommendation": compact_previous(previous_recommendation),
     }
 
 
@@ -4165,8 +5058,9 @@ class MarketSettingsAdvisorAgent:
         runtime_state: dict[str, Any],
         settings_policy: dict[str, Any],
         observed_risk_flags: list[str],
-        previous_recommendation: dict[str, Any] | None = None,
         use_ai: bool,
+        previous_recommendation: dict[str, Any] | None = None,
+        universe_context: dict[str, Any] | None = None,
     ) -> tuple[AIMarketSettingsRecommendation | None, str, dict[str, Any]]:
         generated_at = datetime.now(UTC)
         ttl_seconds = int(settings_policy.get("recommendation_ttl_seconds") or 900)
@@ -4190,6 +5084,7 @@ class MarketSettingsAdvisorAgent:
             settings_policy=settings_policy,
             observed_risk_flags=observed_risk_flags,
             previous_recommendation=previous_recommendation,
+            universe_context=universe_context,
         )
         if not use_ai or self.provider is None:
             return baseline, "deterministic-mock", {

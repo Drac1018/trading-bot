@@ -132,7 +132,7 @@ Invoke-WebRequest -Method POST http://127.0.0.1:8000/api/cycles/run -UseBasicPar
 ### cadence delay
 
 - 증상: 서비스는 정상이지만 반영이 늦음
-- 조치: cadence를 1분 수준으로 낮추고 다음 발표 전부터 유지
+- 조치: market 1분, decision 5분 이하로 맞추고 다음 발표 전부터 유지
 
 ## 한 줄 요약
 

@@ -7,9 +7,98 @@ import {
 } from "../lib/ui-copy";
 import { buildTableRowKeys, splitTableColumns, type TableRow } from "../lib/data-table";
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function formatNumber(value: unknown, digits = 2) {
+  const numeric = asNumber(value);
+  return numeric === null ? "-" : numeric.toLocaleString("ko-KR", { maximumFractionDigits: digits });
+}
+
+function formatUsd(value: unknown) {
+  const numeric = asNumber(value);
+  return numeric === null ? "-" : `$${numeric.toFixed(6)}`;
+}
+
+function formatBps(value: unknown) {
+  const numeric = asNumber(value);
+  return numeric === null ? "-" : `${formatNumber(numeric, 2)} bps`;
+}
+
+function decisionQualityStatusLabel(status: unknown) {
+  const labels: Record<string, string> = {
+    filled: "체결 확인",
+    ordered: "주문 제출",
+    risk_allowed_no_order: "리스크 통과, 주문 없음",
+    risk_blocked: "리스크 차단",
+    risk_checked_pending: "리스크 확인 중",
+    pending_risk: "리스크 대기",
+    not_actionable_hold: "관망",
+    no_ai_provider: "AI 미호출",
+  };
+  const key = typeof status === "string" ? status : "";
+  return labels[key] ?? formatDisplayValue(key || "unknown");
+}
+
+function pnlConfidenceLabel(value: unknown) {
+  const labels: Record<string, string> = {
+    exchange_trade_linked: "거래소 체결 연결",
+    local_execution_row: "로컬 execution 기준",
+    order_without_fill: "주문 있음, 체결 미확인",
+    not_realized: "실현 손익 없음",
+    unknown: "확인 필요",
+  };
+  const key = typeof value === "string" ? value : "";
+  return labels[key] ?? formatDisplayValue(key || "unknown");
+}
+
+function renderDecisionQuality(value: unknown) {
+  const quality = asRecord(value);
+  if (!quality || Object.keys(quality).length === 0) {
+    return <span className="text-slate-400">-</span>;
+  }
+  const riskAllowed = quality.risk_allowed;
+  const riskLabel = riskAllowed === true ? "리스크 통과" : riskAllowed === false ? "리스크 차단" : "리스크 미확인";
+  const rows = [
+    ["AI 결과", decisionQualityStatusLabel(quality.ai_usefulness_status)],
+    ["AI 비용", formatUsd(quality.ai_known_cost_usd)],
+    ["토큰", formatNumber(quality.ai_total_tokens, 0)],
+    ["net edge", formatBps(quality.net_expected_edge_bps)],
+    ["edge", `${formatBps(quality.expected_edge_bps)} / 비용 ${formatBps(quality.expected_total_cost_bps)}`],
+    ["PnL 신뢰도", pnlConfidenceLabel(quality.pnl_data_confidence)],
+    ["리스크", riskLabel],
+  ];
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      {rows.map(([label, item]) => (
+        <div key={label} className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">{label}</p>
+          <p className="mt-1 break-words text-xs font-semibold text-slate-900">{item}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function renderValue(value: unknown, key?: string) {
   if (value === null || value === undefined) {
     return <span className="text-slate-400">-</span>;
+  }
+
+  if (key === "decision_quality") {
+    return renderDecisionQuality(value);
   }
 
   if (Array.isArray(value)) {

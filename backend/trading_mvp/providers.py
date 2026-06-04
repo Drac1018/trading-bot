@@ -15,6 +15,7 @@ class ProviderResult:
     output: dict[str, Any]
     usage: dict[str, int] | None = None
     request_id: str | None = None
+    model: str | None = None
 
 
 class StructuredModelProvider(Protocol):
@@ -75,7 +76,7 @@ class OpenAIProvider:
             "Return only valid JSON that strictly matches the provided schema. "
             "Do not wrap JSON in markdown."
         )
-        if role in {"trading_decision", "market_settings_advisor"} and instructions:
+        if role in {"trading_decision", "market_settings_advisor", "position_exit_review"} and instructions:
             return f"{instructions}\n\n{schema_contract}"
         return schema_contract
 
@@ -202,6 +203,7 @@ class OpenAIProvider:
             output=parsed,
             usage=usage,
             request_id=payload_json.get("id"),
+            model=str(payload_json.get("model") or self.model),
         )
 
     def test_connection(self) -> dict[str, Any]:

@@ -11,16 +11,18 @@ import {
   type SyncScopeStatus,
 } from "../lib/sync-freshness";
 import { type EventOperatorControlPayload } from "../lib/event-operator-control.js";
+import { serviceGateDetailSummary, serviceGateDisplayReasonCodes } from "../lib/operator-control";
 import { buildOperatorDetailSections, type OperatorDetailTone } from "../lib/operator-symbol-detail";
 import {
   describeReasonCode,
   describeReasonCodeInContext,
   isEntryWaitReasonCodeInContext,
+  isReasonCode,
   lookupRiskReasonCode,
 } from "../lib/risk-reason-copy.js";
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const refreshIntervalMs = 15000;
+const apiBaseUrl = "";
+const refreshIntervalMs = 60000;
 const rolloutModeOptions = ["paper", "shadow", "live_dry_run", "limited_live", "full_live"] as const;
 
 type RolloutMode = (typeof rolloutModeOptions)[number];
@@ -52,6 +54,7 @@ type PerformanceWindow = {
   };
   cost_breakdown?: ProfitabilityCostBreakdown;
   entry_quality?: Record<string, EntryQualityBreakdown>;
+  limited_live_readiness?: LimitedLiveReadiness;
   rationale_winners: PerformanceEntry[];
   rationale_losers: PerformanceEntry[];
   top_regimes: PerformanceEntry[];
@@ -85,8 +88,14 @@ export type ProfitabilityCostBreakdown = {
   net_pnl: number;
   net_pnl_excluding_funding: number;
   net_pnl_including_funding: number;
-  signed_slippage_bps_avg: number;
-  adverse_slippage_bps_avg: number;
+  signed_slippage_bps_avg: number | null;
+  adverse_slippage_bps_avg: number | null;
+  slippage_data_status?: string | null;
+  slippage_data_reason?: string | null;
+  funding_sync_status?: string | null;
+  funding_sync_reason?: string | null;
+  slippage_sample_count?: number | null;
+  missing_slippage_sample_count?: number | null;
   entry_count: number;
   marketable_entry_count: number;
   passive_entry_count: number;
@@ -95,7 +104,31 @@ export type ProfitabilityCostBreakdown = {
   fee_to_gross_pnl_ratio: number | null;
   cost_to_gross_pnl_ratio: number | null;
   total_cost: number;
-  warning_codes: string[];
+  warning_codes?: string[] | null;
+  basis: string;
+};
+
+export type LimitedLiveReadiness = {
+  window_label: string;
+  window_hours: number;
+  status: string;
+  reason_codes: string[];
+  read_only: boolean;
+  recent_candidate_events: number;
+  ai_calls_total: number;
+  ai_calls_provider_invoked: number;
+  ai_calls_skipped_preai: number;
+  actual_entries: number;
+  fills: number;
+  expectancy_after_fees: number;
+  net_pnl_after_fees: number;
+  max_drawdown: number;
+  consecutive_losses: number;
+  protection_failure_count: number;
+  unknown_submission_count: number;
+  stale_incomplete_data_block_count: number;
+  ai_filter_observed_value_net_pnl_after_fees: number | null;
+  thresholds: Record<string, number>;
   basis: string;
 };
 
@@ -115,7 +148,32 @@ type AuditEvent = {
   created_at: string;
 };
 
+export type ExchangeSyncDiagnostics = {
+  workflow?: string;
+  lookback_hours?: number;
+  status?: string | null;
+  current_block_state?: string | null;
+  currently_blocking_new_entries?: boolean;
+  currently_permission_blocked?: boolean;
+  active_reason_codes?: string[];
+  failure_count_24h?: number;
+  permission_failure_count_24h?: number;
+  success_count_24h?: number;
+  latest_status?: string | null;
+  latest_run_at?: string | null;
+  latest_success_at?: string | null;
+  latest_failure_at?: string | null;
+  latest_failure_reason_code?: string | null;
+  latest_failure_summary?: string | null;
+  recovered_after_latest_failure?: boolean;
+  recovery_basis?: string | null;
+};
+
 type ControlStatusSummary = {
+  exchange_can_trade?: boolean | null;
+  exchange_can_trade_known?: boolean;
+  exchange_can_trade_source?: string;
+  exchange_can_trade_checked_at?: string | null;
   exchange_connectivity_state: string;
   rollout_mode: RolloutMode;
   exchange_submit_allowed: boolean;
@@ -131,6 +189,44 @@ type ControlStatusSummary = {
   blocked_reason_codes: string[];
   degraded_reason_codes: string[];
   protection_reason_codes: string[];
+  block_scope?: string;
+  candidate_hold_reason_codes?: string[];
+  global_block_reason_codes?: string[];
+  approval_control_blocked_reasons?: string[];
+  exchange_sync_diagnostics?: ExchangeSyncDiagnostics | null;
+  live_arm_disabled?: boolean;
+  live_arm_disable_reason_code?: string | null;
+  live_arm_disable_reason?: string | null;
+};
+
+type PsychologySceneReview = {
+  market_psychology?: string | null;
+  psychology_bias?: string | null;
+  scene_scenario?: string | null;
+  scene_type?: string | null;
+  entry_choreography?: string | null;
+  preferred_entry_timing?: string | null;
+  confirmation_cues?: string[];
+  invalidation_cues?: string[];
+  reason_codes?: string[];
+  summary?: string | null;
+  execution_boundary?: string | null;
+};
+
+type PositionExitReview = {
+  recommendation?: string | null;
+  confidence?: number | null;
+  profit_take_bias?: string | null;
+  runner_state?: string | null;
+  exit_urgency?: string | null;
+  rationale?: string | null;
+  summary?: string | null;
+  reason_codes?: string[];
+  profit_protection_cues?: string[];
+  runner_invalidation_cues?: string[];
+  data_quality_notes?: string[];
+  advisory_only?: boolean | null;
+  execution_boundary?: string | null;
 };
 
 type OperatorDecisionSnapshot = {
@@ -167,12 +263,15 @@ type OperatorDecisionSnapshot = {
   event_risk_acknowledgement: string | null;
   confidence_penalty_reason: string | null;
   scenario_note: string | null;
+  psychology_scene_review?: PsychologySceneReview | null;
+  psychology_scene_performance?: Record<string, unknown>;
   decision_reference?: {
     display_gap?: boolean | null;
     display_gap_reason?: string | null;
     market_snapshot_at?: string | null;
     market_snapshot_id?: number | null;
   } | null;
+  hold_diagnostic?: Record<string, unknown>;
 };
 
 type OperatorRiskSnapshot = {
@@ -189,6 +288,9 @@ type OperatorRiskSnapshot = {
   adjustment_reason_codes: string[];
   degraded_reason_codes: string[];
   protection_reason_codes: string[];
+  block_scope?: string | null;
+  candidate_hold_reason_codes?: string[];
+  global_block_reason_codes?: string[];
   blocked_reason: string | null;
   degraded_reason: string | null;
   approval_required_reason: string | null;
@@ -262,6 +364,7 @@ type OperatorPositionSummary = {
   ai_stop_management_allowed: boolean | null;
   hard_stop_active: boolean | null;
   stop_widening_allowed: boolean | null;
+  position_exit_review?: PositionExitReview | null;
 };
 
 type OperatorCandidateSelectionSnapshot = {
@@ -312,6 +415,7 @@ type OperatorPendingEntryPlanSnapshot = {
   idempotency_key?: string | null;
   last_watch_at?: string | null;
   last_watch_snapshot_id?: number | null;
+  psychology_scene_review?: PsychologySceneReview | null;
   trigger_details?: Record<string, unknown>;
 };
 
@@ -381,6 +485,7 @@ export type OperatorDashboardPayload = {
     approval_expires_at: string | null;
     trading_paused: boolean;
     operating_state: string;
+    guard_mode_reason_code: string | null;
     guard_mode_reason_message: string | null;
     pause_reason_code: string | null;
     pause_origin: string | null;
@@ -394,6 +499,7 @@ export type OperatorDashboardPayload = {
     latest_blocked_reasons: string[];
     control_status_summary?: ControlStatusSummary | null;
     sync_freshness_summary: Record<string, SyncScopeStatus>;
+    exchange_sync_diagnostics: ExchangeSyncDiagnostics;
     market_freshness_summary: Record<string, unknown>;
     protection_recovery_status: string;
     protected_positions: number;
@@ -404,9 +510,22 @@ export type OperatorDashboardPayload = {
     cumulative_pnl: number;
     account_sync_summary: Record<string, unknown>;
     exposure_summary: Record<string, unknown>;
+    limited_live_readiness: LimitedLiveReadiness;
+    service_gate_gate_clear?: boolean | null;
+    service_gate_blockers?: string[] | null;
+    service_gate_root_cause_codes?: string[] | null;
+    service_gate_counts?: Record<string, number> | null;
+    service_gate_recent_scheduler_non_success?: Array<Record<string, unknown>> | null;
+    service_gate_recent_health_errors?: Array<Record<string, unknown>> | null;
+    service_gate_redis_cache?: Record<string, unknown> | null;
+    stale_pending_entry_plan_count: number;
+    stale_pending_entry_plans: Array<Record<string, unknown>>;
+    triggered_terminal_history_entry_plan_count: number;
     scheduler_status: string | null;
     scheduler_window: string | null;
+    scheduler_last_run_at: string | null;
     scheduler_next_run_at: string | null;
+    scheduler_freshness_summary: Record<string, unknown>;
     deterministic_market_profile: string | null;
     ai_recommended_profile: string | null;
     ai_recommendation_id: string | null;
@@ -464,6 +583,11 @@ const operatingStateLabelMap: Record<string, string> = {
 const reasonCodeLabelMap: Record<string, string> = {
   TRADING_PAUSED: "시스템 가드 모드",
   HOLD_DECISION: "보류 판단",
+  ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "일일 AI 토큰 예산 소진",
+  SOFT_SIGNAL_AI_REVIEW: "약한 후보 AI 검토 대상",
+  DERIVATIVES_ALIGNMENT_HEADWIND: "파생시장 정합성 부족",
+  BREAKOUT_OI_SPREAD_FILTER: "돌파 OI/스프레드 조건 부족",
+  BREAKOUT_OI_NOT_EXPANDING: "돌파 OI 확장 없음",
   LIVE_APPROVAL_REQUIRED: "실거래 승인 창 닫힘",
   LIVE_TRADING_DISABLED: "실거래 비활성화",
   PROTECTION_REQUIRED: "보호 주문 복구 필요",
@@ -475,6 +599,7 @@ const reasonCodeLabelMap: Record<string, string> = {
   POSITION_STATE_STALE: "포지션 정보가 늦게 들어오고 있습니다.",
   OPEN_ORDERS_STATE_STALE: "열린 주문 정보가 늦게 들어오고 있습니다.",
   PROTECTION_STATE_UNVERIFIED: "보호 주문 검증 불가",
+  FULL_LIVE_SYNC_STALE: "full_live 승인 전 거래소 동기화 필요",
 };
 
 const syncScopeLabelMap: Record<string, string> = {
@@ -768,6 +893,11 @@ function translateAiSkipReason(value: string | null | undefined) {
     AI_DISABLED: "AI 사용이 꺼져 있습니다.",
     AI_FAILURE_BACKOFF: "직전 오류 뒤 잠시 쉬는 중입니다.",
     AI_COOLDOWN_ACTIVE: "너무 자주 호출하지 않도록 잠시 기다리는 중입니다.",
+    ROLE_DAILY_TOKEN_BUDGET_EXHAUSTED: "trading_decision 일일 AI 토큰 예산이 소진되어 deterministic 판단으로 처리됐습니다.",
+    SOFT_SIGNAL_REVIEW_COOLDOWN_ACTIVE: "약한 후보 전환감시 AI 쿨다운 중입니다.",
+    SOFT_SIGNAL_REVIEW_SUPPRESSED_WEAK_CANDIDATE: "약한 관망 후보라 AI 호출 전 억제했습니다.",
+    SOFT_SIGNAL_REVIEW_NO_MATERIAL_CHANGE: "직전 전환감시와 변화가 작아 AI 호출을 생략했습니다.",
+    AI_CYCLE_BUDGET_EXHAUSTED: "이번 사이클의 신규 후보 AI 예산을 모두 사용해 검토를 생략했습니다.",
     PROTECTION_REVIEW_DETERMINISTIC_ONLY: "보호 주문 점검은 자동 안전 규칙만 사용합니다.",
   };
   return labels[value] ?? value;
@@ -1209,7 +1339,14 @@ function rolloutModeLabel(mode: RolloutMode) {
 
 function resolveControlStatusSummary(control: OperatorDashboardPayload["control"]): ControlStatusSummary {
   const summary = control.control_status_summary;
+  const serviceGateReasonCodes = serviceGateDisplayReasonCodes(control);
+  const currentCycleReasons = summary?.blocked_reasons_current_cycle ?? control.latest_blocked_reasons;
+  const blockedReasonCodes = summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? [];
   return {
+    exchange_can_trade: summary?.exchange_can_trade ?? null,
+    exchange_can_trade_known: summary?.exchange_can_trade_known ?? false,
+    exchange_can_trade_source: summary?.exchange_can_trade_source ?? "unknown",
+    exchange_can_trade_checked_at: summary?.exchange_can_trade_checked_at ?? null,
     exchange_connectivity_state:
       summary?.exchange_connectivity_state ?? control.exchange_connectivity_state ?? "unknown",
     rollout_mode: summary?.rollout_mode ?? control.rollout_mode,
@@ -1222,14 +1359,98 @@ function resolveControlStatusSummary(control: OperatorDashboardPayload["control"
     paused: summary?.paused ?? control.trading_paused,
     degraded: summary?.degraded ?? control.operating_state === "DEGRADED_MANAGE_ONLY",
     risk_allowed: summary?.risk_allowed ?? null,
-    blocked_reasons_current_cycle: dedupeReasons(
-      summary?.blocked_reasons_current_cycle ?? control.latest_blocked_reasons,
-    ),
-    blocked_reason_codes: dedupeReasons(summary?.blocked_reason_codes ?? control.blocked_reason_codes ?? []),
+    blocked_reasons_current_cycle: dedupeReasons([...serviceGateReasonCodes, ...currentCycleReasons]),
+    blocked_reason_codes: dedupeReasons([...serviceGateReasonCodes, ...blockedReasonCodes]),
     degraded_reason_codes: dedupeReasons(summary?.degraded_reason_codes ?? control.degraded_reason_codes ?? []),
     protection_reason_codes: dedupeReasons(
       summary?.protection_reason_codes ?? control.protection_reason_codes ?? [],
     ),
+    approval_control_blocked_reasons: dedupeReasons(summary?.approval_control_blocked_reasons ?? []),
+    exchange_sync_diagnostics:
+      summary?.exchange_sync_diagnostics ?? control.exchange_sync_diagnostics ?? {},
+    live_arm_disabled: summary?.live_arm_disabled ?? false,
+    live_arm_disable_reason_code: summary?.live_arm_disable_reason_code ?? null,
+    live_arm_disable_reason: summary?.live_arm_disable_reason ?? null,
+  };
+}
+
+function exchangeSyncDiagnostics(control: OperatorDashboardPayload["control"]): ExchangeSyncDiagnostics {
+  return control.control_status_summary?.exchange_sync_diagnostics ?? control.exchange_sync_diagnostics ?? {};
+}
+
+function diagnosticCount(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function exchangeSyncGateCard(control: OperatorDashboardPayload["control"]) {
+  const diagnostics = exchangeSyncDiagnostics(control);
+  const status = diagnostics.status ?? "unknown";
+  const blockState = diagnostics.current_block_state ?? "unknown";
+  const failureCount = diagnosticCount(diagnostics.failure_count_24h);
+  const permissionFailureCount = diagnosticCount(diagnostics.permission_failure_count_24h);
+  const latestFailureAt = formatDateTime(diagnostics.latest_failure_at);
+  const latestSuccessAt = formatDateTime(diagnostics.latest_success_at);
+  const reason =
+    isReasonCode(diagnostics.latest_failure_reason_code, "EXCHANGE_AUTH_PERMISSION_REJECTED")
+      ? "권한 거부"
+      : diagnostics.latest_failure_reason_code ?? "실패";
+
+  if (diagnostics.currently_blocking_new_entries || status === "blocked" || blockState === "currently_blocked") {
+    return {
+      title: "거래소 동기화 진단",
+      value: "현재 차단",
+      hint: `최근 실패 ${latestFailureAt} / ${reason} / 24시간 실패 ${failureCount}건, 권한 ${permissionFailureCount}건`,
+      kind: "danger" as const,
+    };
+  }
+  if (status === "recovered" || diagnostics.recovered_after_latest_failure) {
+    return {
+      title: "거래소 동기화 진단",
+      value: "복구됨",
+      hint: `최근 실패 이후 ${latestSuccessAt} 성공 / 권한 실패 이력 ${permissionFailureCount}건`,
+      kind: "good" as const,
+    };
+  }
+  if (status === "healthy") {
+    return {
+      title: "거래소 동기화 진단",
+      value: "정상",
+      hint: `최근 성공 ${latestSuccessAt} / 24시간 실패 ${failureCount}건`,
+      kind: "good" as const,
+    };
+  }
+  return {
+    title: "거래소 동기화 진단",
+    value: "확인 중",
+    hint: "exchange_sync_cycle 실행 이력 또는 sync freshness 근거가 부족합니다.",
+    kind: "neutral" as const,
+  };
+}
+
+function serviceGateCard(control: OperatorDashboardPayload["control"]) {
+  const reasons = serviceGateDisplayReasonCodes(control);
+  const detail = serviceGateDetailSummary(control);
+  const reasonSuffix = reasons.length > 0 ? ` / reasons ${reasons.join(", ")}` : "";
+  const hasClearConflict = control.service_gate_gate_clear === true && reasons.length > 0;
+  return {
+    title: "service-gate",
+    value:
+      control.service_gate_gate_clear === true
+        ? hasClearConflict
+          ? "확인 필요"
+          : "정상"
+        : control.service_gate_gate_clear === false
+          ? "차단"
+          : "확인 중",
+    hint: `${detail}${reasonSuffix}`,
+    kind:
+      control.service_gate_gate_clear === false
+        ? ("danger" as const)
+        : hasClearConflict
+          ? ("warn" as const)
+          : control.service_gate_gate_clear === true
+            ? ("good" as const)
+            : ("neutral" as const),
   };
 }
 
@@ -1279,6 +1500,8 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
               ? ("good" as const)
               : ("neutral" as const),
     },
+    exchangeSyncGateCard(control),
+    serviceGateCard(control),
     {
       title: "앱 실거래 준비",
       value: summary.app_live_armed ? "준비됨" : "해제됨",
@@ -1339,13 +1562,33 @@ function controlGateCards(control: OperatorDashboardPayload["control"]) {
   ];
 }
 
-async function fetchPayload(): Promise<OperatorDashboardPayload> {
-  const response = await fetch(`${apiBaseUrl}/api/dashboard/operator`, { cache: "no-store" });
+function operatorDashboardRefreshPath(pathname: string | null) {
+  if (pathname?.includes("/dashboard/market")) {
+    return "/api/dashboard/operator?view=market";
+  }
+  if (pathname?.includes("/dashboard/decisions")) {
+    return "/api/dashboard/operator?view=decision";
+  }
+  if (pathname?.includes("/dashboard/scheduler")) {
+    return "/api/dashboard/operator?view=scheduler";
+  }
+  if (pathname?.includes("/dashboard/risk")) {
+    return "/api/dashboard/operator?view=risk";
+  }
+  return "/api/dashboard/operator?view=home";
+}
+
+async function fetchPayload(pathname: string | null): Promise<OperatorDashboardPayload> {
+  const response = await fetch(`${apiBaseUrl}${operatorDashboardRefreshPath(pathname)}`, { cache: "no-store" });
   if (!response.ok) {
     const body = await response.text();
     throw new Error(body || response.statusText);
   }
   return (await response.json()) as OperatorDashboardPayload;
+}
+
+function shouldRefreshInBrowser() {
+  return typeof document === "undefined" || document.visibilityState === "visible";
 }
 
 function filteredBlockedReasons(symbol: OperatorSymbolSummary) {
@@ -1646,6 +1889,14 @@ function GlobalOperatorSummary({
               control.scheduler_window || control.scheduler_status
                 ? `${control.scheduler_window ?? "-"} / ${translateSchedulerStatus(control.scheduler_status)}`
                 : "-",
+            ],
+            [
+              "자동 점검 최신성",
+              recordString(control.scheduler_freshness_summary, "status") === "stale"
+                ? `지연: ${recordString(control.scheduler_freshness_summary, "message") || "-"}`
+                : recordString(control.scheduler_freshness_summary, "status") === "fresh"
+                  ? "최근 실행 확인"
+                  : "기록 없음",
             ],
             ["다음 자동 점검 예정", formatDateTime(control.scheduler_next_run_at)],
             [
@@ -2569,8 +2820,11 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
   useEffect(() => {
     let active = true;
     const refresh = async () => {
+      if (!shouldRefreshInBrowser()) {
+        return;
+      }
       try {
-        const next = await fetchPayload();
+        const next = await fetchPayload(pathname);
         if (!active) {
           return;
         }
@@ -2585,11 +2839,19 @@ export function OverviewDashboard({ initial }: { initial: OperatorDashboardPaylo
       }
     };
     const interval = window.setInterval(() => void refresh(), refreshIntervalMs);
+    void refresh();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       active = false;
       window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, []);
+  }, [pathname]);
 
   const operator = payload;
   const selectedSymbol = useMemo(

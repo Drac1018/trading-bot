@@ -22,7 +22,10 @@
 
 변경 범위에 맞춰 아래를 우선 실행:
 
-* `python -m pytest -q`
-* `python -m ruff check backend tests workers`
-* `python -m mypy backend\\trading_mvp`
-* 필요 시 `python -m trading_mvp.migrate`
+* 좁은 변경: `.\.venv\Scripts\python.exe -m compileall -q backend\trading_mvp`
+* 좁은 변경: `.\.venv\Scripts\python.exe -m ruff check backend tests workers`
+* 좁은 변경: `.\.venv\Scripts\python.exe -m pytest -q <관련 테스트>`
+* 넓은 변경: `.\.venv\Scripts\python.exe -m pytest`
+* 타입 경계 변경 시: `.\.venv\Scripts\python.exe -m mypy backend\trading_mvp`
+* 모델 변경 시: Alembic revision/upgrade 경로 또는 `python -m trading_mvp.migrate` 영향 확인
+* 제품화/외부 운영 변경 시: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_productization_checks.ps1`

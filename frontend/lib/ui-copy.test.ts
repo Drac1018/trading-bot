@@ -127,6 +127,32 @@ test("ui-copy separates AI review reason from market signal summary", async () =
   assert.equal(formatDisplayValue("entry_candidate_review"), "신규 진입 후보 검토");
   assert.equal(formatDisplayValue("ENTRY_CANDIDATE_SELECTED"), "신규 진입 후보 선정");
   assert.equal(formatDisplayValue("ENTRY_CANDIDATE_WEAK_VOLUME_PREAI"), "거래량 부족으로 AI 검토 생략");
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF"),
+    "반복 중립 후보라 AI 검토 생략",
+  );
+  assert.equal(formatDisplayValue("ENTRY_CANDIDATE_NEUTRAL_CONTEXT_PREAI"), "중립 신호라 AI 검토 생략");
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_LOW_ACTIONABILITY_HOLD_BACKOFF"),
+    "반복 저효용 후보라 AI 검토 생략",
+  );
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_ORDER_PATH_NOT_ACTIONABLE"),
+    "주문 경로 미준비로 AI 검토 생략",
+  );
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_ACTIVE_PENDING_PLAN_PREAI"),
+    "기존 대기 진입안으로 AI 검토 생략",
+  );
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_INCOMPLETE_TRADE_PLAN_PREAI"),
+    "진입 구조 불완전으로 AI 검토 생략",
+  );
+  assert.equal(
+    formatDisplayValue("ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN"),
+    "최근 같은 장면의 AI hold 판단 재사용",
+  );
+  assert.equal(formatDisplayValue("AI_ENTRY_OUTPUT_INCOMPLETE"), "AI 진입안 구조 불완전으로 hold 정규화");
   assert.equal(formatDisplayValue("MACRO_EVENT_IMMINENT"), "주요 경제 이벤트 임박으로 신규 진입 보수화");
   assert.equal(formatDisplayValue("MACRO_EVENT_RISK_WINDOW_ACTIVE"), "거시 이벤트 리스크 구간");
 });

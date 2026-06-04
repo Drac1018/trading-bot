@@ -87,6 +87,7 @@ DEGRADED_REASON_CODES = {
     "BINANCE_REST_MUTATING_ORDER_FAILED",
     "BINANCE_REST_AUTH_PERMISSION_REJECTED",
     "EXCHANGE_AUTH_PERMISSION_REJECTED",
+    "EXCHANGE_CAN_TRADE_UNKNOWN",
     "DAILY_LOSS_LIMIT_REACHED",
     "MAX_CONSECUTIVE_LOSSES_REACHED",
 }
@@ -95,6 +96,7 @@ SYNC_STATE_DETAIL_KEY = "exchange_sync"
 EXECUTION_GUARD_DETAIL_KEY = "execution_guard"
 USER_STREAM_DETAIL_KEY = "user_stream"
 MARKET_STREAM_DETAIL_KEY = MARKET_STREAM_RUNTIME_DETAIL_KEY
+MARKET_STREAM_PERSIST_TRANSIENT_KEYS = {"freshness_seconds"}
 RECONCILIATION_DETAIL_KEY = "reconciliation"
 CANDIDATE_SELECTION_DETAIL_KEY = "candidate_selection"
 DRAWDOWN_STATE_DETAIL_KEY = "drawdown_state"
@@ -143,6 +145,7 @@ EXCHANGE_CONNECTIVITY_DEGRADED_REASON_CODES = {
     BINANCE_REST_MUTATING_FAILURE_REASON_CODE,
     BINANCE_REST_AUTH_PERMISSION_REASON_CODE,
     "EXCHANGE_AUTH_PERMISSION_REJECTED",
+    "EXCHANGE_CAN_TRADE_UNKNOWN",
 }
 
 
@@ -420,14 +423,32 @@ def get_user_stream_detail(settings_row: Setting) -> dict[str, Any]:
     }
 
 
+def public_user_stream_detail(user_stream_summary: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = dict(user_stream_summary or {})
+    listen_key = str(payload.pop("listen_key", "") or "").strip()
+    payload["listen_key_present"] = bool(listen_key)
+    return payload
+
+
 def get_market_stream_detail(settings_row: Setting) -> dict[str, Any]:
     detail = get_runtime_detail(settings_row)
     return build_market_stream_state(_as_dict(detail.get(MARKET_STREAM_DETAIL_KEY)))
 
 
+def _market_stream_persisted_state(payload: dict[str, Any]) -> dict[str, Any]:
+    state = build_market_stream_state(payload)
+    for key in MARKET_STREAM_PERSIST_TRANSIENT_KEYS:
+        state.pop(key, None)
+    return state
+
+
 def replace_market_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
-    runtime_detail[MARKET_STREAM_DETAIL_KEY] = build_market_stream_state(payload)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
+    next_state = _market_stream_persisted_state(payload)
+    current_state = _market_stream_persisted_state(_as_dict(runtime_detail.get(MARKET_STREAM_DETAIL_KEY)))
+    if current_state == next_state:
+        return
+    runtime_detail[MARKET_STREAM_DETAIL_KEY] = next_state
     _write_runtime_detail(settings_row, runtime_detail)
 
 
@@ -458,7 +479,7 @@ def set_user_stream_detail(
     listen_key_rotate_status: str | None = None,
     listen_key_rotate_error: str | None = None,
 ) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     payload = get_user_stream_detail(settings_row)
     if status is not None:
         payload["status"] = status
@@ -511,7 +532,7 @@ def set_user_stream_detail(
 
 
 def replace_user_stream_detail(settings_row: Setting, payload: dict[str, Any]) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     runtime_detail[USER_STREAM_DETAIL_KEY] = dict(payload)
     _write_runtime_detail(settings_row, runtime_detail)
 
@@ -615,7 +636,7 @@ def set_reconciliation_detail(
     unresolved_submission_symbols: list[str] | None = None,
     unresolved_submissions: list[dict[str, Any]] | None = None,
 ) -> None:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     payload = get_reconciliation_detail(settings_row)
     if status is not None:
         payload["status"] = status
@@ -786,7 +807,7 @@ def get_binance_rest_entry_block_reason_code(
 
 
 def _write_binance_rest_detail(settings_row: Setting, payload: dict[str, Any]) -> dict[str, Any]:
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     runtime_detail[BINANCE_REST_DETAIL_KEY] = payload
     _write_runtime_detail(settings_row, runtime_detail)
     return get_binance_rest_detail(settings_row)
@@ -1292,7 +1313,7 @@ def mark_sync_success(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     sync_detail = get_sync_state_detail(settings_row)
     now = synced_at or utcnow_naive()
     scope_detail = {
@@ -1329,7 +1350,7 @@ def mark_sync_issue(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     sync_detail = get_sync_state_detail(settings_row)
     now = observed_at or utcnow_naive()
     scope_detail = {
@@ -1364,7 +1385,7 @@ def mark_sync_skipped(
 ) -> None:
     if scope not in SYNC_SCOPES:
         raise ValueError(f"Unsupported sync scope: {scope}")
-    runtime_detail = _runtime_detail_for_write(settings_row)
+    runtime_detail = _runtime_detail_for_write(settings_row, lock=False)
     sync_detail = get_sync_state_detail(settings_row)
     now = observed_at or utcnow_naive()
     scope_detail = {

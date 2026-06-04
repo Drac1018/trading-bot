@@ -33,7 +33,7 @@ import { formatDisplayValue } from "../lib/ui-copy";
 
 export type { AuditRow } from "../lib/audit-log";
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const apiBaseUrl = "";
 const refreshMs = 20000;
 const limitOptions = [30, 50, 100] as const;
 const severityOptions = ["", "critical", "error", "warning", "info"] as const;
@@ -352,7 +352,7 @@ export function LogExplorer({
     <div className="space-y-6">
       <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
         <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">Audit Explorer</p>
-        <h2 className="mt-2 text-2xl font-semibold text-slate-950">감사 이벤트 검색</h2>
+        <h2 className="mt-2 text-2xl font-semibold text-slate-950">감사 이벤트 탐색</h2>
         <p className="mt-3 text-sm leading-7 text-slate-600">
           목록은 요약 필드만 먼저 표시하고, 원본 payload는 행을 펼쳤을 때 별도로 조회합니다.
         </p>

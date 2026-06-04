@@ -5,6 +5,12 @@ import hashlib
 
 from cryptography.fernet import Fernet, InvalidToken
 
+INSECURE_DEFAULT_SECRET_SEED = "change-me-local-dev-secret"
+
+
+def secret_seed_is_insecure(seed: str) -> bool:
+    return not seed.strip() or seed.strip() == INSECURE_DEFAULT_SECRET_SEED
+
 
 def _fernet(seed: str) -> Fernet:
     digest = hashlib.sha256(seed.encode("utf-8")).digest()

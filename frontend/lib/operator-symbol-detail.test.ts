@@ -259,6 +259,30 @@ test("buildOperatorDetailSections keeps legacy AI trigger summary usable as mark
   );
 });
 
+test("buildOperatorDetailSections translates new pre-AI skip reasons", async () => {
+  const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
+  const baseSymbol = buildSymbol();
+
+  const sections = buildOperatorDetailSections(
+    buildSymbol({
+      ai_decision: {
+        ...baseSymbol.ai_decision,
+        ai_review: null,
+        ai_review_type: null,
+        last_ai_trigger_reason: null,
+        ai_trigger_reason_codes: [],
+        ai_skip_reason: "ENTRY_CANDIDATE_AI_HOLD_FINGERPRINT_COOLDOWN",
+        last_ai_skip_reason: null,
+      },
+    }),
+  );
+
+  const aiReviewSection = sections.find((section) => section.key === "ai_review_reason");
+  assert.ok(
+    aiReviewSection?.items.some((item) => item.value === "최근 같은 장면의 AI hold 판단 재사용"),
+  );
+});
+
 test("buildOperatorDetailSections does not reuse generic decision confidence as AI event confidence", async () => {
   const { buildOperatorDetailSections } = await operatorSymbolDetailModule;
   const baseSymbol = buildSymbol();

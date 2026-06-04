@@ -614,6 +614,7 @@ class ProtectionFailureClient:
 
     def get_account_info(self):
         return {
+            "canTrade": True,
             "availableBalance": "100.0",
             "totalWalletBalance": "100.0",
             "totalUnrealizedProfit": "0.0",
@@ -832,6 +833,7 @@ class ExitWhilePausedClient:
 
     def get_account_info(self):
         return {
+            "canTrade": True,
             "availableBalance": "100.0",
             "totalWalletBalance": "100.0",
             "totalUnrealizedProfit": "0.0",
@@ -1046,6 +1048,7 @@ class TimeoutUnknownEntryClient:
 
     def get_account_info(self):
         return {
+            "canTrade": True,
             "availableBalance": "1000.0",
             "totalWalletBalance": "1000.0",
             "totalUnrealizedProfit": "0.0",
@@ -1310,6 +1313,7 @@ class EntrySuccessClient:
     def get_account_info(self):
         self.account_info_calls += 1
         return {
+            "canTrade": True,
             "availableBalance": "100.0",
             "totalWalletBalance": "100.0",
             "totalUnrealizedProfit": "0.0",
@@ -3921,6 +3925,58 @@ def test_sync_live_state_reconciles_enabled_symbols_only_and_records_one_way_map
     assert position.metadata_json["exchange_position_mode"] == "one_way"
 
 
+def test_sync_live_state_missing_cantrade_keeps_unknown_entry_blocker(monkeypatch, db_session) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+    client = StreamPrimarySyncClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: _connected_user_stream_payload(),
+    )
+
+    sync_live_state(db_session, settings_row, symbol="BTCUSDT", allow_protection_recovery=False)
+    db_session.flush()
+
+    summary = serialize_settings(settings_row)["operational_status"]["control_status_summary"]
+
+    assert summary["exchange_can_trade"] is None
+    assert summary["exchange_can_trade_known"] is False
+    assert summary["exchange_can_trade_source"] == "binance_account_info_missing_canTrade"
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in summary["blocked_reasons_current_cycle"]
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" in summary["degraded_reason_codes"]
+
+
+def test_sync_live_state_uses_account_config_cantrade_when_account_info_omits(
+    monkeypatch,
+    db_session,
+) -> None:
+    _prime_live_settings(db_session)
+    settings_row = get_or_create_settings(db_session)
+
+    class AccountConfigSyncClient(StreamPrimarySyncClient):
+        def get_account_config(self):
+            return {"canTrade": True}
+
+    client = AccountConfigSyncClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: client)
+    monkeypatch.setattr(
+        "trading_mvp.services.execution.poll_live_user_stream",
+        lambda *args, **kwargs: _connected_user_stream_payload(),
+    )
+
+    sync_live_state(db_session, settings_row, symbol="BTCUSDT", allow_protection_recovery=False)
+    db_session.flush()
+
+    summary = serialize_settings(settings_row)["operational_status"]["control_status_summary"]
+
+    assert summary["exchange_can_trade"] is True
+    assert summary["exchange_can_trade_known"] is True
+    assert summary["exchange_can_trade_source"] == "binance_account_config"
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" not in summary["blocked_reasons_current_cycle"]
+    assert "EXCHANGE_CAN_TRADE_UNKNOWN" not in summary["degraded_reason_codes"]
+
+
 def test_sync_live_state_prefetches_bulk_exchange_state_for_multi_symbol_sync(monkeypatch, db_session) -> None:
     _prime_live_settings(db_session)
     settings_row = get_or_create_settings(db_session)
@@ -4099,6 +4155,93 @@ def test_post_order_resync_updates_sync_freshness_summary(monkeypatch, db_sessio
     assert serialized["sync_freshness_summary"]["open_orders"]["stale"] is False
     assert serialized["sync_freshness_summary"]["protective_orders"]["stale"] is False
     assert serialized["sync_freshness_summary"]["protective_orders"]["last_sync_at"] is not None
+
+
+def test_execute_live_trade_blocks_entry_but_not_reduce_only_when_cantrade_unknown(
+    monkeypatch,
+    db_session,
+) -> None:
+    _prime_live_settings(db_session)
+
+    class MissingCanTradeEntryClient(EntrySuccessClient):
+        def get_account_info(self):
+            self.account_info_calls += 1
+            return {
+                "availableBalance": "100.0",
+                "totalWalletBalance": "100.0",
+                "totalUnrealizedProfit": "0.0",
+                "totalMarginBalance": "100.0",
+            }
+
+    entry_client = MissingCanTradeEntryClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: entry_client)
+
+    blocked = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=56,
+        decision=_live_decision("long"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("long"),
+    )
+    db_session.flush()
+
+    assert blocked["status"] == "blocked"
+    assert blocked["reason_codes"] == ["EXCHANGE_CAN_TRADE_UNKNOWN"]
+    assert blocked["exchange_permission"]["exchange_can_trade_source"] == "binance_account_info_missing_canTrade"
+    assert entry_client.entry_submitted is False
+
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            mode="live",
+            side="long",
+            status="open",
+            quantity=0.01,
+            entry_price=70000.0,
+            mark_price=69950.0,
+            leverage=2.0,
+            stop_loss=69000.0,
+            take_profit=72000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=-0.5,
+            metadata_json={},
+        )
+    )
+    db_session.flush()
+
+    class MissingCanTradeExitClient(ExitWhilePausedClient):
+        def get_account_info(self):
+            return {
+                "availableBalance": "100.0",
+                "totalWalletBalance": "100.0",
+                "totalUnrealizedProfit": "0.0",
+                "totalMarginBalance": "100.0",
+            }
+
+    exit_client = MissingCanTradeExitClient()
+    monkeypatch.setattr("trading_mvp.services.execution._build_client", lambda settings: exit_client)
+
+    exit_result = execute_live_trade(
+        db_session,
+        get_or_create_settings(db_session),
+        decision_run_id=57,
+        decision=_live_decision("exit"),
+        market_snapshot=_market_snapshot(),
+        risk_result=_risk_result("exit"),
+    )
+    db_session.flush()
+
+    audit_events = list(
+        db_session.scalars(
+            select(AuditEvent).where(AuditEvent.event_type == "live_execution_blocked").order_by(AuditEvent.id)
+        )
+    )
+
+    assert exit_result["status"] == "filled"
+    assert exit_result["intent_type"] == "reduce_only"
+    assert exit_client.exit_submitted is True
+    assert any(event.payload.get("reason_code") == "EXCHANGE_CAN_TRADE_UNKNOWN" for event in audit_events)
 
 
 def _protective_health_orders(case_name: str) -> list[dict[str, object]]:

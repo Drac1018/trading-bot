@@ -46,7 +46,7 @@ const navGroups: ChromeNavGroup[] = [
     label: "분석 / 추적",
     items: [
       { href: "/dashboard/analytics", label: "비용 분석", icon: "pie" },
-      { href: "/dashboard/audit", label: "감사 / 디버그", icon: "list" },
+      { href: "/dashboard/audit", label: "감사 / 원인 추적", icon: "list" },
     ],
   },
   {
@@ -195,7 +195,7 @@ export function AppChrome({ children }: { children: React.ReactNode }) {
               <Icon name="shield" className="h-8 w-8" />
             </span>
             <span>
-              <span className="block text-[11px] font-semibold tracking-[0.28em] text-slate-400">LIVE</span>
+              <span className="block text-[11px] font-semibold tracking-[0.28em] text-slate-400">실거래</span>
               <span className="block text-xl font-semibold tracking-[-0.02em] text-slate-950 sm:text-2xl">
                 거래 안전 콘솔
               </span>

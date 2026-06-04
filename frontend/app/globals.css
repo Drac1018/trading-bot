@@ -28,6 +28,13 @@ textarea {
   font: inherit;
 }
 
+input[type="checkbox"] {
+  accent-color: #2563eb;
+  flex-shrink: 0;
+  height: 1.25rem;
+  width: 1.25rem;
+}
+
 pre {
   white-space: pre-wrap;
   word-break: break-word;

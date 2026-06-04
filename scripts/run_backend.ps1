@@ -1,3 +1,7 @@
+param(
+    [string]$HostName = $(if ($env:TRADING_MVP_BACKEND_HOST) { $env:TRADING_MVP_BACKEND_HOST } else { "127.0.0.1" })
+)
+
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
@@ -86,8 +90,25 @@ function Invoke-CheckedPython {
     }
 }
 
+function Assert-BackendHostNotPublic {
+    param([string]$HostName)
+
+    $normalizedHost = $HostName.Trim()
+    $allowPublicBind = $env:TRADING_MVP_ALLOW_PUBLIC_BACKEND_BIND -in @("1", "true", "TRUE", "True", "yes", "YES", "Yes", "on", "ON", "On")
+    if ($normalizedHost -in @("0.0.0.0", "::", "[::]") -and -not $allowPublicBind) {
+        throw "Backend public bind is blocked for productized runtime. Keep backend on 127.0.0.1 behind the frontend/proxy, or set TRADING_MVP_ALLOW_PUBLIC_BACKEND_BIND=1 only behind VPN/allowlist."
+    }
+
+    return $normalizedHost
+}
+
 $databaseUrl = Test-ExplicitDatabaseConfiguration
+$backendHost = Assert-BackendHostNotPublic -HostName $HostName
 $env:DATABASE_URL = $databaseUrl
+$env:TRADING_MVP_SERVICE_RUNTIME = "1"
+$env:TRADING_MVP_ENABLE_BACKGROUND_SCHEDULER = "1"
+$env:TRADING_MVP_ENABLE_BACKGROUND_USER_STREAM = "1"
+$env:TRADING_MVP_ENABLE_BACKGROUND_MARKET_STREAM = "1"
 Start-LocalPostgresqlIfConfigured -DatabaseUrl $databaseUrl
 Invoke-CheckedPython -Arguments @("-m", "trading_mvp.migrate")
-Invoke-CheckedPython -Arguments @("-m", "uvicorn", "trading_mvp.main:app", "--app-dir", "backend", "--host", "0.0.0.0", "--port", "8000")
+Invoke-CheckedPython -Arguments @("-m", "uvicorn", "trading_mvp.main:app", "--app-dir", "backend", "--host", $backendHost, "--port", "8000")

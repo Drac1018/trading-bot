@@ -313,9 +313,18 @@ def render_prompt_instructions(
     )
     schema_instruction = (
         "Populate the structured schema as completely as possible: decision, symbol, strategy_id, regime, confidence, "
-        "reason_summary, entry_intent, entry_zone, invalidation_level, risk_notes, required_confirmations, and hard_blocks_observed. "
+        "reason_summary, entry_intent, watch_entry_plan, entry_zone, invalidation_level, risk_notes, required_confirmations, and hard_blocks_observed. "
         "Use risk_notes for cost/RR/protection concerns, required_confirmations for zone/pullback/1m checks, "
         "and hard_blocks_observed for stale data, incomplete sync, protection uncertainty, policy blocks, or missing capacity. "
+        "Do not populate internal telemetry fields such as bounded_output_applied, fail_closed_applied, provider_status, "
+        "fallback_reason_codes, or data_quality_fail_closed_applied; deterministic post-processing owns those fields. "
+    )
+    psychology_scene_instruction = (
+        "Populate psychology_scene_review as optional metadata: describe market_psychology, classify the scene_scenario, "
+        "and design entry_choreography as an operator-facing setup narrative. "
+        "Set execution_boundary='metadata_only_no_order_authority'. "
+        "This review may explain why to wait, avoid chase, monitor a zone, or require 1m confirmation, "
+        "but it must not loosen risk_guard, watcher confirmation, stop policy, or execution permissions. "
     )
     entry_plan_instruction = (
         "For new-entry routes, distinguish no-trade from a conditional entry plan. "
@@ -323,7 +332,9 @@ def render_prompt_instructions(
         "return decision='hold' with watch_entry_plan populated with side, entry zone, invalidation, stop, target, chase cap, TTL, and reason codes. "
         "A watch_entry_plan only arms a pending entry plan; execution still requires zone touch, AI recheck, and risk_guard approval. "
         "For same-direction re-entry after a recent take-profit close, only consider a new watch_entry_plan when fresh edge clearly exceeds estimated fees and slippage. "
-        "Use decision='long' or decision='short' only when you are endorsing that side as the current trade intent. "
+        "Use decision='long' or decision='short' only when you are endorsing that side as the current trade intent and can populate "
+        "entry_zone_min, entry_zone_max, stop_loss, take_profit, invalidation_price or invalidation_level, expected RR/cost notes, and invalidation conditions. "
+        "If any of that direct-entry trade geometry is missing, return decision='hold' instead. "
         "Use decision='hold' with watch_entry_plan=null when no side and zone should be monitored. "
     ) if route.allow_new_entry else (
         "This route must not create a watch_entry_plan; keep watch_entry_plan=null. "
@@ -335,6 +346,7 @@ def render_prompt_instructions(
         f"{route.engine_instruction} "
         f"{entry_plan_instruction}"
         f"{schema_instruction}"
+        f"{psychology_scene_instruction}"
         "Use regime_summary as the descriptive market-structure layer and event_context_summary as the forward-looking event-risk layer. "
         "Event context may justify lower confidence, a no-trade stance, event_risk_acknowledgement, confidence_penalty_reason, or scenario_note, "
         "but it never overrides the routing contract, risk_guard, or execution permissions. "

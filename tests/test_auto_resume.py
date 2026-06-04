@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from trading_mvp.main import app
 from trading_mvp.models import AuditEvent, PnLSnapshot, Position, SchedulerRun
 from trading_mvp.schemas import AppSettingsUpdateRequest
@@ -347,7 +348,72 @@ def test_scheduler_path_attempts_auto_resume_before_interval_cycle(db_session, m
     assert scheduler_run.status == "success"
 
 
-def test_manual_cycle_api_attempts_auto_resume_before_running(testclient_db_factory, monkeypatch) -> None:
+def test_interval_cycle_persists_failed_scheduler_run_after_operational_error(db_session, monkeypatch) -> None:
+    update_settings(db_session, _build_live_settings_payload())
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.attempt_auto_resume",
+        lambda session, settings_row, trigger_source="system": {
+            "status": "resumed",
+            "resumed": True,
+            "allowed": True,
+            "blockers": [],
+            "trigger_source": trigger_source,
+        },
+    )
+    monkeypatch.setattr(
+        "trading_mvp.services.scheduler.maybe_refresh_exchange_sync_freshness",
+        lambda session, triggered_by="scheduler": {
+            "workflow": "exchange_sync_cycle",
+            "status": "success",
+            "triggered_by": triggered_by,
+        },
+    )
+
+    def fake_plan(self, *, symbols, triggered_at):
+        del triggered_at
+        return {
+            "candidate_selection": {"breadth_regime": "mixed"},
+            "plans": [
+                {
+                    "symbol": symbols[0],
+                    "trigger": {
+                        "trigger_reason": "entry_candidate_event",
+                        "trigger_fingerprint": "db-failure-trigger",
+                        "fingerprint_changed_fields": [],
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(TradingOrchestrator, "build_interval_decision_plan", fake_plan)
+    monkeypatch.setattr(
+        TradingOrchestrator,
+        "run_decision_cycle",
+        lambda self, **kwargs: (_ for _ in ()).throw(
+            OperationalError(
+                "insert into agent_runs",
+                {},
+                Exception("server closed the connection unexpectedly"),
+            )
+        ),
+    )
+
+    result = run_interval_decision_cycle(db_session, triggered_by="scheduler")
+    scheduler_run = db_session.scalar(select(SchedulerRun).order_by(SchedulerRun.id.desc()).limit(1))
+
+    assert result["results"]
+    assert scheduler_run is not None
+    assert scheduler_run.status == "failed"
+    assert scheduler_run.outcome["error_category"] == "db_operational_error"
+    assert scheduler_run.outcome["db_connection_lost"] is True
+    assert scheduler_run.outcome["scheduler_failure_persisted"] is True
+
+
+def test_manual_cycle_api_attempts_auto_resume_before_running(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("auto_resume_cycle.db")
 
     call_state = {"count": 0}
@@ -373,7 +439,10 @@ def test_manual_cycle_api_attempts_auto_resume_before_running(testclient_db_fact
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/cycles/run")
+        response = client.post(
+            "/api/cycles/run",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "cycle.run"},
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["auto_resume"]["status"] == "resumed"
@@ -468,7 +537,11 @@ def test_auto_resume_reports_symbol_detail_for_market_data_failure(db_session, m
     )
 
 
-def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, monkeypatch) -> None:
+def test_live_sync_runs_auto_resume_precheck_before_sync(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("live_sync_precheck.db")
 
     call_order: list[str] = []
@@ -538,7 +611,10 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, 
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/live/sync")
+        response = client.post(
+            "/api/live/sync",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "live.sync"},
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["auto_resume_precheck"]["trigger_source"] == "api_live_sync_precheck"
@@ -549,7 +625,11 @@ def test_live_sync_runs_auto_resume_precheck_before_sync(testclient_db_factory, 
         assert call_order == ["api_live_sync_precheck", "sync", "api_live_sync_postcheck"]
 
 
-def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypatch) -> None:
+def test_live_sync_verify_only_skips_auto_resume(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("live_sync_verify_only.db")
 
     call_order: list[str] = []
@@ -592,7 +672,10 @@ def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypa
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/live/sync?allow_protection_recovery=false")
+        response = client.post(
+            "/api/live/sync?allow_protection_recovery=false",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "live.sync"},
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["allow_protection_recovery"] is False
@@ -602,7 +685,11 @@ def test_live_sync_verify_only_skips_auto_resume(testclient_db_factory, monkeypa
         assert call_order == ["sync:False"]
 
 
-def test_live_sync_failure_still_returns_precheck_result(testclient_db_factory, monkeypatch) -> None:
+def test_live_sync_failure_still_returns_precheck_result(
+    testclient_db_factory,
+    monkeypatch,
+    full_live_operator_headers,
+) -> None:
     testing_session = testclient_db_factory("live_sync_failure.db")
 
     def fake_attempt(db, settings_row, trigger_source="system"):
@@ -646,7 +733,10 @@ def test_live_sync_failure_still_returns_precheck_result(testclient_db_factory, 
         session.commit()
 
     with TestClient(app) as client:
-        response = client.post("/api/live/sync")
+        response = client.post(
+            "/api/live/sync",
+            headers={**full_live_operator_headers, "X-Operator-Intent": "live.sync"},
+        )
         assert response.status_code == 400
         detail = response.json()["detail"]
         assert detail["auto_resume_precheck"]["symbol_blockers"]["BTCUSDT"] == ["MISSING_PROTECTIVE_ORDERS"]

@@ -181,6 +181,14 @@ def build_shared_market_cache_state(
         redis_connected = False
     else:
         redis_connected = None
+    if "cache_scope_detail" in data:
+        cache_scope_detail = str(data.get("cache_scope_detail") or "") or None
+    elif not redis_configured:
+        cache_scope_detail = "Redis shared cache is disabled; process-local and REST fallback are expected."
+    elif redis_required:
+        cache_scope_detail = "Redis shared cache is required for this runtime; Redis failures should be treated as operational issues."
+    else:
+        cache_scope_detail = "Redis shared cache is optional; process-local and REST fallback remain active when Redis is unavailable."
     return {
         "cache_backend": cache_backend,
         "configured_cache_backend": configured_cache_backend,
@@ -198,6 +206,7 @@ def build_shared_market_cache_state(
         "redis_connected": redis_connected,
         "cache_health": cache_health,
         "cache_reject_reason": cache_reject_reason,
+        "cache_scope_detail": cache_scope_detail,
         "cache_write_status": str(data.get("cache_write_status") or "") or None,
         "last_shared_cache_read_at": str(data.get("last_shared_cache_read_at") or "") or None,
         "last_shared_cache_write_at": str(data.get("last_shared_cache_write_at") or "") or None,
@@ -343,7 +352,9 @@ def write_closed_kline_event_to_redis(
                 "cache_environment": normalized_environment,
                 "cache_write_status": "failed",
                 "last_shared_cache_write_at": current_time.isoformat(),
-                "last_shared_cache_error": "REDIS_URL not configured",
+                "last_shared_cache_error": (
+                    "REDIS_URL not configured; shared Redis cache is disabled and fallback remains available."
+                ),
                 "shared_cache_key": key,
             }
         )
@@ -358,7 +369,10 @@ def write_closed_kline_event_to_redis(
                 "cache_environment": normalized_environment,
                 "cache_write_status": "failed",
                 "last_shared_cache_write_at": current_time.isoformat(),
-                "last_shared_cache_error": str(exc),
+                "last_shared_cache_error": (
+                    "Optional Redis shared cache unavailable; fallback remains available: "
+                    f"{exc}"
+                ),
                 "shared_cache_key": key,
             }
         )
@@ -412,7 +426,9 @@ def read_closed_kline_from_redis(
                     "configured_cache_backend": MARKET_DATA_CACHE_BACKEND_DISABLED,
                     "redis_configured": False,
                     "redis_connected": False,
-                    "last_shared_cache_error": "REDIS_URL not configured",
+                    "last_shared_cache_error": (
+                        "REDIS_URL not configured; shared Redis cache is disabled and fallback remains available."
+                    ),
                 }
             ),
         )
@@ -426,7 +442,10 @@ def read_closed_kline_from_redis(
                     **base_state,
                     "cache_health": "unavailable",
                     "cache_reject_reason": "cache_unavailable",
-                    "last_shared_cache_error": str(exc),
+                    "last_shared_cache_error": (
+                        "Optional Redis shared cache unavailable; fallback remains available: "
+                        f"{exc}"
+                    ),
                 }
             ),
         )

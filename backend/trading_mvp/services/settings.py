@@ -13,6 +13,7 @@ from trading_mvp.config import Settings as AppConfig
 from trading_mvp.config import get_settings
 from trading_mvp.models import (
     AgentRun,
+    DecisionPerformanceFact,
     FeatureSnapshot,
     MarketSnapshot,
     PnLSnapshot,
@@ -25,9 +26,9 @@ from trading_mvp.models import (
 from trading_mvp.schemas import (
     SUPPORTED_SYMBOL_TIMEFRAME_OVERRIDES,
     AIEventViewPayload,
-    AppSettingsExecutionRiskProfilePolicy,
     AppSettingsAIUsageResponse,
     AppSettingsCadenceResponse,
+    AppSettingsExecutionRiskProfilePolicy,
     AppSettingsResponse,
     AppSettingsUpdateRequest,
     AppSettingsViewResponse,
@@ -81,6 +82,7 @@ from trading_mvp.services.runtime_state import (
     get_drawdown_state_detail,
     get_market_stream_detail,
     get_sync_state_detail,
+    public_user_stream_detail,
     resolve_exchange_connectivity_state,
     summarize_runtime_state,
 )
@@ -250,10 +252,12 @@ def build_ai_model_routing_policy(settings_row: Setting) -> dict[str, Any]:
                 "model_candidates": [],
                 "reason_codes": [
                     "ENTRY_CANDIDATE_WEAK_VOLUME_PREAI",
+                    "ENTRY_CANDIDATE_NEUTRAL_CONTEXT_HOLD_BACKOFF",
                     "STALE_MARKET_DATA",
                     "LOW_SCORE",
                     "SPREAD_STRESS",
                     "EXPOSURE_LIMIT",
+                    "AI_CYCLE_BUDGET_EXHAUSTED",
                     "MACRO_EVENT_IMMINENT",
                     "MACRO_EVENT_RISK_WINDOW_ACTIVE",
                 ],
@@ -335,6 +339,11 @@ ACCOUNT_SYNC_WARNING_REASON_CODES = {
     "EXCHANGE_AUTH_PERMISSION_REJECTED",
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE",
 }
+EXCHANGE_SYNC_WORKFLOW = "exchange_sync_cycle"
+EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS = 24
+EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE = "EXCHANGE_AUTH_PERMISSION_REJECTED"
+FULL_LIVE_SYNC_STALE_REASON_CODE = "FULL_LIVE_SYNC_STALE"
+LIVE_APPROVAL_WINDOW_INVALID_REASON_CODE = "LIVE_APPROVAL_WINDOW_INVALID"
 SYNC_SCOPE_GUARD_REASON_CODES = {
     "account": "ACCOUNT_STATE_STALE",
     "positions": "POSITION_STATE_STALE",
@@ -355,6 +364,7 @@ STALE_FIRST_REASON_PRIORITY = {
     "EXCHANGE_AUTH_PERMISSION_REJECTED": 4,
     "EXCHANGE_POSITION_SYNC_FAILED": 5,
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": 6,
+    "EXCHANGE_CAN_TRADE_UNKNOWN": 6,
     "TEMPORARY_SYNC_FAILURE": 7,
     "EXCHANGE_CONNECTIVITY_TEMPORARY_FAILURE": 8,
     "LIVE_CREDENTIALS_MISSING": 9,
@@ -373,6 +383,7 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "TEMPORARY_SYNC_FAILURE": "계좌 상태 동기화가 일시 실패해 가드 모드입니다.",
     "EXCHANGE_POSITION_SYNC_FAILED": "거래소 포지션 동기화 실패로 가드 모드입니다.",
     "EXCHANGE_OPEN_ORDERS_SYNC_FAILED": "거래소 주문 동기화 실패로 가드 모드입니다.",
+    "EXCHANGE_CAN_TRADE_UNKNOWN": "full_live 승인 상태지만 거래소 주문 권한 확인값이 unknown이라 신규 진입을 보류합니다.",
     "PROTECTION_REQUIRED": "무보호 포지션이 감지되어 보호 복구 우선 상태입니다.",
     "DEGRADED_MANAGE_ONLY": "보호 복구가 반복 실패해 관리 전용 상태로 가드 모드입니다.",
     "EMERGENCY_EXIT": "비상 청산 상태가 진행 중이라 가드 모드입니다.",
@@ -393,6 +404,7 @@ GUARD_MODE_REASON_MESSAGES: dict[str, str] = {
     "POSITION_STATE_STALE": "거래소 포지션 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "OPEN_ORDERS_STATE_STALE": "거래소 오더 상태 동기화가 오래되어 신규 진입을 차단했습니다.",
     "PROTECTION_STATE_UNVERIFIED": "보호주문 상태를 확인할 수 없어 신규 진입을 차단했습니다.",
+    "FULL_LIVE_SYNC_STALE": "full_live 실거래 승인 전 거래소 계좌, 포지션, 미체결 주문, 보호주문 동기화가 최신이어야 합니다.",
     "USER_STREAM_LISTEN_KEY_ROTATION_PENDING": "listen key 재등록이 완료되지 않아 신규 진입을 차단하고 REST fallback으로 운용 중입니다.",
     "BINANCE_REST_CIRCUIT_OPEN": "Binance REST/API circuit is open, so new entries are blocked.",
     "BINANCE_REST_RECOVERING_SYNC_STALE": "Binance REST/API is recovering; account, position, open-order, and protection sync must be fresh before new entries resume.",
@@ -408,6 +420,7 @@ RISK_STATUS_ONLY_REASON_CODES = frozenset(
         "WEAK_VOLUME",
         "MOMENTUM_WEAKENING",
         "DETERMINISTIC_BASELINE_DISAGREEMENT",
+        "EXCHANGE_CAN_TRADE_UNKNOWN",
     }
 )
 
@@ -637,13 +650,13 @@ def _default_execution_risk_profile_policy(defaults: AppConfig | None = None) ->
         "elevated_interval_seconds": _settings_int(
             defaults,
             "ai_market_settings_advisor_elevated_interval_seconds",
-            300,
+            900,
             minimum=60,
         ),
         "min_recheck_interval_seconds": _settings_int(
             defaults,
             "ai_market_settings_advisor_min_recheck_interval_seconds",
-            300,
+            900,
             minimum=60,
         ),
         "recommendation_ttl_seconds": _settings_int(
@@ -867,6 +880,19 @@ def _latest_symbol_decision(
     if session is None:
         return None
     symbol_key = symbol.upper()
+    fact_query = select(DecisionPerformanceFact.decision_run_id).where(
+        DecisionPerformanceFact.symbol == symbol_key
+    )
+    if timeframe:
+        fact_query = fact_query.where(DecisionPerformanceFact.timeframe == timeframe)
+    fact_decision_run_id = session.scalar(
+        fact_query.order_by(desc(DecisionPerformanceFact.created_at), desc(DecisionPerformanceFact.id)).limit(1)
+    )
+    if fact_decision_run_id is not None:
+        fact_decision = session.get(AgentRun, int(fact_decision_run_id))
+        if fact_decision is not None and fact_decision.role == "trading_decision":
+            return fact_decision
+
     statement = (
         select(AgentRun)
         .where(AgentRun.role == "trading_decision")
@@ -1649,6 +1675,7 @@ def get_or_create_settings(session: Session) -> Setting:
         ai_model=defaults.openai_model,
         ai_call_interval_minutes=defaults.ai_call_interval_minutes,
         decision_cycle_interval_minutes=defaults.decision_cycle_interval_minutes,
+        ai_trading_decision_daily_token_budget=defaults.ai_trading_decision_daily_token_budget,
         ai_max_input_candles=defaults.ai_max_input_candles,
         ai_temperature=defaults.ai_temperature,
         openai_api_key_encrypted=encrypt_secret(defaults.openai_api_key, defaults.app_secret_seed),
@@ -1673,19 +1700,20 @@ def get_or_create_settings(session: Session) -> Setting:
 
 def get_runtime_credentials(settings_row: Setting, defaults: AppConfig | None = None) -> RuntimeCredentials:
     app_defaults = defaults or get_settings()
-    openai_key = decrypt_secret(settings_row.openai_api_key_encrypted, app_defaults.app_secret_seed)
+    app_secret_seed = getattr(app_defaults, "app_secret_seed", "")
+    openai_key = decrypt_secret(settings_row.openai_api_key_encrypted, app_secret_seed)
     if not openai_key:
-        openai_key = app_defaults.openai_api_key
+        openai_key = getattr(app_defaults, "openai_api_key", "")
     event_source_api_key = decrypt_secret(
         settings_row.event_source_api_key_encrypted,
-        app_defaults.app_secret_seed,
+        app_secret_seed,
     )
     if not event_source_api_key:
         event_source_api_key = os.getenv("TRADING_EVENT_SOURCE_API_KEY", "").strip()
     return RuntimeCredentials(
         openai_api_key=openai_key,
-        binance_api_key=decrypt_secret(settings_row.binance_api_key_encrypted, app_defaults.app_secret_seed),
-        binance_api_secret=decrypt_secret(settings_row.binance_api_secret_encrypted, app_defaults.app_secret_seed),
+        binance_api_key=decrypt_secret(settings_row.binance_api_key_encrypted, app_secret_seed),
+        binance_api_secret=decrypt_secret(settings_row.binance_api_secret_encrypted, app_secret_seed),
         event_source_api_key=event_source_api_key,
     )
 
@@ -2176,6 +2204,171 @@ def _latest_scheduler_timestamps_by_symbol(
     return resolved
 
 
+def _exchange_sync_failure_reason_code_from_text(value: object) -> str | None:
+    normalized = str(value or "").lower()
+    if not normalized:
+        return None
+    if "exchange_auth_permission_rejected" in normalized:
+        return EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+    if "binance error -2015" in normalized or "invalid api-key" in normalized:
+        return EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+    return None
+
+
+def _exchange_sync_outcome_reason_codes(outcome: dict[str, object]) -> list[str]:
+    codes: list[str] = []
+
+    def add(value: object) -> None:
+        code = str(value or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+
+    for key in ("reason_code", "last_failure_reason", "error_code"):
+        add(outcome.get(key))
+    for key in ("error", "message", "last_failure_message"):
+        add(_exchange_sync_failure_reason_code_from_text(outcome.get(key)))
+
+    sync_summary = outcome.get("sync_freshness_summary")
+    if isinstance(sync_summary, dict):
+        for scope_payload in sync_summary.values():
+            if not isinstance(scope_payload, dict):
+                continue
+            add(scope_payload.get("last_failure_reason"))
+            add(_exchange_sync_failure_reason_code_from_text(scope_payload.get("last_failure_reason")))
+            add(_exchange_sync_failure_reason_code_from_text(scope_payload.get("last_failure_message")))
+    return codes
+
+
+def _exchange_sync_scope_states(sync_freshness_summary: dict[str, object]) -> dict[str, dict[str, object]]:
+    states: dict[str, dict[str, object]] = {}
+    for scope in ("account", "positions", "open_orders", "protective_orders"):
+        scope_payload = sync_freshness_summary.get(scope)
+        if not isinstance(scope_payload, dict):
+            continue
+        states[scope] = {
+            "status": scope_payload.get("status"),
+            "raw_status": scope_payload.get("raw_status"),
+            "stale": bool(scope_payload.get("stale")),
+            "incomplete": bool(scope_payload.get("incomplete")),
+            "last_sync_at": scope_payload.get("last_sync_at"),
+            "last_attempt_at": scope_payload.get("last_attempt_at"),
+            "last_failure_at": scope_payload.get("last_failure_at"),
+            "last_failure_reason": scope_payload.get("last_failure_reason"),
+        }
+    return states
+
+
+def _build_exchange_sync_diagnostics(
+    session: Session | None,
+    sync_freshness_summary: dict[str, object],
+) -> dict[str, object]:
+    active_reason_codes = _derive_sync_blocking_reasons(sync_freshness_summary)
+    active_permission_block = EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE in active_reason_codes
+    base: dict[str, object] = {
+        "workflow": EXCHANGE_SYNC_WORKFLOW,
+        "lookback_hours": EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS,
+        "status": "unknown",
+        "current_block_state": "unknown",
+        "currently_blocking_new_entries": bool(active_reason_codes),
+        "currently_permission_blocked": active_permission_block,
+        "active_reason_codes": active_reason_codes,
+        "scope_states": _exchange_sync_scope_states(sync_freshness_summary),
+        "failure_count_24h": 0,
+        "permission_failure_count_24h": 0,
+        "success_count_24h": 0,
+        "latest_status": None,
+        "latest_run_at": None,
+        "latest_success_at": None,
+        "latest_failure_at": None,
+        "latest_failure_reason_code": None,
+        "latest_failure_summary": None,
+        "recovered_after_latest_failure": False,
+        "recovery_basis": None,
+    }
+    if session is None:
+        return base
+
+    now = utcnow_naive()
+    cutoff = now - timedelta(hours=EXCHANGE_SYNC_DIAGNOSTIC_LOOKBACK_HOURS)
+    rows = list(
+        session.scalars(
+            select(SchedulerRun)
+            .where(SchedulerRun.workflow == EXCHANGE_SYNC_WORKFLOW)
+            .where(SchedulerRun.created_at >= cutoff)
+            .order_by(desc(SchedulerRun.created_at))
+            .limit(500)
+        )
+    )
+    latest_run = rows[0] if rows else session.scalar(
+        select(SchedulerRun)
+        .where(SchedulerRun.workflow == EXCHANGE_SYNC_WORKFLOW)
+        .order_by(desc(SchedulerRun.created_at))
+        .limit(1)
+    )
+    success_rows = [row for row in rows if str(row.status).lower() in {"success", "completed"}]
+    failure_rows = [row for row in rows if str(row.status).lower() in {"failed", "error"}]
+    permission_failure_rows = [
+        row
+        for row in failure_rows
+        if EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+        in _exchange_sync_outcome_reason_codes(row.outcome if isinstance(row.outcome, dict) else {})
+    ]
+    latest_success = success_rows[0] if success_rows else None
+    latest_failure = failure_rows[0] if failure_rows else None
+    latest_failure_codes = (
+        _exchange_sync_outcome_reason_codes(latest_failure.outcome if isinstance(latest_failure.outcome, dict) else {})
+        if latest_failure is not None
+        else []
+    )
+    latest_failure_reason_code = latest_failure_codes[0] if latest_failure_codes else None
+    recovered_after_latest_failure = (
+        latest_success is not None
+        and latest_failure is not None
+        and latest_success.created_at > latest_failure.created_at
+        and not bool(active_reason_codes)
+    )
+    if bool(active_reason_codes):
+        status = "blocked"
+        current_block_state = "currently_blocked"
+    elif recovered_after_latest_failure:
+        status = "recovered"
+        current_block_state = "recovered"
+    elif latest_run is not None and str(latest_run.status).lower() in {"failed", "error"}:
+        status = "blocked"
+        current_block_state = "currently_blocked"
+    elif latest_success is not None:
+        status = "healthy"
+        current_block_state = "not_blocked"
+    else:
+        status = "unknown"
+        current_block_state = "unknown"
+
+    return {
+        **base,
+        "status": status,
+        "current_block_state": current_block_state,
+        "failure_count_24h": len(failure_rows),
+        "permission_failure_count_24h": len(permission_failure_rows),
+        "success_count_24h": len(success_rows),
+        "latest_status": latest_run.status if latest_run is not None else None,
+        "latest_run_at": latest_run.created_at if latest_run is not None else None,
+        "latest_success_at": latest_success.created_at if latest_success is not None else None,
+        "latest_failure_at": latest_failure.created_at if latest_failure is not None else None,
+        "latest_failure_reason_code": latest_failure_reason_code,
+        "latest_failure_summary": (
+            "Binance API auth, IP, or permission was rejected."
+            if latest_failure_reason_code == EXCHANGE_SYNC_AUTH_PERMISSION_REASON_CODE
+            else None
+        ),
+        "recovered_after_latest_failure": recovered_after_latest_failure,
+        "recovery_basis": (
+            "latest_success_after_latest_failure_and_no_active_sync_block"
+            if recovered_after_latest_failure
+            else ("active_sync_reason_codes" if active_reason_codes else None)
+        ),
+    }
+
+
 def _latest_decision_activity_by_symbol(
     session: Session | None,
     *,
@@ -2351,14 +2544,28 @@ def _coerce_int(value: object, default: int = 0) -> int:
     return default
 
 
+class LiveApprovalWindowError(ValueError):
+    pass
+
+
 def is_live_execution_armed(settings_row: Setting) -> bool:
+    if (
+        settings_row.manual_live_approval
+        and settings_row.live_execution_armed
+        and settings_row.live_approval_window_minutes == 0
+        and settings_row.live_execution_armed_until is None
+    ):
+        return True
     return bool(
         settings_row.live_execution_armed
-        and (
-            settings_row.live_execution_armed_until is None
-            or settings_row.live_execution_armed_until > utcnow_naive()
-        )
+        and settings_row.live_execution_armed_until is not None
+        and settings_row.live_execution_armed_until > utcnow_naive()
     )
+
+
+def resolve_live_approval_window_minutes(settings_row: Setting, minutes: int | None = None) -> int:
+    requested_minutes = settings_row.live_approval_window_minutes if minutes is None else minutes
+    return _coerce_int(requested_minutes, default=0)
 
 
 def _parse_runtime_datetime(value: object) -> datetime | None:
@@ -2386,6 +2593,31 @@ def _coerce_optional_bool(value: object) -> bool | None:
         if normalized in {"false", "0", "no", "n"}:
             return False
     return None
+
+
+def _exchange_can_trade_metadata(account_sync_detail: dict[str, object]) -> dict[str, object]:
+    exchange_can_trade = _coerce_optional_bool(account_sync_detail.get("exchange_can_trade"))
+    explicit_known = account_sync_detail.get("exchange_can_trade_known")
+    exchange_can_trade_known = (
+        bool(explicit_known) if explicit_known is not None else exchange_can_trade is not None
+    ) and exchange_can_trade is not None
+    if not exchange_can_trade_known:
+        return {
+            "exchange_can_trade": None,
+            "exchange_can_trade_known": False,
+            "exchange_can_trade_source": str(account_sync_detail.get("exchange_can_trade_source") or "unknown"),
+            "exchange_can_trade_checked_at": _parse_runtime_datetime(
+                account_sync_detail.get("exchange_can_trade_checked_at") or account_sync_detail.get("last_sync_at")
+            ),
+        }
+    return {
+        "exchange_can_trade": exchange_can_trade,
+        "exchange_can_trade_known": True,
+        "exchange_can_trade_source": str(account_sync_detail.get("exchange_can_trade_source") or "account_sync"),
+        "exchange_can_trade_checked_at": _parse_runtime_datetime(
+            account_sync_detail.get("exchange_can_trade_checked_at") or account_sync_detail.get("last_sync_at")
+        ),
+    }
 
 
 def get_live_approval_status(settings_row: Setting) -> tuple[bool, str, dict[str, object]]:
@@ -2874,6 +3106,15 @@ def _sync_blocks_new_entries(sync_freshness_summary: dict[str, object]) -> bool:
     return False
 
 
+def live_arm_blocking_reason_codes(settings_row: Setting) -> list[str]:
+    if get_rollout_mode(settings_row) != "full_live":
+        return []
+    sync_summary = build_sync_freshness_summary(settings_row)
+    if not _sync_blocks_new_entries(sync_summary):
+        return []
+    return _derive_sync_blocking_reasons(sync_summary)
+
+
 def _market_blocks_new_entries(market_freshness_summary: dict[str, object]) -> bool:
     return bool(market_freshness_summary.get("stale")) or bool(market_freshness_summary.get("incomplete"))
 
@@ -2890,10 +3131,14 @@ def _build_control_status_summary(
     risk_allowed: bool | None,
     reconciliation_summary: dict[str, object],
     drawdown_state_summary: dict[str, object],
+    exchange_sync_diagnostics: dict[str, object] | None = None,
+    live_arm_disable_reason_code: str | None = None,
+    live_arm_disable_reason: str | None = None,
+    live_arm_blocked_reason_codes: list[str] | None = None,
 ) -> ControlStatusSummary:
     approval_window_open, approval_state, approval_detail = get_live_approval_status(settings_row)
     account_sync_detail = get_sync_state_detail(settings_row).get("account", {})
-    exchange_can_trade = _coerce_optional_bool(account_sync_detail.get("exchange_can_trade"))
+    exchange_permission = _exchange_can_trade_metadata(account_sync_detail)
     rollout_mode = get_rollout_mode(settings_row)
     resolved_risk_allowed = risk_allowed
     if resolved_risk_allowed is None and current_cycle_blocked_reasons:
@@ -2902,9 +3147,16 @@ def _build_control_status_summary(
     approval_control_blocked_reasons = _prioritize_blocked_reasons(
         _actionable_guard_reason_codes(list(current_cycle_blocked_reasons))
         + ([one_way_reason_code] if one_way_reason_code else [])
+        + ([live_arm_disable_reason_code] if live_arm_disable_reason_code else [])
+        + [str(item) for item in (live_arm_blocked_reason_codes or []) if item not in {None, ""}]
     )
+    resolved_live_arm_disable_reason_code = one_way_reason_code or live_arm_disable_reason_code
+    resolved_live_arm_disable_reason = one_way_reason_message or live_arm_disable_reason
     return ControlStatusSummary(
-        exchange_can_trade=exchange_can_trade,
+        exchange_can_trade=cast(bool | None, exchange_permission["exchange_can_trade"]),
+        exchange_can_trade_known=bool(exchange_permission["exchange_can_trade_known"]),
+        exchange_can_trade_source=str(exchange_permission["exchange_can_trade_source"]),
+        exchange_can_trade_checked_at=cast(datetime | None, exchange_permission["exchange_can_trade_checked_at"]),
         exchange_connectivity_state=exchange_connectivity_state,
         rollout_mode=rollout_mode,
         exchange_submit_allowed=rollout_mode_allows_exchange_submit(settings_row),
@@ -2926,10 +3178,11 @@ def _build_control_status_summary(
         blocked_reason_codes=_prioritize_blocked_reasons(blocked_reason_codes),
         degraded_reason_codes=_prioritize_blocked_reasons(degraded_reason_codes),
         protection_reason_codes=_prioritize_blocked_reasons(protection_reason_codes),
+        exchange_sync_diagnostics=dict(exchange_sync_diagnostics or {}),
         approval_control_blocked_reasons=approval_control_blocked_reasons,
-        live_arm_disabled=bool(one_way_reason_message),
-        live_arm_disable_reason_code=one_way_reason_code,
-        live_arm_disable_reason=one_way_reason_message,
+        live_arm_disabled=bool(resolved_live_arm_disable_reason),
+        live_arm_disable_reason_code=resolved_live_arm_disable_reason_code,
+        live_arm_disable_reason=resolved_live_arm_disable_reason,
         current_drawdown_state=str(drawdown_state_summary.get("current_drawdown_state") or "normal"),
         drawdown_state_entered_at=_parse_runtime_datetime(drawdown_state_summary.get("entered_at")),
         drawdown_transition_reason=str(drawdown_state_summary.get("transition_reason") or "") or None,
@@ -2981,6 +3234,19 @@ def build_operational_status_payload(
             current_detail=get_drawdown_state_detail(settings_row),
         )
     sync_summary = dict(sync_freshness_summary or build_sync_freshness_summary(settings_row))
+    rollout_mode = get_rollout_mode(settings_row)
+    full_live_arm_blockers = (
+        _derive_sync_blocking_reasons(sync_summary)
+        if rollout_mode == "full_live" and _sync_blocks_new_entries(sync_summary)
+        else []
+    )
+    full_live_arm_disable_reason_code = FULL_LIVE_SYNC_STALE_REASON_CODE if full_live_arm_blockers else None
+    full_live_arm_disable_reason = (
+        _guard_message_for_code(FULL_LIVE_SYNC_STALE_REASON_CODE)
+        if full_live_arm_disable_reason_code
+        else None
+    )
+    exchange_sync_diagnostics = _build_exchange_sync_diagnostics(current_session, sync_summary)
     market_summary = dict(market_freshness_summary or _build_market_freshness_summary(current_session, settings_row))
     if current_cycle_blocked_reasons:
         current_cycle_blocked_reasons = _filter_resolved_latest_blocked_reasons(
@@ -3080,6 +3346,29 @@ def build_operational_status_payload(
         }
     )
     operating_state = operating_state_override or str(runtime.get("operating_state", "TRADABLE"))
+    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
+    exchange_permission = _exchange_can_trade_metadata(get_sync_state_detail(settings_row).get("account", {}))
+    exchange_can_trade = cast(bool | None, exchange_permission["exchange_can_trade"])
+    exchange_can_trade_known = bool(exchange_permission["exchange_can_trade_known"])
+    exchange_permission_unknown_blocks_entry = (
+        rollout_mode == "full_live"
+        and is_live_execution_armed(settings_row)
+        and not exchange_can_trade_known
+    )
+    exchange_permission_unknown_reasons = (
+        ["EXCHANGE_CAN_TRADE_UNKNOWN"] if exchange_permission_unknown_blocks_entry else []
+    )
+    if exchange_permission_unknown_reasons:
+        risk_allowed = False
+        current_cycle_blocked_reasons = _prioritize_blocked_reasons(
+            exchange_permission_unknown_reasons + current_cycle_blocked_reasons
+        )
+        recent_blocked_reasons = _prioritize_blocked_reasons(
+            exchange_permission_unknown_reasons + recent_blocked_reasons
+        )
+        current_blocked_reasons = _prioritize_blocked_reasons(
+            exchange_permission_unknown_reasons + current_blocked_reasons
+        )
     guard_runtime = {**runtime, "operating_state": operating_state}
     guard_mode_reason = derive_guard_mode_reason(
         settings_row,
@@ -3090,8 +3379,6 @@ def build_operational_status_payload(
         sync_freshness_summary=sync_summary,
         market_freshness_summary=market_summary,
     )
-    rollout_mode = get_rollout_mode(settings_row)
-    exchange_submit_allowed = rollout_mode_allows_exchange_submit(settings_row)
     can_enter_new_position = (
         exchange_submit_allowed
         and
@@ -3103,6 +3390,7 @@ def build_operational_status_payload(
         and not _user_stream_blocks_new_entries(user_stream_summary)
         and not _binance_rest_blocks_new_entries(binance_rest_summary)
         and not _reconciliation_blocks_new_entries(reconciliation_summary)
+        and not exchange_permission_unknown_blocks_entry
     )
     pause_policy = get_pause_reason_policy(settings_row.pause_reason_code)
     one_way_reason_code, one_way_reason_message = _one_way_requirement_reason_payload(reconciliation_summary)
@@ -3123,7 +3411,6 @@ def build_operational_status_payload(
         missing_protection_symbols=missing_protection_symbols,
         missing_protection_items=missing_protection_items,
     )
-    exchange_can_trade = _coerce_optional_bool(get_sync_state_detail(settings_row).get("account", {}).get("exchange_can_trade"))
     exchange_connectivity_state = resolve_exchange_connectivity_state(
         exchange_can_trade,
         reason_codes=reason_code_basis,
@@ -3141,6 +3428,10 @@ def build_operational_status_payload(
         risk_allowed=risk_allowed,
         reconciliation_summary=reconciliation_summary,
         drawdown_state_summary=drawdown_state_summary,
+        exchange_sync_diagnostics=exchange_sync_diagnostics,
+        live_arm_disable_reason_code=full_live_arm_disable_reason_code,
+        live_arm_disable_reason=full_live_arm_disable_reason,
+        live_arm_blocked_reason_codes=full_live_arm_blockers,
     )
     operator_alert: dict[str, object] = {}
     if one_way_reason_message:
@@ -3153,6 +3444,7 @@ def build_operational_status_payload(
             "position_mode_checked_at": reconciliation_summary.get("position_mode_checked_at"),
             "guarded_symbols_count": int(reconciliation_summary.get("guarded_symbols_count") or 0),
         }
+    public_user_stream_summary = public_user_stream_detail(user_stream_summary)
     return OperationalStatusPayload(
         live_trading_enabled=settings_row.live_trading_enabled,
         rollout_mode=rollout_mode,
@@ -3187,6 +3479,7 @@ def build_operational_status_payload(
         latest_blocked_reasons=recent_blocked_reasons,
         account_sync_summary=account_summary,
         sync_freshness_summary=sync_summary,
+        exchange_sync_diagnostics=exchange_sync_diagnostics,
         market_freshness_summary=market_summary,
         protection_recovery_status=str(runtime["protection_recovery_status"]),
         protection_recovery_active=bool(runtime["protection_recovery_active"]),
@@ -3198,7 +3491,7 @@ def build_operational_status_payload(
         drawdown_transition_reason=str(drawdown_state_summary.get("transition_reason") or "") or None,
         drawdown_policy_adjustments=dict(drawdown_state_summary.get("policy_adjustments") or {}),
         control_status_summary=control_status_summary,
-        user_stream_summary=user_stream_summary,
+        user_stream_summary=public_user_stream_summary,
         reconciliation_summary=reconciliation_summary,
         candidate_selection_summary=dict(runtime.get("candidate_selection_summary") or {}),
         operator_alert=operator_alert,
@@ -3208,8 +3501,19 @@ def build_operational_status_payload(
 
 def arm_live_execution(session: Session, minutes: int | None = None) -> Setting:
     row = get_or_create_settings(session)
+    effective_minutes = resolve_live_approval_window_minutes(row, minutes)
+    if effective_minutes < 0:
+        row.live_execution_armed = False
+        row.live_execution_armed_until = None
+        session.add(row)
+        session.flush()
+        raise LiveApprovalWindowError(LIVE_APPROVAL_WINDOW_INVALID_REASON_CODE)
+    if effective_minutes == 0:
+        row.live_approval_window_minutes = 0
     row.live_execution_armed = True
-    row.live_execution_armed_until = None
+    row.live_execution_armed_until = (
+        None if effective_minutes == 0 else utcnow_naive() + timedelta(minutes=effective_minutes)
+    )
     session.add(row)
     session.flush()
     return row
@@ -3229,21 +3533,44 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
     credentials = get_runtime_credentials(settings_row, defaults=defaults)
     current_session = object_session(settings_row)
     usage_metrics: AIUsageMetrics = build_ai_usage_metrics(current_session) if current_session is not None else {
+        "recent_ai_calls_today_kst": 0,
         "recent_ai_calls_24h": 0,
         "recent_ai_calls_7d": 0,
+        "recent_ai_calls_30d": 0,
+        "recent_ai_successes_today_kst": 0,
         "recent_ai_successes_24h": 0,
         "recent_ai_successes_7d": 0,
+        "recent_ai_successes_30d": 0,
+        "recent_ai_failures_today_kst": 0,
         "recent_ai_failures_24h": 0,
         "recent_ai_failures_7d": 0,
+        "recent_ai_failures_30d": 0,
+        "recent_ai_tokens_today_kst": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_24h": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_7d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_tokens_30d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_role_calls_today_kst": {},
         "recent_ai_role_calls_24h": {},
         "recent_ai_role_calls_7d": {},
+        "recent_ai_role_calls_30d": {},
+        "recent_ai_role_failures_today_kst": {},
         "recent_ai_role_failures_24h": {},
         "recent_ai_role_failures_7d": {},
+        "recent_ai_role_failures_30d": {},
         "recent_ai_failure_reasons": [],
         "observed_monthly_ai_calls_projection": 0,
         "observed_monthly_ai_calls_projection_breakdown": {},
+        "observed_monthly_ai_cost_projection_usd": None,
+        "observed_monthly_ai_net_projection_usd": None,
+        "ai_protection_status": {},
+        "ai_cost_efficiency_summary": {},
+        "ai_usage_today_timezone": "Asia/Seoul",
+        "ai_usage_today_start_at": None,
+        "ai_usage_today_end_at": None,
+        "ai_usage_summary_today_kst": {},
+        "ai_usage_summary_24h": {},
+        "ai_usage_summary_7d": {},
+        "ai_usage_summary_30d": {},
     }
 
     rollout_mode = get_rollout_mode(settings_row)
@@ -3446,6 +3773,7 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         ai_model_routing_policy=build_ai_model_routing_policy(settings_row),
         ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
         decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
+        ai_trading_decision_daily_token_budget=settings_row.ai_trading_decision_daily_token_budget,
         ai_max_input_candles=settings_row.ai_max_input_candles,
         ai_temperature=settings_row.ai_temperature,
         binance_market_data_enabled=settings_row.binance_market_data_enabled,
@@ -3479,12 +3807,23 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
         binance_api_key_configured=bool(credentials.binance_api_key),
         binance_api_secret_configured=bool(credentials.binance_api_secret),
         event_source_api_key_configured=bool(credentials.event_source_api_key),
+        recent_ai_calls_today_kst=usage_metrics["recent_ai_calls_today_kst"],
         recent_ai_calls_24h=usage_metrics["recent_ai_calls_24h"],
         recent_ai_calls_7d=usage_metrics["recent_ai_calls_7d"],
+        recent_ai_calls_30d=usage_metrics["recent_ai_calls_30d"],
+        recent_ai_successes_today_kst=usage_metrics["recent_ai_successes_today_kst"],
         recent_ai_successes_24h=usage_metrics["recent_ai_successes_24h"],
         recent_ai_successes_7d=usage_metrics["recent_ai_successes_7d"],
+        recent_ai_successes_30d=usage_metrics["recent_ai_successes_30d"],
+        recent_ai_failures_today_kst=usage_metrics["recent_ai_failures_today_kst"],
         recent_ai_failures_24h=usage_metrics["recent_ai_failures_24h"],
         recent_ai_failures_7d=usage_metrics["recent_ai_failures_7d"],
+        recent_ai_failures_30d=usage_metrics["recent_ai_failures_30d"],
+        recent_ai_tokens_today_kst={
+            "prompt_tokens": usage_metrics["recent_ai_tokens_today_kst"]["prompt_tokens"],
+            "completion_tokens": usage_metrics["recent_ai_tokens_today_kst"]["completion_tokens"],
+            "total_tokens": usage_metrics["recent_ai_tokens_today_kst"]["total_tokens"],
+        },
         recent_ai_tokens_24h={
             "prompt_tokens": usage_metrics["recent_ai_tokens_24h"]["prompt_tokens"],
             "completion_tokens": usage_metrics["recent_ai_tokens_24h"]["completion_tokens"],
@@ -3495,15 +3834,39 @@ def serialize_settings(settings_row: Setting) -> dict[str, object]:
             "completion_tokens": usage_metrics["recent_ai_tokens_7d"]["completion_tokens"],
             "total_tokens": usage_metrics["recent_ai_tokens_7d"]["total_tokens"],
         },
+        recent_ai_tokens_30d={
+            "prompt_tokens": usage_metrics["recent_ai_tokens_30d"]["prompt_tokens"],
+            "completion_tokens": usage_metrics["recent_ai_tokens_30d"]["completion_tokens"],
+            "total_tokens": usage_metrics["recent_ai_tokens_30d"]["total_tokens"],
+        },
+        recent_ai_role_calls_today_kst=usage_metrics["recent_ai_role_calls_today_kst"],
         recent_ai_role_calls_24h=usage_metrics["recent_ai_role_calls_24h"],
         recent_ai_role_calls_7d=usage_metrics["recent_ai_role_calls_7d"],
+        recent_ai_role_calls_30d=usage_metrics["recent_ai_role_calls_30d"],
+        recent_ai_role_failures_today_kst=usage_metrics["recent_ai_role_failures_today_kst"],
         recent_ai_role_failures_24h=usage_metrics["recent_ai_role_failures_24h"],
         recent_ai_role_failures_7d=usage_metrics["recent_ai_role_failures_7d"],
+        recent_ai_role_failures_30d=usage_metrics["recent_ai_role_failures_30d"],
         recent_ai_failure_reasons=usage_metrics["recent_ai_failure_reasons"],
         observed_monthly_ai_calls_projection=usage_metrics["observed_monthly_ai_calls_projection"],
         observed_monthly_ai_calls_projection_breakdown=usage_metrics[
             "observed_monthly_ai_calls_projection_breakdown"
         ],
+        observed_monthly_ai_cost_projection_usd=usage_metrics[
+            "observed_monthly_ai_cost_projection_usd"
+        ],
+        observed_monthly_ai_net_projection_usd=usage_metrics[
+            "observed_monthly_ai_net_projection_usd"
+        ],
+        ai_protection_status=usage_metrics["ai_protection_status"],
+        ai_cost_efficiency_summary=usage_metrics["ai_cost_efficiency_summary"],
+        ai_usage_today_timezone=usage_metrics["ai_usage_today_timezone"],
+        ai_usage_today_start_at=usage_metrics["ai_usage_today_start_at"],
+        ai_usage_today_end_at=usage_metrics["ai_usage_today_end_at"],
+        ai_usage_summary_today_kst=usage_metrics["ai_usage_summary_today_kst"],
+        ai_usage_summary_24h=usage_metrics["ai_usage_summary_24h"],
+        ai_usage_summary_7d=usage_metrics["ai_usage_summary_7d"],
+        ai_usage_summary_30d=usage_metrics["ai_usage_summary_30d"],
         manual_ai_guard_minutes=manual_ai_guard_minutes(settings_row),
     )
     return payload.model_dump(mode="json")
@@ -3609,6 +3972,8 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         live_approval_window_minutes=settings_row.live_approval_window_minutes,
         live_execution_ready=operational_status.live_execution_ready,
         trading_paused=operational_status.trading_paused,
+        approval_armed=operational_status.approval_armed,
+        approval_expires_at=operational_status.approval_expires_at,
         guard_mode_reason_category=operational_status.guard_mode_reason_category,
         guard_mode_reason_code=operational_status.guard_mode_reason_code,
         guard_mode_reason_message=operational_status.guard_mode_reason_message,
@@ -3667,6 +4032,7 @@ def serialize_settings_view(settings_row: Setting) -> dict[str, object]:
         ai_model_routing_policy=build_ai_model_routing_policy(settings_row),
         ai_call_interval_minutes=settings_row.ai_call_interval_minutes,
         decision_cycle_interval_minutes=settings_row.decision_cycle_interval_minutes,
+        ai_trading_decision_daily_token_budget=settings_row.ai_trading_decision_daily_token_budget,
         ai_max_input_candles=settings_row.ai_max_input_candles,
         ai_temperature=settings_row.ai_temperature,
         binance_market_data_enabled=settings_row.binance_market_data_enabled,
@@ -3714,21 +4080,44 @@ def serialize_settings_cadences(settings_row: Setting) -> dict[str, object]:
 def serialize_settings_ai_usage(settings_row: Setting) -> dict[str, object]:
     current_session = object_session(settings_row)
     usage_metrics: AIUsageMetrics = build_ai_usage_metrics(current_session) if current_session is not None else {
+        "recent_ai_calls_today_kst": 0,
         "recent_ai_calls_24h": 0,
         "recent_ai_calls_7d": 0,
+        "recent_ai_calls_30d": 0,
+        "recent_ai_successes_today_kst": 0,
         "recent_ai_successes_24h": 0,
         "recent_ai_successes_7d": 0,
+        "recent_ai_successes_30d": 0,
+        "recent_ai_failures_today_kst": 0,
         "recent_ai_failures_24h": 0,
         "recent_ai_failures_7d": 0,
+        "recent_ai_failures_30d": 0,
+        "recent_ai_tokens_today_kst": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_24h": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "recent_ai_tokens_7d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_tokens_30d": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "recent_ai_role_calls_today_kst": {},
         "recent_ai_role_calls_24h": {},
         "recent_ai_role_calls_7d": {},
+        "recent_ai_role_calls_30d": {},
+        "recent_ai_role_failures_today_kst": {},
         "recent_ai_role_failures_24h": {},
         "recent_ai_role_failures_7d": {},
+        "recent_ai_role_failures_30d": {},
         "recent_ai_failure_reasons": [],
         "observed_monthly_ai_calls_projection": 0,
         "observed_monthly_ai_calls_projection_breakdown": {},
+        "observed_monthly_ai_cost_projection_usd": None,
+        "observed_monthly_ai_net_projection_usd": None,
+        "ai_protection_status": {},
+        "ai_cost_efficiency_summary": {},
+        "ai_usage_today_timezone": "Asia/Seoul",
+        "ai_usage_today_start_at": None,
+        "ai_usage_today_end_at": None,
+        "ai_usage_summary_today_kst": {},
+        "ai_usage_summary_24h": {},
+        "ai_usage_summary_7d": {},
+        "ai_usage_summary_30d": {},
     }
     payload = AppSettingsAIUsageResponse(
         **usage_metrics,
@@ -3737,7 +4126,12 @@ def serialize_settings_ai_usage(settings_row: Setting) -> dict[str, object]:
     return payload.model_dump(mode="json")
 
 
-def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, object]:
+def serialize_settings_runtime_summary(
+    settings_row: Setting,
+    *,
+    include_operational_status: bool = True,
+    include_event_operator_control: bool = True,
+) -> dict[str, object]:
     defaults = get_settings()
     current_session = object_session(settings_row)
 
@@ -3806,7 +4200,10 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
             raw_codes = payload.get("rationale_codes", [])
             if isinstance(raw_codes, list):
                 latest_decision_rationale_codes = [str(item) for item in raw_codes if item not in {None, ""}]
-    current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
+    current_risk_allowed: bool | None = None
+    current_cycle_blocked_reasons: list[str] = []
+    if include_operational_status:
+        current_risk_allowed, current_cycle_blocked_reasons = get_latest_risk_gate_status(current_session)
     adaptive_signal_summary = summarize_adaptive_signal_state(
         adaptive_signal_context,
         latest_rationale_codes=latest_decision_rationale_codes,
@@ -3822,40 +4219,51 @@ def serialize_settings_runtime_summary(settings_row: Setting) -> dict[str, objec
     )
     execution_policy_summary = summarize_execution_policy(settings_row)
     position_management_summary = _build_position_management_summary(current_session, settings_row)
-    event_operator_control = build_event_operator_control_payload(
-        session=current_session,
-        settings_row=settings_row,
-        symbol=settings_row.default_symbol.upper(),
-        timeframe=settings_row.default_timeframe,
+    event_operator_control = (
+        build_event_operator_control_payload(
+            session=current_session,
+            settings_row=settings_row,
+            symbol=settings_row.default_symbol.upper(),
+            timeframe=settings_row.default_timeframe,
+        )
+        if include_event_operator_control
+        else None
     )
-    operational_status = build_operational_status_payload(
-        settings_row,
-        session=current_session,
-        defaults=defaults,
-        runtime_state=runtime_state,
-        blocked_reasons=current_cycle_blocked_reasons,
-        latest_blocked_reasons=current_cycle_blocked_reasons,
-        risk_allowed=current_risk_allowed,
-        account_sync_summary=account_sync_summary,
-        sync_freshness_summary=sync_freshness_summary,
-        market_freshness_summary=market_freshness_summary,
+    operational_status = (
+        build_operational_status_payload(
+            settings_row,
+            session=current_session,
+            defaults=defaults,
+            runtime_state=runtime_state,
+            blocked_reasons=current_cycle_blocked_reasons,
+            latest_blocked_reasons=current_cycle_blocked_reasons,
+            risk_allowed=current_risk_allowed,
+            account_sync_summary=account_sync_summary,
+            sync_freshness_summary=sync_freshness_summary,
+            market_freshness_summary=market_freshness_summary,
+        )
+        if include_operational_status
+        else None
     )
-    return {
+    payload: dict[str, object] = {
         "mode": mode,
         "pnl_summary": pnl_summary,
         "account_sync_summary": account_sync_summary,
         "sync_freshness_summary": sync_freshness_summary,
         "market_freshness_summary": market_freshness_summary,
-        "binance_rest_summary": operational_status.reconciliation_summary.get("rest_connectivity", {}),
         "exposure_summary": exposure_summary,
         "execution_policy_summary": execution_policy_summary,
         "market_context_summary": market_context_summary,
         "adaptive_protection_summary": adaptive_protection_summary,
         "adaptive_signal_summary": adaptive_signal_summary,
         "position_management_summary": position_management_summary,
-        "event_operator_control": event_operator_control.model_dump(mode="json"),
-        "operational_status": operational_status.model_dump(mode="json"),
     }
+    if operational_status is not None:
+        payload["binance_rest_summary"] = operational_status.reconciliation_summary.get("rest_connectivity", {})
+        payload["operational_status"] = operational_status.model_dump(mode="json")
+    if event_operator_control is not None:
+        payload["event_operator_control"] = event_operator_control.model_dump(mode="json")
+    return payload
 
 
 def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Setting:
@@ -3911,6 +4319,8 @@ def update_settings(session: Session, payload: AppSettingsUpdateRequest) -> Sett
     row.ai_model = payload.ai_model
     row.ai_call_interval_minutes = payload.ai_call_interval_minutes
     row.decision_cycle_interval_minutes = payload.decision_cycle_interval_minutes
+    if "ai_trading_decision_daily_token_budget" in fields_set:
+        row.ai_trading_decision_daily_token_budget = payload.ai_trading_decision_daily_token_budget
     if "execution_risk_profile_settings" in fields_set:
         _write_execution_risk_profile_policy(
             row,
